@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "useDefineForClassFields": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "jsx": "react-jsx",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+    "noEmit": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./packages/ui/src/*"],
+      "@zhangqinzhong/agentrouter/*": ["./packages/cli/src/*"],
+      "@agentrouter/core/*": ["./packages/core/src/*"],
+      "@agentrouter/electron/*": ["./packages/electron/src/*"],
+      "@agentrouter/ui/*": ["./packages/ui/src/*"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/src/**/*.d.ts",
+    "packages/*/src/**/*.tsx",
+    "tests/e2e/**/*.ts"
+  ],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

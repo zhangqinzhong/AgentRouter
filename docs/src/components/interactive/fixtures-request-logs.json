@@ -1,0 +1,124 @@
+{
+  "generatedAt": "2026-09-13T09:00:04.000Z",
+  "items": [
+    {
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "client": "claude-code",
+      "completedAt": "2026-09-13T09:00:01.800Z",
+      "costUsd": 0,
+      "createdAt": "2026-09-13T09:00:00.000Z",
+      "credentialChain": [],
+      "credentialId": "",
+      "credentialSaturated": false,
+      "durationMs": 1800,
+      "error": "",
+      "id": 1,
+      "inputTokens": 120,
+      "isStream": false,
+      "method": "POST",
+      "model": "demo-model",
+      "ok": true,
+      "outputTokens": 40,
+      "path": "/v1/messages",
+      "provider": "Demo API",
+      "reasoningTokens": 0,
+      "requestedModel": "demo-model",
+      "requestBody": {
+        "text": "{\"model\": \"demo-model\", \"max_tokens\": 128, \"messages\": [{\"role\": \"user\", \"content\": \"查询订单 DEMO-1001 的配送状态。\"}]}",
+        "sizeBytes": 130,
+        "encoding": "utf8",
+        "truncated": false
+      },
+      "requestHeaders": {
+        "content-type": "application/json"
+      },
+      "requestId": "demo-request-1",
+      "routeAttemptCount": 1,
+      "routeHopCount": 0,
+      "routeTraceTruncated": false,
+      "retryAttempts": [],
+      "resolvedModel": "demo-model",
+      "responseBody": {
+        "text": "{\"id\": \"demo-message-1\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"demo-model\", \"content\": [{\"type\": \"tool_use\", \"id\": \"demo-tool-call\", \"name\": \"lookup_order\", \"input\": {\"order_id\": \"DEMO-1001\"}}], \"usage\": {\"input_tokens\": 120, \"output_tokens\": 40}, \"stop_reason\": \"tool_use\"}",
+        "sizeBytes": 286,
+        "encoding": "utf8",
+        "truncated": false
+      },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "responseModel": "demo-model",
+      "statusCode": 200,
+      "totalTokens": 160,
+      "url": "http://127.0.0.1:3466/v1/messages"
+    },
+    {
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "client": "claude-code",
+      "completedAt": "2026-09-13T09:00:03.900Z",
+      "costUsd": 0,
+      "createdAt": "2026-09-13T09:00:02.100Z",
+      "credentialChain": [],
+      "credentialId": "",
+      "credentialSaturated": false,
+      "durationMs": 1800,
+      "error": "",
+      "id": 2,
+      "inputTokens": 120,
+      "isStream": true,
+      "method": "POST",
+      "model": "demo-model",
+      "ok": true,
+      "outputTokens": 40,
+      "path": "/v1/messages",
+      "provider": "Demo API",
+      "reasoningTokens": 0,
+      "requestedModel": "demo-model",
+      "requestBody": {
+        "text": "{\"model\": \"demo-model\", \"max_tokens\": 128, \"messages\": [{\"role\": \"user\", \"content\": \"查询订单 DEMO-1001 的配送状态。\"}, {\"role\": \"assistant\", \"content\": [{\"type\": \"tool_use\", \"id\": \"demo-tool-call\", \"name\": \"lookup_order\", \"input\": {\"order_id\": \"DEMO-1001\"}}]}, {\"role\": \"user\", \"content\": [{\"type\": \"tool_result\", \"tool_use_id\": \"demo-tool-call\", \"content\": \"订单已发货，预计明天送达。\"}]}], \"stream\": true}",
+        "sizeBytes": 431,
+        "encoding": "utf8",
+        "truncated": false
+      },
+      "requestHeaders": {
+        "content-type": "application/json"
+      },
+      "requestId": "demo-request-2",
+      "routeAttemptCount": 1,
+      "routeHopCount": 0,
+      "routeTraceTruncated": false,
+      "retryAttempts": [],
+      "resolvedModel": "demo-model",
+      "responseBody": {
+        "text": "data: {\"type\": \"content_block_delta\", \"delta\": {\"type\": \"text_delta\", \"text\": \"订单 DEMO-1001 已发货，预计明天送达。\"}}\n\ndata: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\"}, \"usage\": {\"output_tokens\": 40}}\n\ndata: {\"type\": \"message_stop\"}\n\n",
+        "sizeBytes": 269,
+        "encoding": "utf8",
+        "truncated": false
+      },
+      "responseHeaders": {
+        "content-type": "text/event-stream"
+      },
+      "responseModel": "demo-model",
+      "statusCode": 200,
+      "totalTokens": 160,
+      "url": "http://127.0.0.1:3466/v1/messages",
+      "timeToFirstTokenMs": 800,
+      "streamOutputDurationMs": 900
+    }
+  ],
+  "options": {
+    "credentials": [],
+    "models": [
+      "demo-model"
+    ],
+    "providers": [
+      "Demo API"
+    ]
+  },
+  "page": 1,
+  "pageSize": 25,
+  "total": 2,
+  "totalPages": 1
+}

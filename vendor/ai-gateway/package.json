@@ -1,0 +1,26 @@
+{
+  "name": "@the-next-ai/ai-gateway",
+  "version": "1.0.18",
+  "private": true,
+  "description": "TypeScript Fastify AI protocol gateway for OpenAI, Anthropic, Gemini, MCP and agent workflows.",
+  "license": "MIT",
+  "author": "musistudio",
+  "main": "src/index.ts",
+  "bin": {
+    "next-ai-gateway": "bin/next-ai-gateway.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "diff": "^8.0.3",
+    "fastify": "^5.8.2",
+    "glob": "^13.0.6",
+    "openai": "^6.27.0",
+    "undici": "^6.28.0",
+    "ws": "^8.19.0"
+  }
+}

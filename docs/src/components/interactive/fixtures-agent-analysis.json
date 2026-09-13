@@ -1,0 +1,610 @@
+{
+  "agents": [
+    {
+      "avgDurationMs": 1800,
+      "cacheRatio": 0,
+      "cacheReadTokens": 0,
+      "cacheTokens": 0,
+      "cacheWriteTokens": 0,
+      "costUsd": 0,
+      "errorCount": 0,
+      "inputTokens": 240,
+      "maxConcurrentRequests": 1,
+      "maxDurationMs": 1800,
+      "outputTokens": 80,
+      "p50DurationMs": 1800,
+      "p95DurationMs": 1800,
+      "p99DurationMs": 1800,
+      "requestCount": 2,
+      "sessionCount": 1,
+      "subagentCallCount": 0,
+      "successRate": 1,
+      "toolCallCount": 1,
+      "totalTokens": 320,
+      "agent": "claude-code",
+      "key": "claude-code",
+      "label": "Claude Code",
+      "maxShare": 1
+    }
+  ],
+  "clients": [
+    {
+      "avgDurationMs": 1800,
+      "cacheRatio": 0,
+      "cacheReadTokens": 0,
+      "cacheTokens": 0,
+      "cacheWriteTokens": 0,
+      "costUsd": 0,
+      "errorCount": 0,
+      "inputTokens": 240,
+      "maxConcurrentRequests": 1,
+      "maxDurationMs": 1800,
+      "outputTokens": 80,
+      "p50DurationMs": 1800,
+      "p95DurationMs": 1800,
+      "p99DurationMs": 1800,
+      "requestCount": 2,
+      "sessionCount": 1,
+      "subagentCallCount": 0,
+      "successRate": 1,
+      "toolCallCount": 1,
+      "totalTokens": 320,
+      "agent": "claude-code",
+      "key": "demo-client",
+      "label": "Demo Client",
+      "lastSeenAt": "2026-09-13T09:00:03.900Z",
+      "userAgent": "Demo Client"
+    }
+  ],
+  "concurrency": [
+    {
+      "bucket": "2026-09-13T09:00:00.000Z",
+      "label": "09:00",
+      "maxConcurrentRequests": 1,
+      "requestCount": 2
+    }
+  ],
+  "endpoints": [
+    {
+      "avgDurationMs": 1800,
+      "cacheRatio": 0,
+      "cacheReadTokens": 0,
+      "cacheTokens": 0,
+      "cacheWriteTokens": 0,
+      "costUsd": 0,
+      "errorCount": 0,
+      "inputTokens": 240,
+      "maxConcurrentRequests": 1,
+      "maxDurationMs": 1800,
+      "outputTokens": 80,
+      "p50DurationMs": 1800,
+      "p95DurationMs": 1800,
+      "p99DurationMs": 1800,
+      "requestCount": 2,
+      "sessionCount": 1,
+      "subagentCallCount": 0,
+      "successRate": 1,
+      "toolCallCount": 1,
+      "totalTokens": 320,
+      "agent": "claude-code",
+      "key": "demo-endpoint",
+      "lastSeenAt": "2026-09-13T09:00:03.900Z",
+      "method": "POST",
+      "model": "demo-model",
+      "path": "/v1/messages",
+      "provider": "Demo API",
+      "statusCodes": [
+        {
+          "count": 2,
+          "statusCode": 200
+        }
+      ]
+    }
+  ],
+  "errors": [],
+  "generatedAt": "2026-09-13T09:00:04.000Z",
+  "range": "today",
+  "recentRequests": [
+    {
+      "agent": "claude-code",
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "client": "claude-code",
+      "concurrentRequests": 1,
+      "costUsd": 0,
+      "createdAt": "2026-09-13T09:00:00.000Z",
+      "durationMs": 1800,
+      "id": 1,
+      "inputTokens": 120,
+      "method": "POST",
+      "model": "demo-model",
+      "ok": true,
+      "outputTokens": 40,
+      "path": "/v1/messages",
+      "provider": "Demo API",
+      "requestId": "demo-request-1",
+      "routeReason": "configured-model",
+      "sessionId": "demo-order-session",
+      "statusCode": 200,
+      "toolCallCount": 1,
+      "tools": [
+        "lookup_order"
+      ],
+      "totalTokens": 160,
+      "userAgent": "Demo Client"
+    },
+    {
+      "agent": "claude-code",
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "client": "claude-code",
+      "concurrentRequests": 1,
+      "costUsd": 0,
+      "createdAt": "2026-09-13T09:00:02.100Z",
+      "durationMs": 1800,
+      "id": 2,
+      "inputTokens": 120,
+      "method": "POST",
+      "model": "demo-model",
+      "ok": true,
+      "outputTokens": 40,
+      "path": "/v1/messages",
+      "provider": "Demo API",
+      "requestId": "demo-request-2",
+      "routeReason": "configured-model",
+      "sessionId": "demo-order-session",
+      "statusCode": 200,
+      "toolCallCount": 0,
+      "tools": [],
+      "totalTokens": 160,
+      "userAgent": "Demo Client"
+    }
+  ],
+  "routes": [
+    {
+      "agent": "claude-code",
+      "cacheRatio": 0,
+      "errorCount": 0,
+      "key": "demo-route",
+      "lastSeenAt": "2026-09-13T09:00:03.900Z",
+      "model": "demo-model",
+      "p95DurationMs": 1800,
+      "provider": "Demo API",
+      "requestCount": 2,
+      "routeReason": "configured-model",
+      "successRate": 1,
+      "totalTokens": 320
+    }
+  ],
+  "scannedRequestCount": 2,
+  "selectedSession": {
+    "endpoints": [
+      {
+        "avgDurationMs": 1800,
+        "cacheRatio": 0,
+        "cacheReadTokens": 0,
+        "cacheTokens": 0,
+        "cacheWriteTokens": 0,
+        "costUsd": 0,
+        "errorCount": 0,
+        "inputTokens": 240,
+        "maxConcurrentRequests": 1,
+        "maxDurationMs": 1800,
+        "outputTokens": 80,
+        "p50DurationMs": 1800,
+        "p95DurationMs": 1800,
+        "p99DurationMs": 1800,
+        "requestCount": 2,
+        "sessionCount": 1,
+        "subagentCallCount": 0,
+        "successRate": 1,
+        "toolCallCount": 1,
+        "totalTokens": 320,
+        "agent": "claude-code",
+        "key": "demo-endpoint",
+        "lastSeenAt": "2026-09-13T09:00:03.900Z",
+        "method": "POST",
+        "model": "demo-model",
+        "path": "/v1/messages",
+        "provider": "Demo API",
+        "statusCodes": [
+          {
+            "count": 2,
+            "statusCode": 200
+          }
+        ]
+      }
+    ],
+    "errors": [],
+    "models": [
+      {
+        "avgDurationMs": 1800,
+        "cacheRatio": 0,
+        "cacheReadTokens": 0,
+        "cacheTokens": 0,
+        "cacheWriteTokens": 0,
+        "costUsd": 0,
+        "errorCount": 0,
+        "inputTokens": 240,
+        "maxConcurrentRequests": 1,
+        "maxDurationMs": 1800,
+        "outputTokens": 80,
+        "p50DurationMs": 1800,
+        "p95DurationMs": 1800,
+        "p99DurationMs": 1800,
+        "requestCount": 2,
+        "sessionCount": 1,
+        "subagentCallCount": 0,
+        "successRate": 1,
+        "toolCallCount": 1,
+        "totalTokens": 320,
+        "key": "demo-model",
+        "lastSeenAt": "2026-09-13T09:00:03.900Z",
+        "model": "demo-model",
+        "provider": "Demo API"
+      }
+    ],
+    "requests": [
+      {
+        "agent": "claude-code",
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0,
+        "client": "claude-code",
+        "concurrentRequests": 1,
+        "costUsd": 0,
+        "createdAt": "2026-09-13T09:00:00.000Z",
+        "durationMs": 1800,
+        "id": 1,
+        "inputTokens": 120,
+        "method": "POST",
+        "model": "demo-model",
+        "ok": true,
+        "outputTokens": 40,
+        "path": "/v1/messages",
+        "provider": "Demo API",
+        "requestId": "demo-request-1",
+        "routeReason": "configured-model",
+        "sessionId": "demo-order-session",
+        "statusCode": 200,
+        "toolCallCount": 1,
+        "tools": [
+          "lookup_order"
+        ],
+        "totalTokens": 160,
+        "userAgent": "Demo Client"
+      },
+      {
+        "agent": "claude-code",
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0,
+        "client": "claude-code",
+        "concurrentRequests": 1,
+        "costUsd": 0,
+        "createdAt": "2026-09-13T09:00:02.100Z",
+        "durationMs": 1800,
+        "id": 2,
+        "inputTokens": 120,
+        "method": "POST",
+        "model": "demo-model",
+        "ok": true,
+        "outputTokens": 40,
+        "path": "/v1/messages",
+        "provider": "Demo API",
+        "requestId": "demo-request-2",
+        "routeReason": "configured-model",
+        "sessionId": "demo-order-session",
+        "statusCode": 200,
+        "toolCallCount": 0,
+        "tools": [],
+        "totalTokens": 160,
+        "userAgent": "Demo Client"
+      }
+    ],
+    "routes": [
+      {
+        "agent": "claude-code",
+        "cacheRatio": 0,
+        "errorCount": 0,
+        "key": "demo-route",
+        "lastSeenAt": "2026-09-13T09:00:03.900Z",
+        "model": "demo-model",
+        "p95DurationMs": 1800,
+        "provider": "Demo API",
+        "requestCount": 2,
+        "routeReason": "configured-model",
+        "successRate": 1,
+        "totalTokens": 320
+      }
+    ],
+    "session": {
+      "avgDurationMs": 1800,
+      "cacheRatio": 0,
+      "cacheReadTokens": 0,
+      "cacheTokens": 0,
+      "cacheWriteTokens": 0,
+      "costUsd": 0,
+      "errorCount": 0,
+      "inputTokens": 240,
+      "maxConcurrentRequests": 1,
+      "maxDurationMs": 1800,
+      "outputTokens": 80,
+      "p50DurationMs": 1800,
+      "p95DurationMs": 1800,
+      "p99DurationMs": 1800,
+      "requestCount": 2,
+      "sessionCount": 1,
+      "subagentCallCount": 0,
+      "successRate": 1,
+      "toolCallCount": 1,
+      "totalTokens": 320,
+      "agent": "claude-code",
+      "client": "claude-code",
+      "durationMs": 3900,
+      "id": "demo-order-session",
+      "lastRequestId": "demo-request-2",
+      "lastSeenAt": "2026-09-13T09:00:03.900Z",
+      "models": [
+        "demo-model"
+      ],
+      "providers": [
+        "Demo API"
+      ],
+      "startedAt": "2026-09-13T09:00:00.000Z",
+      "topTools": [
+        {
+          "name": "lookup_order",
+          "count": 1
+        }
+      ],
+      "userAgent": "Demo Client"
+    },
+    "statusCodes": [
+      {
+        "count": 2,
+        "statusCode": 200
+      }
+    ],
+    "subagents": [],
+    "tools": [
+      {
+        "agents": [
+          "claude-code"
+        ],
+        "count": 1,
+        "lastSeenAt": "2026-09-13T09:00:02.100Z",
+        "name": "lookup_order",
+        "requestCount": 1,
+        "sessions": 1
+      }
+    ],
+    "totals": {
+      "avgDurationMs": 1800,
+      "cacheRatio": 0,
+      "cacheReadTokens": 0,
+      "cacheTokens": 0,
+      "cacheWriteTokens": 0,
+      "costUsd": 0,
+      "errorCount": 0,
+      "inputTokens": 240,
+      "maxConcurrentRequests": 1,
+      "maxDurationMs": 1800,
+      "outputTokens": 80,
+      "p50DurationMs": 1800,
+      "p95DurationMs": 1800,
+      "p99DurationMs": 1800,
+      "requestCount": 2,
+      "sessionCount": 1,
+      "subagentCallCount": 0,
+      "successRate": 1,
+      "toolCallCount": 1,
+      "totalTokens": 320
+    },
+    "trace": {
+      "agent": "claude-code",
+      "durationMs": 3900,
+      "endedAt": "2026-09-13T09:00:03.900Z",
+      "errorCount": 0,
+      "id": "demo-trace",
+      "llmRunCount": 2,
+      "maxDepth": 2,
+      "rootRunId": "demo-root",
+      "runCount": 4,
+      "runs": [
+        {
+          "agent": "claude-code",
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "concurrentRequests": 1,
+          "costUsd": 0,
+          "depth": 0,
+          "durationMs": 3900,
+          "endedAt": "2026-09-13T09:00:03.900Z",
+          "id": "demo-root",
+          "inputTokens": 240,
+          "kind": "agent",
+          "name": "订单配送查询",
+          "offsetMs": 0,
+          "outputTokens": 80,
+          "sessionId": "demo-order-session",
+          "startedAt": "2026-09-13T09:00:00.000Z",
+          "status": "success",
+          "totalTokens": 320
+        },
+        {
+          "agent": "claude-code",
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "concurrentRequests": 1,
+          "costUsd": 0,
+          "depth": 1,
+          "durationMs": 1800,
+          "endedAt": "2026-09-13T09:00:01.800Z",
+          "id": "demo-llm-1",
+          "inputTokens": 120,
+          "kind": "llm",
+          "name": "demo-model",
+          "offsetMs": 0,
+          "outputTokens": 40,
+          "sessionId": "demo-order-session",
+          "startedAt": "2026-09-13T09:00:00.000Z",
+          "status": "success",
+          "totalTokens": 160,
+          "parentId": "demo-root",
+          "model": "demo-model",
+          "provider": "Demo API",
+          "requestId": "demo-request-1",
+          "requestLogId": 1,
+          "statusCode": 200,
+          "path": "/v1/messages"
+        },
+        {
+          "agent": "claude-code",
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "concurrentRequests": 1,
+          "costUsd": 0,
+          "depth": 2,
+          "durationMs": 300,
+          "endedAt": "2026-09-13T09:00:02.100Z",
+          "id": "demo-tool-1",
+          "inputTokens": 0,
+          "kind": "tool",
+          "name": "lookup_order",
+          "offsetMs": 1800,
+          "outputTokens": 0,
+          "sessionId": "demo-order-session",
+          "startedAt": "2026-09-13T09:00:01.800Z",
+          "status": "success",
+          "totalTokens": 0,
+          "parentId": "demo-llm-1",
+          "toolName": "lookup_order",
+          "tool": {
+            "callId": "demo-tool-call",
+            "input": {
+              "kind": "json",
+              "preview": "{\"order_id\": \"DEMO-1001\"}",
+              "sizeBytes": 25,
+              "truncated": false
+            },
+            "result": {
+              "kind": "json",
+              "preview": "{\"status\": \"shipped\", \"estimated_delivery\": \"tomorrow\"}",
+              "sizeBytes": 55,
+              "truncated": false
+            }
+          }
+        },
+        {
+          "agent": "claude-code",
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "concurrentRequests": 1,
+          "costUsd": 0,
+          "depth": 1,
+          "durationMs": 1800,
+          "endedAt": "2026-09-13T09:00:03.900Z",
+          "id": "demo-llm-2",
+          "inputTokens": 120,
+          "kind": "llm",
+          "name": "demo-model",
+          "offsetMs": 2100,
+          "outputTokens": 40,
+          "sessionId": "demo-order-session",
+          "startedAt": "2026-09-13T09:00:02.100Z",
+          "status": "success",
+          "totalTokens": 160,
+          "parentId": "demo-root",
+          "model": "demo-model",
+          "provider": "Demo API",
+          "requestId": "demo-request-2",
+          "requestLogId": 2,
+          "statusCode": 200,
+          "path": "/v1/messages"
+        }
+      ],
+      "sessionId": "demo-order-session",
+      "startedAt": "2026-09-13T09:00:00.000Z",
+      "subagentRunCount": 0,
+      "toolRunCount": 1
+    }
+  },
+  "sessions": [
+    {
+      "avgDurationMs": 1800,
+      "cacheRatio": 0,
+      "cacheReadTokens": 0,
+      "cacheTokens": 0,
+      "cacheWriteTokens": 0,
+      "costUsd": 0,
+      "errorCount": 0,
+      "inputTokens": 240,
+      "maxConcurrentRequests": 1,
+      "maxDurationMs": 1800,
+      "outputTokens": 80,
+      "p50DurationMs": 1800,
+      "p95DurationMs": 1800,
+      "p99DurationMs": 1800,
+      "requestCount": 2,
+      "sessionCount": 1,
+      "subagentCallCount": 0,
+      "successRate": 1,
+      "toolCallCount": 1,
+      "totalTokens": 320,
+      "agent": "claude-code",
+      "client": "claude-code",
+      "durationMs": 3900,
+      "id": "demo-order-session",
+      "lastRequestId": "demo-request-2",
+      "lastSeenAt": "2026-09-13T09:00:03.900Z",
+      "models": [
+        "demo-model"
+      ],
+      "providers": [
+        "Demo API"
+      ],
+      "startedAt": "2026-09-13T09:00:00.000Z",
+      "topTools": [
+        {
+          "name": "lookup_order",
+          "count": 1
+        }
+      ],
+      "userAgent": "Demo Client"
+    }
+  ],
+  "subagents": [],
+  "tools": [
+    {
+      "agents": [
+        "claude-code"
+      ],
+      "count": 1,
+      "lastSeenAt": "2026-09-13T09:00:02.100Z",
+      "name": "lookup_order",
+      "requestCount": 1,
+      "sessions": 1
+    }
+  ],
+  "totals": {
+    "avgDurationMs": 1800,
+    "cacheRatio": 0,
+    "cacheReadTokens": 0,
+    "cacheTokens": 0,
+    "cacheWriteTokens": 0,
+    "costUsd": 0,
+    "errorCount": 0,
+    "inputTokens": 240,
+    "maxConcurrentRequests": 1,
+    "maxDurationMs": 1800,
+    "outputTokens": 80,
+    "p50DurationMs": 1800,
+    "p95DurationMs": 1800,
+    "p99DurationMs": 1800,
+    "requestCount": 2,
+    "sessionCount": 1,
+    "subagentCallCount": 0,
+    "successRate": 1,
+    "toolCallCount": 1,
+    "totalTokens": 320
+  }
+}
