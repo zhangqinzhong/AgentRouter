@@ -84,6 +84,8 @@ The browser management UI opens at `http://127.0.0.1:3458`. The CLI package is n
 
 ## Guides
 
+- [Code map](docs/src/content/docs/en/guides/code-map.md)
+
 - [Agent profiles and launch options](docs/src/content/docs/en/configuration/profiles.md)
 - [Providers](docs/src/content/docs/en/guides/provider.md)
 - [Logs, retention, and rate calculations](docs/src/content/docs/en/configuration/observability.md)

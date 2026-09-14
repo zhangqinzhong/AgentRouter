@@ -84,6 +84,8 @@ node packages/cli/dist/main/cli.js ui
 
 ## 使用指南
 
+- [代码地图](docs/src/content/docs/zh/guides/code-map.md)
+
 - [Agent 档案与启动选项](docs/src/content/docs/zh/configuration/profiles.md)
 - [供应商配置](docs/src/content/docs/zh/guides/provider.md)
 - [日志、保存期限与速率计算](docs/src/content/docs/zh/configuration/observability.md)

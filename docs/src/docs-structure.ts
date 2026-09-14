@@ -85,6 +85,13 @@ export const docPages: DocPageDef[] = [
     source: { zh: "guides/cli.md", en: "guides/cli.md" },
   },
   {
+    key: "guides/code-map",
+    section: "guides",
+    label: { zh: "代码地图", en: "Code map" },
+    path: { zh: "/guides/code-map/", en: "/en/guides/code-map/" },
+    source: { zh: "guides/code-map.md", en: "guides/code-map.md" },
+  },
+  {
     key: "guides/docker",
     section: "guides",
     label: { zh: "Docker 部署", en: "Docker deployment" },
@@ -441,6 +448,7 @@ export const docSections: DocSectionDef[] = [
           pageItem("guides/provider"),
           pageItem("guides/agent-profile"),
           pageItem("guides/observability"),
+          pageItem("guides/code-map"),
         ],
       },
     ],

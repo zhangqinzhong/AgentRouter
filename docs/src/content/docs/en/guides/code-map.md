@@ -1,0 +1,107 @@
+---
+title: Code map
+pageTitle: Code map
+eyebrow: Development reference
+lead: Module responsibilities, entry points, launch and usage data flows, and boundaries for local-session collection.
+---
+
+## Repository layout
+
+```text
+packages/electron/  Desktop process, windows, tray, IPC, updates
+packages/cli/       Command-line entry
+packages/core/      Configuration, profiles, gateway, routing, logs, usage, tools
+packages/ui/        React main window, tray, and shared components
+vendor/ai-gateway/  Retained gateway source; check runtime/build references
+build/             Build, test, package, and artifact verification
+scripts/           Supporting generators, including model catalogs
+tests/             Cross-package architecture, end-to-end, and system tests
+docs/              Astro documentation and Markdown sources
+.github/workflows/ Documentation and release workflows
+```
+
+Business services belong in core. Electron and CLI provide different runtime entry points; the UI calls services through their exposed interfaces. Shared contracts live in `packages/core/src/contracts/`. Architecture tests enforce package boundaries.
+
+## Entry points
+
+All paths below are relative to the repository root.
+
+| Area | Entry | Responsibility |
+| --- | --- | --- |
+| Desktop | [main.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/electron/src/main/main.ts), [main-app.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/electron/src/main/main-app.ts) | Runtime paths, application startup and shutdown |
+| Desktop bridge | [preload.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/electron/src/main/preload.ts), [ipc.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/electron/src/main/ipc.ts) | Renderer-facing API and IPC handlers |
+| CLI | [cli.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/cli/src/cli.ts) | Command parsing, profile selection, and agent launch |
+| Web API | [management-server.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/web/management-server.ts) | Browser management endpoints |
+| UI | [App.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/App.tsx) | Navigation, configuration drafts, saving, and profile actions |
+| Configuration | [config.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/config/config.ts), [config-repository.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/config/config-repository.ts) | Normalization, compatibility, and persistence |
+| Contracts | [contracts/app.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/contracts/app.ts) | Shared configuration and service data structures |
+| Profiles | [profiles/service.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/profiles/service.ts) | Apply and restore agent configuration and managed authentication |
+| Launch | [launch-core.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/profiles/launch-core.ts), [launch-service.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/profiles/launch-service.ts) | Launch plans, execution, and runtime state |
+| Terminal | [terminal-launch.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/profiles/terminal-launch.ts) | Terminal selection and foreground activation |
+| Gateway | [application/gateway-service.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/gateway/application/gateway-service.ts) | Gateway orchestration, configuration, and synchronization |
+| Runtime | [supervisor.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/gateway/core-runtime/supervisor.ts) | Gateway child process and health checks |
+| Routing | [claude-code-router-plugin.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/gateway/claude-code-router-plugin.ts), [routing/config-compiler.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/routing/config-compiler.ts) | AgentRouter policies and rule compilation |
+| Request logs | [request-log-store.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/observability/request-log-store.ts), [raw-trace-sync.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/observability/raw-trace-sync.ts) | Request persistence, retention, and raw trace ingestion |
+| Usage | [usage/store.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/store.ts), [billing-sync.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/billing-sync.ts) | Usage capture, aggregation, reset, and billing synchronization |
+| Token normalization | [normalization.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/normalization.ts) | Protocol-specific token accounting |
+| Charts | [dashboard.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/dashboard.tsx) | Overview cards, trends, activity, and breakdowns |
+| Log UI | [network-logs.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/network-logs.tsx), [token-rate.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/lib/token-rate.ts) | Log details and timing/rate presentation |
+
+## Profile launch flow
+
+```text
+Profile card → save configuration → preload / IPC
+  → openProfileFromAr → applyProfileConfig
+  → terminal-launch → agentrouter <profile-id> cli
+  → CLI profile resolution → buildProfileLaunchPlan
+  → permission mode, saved arguments, and environment → agent
+```
+
+A launch alias enters the same CLI through a generated script. It binds to the profile ID, not its display name. App launches use separate agent-specific adapters; CLI permission and argument options do not imply equivalent App behavior.
+
+## Gateway and usage flow
+
+```text
+Agent / API client → local gateway runtime → AgentRouter routing plugin
+  → selected provider / model → client response
+
+Raw traces → raw-trace-sync → request records, traces, body files
+                          └→ missing usage capture
+Billing usage → billing-sync → usage/store
+
+Request data → logs and observability
+Usage store → getUsageStats → IPC or Web API → overview charts
+```
+
+`gateway/service.ts` is a compatibility export surface. The main orchestration lives in `gateway/application/gateway-service.ts`; runtime configuration and process startup live under `gateway/core-runtime/`. Follow those references before assuming a retained vendor or older gateway file is the active execution path.
+
+## Storage boundaries
+
+Default root: `~/.agentrouter` on macOS/Linux; `%APPDATA%\agentrouter` on Windows. Runtime overrides are resolved by `runtime/app-paths.ts` and `config/constants.ts`.
+
+| Path under the configuration root | Data |
+| --- | --- |
+| `config.sqlite` | Configuration and credentials |
+| `profiles/`, `bin/` | Isolated profile state and generated launchers |
+| `terminal-launchers/` | Script-based terminal launch entries |
+| `app-data/request-logs.sqlite` | Requests and related traces |
+| `app-data/request-log-bodies/` | Request and response bodies |
+| `app-data/raw-trace-spool/` | Raw trace synchronization staging |
+| `app-data/usage.sqlite` | Overview usage records |
+| `app-data/context-archive.sqlite` | Context archive |
+
+Logs and observability share request data. Overview usage has separate storage and reset behavior. Request retention does not make the entire application data directory disposable.
+
+## Local-session collection boundary
+
+A generic TokenTracker-style local-session collector is not currently implemented. Gateway statistics do not cover every local agent conversation.
+
+A collector would belong in core, with explicit source identity, event deduplication, scan cursors, and reset semantics. Default agent homes and isolated profile directories both matter. Chart components should consume query results instead of scanning files; Electron IPC and Web endpoints should expose the same query contract.
+
+One request can appear in both a session log and a gateway record. Adding the two datasets directly would double-count it. Input, cache, output, reasoning, and cumulative counters also need normalization per source before aggregation.
+
+## Validation and documentation
+
+Use `npm run typecheck`, `npm run test:core`, `npm run test:ui`, `npm run test:electron`, and `npm run test:architecture` for their respective layers. Build documentation with `npm run build --prefix docs`.
+
+`build/build.mjs` and `electron-builder.json` control desktop packaging. `build/verify-release-version.mjs` checks release versions. Register documentation navigation in `docs/src/docs-structure.ts`; documentation changes on `main` deploy through the Docs workflow without a desktop release.

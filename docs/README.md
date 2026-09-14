@@ -27,6 +27,8 @@ Frontmatter provides the title, eyebrow, and lead. Headings form the table of co
 
 ## 中文指南
 
+- [代码地图](src/content/docs/zh/guides/code-map.md)
+
 - [安装与更新](src/content/docs/zh/guides/install.md)
 - [CLI 命令](src/content/docs/zh/guides/cli.md)
 - [供应商配置](src/content/docs/zh/configuration/providers.md)
@@ -35,6 +37,8 @@ Frontmatter provides the title, eyebrow, and lead. Headings form the table of co
 - [数据目录](src/content/docs/zh/configuration/configuration-file.md)
 
 ## English guides
+
+- [Code map](src/content/docs/en/guides/code-map.md)
 
 - [Installation and updates](src/content/docs/en/guides/install.md)
 - [CLI reference](src/content/docs/en/guides/cli.md)
