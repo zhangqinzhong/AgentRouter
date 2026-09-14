@@ -1,12 +1,12 @@
 import { profileTerminalLaunch } from "@agentrouter/core/profiles/terminal-launch";
 import { syncProfileAliases } from "@agentrouter/core/profiles/aliases";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { assertAvailableGatewayModels, type AppConfig, type ProfileConfig, type ProfileOpenCommandResult, type ProfileOpenRequest, type ProfileOpenResult, type ProfileRuntimeEntry, type ProfileRuntimeStatus, type ProfileStopResult } from "@agentrouter/core/contracts/app";
 import { botGatewayProfileEnv } from "@agentrouter/core/agents/bot-gateway/env";
-import { applyClaudeAppGatewayConfig, readClaudeAppGatewayApiKeyCandidates } from "@agentrouter/core/agents/claude-app/gateway-service";
+import { applyClaudeAppGatewayConfig } from "@agentrouter/core/agents/claude-app/gateway-service";
 import { launchClaudeAppProfile, resolveClaudeAppProfileUserDataDir } from "@agentrouter/core/agents/claude-app/launch";
 import { resolveClaudeCodeGatewayAuthMode } from "@agentrouter/core/agents/claude-code/auth-mode";
 import { claudeCodeUtcTimezoneEnvOverride } from "@agentrouter/core/agents/claude-code/environment";
@@ -23,7 +23,6 @@ import { mediaToolsGatewayEndpoint } from "@agentrouter/core/mcp/grok-media-conf
 import { buildProfileLaunchPlan, findProfileForOpen, profileLaunchSpawnCommand, profileOpenCommand, profileOpenSurfaces, resolveClaudeCodeSettingsFile, resolveProfileOpenSurface } from "@agentrouter/core/profiles/launch-core";
 import { profileApiKeyId } from "@agentrouter/core/profiles/api-key";
 import { applyProfileConfig, cleanupGeneratedBinBackups } from "@agentrouter/core/profiles/service";
-import { adoptLegacyArtifacts } from "@agentrouter/core/profiles/legacy-artifacts";
 import { isDesktopAppRuntime } from "@agentrouter/core/runtime/desktop-app";
 import { windowsEnvironmentChangedPowerShellLines, windowsSystemCommand } from "@agentrouter/core/platform/windows-system";
 
@@ -481,7 +480,8 @@ async function ensureGatewayConfigRunning(
     throw new ProfileGatewayUnavailableError(`AgentRouter gateway is not running at ${profileGatewayEndpoint(config)}. Start AgentRouter Desktop or run agentrouter start before opening ${appName}.`);
   }
 
-  const startedStatus = await gatewayService.start(config);
+  // Client credentials are scoped, but the shared listener serves all profiles.
+  const startedStatus = await gatewayService.start(candidateConfig);
   if (startedStatus.state === "running") {
     return { config };
   }
@@ -653,12 +653,8 @@ function existingGatewayApiKeyCandidates(
   candidateConfig: AppConfig
 ): Array<string | undefined> {
   const values = [
-    config.APIKEY,
-    ...(Array.isArray(config.APIKEYS) ? config.APIKEYS.map((apiKey) => apiKey.key) : []),
-    candidateConfig.APIKEY,
-    ...(Array.isArray(candidateConfig.APIKEYS) ? candidateConfig.APIKEYS.map((apiKey) => apiKey.key) : []),
-    ...readClaudeAppGatewayApiKeyCandidates(),
-    ...readClaudeCodeProfileTokenCandidates(profile)
+    config.APIKEYS?.find((key) => key.id === profileApiKeyId(profile))?.key,
+    candidateConfig.APIKEYS?.find((key) => key.id === profileApiKeyId(profile))?.key
   ];
   const seen = new Set<string>();
   const result: string[] = [];
@@ -671,111 +667,6 @@ function existingGatewayApiKeyCandidates(
     result.push(key);
   }
   return result.length > 0 ? result : [undefined];
-}
-
-function readClaudeCodeProfileTokenCandidates(profile: ReturnType<typeof findProfileForOpen>): string[] {
-  return uniqueStrings([
-    ...readClaudeCodeWifTokenCandidates(profile),
-    ...readClaudeCodeLegacyApiKeyHelperCandidates(profile)
-  ]);
-}
-
-function readClaudeCodeWifTokenCandidates(profile: ReturnType<typeof findProfileForOpen>): string[] {
-  const file = path.join(CONFIGDIR, "bin", claudeCodeWifIdentityTokenFilename(profile));
-  const files = [
-    file,
-    ...readBackupFiles(file)
-  ];
-  return uniqueStrings(files.map(readFirstLineToken));
-}
-
-function claudeCodeWifIdentityTokenFilename(profile: ReturnType<typeof findProfileForOpen>): string {
-  const slug = sanitizeProfilePathSegment(profile.id || profile.name || profile.agent) || "claude-code";
-  return process.platform === "win32"
-    ? `ar-claude-code-wif-token-${slug}.txt`
-    : `ar-claude-code-wif-token-${slug}`;
-}
-
-function readClaudeCodeLegacyApiKeyHelperCandidates(profile: ReturnType<typeof findProfileForOpen>): string[] {
-  const file = path.join(CONFIGDIR, "bin", claudeCodeLegacyApiKeyHelperFilename(profile));
-  const files = [
-    file,
-    ...readBackupFiles(file)
-  ];
-  return uniqueStrings(files.map(readClaudeCodeLegacyApiKeyHelperToken));
-}
-
-function claudeCodeLegacyApiKeyHelperFilename(profile: ReturnType<typeof findProfileForOpen>): string {
-  const slug = sanitizeProfilePathSegment(profile.id || profile.name || profile.agent) || "claude-code";
-  return process.platform === "win32"
-    ? `ar-claude-code-api-key-${slug}.cmd`
-    : `ar-claude-code-api-key-${slug}`;
-}
-
-function readBackupFiles(file: string): string[] {
-  const dir = path.dirname(file);
-  adoptLegacyArtifacts(file);
-  const basename = path.basename(file);
-  try {
-    return readdirSync(dir)
-      .filter((entry) => entry.startsWith(`${basename}.ar-backup-`))
-      .sort()
-      .reverse()
-      .map((entry) => path.join(dir, entry));
-  } catch {
-    return [];
-  }
-}
-
-function readFirstLineToken(file: string): string {
-  if (!existsSync(file)) {
-    return "";
-  }
-  try {
-    return readFileSync(file, "utf8")
-      .split(/\r?\n/g)
-      .map((line) => line.trim())
-      .find(Boolean) || "";
-  } catch {
-    return "";
-  }
-}
-
-function readClaudeCodeLegacyApiKeyHelperToken(file: string): string {
-  if (!existsSync(file)) {
-    return "";
-  }
-  try {
-    const content = readFileSync(file, "utf8");
-    for (const line of content.split(/\r?\n/g)) {
-      const token = parseClaudeCodeApiKeyHelperLine(line);
-      if (token) {
-        return token;
-      }
-    }
-  } catch {
-    return "";
-  }
-  return "";
-}
-
-function parseClaudeCodeApiKeyHelperLine(line: string): string {
-  const trimmed = line.trim();
-  const shellPrefix = "printf '%s\\n' ";
-  if (trimmed.startsWith(shellPrefix)) {
-    return unquoteShellValue(trimmed.slice(shellPrefix.length).trim());
-  }
-  if (/^echo\s+/i.test(trimmed)) {
-    return trimmed.replace(/^echo\s+/i, "").trim().replace(/^"|"$/g, "");
-  }
-  return "";
-}
-
-function unquoteShellValue(value: string): string {
-  if (value.startsWith("'") && value.endsWith("'")) {
-    return value.slice(1, -1).replace(/'\\''/g, "'");
-  }
-  return value.replace(/^"|"$/g, "");
 }
 
 function existingGatewayConflictMessage(probe: ExistingProfileGatewayProbe, appName: string): string {
@@ -830,6 +721,7 @@ function profileGatewayConfigWithToken(config: AppConfig, profile: ReturnType<ty
     ...config,
     APIKEY: token,
     APIKEYS: [
+      ...config.APIKEYS.filter((key) => key.id !== profileApiKeyId(profile)),
       {
         createdAt: new Date().toISOString(),
         id: profileApiKeyId(profile),
@@ -2207,9 +2099,5 @@ function stringRecord(value: Record<string, string> | undefined): Record<string,
 function findProfileApiKey(config: AppConfig, profile: ReturnType<typeof findProfileForOpen>): string {
   const keyId = profileApiKeyId(profile);
   const key = config.APIKEYS.find((apiKey) => apiKey.id === keyId)?.key.trim();
-  return key || config.APIKEYS.find((apiKey) => apiKey.key.trim())?.key.trim() || config.APIKEY.trim();
-}
-
-function sanitizeProfilePathSegment(value: string): string {
-  return value.trim().replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
+  return key || "";
 }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { CLAUDE_CODE_AUTH_MODE_ENV } from "@agentrouter/core/agents/claude-code/auth-mode.ts";
 import { createDefaultAppConfig } from "@agentrouter/core/config/default-config.ts";
+import { gatewayService } from "@agentrouter/core/gateway/service.ts";
 import { ensureProfileGateway } from "@agentrouter/core/profiles/launch-service.ts";
 
 function claudeProfileConfig(authMode = "api-key-helper") {
@@ -217,4 +218,52 @@ test("unavailable profile gateway reports the probe failure reason", async () =>
   } finally {
     globalThis.fetch = previousFetch;
   }
+});
+
+test("profile gateway never borrows another profile key after authentication fails", async () => {
+  const previousFetch = globalThis.fetch;
+  const keys = [];
+  const { config, profile } = claudeProfileConfig();
+  config.APIKEYS.push({ id: "profile:codex", key: "codex-token", createdAt: "2026-01-01" });
+  globalThis.fetch = async (input, init = {}) => {
+    if (new URL(String(input)).pathname === "/health") return Response.json({ status: "running", core: "http://127.0.0.1:3467", timestamp: "2026-01-01T00:00:00Z" });
+    const key = new Headers(init.headers).get("authorization");
+    keys.push(key);
+    return key === "Bearer codex-token" ? Response.json({ data: [] }) : Response.json({ error: { message: "Invalid key" } }, { status: 401 });
+  };
+  try {
+    await assert.rejects(ensureProfileGateway(config, profile, "Claude", { reuseExisting: true, startIfMissing: false }), /does not accept the API key/);
+    assert.deepEqual(keys, ["Bearer profile-token"]);
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+test("profile launch retains other profiles in its configuration", async () => {
+  const previousFetch = globalThis.fetch;
+  const { config, profile } = claudeProfileConfig();
+  config.APIKEYS.push({ id: "profile:codex", key: "codex-token", createdAt: "2026-01-01" });
+  globalThis.fetch = async (input) => new URL(String(input)).pathname === "/health"
+    ? Response.json({ status: "running", core: "http://127.0.0.1:3467", timestamp: "2026-01-01T00:00:00Z" }) : Response.json({ data: [] });
+  try {
+    const result = await ensureProfileGateway(config, profile, "Claude", { reuseExisting: true, startIfMissing: false });
+    assert.equal(result.APIKEY, "profile-token");
+    assert.equal(result.APIKEYS.find((key) => key.id === "profile:codex").key, "codex-token");
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+
+test("starting a profile uses the complete shared gateway authentication config", async () => {
+  const previousStart = gatewayService.start;
+  const { config, profile } = claudeProfileConfig();
+  config.APIKEY = "admin-token";
+  config.APIKEYS.unshift({ id: "local-gateway", key: "admin-token", createdAt: "2026-01-01" });
+  config.APIKEYS.push({ id: "profile:codex", key: "codex-token", createdAt: "2026-01-01" });
+  let started;
+  gatewayService.start = async (value) => { started = value; return { state: "running" }; };
+  try {
+    const result = await ensureProfileGateway(config, profile, "Claude");
+    assert.equal(started, config);
+    assert.equal(started.APIKEY, "admin-token");
+    assert.equal(started.APIKEYS.length, 3);
+    assert.equal(result.APIKEY, "profile-token");
+  } finally { gatewayService.start = previousStart; }
 });
