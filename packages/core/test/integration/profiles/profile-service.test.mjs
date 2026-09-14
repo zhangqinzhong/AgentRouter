@@ -1029,10 +1029,11 @@ test("profile service injects ToolHub MCP into Codex config", { skip: !process.e
   ];
 
   const result = await applyProfileFixture(config);
-  assert.equal(result.clients.length, 1);
-  assert.equal(result.clients[0].ok, true);
-
   const configFile = path.join(CONFIGDIR, "profiles", profileId, "codex", "config.toml");
+  // Applying a profile can also report cleanup of other inactive global configs.
+  const applied = result.clients.filter((client) => client.client === "codex" && client.path === configFile);
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].ok, true);
   const content = readFileSync(configFile, "utf8");
   assert.match(content, /# BEGIN AgentRouter managed ToolHub MCP/);
   assert.match(content, /# AgentRouter configured model = "Provider\/model"/);

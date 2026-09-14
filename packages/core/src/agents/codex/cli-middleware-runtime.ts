@@ -4817,6 +4817,10 @@ function configRequirementsRead(existingResult) {
   const requirements = result.requirements && typeof result.requirements === "object" && !Array.isArray(result.requirements)
     ? { ...result.requirements }
     : {};
+  // A null requirements response means no application restrictions. Once the
+  // Fast Mode shim materializes that object, newer desktop clients require
+  // application to remain explicit; never replace an upstream network policy.
+  if (result.requirements === null) requirements.application = null;
   const featureRequirements = requirements.featureRequirements && typeof requirements.featureRequirements === "object" && !Array.isArray(requirements.featureRequirements)
     ? { ...requirements.featureRequirements }
     : {};

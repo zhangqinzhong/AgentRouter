@@ -452,7 +452,7 @@ test("Codex app-server merges AgentRouter Fast Mode catalog metadata without spo
     "  const request = JSON.parse(line);",
     "  let result = {};",
     "  if (request.method === 'model/list') result = { data: [{ id: 'native-model', hidden: true }], nextCursor: null };",
-    "  else if (request.method === 'configRequirements/read') result = { requirements: { featureRequirements: { fast_mode: false, other_feature: false } } };",
+    "  else if (request.method === 'configRequirements/read') result = request.id === 5 ? { requirements: null } : { requirements: { application: { network: { enabled: true, domains: { 'example.test': 'allow' } } }, featureRequirements: { fast_mode: false, other_feature: false } } };",
     "  process.stdout.write(JSON.stringify({ id: request.id, result }) + '\\n');",
     "});",
     ""
@@ -480,6 +480,7 @@ test("Codex app-server merges AgentRouter Fast Mode catalog metadata without spo
       JSON.stringify({ id: 2, method: "getAuthStatus", params: { includeToken: true } }),
       JSON.stringify({ id: 3, method: "account/read", params: {} }),
       JSON.stringify({ id: 4, method: "configRequirements/read", params: {} }),
+      JSON.stringify({ id: 5, method: "configRequirements/read", params: {} }),
       ""
     ].join("\n")
   });
@@ -503,6 +504,11 @@ test("Codex app-server merges AgentRouter Fast Mode catalog metadata without spo
     account: { type: "amazonBedrock", credentialSource: "codexManaged" },
     requiresOpenaiAuth: false
   });
+  assert.deepEqual(responses.get(4).result.requirements.application, {
+    network: { enabled: true, domains: { "example.test": "allow" } }
+  });
+  assert.equal(responses.get(5).result.requirements.application, null);
+  assert.equal(responses.get(5).result.requirements.featureRequirements.fast_mode, true);
   assert.deepEqual(responses.get(4).result.requirements.featureRequirements, {
     fast_mode: true,
     other_feature: false
