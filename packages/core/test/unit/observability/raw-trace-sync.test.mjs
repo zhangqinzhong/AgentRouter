@@ -7,6 +7,7 @@ import test from "node:test";
 import { createDefaultAppConfig } from "@agentrouter/core/config/default-config.ts";
 import { rawTraceSyncHeader } from "@agentrouter/core/gateway/internal/shared.ts";
 import { rawTraceHardMaxBodyBytes, rawTraceMaxPartBytes } from "@agentrouter/core/observability/request-log-limits.ts";
+import { usageStore } from "@agentrouter/core/usage/store.ts";
 import {
   applyRawTraceRequestLogPolicy,
   buildRawTraceConfig,
@@ -39,10 +40,58 @@ test("raw trace uses the managed runtime outcome when response metadata omits st
     });
     await waitFor(() => update !== undefined);
     assert.equal(update.statusCode, 200);
-    assert.equal(update.requestId, "logical-request");
+    assert.equal(update.requestId, "core-request");
   } finally {
     await synchronizer.stop();
     rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("standalone requests in one Codex conversation retain distinct log and usage identities", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-codex-request-identity-"));
+  const estimateCost = usageStore.estimateCost;
+  usageStore.estimateCost = async () => undefined;
+  const updates = [];
+  const synchronizer = new RawTraceSynchronizer({
+    allowStandaloneRequestLogs: () => true,
+    enqueueUpdate: (input, files) => {
+      updates.push(input);
+      rmSync(files.cleanupDirectory, { recursive: true, force: true });
+      return { accepted: true, degraded: false };
+    },
+    getConfig: createConfig,
+    spoolDirectory: dir
+  });
+  try {
+    for (const id of ["codex-http-1", "codex-http-2", "codex-http-3"]) {
+      const bundleDir = path.join(dir, id);
+      mkdirSync(bundleDir);
+      const metadata = path.join(bundleDir, "response.json");
+      const requestMetadata = path.join(bundleDir, "request.json");
+      const body = path.join(bundleDir, "body.json");
+      writeFileSync(metadata, JSON.stringify({ statusCode: 200, headers: { "content-type": "application/json" } }));
+      writeFileSync(requestMetadata, JSON.stringify({ method: "POST", url: "http://localhost/v1/responses" }));
+      writeFileSync(body, JSON.stringify({ id: `response-${id}`, object: "response", model: "test", output: [], usage: { input_tokens: 11, output_tokens: 5, total_tokens: 16 } }));
+      await sendRawTrace(synchronizer, {
+        requestId: id,
+        turnKey: "same-codex-conversation",
+        parts: [
+          { partType: "upstream_response_metadata", filePath: metadata },
+          { partType: "upstream_request_metadata", filePath: requestMetadata },
+          { partType: "upstream_response", filePath: body, contentType: "application/json" }
+        ]
+      });
+    }
+    await waitFor(() => updates.length === 3);
+    assert.deepEqual(updates.map((value) => value.requestId).sort(), ["codex-http-1", "codex-http-2", "codex-http-3"]);
+    assert.ok(updates.every((value) => value.requestId === value.bundleId));
+    assert.ok(updates.every((value) => value.allowStandaloneRecord === true));
+    for (const update of updates) assert.equal(await usageStore.hasRequestId(update.requestId), true);
+    assert.equal(await usageStore.hasRequestId("same-codex-conversation"), false);
+  } finally {
+    await synchronizer.stop();
+    usageStore.estimateCost = estimateCost;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

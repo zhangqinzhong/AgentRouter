@@ -401,7 +401,10 @@ export class RawTraceSynchronizer {
       if (stored.inspectionError) {
         throw new Error(stored.inspectionError);
       }
-      const bundle = await readRawTraceRequestLogBundle(stored.manifest, this.spoolDirectory());
+      const standaloneRequestLog = this.dependencies.allowStandaloneRequestLogs?.() === true;
+      const bundle = await readRawTraceRequestLogBundle(stored.manifest, this.spoolDirectory(), {
+        standaloneRequest: standaloneRequestLog
+      });
       if (!bundle) {
         await this.deadLetterStoredBundle(stored, "invalid_manifest");
         this.retryStates.delete(stored.bundleId);
@@ -417,7 +420,6 @@ export class RawTraceSynchronizer {
         this.retryStates.delete(stored.bundleId);
         return true;
       }
-      const standaloneRequestLog = this.dependencies.allowStandaloneRequestLogs?.() === true;
       const policy = applyRawTraceRequestLogPolicy(config, {
         ...bundle.update,
         ...(standaloneRequestLog ? { allowStandaloneRecord: true } : {})
@@ -1621,10 +1623,16 @@ function rawTraceDisabledFromEnv(): boolean {
 
 export async function readRawTraceRequestLogBundle(
   manifest: Record<string, unknown>,
-  spoolDirectory = RAW_TRACE_SPOOL_DIR
+  spoolDirectory = RAW_TRACE_SPOOL_DIR,
+  options: { standaloneRequest?: boolean } = {}
 ): Promise<RawTraceRequestLogBundle | undefined> {
-  const requestId = stringValue(manifest.turnKey) || stringValue(manifest.requestId);
   const bundleId = stringValue(manifest.requestId);
+  // In the public runtime turnKey comes from the client's x-client-request-id:
+  // Codex reuses it for an entire conversation. Only the wrapper replaces it
+  // with a per-request ID for correlating fallback attempts.
+  const requestId = options.standaloneRequest
+    ? bundleId
+    : stringValue(manifest.turnKey) || bundleId;
   const parts = Array.isArray(manifest.parts)
     ? manifest.parts.filter((part): part is Record<string, unknown> => isRecord(part))
     : [];
