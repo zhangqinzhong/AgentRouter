@@ -55,7 +55,7 @@ Codex 是 OpenAI 的编码 Agent。AgentRouter 同时支持两种形态：
 
 ## 打开与使用
 
-- **CLI**：在桌面端点击终端按钮，运行复制出的命令：
+- **CLI**：在桌面端点击终端按钮直接启动，或使用旁边的复制按钮复制命令后运行：
   ```text
   agentrouter "Codex - Work"
   ```

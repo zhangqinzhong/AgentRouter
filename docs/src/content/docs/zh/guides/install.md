@@ -20,15 +20,15 @@ lead: 按运行场景在桌面应用、npm CLI 和 Docker 三种发行方式中�
 1. 打开 [AgentRouter Releases](https://github.com/zhangqinzhong/AgentRouter/releases/latest)。
 2. macOS 按芯片选择 Apple Silicon（arm64）或 Intel（x64）的 DMG/ZIP；Windows 选择 EXE，Linux 选择 AppImage。
 3. 安装并打开 **AgentRouter**。
-4. 添加供应商和模型，在 **API 密钥** 中创建客户端 Key，然后从 **服务** 页面点击 **启动**。
+4. 添加供应商和模型，在 **API 密钥** 中创建客户端 Key，然后点击侧边栏的服务按钮启动网关。
 
-页面显示运行中后，模型网关默认监听 `http://127.0.0.1:3466`。需要打开应用时自动启动网关，可在 **服务** 页面开启自动启动。
+页面显示运行中后，模型网关默认监听 `http://127.0.0.1:3466`。可通过侧边栏的服务按钮启动或暂停网关。
 
 ## 桌面版更新
 
 App 已内置本仓库的 Releases 更新源，通过应用内“检查更新”获取新版本，无需设置环境变量。1.1.2 提供 macOS、Windows 和 Linux 安装包。
 
-macOS 包使用本地签名，尚未 Apple 公证，自动安装升级尚未验证；可从 Releases 手动下载替换。旧的 3.0.22 开发版首次切换到 AgentRouter 1.x 时需手动安装。
+macOS 包使用本地签名，尚未 Apple 公证，自动安装升级尚未验证；可从 Releases 手动下载替换。
 
 ## 安装 npm CLI
 
@@ -57,13 +57,13 @@ agentrouter ui
 docker compose up -d --build
 ```
 
-打开 <http://127.0.0.1:3458>。Docker 只发布 Nginx 单入口，管理 UI 和模型网关共用该地址。首次启动后仍需添加供应商 / 模型、创建 AgentRouter 客户端 Key，并从 **服务** 页面启动网关。端口、鉴权、持久化、备份和远程部署见 [Docker 部署](../docker/)。
+打开 <http://127.0.0.1:3458>。Docker 只发布 Nginx 单入口，管理 UI 和模型网关共用该地址。首次启动后仍需添加供应商 / 模型、创建 AgentRouter 客户端 Key，并通过侧边栏的服务按钮启动网关。端口、鉴权、持久化、备份和远程部署见 [Docker 部署](../docker/)。
 
 ## 验证安装
 
 完成供应商、模型和 AgentRouter 客户端 Key 配置后：
 
-1. 在 **服务** 页面确认状态为运行中。
+1. 在侧边栏确认状态为运行中。
 2. 请求当前部署的 `/health`；成功时应返回 `200` 和运行状态。
 3. 用 AgentRouter 客户端 Key 向兼容路径发送一个最小模型请求。
 4. 在 **日志** 页面确认请求模型、最终供应商 / 模型、状态码和耗时。

@@ -116,8 +116,8 @@ const resolvedNavItems = navItems.map((item, index) => {
   };
 });
 const homeHref = withBase(locale === "en" ? "/en/" : "/");
-const faviconHref = withBase("/favicon.svg");
-const logoSrc = withBase("/logo.png");
+const faviconHref = withBase("/agentrouter-favicon.svg");
+const logoSrc = withBase("/agentrouter-mark.png");
 const pageDescription =
   description ??
   (locale === "zh"
@@ -125,7 +125,7 @@ const pageDescription =
     : "AgentRouter (AgentRouter) documentation: installation, configuration, provider setup, and troubleshooting guides.");
 const pageTitle = isHome && docTitle ? String(docTitle) : `${title} | AgentRouter`;
 const canonicalUrl = absoluteHref(currentPath);
-const ogImageUrl = absoluteHref("/logo.png");
+const ogImageUrl = absoluteHref("/agentrouter-mark.png");
 const sitemapUrl = withBase("/sitemap-index.xml");
 const searchIndexUrl = withBase(`/search-index-${locale}.json`);
 const currentYear = new Date().getFullYear();
@@ -170,7 +170,7 @@ const featuredNavLabel = locale === "zh" ? "主要入口" : "Primary navigation"
         }
       })();
     </script>
-    <link rel="icon" href={faviconHref} type="image/png" />
+    <link rel="icon" href={faviconHref} type="image/svg+xml" />
     {
       resolvedLanguageOptions.map((option) => (
         <link
@@ -187,7 +187,7 @@ const featuredNavLabel = locale === "zh" ? "主要入口" : "Primary navigation"
       <header class="topbar" data-topbar>
         <div class="top-left">
           <a class="brand" href={homeHref} aria-label="AgentRouter Docs">
-            <img src={logoSrc} alt="" class="brand-logo" />
+            <span class="brand-logo" aria-hidden="true" style={`--brand-logo: url("${logoSrc}");`}></span>
             <span>AgentRouter docs</span>
           </a>
 

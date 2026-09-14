@@ -22,7 +22,7 @@ In desktop/CLI deployments, management and the model gateway use different ports
 3. Install and open **AgentRouter**.
 4. Add a provider/model, create a client key under **API Keys**, then click **Start** under **Server**.
 
-When Server shows Running, the model gateway defaults to `http://127.0.0.1:3466`. Enable automatic startup under Server if the gateway should start whenever the app opens.
+When the sidebar shows Running, the model gateway defaults to `http://127.0.0.1:3466`. Use the service button in the sidebar to start or pause the gateway.
 
 ## Desktop updates
 

@@ -64,7 +64,7 @@ Claude Code picks a model per tier. The **Model** field sets the default. The op
 
 ## Open and use
 
-- **CLI:** click the terminal button on the desktop profile card and run the copied command:
+- **CLI:** click the terminal button to launch directly, or use the adjacent copy button and run the command:
   ```text
   agentrouter "Claude Code - Work"
   ```

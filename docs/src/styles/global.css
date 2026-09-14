@@ -324,7 +324,11 @@ pre {
 .brand-logo {
   width: 22px;
   height: 22px;
-  border-radius: 6px;
+  display: inline-block;
+  flex-shrink: 0;
+  background-color: currentColor;
+  -webkit-mask: var(--brand-logo) center / contain no-repeat;
+  mask: var(--brand-logo) center / contain no-repeat;
 }
 
 .top-tabs {

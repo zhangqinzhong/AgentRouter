@@ -55,7 +55,7 @@ Use this page to route Codex to a non-OpenAI provider, pin a model, or run separ
 
 ## Open and use
 
-- **CLI:** click the terminal button in the desktop app and run the copied command:
+- **CLI:** click the terminal button to launch directly, or use the adjacent copy button and run the command:
   ```text
   agentrouter "Codex - Work"
   ```

@@ -11,7 +11,7 @@ lead: "The interactive panel at the top of this page connects to your running Ag
 - During trial, prefer **Only opened from AgentRouter** (the default) so only agents launched from AgentRouter are affected; switch to **System default** once it is stable.
 - Claude Code and Codex let you choose an **Entry mode** (CLI & APP / CLI only / App only); Grok CLI and Kimi CLI are CLI-only, and ZCode and WorkBuddy are App-only.
 - After saving, launch the agent from the buttons on its profile card (the terminal button opens the CLI, the play button opens the app), then verify with one request in **Request logs**.
-- Command names differ by distribution: the desktop app copies `agentrouter ...`; CLI uses `agentrouter ...` with the same profile name and optional `cli` / `app` suffix.
+- Both desktop and CLI use `agentrouter ...`. A configured launch alias can also start the profile directly.
 
 ## Claude Code
 

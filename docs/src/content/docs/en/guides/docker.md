@@ -52,7 +52,7 @@ Complete the first-time configuration in this order:
 
 1. Add a provider and at least one model.
 2. Create an AgentRouter client key on the **API Keys** page.
-3. Start the gateway on the **Server** page.
+3. Start the gateway using the service controls in the sidebar.
 4. Request `/health` and confirm it returns `200` with a running status.
 5. Point the client Base URL at `http://127.0.0.1:3458` and use the AgentRouter client key you just created.
 

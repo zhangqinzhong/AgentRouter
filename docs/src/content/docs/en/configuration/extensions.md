@@ -190,7 +190,7 @@ The recommended flow is through the desktop UI:
 2. Add an extension and choose a local extension directory.
 3. Select the `hello-extension` directory.
 4. Save the config.
-5. Open **Server** and restart the gateway.
+5. Restart the gateway using the service controls in the sidebar.
 
 AgentRouter stores runtime configuration in SQLite. Add extensions through the UI; the legacy JSON config file is kept here only as a reference. The extension entry has this shape:
 

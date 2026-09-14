@@ -14,7 +14,7 @@ lead: Create reusable launch configs for Claude Code, Codex, OpenCode, Grok CLI,
 3. Choose the agent type, name the config, then choose the effect scope and entry mode.
 4. Select a model. The value is usually `Provider name/model name`, and Fusion models can be selected too.
 5. If the entry mode includes App, optionally bind the Bot used by AgentClaw and choose whether to forward agent messages or enable handoff.
-6. Save the config, then open it from the Agent Config card: the terminal button copies the CLI command, and the play button starts the App instance.
+6. Save the config, then open it from the Agent Config card: the terminal button launches the selected terminal, the adjacent copy button copies the CLI command, and the play button starts the App instance.
 
 During trial, prefer **Only opened from AgentRouter** and always open the agent from AgentRouter. That keeps the config limited to AR-launched instances and avoids changing the Claude Code, Codex, Grok CLI, Kimi CLI, ZCode, or WorkBuddy setup you open directly from the system.
 
@@ -84,7 +84,7 @@ With a Bot bound, OpenCode can relay conversations through the selected IM chann
 | Environment variables | Optional advanced overrides; leave empty for normal use. |
 | Bot | Applies only to the ChatGPT app entry. |
 
-After saving, use the terminal button on the desktop config card to copy the Codex CLI command, for example `agentrouter "Codex - Work"`. For CLI, run: `agentrouter "Codex - Work"`. Use the play button to open ChatGPT.
+After saving, use the terminal button to launch Codex CLI, or the adjacent copy button to copy a command such as `agentrouter "Codex - Work"`. Use the play button to open ChatGPT.
 
 ### Grok CLI
 

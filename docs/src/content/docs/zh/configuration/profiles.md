@@ -14,7 +14,7 @@ lead: 为 Claude Code、Codex、OpenCode、Grok CLI、Kimi CLI、ZCode 和 WorkB
 3. 选择 Agent 类型，填写配置名称，并选择作用范围和入口模式。
 4. 选择模型。模型值通常是 `供应商名称/模型名称`，也可以选择 Fusion 模型。
 5. 如果入口模式包含 App，可以绑定 AgentClaw 使用的 Bot，并选择是否转发 Agent 消息或开启接力。
-6. 保存后，从 Agent 配置卡片打开：终端图标会复制 CLI 命令，播放图标会启动 App 实例。
+6. 保存后，从 Agent 配置卡片打开：终端按钮启动所选终端，旁边的复制按钮复制 CLI 命令；播放按钮启动 App 实例。
 
 试用阶段建议选择 **仅从 AgentRouter 打开时生效**，并且总是从 AgentRouter 打开 Agent。这样配置只影响 AgentRouter 启动的实例，不会改掉你系统里原本直接打开的 Claude Code、Codex、Grok CLI、Kimi CLI、ZCode 或 WorkBuddy。
 
@@ -84,7 +84,7 @@ Claude App 和 Claude Code CLI 的模型列表适配方式不同：
 | 环境变量 | 可选高级设置；普通使用保持为空。 |
 | Bot | 只在 ChatGPT App 入口生效。 |
 
-保存后，Codex CLI 在桌面端可用配置卡片里的终端图标复制命令，例如 `agentrouter "Codex - Work"`；CLI请执行：`agentrouter "Codex - Work"`。ChatGPT 使用播放图标打开。
+保存后，点击终端按钮启动 Codex CLI；复制按钮可获取启动命令，例如 `agentrouter "Codex - Work"`。ChatGPT 使用播放按钮打开。
 
 ### Grok CLI
 

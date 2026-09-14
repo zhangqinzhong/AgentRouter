@@ -50,7 +50,7 @@ Use this page to route OpenCode to any AgentRouter provider or Fusion model, or 
 
 ## Open and use
 
-- **CLI:** click the terminal button in the desktop app and run the copied command:
+- **CLI:** click the terminal button to launch directly, or use the adjacent copy button and run the command:
   ```text
   agentrouter "OpenCode - Work"
   ```

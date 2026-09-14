@@ -11,7 +11,7 @@ lead: "页面顶部的交互式面板可直接连到你正在运行的 AgentRout
 - 试用阶段优先选择 **仅从 AgentRouter 打开时生效**（默认），只影响从 AgentRouter 打开的 Agent；确认稳定后再考虑 **系统默认**。
 - Claude Code、Codex 可选择 **入口模式**（CLI 与 APP / 仅 CLI / 仅 App）；Grok CLI、Kimi CLI 固定为仅 CLI，ZCode 和 WorkBuddy 固定为仅 App。
 - 保存后尽量用配置卡片上的按钮启动 Agent（终端按钮打开 CLI，播放按钮打开 App），再发一条请求到 **请求日志** 验证。
-- 命令名按发行版区分：桌面端卡片复制的是 `agentrouter ...`；CLI 使用 `agentrouter ...`，配置名称和可选的 `cli` / `app` 后缀保持一致。
+- 桌面端和 CLI 均使用 `agentrouter ...`；设置启动别名后，也可以直接输入别名启动。
 
 ## Claude Code
 

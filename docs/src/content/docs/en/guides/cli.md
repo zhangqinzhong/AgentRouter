@@ -59,7 +59,7 @@ Then complete the configuration in this order:
 1. Add a provider and at least one model.
 2. Create an AgentRouter client key on the **API Keys** page for gateway access.
 3. Set the default model, routing rules, and fallbacks as needed.
-4. Confirm the gateway is running on the **Server** page.
+4. Confirm the gateway is running using the service controls in the sidebar.
 5. Point the client Base URL at the gateway address shown in the UI.
 
 The management UI defaults to `http://127.0.0.1:3458`; the model gateway defaults to `http://127.0.0.1:3466`. The management token and AgentRouter client keys are two independent credentials: the former protects UI / RPC, the latter authenticates model requests.
@@ -197,7 +197,7 @@ In production, use `agentrouter serve --no-open` and let an external manager han
 
 ### The UI opens, but `/health` or model requests fail
 
-The management service can run without a usable model gateway. Add a provider and model, create an AgentRouter client key, then start or restart the gateway from the **Server** page. Use `agentrouter serve` to see startup errors.
+The management service can run without a usable model gateway. Add a provider and model, create an AgentRouter client key, then start or restart the gateway using the service controls in the sidebar. Use `agentrouter serve` to see startup errors.
 
 ### The management port shifted
 

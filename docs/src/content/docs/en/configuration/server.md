@@ -7,7 +7,7 @@ lead: Configure the AgentRouter gateway host, port, and Proxy mode for MITM inte
 
 ## Management and gateway addresses are separate
 
-The Host/Port fields under **Server** configure the model gateway. The browser management page uses a separate address and port:
+The Host/Port configuration fields configure the model gateway. The browser management page uses a separate address and port:
 
 | Distribution | Management entry | Model gateway |
 | --- | --- | --- |
