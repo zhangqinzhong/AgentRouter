@@ -1,6 +1,6 @@
 {
   "name": "agentrouter-monorepo",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "private": true,
   "license": "MIT",
   "description": "Local AgentRouter gateway with CLI and web management UI.",
@@ -46,7 +46,7 @@
     "bench:claude-compact-real": "node benchmarks/claude-code-real-compact.mjs",
     "docker:build": "docker build -t agentrouter:local .",
     "docker:run": "docker run --rm -p 3458:8080 -v ar-data:/data agentrouter:local",
-    "test": "npm run test:packages && npm run test:architecture",
+    "test": "npm run test:packages && npm run test:architecture && npm run test:gateway-stream",
     "test:packages": "npm run test --workspaces --if-present",
     "test:core": "npm test -w @agentrouter/core",
     "test:ui": "npm test -w @agentrouter/ui",
@@ -61,7 +61,9 @@
     "test:renderer": "npm run test:ui",
     "benchmark:request-logs": "node build/benchmark-request-logs.mjs",
     "typecheck": "tsc --noEmit",
-    "rebuild:sqlite3": "electron-rebuild -f -w better-sqlite3"
+    "rebuild:sqlite3": "electron-rebuild -f -w better-sqlite3",
+    "test:collector": "node --test tests/collector/*.test.cjs",
+    "test:gateway-stream": "node --test tests/gateway-stream/*.test.mjs"
   },
   "dependencies": {
     "@the-next-ai/ai-gateway": "^1.0.21",

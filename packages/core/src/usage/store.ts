@@ -298,6 +298,38 @@ export class UsageStore {
     };
   }
 
+  async getNativeMenuUsage(from: string, to: string, unit: "day" | "hour" | "month" = "day", filter: UsageStatsFilter = {}) {
+    if (![from, to].every((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))) throw new Error("Invalid date range");
+    const since = new Date(`${from}T00:00:00`);
+    const until = new Date(`${to}T00:00:00`); until.setDate(until.getDate() + 1);
+    if (!Number.isFinite(since.getTime()) || !Number.isFinite(until.getTime()) || since >= until) throw new Error("Invalid date range");
+    const database = await this.getDatabase();
+    const query = buildUsageWhereClause(since, filter);
+    query.where += " AND created_at < ?"; query.params.push(until.toISOString());
+    const format = unit === "hour" ? "%Y-%m-%dT%H:00:00" : unit === "month" ? "%Y-%m" : "%Y-%m-%d";
+    const series = queryRows(database, `SELECT strftime('${format}', created_at, 'localtime') AS bucket,
+      SUM(total_tokens) AS total_tokens, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+      SUM(cache_read_tokens) AS cached_input_tokens, SUM(cache_write_tokens) AS cache_creation_input_tokens,
+      SUM(COALESCE(cost_usd, 0)) AS total_cost_usd FROM usage_events WHERE ${query.where} GROUP BY bucket ORDER BY bucket LIMIT 12000`, query.params);
+    const active = queryRows(database, `SELECT COUNT(DISTINCT strftime('%Y-%m-%d', created_at, 'localtime')) AS days FROM usage_events WHERE ${query.where} AND total_tokens > 0`, query.params)[0];
+    return { totals: readUsageTotals(database, query), models: readClientModelRows(database, query), series, activeDays: Number(active?.days) || 0 };
+  }
+
+  async getActivitySeries(days = 182, filter: UsageStatsFilter = {}): Promise<Array<{ bucket: string; totalTokens: number }>> {
+    const count = Math.min(366, Math.max(1, Math.floor(days) || 182));
+    const start = floorDay(new Date());
+    start.setDate(start.getDate() - count + 1);
+    const database = await this.getDatabase();
+    const query = buildUsageWhereClause(start, filter);
+    const rows = queryRows(database, `SELECT strftime('%Y-%m-%d', created_at, 'localtime') AS day, SUM(total_tokens) AS tokens FROM usage_events WHERE ${query.where} GROUP BY day`, query.params);
+    const totals = new Map(rows.map((row) => [String(row.day), Number(row.tokens) || 0]));
+    return Array.from({ length: count }, (_, index) => {
+      const date = new Date(start); date.setDate(start.getDate() + index);
+      const bucket = formatBucketKey(date, "day");
+      return { bucket, totalTokens: totals.get(bucket) ?? 0 };
+    });
+  }
+
   async getTotalsSince(since: Date, filter: UsageStatsFilter | null | undefined = {}, options: UsageStatsQueryOptions | null | undefined = {}): Promise<UsageTotals> {
     const database = await this.getDatabase();
     this.backfillFromRequestLogs(database, since);

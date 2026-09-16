@@ -138,6 +138,8 @@ contextBridge.exposeInMainWorld("agentrouter", {
   getRequestLogBodyChunk: (request: RequestLogBodyChunkRequest) => invoke(IPC_CHANNELS.appGetRequestLogBodyChunk, request) as Promise<RequestLogBodyChunk | undefined>,
   getRequestLogs: (filter?: RequestLogListFilter) => invoke(IPC_CHANNELS.appGetRequestLogs, filter) as Promise<RequestLogPage>,
   getUpdateStatus: () => invoke(IPC_CHANNELS.appGetUpdateStatus) as Promise<AppUpdateStatus>,
+  getLocalUsagePage: (range: import("@agentrouter/core/collector/usage-page").LocalUsageRange) => invoke(IPC_CHANNELS.appGetLocalUsagePage, range) as Promise<import("@agentrouter/core/collector/usage-page").LocalUsagePageData>,
+  getLocalUsageCategories: (range: import("@agentrouter/core/collector/usage-page").LocalUsageCategoryRange) => invoke(IPC_CHANNELS.appGetLocalUsageCategories, range) as Promise<Record<string,unknown>>,
   getUsageStats: (range?: UsageStatsRange, filter?: UsageStatsFilter) => invoke(IPC_CHANNELS.appGetUsageStats, range, filter) as Promise<UsageStatsSnapshot>,
   installProxyCertificate: () => invoke(IPC_CHANNELS.appInstallProxyCertificate) as Promise<ProxyCertificateInstallResult>,
   importLocalAgentProvider: (request: LocalAgentProviderImportRequest) => invoke(IPC_CHANNELS.appImportLocalAgentProvider, request) as Promise<LocalAgentProviderImportResult>,

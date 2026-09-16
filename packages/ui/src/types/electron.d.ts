@@ -126,6 +126,8 @@ declare global {
       getRequestLogBodyChunk: (request: RequestLogBodyChunkRequest) => Promise<RequestLogBodyChunk | undefined>;
       getRequestLogs: (filter?: RequestLogListFilter) => Promise<RequestLogPage>;
       getUpdateStatus: () => Promise<AppUpdateStatus>;
+      getLocalUsagePage: (range: import("@agentrouter/core/collector/usage-page").LocalUsageRange) => Promise<import("@agentrouter/core/collector/usage-page").LocalUsagePageData>;
+      getLocalUsageCategories: (range: import("@agentrouter/core/collector/usage-page").LocalUsageCategoryRange) => Promise<Record<string,unknown>>;
       getUsageStats: (range?: UsageStatsRange, filter?: UsageStatsFilter) => Promise<UsageStatsSnapshot>;
       installProxyCertificate: () => Promise<ProxyCertificateInstallResult>;
       importLocalAgentProvider: (request: LocalAgentProviderImportRequest) => Promise<LocalAgentProviderImportResult>;

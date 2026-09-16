@@ -1,4 +1,7 @@
 @import "tailwindcss";
+@import "../vendor/cc-switch/preflight.css";
+@import "../vendor/cc-switch/routing.css";
+@source "../vendor/tokentracker/**/*.{js,jsx}";
 @source "../pages/**/*.{html,ts,tsx}";
 @source "../components/**/*.{ts,tsx}";
 @source "../lib/**/*.{ts,tsx}";
@@ -6,6 +9,25 @@
 @source "../../../core/src/contracts/**/*.{ts,tsx}";
 
 @theme inline {
+  --color-oai-black: #0a0a0a;
+  --color-oai-white: #fafafa;
+  --color-oai-gray-50: #fafafa;
+  --color-oai-gray-100: #f5f5f5;
+  --color-oai-gray-200: #e5e5e5;
+  --color-oai-gray-300: #d4d4d4;
+  --color-oai-gray-400: #a3a3a3;
+  --color-oai-gray-500: #737373;
+  --color-oai-gray-600: #525252;
+  --color-oai-gray-700: #404040;
+  --color-oai-gray-800: #262626;
+  --color-oai-gray-900: #171717;
+  --color-oai-gray-950: #0a0a0a;
+  --color-oai-brand: #059669;
+  --color-oai-brand-dark: #047857;
+  --color-oai-brand-light: #10b981;
+  --color-oai-brand-500: #10b981;
+  --color-oai-blue: #059669;
+
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -1598,3 +1620,129 @@
     display: none;
   }
 }
+
+.local-usage-page { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif; -webkit-font-smoothing: antialiased; color: #0a0a0a; background: transparent; }
+.dark .local-usage-page { color: #fafafa; background: transparent; }
+
+.rdp-selected { background: #0a0a0a; border-radius: 0; }
+.rdp-selected .rdp-day-btn { color: #fff; background: transparent; }
+.rdp-range-start { border-radius: 8px 0 0 8px; }
+.rdp-range-end { border-radius: 0 8px 8px 0; }
+.rdp-range-start.rdp-range-end { border-radius: 8px; }
+.dark .rdp-selected { background: #fafafa; }
+.dark .rdp-selected .rdp-day-btn { color: #0a0a0a; }
+
+.app-usage-sidebar, .app-usage-surface { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+.app-usage-sidebar { background: rgba(250,252,251,.7); backdrop-filter: blur(28px) saturate(1.12); }
+.app-usage-sidebar nav button { font-size: 14px; }
+.app-usage-surface { background: rgba(255,255,255,.82); }
+.dark .app-usage-sidebar { background: rgba(24,27,25,.72); }
+.dark .app-usage-surface { background: rgba(21,23,22,.88); }
+
+.local-usage-page { --oai-black: #0a0a0a; --oai-blue: #059669; --oai-brand: #059669; }
+.dark .local-usage-page { --oai-black: #fafafa; --oai-blue: #10b981; --oai-brand: #10b981; }
+
+  .cost-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(4px);
+    opacity: 1;
+    transition: opacity 200ms ease-out;
+  }
+
+  .cost-modal-backdrop[data-starting-style],
+  .cost-modal-backdrop[data-ending-style] {
+    opacity: 0;
+  }
+
+  .cost-modal-popup {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+    transition:
+      opacity 220ms cubic-bezier(0.16, 1, 0.3, 1),
+      transform 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .cost-modal-popup[data-starting-style],
+  .cost-modal-popup[data-ending-style] {
+    opacity: 0;
+    transform: scale(0.96) translateY(12px);
+  }
+
+  :root.dark .cost-modal-backdrop {
+    background: rgba(0, 0, 0, 0.6);
+  }
+
+@theme { --text-body-sm: 14px; --text-caption: 12px; --text-label: 11px; }
+body:has(.app-usage-surface) { --app-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif; }
+body:has(.app-usage-surface) #root > div, body:has(.app-usage-surface) .bg-background { background: transparent; }
+.app-usage-sidebar { background: transparent; backdrop-filter: none; }
+.app-usage-sidebar nav button { font-size: 16px; font-weight: 400; height: 40px; border-radius: 10px; }
+.app-usage-sidebar nav button.bg-card { background: rgba(128,128,128,.12); box-shadow: none; }
+.app-usage-surface { margin: 40px 12px 12px 0; border: 1px solid rgba(128,128,128,.17); border-radius: 20px; background: rgba(250,250,250,.94); }
+.dark .app-usage-sidebar { background: transparent; }
+.dark .app-usage-surface { background: rgba(20,20,20,.94); }
+.cost-modal-popup { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif; -webkit-font-smoothing: antialiased; }
+
+/* Resolve system PingFang by PostScript name: Chromium family fallback can
+   select installed ExtraLight variants even for a regular font weight. */
+@font-face { font-family: "AR System Chinese"; src: local("PingFangSC-Regular"); font-style: normal; font-weight: 400; font-display: swap; }
+@font-face { font-family: "AR System Chinese"; src: local("PingFangSC-Medium"); font-style: normal; font-weight: 500; font-display: swap; }
+@font-face { font-family: "AR System Chinese"; src: local("PingFangSC-Semibold"); font-style: normal; font-weight: 600 900; font-display: swap; }
+body:has(.app-usage-surface), .local-usage-page, .app-usage-sidebar, .app-usage-surface, .cost-modal-popup {
+  --app-font-sans: -apple-system, BlinkMacSystemFont, "AR System Chinese", "Segoe UI", sans-serif;
+  font-family: var(--app-font-sans);
+}
+.app-usage-sidebar nav button { color: #525252; font-size: 13px; font-weight: 400; }
+.app-usage-sidebar nav button.bg-card { color: #0a0a0a; font-weight: 500; }
+.app-usage-sidebar { background: rgba(250,250,250,.74); }
+.dark .app-usage-sidebar { background: rgba(28,28,28,.68); }
+.dark .app-usage-sidebar nav button { color: #a3a3a3; }
+.dark .app-usage-sidebar nav button.bg-card { color: #fafafa; }
+
+/* Keep the toolbar in the window chrome; inset only the scrollable page. */
+.app-usage-controls { top: 0; height: 46px; }
+.app-usage-surface, .dark .app-usage-surface { margin: 0; border: 0; border-radius: 0; background: rgba(250,250,250,.74); }
+.app-usage-surface > .app-titlebar { height: 46px; background: transparent; }
+.app-usage-surface > .app-page-content { margin: 0; padding: 0; border: 0; border-radius: 0; background: #fff; }
+.dark .app-usage-surface { background: rgba(28,28,28,.68); }
+.dark .app-usage-surface > .app-page-content { background: #141414; }
+
+.ar-route-toolbar { display:flex; align-items:center; gap:12px; margin-left:8px; }
+.ar-route-toggle-group { display:flex; align-items:center; gap:4px; padding:3px 6px; border-radius:8px; background:rgba(128,128,128,.06); }
+.ar-compact-endpoint { width:24px; height:26px; padding:0; justify-content:center; border:0; box-shadow:none; background:transparent; }
+.app-usage-sidebar .ar-route-toolbar { position:relative; z-index:95; flex-shrink:0; justify-content:space-between; gap:8px; margin:4px 16px 8px; min-height:36px; -webkit-app-region:no-drag; }
+.app-usage-sidebar .ar-route-toolbar * { -webkit-app-region:no-drag; }
+
+@source "../vendor/cc-switch/**/*.{ts,tsx}";
+.status-heartbeat {
+  opacity: 1;
+  transition-property: color, opacity;
+  transition-duration: 150ms, 300ms;
+  transition-timing-function: ease, ease-out;
+}
+
+html[data-window-active="true"][data-status-heartbeat="true"]
+  .status-heartbeat {
+  opacity: 0.5;
+}
+
+html[data-window-active="false"] .status-heartbeat {
+  opacity: 1;
+  transition-duration: 0s;
+}
+
+
+@media(prefers-reduced-motion:reduce) {.status-heartbeat,html[data-window-active="true"][data-status-heartbeat="true"] .status-heartbeat {opacity:1;transition-property:color;} }
+
+.cc-routing-scope { --muted:240 4.8% 95.9%; --muted-foreground:240 3.8% 46.1%; --ring:210 100% 56%; --background:0 0% 100%; font-family:-apple-system,BlinkMacSystemFont,"AR System Chinese","Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif; }
+.dark .cc-routing-scope { --muted:240 5% 18%; --muted-foreground:240 5% 64.9%; }
+.cc-routing-scope [data-state] { translate:none !important; }
+.app-usage-sidebar .ar-route-toolbar { justify-content:flex-start; gap:8px; margin:4px 12px 8px; }
+
+
+.local-usage-page { max-width: none; padding-top: 64px; }
+
+.app-usage-surface > .app-page-content:not([data-view="usage"]) { padding:64px 20px 20px; }

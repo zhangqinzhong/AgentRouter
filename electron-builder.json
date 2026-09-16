@@ -45,7 +45,9 @@
     "!node_modules/better-sqlite3/README.md",
     "!node_modules/better-sqlite3/docs/**",
     "!node_modules/better-sqlite3/benchmark/**",
-    "!node_modules/better-sqlite3/test/**"
+    "!node_modules/better-sqlite3/test/**",
+    "!dist/widgets/**",
+    "!dist/native-icon/**"
   ],
   "mac": {
     "icon": "build/icon.icns",
@@ -59,7 +61,32 @@
       "dmg",
       "zip"
     ],
-    "artifactName": "AgentRouter_${version}.${ext}"
+    "artifactName": "AgentRouter_${version}.${ext}",
+    "extraResources": [
+      {
+        "from": "packages/electron/dist/main/native",
+        "to": "native"
+      },
+      {
+        "from": "packages/electron/dist/native-icon",
+        "to": ".",
+        "filter": [
+          "Assets.car",
+          "AgentRouter.icns"
+        ]
+      }
+    ],
+    "sign": "build/sign-mac.cjs",
+    "extraFiles": [
+      {
+        "from": "packages/electron/dist/widgets/AgentRouterWidget.appex",
+        "to": "PlugIns/AgentRouterWidget.appex"
+      }
+    ],
+    "extendInfo": {
+      "CFBundleIconName": "AgentRouter",
+      "CFBundleIconFile": "AgentRouter"
+    }
   },
   "afterSign": "build/verify-macos-notarization.cjs",
   "win": {
@@ -92,7 +119,7 @@
     "runAfterFinish": true,
     "shortcutName": "AgentRouter"
   },
-  "copyright": "Copyright © 2026 zhangqinzhong",
+  "copyright": "Copyright \u00a9 2026 zhangqinzhong",
   "extraResources": [
     {
       "from": "LICENSE",

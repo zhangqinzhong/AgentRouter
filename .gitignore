@@ -24,3 +24,10 @@ output/
 
 # npm pack output
 *.tgz
+
+# Native Swift menu bar build products
+native/**/.build/
+
+# Generated WidgetKit Xcode project
+native/AgentRouterWidget/.generated/
+native/AgentRouterWidget/*.xcodeproj/

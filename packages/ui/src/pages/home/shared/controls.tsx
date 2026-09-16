@@ -1,7 +1,10 @@
+import {ProxyToggle} from "@/vendor/cc-switch/ProxyToggle";
 import { useEffect, useRef, useState } from "react";
 import { MorphIcon } from "@/vendor/lucide-morph";
 import { AnimatePresence } from "motion/react";
 import {
+  Radio,
+  Loader2,
   Check,
   Copy,
   Plus,
@@ -383,11 +386,17 @@ export function ServiceControlButton({
 export function EndpointTitleBar({
   config,
   endpoint,
-  gatewayStatus
+  gatewayStatus,
+  compact = false,
+  busy = false,
+  onToggle
 }: {
   config: AppConfig;
   endpoint: string;
   gatewayStatus: GatewayStatus;
+  compact?: boolean;
+  busy?: boolean;
+  onToggle?: ()=>void;
 }) {
   const t = useAppText();
   const [open, setOpen] = useState(false);
@@ -445,22 +454,25 @@ export function EndpointTitleBar({
 
   return (
     <div
-      className="app-no-drag fixed left-1/2 top-2 z-50 w-[min(560px,56vw,calc(100%_-_48px))] min-w-[220px] -translate-x-1/2 max-[720px]:static max-[720px]:w-full max-[720px]:min-w-0 max-[720px]:translate-x-0"
+      className={compact ? "app-no-drag relative shrink-0" : "app-no-drag fixed left-1/2 top-2 z-50 w-[min(560px,56vw,calc(100%_-_48px))] min-w-[220px] -translate-x-1/2 max-[720px]:static max-[720px]:w-full max-[720px]:min-w-0 max-[720px]:translate-x-0"}
       ref={rootRef}
       title={`${t("Endpoint")} ${value} - ${statusLabel}`}
     >
-      <Button
+      {compact && onToggle ? <ProxyToggle active={running} pending={busy} onToggle={onToggle} onInfo={()=>setOpen(v=>!v)} label={running?t("Pause service"):t("Start service")}/> : <Button
+        aria-label={t("Endpoint information")}
         aria-controls="endpoint-info-panel"
         aria-expanded={open}
         aria-haspopup="dialog"
         className={cn(
           "flex h-8 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-card px-3 text-left shadow-sm outline-none transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/25",
-          open && "border-ring/35 bg-muted/40"
+          open && "border-ring/35 bg-muted/40",
+          compact && "ar-compact-endpoint"
         )}
         onClick={() => setOpen((current) => !current)}
         type="button"
         unstyled
       >
+        {compact ? busy ? <Loader2 size={16} className="animate-spin text-muted-foreground"/> : <Radio size={16} className={running ? "status-heartbeat text-emerald-500" : "text-muted-foreground"}/> : <>
         <span
           aria-hidden="true"
           className={cn(
@@ -472,11 +484,12 @@ export function EndpointTitleBar({
         <span className="h-3 w-px shrink-0 bg-border" />
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">{value}</span>
         <span className="sr-only">{t("Service status")}: {statusLabel}</span>
-      </Button>
+        </>}
+      </Button>}
 
       <AnimatePresence initial={false}>
         {open ? (
-          <AnimatedPopover className="absolute left-1/2 top-full z-50 mt-2 w-[340px] max-w-[calc(100vw-24px)] -translate-x-1/2">
+          <AnimatedPopover className={cn("absolute top-full z-50 mt-2 w-[340px] max-w-[calc(100vw-24px)]", compact ? "!fixed !left-4" : "left-1/2 -translate-x-1/2")} style={compact ? {top:(rootRef.current?.getBoundingClientRect().bottom??100)+8} : undefined}>
             <PopoverContent
               aria-label={t("Endpoint information")}
               className="p-3"

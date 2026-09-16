@@ -1,3 +1,4 @@
+import {gatewayResponsesErrorsPlugin} from "./patches/gateway-responses-errors.mjs";
 import esbuild from "esbuild";
 import { spawn } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -322,6 +323,7 @@ export function createMainBuildOptions({ mode = "production", plugins = [] } = {
       path.join(coreSourceRoot, "mcp", "media-tools-proxy-mcp.ts"),
       path.join(coreSourceRoot, "mcp", "toolhub-mcp.ts"),
       path.join(coreSourceRoot, "observability", "request-log-worker.ts"),
+      path.join(coreSourceRoot, "collector", "local-collector-worker.ts"),
       path.join(coreSourceRoot, "routing", "route-script-worker.ts"),
       localAgentAuthProviderHookInput,
       routerPluginInput,
@@ -337,7 +339,7 @@ export function createMainBuildOptions({ mode = "production", plugins = [] } = {
     minify: mode === "production",
     outdir: electronMainOutDir,
     platform: "node",
-    plugins: [packageAliasPlugin(), ...plugins],
+    plugins: [gatewayResponsesErrorsPlugin(gatewayPackageRoot), packageAliasPlugin(), ...plugins],
     sourcemap: mode !== "production",
     target: "node22"
   };
@@ -357,6 +359,7 @@ export function createCliBuildOptions({ mode = "production", plugins = [] } = {}
       path.join(coreSourceRoot, "mcp", "media-tools-proxy-mcp.ts"),
       path.join(coreSourceRoot, "mcp", "toolhub-mcp.ts"),
       path.join(coreSourceRoot, "observability", "request-log-worker.ts"),
+      path.join(coreSourceRoot, "collector", "local-collector-worker.ts"),
       path.join(coreSourceRoot, "routing", "route-script-worker.ts"),
       localAgentAuthProviderHookInput,
       routerPluginInput,
@@ -369,7 +372,7 @@ export function createCliBuildOptions({ mode = "production", plugins = [] } = {}
     minify: mode === "production",
     outdir: cliMainOutDir,
     platform: "node",
-    plugins: [forbidCliElectronPlugin(), packageAliasPlugin(), ...plugins],
+    plugins: [gatewayResponsesErrorsPlugin(gatewayPackageRoot), forbidCliElectronPlugin(), packageAliasPlugin(), ...plugins],
     sourcemap: mode !== "production",
     target: "node22"
   };
@@ -389,6 +392,7 @@ export function createCoreServerBuildOptions({ mode = "production", plugins = []
       path.join(coreSourceRoot, "mcp", "media-tools-proxy-mcp.ts"),
       path.join(coreSourceRoot, "mcp", "toolhub-mcp.ts"),
       path.join(coreSourceRoot, "observability", "request-log-worker.ts"),
+      path.join(coreSourceRoot, "collector", "local-collector-worker.ts"),
       path.join(coreSourceRoot, "routing", "route-script-worker.ts"),
       localAgentAuthProviderHookInput,
       routerPluginInput,
@@ -401,7 +405,7 @@ export function createCoreServerBuildOptions({ mode = "production", plugins = []
     minify: mode === "production",
     outdir: coreMainOutDir,
     platform: "node",
-    plugins: [forbidCliElectronPlugin(), packageAliasPlugin(), ...plugins],
+    plugins: [gatewayResponsesErrorsPlugin(gatewayPackageRoot), forbidCliElectronPlugin(), packageAliasPlugin(), ...plugins],
     sourcemap: mode !== "production",
     target: "node22"
   };
@@ -534,6 +538,7 @@ export async function buildMain(options = {}) {
     buildCli(options)
   ]);
   copyCliRuntimeToElectronDist();
+  for (const out of [electronMainOutDir, coreMainOutDir, cliMainOutDir]) cpSync(path.join(coreSourceRoot, "vendor", "tokentracker"), path.join(out, "tokentracker"), {recursive:true});
   validateLightweightMcpBundles(mainBuildResult.metafile);
 }
 

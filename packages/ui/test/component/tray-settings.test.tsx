@@ -16,6 +16,7 @@ function renderSettings(showTokenUsage = false, mac = true, language: "en" | "zh
       onChangeTrayIcon={() => undefined}
       onChangeTrayShowTokenUsage={() => undefined}
       onChangeTrayWidgets={() => undefined}
+      onChangeTrayPetEnabled={() => undefined}
       providerAccountSnapshots={[]}
       trayIconPreference="layered"
       trayShowTokenUsage={showTokenUsage}
@@ -25,28 +26,20 @@ function renderSettings(showTokenUsage = false, mac = true, language: "en" | "zh
   );
 }
 
-test("tray settings show only the AgentRouter icon, and an accessible off switch", () => {
+test("native tray settings expose supported switches without the legacy layout editor", () => {
   const html = renderSettings();
-  assert.match(html, /data-tray-icon="layered"/);
-  assert.match(html, /mask-image:url\(/);
-  assert.match(html, /value="layered"[^>]*selected/);
-  assert.ok(html.includes("AgentRouter"));
-  for (const label of ["Random", "Auralis", "Solara", "Vesper", "Balance progress"]) {
-    assert.ok(!html.includes(label), label);
-  }
+  assert.doesNotMatch(html, /data-tray-icon|TokenTracker|original layout|Tray components/);
   assert.match(html, /aria-label="Show Token usage in the menu bar"/);
-  assert.match(html, /aria-describedby="tray-token-usage-hint"/);
   assert.match(html, /aria-checked="false"/);
-  assert.doesNotMatch(html, /Tray mascot/);
+  assert.ok(html.includes(appCopy.en.settings.trayPetEnabled));
 });
 
-test("tray settings reflect the enabled preference and translated labels", () => {
+test("native tray settings reflect the enabled preference and translated labels", () => {
   const html = renderSettings(true, true, "zh");
   assert.match(html, /aria-checked="true"/);
-  assert.match(html, /托盘图标/);
-  assert.match(html, /AgentRouter/);
   assert.match(html, /菜单栏显示 Token 用量/);
-  assert.match(html, /悬停仍可查看今日用量/);
+  assert.ok(html.includes(appCopy.zh.settings.trayPetEnabled));
+  assert.doesNotMatch(html, /TokenTracker|原版布局|托盘图标/);
 });
 
 test("platforms without tray titles do not show a nonfunctional text toggle", () => {

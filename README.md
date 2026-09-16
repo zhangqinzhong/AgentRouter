@@ -95,3 +95,7 @@ The browser management UI opens at `http://127.0.0.1:3458`. The CLI package is n
 ## License and acknowledgments
 
 [MIT](LICENSE). AgentRouter is based on [Claude Code Router](https://github.com/musistudio/claude-code-router). The upstream copyright and license notices are retained.
+
+### Local session usage
+
+The Usage page reads local agent history, including managed Claude and Codex profiles and local OpenClaw, Grok, Mimo, ZCode and LM Studio stores. It provides date filters, model cost details and nested Claude/Codex/Grok context breakdowns. Context attribution and costs are estimates. Local-session statistics remain separate from gateway request logs.

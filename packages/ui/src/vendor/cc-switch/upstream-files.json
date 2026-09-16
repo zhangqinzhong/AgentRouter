@@ -1,0 +1,8 @@
+{
+  "src/components/proxy/RoutingActivationBrand.tsx": "63e69f6f795fe451c8391f6c57d4db45e8ac10a242bfceecfcc0980af1692e9b",
+  "src/components/proxy/ProxyToggle.tsx": "8f7216a6f5cd11ff2b81f20b754c94188e36acb218b37caa302ee378da1d7235",
+  "src/components/ui/switch.tsx": "57d6948921b018b47ec894b0000290225c2b87f1aeab026e466b55ade3f0966a",
+  "src/lib/windowActivity.ts": "e913c8a6485634ed225b270224073aaa372efb52d2fb1304bfeac2ed237b0097",
+  "src/index.css": "591f512bc5d5214440ed3c460b163bacbb7fe39fae02aefcba5545e7228a5d35",
+  "tailwind.config.cjs": "406a226483f5989456f6c63036e9a44cba3663f7672b3f30e3ccf9f8a506afb5"
+}

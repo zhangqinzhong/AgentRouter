@@ -53,6 +53,10 @@ class DeepLinkService {
   }
 
   handleUrl(url: string): void {
+    if (url === "agentrouter://dashboard" || url === "agentrouter://dashboard/") {
+      void app.whenReady().then(() => windowsManager.showMainWindow());
+      return;
+    }
     let pluginRequest: PluginDeepLinkRequest | undefined;
     try {
       pluginRequest = parsePluginDeepLinkRequest(url);

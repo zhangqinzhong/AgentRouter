@@ -1,7 +1,7 @@
 import { createContext, useContext, useMemo } from "react";
 import { translateErrorMessage } from "@agentrouter/core/contracts/i18n";
 
-type NavigationId = "onboarding" | "overview" | "observability" | "api-keys" | "server" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
+type NavigationId = "onboarding" | "overview" | "usage" | "observability" | "api-keys" | "server" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
 type ResolvedLanguage = "en" | "zh";
 
 export type AppCopy = {
@@ -47,6 +47,7 @@ export type AppCopy = {
     trayBalanceProgressRequired: string;
     trayIcon: string;
     trayIconLayered: string;
+    trayPetEnabled: string;
     trayShowTokenUsage: string;
     trayShowTokenUsageHint: string;
     trayIconProgress: string;
@@ -112,6 +113,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       networking: "Networking",
       observability: "Observability",
       overview: "Overview",
+      usage: "Usage",
       profile: "Agent Profiles",
       providers: "Providers",
       models: "Models",
@@ -160,6 +162,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       trayBalanceProgressRequired: "Choose an account and data to enable balance progress.",
       trayIcon: "Tray icon",
       trayIconLayered: "AgentRouter",
+      trayPetEnabled: "Show interactive companion",
       trayShowTokenUsage: "Show Token usage in the menu bar",
       trayShowTokenUsageHint: "Turn off to show only the icon. Hover to see today's usage.",
       trayIconProgress: "Balance progress",
@@ -741,6 +744,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       networking: "网络",
       observability: "观测",
       overview: "概览",
+      usage: "用量",
       profile: "Agent 配置档案",
       providers: "供应商",
       models: "模型",
@@ -789,6 +793,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       trayBalanceProgressRequired: "请选择账户和数据后启用余额进度条。",
       trayIcon: "托盘图标",
       trayIconLayered: "AgentRouter",
+      trayPetEnabled: "显示互动小宠物",
       trayShowTokenUsage: "菜单栏显示 Token 用量",
       trayShowTokenUsageHint: "关闭后仅显示图标，悬停仍可查看今日用量。",
       trayIconProgress: "余额进度条",
@@ -1527,6 +1532,8 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       "Final attempt": "最终尝试",
       "Next retry wait": "下次重试等待",
       "Retries": "重试次数",
+      "Usage": "用量",
+      "Local usage data is unavailable.": "暂时无法读取本地用量。",
       "Retry": "继续重试",
       "Retry attempts": "重试尝试",
       "Weighted order": "按权重排序",

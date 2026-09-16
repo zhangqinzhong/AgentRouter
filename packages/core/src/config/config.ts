@@ -908,6 +908,7 @@ function pickConfig(value: Partial<AppConfig>): LoadedAppConfig {
     config.trayIcon = trayIcon;
   }
   config.trayShowTokenUsage = value.trayShowTokenUsage === true;
+  config.trayPetEnabled = value.trayPetEnabled !== false;
   const trayBalanceProgress = parseTrayBalanceProgress((value as Record<string, unknown>).trayBalanceProgress);
   if (trayBalanceProgress) {
     config.trayBalanceProgress = trayBalanceProgress;

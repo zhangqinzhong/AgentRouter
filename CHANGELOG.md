@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 - 2026-09-16
+
+- Added a local-session usage page with tool/model filters, cost details and nested context breakdowns.
+- Added native macOS tray, desktop pets, Dynamic Island and WidgetKit integration, with unified application icons.
+- Collect local Claude, Codex, OpenClaw, Grok, Mimo, ZCode, LM Studio, Gemini, OpenCode and Kilo CLI data independently of gateway logs.
+- Recover Codex model attribution from thread settings and unique session/turn evidence, with a guarded rebuild of existing statistics.
+- Correct MCP namespace separators so context tools are grouped under their actual servers.
+- Surface upstream stream failures instead of silently reporting successful completion.
+
 ## 1.1.2 - 2026-09-14
 
 - Moved distribution and automatic update checks to the independent zhangqinzhong/AgentRouter repository.

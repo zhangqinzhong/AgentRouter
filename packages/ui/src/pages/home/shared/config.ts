@@ -71,6 +71,7 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     trayComponentVariants: normalizeTrayComponentVariants(config.trayComponentVariants),
     trayIcon: trayIcon,
     trayShowTokenUsage: config.trayShowTokenUsage === true,
+    trayPetEnabled: config.trayPetEnabled !== false,
     trayProgressTargetTokens: normalizeTrayProgressTargetTokens(config.trayProgressTargetTokens),
     trayWidgets: normalizeTrayWidgets(config.trayWidgets, config.trayWindowModules, config.trayComponentVariants),
     trayWindowModules: normalizeTrayWindowModules(config.trayWindowModules),

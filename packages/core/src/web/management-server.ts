@@ -1,3 +1,4 @@
+import {getLocalUsagePage, getLocalUsageCategories, type LocalUsageCategoryRange, type LocalUsageRange} from "@agentrouter/core/collector/usage-page";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -340,6 +341,8 @@ const rpcHandlers: Record<string, RpcHandler> = {
   getRequestLogBodyChunk: (request) => getRequestLogBodyChunk(request as RequestLogBodyChunkRequest),
   getRequestLogs: (filter) => getRequestLogs(filter as RequestLogListFilter | undefined),
   getUpdateStatus: () => unsupportedUpdateStatus,
+  getLocalUsagePage: (range) => getLocalUsagePage(range as LocalUsageRange),
+  getLocalUsageCategories: (range) => getLocalUsageCategories(range as LocalUsageCategoryRange),
   getUsageStats: (range, filter) => getUsageStats(range as UsageStatsRange | undefined, filter as UsageStatsFilter | undefined),
   importLocalAgentProvider: (request) => importLocalAgentProvider(request as LocalAgentProviderImportRequest),
   installProxyCertificate: () => proxyService.installCertificate(),

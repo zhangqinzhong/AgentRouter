@@ -35,6 +35,17 @@ module.exports = async function verifyPackagedApp(context) {
   const resourcesDir = findResourcesDir(appOutDir, platform);
   assertFile(path.join(resourcesDir, "app.asar"), "Packaged app archive");
   cleanupBetterSqlitePackage(resourcesDir);
+  if (platform === "darwin") {
+    assertFile(path.join(resourcesDir, "Assets.car"), "Native Icon Composer asset catalog");
+    assertFile(path.join(resourcesDir, "AgentRouter.icns"), "Native app icon fallback");
+    const widget = path.join(resourcesDir, "..", "PlugIns", "AgentRouterWidget.appex");
+    assertFile(path.join(widget, "Contents", "Info.plist"), "WidgetKit extension metadata");
+    const binary = path.join(widget, "Contents", "MacOS", "AgentRouterWidget");
+    assertFile(binary, "WidgetKit extension executable");
+    if (arch && !nativeArchMatches(inspectNativeModule(binary), arch)) {
+      throw new Error("WidgetKit extension architecture does not match the app");
+    }
+  }
 
   const nativeModule = path.join(resourcesDir, betterSqliteNativeRelativePath);
   assertFile(nativeModule, "better-sqlite3 native module");

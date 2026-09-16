@@ -1,3 +1,7 @@
+import {RoutingActivationBrand} from "@/vendor/cc-switch/RoutingActivationBrand";
+import {initializeWindowActivity} from "@/vendor/cc-switch/windowActivity";
+import {useEffect} from "react";
+import {LocalUsageView} from "./local-usage";
 import type { ComponentProps } from "react";
 import { MorphIcon } from "@/vendor/lucide-morph";
 import { collapseSidebarToExpandInspectorMorph } from "@/lib/morph-icon";
@@ -5,7 +9,7 @@ import {
   AnimatePresence, AppConfig, AppCopy, Button, Check, CircleAlert, cn, EndpointTitleBar,
   AppUpdateStatus, GatewayStatus, listSpringTransition, LucideIcon, motion, motionEase,
   LoaderCircle, NavigationId, RefreshCw,
-  reducedMotionTransition, ServiceControlButton, Settings, ViewId,
+  reducedMotionTransition, Settings, ViewId,
   useAppText, ViewMotionShell, viewUsesInternalScroll
 } from "../shared/index";
 import { ApiKeysView } from "./api-keys";
@@ -34,7 +38,7 @@ const sidebarNavigationGroupDefinitions: Array<{
   itemIds: NavigationId[];
   label: string;
 }> = [
-  { id: "workspace", itemIds: ["overview"], label: "Workspace" },
+  { id: "workspace", itemIds: ["overview", "usage"], label: "Workspace" },
   { id: "setup", itemIds: ["providers", "profile", "routing"], label: "Setup" },
   { id: "monitor", itemIds: ["logs", "observability"], label: "Monitor" },
   { id: "advanced", itemIds: ["virtual-models", "models", "api-keys", "extensions"], label: "Advanced" }
@@ -96,9 +100,7 @@ export function MainLayout({
   gatewayEndpoint,
   gatewayStartupError,
   gatewayStatus,
-  gatewayTargetActive,
   isMac,
-  needsTrafficLightSafeArea,
   agentAnalysisEnabled,
   networkCaptureEnabled,
   onOpenUpdate,
@@ -141,6 +143,7 @@ export function MainLayout({
   requestLogsEnabled: boolean;
   visibleNavigation: MainNavigationItem[];
 }) {
+  useEffect(()=>initializeWindowActivity(),[]);
   const showUpdateButton = updateStatus.supported;
   const windowControlSafeAreaWidth = showUpdateButton
     ? (isMac ? 188 : 124)
@@ -151,6 +154,7 @@ export function MainLayout({
     <>
       <div className={cn(
         "app-no-drag app-window-controls pointer-events-auto absolute top-2 z-[90] flex items-center",
+        "app-usage-controls",
         isMac ? "left-[84px] gap-0.5" : "left-3 gap-1"
       )}>
         <Button
@@ -173,12 +177,6 @@ export function MainLayout({
             strokeWidth={2}
           />
         </Button>
-        <ServiceControlButton
-          busy={gatewayActionBusy}
-          onClick={toggleGatewayService}
-          state={gatewayStatus.state}
-          targetActive={gatewayTargetActive}
-        />
         {showUpdateButton ? (
           <UpdateEntryButton
             actionBusy={updateActionBusy}
@@ -191,38 +189,46 @@ export function MainLayout({
 
       <motion.aside
         animate={{
-          width: sidebarOpen ? (compactLayout ? "100%" : 248) : 0
+          width: sidebarOpen ? (compactLayout ? "100%" : 280) : 0
         }}
         aria-hidden={!sidebarOpen}
         className={cn(
           "app-sidebar flex min-h-0 shrink-0 flex-col overflow-hidden bg-sidebar/95 max-[720px]:h-auto",
+          "app-usage-sidebar",
           sidebarOpen && compactLayout && "border-b border-border"
         )}
         id="primary-sidebar"
         initial={false}
         style={{ pointerEvents: sidebarOpen ? "auto" : "none" }}
-        transition={shouldReduceMotion ? reducedMotionTransition : { duration: 0.3, ease: motionEase }}
+        transition={shouldReduceMotion ? reducedMotionTransition : { duration: 0.4, ease: motionEase }}
       >
         <AnimatePresence initial={false}>
           {sidebarOpen ? (
             <motion.div
               animate={{ opacity: 1 }}
-              className="flex min-h-0 w-[248px] flex-1 flex-col max-[720px]:w-full"
+              className={cn("flex min-h-0 flex-1 flex-col max-[720px]:w-full","w-[280px]")}
               exit={{ opacity: 0 }}
               initial={{ opacity: 0 }}
-              transition={shouldReduceMotion ? reducedMotionTransition : { duration: 0.3, ease: motionEase }}
+              transition={shouldReduceMotion ? reducedMotionTransition : { duration: 0.4, ease: motionEase }}
             >
             <div className="flex h-14 shrink-0 max-[720px]:h-12">
               <div className="app-no-drag shrink-0" style={{ width: windowControlSafeAreaWidth }} />
               <div className="app-drag min-w-0 flex-1" />
             </div>
 
+            <div className="ar-route-toolbar cc-routing-scope">
+          <RoutingActivationBrand active={gatewayStatus.state==='running'} contextKey="gateway" ready={true}/>
+          <div>
+            <EndpointTitleBar compact onToggle={toggleGatewayService} busy={gatewayActionBusy} config={config} endpoint={gatewayEndpoint} gatewayStatus={gatewayStatus}/>
+          </div>
+        </div>
+
             <nav className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-2 py-3 max-[720px]:flex-none max-[720px]:flex-row max-[720px]:gap-1 max-[720px]:overflow-x-auto max-[720px]:overflow-y-hidden max-[720px]:py-2" aria-label={copy.sidebar.primaryNavigation}>
               {navigationGroups.map((group) => (
                 <div className="grid min-w-0 gap-1 max-[720px]:contents" key={group.id}>
-                  <div className="px-2 text-[13px] font-medium text-muted-foreground max-[720px]:hidden">
+                  {group.label !== "Workspace" ? <div className="px-2 text-[13px] font-medium text-muted-foreground max-[720px]:hidden">
                     {copy.text[group.label] ?? group.label}
-                  </div>
+                  </div> : null}
                   <div className="grid min-w-0 gap-1 max-[720px]:contents">
                     {group.items.map((item) => (
                       <SidebarNavigationButton
@@ -260,30 +266,16 @@ export function MainLayout({
         </AnimatePresence>
       </motion.aside>
 
-      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div
-          className={cn(
-            "app-drag relative flex h-12 shrink-0 items-center bg-background/95 px-5 max-[720px]:h-auto max-[720px]:px-3 max-[720px]:py-2",
-            needsTrafficLightSafeArea && "pl-[116px] max-[720px]:pl-[116px]"
-          )}
-        >
-          {needsTrafficLightSafeArea || !sidebarOpen ? (
-            <div className="app-no-drag absolute left-0 top-0 h-full" style={{ width: windowControlSafeAreaWidth }} />
-          ) : null}
-          <EndpointTitleBar
-            config={config}
-            endpoint={gatewayEndpoint}
-            gatewayStatus={gatewayStatus}
-          />
-        </div>
+      <div aria-hidden="true" className="app-drag absolute right-0 top-0 z-[80] h-[46px]" style={{left:windowControlSafeAreaWidth}}/>
+      <main className={cn("flex min-h-0 min-w-0 flex-1 flex-col", "app-usage-surface")}>
         <GatewayStartupErrorBanner
           className="mx-5 mt-3 max-[720px]:mx-3"
           message={gatewayStartupError}
           onOpenServerSettings={onOpenServerSettings}
         />
-        <div
+        <div data-view={activeView}
           className={cn(
-            "min-h-0 flex-1 px-5 pb-5 pt-5 max-[720px]:px-3 max-[720px]:pb-3 max-[720px]:pt-3",
+            "app-page-content min-h-0 flex-1 px-5 pb-5 pt-5 max-[720px]:px-3 max-[720px]:pb-3 max-[720px]:pt-3",
             viewUsesInternalScroll(activeView) ? "overflow-hidden" : "overflow-auto"
           )}
         >
@@ -448,6 +440,7 @@ function MainViewSwitch({
   return (
     <AnimatePresence initial={false} mode="wait">
       <ViewMotionShell key={activeView} view={activeView}>
+        {activeView === "usage" ? <LocalUsageView /> : null}
         {activeView === "overview" ? <OverviewView {...viewProps.overview} /> : null}
         {activeView === "observability" && agentAnalysisEnabled ? <AgentAnalysisView {...viewProps.observability} /> : null}
         {activeView === "api-keys" ? <ApiKeysView {...viewProps.apiKeys} /> : null}

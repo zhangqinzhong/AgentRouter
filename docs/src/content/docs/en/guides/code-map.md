@@ -94,11 +94,17 @@ Logs and observability share request data. Overview usage has separate storage a
 
 ## Local-session collection boundary
 
-A generic TokenTracker-style local-session collector is not currently implemented. Gateway statistics do not cover every local agent conversation.
+The WidgetKit extension in `native/AgentRouterWidget` provides summary, heatmap, model ranking and quota widgets. `WidgetSnapshotWriter.swift` publishes native-menu data as a local snapshot; the extension reads it and opens the main window through `agentrouter://dashboard`.
 
-A collector would belong in core, with explicit source identity, event deduplication, scan cursors, and reset semantics. Default agent homes and isolated profile directories both matter. Chart components should consume query results instead of scanning files; Electron IPC and Web endpoints should expose the same query contract.
+The macOS menu uses SwiftUI/AppKit in `native/AgentRouterTray`. Electron connects it through `native-tray-controller.ts` and `native-menu-data.ts`.
+
+`packages/core/src/collector/` manages a background worker. The vendored TokenTracker parsers in `packages/core/src/vendor/tokentracker/` collect local Claude/Codex sessions, including AgentRouter profiles, and preserve the original quota and aggregate contracts. Incremental cursors and compacted buckets live in `~/.agentrouter/collector`. Gateway statistics remain independent in `usage.sqlite`; the two totals are not added together.
+
+Collection installs no hooks and enables neither telemetry nor cloud sync. Renewal dates come from manually maintained subscription records. Run `npm run test:collector` to check deduplication, cumulative usage and quota contracts.
 
 One request can appear in both a session log and a gateway record. Adding the two datasets directly would double-count it. Input, cache, output, reasoning, and cumulative counters also need normalization per source before aggregation.
+
+App icon metadata lives in `build/brand.json`; `build/AgentRouter.icon` is the native Icon Composer source. `build/native-app-icon.mjs` compiles `Assets.car` and legacy ICNS resources and exports matching UI and documentation images.
 
 ## Validation and documentation
 

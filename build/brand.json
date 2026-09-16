@@ -1,0 +1,13 @@
+{
+  "name": "AgentRouter",
+  "appId": "com.agentrouter.desktop",
+  "website": "https://zhangqinzhong.com/AgentRouter/",
+  "repository": "https://github.com/zhangqinzhong/AgentRouter",
+  "macIcon": "build/icon.icns",
+  "uiIcon": "build/icon.png",
+  "mark": "build/icon-source/agentrouter-native.png",
+  "nativeIconName": "app-icon.icns",
+  "sourceIcon": "build/icon-source/agentrouter-native.png",
+  "favicon": "build/favicon.png",
+  "composerIcon": "build/AgentRouter.icon"
+}

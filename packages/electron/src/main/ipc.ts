@@ -1,3 +1,4 @@
+import {getLocalUsagePage,getLocalUsageCategories} from "@agentrouter/core/collector/usage-page";
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, session, shell, WebContentsView, type OpenDialogOptions, type Rectangle, type SaveDialogOptions } from "electron";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -126,6 +127,8 @@ ipcMain.handle(IPC_CHANNELS.appGetRequestLogDetail, (_event, request) => getRequ
 ipcMain.handle(IPC_CHANNELS.appGetRequestLogBodyChunk, (_event, request) => getRequestLogBodyChunk(request));
 ipcMain.handle(IPC_CHANNELS.appGetRequestLogs, (_event, filter?: RequestLogListFilter) => getRequestLogs(filter));
 ipcMain.handle(IPC_CHANNELS.appGetUpdateStatus, () => appUpdateService.getStatus());
+ipcMain.handle(IPC_CHANNELS.appGetLocalUsagePage, (_event, range) => getLocalUsagePage(range));
+ipcMain.handle(IPC_CHANNELS.appGetLocalUsageCategories, (_event, range) => getLocalUsageCategories(range));
 ipcMain.handle(IPC_CHANNELS.appGetUsageStats, (_event, range?: UsageStatsRange, filter?: UsageStatsFilter) => getUsageStats(range, filter));
 ipcMain.handle(IPC_CHANNELS.appFetchProviderManifest, (_event, request: ProviderManifestFetchRequest) => fetchProviderManifest(request));
 ipcMain.handle(IPC_CHANNELS.appImportLocalAgentProvider, (_event, request: LocalAgentProviderImportRequest) => importLocalAgentProvider(request));

@@ -1868,6 +1868,7 @@ export type AppConfig = {
   trayComponentVariants: TrayComponentVariants;
   trayIcon: TrayIconPreference;
   trayShowTokenUsage: boolean;
+  trayPetEnabled?: boolean;
   trayWidgets: TrayWidgetConfig[];
   trayWindowModules: TrayWindowModuleId[];
   toolHub: ToolHubConfig;

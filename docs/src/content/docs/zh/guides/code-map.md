@@ -33,7 +33,7 @@ docs/              Astro 文档站与 Markdown 文档
 | 无桌面服务入口 | [`packages/core/src/entrypoints/server.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/entrypoints/server.ts) | 启动 Web 管理服务。 |
 | Web 管理 API | [`packages/core/src/web/management-server.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/web/management-server.ts) | 为浏览器提供配置、启动、日志和统计等服务。 |
 | 主界面 | [`packages/ui/src/pages/home/App.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/App.tsx) | 页面切换、配置草稿、保存和档案操作。 |
-| 菜单栏界面 | [`packages/ui/src/pages/tray/TrayApp.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/tray/TrayApp.tsx) | 托盘弹出界面的 React 入口。 |
+| 菜单栏界面 | [`packages/ui/src/pages/tray/TrayApp.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/tray/TrayApp.tsx) | Windows/Linux 与原生组件不可用时的 React 托盘入口。 |
 | 配置契约 | [`packages/core/src/contracts/app.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/contracts/app.ts) | AppConfig、ProfileConfig、路由规则及跨层数据结构。 |
 | 配置读写 | [`packages/core/src/config/config.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/config/config.ts) | 配置加载、规范化、兼容和保存。 |
 | 配置数据库 | [`packages/core/src/config/config-repository.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/config/config-repository.ts) | SQLite 配置及凭据的持久化访问。 |
@@ -116,23 +116,28 @@ usage/store.ts → getUsageStats → IPC 或 Web API → 概览图表
 
 日志保存期限会清理过期请求及其关联数据；概览统计单独重置。操作数据库时需区分配置、用量、正文和暂存数据，不能把整个数据目录视为缓存。
 
-## 本机会话采集的扩展边界
+## 原生菜单栏与本机会话统计
 
-当前没有 TokenTracker 式的通用本机会话扫描器。现有概览主要统计经过网关的用量，不能据此推断所有本地 Agent 的总用量。
+WidgetKit 系统小组件位于 `native/AgentRouterWidget`，包括用量摘要、热力图、模型排行和额度。`WidgetSnapshotWriter.swift` 从菜单栏数据生成快照；扩展读取快照，通过 `agentrouter://dashboard` 打开主窗口。
 
-| 扩展内容 | 相关位置 | 边界 |
+macOS 菜单栏使用 `native/AgentRouterTray` 的 SwiftUI/AppKit 视图。Electron 的 `native-tray-controller.ts` 管理原生进程，`native-menu-data.ts` 连接数据查询。
+
+| 模块 | 位置 | 职责 |
 | --- | --- | --- |
-| 本地日志解析与增量扫描 | core 中新增采集模块；参考 `profiles/` 中的档案路径解析 | 不放入 renderer；识别默认目录和独立档案目录 |
-| 采集结果持久化 | `usage/`、`storage/` 与共享契约 | 标记数据来源、事件身份与采集进度；先确定去重与重置语义 |
-| 图表和筛选 | `dashboard.tsx`、`shared/usage.ts` | 展示来源与聚合口径，不在组件中扫描文件 |
-| 桌面和 Web 查询 | `ipc.ts`、`preload.ts`、`management-server.ts` | 两个入口使用一致的查询契约 |
+| 后台采集与请求调度 | `packages/core/src/collector/` | Worker 生命周期、统计查询、沿用应用代理的网络请求 |
+| 本机会话采集 | `packages/core/src/vendor/tokentracker/collector.cjs` | 增量读取本机 Claude/Codex 与 AgentRouter 档案会话；保存游标和聚合桶 |
+| 原始解析与统计口径 | `vendor/tokentracker/lib/rollout.js`、`offline-api.js` | 会话去重、累计 Token 差分、项目、趋势、热力图和模型统计 |
+| 套餐额度 | `vendor/tokentracker/lib/usage-limits.js` | 本地登录凭据与供应商接口，保留真实周期、Spark 和重置权益 |
 
-同一请求可能同时出现在 Agent 会话日志和网关记录中，不能直接相加。缓存与思考 Token 是否已包含在输入、输出或累计总量中，也需要按来源规范化。这些是扩展边界，不表示本机会话采集已经实现。
+菜单栏本机会话统计保存在 `~/.agentrouter/collector`；概览的网关统计仍保存在 `usage.sqlite`。两者不直接相加。扫描不复制会话正文、不安装钩子、不启用遥测或云同步。订阅续费日期读取手动维护的订阅记录。
+
+图标入口为 `build/brand.json`，原生图标源为 `build/AgentRouter.icon`。`build/native-app-icon.mjs` 使用 Apple 资源编译器生成 `Assets.car` 和旧版 macOS 的 ICNS，并同步主界面与文档图标。
 
 ## 修改与验证入口
 
 | 修改范围 | 验证命令 |
 | --- | --- |
+| 本机会话采集和额度 | `npm run test:collector` |
 | 类型和跨层契约 | `npm run typecheck` |
 | 配置、档案、路由、日志、用量 | `npm run test:core` |
 | React 页面和图表 | `npm run test:ui` |

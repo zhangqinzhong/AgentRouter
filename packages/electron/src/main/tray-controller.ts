@@ -1,3 +1,4 @@
+import { NativeTrayController } from "./native-tray-controller";
 import { BrowserWindow, Menu, Tray, app, nativeImage, nativeTheme, screen, type BrowserWindowConstructorOptions } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -25,6 +26,8 @@ const trayIconFallbackPath = path.join(__dirname, "../assets/tray.png");
 type TrayStaticIconId = "layered";
 
 class TrayController {
+  private native?: NativeTrayController;
+  private nativeAttempted = false;
   private detailCloseTimer?: NodeJS.Timeout;
   private detailOpen = false;
   private detailPopover?: BrowserWindow;
@@ -45,6 +48,19 @@ class TrayController {
   };
 
   start(): void {
+    if (this.native) return;
+    if (process.platform === "darwin" && !this.nativeAttempted) {
+      this.nativeAttempted = true;
+      const native = new NativeTrayController((settings, update) => {
+        const window = windowsManager.showMainWindow();
+        if (settings || update) {
+          const channel = update ? IPC_CHANNELS.appOpenUpdate : IPC_CHANNELS.appOpenSettings;
+          if (window.webContents.isLoading()) window.webContents.once("did-finish-load", () => window.webContents.send(channel));
+          else window.webContents.send(channel);
+        }
+      }, () => { this.native = undefined; this.start(); });
+      if (native.start()) { this.native = native; return; }
+    }
     if (!supportsTrayPlatform() || this.tray) {
       return;
     }
@@ -79,6 +95,7 @@ class TrayController {
   }
 
   hidePopover(): void {
+    this.native?.hide();
     this.clearDetailCloseTimer();
     this.detailOpen = false;
     this.hideDetailPopover();
@@ -88,6 +105,8 @@ class TrayController {
   }
 
   destroy(): void {
+    this.native?.destroy();
+    this.native = undefined;
     this.clearDetailCloseTimer();
     if (process.platform === "win32") {
       nativeTheme.off("updated", this.handleNativeThemeUpdated);
@@ -113,6 +132,7 @@ class TrayController {
   }
 
   refreshUsageTitle(): void {
+    if (this.native) { void this.native.refresh(); return; }
     void this.refreshTrayTitle();
   }
 
@@ -125,6 +145,7 @@ class TrayController {
   }
 
   async refreshIconFromConfig(config?: AppConfig): Promise<void> {
+    if (this.native) { await this.native.refresh(config); return; }
     if (!supportsTrayPlatform() || !this.tray) {
       return;
     }
@@ -144,6 +165,7 @@ class TrayController {
   }
 
   refreshTheme(theme: AppConfig["theme"]): void {
+    if (this.native) { void this.native.refresh(); return; }
     for (const window of [this.popover, this.detailPopover]) {
       if (!window || window.isDestroyed()) {
         continue;

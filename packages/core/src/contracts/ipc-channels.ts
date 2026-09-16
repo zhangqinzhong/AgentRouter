@@ -25,6 +25,8 @@ export const IPC_CHANNELS = {
   appGetRequestLogBodyChunk: "ar:app:get-request-log-body-chunk",
   appGetRequestLogs: "ar:app:get-request-logs",
   appGetUpdateStatus: "ar:app:get-update-status",
+  appGetLocalUsagePage: "ar:app:get-local-usage-page",
+  appGetLocalUsageCategories: "ar:app:get-local-usage-categories",
   appGetUsageStats: "ar:app:get-usage-stats",
   appFetchProviderManifest: "ar:app:fetch-provider-manifest",
   appInstallProxyCertificate: "ar:app:install-proxy-certificate",

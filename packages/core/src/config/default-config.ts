@@ -218,6 +218,7 @@ export function createDefaultAppConfig(options: DefaultAppConfigOptions = {}): A
     trayComponentVariants: DEFAULT_TRAY_COMPONENT_VARIANTS,
     trayIcon: "layered",
     trayShowTokenUsage: false,
+    trayPetEnabled: true,
     trayProgressTargetTokens: 100000,
     trayWidgets: DEFAULT_TRAY_WIDGETS,
     trayWindowModules: DEFAULT_TRAY_WINDOW_MODULES,

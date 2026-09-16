@@ -1,0 +1,11 @@
+{
+  "TokenTrackerWidgetBundle.swift": "fcb002be411118e41b912d5f629ded1d4ef0d8027438376c514c63c60541a1c2",
+  "Providers/StaticSnapshotProvider.swift": "c497b0f77254d4a3f2ad1a6de08f10f176713c72d4936646383a951fcf7f9f9b",
+  "Views/WidgetStrings.swift": "cce50e697f45976a71bd9e0a3e3770844a016c236f266ff5282f68d3ce5522db",
+  "Views/WidgetTheme.swift": "f5336d80a67622522213a89af23bc20f13bbeff834dd77ba1b0201dd6dd09118",
+  "Views/SharedWidgetViews.swift": "861eee5145f7aa980f23fdc2addf5a03a883fa98a2154dbe36bbaeccc7d2f87e",
+  "Widgets/TopModelsWidget.swift": "4a2bab23d773cca9a1954d115157b2ce187adfd17bf64edde30b0f5947ed19bc",
+  "Widgets/HeatmapWidget.swift": "734e49203dd1ccdd8f87b5951153d27f5dc3cdff1e88c143154e6941c30a7c06",
+  "Widgets/SummaryWidget.swift": "b7205eab01c446072a9f7c2f48af9d22c383177efa2c50d88a041214a5020da2",
+  "Widgets/UsageLimitsWidget.swift": "b8bb913a8de2b5968b902cdf1bf4cd05dd9619d498afbcf88a5d28efceb7cdae"
+}

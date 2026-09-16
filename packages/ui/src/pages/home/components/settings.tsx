@@ -138,6 +138,8 @@ export function AppSettingsDialog({
               providerAccountSnapshots={providerAccountSnapshots}
               trayBalanceProgress={trayBalanceProgress}
               trayIconPreference={trayIconPreference}
+              trayPetEnabled={config.trayPetEnabled !== false}
+              onChangeTrayPetEnabled={(trayPetEnabled) => updateConfig((current) => ({ ...current, trayPetEnabled }))}
               trayShowTokenUsage={config.trayShowTokenUsage === true}
               trayTitleSupported={/^(darwin|mac)/i.test(appInfo.platform)}
               trayWidgets={trayWidgets}
@@ -1923,6 +1925,8 @@ export function TraySettingsPage({
   trayBalanceProgress,
   trayIconPreference,
   trayShowTokenUsage,
+  trayPetEnabled = true,
+  onChangeTrayPetEnabled,
   trayTitleSupported,
   trayWidgets
 }: {
@@ -1935,6 +1939,8 @@ export function TraySettingsPage({
   trayBalanceProgress?: TrayBalanceProgressConfig;
   trayIconPreference: AppConfig["trayIcon"];
   trayShowTokenUsage: boolean;
+  trayPetEnabled?: boolean;
+  onChangeTrayPetEnabled?: (enabled: boolean) => void;
   trayTitleSupported: boolean;
   trayWidgets: TrayWidgetConfig[];
 }) {
@@ -2093,6 +2099,7 @@ export function TraySettingsPage({
   }
 
   useEffect(() => {
+    if (trayTitleSupported) return;
     if (!selectedWidget || selectedWidgetIndex < 0) {
       return;
     }
@@ -2114,7 +2121,23 @@ export function TraySettingsPage({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedWidget, selectedWidgetIndex, widgets]);
+  }, [trayTitleSupported, selectedWidget, selectedWidgetIndex, widgets]);
+
+  if (trayTitleSupported) {
+    return (
+      <div className={cn(settingsPageContentWidthClassName, "grid content-start gap-4")}>
+        <h3 className="text-[15px] font-semibold text-foreground">{copy.settings.tray}</h3>
+        <label className="flex items-center justify-between gap-4 rounded-md border border-border bg-background p-3">
+          <span className="text-[13px] font-semibold">{copy.settings.trayShowTokenUsage}</span>
+          <Switch aria-label={copy.settings.trayShowTokenUsage} checked={trayShowTokenUsage} onCheckedChange={onChangeTrayShowTokenUsage} />
+        </label>
+        {onChangeTrayPetEnabled ? <label className="flex items-center justify-between gap-4 rounded-md border border-border bg-background p-3">
+          <span className="text-[13px] font-semibold">{copy.settings.trayPetEnabled}</span>
+          <Switch aria-label={copy.settings.trayPetEnabled} checked={trayPetEnabled} onCheckedChange={onChangeTrayPetEnabled} />
+        </label> : null}
+      </div>
+    );
+  }
 
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid min-h-[520px] grid-rows-[auto_auto_auto] gap-4")} ref={pageRef}>
@@ -2158,24 +2181,6 @@ export function TraySettingsPage({
           )
         ) : null}
       </div>
-      {trayTitleSupported ? (
-        <label className="flex min-w-0 items-center justify-between gap-4 rounded-md border border-border bg-background p-3">
-          <span className="min-w-0">
-            <span className="block text-[13px] font-semibold text-foreground">
-              {copy.settings.trayShowTokenUsage}
-            </span>
-            <span className="mt-1 block text-[11px] leading-4 text-muted-foreground" id="tray-token-usage-hint">
-              {copy.settings.trayShowTokenUsageHint}
-            </span>
-          </span>
-          <Switch
-            aria-describedby="tray-token-usage-hint"
-            aria-label={copy.settings.trayShowTokenUsage}
-            checked={trayShowTokenUsage}
-            onCheckedChange={onChangeTrayShowTokenUsage}
-          />
-        </label>
-      ) : null}
       <div className="grid min-h-0 grid-cols-[220px_minmax(320px,1fr)_260px] gap-4 max-[1140px]:grid-cols-1">
         <div className="flex min-h-0 flex-col overflow-hidden rounded-md border border-border bg-background">
           <div className="shrink-0 border-b border-border/70 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">

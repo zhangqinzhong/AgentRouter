@@ -715,3 +715,18 @@ test("UsageStore reset clears overview stats and does not backfill old request l
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("native activity calendar fills local days and filters providers", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-native-activity-"));
+  const store = new UsageStore(path.join(dir, "usage.sqlite"), { estimateCost: async () => undefined });
+  try {
+    for (const [provider, totalTokens] of [["Company", 12], ["Personal", 30]]) {
+      await store.record({ createdAt: new Date().toISOString(), requestId: provider, method: "POST", path: "/v1/responses", statusCode: 200, durationMs: 10, provider, model: "test", usage: { totalTokens } });
+    }
+    const points = await store.getActivitySeries(182, { provider: "Company" });
+    assert.equal(points.length, 182);
+    assert.equal(points.at(-1).totalTokens, 12);
+    assert.equal(points.slice(0, -1).reduce((sum, point) => sum + point.totalTokens, 0), 0);
+    assert.equal((await store.getActivitySeries(1, { includeProxy: true }))[0].totalTokens, 42);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

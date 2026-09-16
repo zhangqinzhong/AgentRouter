@@ -95,3 +95,7 @@ node packages/cli/dist/main/cli.js ui
 ## 许可证与致谢
 
 采用 [MIT 许可证](LICENSE)。AgentRouter 基于 [Claude Code Router](https://github.com/musistudio/claude-code-router) 开发，保留上游版权与许可证声明。
+
+### 本地会话用量
+
+左侧“用量”读取本机 Agent 会话，包括 AgentRouter 配置档案中的 Claude、Codex 会话，以及 OpenClaw、Grok、Mimo、ZCode、LM Studio 等本地记录。支持日期筛选、模型费用明细和 Claude／Codex／Grok 上下文逐层细分。上下文分类属于近似归因，费用为估算值；这份统计与网关请求日志独立，不相加。
