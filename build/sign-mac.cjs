@@ -4,7 +4,11 @@ const { signAsync } = require('@electron/osx-sign');
 
 module.exports = async function sign(options) {
   const widget = path.join(options.app, 'Contents/PlugIns/AgentRouterWidget.appex');
-  if (!fs.existsSync(widget)) throw new Error('Packaged WidgetKit extension is missing');
+  if (!fs.existsSync(widget)) {
+    console.warn('WidgetKit extension is missing; signing the app without it.');
+    await signAsync(options);
+    return;
+  }
   const originalIgnore = options.ignore;
   const originalOptions = options.optionsForFile;
   const isWidget = file => file === widget || file.startsWith(widget + path.sep);
