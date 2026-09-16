@@ -1,3 +1,4 @@
+import {modelDisplayName,compareOtherLast} from '../../../lib/model-display';
 import { Dialog } from "@base-ui/react/dialog";
 import { X } from "lucide-react";
 import React, { useMemo } from "react";
@@ -58,7 +59,7 @@ export const CostAnalysisModal = React.memo(function CostAnalysisModal({
               };
             })
             .filter((m) => m.costLabel || m.tokensLabel)
-            .sort((a, b) => b.sortCost - a.sortCost),
+            .sort((a, b) => compareOtherLast(a,b)||b.sortCost - a.sortCost),
         };
       })
       .filter((fleet) => fleet.usdValue > 0 || fleet.models.length > 0)
@@ -151,16 +152,16 @@ export const CostAnalysisModal = React.memo(function CostAnalysisModal({
 
                         {fleet.models.map((model, mi) => (
                           <div
-                            key={model.id || `${model.name}-${mi}`}
+                            key={model.id || `${modelDisplayName(model.name)}-${mi}`}
                             role="row"
                             className="flex items-center justify-between gap-4 py-[5px]"
                           >
                             <span
                               role="cell"
                               className="flex-1 min-w-0 text-caption text-oai-gray-500 dark:text-oai-gray-400 truncate leading-none"
-                              title={model.name}
+                              title={modelDisplayName(model.name)}
                             >
-                              {model.name}
+                              {modelDisplayName(model.name)}
                             </span>
                             <span
                               role="cell"

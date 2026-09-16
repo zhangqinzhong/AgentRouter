@@ -1,3 +1,4 @@
+import {compareOtherLast} from './model-display';
 import { toFiniteNumber } from "./format";
 function normalizeModelId(value) {
     if (typeof value !== "string")
@@ -270,6 +271,7 @@ export function buildAllModels(fleetData) {
             : 0,
     }))
         .sort((a, b) => {
+        const otherOrder=compareOtherLast(a,b);if(otherOrder)return otherOrder;
         if (b.usage !== a.usage)
             return b.usage - a.usage;
         return String(a.name).localeCompare(String(b.name));
@@ -327,6 +329,7 @@ export function buildTopModels(modelBreakdown, { limit = 3, copyFn } = {}) {
         };
     })
         .sort((a, b) => {
+        const otherOrder=compareOtherLast(a,b);if(otherOrder)return otherOrder;
         if (b.tokens !== a.tokens)
             return b.tokens - a.tokens;
         return String(a.name).localeCompare(String(b.name));

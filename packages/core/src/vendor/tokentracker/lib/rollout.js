@@ -1,4 +1,3 @@
-const {scanCodexModelEvidence,modelForUsage}=require('./codex-model-evidence');
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
 const os = require("node:os");
@@ -2079,7 +2078,6 @@ async function parseRolloutFile({
 }) {
   const st = fileStat || (await fs.stat(filePath));
   const endOffset = st.size;
-  const modelEvidence=await scanCodexModelEvidence(filePath);
   const projectFileContexts = [];
   addProjectFileContext(projectFileContexts, projectContext);
   if (startOffset >= endOffset) {
@@ -2203,7 +2201,6 @@ async function parseRolloutFile({
 
     const token = extractTokenCount(obj);
     if (!token) continue;
-    model=modelForUsage(modelAttributionState,obj,modelEvidence);
 
     const info = token.info;
     if (!info || typeof info !== "object") continue;

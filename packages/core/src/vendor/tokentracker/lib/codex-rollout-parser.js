@@ -1,4 +1,3 @@
-const {scanCodexModelEvidence,modelForUsage}=require('./codex-model-evidence');
 // Codex rollout JSONL parser — extracted from codex-context-breakdown.js.
 //
 // Handles file discovery and per-file parsing. Does NOT hold any aggregation
@@ -564,7 +563,6 @@ async function parseCodexRolloutFile(filePath, {
   onObject = null,
 } = {}) {
   const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
-  const modelEvidence=await scanCodexModelEvidence(filePaths);
   const primaryFilePath = filePaths[0] || String(filePath || "");
   const isResuming = Boolean(resumeState && filePaths.length === 1);
   const initialOffset = Math.max(0, Number(startOffset) || 0);
@@ -642,7 +640,7 @@ async function parseCodexRolloutFile(filePath, {
 
   function recordModelUsage(delta, rawRequestUsage) {
     if (!collectModelUsage || !delta || delta.total_tokens <= 0) return;
-    const effectiveModel = model || "unknown";
+    const effectiveModel = currentCodexModel(modelAttributionState) || "unknown";
     let row = byModel.get(effectiveModel);
     if (!row) {
       row = {
@@ -906,8 +904,8 @@ async function parseCodexRolloutFile(filePath, {
     sourceHandle,
   })) {
     const modelEvent = applyCodexModelEvent(modelAttributionState, obj);
-    const attributedModel = modelForUsage(modelAttributionState,obj,modelEvidence);
-    model = attributedModel;
+    const attributedModel = currentCodexModel(modelAttributionState);
+    model = attributedModel || model;
     // onObject runs AFTER the attribution state machine, and is handed the
     // model it just decided. A consumer sharing this pass (the delivery-signal
     // collector, which attributes edit turns) therefore sees exactly the model

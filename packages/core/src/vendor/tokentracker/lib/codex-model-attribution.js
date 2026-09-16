@@ -1,9 +1,26 @@
 "use strict";
 
-// Resolve models from structured metadata and settings. A whole-file evidence
-// pass supplies unique-model/turn fallbacks for history preceding those events.
-// Never inspect prompt text, tool arguments, outputs or model_provider as models.
-const {eventModels}=require('./codex-model-evidence');
+// Codex token_count events do not carry a model id. Every usage event is
+// therefore attributed to the model named by the most recent turn_context,
+// which Codex emits at the start of each turn and which tracks mid-session
+// model switches exactly. That per-turn path is what actually runs today.
+//
+// The model/rerouted upgrade below is forward-looking: it promotes usage to
+// the effective model when the app server reports a server-side reroute.
+//
+// Deliberately NOT used for attribution: event_msg/thread_settings_applied.
+// It carries thread_settings.model, but it fires when the user picks a model
+// in the UI - seconds to minutes before the switch takes effect - so usage
+// still streaming from the in-flight turn belongs to the previous model.
+// turn_context is the only signal that marks where a turn actually begins.
+//
+// session_meta is a defensive fallback, not an observed source. Codex has
+// never written a model into it - 0 of 10310 session_meta rows across 5849
+// local rollouts carry the field (codex-cli 0.151.0); the payload records
+// model_provider ("openai"), which is provenance rather than a model. The
+// fallback only fills selectedModel when nothing else has, so a future format
+// that does carry one attributes instead of falling through to "unknown". It
+// never overrides a turn_context model.
 
 function cleanString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -62,15 +79,8 @@ function createCodexModelAttributionState(value = {}) {
 
 function applyCodexModelEvent(state, obj) {
   if (!state || typeof state !== "object") return null;
-  const payload=obj?.payload||{};
-  if(payload.type==='task_started')state.turnId=cleanString(payload.turn_id??payload.turnId);
-  if(payload.type==='task_complete')state.turnId=null;
-  if(payload.type==='thread_settings_applied') {
-    const model=cleanString(payload.thread_settings?.model??payload.thread_settings?.model_id);
-    if(model){state.selectedModel=model;state.effectiveModel=model;state.rerouted=false;return{type:'thread_settings_applied',selectedModel:model};}
-  }
   if (obj?.type === "turn_context" && obj.payload && typeof obj.payload === "object") {
-    const selectedModel = cleanString(obj.payload.model??obj.payload.model_id);
+    const selectedModel = cleanString(obj.payload.model);
     if (selectedModel) {
       state.selectedModel = selectedModel;
     }
@@ -84,7 +94,7 @@ function applyCodexModelEvent(state, obj) {
   // Strictly weaker than turn_context, and never allowed to overwrite it: a
   // forked rollout replays the parent's session_meta rows after its own.
   if (obj?.type === "session_meta" && obj.payload && typeof obj.payload === "object") {
-    const metaModel = cleanString(obj.payload.model??obj.payload.model_id);
+    const metaModel = cleanString(obj.payload.model);
     if (!metaModel || state.selectedModel) return null;
     state.selectedModel = metaModel;
     state.effectiveModel = state.effectiveModel || metaModel;
@@ -92,11 +102,7 @@ function applyCodexModelEvent(state, obj) {
   }
 
   const reroute = extractModelReroute(obj);
-  if (!reroute) {
-    const candidates=eventModels(obj);
-    if(candidates.length===1){state.selectedModel=candidates[0];state.effectiveModel=candidates[0];state.rerouted=false;return{type:'model_metadata',selectedModel:candidates[0]};}
-    return null;
-  }
+  if (!reroute) return null;
   state.selectedModel = reroute.fromModel || state.selectedModel || state.effectiveModel;
   state.effectiveModel = reroute.toModel;
   state.turnId = reroute.turnId || state.turnId;

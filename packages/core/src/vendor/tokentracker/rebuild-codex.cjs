@@ -1,6 +1,6 @@
 'use strict';
 const fs=require('node:fs/promises'),path=require('node:path');const rollout=require('./lib/rollout');
-const MODEL_SCHEMA=2;
+const MODEL_SCHEMA=3;
 async function readRows(file){try{return(await fs.readFile(file,'utf8')).split('\n').filter(Boolean).map(JSON.parse)}catch(e){if(e.code==='ENOENT')return[];throw e}}
 function latest(rows){const m=new Map();for(const r of rows)m.set(JSON.stringify([r.project_key||null,r.source,r.model,r.hour_start]),r);return [...m.values()]}
 async function rebuildCodex({dataDir,cursors,files}){

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1 - 2026-09-16
+
+- Restored TokenTracker model attribution without inferring historical models from later thread settings.
+- Display unattributed models as Other at the end of usage and cost detail lists.
+- Prefer an available stable Apple signing certificate for local macOS builds, preserving application identity across updates.
+
 ## 1.2.0 - 2026-09-16
 
 - Added a local-session usage page with tool/model filters, cost details and nested context breakdowns.

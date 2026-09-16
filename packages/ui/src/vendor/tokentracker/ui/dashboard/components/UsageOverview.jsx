@@ -1,3 +1,4 @@
+import {modelDisplayName,compareOtherLast} from '../../../lib/model-display';
 import {ContextBreakdownPanel} from "./ContextBreakdownPanel.jsx";
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { motion, useReducedMotion } from "motion/react";
@@ -653,7 +654,7 @@ export function UsageOverview({
                     const color = getProviderColor(provider.label, 0);
                     const contextSource = resolveContextBreakdownSource(provider);
                     const sortedModels = [...provider.models].sort((a, b) => {
-                      return (b.share || 0) - (a.share || 0);
+                      return compareOtherLast(a,b)||((b.share || 0) - (a.share || 0));
                     });
 
                     const providerHeading = contextSource
@@ -700,9 +701,9 @@ function ModelUsageRows({ models, color }) {
             <div className="grid grid-cols-[minmax(0,1fr)_minmax(8rem,max-content)_minmax(5.5rem,max-content)_4rem] items-baseline gap-x-3 mb-1.5">
               <span
                 className="col-start-1 row-start-1 min-w-0 text-sm text-oai-gray-700 dark:text-oai-gray-300 truncate"
-                title={model.name}
+                title={modelDisplayName(model.name)}
               >
-                {model.name}
+                {modelDisplayName(model.name)}
               </span>
               <span
                 title={formatTokensTooltip(model.usage)}

@@ -14,3 +14,7 @@ test('tool proportions use collected totals without double adding cached tokens'
  assert.equal(providers.reduce((sum,p)=>sum+p.usage,0),200);
  assert.ok(providers.every(p=>Number(p.totalPercent)===50));
 });
+
+import {modelDisplayName,compareOtherLast} from '../../src/vendor/tokentracker/lib/model-display';
+import {setUsageLocale} from '../../src/vendor/tokentracker/lib/copy';
+test('unattributed models display Other and sort behind concrete models regardless of usage',()=>{setUsageLocale('zh');assert.equal(modelDisplayName('unknown'),'其他');const rows=[{name:'unknown',usage:999},{name:'gpt-test',usage:1}].sort((a,b)=>compareOtherLast(a,b)||b.usage-a.usage);assert.equal(rows[1].name,'unknown');setUsageLocale('en');assert.equal(modelDisplayName('unknown'),'Other');setUsageLocale('zh');});

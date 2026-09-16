@@ -100,7 +100,8 @@
     "dashboard.context_breakdown.exec_details.group_by_command": "Command",
     "dashboard.context_breakdown.exec_details.group_by_duration": "Duration",
     "dashboard.context_breakdown.exec_details.group_by_output": "Output",
-    "dashboard.context_breakdown.exec_details.group_by_exit": "By exit"
+    "dashboard.context_breakdown.exec_details.group_by_exit": "By exit",
+    "usage.model.other": "Other"
   },
   "zh": {
     "share.button.label": "分享",
@@ -203,6 +204,7 @@
     "dashboard.context_breakdown.exec_details.group_by_command": "命令",
     "dashboard.context_breakdown.exec_details.group_by_duration": "耗时",
     "dashboard.context_breakdown.exec_details.group_by_output": "输出",
-    "dashboard.context_breakdown.exec_details.group_by_exit": "按退出状态"
+    "dashboard.context_breakdown.exec_details.group_by_exit": "按退出状态",
+    "usage.model.other": "其他"
   }
 }

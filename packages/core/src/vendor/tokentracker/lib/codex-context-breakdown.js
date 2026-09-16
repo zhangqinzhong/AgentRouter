@@ -168,7 +168,7 @@ function buildDateRange({ period, date }) {
 const CACHE = new Map();
 const PARSED_GROUP_CACHE = new Map();
 const CACHE_TTL_MS = 60_000;
-const CACHE_SCHEMA_VERSION = "codex-context-v7-ar-model-evidence";
+const CACHE_SCHEMA_VERSION = "codex-context-v8-ar-upstream-models";
 const MAX_PARSED_GROUP_CACHE_ENTRIES = 4096;
 const PREFIX_HASH_READ_BYTES = 1024 * 1024;
 
