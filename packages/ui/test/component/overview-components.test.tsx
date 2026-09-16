@@ -61,7 +61,7 @@ test("OverviewView renders every overview widget type", () => {
   assert.match(html, /Errors/);
   assert.match(html, /Usage Trend/);
   assert.match(html, /Activity/);
-  assert.match(html, /Token Mix/);
+  assert.doesNotMatch(html, /Token Mix/);
   assert.match(html, /Model Distribution/);
   assert.match(html, /Client Analysis/);
   assert.match(html, /Provider Analysis/);
@@ -137,7 +137,7 @@ test("OverviewView keeps Chinese token copy as Token", () => {
   );
 
   assert.match(html, /Token/);
-  assert.match(html, /Token 构成/);
+  assert.doesNotMatch(html, /Token 构成/);
   assert.match(html, /总 Token/);
   assert.doesNotMatch(html, /令牌/);
 });

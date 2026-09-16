@@ -58,8 +58,7 @@ test("only the unchanged legacy dashboard receives the new default order", () =>
   const customized = LEGACY_DEFAULT_OVERVIEW_WIDGETS.map((widget, index) => index === 0 ? { ...widget, enabled: false } : widget);
   const expectedCustomized = customized
     .map(normalizeOverviewWidget)
-    .filter((widget): widget is NonNullable<typeof widget> => Boolean(widget) && widget.type !== "token-mix")
-    .map((widget) => widget.type === "account-balance" && widget.variant === "cards" ? { ...widget, variant: "compact" } : widget);
+    .filter((widget): widget is NonNullable<typeof widget> => Boolean(widget) && widget.type !== "token-mix");
   assert.deepEqual(normalizeOverviewWidgets(customized), expectedCustomized);
   assert.deepEqual(normalizeOverviewWidgets([]), []);
 });

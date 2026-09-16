@@ -1,6 +1,7 @@
 import {
   DEFAULT_OVERVIEW_WIDGETS,
   LEGACY_DEFAULT_OVERVIEW_WIDGETS,
+  V12_DEFAULT_OVERVIEW_WIDGETS,
   DEFAULT_TRAY_COMPONENT_VARIANTS,
   DEFAULT_TRAY_WINDOW_MODULES,
   OVERVIEW_WIDGET_SIZE_VALUES,
@@ -332,12 +333,11 @@ export function normalizeOverviewWidgets(value: unknown): OverviewWidgetConfig[]
     .map(normalizeOverviewWidget)
     .filter((widget): widget is OverviewWidgetConfig => Boolean(widget));
   // Only upgrade the untouched old default; preserve every customized layout.
-  if (JSON.stringify(mapped) === JSON.stringify(LEGACY_DEFAULT_OVERVIEW_WIDGETS.map(normalizeOverviewWidget))) {
+  if (JSON.stringify(mapped) === JSON.stringify(LEGACY_DEFAULT_OVERVIEW_WIDGETS.map(normalizeOverviewWidget))
+    || JSON.stringify(mapped) === JSON.stringify(V12_DEFAULT_OVERVIEW_WIDGETS.map(normalizeOverviewWidget))) {
     return DEFAULT_OVERVIEW_WIDGETS.map((widget) => ({ ...widget }));
   }
-  return mapped
-    .filter((widget) => widget.type !== "token-mix")
-    .map((widget) => widget.type === "account-balance" && widget.variant === "cards" ? { ...widget, variant: "compact" as const } : widget);
+  return mapped.filter((widget) => widget.type !== "token-mix");
 }
 
 export function normalizeOverviewWidget(value: unknown): OverviewWidgetConfig | undefined {

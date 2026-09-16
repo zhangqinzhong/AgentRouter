@@ -1424,6 +1424,24 @@ export const LEGACY_DEFAULT_OVERVIEW_WIDGETS: OverviewWidgetConfig[] = [
   { enabled: true, id: "provider-analysis", size: "2:2", type: "provider-analysis", variant: "table" }
 ];
 
+export const V12_DEFAULT_OVERVIEW_WIDGETS: OverviewWidgetConfig[] = [
+  { enabled: true, id: "system-status", size: "4:1", type: "system-status", variant: "timeline" },
+  { enabled: true, id: "metric-requests", metric: "requests", size: "1:1", type: "metric", variant: "card" },
+  { enabled: true, id: "metric-success-rate", metric: "success-rate", size: "1:1", type: "metric", variant: "card" },
+  { enabled: true, id: "metric-avg-latency", metric: "avg-latency", size: "1:1", type: "metric", variant: "card" },
+  { enabled: true, id: "metric-estimated-cost", metric: "estimated-cost", size: "1:1", type: "metric", variant: "card" },
+  { enabled: true, id: "usage-trend", size: "4:2", type: "usage-trend", variant: "composed" },
+  { enabled: true, id: "metric-input-tokens", metric: "input-tokens", size: "1:1", type: "metric", variant: "card" },
+  { enabled: true, id: "metric-output-tokens", metric: "output-tokens", size: "1:1", type: "metric", variant: "card" },
+  { enabled: true, id: "metric-cache-tokens", metric: "cache-tokens", size: "1:1", type: "metric", variant: "card" },
+  { enabled: true, id: "metric-cache-ratio", metric: "cache-ratio", size: "1:1", type: "metric", variant: "card" },
+  { enabled: true, id: "account-balance", size: "4:2", type: "account-balance", variant: "cards" },
+  { enabled: true, id: "token-activity", size: "4:2", type: "token-activity", variant: "heatmap" },
+  { enabled: true, id: "token-mix", size: "1:2", type: "token-mix", variant: "bars" },
+  { enabled: true, id: "client-analysis", size: "2:2", type: "client-analysis", variant: "table" },
+  { enabled: true, id: "provider-analysis", size: "2:2", type: "provider-analysis", variant: "table" }
+];
+
 export const DEFAULT_OVERVIEW_WIDGETS: OverviewWidgetConfig[] = [
   { enabled: true, id: "system-status", size: "4:2", type: "system-status", variant: "timeline" },
   { enabled: true, id: "metric-requests", metric: "requests", size: "1:1", type: "metric", variant: "card" },

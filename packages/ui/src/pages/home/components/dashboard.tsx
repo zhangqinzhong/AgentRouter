@@ -2305,7 +2305,7 @@ function uniqueOverviewWidgetId(widgets: OverviewWidgetConfig[], baseId: string)
 type OverviewAccountVariant = "arc" | "bars" | "cards" | "compact" | "nested-rings" | "ring" | "semicircle";
 
 function overviewAccountVariant(value: OverviewWidgetVariant): OverviewAccountVariant {
-  return value === "bars" ? "bars" : "compact";
+  return value === "arc" || value === "bars" || value === "cards" || value === "nested-rings" || value === "ring" || value === "semicircle" ? value : "compact";
 }
 
 function overviewMetricVariant(value: OverviewWidgetVariant): "bar" | "card" | "compact" | "ring" {
