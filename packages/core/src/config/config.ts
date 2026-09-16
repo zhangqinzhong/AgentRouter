@@ -1185,7 +1185,7 @@ function parseOverviewWidgetType(value: unknown): OverviewWidgetType | undefined
   return parseEnumValue(value, ["account-balance", "client-analysis", "metric", "model-distribution", "provider-analysis", "share-fuel-cockpit", "share-model-leaderboard", "share-route-map", "share-spend-receipt", "share-token-calendar", "share-usage-wrapped", "system-status", "token-activity", "token-mix", "usage-trend"], undefined);
 }
 
-function parseOverviewWidgetSize(value: unknown, type: OverviewWidgetType): OverviewWidgetSize | undefined {
+function parseOverviewWidgetSize(value: unknown, _type: OverviewWidgetType): OverviewWidgetSize | undefined {
   const size = parseEnumValue(value, OVERVIEW_WIDGET_SIZE_VALUES, undefined);
   if (size) {
     return size;

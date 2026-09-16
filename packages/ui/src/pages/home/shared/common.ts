@@ -418,7 +418,7 @@ export function normalizeOverviewWidgetType(value: unknown): OverviewWidgetType 
     : undefined;
 }
 
-export function normalizeOverviewWidgetSize(value: unknown, type: OverviewWidgetType): OverviewWidgetSize | undefined {
+export function normalizeOverviewWidgetSize(value: unknown, _type: OverviewWidgetType): OverviewWidgetSize | undefined {
   if (typeof value !== "string") {
     return undefined;
   }

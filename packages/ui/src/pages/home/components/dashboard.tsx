@@ -1270,7 +1270,7 @@ function OverviewWidgetRenderer({
   const dimensions = overviewWidgetDimensions(widget.size);
   let content: ReactNode;
   if (widget.type === "system-status") {
-    content = <SystemStatusBar dimensions={dimensions} usageRange={usageRange} usageStats={usageStats} variant={widget.variant === "compact" ? "compact" : "timeline"} />;
+    content = <SystemStatusBar usageRange={usageRange} usageStats={usageStats} variant={widget.variant === "compact" ? "compact" : "timeline"} />;
   } else if (widget.type === "account-balance") {
     content = <ProviderAccountsOverview accountCardOrder={widget.accountCardOrder} accountCardSizes={widget.accountCardSizes} accountProviders={overviewWidgetAccountProviderValues(widget)} accounts={providerAccounts} dimensions={dimensions} editing={editing} providers={providers} refreshing={providerAccountRefreshing} variant={overviewAccountVariant(widget.variant)} onChangeAccountCardOrder={onChangeAccountCardOrder} onChangeAccountCardSize={onChangeAccountCardSize} onRefresh={refreshProviderAccounts} />;
   } else if (widget.type === "metric") {
@@ -2401,7 +2401,6 @@ function resolveSystemStatusTooltipPosition(rect: DOMRect): Omit<SystemStatusToo
 }
 
 function SystemStatusBar({
-  dimensions,
   variant = "timeline",
   usageRange,
   usageStats
