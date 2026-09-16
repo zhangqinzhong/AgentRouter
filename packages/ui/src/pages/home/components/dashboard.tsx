@@ -1,15 +1,15 @@
 import {
   agentAnalysisRangeOptions, AgentAnalysisSessionSelection, AgentAnalysisSnapshot, AgentAnalysisTracePayloadFullResult, AgentAnalysisTracePayloadRequest, AgentAnalysisTraceRun, agentFilterOptions, AgentFilterValue, agentKindLabel,
   AnimatePresence, AnimatedDisclosure, AnimatedIconSwap,
-  Area, arrayMove, Badge, Bar, BarChart, Button,
+  arrayMove, Badge, Bar, BarChart, Button,
   Card, CardContent, CardHeader, CardTitle, CartesianGrid, Cell, constrainOverviewWidgetSize,
   Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, cn, codexLogoUrl, compactId,
-  compactUserAgent, compareProviderAccountSnapshots, ComposedChart, CSS, Checkbox, DEFAULT_OVERVIEW_WIDGETS, DndContext,
+  compactUserAgent, compareProviderAccountSnapshots, CSS, Checkbox, DEFAULT_OVERVIEW_WIDGETS, DndContext,
   Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
   DragEndEvent, DragOverEvent, DragOverlay, DragStartEvent, Field, formatAxisNumber, formatBytes,
   formatCompactNumber, formatDuration, formatLogDateTime, formatPercent, formatPercentFixed, formatProviderAccountDetailDate, formatProviderAccountMeterTitle, formatProviderAccountMeterValue,
   formatStatusBucketDate, formatSystemStatusRange, formatUsdCost, KeyboardSensor,
-  LabelList, LayoutGroup, Line, LoaderCircle, MeasuringStrategy, MetricTone,
+  LayoutGroup, LoaderCircle, MeasuringStrategy, MetricTone,
   motion, normalizeAgentFilterValue, normalizeOverviewWidget, normalizeOverviewWidgets,
   OverviewAccountCardSize, OverviewMetricKind, overviewMetricOptions, overviewWidgetCollisionDetection, OverviewWidgetConfig, OverviewWidgetSize, overviewWidgetSizeOptions,
   OverviewWidgetType, OverviewWidgetVariant, Pencil, Pie, PieChart, Plus,
@@ -30,6 +30,10 @@ import {
   Rocket, Server, UsersRound, WalletCards, Wifi
 } from "lucide-react";
 import { Tooltip as UiTooltip, TooltipPortal } from "@/components/ui/tooltip";
+import { heatmapTrendRange, TrendPeriodTabs, UsageTrendLineChart } from "./usage-trend-line";
+import { useTrendData } from "@/vendor/tokentracker/hooks/use-trend-data";
+import { getBrowserTimeZone, getBrowserTimeZoneOffsetMinutes } from "@/vendor/tokentracker/lib/timezone";
+import { setUsageLocale } from "@/vendor/tokentracker/lib/copy";
 
 type OverviewUsageFilters = {
   modelFilter: string;
@@ -95,7 +99,7 @@ export function OverviewView({
   const displayWidgets = dragPreviewWidgets ?? widgets;
   const accountsUnconfigured = providerAccounts.length === 0 && !(usageFilters?.providers ?? []).some((provider) => provider.account?.enabled);
   const showAccountSetup = !editing && accountsUnconfigured && displayWidgets.some((widget) => widget.enabled && widget.type === "account-balance");
-  const visibleWidgets = displayWidgets.filter((widget) => widget.enabled && !(showAccountSetup && widget.type === "account-balance"));
+  const visibleWidgets = displayWidgets.filter((widget) => widget.enabled && widget.type !== "token-mix" && !(showAccountSetup && widget.type === "account-balance"));
   const activeWidget = visibleWidgets.find((widget) => widget.id === activeWidgetId);
   const selectedWidget = widgets.find((widget) => widget.id === selectedWidgetId);
   const filterProviders = usageFilters?.providers ?? emptyOverviewProviders;
@@ -356,7 +360,7 @@ export function OverviewView({
     >
       <SortableContext items={visibleWidgets.map((widget) => widget.id)} strategy={rectSortingStrategy}>
         <LayoutGroup>
-          <section className="grid auto-rows-[132px] grid-cols-1 gap-4 sm:auto-rows-[140px] sm:grid-cols-2 xl:auto-rows-[148px] xl:grid-cols-4" data-overview-widget-grid>
+          <section className="grid auto-rows-[minmax(132px,auto)] grid-cols-1 gap-4 sm:auto-rows-[minmax(140px,auto)] sm:grid-cols-2 xl:auto-rows-[minmax(148px,auto)] xl:grid-cols-4" data-overview-widget-grid>
             {visibleWidgets.map((widget) => (
               <SortableOverviewWidget editing={editing} key={widget.id} widget={widget} onSelect={() => setSelectedWidgetId(widget.id)}>
                 <OverviewWidgetFrame
@@ -657,7 +661,7 @@ function OverviewEmptyState({
   );
 }
 
-function OverviewChartLegend({ items }: { items: Array<{ color: string; label: string }> }) {
+export function OverviewChartLegend({ items }: { items: Array<{ color: string; label: string }> }) {
   return (
     <div className="overview-chart-legend hidden items-center gap-3 md:flex">
       {items.map((item) => (
@@ -935,8 +939,9 @@ function SortableOverviewWidget({
   return (
     <motion.div
       className={cn(
-        "min-h-0 min-w-0",
-        overviewWidgetSizeClass(widget.size),
+        widget.type === "system-status" ? "h-auto self-start" : "min-h-0",
+        "min-w-0",
+        overviewWidgetSizeClass(widget.size, widget.type),
         editing && "cursor-grab touch-none",
         isDragging && "relative z-20 cursor-grabbing opacity-70"
       )}
@@ -1077,7 +1082,8 @@ function OverviewWidgetFrame({
     <div
       aria-selected={editing ? selected : undefined}
       className={cn(
-        "overview-widget-frame group/overview-widget relative h-full min-h-0 min-w-0 transition-opacity",
+        "overview-widget-frame group/overview-widget relative min-h-0 min-w-0 transition-opacity",
+        widget.type === "system-status" ? "h-auto" : "h-full",
         editing && "is-editing",
         selected && "is-selected"
       )}
@@ -1101,18 +1107,22 @@ function OverviewWidgetFrame({
             selected={selected}
             onPointerDown={(event) => startResize("width", event)}
           />
-          <OverviewWidgetResizeHandle
-            axis="height"
-            label={t("Resize widget height")}
-            selected={selected}
-            onPointerDown={(event) => startResize("height", event)}
-          />
-          <OverviewWidgetResizeHandle
-            axis="both"
-            label={t("Resize widget size")}
-            selected={selected}
-            onPointerDown={(event) => startResize("both", event)}
-          />
+          {widget.type === "system-status" ? null : (
+            <>
+              <OverviewWidgetResizeHandle
+                axis="height"
+                label={t("Resize widget height")}
+                selected={selected}
+                onPointerDown={(event) => startResize("height", event)}
+              />
+              <OverviewWidgetResizeHandle
+                axis="both"
+                label={t("Resize widget size")}
+                selected={selected}
+                onPointerDown={(event) => startResize("both", event)}
+              />
+            </>
+          )}
         </>
       ) : null}
     </div>
@@ -1260,13 +1270,13 @@ function OverviewWidgetRenderer({
   const dimensions = overviewWidgetDimensions(widget.size);
   let content: ReactNode;
   if (widget.type === "system-status") {
-    content = <SystemStatusBar usageRange={usageRange} usageStats={usageStats} variant={widget.variant === "compact" ? "compact" : "timeline"} />;
+    content = <SystemStatusBar dimensions={dimensions} usageRange={usageRange} usageStats={usageStats} variant={widget.variant === "compact" ? "compact" : "timeline"} />;
   } else if (widget.type === "account-balance") {
     content = <ProviderAccountsOverview accountCardOrder={widget.accountCardOrder} accountCardSizes={widget.accountCardSizes} accountProviders={overviewWidgetAccountProviderValues(widget)} accounts={providerAccounts} dimensions={dimensions} editing={editing} providers={providers} refreshing={providerAccountRefreshing} variant={overviewAccountVariant(widget.variant)} onChangeAccountCardOrder={onChangeAccountCardOrder} onChangeAccountCardSize={onChangeAccountCardSize} onRefresh={refreshProviderAccounts} />;
   } else if (widget.type === "metric") {
     content = <OverviewMetricWidget metric={widget.metric ?? "requests"} totals={usageStats.totals} variant={overviewMetricVariant(widget.variant)} />;
   } else if (widget.type === "usage-trend") {
-    content = <UsageTrendWidget dimensions={dimensions} usageRange={usageRange} usageStats={usageStats} variant={overviewTrendVariant(widget.variant)} />;
+    content = <UsageTrendWidget />;
   } else if (widget.type === "token-activity") {
     content = <TokenActivityOverviewWidget dimensions={dimensions} usageStats={usageStats} />;
   } else if (widget.type === "token-mix") {
@@ -1281,7 +1291,7 @@ function OverviewWidgetRenderer({
     content = <OverviewAnalysisWidget dimensions={dimensions} kind="provider" rows={usageStats.providerModels} variant={widget.variant === "compact" ? "compact" : "table"} />;
   }
 
-  return <div className="h-full min-h-0 min-w-0 overflow-hidden">{content}</div>;
+  return <div className={cn("min-h-0 min-w-0", widget.type === "system-status" ? "h-auto overflow-visible" : "h-full overflow-hidden")}>{content}</div>;
 }
 
 function OverviewMetricWidget({
@@ -1402,78 +1412,38 @@ function overviewMetricShowsRatio(metric: OverviewMetricKind): boolean {
     metric === "input-tokens" || metric === "output-tokens" || metric === "cache-tokens";
 }
 
-function UsageTrendWidget({
-  dimensions,
-  usageStats,
-  variant
-}: {
-  dimensions: OverviewWidgetDimensions;
-  usageRange: UsageStatsRange;
-  usageStats: UsageStatsSnapshot;
-  variant: "area" | "bar" | "composed" | "line";
-}) {
+function UsageTrendWidget() {
   const t = useAppText();
-  const chartMargin = dimensions.height <= 1
-    ? { bottom: 0, left: 0, right: 4, top: 8 }
-    : { bottom: 4, left: 0, right: 8, top: 8 };
-  const legendItems = variant === "composed"
-    ? [
-        { color: "#007aff", label: t("Total tokens") },
-        { color: "#34c759", label: t("Requests") },
-        { color: overviewCacheColor, label: t("Cache tokens") }
-      ]
-    : variant === "bar"
-      ? [
-          { color: "#007aff", label: t("Total tokens") },
-          { color: "#34c759", label: t("Requests") }
-        ]
-      : [
-          { color: "#007aff", label: t("Total tokens") },
-          { color: overviewCacheColor, label: t("Cache tokens") }
-        ];
-
+  setUsageLocale(t("Usage") === "用量" ? "zh" : "en");
+  const [period, setPeriod] = useState<"day" | "week" | "month" | "total">("month");
+  const range = heatmapTrendRange(period);
+  const timeZone = getBrowserTimeZone() || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const trend = useTrendData({
+    period,
+    from: range.from,
+    to: range.to,
+    timeZone,
+    tzOffsetMinutes: getBrowserTimeZoneOffsetMinutes()
+  });
   return (
     <Card className="overview-card flex h-full min-h-0 min-w-0 flex-col">
-      <OverviewCardHeading icon={ChartNoAxesCombined} title={t("Usage Trend")} trailing={dimensions.width >= 2 ? <OverviewChartLegend items={legendItems} /> : null} />
-      <CardContent className="min-h-0 flex-1">
-        <ChartFrame fill>
-          {({ height, width }) => (
-            <ComposedChart data={usageStats.series} height={height} margin={chartMargin} width={width}>
-              <CartesianGrid stroke="var(--overview-chart-grid)" strokeDasharray="2 5" vertical={false} />
-              <XAxis axisLine={false} dataKey="label" hide={dimensions.height <= 1} tick={{ fill: "var(--muted-foreground)", fontSize: 11 }} tickLine={false} />
-              <YAxis axisLine={false} hide={dimensions.width <= 1} tick={{ fill: "var(--muted-foreground)", fontSize: 11 }} tickFormatter={formatAxisNumber} tickLine={false} yAxisId="tokens" />
-              <YAxis axisLine={false} hide orientation="right" yAxisId="requests" />
-              <Tooltip content={<UsageTooltip />} portal={chartTooltipPortal()} />
-              {variant === "composed" ? (
-                <>
-                  <Area dataKey="totalTokens" fill="#007aff" fillOpacity={0.12} name={t("Total tokens")} stroke="#007aff" strokeWidth={2.25} type="monotone" yAxisId="tokens" />
-                  <Bar barSize={12} dataKey="requestCount" fill="#34c759" name={t("Requests")} radius={[4, 4, 0, 0]} yAxisId="requests">
-                    <LabelList content={<RequestHealthBarLabel />} dataKey="requestCount" />
-                  </Bar>
-                  <Line dataKey="cacheTokens" dot={false} name={t("Cache tokens")} stroke={overviewCacheColor} strokeWidth={2} type="monotone" yAxisId="tokens" />
-                </>
-              ) : null}
-              {variant === "area" ? (
-                <>
-                  <Area dataKey="totalTokens" fill="#007aff" fillOpacity={0.14} name={t("Total tokens")} stroke="#007aff" strokeWidth={2.25} type="monotone" yAxisId="tokens" />
-                  <Area dataKey="cacheTokens" fill={overviewCacheColor} fillOpacity={0.12} name={t("Cache tokens")} stroke={overviewCacheColor} strokeWidth={2} type="monotone" yAxisId="tokens" />
-                </>
-              ) : null}
-              {variant === "line" ? (
-                <>
-                  <Line dataKey="totalTokens" dot={false} name={t("Total tokens")} stroke="#007aff" strokeWidth={2.5} type="monotone" yAxisId="tokens" />
-                  <Line dataKey="cacheTokens" dot={false} name={t("Cache tokens")} stroke={overviewCacheColor} strokeWidth={2} type="monotone" yAxisId="tokens" />
-                </>
-              ) : null}
-              {variant === "bar" ? (
-                <>
-                  <Bar barSize={14} dataKey="totalTokens" fill="#007aff" name={t("Total tokens")} radius={[4, 4, 0, 0]} yAxisId="tokens" />
-                  <Line dataKey="requestCount" dot={false} name={t("Requests")} stroke="#34c759" strokeWidth={2} type="monotone" yAxisId="requests" />
-                </>
-              ) : null}
-            </ComposedChart>
-          )}
-        </ChartFrame>
+      <OverviewCardHeading
+        icon={ChartNoAxesCombined}
+        title={t("Usage Trend")}
+        trailing={<TrendPeriodTabs period={period} periods={["day", "week", "month", "total"]} onPeriodChange={(value)=>{if(value==="day"||value==="week"||value==="month"||value==="total")setPeriod(value);}} />}
+      />
+      <CardContent className="min-h-0 flex-1 px-3 pb-3">
+        <UsageTrendLineChart
+          period={period}
+          onPeriodChange={(value)=>{if(value==="day"||value==="week"||value==="month"||value==="total")setPeriod(value);}}
+          rows={trend.rows as Array<Record<string, unknown>>}
+          loading={trend.loading}
+          from={range.from}
+          to={range.to}
+          size="compact"
+          showHeader={false}
+          periods={["day", "week", "month", "total"]}
+        />
       </CardContent>
     </Card>
   );
@@ -1890,21 +1860,22 @@ function OverviewAnalysisWidget({
     ];
 
   const rowLimit = overviewAnalysisRowLimit(dimensions);
+  const displayRows = collapseAnalysisDisplayRows(kind, rows);
   const shouldUseCompact = variant === "compact" || dimensions.width <= 2 || dimensions.height <= 1;
 
   if (shouldUseCompact) {
     return (
       <Card className="overview-card flex h-full min-h-0 min-w-0 flex-col">
-        <OverviewCardHeading icon={UsersRound} title={title} tone="slate" trailing={<Badge variant="outline">{rows.length}</Badge>} />
+        <OverviewCardHeading icon={UsersRound} title={title} tone="slate" trailing={<Badge variant="outline">{displayRows.length}</Badge>} />
         <CardContent className="min-h-0 flex-1 overflow-hidden">
-          {rows.length === 0 ? (
+          {displayRows.length === 0 ? (
             <OverviewEmptyState compact label={emptyLabel} />
           ) : (
             <div className="space-y-2">
-              {rows.slice(0, rowLimit).map((row) => (
-                <div className="overview-nested-surface flex min-w-0 items-center justify-between gap-3 border px-3 py-2" key={row.key}>
-                  <span className="min-w-0 truncate text-[12px] font-medium">{row.label}</span>
-                  <span className="shrink-0 text-[12px] font-semibold">{formatCompactNumber(row.totalTokens)}</span>
+              {displayRows.slice(0, rowLimit).map((row) => (
+                <div className="flex min-w-0 items-center justify-between gap-3 rounded-xl border border-border bg-white px-3 py-2.5 dark:bg-neutral-900" key={row.key}>
+                  <span className="min-w-0 truncate text-[13px] font-medium">{row.label}</span>
+                  <span className="shrink-0 text-[13px] font-semibold tabular-nums">{formatCompactNumber(row.totalTokens)}</span>
                 </div>
               ))}
             </div>
@@ -1917,6 +1888,31 @@ function OverviewAnalysisWidget({
   return <UsageAnalysisCard columns={columns} dimensions={dimensions} emptyLabel={emptyLabel} rows={rows} title={title} />;
 }
 
+function analysisDisplayLabel(kind: "client" | "provider", row: UsageComparisonRow): string {
+  if (kind === "provider") {
+    return row.provider && row.provider !== "unknown" ? row.provider : row.label;
+  }
+  if (row.client && row.client !== "unknown") return row.client;
+  if (row.provider && row.provider !== "unknown") return row.provider;
+  if (row.model && row.model !== "unknown") return row.model;
+  return row.label;
+}
+
+function collapseAnalysisDisplayRows(kind: "client" | "provider", rows: UsageComparisonRow[]): UsageComparisonRow[] {
+  const grouped = new Map<string, UsageComparisonRow>();
+  for (const row of rows) {
+    const label = analysisDisplayLabel(kind, row);
+    const existing = grouped.get(label);
+    if (existing) {
+      existing.totalTokens += row.totalTokens || 0;
+      existing.requestCount += row.requestCount || 0;
+      continue;
+    }
+    grouped.set(label, { ...row, key: `${kind}:${label}`, label });
+  }
+  return [...grouped.values()].sort((left, right) => (right.totalTokens || 0) - (left.totalTokens || 0));
+}
+
 function overviewAnalysisRowLimit(dimensions: OverviewWidgetDimensions): number {
   if (dimensions.height <= 1) return 2;
   if (dimensions.height === 2) return 5;
@@ -1926,12 +1922,11 @@ function overviewAnalysisRowLimit(dimensions: OverviewWidgetDimensions): number 
 
 function overviewWidgetTemplates(): OverviewWidgetConfig[] {
   return [
-    { enabled: true, id: "system-status", size: "4:1", type: "system-status", variant: "timeline" },
-    { enabled: true, id: "account-balance", size: "4:2", type: "account-balance", variant: "cards" },
+    { enabled: true, id: "system-status", size: "4:2", type: "system-status", variant: "timeline" },
+    { enabled: true, id: "account-balance", size: "4:2", type: "account-balance", variant: "compact" },
     { enabled: true, id: "metric-requests", metric: "requests", size: "1:1", type: "metric", variant: "card" },
     { enabled: true, id: "usage-trend", size: "3:2", type: "usage-trend", variant: "composed" },
     { enabled: true, id: "token-activity", size: "4:2", type: "token-activity", variant: "heatmap" },
-    { enabled: true, id: "token-mix", size: "1:2", type: "token-mix", variant: "bars" },
     { enabled: true, id: "client-analysis", size: "2:2", type: "client-analysis", variant: "table" },
     { enabled: true, id: "share-usage-wrapped", size: "1:4", type: "share-usage-wrapped", variant: "card" },
     { enabled: true, id: "share-route-map", size: "1:4", type: "share-route-map", variant: "card" },
@@ -2232,8 +2227,11 @@ function isShareOverviewWidgetType(type: OverviewWidgetType): type is ShareOverv
     type === "share-usage-wrapped";
 }
 
-function overviewWidgetSizeClass(size: OverviewWidgetSize): string {
+function overviewWidgetSizeClass(size: OverviewWidgetSize, type?: OverviewWidgetType): string {
   const { height, width } = overviewWidgetDimensions(size);
+  if (type === "system-status") {
+    return cn(overviewWidgetWidthClass(4), "h-auto");
+  }
   return cn(overviewWidgetWidthClass(width), overviewWidgetHeightClass(height));
 }
 
@@ -2307,14 +2305,14 @@ function uniqueOverviewWidgetId(widgets: OverviewWidgetConfig[], baseId: string)
 type OverviewAccountVariant = "arc" | "bars" | "cards" | "compact" | "nested-rings" | "ring" | "semicircle";
 
 function overviewAccountVariant(value: OverviewWidgetVariant): OverviewAccountVariant {
-  return value === "arc" || value === "bars" || value === "compact" || value === "nested-rings" || value === "ring" || value === "semicircle" ? value : "cards";
+  return value === "bars" ? "bars" : "compact";
 }
 
 function overviewMetricVariant(value: OverviewWidgetVariant): "bar" | "card" | "compact" | "ring" {
   return value === "bar" || value === "compact" || value === "ring" ? value : "card";
 }
 
-function overviewTrendVariant(value: OverviewWidgetVariant): "area" | "bar" | "composed" | "line" {
+export function overviewTrendVariant(value: OverviewWidgetVariant): "area" | "bar" | "composed" | "line" {
   return value === "area" || value === "bar" || value === "line" ? value : "composed";
 }
 
@@ -2403,10 +2401,12 @@ function resolveSystemStatusTooltipPosition(rect: DOMRect): Omit<SystemStatusToo
 }
 
 function SystemStatusBar({
+  dimensions,
   variant = "timeline",
   usageRange,
   usageStats
 }: {
+  dimensions?: OverviewWidgetDimensions;
   variant?: "compact" | "timeline";
   usageRange: UsageStatsRange;
   usageStats: UsageStatsSnapshot;
@@ -2463,83 +2463,115 @@ function SystemStatusBar({
     );
   }
 
+  const providerRows = (usageStats.providerSeries ?? [])
+    .filter((row) => row.provider && row.provider !== "unknown")
+    .map((row) => ({
+      provider: row.provider,
+      totals: row.totals,
+      tone: usageStatusTone(row.totals),
+      segments: row.series.map((point) => ({
+        dateLabel: formatStatusBucketDate(point.bucket, usageRange),
+        point,
+        tone: usageStatusTone(point)
+      }))
+    }));
+  const statusRows = providerRows.length > 0
+    ? providerRows
+    : [{
+      provider: t("API Service"),
+      totals: usageStats.totals,
+      tone: overallTone,
+      segments
+    }];
+
+  const statusRangeLabel = statusRows[0]?.segments.length
+    ? formatSystemStatusRange(statusRows[0].segments, "30d")
+    : rangeLabel;
+
+  const renderTicks = (row: (typeof statusRows)[number]) => (
+    <div className="flex h-4 min-w-0 items-stretch" aria-label={`${row.provider} ${t("System status")}`} style={{ gap: 4 }}>
+      {row.segments.map((segment, index) => (
+        <span
+          aria-label={systemStatusPointTooltip(segment, t)}
+          className="relative min-w-0 flex-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          key={`${row.provider}-${segment.point.bucket}-${index}`}
+          onBlur={() => setStatusTooltip(undefined)}
+          onFocus={(event) => showStatusTooltip(segment, event.currentTarget)}
+          onMouseEnter={(event) => showStatusTooltip(segment, event.currentTarget)}
+          onMouseLeave={() => setStatusTooltip(undefined)}
+          style={{ height: 16 }}
+          tabIndex={0}
+        >
+          <span className="overview-status-tick block h-full w-full rounded-[1px]" data-tone={segment.tone} />
+        </span>
+      ))}
+    </div>
+  );
+
   return (
-    <Card className="overview-card flex h-full min-h-0 min-w-0 flex-col">
+    <Card className="overview-card flex h-auto min-w-0 flex-col">
       <OverviewCardHeading
         icon={Server}
         title={t("System status")}
         tone={overallTone === "ok" ? "green" : overallTone === "warn" ? "orange" : overallTone === "error" ? "red" : "slate"}
-        trailing={<span className="overview-date-pill block max-w-[320px] truncate">{rangeLabel}</span>}
+        trailing={<span className="overview-date-pill block max-w-[320px] truncate">{statusRangeLabel}</span>}
       />
-      <CardContent className="min-h-0 flex-1 overflow-hidden p-3">
-        <div className="space-y-2.5">
-          <div className="flex min-w-0 items-center justify-between gap-3">
-            <div className="flex min-w-0 items-center gap-2">
-              <span className="overview-status-icon flex h-4 w-4 shrink-0 items-center justify-center rounded-full" data-tone={overallTone}>
-                <StatusIcon className="h-3 w-3" />
-              </span>
-              <span className="min-w-0 truncate text-[13px] font-semibold">{t("API Service")}</span>
-            </div>
-            <Badge variant={overallTone === "ok" ? "success" : overallTone === "warn" ? "warning" : overallTone === "error" ? "danger" : "outline"}>
-              {successLabel}
-            </Badge>
-          </div>
-
-          <div className="flex min-w-0 gap-1" aria-label={t("System status")}>
-            {segments.map((segment, index) => (
-              <span
-                aria-label={systemStatusPointTooltip(segment, t)}
-                className="relative flex h-5 min-w-[3px] flex-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-                key={`${segment.point.bucket}-${index}`}
-                onBlur={() => setStatusTooltip(undefined)}
-                onFocus={(event) => showStatusTooltip(segment, event.currentTarget)}
-                onMouseEnter={(event) => showStatusTooltip(segment, event.currentTarget)}
-                onMouseLeave={() => setStatusTooltip(undefined)}
-                tabIndex={0}
-              >
-                <span
-                  aria-label={systemStatusPointTooltip(segment, t)}
-                  className="overview-status-segment h-full w-full rounded-[4px]"
-                  data-tone={segment.tone}
-                />
-              </span>
-            ))}
-            {statusTooltip ? (
-              <TooltipPortal
-                className="w-[190px] max-w-[calc(100vw-24px)] px-3 py-2 text-left font-normal leading-4"
-                style={{ left: statusTooltip.left, top: statusTooltip.top }}
-              >
-                <span
-                  aria-hidden="true"
-                  className={cn(
-                    "absolute h-2 w-2 -translate-x-1/2 rotate-45 bg-popover",
-                    statusTooltip.placement === "above"
-                      ? "-bottom-1 border-b border-r border-border/70"
-                      : "-top-1 border-l border-t border-border/70"
-                  )}
-                  style={{ left: statusTooltip.arrowLeft }}
-                />
-                <span className="block font-semibold">{statusTooltip.segment.dateLabel}</span>
-                <span className="mt-1 flex justify-between gap-3">
-                  <span className="text-muted-foreground">{t("Requests")}</span>
-                  <span className="font-medium">{formatCompactNumber(statusTooltip.segment.point.requestCount)}</span>
-                </span>
-                <span className="flex justify-between gap-3">
-                  <span className="text-muted-foreground">{t("Success rate")}</span>
-                  <span className="font-medium">{statusTooltip.segment.point.requestCount > 0 ? formatPercent(statusTooltip.segment.point.successRate) : "—"}</span>
-                </span>
-                <span className="flex justify-between gap-3">
-                  <span className="text-muted-foreground">{t("Failed requests")}</span>
-                  <span className="font-medium">{formatCompactNumber(statusTooltip.segment.point.errorCount)}</span>
-                </span>
-                <span className="flex justify-between gap-3">
-                  <span className="text-muted-foreground">{t("Duration")}</span>
-                  <span className="font-medium">{formatDuration(statusTooltip.segment.point.avgDurationMs)}</span>
-                </span>
-              </TooltipPortal>
-            ) : null}
-          </div>
+      <CardContent className="min-w-0 p-4">
+        <div className="mb-4">
+          <div className="text-[28px] font-semibold leading-none tracking-tight">{usageStats.totals.requestCount > 0 ? formatPercent(usageStats.totals.successRate) : "—"}</div>
+          <div className="mt-1 text-[11px] text-muted-foreground">{t("Request success rate")}</div>
         </div>
+        <div className="space-y-3">
+          {statusRows.map((row) => {
+            const RowIcon = row.tone === "ok" ? Check : CircleAlert;
+            return (
+              <div className="min-w-0" key={row.provider}>
+                <div className="mb-1.5 flex min-w-0 items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="overview-status-icon flex h-4 w-4 shrink-0 items-center justify-center rounded-full" data-tone={row.tone}>
+                      <RowIcon className="h-3 w-3" />
+                    </span>
+                    <span className="min-w-0 truncate text-[13px] font-medium">{row.provider}</span>
+                  </div>
+                  <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">
+                    {row.totals.requestCount > 0 ? `${formatPercent(row.totals.successRate)} ${t("uptime")}` : t("No requests yet")}
+                  </span>
+                </div>
+                {renderTicks(row)}
+              </div>
+            );
+          })}
+        </div>
+        {statusTooltip ? (
+          <TooltipPortal
+            className="w-[190px] max-w-[calc(100vw-24px)] px-3 py-2 text-left font-normal leading-4"
+            style={{ left: statusTooltip.left, top: statusTooltip.top }}
+          >
+            <span
+              aria-hidden="true"
+              className={cn(
+                "absolute h-2 w-2 -translate-x-1/2 rotate-45 bg-popover",
+                statusTooltip.placement === "above"
+                  ? "-bottom-1 border-b border-r border-border/70"
+                  : "-top-1 border-l border-t border-border/70"
+              )}
+              style={{ left: statusTooltip.arrowLeft }}
+            />
+            <span className="block font-semibold">{statusTooltip.segment.dateLabel}</span>
+            <span className="mt-1 flex justify-between gap-3">
+              <span className="text-muted-foreground">{t("Requests")}</span>
+              <span className="font-medium">{formatCompactNumber(statusTooltip.segment.point.requestCount)}</span>
+            </span>
+            <span className="flex justify-between gap-3">
+              <span className="text-muted-foreground">{t("Success rate")}</span>
+              <span className="font-medium">{statusTooltip.segment.point.requestCount > 0 ? formatPercent(statusTooltip.segment.point.successRate) : "—"}</span>
+            </span>
+            <span className="flex justify-between gap-3">
+              <span className="text-muted-foreground">{t("Failed requests")}</span>
+              <span className="font-medium">{formatCompactNumber(statusTooltip.segment.point.errorCount)}</span>
+            </span>
+          </TooltipPortal>
+        ) : null}
       </CardContent>
     </Card>
   );
@@ -2635,18 +2667,17 @@ function ProviderAccountsOverview({
             {visibleAccounts.map((account) => {
               const meter = primaryProviderAccountDisplayMeter(account);
               return (
-                <div className="overview-nested-surface flex min-h-0 min-w-0 items-center justify-between gap-3 overflow-hidden border px-3 py-2" key={providerAccountSnapshotKey(account)}>
-                  <div className="flex min-w-0 items-center gap-2">
-                    <ProviderAccountLogo account={account} className="h-7 w-7 rounded-md" providers={providers} />
+                <div className="flex min-h-0 min-w-0 items-center justify-between gap-3 overflow-hidden rounded-xl border border-border bg-white px-3 py-2.5 dark:bg-neutral-900" key={providerAccountSnapshotKey(account)}>
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <ProviderAccountLogo account={account} className="h-8 w-8 rounded-lg" providers={providers} />
                     <div className="min-w-0">
-                      <div className="truncate text-[12px] font-semibold">{providerAccountSnapshotLabel(account)}</div>
-                      {providerAccountShowSource(dimensions) && meter ? <div className="truncate text-[11px] text-muted-foreground">{t(meter.label)}</div> : null}
-                      {providerAccountShowRefreshTime(dimensions) ? <div className="truncate text-[11px] text-muted-foreground">{formatProviderAccountRefreshTime(account, t)}</div> : null}
+                      <div className="truncate text-[13px] font-medium">{providerAccountSnapshotLabel(account)}</div>
+                      {meter ? <div className="truncate text-[11px] text-muted-foreground">{t(meter.label)}</div> : <div className="truncate text-[11px] text-muted-foreground">{account.message || account.errors?.[0]?.message || t("Unavailable")}</div>}
                     </div>
                   </div>
-                  <div className="flex shrink-0 flex-col items-end gap-1 text-right">
+                  <div className="flex shrink-0 items-center gap-2 text-right">
+                    {meter ? <div className="text-[13px] font-semibold tabular-nums">{formatProviderAccountMeterValue(meter)}</div> : null}
                     {providerAccountShowRefresh(dimensions) ? <ProviderAccountRefreshButton account={account} refreshing={refreshing} onRefresh={onRefresh} /> : null}
-                    {meter ? <div className="text-[12px] font-semibold">{formatProviderAccountMeterValue(meter)}</div> : null}
                   </div>
                 </div>
               );
@@ -3314,17 +3345,23 @@ function ProviderAccountLogo({
   );
 }
 
+function isUsableProviderIconUrl(url: string): boolean {
+  return url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:") || url.startsWith("blob:") || url.startsWith("/") || url.startsWith(".");
+}
+
 function providerAccountIconUrl(account: ProviderAccountSnapshot, providers: GatewayProviderConfig[]): string {
   const providerName = account.provider.trim().toLowerCase();
   if (!providerName) {
     return "";
   }
-  const provider = providers.find((item) => (
-    item.name.trim().toLowerCase() === providerName
-      || item.id?.trim().toLowerCase() === providerName
-      || item.provider?.trim().toLowerCase() === providerName
-  ));
-  return provider ? providerDisplayIcon(provider) : "";
+  const provider = providers.find((item) => {
+    const name = item.name.trim().toLowerCase();
+    const id = item.id?.trim().toLowerCase() || "";
+    const kind = item.provider?.trim().toLowerCase() || "";
+    return name === providerName || id === providerName || kind === providerName || name.includes(providerName) || providerName.includes(name);
+  });
+  const url = provider ? providerDisplayIcon(provider) : "";
+  return url && isUsableProviderIconUrl(url) ? url : "";
 }
 
 function ProviderAccountRefreshButton({
@@ -6295,7 +6332,7 @@ type RequestHealthBarLabelProps = {
   y?: number | string;
 };
 
-function RequestHealthBarLabel({ payload, value, width, x, y }: RequestHealthBarLabelProps) {
+export function RequestHealthBarLabel({ payload, value, width, x, y }: RequestHealthBarLabelProps) {
   const requestCount = Number(value ?? payload?.requestCount ?? 0);
   const xValue = Number(x);
   const yValue = Number(y);
@@ -6319,7 +6356,7 @@ function RequestHealthBarLabel({ payload, value, width, x, y }: RequestHealthBar
   );
 }
 
-function UsageTooltip({
+export function UsageTooltip({
   active,
   label,
   payload

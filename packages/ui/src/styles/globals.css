@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "../vendor/cc-switch/preflight.css";
 @import "../vendor/cc-switch/routing.css";
+@import "react-day-picker/style.css";
 @source "../vendor/tokentracker/**/*.{js,jsx}";
 @source "../pages/**/*.{html,ts,tsx}";
 @source "../components/**/*.{ts,tsx}";
@@ -523,10 +524,14 @@
   }
 
   .overview-card {
-    background: color-mix(in oklab, var(--card) 96%, var(--background));
-    border-color: color-mix(in oklab, var(--border) 70%, transparent);
+    background: #fff;
+    border-color: rgba(0, 0, 0, 0.08);
     border-radius: 16px;
     box-shadow: none !important;
+  }
+  .dark .overview-card {
+    background: #171717;
+    border-color: rgba(255, 255, 255, 0.1);
   }
 
   .overview-card-header {
@@ -641,6 +646,13 @@
     filter: brightness(1.04) saturate(1.08);
     transform: translateY(-1px);
   }
+
+  .overview-status-tick[data-tone="ok"] { background: #22c55e; }
+  .overview-status-tick[data-tone="warn"] { background: #f59e0b; }
+  .overview-status-tick[data-tone="error"] { background: #ef4444; }
+  .overview-status-tick[data-tone="idle"] { background: #e7e7e7; }
+  .dark .overview-status-tick[data-tone="idle"] { background: #3f3f46; }
+  .overview-status-tick:hover { filter: brightness(1.06); }
 
   .overview-metric-card {
     --overview-metric-accent: #30b0c7;
@@ -1624,13 +1636,33 @@
 .local-usage-page { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif; -webkit-font-smoothing: antialiased; color: #0a0a0a; background: transparent; }
 .dark .local-usage-page { color: #fafafa; background: transparent; }
 
-.rdp-selected { background: #0a0a0a; border-radius: 0; }
-.rdp-selected .rdp-day-btn { color: #fff; background: transparent; }
-.rdp-range-start { border-radius: 8px 0 0 8px; }
-.rdp-range-end { border-radius: 0 8px 8px 0; }
-.rdp-range-start.rdp-range-end { border-radius: 8px; }
-.dark .rdp-selected { background: #fafafa; }
-.dark .rdp-selected .rdp-day-btn { color: #0a0a0a; }
+.rdp-oai {
+  --rdp-accent-color: #0a0a0a;
+  --rdp-accent-background-color: rgba(10, 10, 10, 0.08);
+  --rdp-range_middle-background-color: rgba(10, 10, 10, 0.08);
+  --rdp-day-height: 36px;
+  --rdp-day-width: 36px;
+  --rdp-day_button-height: 36px;
+  --rdp-day_button-width: 36px;
+  --rdp-day_button-border-radius: 8px;
+  --rdp-selected-border: 2px solid transparent;
+}
+.dark .rdp-oai {
+  --rdp-accent-color: #fafafa;
+  --rdp-accent-background-color: rgba(250, 250, 250, 0.12);
+  --rdp-range_middle-background-color: rgba(250, 250, 250, 0.12);
+  --rdp-range_start-color: #0a0a0a;
+  --rdp-range_end-color: #0a0a0a;
+}
+.rdp-oai .rdp-months {
+  flex-wrap: nowrap;
+  max-width: none;
+}
+.rdp-oai .rdp-weekday {
+  width: var(--rdp-day-width);
+  overflow: hidden;
+  white-space: nowrap;
+}
 
 .app-usage-sidebar, .app-usage-surface { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
 .app-usage-sidebar { background: rgba(250,252,251,.7); backdrop-filter: blur(28px) saturate(1.12); }
@@ -1677,7 +1709,8 @@
 
 @theme { --text-body-sm: 14px; --text-caption: 12px; --text-label: 11px; }
 body:has(.app-usage-surface) { --app-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif; }
-body:has(.app-usage-surface) #root > div, body:has(.app-usage-surface) .bg-background { background: transparent; }
+body:has(.app-usage-surface) #root > div, body:has(.app-usage-surface) .bg-background { background: #fafafa; }
+.dark body:has(.app-usage-surface) #root > div, .dark body:has(.app-usage-surface) .bg-background { background: #141414; }
 .app-usage-sidebar { background: transparent; backdrop-filter: none; }
 .app-usage-sidebar nav button { font-size: 16px; font-weight: 400; height: 40px; border-radius: 10px; }
 .app-usage-sidebar nav button.bg-card { background: rgba(128,128,128,.12); box-shadow: none; }
@@ -1697,17 +1730,18 @@ body:has(.app-usage-surface), .local-usage-page, .app-usage-sidebar, .app-usage-
 }
 .app-usage-sidebar nav button { color: #525252; font-size: 13px; font-weight: 400; }
 .app-usage-sidebar nav button.bg-card { color: #0a0a0a; font-weight: 500; }
-.app-usage-sidebar { background: rgba(250,250,250,.74); }
-.dark .app-usage-sidebar { background: rgba(28,28,28,.68); }
+.app-usage-sidebar { background: #f3f3f3; }
+.dark .app-usage-sidebar { background: #1c1c1c; }
 .dark .app-usage-sidebar nav button { color: #a3a3a3; }
 .dark .app-usage-sidebar nav button.bg-card { color: #fafafa; }
 
 /* Keep the toolbar in the window chrome; inset only the scrollable page. */
 .app-usage-controls { top: 0; height: 46px; }
-.app-usage-surface, .dark .app-usage-surface { margin: 0; border: 0; border-radius: 0; background: rgba(250,250,250,.74); }
-.app-usage-surface > .app-titlebar { height: 46px; background: transparent; }
+.app-usage-surface, .dark .app-usage-surface { margin: 0; border: 0; border-radius: 0; background: #fafafa; }
+.app-usage-surface > .app-titlebar { height: 46px; background: #fafafa; }
 .app-usage-surface > .app-page-content { margin: 0; padding: 0; border: 0; border-radius: 0; background: #fff; }
-.dark .app-usage-surface { background: rgba(28,28,28,.68); }
+.dark .app-usage-surface { background: #1c1c1c; }
+.dark .app-usage-surface > .app-titlebar { background: #1c1c1c; }
 .dark .app-usage-surface > .app-page-content { background: #141414; }
 
 .ar-route-toolbar { display:flex; align-items:center; gap:12px; margin-left:8px; }
@@ -1745,4 +1779,4 @@ html[data-window-active="false"] .status-heartbeat {
 
 .local-usage-page { max-width: none; padding-top: 64px; }
 
-.app-usage-surface > .app-page-content:not([data-view="usage"]) { padding:64px 20px 20px; }
+.app-usage-surface > .app-page-content:not([data-view="usage"]):not([data-view="heatmap"]):not([data-view="sessions"]):not([data-view="trend"]) { padding:64px 20px 20px; }

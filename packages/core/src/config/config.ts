@@ -1200,7 +1200,7 @@ function parseOverviewWidgetSize(value: unknown, type: OverviewWidgetType): Over
     return "3:2";
   }
   if (value === "full") {
-    return type === "system-status" ? "4:1" : "4:2";
+    return "4:2";
   }
   return undefined;
 }
@@ -1233,7 +1233,7 @@ function defaultOverviewWidgetSize(type: OverviewWidgetType): OverviewWidgetSize
     return "3:2";
   }
   if (type === "system-status") {
-    return "4:1";
+    return "4:2";
   }
   if (isShareOverviewWidgetType(type)) {
     return "1:4";

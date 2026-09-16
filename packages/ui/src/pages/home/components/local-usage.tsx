@@ -6,13 +6,14 @@ import {buildFleetData} from '@/vendor/tokentracker/lib/model-breakdown';
 import {copy,setUsageLocale} from '@/vendor/tokentracker/lib/copy';
 import {useAppText} from '../shared/index';
 
-type Period='day'|'week'|'month'|'total'|'custom';
+type Period='day'|'week'|'month'|'year'|'total'|'custom';
 export function localUsageRange(period:Period, custom:{from:string;to:string}, now=new Date()){
  const day=(d:Date)=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
  if(period==='custom')return custom;
  const start=new Date(now);const end=new Date(now);
  if(period==='week'){start.setDate(start.getDate()-((start.getDay()+6)%7));end.setTime(start.getTime());end.setDate(start.getDate()+6);}
  if(period==='month'){start.setDate(1);end.setMonth(end.getMonth()+1,0);}
+ if(period==='year'){start.setMonth(0,1);end.setMonth(11,31);}
  return {from:period==='total'?'':day(start),to:day(end)};
 }
 export const LocalUsageView=memo(function LocalUsageView(){

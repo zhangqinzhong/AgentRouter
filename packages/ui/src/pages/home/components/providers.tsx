@@ -1464,7 +1464,7 @@ function LocalAgentProviderImportPanel({
   }
 
   return (
-    <div className="sm:col-span-2 rounded-md border border-border bg-muted/20 p-3">
+    <div className="sm:col-span-2 rounded-xl border border-border bg-white p-3 dark:bg-neutral-900">
       <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
         <div className="min-w-0">
           <div className="truncate text-[12px] font-semibold text-foreground">{t("Import local agent provider")}</div>

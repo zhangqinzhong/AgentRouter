@@ -23,6 +23,7 @@ export function createEmptyUsageStats(range: UsageStatsRange): UsageStatsSnapsho
     range,
     recentRequests: [],
     series: createEmptyUsageSeries(range),
+    providerSeries: [],
     totals: emptyUsageTotals()
   };
 }

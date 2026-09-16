@@ -56,7 +56,11 @@ test("settings save progress is a live status inside the dialog flow", () => {
 test("only the unchanged legacy dashboard receives the new default order", () => {
   assert.deepEqual(normalizeOverviewWidgets(LEGACY_DEFAULT_OVERVIEW_WIDGETS), DEFAULT_OVERVIEW_WIDGETS);
   const customized = LEGACY_DEFAULT_OVERVIEW_WIDGETS.map((widget, index) => index === 0 ? { ...widget, enabled: false } : widget);
-  assert.deepEqual(normalizeOverviewWidgets(customized), customized.map(normalizeOverviewWidget));
+  const expectedCustomized = customized
+    .map(normalizeOverviewWidget)
+    .filter((widget): widget is NonNullable<typeof widget> => Boolean(widget) && widget.type !== "token-mix")
+    .map((widget) => widget.type === "account-balance" && widget.variant === "cards" ? { ...widget, variant: "compact" } : widget);
+  assert.deepEqual(normalizeOverviewWidgets(customized), expectedCustomized);
   assert.deepEqual(normalizeOverviewWidgets([]), []);
 });
 

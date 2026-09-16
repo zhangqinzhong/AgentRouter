@@ -1,4 +1,4 @@
-import {getLocalUsagePage, getLocalUsageCategories, type LocalUsageCategoryRange, type LocalUsageRange} from "@agentrouter/core/collector/usage-page";
+import {getLocalUsagePage, getLocalUsageTrend, getLocalUsageHeatmap, getLocalUsageSessions, getLocalUsageCategories, type LocalUsageCategoryRange, type LocalUsageHeatmapQuery, type LocalUsageRange, type LocalUsageSessionsQuery, type LocalUsageTrendQuery} from "@agentrouter/core/collector/usage-page";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -342,6 +342,9 @@ const rpcHandlers: Record<string, RpcHandler> = {
   getRequestLogs: (filter) => getRequestLogs(filter as RequestLogListFilter | undefined),
   getUpdateStatus: () => unsupportedUpdateStatus,
   getLocalUsagePage: (range) => getLocalUsagePage(range as LocalUsageRange),
+  getLocalUsageTrend: (query) => getLocalUsageTrend(query as LocalUsageTrendQuery),
+  getLocalUsageHeatmap: (query) => getLocalUsageHeatmap(query as LocalUsageHeatmapQuery | undefined),
+  getLocalUsageSessions: (query) => getLocalUsageSessions(query as LocalUsageSessionsQuery | undefined),
   getLocalUsageCategories: (range) => getLocalUsageCategories(range as LocalUsageCategoryRange),
   getUsageStats: (range, filter) => getUsageStats(range as UsageStatsRange | undefined, filter as UsageStatsFilter | undefined),
   importLocalAgentProvider: (request) => importLocalAgentProvider(request as LocalAgentProviderImportRequest),

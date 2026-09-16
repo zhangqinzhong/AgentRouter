@@ -140,7 +140,7 @@ export async function getProfileOpenCommand(config: AppConfig, request: ProfileO
     ensureArCliLauncher(config);
   }
   return {
-    command: profileOpenCommand(profile, surface, options.commandName ?? desktopCliCommandName, commandProfileRef(config, profile)),
+    command: profileOpenCommand(profile, surface, options.commandName ?? desktopCliCommandName, commandProfileRef(config, profile), request.extraArgs),
     profileId: profile.id,
     profileName: profile.name,
     surface
@@ -166,7 +166,7 @@ export async function openProfileFromAr(config: AppConfig, request: ProfileOpenR
   }
   if (surface === "cli") {
     const launcher = ensureArCliLauncher(config);
-    const terminal = profileTerminalLaunch(CONFIGDIR, launcher, profile.id, process.platform, profile.terminalApp);
+    const terminal = profileTerminalLaunch(CONFIGDIR, launcher, profile.id, process.platform, profile.terminalApp, request.extraArgs);
     if (terminal.scriptFile && terminal.scriptContent) {
       mkdirSync(path.dirname(terminal.scriptFile), { recursive: true });
       writeFileIfChanged(terminal.scriptFile, terminal.scriptContent);

@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from "react";
-import { DayPicker } from "react-day-picker";
+import { DayPicker, getDefaultClassNames } from "react-day-picker";
 import { format } from "date-fns";
 import { enUS, zhCN, zhTW, ja, ko } from "date-fns/locale";
 import { Button } from "../../components";
@@ -64,9 +64,11 @@ export function DateRangePopover({ from, to, onApply, onCancel }) {
   };
 
   const hasSelection = !!range?.from;
+  const defaultClassNames = getDefaultClassNames();
+  const now = new Date();
 
   return (
-    <div className="p-4">
+    <div className="p-4 bg-white dark:bg-oai-gray-900 rounded-xl">
       <DayPicker
         mode="range"
         locale={dateLocale}
@@ -74,33 +76,16 @@ export function DateRangePopover({ from, to, onApply, onCancel }) {
         onSelect={setRange}
         numberOfMonths={2}
         showOutsideDays={false}
+        captionLayout="dropdown"
+        startMonth={new Date(2018, 0)}
+        endMonth={new Date(now.getFullYear() + 1, 11)}
+        defaultMonth={range?.from || range?.to || now}
         classNames={{
-          root: "rdp-oai",
-          months: "flex gap-4",
-          month: "space-y-3",
-          month_caption: "flex justify-center items-center h-8",
-          caption_label: "text-sm font-medium text-oai-black dark:text-oai-white",
-          nav: "flex items-center justify-between absolute inset-x-0 top-0 px-2",
-          button_previous: "inline-flex items-center justify-center w-7 h-7 rounded-md text-oai-gray-500 hover:text-oai-black dark:text-oai-gray-400 dark:hover:text-oai-white hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 transition-colors",
-          button_next: "inline-flex items-center justify-center w-7 h-7 rounded-md text-oai-gray-500 hover:text-oai-black dark:text-oai-gray-400 dark:hover:text-oai-white hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 transition-colors",
-          chevron: "w-4 h-4 fill-current",
-          month_grid: "border-collapse",
-          weekdays: "flex",
-          weekday: "w-9 text-center text-xs font-medium text-oai-gray-400 dark:text-oai-gray-500 py-1",
-          week: "flex",
-          day: "w-9 h-9 text-center text-sm p-0 relative",
-          day_button: "w-full h-full inline-flex items-center justify-center rounded-md transition-colors hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 text-oai-black dark:text-oai-white cursor-pointer rdp-day-btn",
-          today: "font-bold",
-          selected: "rdp-selected",
-          range_start: "rdp-selected rdp-range-start",
-          range_end: "rdp-selected rdp-range-end",
-          range_middle: "rdp-range-mid",
-          outside: "text-oai-gray-300 dark:text-oai-gray-600",
-          disabled: "text-oai-gray-300 dark:text-oai-gray-600 cursor-not-allowed",
-          hidden: "invisible",
-        }}
-        styles={{
-          months: { position: "relative" },
+          ...defaultClassNames,
+          root: `${defaultClassNames.root} rdp-oai`,
+          months: `${defaultClassNames.months} flex-nowrap`,
+          month: `${defaultClassNames.month} shrink-0`,
+          day_button: `${defaultClassNames.day_button} rdp-day-btn`,
         }}
       />
       <div className="flex items-center justify-end gap-2 mt-4 pt-3 border-t border-oai-gray-200 dark:border-oai-gray-700">

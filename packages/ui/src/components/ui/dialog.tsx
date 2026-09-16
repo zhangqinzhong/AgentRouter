@@ -137,7 +137,7 @@ function Dialog({
     <DialogScopeContext.Provider value={scope}>
     <motion.div
       animate={{ opacity: 1 }}
-      className={cn("fixed inset-0 z-[100] flex items-center justify-center overflow-hidden bg-black/28 p-3 sm:p-6", className)}
+      className={cn("fixed inset-0 z-[100] flex items-center justify-center overflow-hidden bg-black/50 p-3 sm:p-6", className)}
       exit={{ opacity: 0 }}
       initial={{ opacity: 0 }}
       onMouseDown={(event) => {

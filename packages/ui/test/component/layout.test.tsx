@@ -9,6 +9,7 @@ import { createVirtualModelDraft } from "@agentrouter/ui/pages/home/shared/virtu
 import { appConfigFixture } from "../fixtures/index.ts";
 import { fallbackGatewayStatus, fallbackUpdateStatus } from "@agentrouter/ui/pages/home/shared/fallbacks.ts";
 import { navigation } from "@agentrouter/ui/pages/home/shared/options.ts";
+import { viewUsesInternalScroll } from "@agentrouter/ui/pages/home/shared/providers.ts";
 import { formatUpdateReleaseNotes, shouldCheckForUpdateOnOpen, UpdateDialog } from "@agentrouter/ui/pages/home/components/update.tsx";
 
 test("sidebar navigation groups pages and hides networking from the sidebar", () => {
@@ -16,7 +17,7 @@ test("sidebar navigation groups pages and hides networking from the sidebar", ()
 
   assert.deepEqual(groups.map((group) => group.label), ["Workspace", "Setup", "Monitor", "Advanced"]);
   assert.deepEqual(groups.map((group) => group.items.map((item) => item.id)), [
-    ["overview", "usage"],
+    ["overview", "usage", "sessions", "trend", "heatmap"],
     ["providers", "profile", "routing"],
     ["logs", "observability"],
     ["virtual-models", "models", "api-keys", "extensions"]
@@ -25,11 +26,15 @@ test("sidebar navigation groups pages and hides networking from the sidebar", ()
 
   const filteredGroups = groupSidebarNavigation(navigation.filter((item) => item.id !== "observability"));
   assert.deepEqual(filteredGroups.map((group) => group.items.map((item) => item.id)), [
-    ["overview", "usage"],
+    ["overview", "usage", "sessions", "trend", "heatmap"],
     ["providers", "profile", "routing"],
     ["logs"],
     ["virtual-models", "models", "api-keys", "extensions"]
   ]);
+  assert.equal(viewUsesInternalScroll("sessions"), false);
+  assert.equal(viewUsesInternalScroll("heatmap"), true);
+  assert.equal(viewUsesInternalScroll("trend"), false);
+  assert.equal(viewUsesInternalScroll("usage"), false);
 });
 
 test("sidebar navigation scrolls vertically without displacing the settings footer", () => {

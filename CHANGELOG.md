@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+## 1.3.0 - 2026-09-17
+
+- Added Sessions, Trend and Heatmap as first-level sidebar pages next to Usage.
+- Trend page shows TokenTracker totals above a full-width usage curve with complete day/week/month/year/total/custom axes, including empty buckets.
+- Total trend fills empty months so the chart can pan through months without usage.
+- Custom ranges can cross years, and long custom charts use monthly ticks instead of overlapping daily labels.
+- Heatmap page follows the Codex profile layout: local avatar and name, lifetime/peak/streaks, contribution calendar, hover tooltips, and most-used tools with mapped names and icons.
+- Sessions resume actions use the matching AgentRouter profile CLI/App buttons when the session lives under a profile home.
+- Overview account balance uses horizontal rows, client analysis no longer labels empty clients as unknown, and the token-mix widget is removed.
+- System status shows one DeepSeek-style 180-day uptime row per provider, with card height growing to fit.
+- Solid window backgrounds on macOS so the UI stays opaque on newer system versions.
+- Updated the code map for the local usage collector, heatmap, trend and session resume flows.
+
 ## 1.2.1 - 2026-09-16
 
 - Restored TokenTracker model attribution without inferring historical models from later thread settings.

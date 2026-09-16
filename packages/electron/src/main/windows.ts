@@ -67,9 +67,7 @@ class WindowsManager {
       ...(process.platform === "darwin"
         ? {
             titleBarStyle: "hiddenInset" as const,
-            backgroundColor: "#00000000",
-            vibrancy: "sidebar" as const,
-            visualEffectState: "active" as const,
+            backgroundColor: "#fafafa",
             trafficLightPosition: mainWindowTrafficLightPosition
           }
         : {}),

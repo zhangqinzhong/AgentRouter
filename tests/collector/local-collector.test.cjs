@@ -26,6 +26,24 @@ test('manual renewal records are read from TokenTracker without changing its sto
  try{const dir=path.join(home,'.tokentracker/tracker');await fs.mkdir(dir,{recursive:true});const file=path.join(dir,'subscription-manager.json');const text=JSON.stringify({version:1,items:[{id:'manual',service:'Codex',autoRenew:true,nextBillingAt:'2026-10-01T00:00:00Z'}]});await fs.writeFile(file,text);const result=await createCollector({home,fetchImpl:async()=>{throw new Error("offline test")}}).query('/functions/tokentracker-subscription-manager');assert.equal(result.subscriptions[0].id,'manual');assert.equal(await fs.readFile(file,'utf8'),text);}finally{await fs.rm(home,{recursive:true,force:true})}
 });
 
+test('hourly heatmap and session routes stay on the local collector contract',async()=>{
+ const home=await fs.mkdtemp(path.join(os.tmpdir(),'ar-collector-trend-'));
+ try {
+  const root=path.join(home,'.claude','projects','fixture');await fs.mkdir(root,{recursive:true});
+  const record={type:'assistant',timestamp:'2026-09-14T01:00:00Z',requestId:'request-1',message:{id:'message-1',model:'claude-sonnet-4',usage:{input_tokens:100,output_tokens:20,cache_read_input_tokens:50}}};
+  await fs.writeFile(path.join(root,'main.jsonl'),JSON.stringify(record)+'\n');
+  const c=createCollector({home,fetchImpl:async()=>{throw new Error("offline test")}});await c.sync(true);
+  const hourly=await c.query('/functions/tokentracker-usage-hourly',{day:'2026-09-14',tz:'UTC'});
+  assert.ok(Array.isArray(hourly.data));
+  assert.ok(hourly.data.some(row=>Number(row.total_tokens)>0));
+  const heatmap=await c.query('/functions/tokentracker-usage-heatmap',{weeks:'8',tz:'UTC'});
+  assert.ok(Array.isArray(heatmap.weeks));
+  const sessions=await c.query('/functions/tokentracker-sessions',{tz:'UTC'});
+  assert.equal(typeof sessions.available,'boolean');
+  assert.ok(Array.isArray(sessions.sessions));
+ }finally{await fs.rm(home,{recursive:true,force:true})}
+});
+
 test('quota observer cannot rotate active CLI credentials',async()=>{
  const home=await fs.mkdtemp(path.join(os.tmpdir(),'ar-credentials-test-'));
  try {const dir=path.join(home,'.codex');await fs.mkdir(dir);const file=path.join(dir,'auth.json');const original=JSON.stringify({tokens:{access_token:'expired-access',refresh_token:'private-refresh'}});await fs.writeFile(file,original);resetUsageLimitsCache();let refreshed=false;

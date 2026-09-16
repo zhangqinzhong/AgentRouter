@@ -51,7 +51,13 @@ docs/              Astro 文档站与 Markdown 文档
 | 用量存储与聚合 | [`packages/core/src/usage/store.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/store.ts) | 记录网关用量、按时段和筛选条件聚合、重置概览统计。 |
 | 计费同步 | [`packages/core/src/usage/billing-sync.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/billing-sync.ts) | 同步底层网关的计费用量。 |
 | Token 规范化 | [`packages/core/src/usage/normalization.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/normalization.ts) | 处理不同协议的输入、输出、缓存等用量口径。 |
-| 概览图表 | [`packages/ui/src/pages/home/components/dashboard.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/dashboard.tsx) | 概览卡片、趋势、热力图和分类统计的展示。 |
+| 概览图表 | [`packages/ui/src/pages/home/components/dashboard.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/dashboard.tsx) | 概览账户余额、趋势、客户端分析等组件。 |
+| 用量页 | [`packages/ui/src/pages/home/components/local-usage.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-usage.tsx) | TokenTracker 风格用量总览与供应商下钻。 |
+| 会话页 | [`packages/ui/src/vendor/tokentracker/pages/SessionsPage.jsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/vendor/tokentracker/pages/SessionsPage.jsx) | 本机会话列表；按档案目录标记 `ar_profile`，恢复入口走档案 CLI/App。 |
+| 趋势页 | [`packages/ui/src/pages/home/components/local-trend.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-trend.tsx) | 日/周/月/年/总计/自定义趋势曲线。 |
+| 热力图页 | [`packages/ui/src/pages/home/components/local-heatmap.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-heatmap.tsx) | Codex 风格贡献热力图、本机身份与工具排行。 |
+| 本地采集 | [`packages/core/src/collector/usage-page.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/collector/usage-page.ts)、[`packages/core/src/vendor/tokentracker/local-sources.cjs`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/vendor/tokentracker/local-sources.cjs) | 读取 Claude/Codex/Grok 会话与各档案独立 `CODEX_HOME`。 |
+| 会话分析 | [`packages/core/src/vendor/tokentracker/lib/session-analytics.js`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/vendor/tokentracker/lib/session-analytics.js) | 扫描会话文件、时长、工具调用，并从路径解析档案 id。 |
 | 请求日志列表 | [`packages/ui/src/pages/home/components/network-logs.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/network-logs.tsx) | 日志查询展示、详情、首 Token 与速率列。 |
 | 速率公式 | [`packages/ui/src/lib/token-rate.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/lib/token-rate.ts) | 输出速率与平均吞吐率的前端计算。 |
 
@@ -71,6 +77,8 @@ docs/              Astro 文档站与 Markdown 文档
 ```
 
 终端输入别名时，从生成的别名脚本进入同一个 CLI。别名绑定档案 ID，不依赖显示名称；YOLO 和附加参数也在 CLI 启动计划中应用。App 启动走对应桌面应用适配分支，不等同于 CLI 终端启动。
+
+会话页恢复入口：若会话文件位于 `~/.agentrouter/profiles/<档案>/`，只显示该档案的 CLI/App 按钮（由档案 `surface` 决定），命令为 `agentrouter <档案> resume <id>` 或 `--resume`，不再使用官方裸命令。
 
 ## 网关与路由链路
 

@@ -44,7 +44,13 @@ All paths below are relative to the repository root.
 | Request logs | [request-log-store.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/observability/request-log-store.ts), [raw-trace-sync.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/observability/raw-trace-sync.ts) | Request persistence, retention, and raw trace ingestion |
 | Usage | [usage/store.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/store.ts), [billing-sync.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/billing-sync.ts) | Usage capture, aggregation, reset, and billing synchronization |
 | Token normalization | [normalization.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/normalization.ts) | Protocol-specific token accounting |
-| Charts | [dashboard.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/dashboard.tsx) | Overview cards, trends, activity, and breakdowns |
+| Charts | [dashboard.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/dashboard.tsx) | Overview balance rows, trends, and client analysis |
+| Usage | [local-usage.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-usage.tsx) | TokenTracker-style usage overview |
+| Sessions | [SessionsPage.jsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/vendor/tokentracker/pages/SessionsPage.jsx) | Local sessions; `ar_profile` from profile homes; resume via profile CLI/App |
+| Trend | [local-trend.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-trend.tsx) | Day/week/month/year/total/custom usage curve |
+| Heatmap | [local-heatmap.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-heatmap.tsx) | Codex-style contribution heatmap, local identity, tool ranking |
+| Collector | [usage-page.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/collector/usage-page.ts), [local-sources.cjs](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/vendor/tokentracker/local-sources.cjs) | Read Claude/Codex/Grok sessions and per-profile `CODEX_HOME` |
+| Session analytics | [session-analytics.js](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/vendor/tokentracker/lib/session-analytics.js) | Scan session files, duration, tools, and profile id from path |
 | Log UI | [network-logs.tsx](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/network-logs.tsx), [token-rate.ts](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/lib/token-rate.ts) | Log details and timing/rate presentation |
 
 ## Profile launch flow
@@ -58,6 +64,8 @@ Profile card → save configuration → preload / IPC
 ```
 
 A launch alias enters the same CLI through a generated script. It binds to the profile ID, not its display name. App launches use separate agent-specific adapters; CLI permission and argument options do not imply equivalent App behavior.
+
+Session resume: files under `~/.agentrouter/profiles/<id>/` are tagged with that profile. The sessions page then shows that profile's CLI/App actions (`resume` / `--resume`), not the upstream `codex resume` command.
 
 ## Gateway and usage flow
 

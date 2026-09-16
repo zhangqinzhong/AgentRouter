@@ -36,5 +36,7 @@
   "lib/codex-context-breakdown.js": "d5dbd751dd2682c6cbff67caccb775e37b7e86aa58ef9d2f8cf9eaf4ffaa5528",
   "lib/categorizer-utils.js": "899fa3646d3ff8166cd8827c92b33d9c02b369e3de78757e3f8802c5ce2d8dd4",
   "lib/grok-context-breakdown.js": "9b63b58004078cda93f9572f2e854268a706bdc28b8cac123c21eef771ec40d7",
-  "lib/pricing/seed-snapshot.json": "636d5436aa9b8b37f3e817ab110ace78a82e36dcf24862a2d53d20e2b224d695"
+  "lib/pricing/seed-snapshot.json": "636d5436aa9b8b37f3e817ab110ace78a82e36dcf24862a2d53d20e2b224d695",
+  "lib/session-analytics.js": "c959f01b2a8d24caa9d70f8ce83456d99653cf90eb1c3dbb662f6590cdcdf2f0",
+  "lib/context-health.js": "ea1710cc9c842091a16bdce00ac6dc2f4610ef355a1f142238a4889fcdcb01e4"
 }

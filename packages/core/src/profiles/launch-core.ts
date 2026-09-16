@@ -95,7 +95,8 @@ export function profileOpenCommand(
   // Mirrors desktopCliCommandName in launch-service.ts, which cannot be
   // imported here without a cycle.
   command = "agentrouter",
-  profileRef = profile.name?.trim() || profile.id
+  profileRef = profile.name?.trim() || profile.id,
+  extraArgs: string[] = []
 ): string {
   const quote = process.platform === "win32" ? windowsCommandQuote : shellQuote;
   const parts = profile.launchAlias && command === "agentrouter"
@@ -103,6 +104,9 @@ export function profileOpenCommand(
     : [quote(command), quote(profileRef)];
   if (surface === "app") {
     parts.push(surface);
+  }
+  for (const arg of extraArgs) {
+    if (typeof arg === "string" && arg.trim()) parts.push(quote(arg));
   }
   return parts.join(" ");
 }

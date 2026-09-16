@@ -19,5 +19,19 @@
   "lib/timezone.ts": "8c6026769e5171bc5827b3030974526758f20ddc1c5a2ecc73130272f8f31fbd",
   "lib/oklch-fallback.js": "3d6111ee4ac30989908d78b986e1e08998a4b54133050a2c3129491793c25ef0",
   "ui/components/index.js": "8f5559f4b3469f662c64e0ea6d4451257435ee6a9a1532c0297e296feeddb00a",
-  "ui/dashboard/components/ContextBreakdownPanel.jsx": "69a7dd92c90b8dabdbbc7eacece54e311c4de6e797da0d5a9fea4c1b738e8cf4"
+  "ui/dashboard/components/ContextBreakdownPanel.jsx": "69a7dd92c90b8dabdbbc7eacece54e311c4de6e797da0d5a9fea4c1b738e8cf4",
+  "ui/dashboard/components/TrendMonitor.jsx": "8c4ba65f03a1a25955f7a73ade75e031e43c545326e735f45a410ca8f7a95f2f",
+  "ui/dashboard/components/TrendMonitorZoomModal.jsx": "9fbe7aa9caf7d290cad0792ebec2004869b0b8c98de6e22935510a8e811eefce",
+  "ui/dashboard/components/ActivityHeatmap.jsx": "5df9e79262f406f4b6169914bbde6529fe84d0d2d7eea4fb2d8afd1c741fb124",
+  "ui/dashboard/components/ActivityHeatmap3D.jsx": "a2b55ac998e97c46679b5dfe65b447f9d5083d149f61ca37c943d98b62476e49",
+  "lib/trend-stats.js": "f7dbbbcf49eb26cce5ec4dd6ecda7e7b1ac38e03da75090ae8e7be2fd56f923c",
+  "lib/activity-heatmap.ts": "51a3effe63ce035cb745cb558baacb55e96778c248ae5637917724a3a4e1b12d",
+  "lib/date-range.ts": "db6abec98703f217a37c527388c9cfcd20561435d7ac0ac0bcde1672653edbca",
+  "ui/components/Card.jsx": "ad70a68c45e1d497823b7393e0b793a8bc9e1e16ea72b37ff4a6e5e9f6be755d",
+  "ui/components/Input.jsx": "c128cf9ba2a13185b12114e98a76b3182bfae8fbc4d488242daeb85397ed0209",
+  "ui/components/SegmentedControl.jsx": "a0613a85029cb258ddedf23350ddb05abfbd5b2302e3a252c848e5a15cdf72cb",
+  "ui/components/SearchableSelect.jsx": "22c551c301f4f8906fbe12a61827f5edb876cc5f03db7982cbe237bae1a43aa3",
+  "ui/components/HoverTooltip.jsx": "d3b254cc06e45264e0e2cfd9198246506d4fd9323aaa64e750930de302284f5c",
+  "ui/components/Toast.jsx": "5c39fff49a1bc35edafe6353e88e3beb26c95c86f0607a85db01e1459157cc57",
+  "pages/SessionsPage.jsx": "470bbb328167aad176fb853c5e3f2700f99e331f0a93f90cbbb83ee991a82ec8"
 }

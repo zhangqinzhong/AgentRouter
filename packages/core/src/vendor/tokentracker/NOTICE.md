@@ -11,12 +11,14 @@ through their original parsers. It keeps
 incremental cursors and compacted aggregate buckets under
 `~/.agentrouter/collector`. Gateway request statistics remain separate.
 
-`lib/offline-api.js` contains the original local aggregation helpers and seven
-native statistics routes extracted from `local-api.js`. Cloud endpoints, CLI
-initialization, hook installation and telemetry are not included. Pricing uses
-TokenTracker's loader and local cache; provider requests use AgentRouter's
-network transport. The quota observer does not rotate Codex refresh tokens.
-Existing TokenTracker subscription dates are read as manually maintained data.
+`lib/offline-api.js` contains the original local aggregation helpers and native
+statistics routes extracted from `local-api.js`, including hourly, daily, monthly,
+heatmap and session browser endpoints. Cloud endpoints, CLI initialization, hook
+installation and telemetry are not included. Pricing uses TokenTracker's loader
+and local cache; provider requests use AgentRouter's network transport. The quota
+observer does not rotate Codex refresh tokens. Existing TokenTracker subscription
+dates are read as manually maintained data. Session analytics sidecars stay under
+`~/.agentrouter/collector`.
 
 `context.cjs` hosts Claude, Codex and Grok breakdowns. Claude and Codex include
 managed profile roots; Claude ranges use the selected time zone. Categorizer

@@ -328,14 +328,16 @@ export function normalizeOverviewWidgets(value: unknown): OverviewWidgetConfig[]
   if (!Array.isArray(value)) {
     return DEFAULT_OVERVIEW_WIDGETS.map((widget) => ({ ...widget }));
   }
-  const widgets = value
+  const mapped = value
     .map(normalizeOverviewWidget)
     .filter((widget): widget is OverviewWidgetConfig => Boolean(widget));
   // Only upgrade the untouched old default; preserve every customized layout.
-  if (JSON.stringify(widgets) === JSON.stringify(LEGACY_DEFAULT_OVERVIEW_WIDGETS.map(normalizeOverviewWidget))) {
+  if (JSON.stringify(mapped) === JSON.stringify(LEGACY_DEFAULT_OVERVIEW_WIDGETS.map(normalizeOverviewWidget))) {
     return DEFAULT_OVERVIEW_WIDGETS.map((widget) => ({ ...widget }));
   }
-  return widgets;
+  return mapped
+    .filter((widget) => widget.type !== "token-mix")
+    .map((widget) => widget.type === "account-balance" && widget.variant === "cards" ? { ...widget, variant: "compact" as const } : widget);
 }
 
 export function normalizeOverviewWidget(value: unknown): OverviewWidgetConfig | undefined {
@@ -433,7 +435,7 @@ export function normalizeOverviewWidgetSize(value: unknown, type: OverviewWidget
     return "3:2";
   }
   if (value === "full") {
-    return type === "system-status" ? "4:1" : "4:2";
+    return "4:2";
   }
   return undefined;
 }
@@ -516,7 +518,7 @@ export function defaultOverviewWidgetSize(type: OverviewWidgetType): OverviewWid
   if (type === "token-activity") return "4:2";
   if (type === "client-analysis" || type === "provider-analysis") return "2:2";
   if (type === "usage-trend") return "3:2";
-  if (type === "system-status") return "4:1";
+  if (type === "system-status") return "4:2";
   if (isShareOverviewWidgetType(type)) return "1:4";
   return "4:2";
 }
@@ -541,6 +543,9 @@ export function constrainOverviewWidgetSize(
 ): OverviewWidgetSize {
   if (isShareOverviewWidgetType(type)) {
     return overviewWidgetSizeAtLeast(size, 1, 4);
+  }
+  if (type === "system-status") {
+    return overviewWidgetSizeAtLeast(size, 4, 1);
   }
   const hasAccountFilter = Array.isArray(accountProviders)
     ? accountProviders.length > 0

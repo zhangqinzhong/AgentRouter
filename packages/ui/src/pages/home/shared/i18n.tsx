@@ -1,7 +1,7 @@
 import { createContext, useContext, useMemo } from "react";
 import { translateErrorMessage } from "@agentrouter/core/contracts/i18n";
 
-type NavigationId = "onboarding" | "overview" | "usage" | "observability" | "api-keys" | "server" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
+type NavigationId = "onboarding" | "overview" | "usage" | "sessions" | "trend" | "heatmap" | "observability" | "api-keys" | "server" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
 type ResolvedLanguage = "en" | "zh";
 
 export type AppCopy = {
@@ -114,6 +114,9 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       observability: "Observability",
       overview: "Overview",
       usage: "Usage",
+      sessions: "Sessions",
+      trend: "Trend",
+      heatmap: "Heatmap",
       profile: "Agent Profiles",
       providers: "Providers",
       models: "Models",
@@ -745,6 +748,9 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       observability: "观测",
       overview: "概览",
       usage: "用量",
+      sessions: "会话",
+      trend: "趋势",
+      heatmap: "热力图",
       profile: "Agent 配置档案",
       providers: "供应商",
       models: "模型",
@@ -858,6 +864,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       "Discard changes": "放弃修改",
       "Usage tracking not configured": "未配置用量查询",
       "Request success rate": "请求成功率",
+      "uptime": "可用性",
       "No requests yet": "暂无请求",
       "Configure account usage": "配置账户用量",
       "Scan local providers again": "重新检测本机供应商",
@@ -1672,6 +1679,10 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       "Full": "整行",
       "Header component": "标题组件",
       "Heatmap": "热力图",
+      "Longest task": "最长任务",
+      "Most used tools": "使用最多的工具",
+      "No local tool usage yet": "还没有本地工具调用记录",
+      "Local usage": "本地用量",
       "Large": "大",
       "Less": "少",
       "Line": "折线图",
@@ -1862,7 +1873,13 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       "Usage request URL is required.": "用量请求 URL 不能为空。",
       "Usage request URL must use http or https.": "用量请求 URL 必须使用 http 或 https。",
       "Usage database": "用量数据库",
+      "Trend": "趋势",
       "Usage Trend": "用量趋势",
+      "Usage trend appears after your first AI session": "首次 AI 会话后会显示使用趋势",
+      "Cumulative tokens": "累计 Token 数",
+      "Peak tokens": "峰值 Token 数",
+      "Current streak": "当前连续天数",
+      "All time": "累计",
       "User idle": "用户空闲",
       "Insert example": "插入示例",
       "Insert New API user balance": "插入 New API 用户余额",

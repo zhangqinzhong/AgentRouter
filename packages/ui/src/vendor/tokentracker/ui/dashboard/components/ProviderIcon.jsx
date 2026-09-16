@@ -20,6 +20,7 @@ import providerAsset18 from "../../../assets/qoder.svg";
 import providerAsset19 from "../../../assets/reasonix.png";
 import providerAsset20 from "../../../assets/unsloth.svg";
 import providerAsset21 from "../../../assets/volcano-ark.svg";
+import grokBrandLogo from "../../../../../assets/agent-logos/grok.ico";
 import React from "react";
 
 /**
@@ -437,6 +438,7 @@ const PROVIDER_LOGO_MAP = {
   // /public/brand-logos/, so it renders through the image path below.
   "COMMAND-CODE": providerAsset6,
   GEMINI: providerAsset9,
+  GROK: grokBrandLogo,
   "KILO-CLI": providerAsset10,
   "KILO-CODE": providerAsset10,
   LMSTUDIO: providerAsset11,

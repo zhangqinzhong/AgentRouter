@@ -1324,6 +1324,46 @@ if (p === "/functions/tokentracker-usage-monthly") {
       json(res, { from, to, scope, excluded_sources: excludedSources, data: Array.from(byMonth.values()).sort((a, b) => a.month.localeCompare(b.month)) });
       return true;
     }
+if (p === "/functions/tokentracker-session-insights") {
+      const from = url.searchParams.get("from") || "";
+      const to = url.searchParams.get("to") || "";
+      const refresh = ["1", "true"].includes(url.searchParams.get("refresh"));
+      const home = path.resolve(qp, "..", "..", "..");
+      try {
+        const { buildSessionAnalytics, summarizeSessions } = require("./session-analytics");
+        const sessions = await buildSessionAnalytics({ home, force: refresh });
+        const includeSessions = ["1", "true"].includes(url.searchParams.get("include_sessions"));
+        const result = summarizeSessions(sessions, { from, to, includeSessions });
+        json(res, { from, to, ...result });
+      } catch (error) {
+        json(res, { available: false, error: error?.message || "Session analytics failed" }, 500);
+      }
+      return true;
+    }
+if (p === "/functions/tokentracker-sessions") {
+      const from = url.searchParams.get("from") || "";
+      const to = url.searchParams.get("to") || "";
+      const refresh = ["1", "true"].includes(url.searchParams.get("refresh"));
+      const limitParam = parseInt(url.searchParams.get("limit") || "0", 10);
+      const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 2000) : 0;
+      const home = path.resolve(qp, "..", "..", "..");
+      try {
+        const { buildSessionAnalytics, listSessionsForBrowser } = require("./session-analytics");
+        const sessions = await buildSessionAnalytics({ home, force: refresh });
+        const result = listSessionsForBrowser(sessions, { from, to, limit });
+        json(res, { from, to, ...result });
+      } catch (error) {
+        console.warn("[local-api] session browser failed:", error?.message || error);
+        json(res, { available: false, error: "Session browser failed" }, 500);
+      }
+      return true;
+    }
+if (p === "/functions/tokentracker-context-health") {
+      const home = path.resolve(qp, "..", "..", "..");
+      const { computeContextHealth } = require("./context-health");
+      json(res, computeContextHealth({ home, cwd: process.cwd(), env: process.env }));
+      return true;
+    }
 throw new Error('Unsupported local statistics request');
 }
 await dispatch();return result;

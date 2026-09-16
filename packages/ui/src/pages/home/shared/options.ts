@@ -3,10 +3,13 @@ import {
   Box,
   Boxes,
   Braces,
+  CalendarRange,
+  ChartNoAxesCombined,
   Database,
   Gauge,
   KeyRound,
   Layers3,
+  MessagesSquare,
   Network,
   Route,
   UserRound,
@@ -68,7 +71,7 @@ import zaiGlobalGeneralProviderIconUrl from "@/assets/provider-icons/zai-global-
 import zhipuCnCodingProviderIconUrl from "@/assets/provider-icons/zhipu-cn-coding.png";
 import zhipuCnGeneralProviderIconUrl from "@/assets/provider-icons/zhipu-cn-general.png";
 
-type ViewId = "onboarding" | "overview" | "usage" | "observability" | "api-keys" | "server" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
+type ViewId = "onboarding" | "overview" | "usage" | "sessions" | "trend" | "heatmap" | "observability" | "api-keys" | "server" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
 type NavigationId = ViewId;
 type OnboardingStepId = "provider" | "profile" | "enter";
 type ProviderAccountDraftMode = "standard" | "http-json" | "browser" | "raw";
@@ -402,6 +405,9 @@ export const mcpServerStartupTimeoutMs = 600000;
 export const navigation: Array<{ icon: LucideIcon; id: NavigationId }> = [
   { icon: Gauge, id: "overview" },
   { icon: Activity, id: "usage" },
+  { icon: MessagesSquare, id: "sessions" },
+  { icon: ChartNoAxesCombined, id: "trend" },
+  { icon: CalendarRange, id: "heatmap" },
   { icon: Layers3, id: "providers" },
   { icon: UserRound, id: "profile" },
   { icon: Route, id: "routing" },

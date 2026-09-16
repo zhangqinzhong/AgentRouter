@@ -283,8 +283,11 @@ export class UsageStore {
     const now = new Date();
     const normalizedRange = normalizeUsageRange(range);
     const since = getRangeSince(normalizedRange, now);
-    this.backfillFromRequestLogs(database, since);
+    const statusSince = floorDay(now);
+    statusSince.setDate(statusSince.getDate() - 179);
+    this.backfillFromRequestLogs(database, statusSince < since ? statusSince : since);
     const query = buildUsageWhereClause(since, filter);
+    const statusQuery = buildUsageWhereClause(statusSince, filter);
 
     return {
       clientModels: readClientModelRows(database, query),
@@ -294,6 +297,7 @@ export class UsageStore {
       range: normalizedRange,
       recentRequests: readRecentRequestRows(database, query),
       series: readUsageSeries(database, normalizedRange, now, query),
+      providerSeries: readProviderUsageSeries(database, now, statusQuery, 180),
       totals: readUsageTotals(database, query)
     };
   }
@@ -774,6 +778,57 @@ function readUsageTotals(database: SqlDatabase, query: UsageWhereClause): UsageT
   return usageTotalsFromRow(row);
 }
 
+function readProviderUsageSeries(
+  database: SqlDatabase,
+  now: Date,
+  query: UsageWhereClause,
+  days: number
+): Array<{ provider: string; series: UsageSeriesPoint[]; totals: UsageTotals }> {
+  const bucketExpression = "strftime('%Y-%m-%d', created_at, 'localtime')";
+  const rows = queryRows(
+    database,
+    `
+      SELECT
+        provider,
+        ${bucketExpression} AS bucket,
+        ${usageTotalsSelect}
+      FROM usage_events
+      WHERE ${query.where}
+      GROUP BY provider, bucket
+    `,
+    query.params
+  );
+  const byProvider = new Map<string, Map<string, UsageTotals>>();
+  for (const row of rows) {
+    const provider = normalizeLabel(String(row.provider ?? ""), "unknown");
+    const bucket = String(row.bucket ?? "");
+    const buckets = byProvider.get(provider) ?? new Map<string, UsageTotals>();
+    buckets.set(bucket, usageTotalsFromRow(row));
+    byProvider.set(provider, buckets);
+  }
+  const template = buildDayBuckets(days, now);
+  return [...byProvider.entries()]
+    .map(([provider, totalsByBucket]) => {
+      const series = template.map(({ key, label }) => ({
+        ...(totalsByBucket.get(key) ?? { ...emptyTotals }),
+        bucket: key,
+        label
+      }));
+      const requestCount = sum(series, (point) => point.requestCount);
+      const errorCount = sum(series, (point) => point.errorCount);
+      const totals: UsageTotals = {
+        ...emptyTotals,
+        errorCount,
+        requestCount,
+        successRate: requestCount > 0 ? (requestCount - errorCount) / requestCount : 0,
+        totalTokens: sum(series, (point) => point.totalTokens)
+      };
+      return { provider, series, totals };
+    })
+    .sort((left, right) => right.totals.requestCount - left.totals.requestCount)
+    .slice(0, 8);
+}
+
 function readUsageSeries(
   database: SqlDatabase,
   range: UsageStatsRange,
@@ -971,6 +1026,19 @@ function buildSeries(range: UsageStatsRange, now: Date, events: StoredUsageEvent
     bucket: key,
     label
   }));
+}
+
+function buildDayBuckets(days: number, now: Date): Array<{ key: string; label: string }> {
+  const start = floorDay(now);
+  start.setDate(start.getDate() - (days - 1));
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    return {
+      key: formatBucketKey(date, "day"),
+      label: `${date.getMonth() + 1}/${date.getDate()}`
+    };
+  });
 }
 
 function buildBuckets(
@@ -1405,6 +1473,7 @@ function emptySnapshot(range: UsageStatsRange): UsageStatsSnapshot {
     range,
     recentRequests: [],
     series: buildSeries(range, new Date(), []),
+    providerSeries: [],
     totals: { ...emptyTotals }
   };
 }

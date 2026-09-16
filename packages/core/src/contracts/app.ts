@@ -1425,7 +1425,7 @@ export const LEGACY_DEFAULT_OVERVIEW_WIDGETS: OverviewWidgetConfig[] = [
 ];
 
 export const DEFAULT_OVERVIEW_WIDGETS: OverviewWidgetConfig[] = [
-  { enabled: true, id: "system-status", size: "4:1", type: "system-status", variant: "timeline" },
+  { enabled: true, id: "system-status", size: "4:2", type: "system-status", variant: "timeline" },
   { enabled: true, id: "metric-requests", metric: "requests", size: "1:1", type: "metric", variant: "card" },
   { enabled: true, id: "metric-success-rate", metric: "success-rate", size: "1:1", type: "metric", variant: "card" },
   { enabled: true, id: "metric-avg-latency", metric: "avg-latency", size: "1:1", type: "metric", variant: "card" },
@@ -1435,9 +1435,8 @@ export const DEFAULT_OVERVIEW_WIDGETS: OverviewWidgetConfig[] = [
   { enabled: true, id: "metric-output-tokens", metric: "output-tokens", size: "1:1", type: "metric", variant: "card" },
   { enabled: true, id: "metric-cache-tokens", metric: "cache-tokens", size: "1:1", type: "metric", variant: "card" },
   { enabled: true, id: "metric-cache-ratio", metric: "cache-ratio", size: "1:1", type: "metric", variant: "card" },
-  { enabled: true, id: "account-balance", size: "4:2", type: "account-balance", variant: "cards" },
+  { enabled: true, id: "account-balance", size: "4:2", type: "account-balance", variant: "compact" },
   { enabled: true, id: "token-activity", size: "4:2", type: "token-activity", variant: "heatmap" },
-  { enabled: true, id: "token-mix", size: "1:2", type: "token-mix", variant: "bars" },
   { enabled: true, id: "client-analysis", size: "2:2", type: "client-analysis", variant: "table" },
   { enabled: true, id: "provider-analysis", size: "2:2", type: "provider-analysis", variant: "table" }
 ];
@@ -1616,6 +1615,7 @@ export type ProfileApplyResult = {
 export type ProfileOpenRequest = {
   profileId: string;
   surface: ProfileOpenSurface;
+  extraArgs?: string[];
 };
 
 export type ProfileOpenCommandResult = {
@@ -2287,6 +2287,12 @@ export type UsageSeriesPoint = UsageTotals & {
   label: string;
 };
 
+export type UsageProviderSeries = {
+  provider: string;
+  series: UsageSeriesPoint[];
+  totals: UsageTotals;
+};
+
 export type UsageComparisonRow = UsageTotals & {
   caption: string;
   client?: string;
@@ -2304,6 +2310,7 @@ export type UsageStatsSnapshot = {
   generatedAt: string;
   models: UsageComparisonRow[];
   providerModels: UsageComparisonRow[];
+  providerSeries?: UsageProviderSeries[];
   range: UsageStatsRange;
   recentRequests: UsageComparisonRow[];
   series: UsageSeriesPoint[];

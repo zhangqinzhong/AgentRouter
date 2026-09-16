@@ -1,6 +1,9 @@
 import {RoutingActivationBrand} from "@/vendor/cc-switch/RoutingActivationBrand";
 import {initializeWindowActivity} from "@/vendor/cc-switch/windowActivity";
 import {useEffect} from "react";
+import {LocalHeatmapView} from "./local-heatmap";
+import {LocalSessionsView} from "./local-sessions";
+import {LocalTrendView} from "./local-trend";
 import {LocalUsageView} from "./local-usage";
 import type { ComponentProps } from "react";
 import { MorphIcon } from "@/vendor/lucide-morph";
@@ -38,7 +41,7 @@ const sidebarNavigationGroupDefinitions: Array<{
   itemIds: NavigationId[];
   label: string;
 }> = [
-  { id: "workspace", itemIds: ["overview", "usage"], label: "Workspace" },
+  { id: "workspace", itemIds: ["overview", "usage", "sessions", "trend", "heatmap"], label: "Workspace" },
   { id: "setup", itemIds: ["providers", "profile", "routing"], label: "Setup" },
   { id: "monitor", itemIds: ["logs", "observability"], label: "Monitor" },
   { id: "advanced", itemIds: ["virtual-models", "models", "api-keys", "extensions"], label: "Advanced" }
@@ -441,6 +444,9 @@ function MainViewSwitch({
     <AnimatePresence initial={false} mode="wait">
       <ViewMotionShell key={activeView} view={activeView}>
         {activeView === "usage" ? <LocalUsageView /> : null}
+        {activeView === "sessions" ? <LocalSessionsView /> : null}
+        {activeView === "trend" ? <LocalTrendView /> : null}
+        {activeView === "heatmap" ? <LocalHeatmapView /> : null}
         {activeView === "overview" ? <OverviewView {...viewProps.overview} /> : null}
         {activeView === "observability" && agentAnalysisEnabled ? <AgentAnalysisView {...viewProps.observability} /> : null}
         {activeView === "api-keys" ? <ApiKeysView {...viewProps.apiKeys} /> : null}
