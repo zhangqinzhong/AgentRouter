@@ -8,15 +8,22 @@ export function buildNativeAppIcon(){
  if(process.platform!=='darwin')return;
  const source=path.join(root,brand.composerIcon);
  const output=path.join(root,'packages/electron/dist/native-icon');rmSync(output,{recursive:true,force:true});mkdirSync(output,{recursive:true});
- run('xcrun',['actool',source,'--compile',output,'--platform','macosx','--minimum-deployment-target','12.0','--app-icon',brand.name,'--output-partial-info-plist',path.join(output,'icon-info.plist'),'--output-format','human-readable-text']);
  const compiled=path.join(output,brand.name+'.icns');
- if(existsSync(compiled))copyFileSync(compiled,path.join(root,brand.macIcon));
+ const fallbackIcns=path.join(root,brand.macIcon);
+ try{
+  run('xcrun',['actool',source,'--compile',output,'--platform','macosx','--minimum-deployment-target','12.0','--app-icon',brand.name,'--output-partial-info-plist',path.join(output,'icon-info.plist'),'--output-format','human-readable-text']);
+ }catch(error){
+  if(!existsSync(fallbackIcns))throw error;
+  console.warn(String(error.message||error));
+ }
+ if(existsSync(compiled))copyFileSync(compiled,fallbackIcns);
+ else if(existsSync(fallbackIcns))copyFileSync(fallbackIcns,compiled);
  const developer=run('xcode-select',['-p']);
  const ictool=path.resolve(developer,'../Applications/Icon Composer.app/Contents/Executables/ictool');
  if(existsSync(ictool)){
   run(ictool,[source,'--export-image','--output-file',path.join(root,brand.sourceIcon),'--platform','macOS','--rendition','Default','--width','1024','--height','1024','--scale','1']);
   copyFileSync(path.join(root,brand.sourceIcon),path.join(root,brand.uiIcon));
- }else if(!existsSync(path.join(root,brand.macIcon))||!existsSync(path.join(root,brand.uiIcon))){
+ }else if(!existsSync(fallbackIcns)||!existsSync(path.join(root,brand.uiIcon))){
   throw Error('Icon Composer is required to export app icons');
  }
  run('sips',['-z','64','64',path.join(root,brand.uiIcon),'--out',path.join(root,brand.favicon)]);
