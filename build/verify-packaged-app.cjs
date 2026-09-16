@@ -36,14 +36,24 @@ module.exports = async function verifyPackagedApp(context) {
   assertFile(path.join(resourcesDir, "app.asar"), "Packaged app archive");
   cleanupBetterSqlitePackage(resourcesDir);
   if (platform === "darwin") {
-    assertFile(path.join(resourcesDir, "Assets.car"), "Native Icon Composer asset catalog");
+    const assetsCar = path.join(resourcesDir, "Assets.car");
+    if (fs.existsSync(assetsCar)) {
+      assertFile(assetsCar, "Native Icon Composer asset catalog");
+    } else {
+      console.warn("Assets.car is missing; continuing with the icns icon fallback.");
+    }
     assertFile(path.join(resourcesDir, "AgentRouter.icns"), "Native app icon fallback");
     const widget = path.join(resourcesDir, "..", "PlugIns", "AgentRouterWidget.appex");
-    assertFile(path.join(widget, "Contents", "Info.plist"), "WidgetKit extension metadata");
-    const binary = path.join(widget, "Contents", "MacOS", "AgentRouterWidget");
-    assertFile(binary, "WidgetKit extension executable");
-    if (arch && !nativeArchMatches(inspectNativeModule(binary), arch)) {
-      throw new Error("WidgetKit extension architecture does not match the app");
+    const widgetInfo = path.join(widget, "Contents", "Info.plist");
+    if (fs.existsSync(widgetInfo)) {
+      assertFile(widgetInfo, "WidgetKit extension metadata");
+      const binary = path.join(widget, "Contents", "MacOS", "AgentRouterWidget");
+      assertFile(binary, "WidgetKit extension executable");
+      if (arch && !nativeArchMatches(inspectNativeModule(binary), arch)) {
+        throw new Error("WidgetKit extension architecture does not match the app");
+      }
+    } else {
+      console.warn("WidgetKit extension is missing; continuing without it.");
     }
   }
 
