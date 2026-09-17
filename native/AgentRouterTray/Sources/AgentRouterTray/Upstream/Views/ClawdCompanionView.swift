@@ -2013,6 +2013,7 @@ private struct PetBubbleSurface: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if isFloating {
+#if compiler(>=6.2)
             if #available(macOS 26, *) {
                 content
                     .glassEffect(
@@ -2036,6 +2037,18 @@ private struct PetBubbleSurface: ViewModifier {
                     }
                     .shadow(color: .black.opacity(0.16), radius: 4, y: 1)
             }
+#else
+            content
+                .background {
+                    BubbleShape(direction: .down)
+                        .fill(.regularMaterial)
+                }
+                .overlay {
+                    BubbleShape(direction: .down)
+                        .stroke(.white.opacity(0.18), lineWidth: 0.6)
+                }
+                .shadow(color: .black.opacity(0.16), radius: 4, y: 1)
+#endif
         } else {
             content
                 .background {

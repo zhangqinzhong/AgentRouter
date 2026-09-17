@@ -43,17 +43,14 @@ module.exports = async function verifyPackagedApp(context) {
       console.warn("Assets.car is missing; continuing with the icns icon fallback.");
     }
     assertFile(path.join(resourcesDir, "AgentRouter.icns"), "Native app icon fallback");
+    assertFile(path.join(resourcesDir, "native", "AgentRouterTray"), "Native menu bar executable");
     const widget = path.join(resourcesDir, "..", "PlugIns", "AgentRouterWidget.appex");
     const widgetInfo = path.join(widget, "Contents", "Info.plist");
-    if (fs.existsSync(widgetInfo)) {
-      assertFile(widgetInfo, "WidgetKit extension metadata");
-      const binary = path.join(widget, "Contents", "MacOS", "AgentRouterWidget");
-      assertFile(binary, "WidgetKit extension executable");
-      if (arch && !nativeArchMatches(inspectNativeModule(binary), arch)) {
-        throw new Error("WidgetKit extension architecture does not match the app");
-      }
-    } else {
-      console.warn("WidgetKit extension is missing; continuing without it.");
+    assertFile(widgetInfo, "WidgetKit extension metadata");
+    const binary = path.join(widget, "Contents", "MacOS", "AgentRouterWidget");
+    assertFile(binary, "WidgetKit extension executable");
+    if (arch && !nativeArchMatches(inspectNativeModule(binary), arch)) {
+      throw new Error("WidgetKit extension architecture does not match the app");
     }
   }
 

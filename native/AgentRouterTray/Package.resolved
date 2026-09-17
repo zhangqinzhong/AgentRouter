@@ -5,7 +5,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/zats/Vortex",
       "state" : {
-        "revision" : "ef5392088d4aeb255c4eee83157dbdafcd31bf07"
+      "revision" : "04a5674590dc0f345c9eb11783746e87a358d950"
       }
     }
   ],
