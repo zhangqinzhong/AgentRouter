@@ -7,6 +7,7 @@ import { copyMissingDirectoryContents, sameFilesystemPath } from "@agentrouter/c
 
 installSocketTypeOfServiceCompat();
 markDesktopAppRuntime();
+normalizePackagedNodeEnv();
 
 const appDataPath = readConfiguredRuntimePath("AR_INTERNAL_APP_DATA_DIR") ?? app.getPath("appData");
 const homePath = readConfiguredRuntimePath("AR_INTERNAL_HOME_DIR") ?? app.getPath("home");
@@ -53,6 +54,15 @@ function reportFatalStartupError(error: unknown): void {
   }
 
   app.exit(1);
+}
+
+// Packaged apps may inherit NODE_ENV=development from a launching shell
+// (open/terminal). Strip it so development-only paths such as auto-opening
+// DevTools never run in a release build.
+function normalizePackagedNodeEnv(): void {
+  if (app.isPackaged && process.env.NODE_ENV === "development") {
+    process.env.NODE_ENV = "production";
+  }
 }
 
 function readConfiguredRuntimePath(key: string): string | undefined {

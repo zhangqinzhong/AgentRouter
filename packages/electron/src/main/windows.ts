@@ -101,7 +101,7 @@ class WindowsManager {
 
     void window.loadURL(this.resolveRendererUrl("pages/home/index.html"));
 
-    if (process.env.NODE_ENV === "development") {
+    if (shouldAutoOpenDevTools()) {
       window.webContents.openDevTools({ mode: "detach" });
     }
 
@@ -474,8 +474,12 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
 }
 
+function shouldAutoOpenDevTools(): boolean {
+  return !app.isPackaged && process.env.NODE_ENV === "development";
+}
+
 function configurePluginAppDiagnostics(window: BrowserWindow, options: PluginAppWindowOptions): void {
-  if (!options.claudeDesignCdp || process.env.NODE_ENV !== "development") {
+  if (!options.claudeDesignCdp || !shouldAutoOpenDevTools()) {
     return;
   }
   if (pluginAppDiagnostics.has(window.webContents)) {
