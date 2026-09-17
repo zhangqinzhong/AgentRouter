@@ -1,0 +1,49 @@
+name: Native macOS Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: macOS (${{ matrix.display_name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            display_name: Apple Silicon
+          - runner: macos-15-intel
+            display_name: Intel
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build native assets
+        run: npm run build:assets
+
+      - name: Verify native assets are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x packages/electron/dist/main/native/AgentRouterTray
+          test -x packages/electron/dist/widgets/AgentRouterWidget.appex/Contents/MacOS/AgentRouterWidget
+          file packages/electron/dist/main/native/AgentRouterTray
+          file packages/electron/dist/widgets/AgentRouterWidget.appex/Contents/MacOS/AgentRouterWidget
