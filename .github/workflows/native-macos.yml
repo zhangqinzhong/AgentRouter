@@ -36,6 +36,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
       - name: Build native assets
         run: npm run build:assets
 
