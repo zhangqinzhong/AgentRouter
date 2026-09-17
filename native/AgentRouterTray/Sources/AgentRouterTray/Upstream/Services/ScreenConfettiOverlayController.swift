@@ -113,7 +113,8 @@ final class ScreenConfettiOverlayController {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor in self?.dismiss() }
+                guard let controller = self else { return }
+                Task { @MainActor in controller.dismiss() }
             }
             sleepObservers.append(observer)
         }

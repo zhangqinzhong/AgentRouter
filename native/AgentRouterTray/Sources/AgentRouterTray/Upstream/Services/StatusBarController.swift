@@ -1461,9 +1461,10 @@ extension StatusBarController: NSMenuDelegate {
             object: UpdateChecker.shared,
             queue: .main
         ) { [weak self] _ in
+            guard let controller = self else { return }
             Task { @MainActor in
-                guard let self, let menu = self.trackedStatusMenu else { return }
-                self.applyUpdateMenuItemState(in: menu)
+                guard let menu = controller.trackedStatusMenu else { return }
+                controller.applyUpdateMenuItemState(in: menu)
             }
         }
         applyUpdateMenuItemState(in: menu)

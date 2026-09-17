@@ -107,7 +107,8 @@ final class MenuBarAnimator {
             withTimeInterval: MenuBarRunnerPace.sprintWindow + 0.1,
             repeats: false
         ) { [weak self] _ in
-            Task { @MainActor in self?.applyCurrentState() }
+            guard let animator = self else { return }
+            Task { @MainActor in animator.applyCurrentState() }
         }
         if !wasSprinting { applyCurrentState() }
     }
@@ -271,7 +272,8 @@ final class MenuBarAnimator {
         loopFrames = frames
         tick()
         animationTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
+            guard let animator = self else { return }
+            Task { @MainActor in animator.tick() }
         }
     }
 
@@ -293,7 +295,8 @@ final class MenuBarAnimator {
         cancelBlink()
         let delay = TimeInterval.random(in: 3...6)
         blinkTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.playBlink() }
+            guard let animator = self else { return }
+            Task { @MainActor in animator.playBlink() }
         }
     }
 

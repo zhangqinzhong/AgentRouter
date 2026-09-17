@@ -20,10 +20,11 @@ import SwiftUI
   island = DynamicIslandController(viewModel: viewModel)
   status = StatusBarController(viewModel: viewModel, serverManager: server, launchAtLoginManager: login, desktopPetController: pet, dynamicIslandController: island)
   defaultsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object:nil, queue:.main) { [weak self] _ in
+   guard let delegate = self else { return }
    Task { @MainActor in
-    guard let self, let previous=self.expectedShowStats else { return }
+    guard let previous=delegate.expectedShowStats else { return }
     let next=UserDefaults.standard.bool(forKey:"MenuBarShowStats")
-    if next != previous { self.expectedShowStats=next; emit("showStats",next ? "true" : "false") }
+    if next != previous { delegate.expectedShowStats=next; emit("showStats",next ? "true" : "false") }
    }
   }
   DispatchQueue.global(qos:.utility).async {
