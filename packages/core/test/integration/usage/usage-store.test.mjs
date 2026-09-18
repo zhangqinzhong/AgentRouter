@@ -777,3 +777,52 @@ test("UsageStore provider filter matches compound provider keys by their id segm
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("UsageStore honors custom date ranges with a fixed provider status window", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-custom-range-test-"));
+  try {
+    const store = new UsageStore(path.join(dir, "usage.sqlite"));
+    const pad = (value) => String(value).padStart(2, "0");
+    const dayKey = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    const now = new Date();
+    const twoDaysAgo = new Date(now);
+    twoDaysAgo.setDate(now.getDate() - 2);
+
+    const recordEvent = async (createdAt, provider, requestId) => {
+      await store.record({
+        createdAt: createdAt.toISOString(),
+        durationMs: 100,
+        method: "POST",
+        model: "alpha-model",
+        path: "/v1/messages",
+        provider,
+        requestId,
+        statusCode: 200,
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
+      });
+    };
+    await recordEvent(twoDaysAgo, "alpha", "custom-1");
+    await recordEvent(now, "alpha", "custom-2");
+
+    const narrow = await store.getStats("custom", { includeProxy: true }, { from: dayKey(twoDaysAgo), to: dayKey(twoDaysAgo) });
+    assert.equal(narrow.range, "custom");
+    assert.equal(narrow.totals.requestCount, 1);
+    assert.equal(narrow.series.length, 1);
+
+    const wide = await store.getStats("custom", { includeProxy: true }, { from: dayKey(twoDaysAgo), to: dayKey(now) });
+    assert.equal(wide.range, "custom");
+    assert.equal(wide.series.length, 3);
+    assert.equal(wide.totals.requestCount, 2);
+
+    const fallback = await store.getStats("custom", { includeProxy: true }, { from: "", to: "nope" });
+    assert.equal(fallback.range, "7d");
+
+    // Provider status series always spans the trailing 90-day window, whatever the range.
+    assert.equal(wide.providerSeries?.[0]?.series.length, 90);
+    const today = await store.getStats("today", { includeProxy: true });
+    assert.equal(today.providerSeries?.[0]?.series.length, 90);
+    assert.ok(today.providerSeries?.[0]?.series.every((point) => !point.bucket.includes(" ")));
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});

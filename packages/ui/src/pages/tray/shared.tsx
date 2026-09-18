@@ -34,7 +34,10 @@ export type {
   UsageStatsFilter, UsageStatsRange, UsageStatsSnapshot, UsageTotals
 };
 
-export type SnapshotMap = Record<UsageStatsRange, UsageStatsSnapshot>;
+// Tray windows only ever fetch the fixed ranges; the overview-only "custom"
+// range is intentionally excluded from this map.
+export type TrayUsageRange = Exclude<UsageStatsRange, "custom">;
+export type SnapshotMap = Record<TrayUsageRange, UsageStatsSnapshot>;
 
 export type SourceTab = {
   id: string;
@@ -177,7 +180,7 @@ export function useTrayErrorText() {
   return useMemo(() => (error: unknown) => formatLocalizedErrorMessage(language, error), [language]);
 }
 
-export const ranges: UsageStatsRange[] = ["today", "24h", "7d", "30d"];
+export const ranges: TrayUsageRange[] = ["today", "24h", "7d", "30d"];
 
 export const emptyTotals: UsageTotals = {
   avgDurationMs: 0,

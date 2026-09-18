@@ -85,6 +85,7 @@ import type {
   RequestLogListFilter,
   RouteScriptTestRequest,
   RouteScriptValidationRequest,
+  UsageDateRange,
   UsageStatsFilter,
   UsageStatsRange
 } from "@agentrouter/core/contracts/app";
@@ -346,7 +347,11 @@ const rpcHandlers: Record<string, RpcHandler> = {
   getLocalUsageHeatmap: (query) => getLocalUsageHeatmap(query as LocalUsageHeatmapQuery | undefined),
   getLocalUsageSessions: (query) => getLocalUsageSessions(query as LocalUsageSessionsQuery | undefined),
   getLocalUsageCategories: (range) => getLocalUsageCategories(range as LocalUsageCategoryRange),
-  getUsageStats: (range, filter) => getUsageStats(range as UsageStatsRange | undefined, filter as UsageStatsFilter | undefined),
+  getUsageStats: (range, filter, customRange) => getUsageStats(
+    range as UsageStatsRange | undefined,
+    filter as UsageStatsFilter | undefined,
+    customRange as UsageDateRange | undefined
+  ),
   importLocalAgentProvider: (request) => importLocalAgentProvider(request as LocalAgentProviderImportRequest),
   installProxyCertificate: () => proxyService.installCertificate(),
   listMcpServerTools: async (serverName) => {

@@ -74,7 +74,11 @@ function overviewTrendFromTo(series: UsageSeriesPoint[], range: UsageStatsRange)
   const parsedDays = series
     .map((point) => parseStatusBucketDate(point.bucket))
     .filter((date): date is Date => Boolean(date));
-  if (parsedDays.length > 0 && days > 1) {
+  if (range === "custom" && parsedDays.length > 0) {
+    // The custom window is whatever the user picked; trust the bucket span.
+    from.setTime(Math.min(...parsedDays.map((date) => date.getTime())));
+    to.setTime(Math.max(...parsedDays.map((date) => date.getTime())));
+  } else if (parsedDays.length > 0 && days > 1) {
     from.setTime(Math.min(from.getTime(), ...parsedDays.map((date) => date.getTime())));
     to.setTime(Math.max(to.getTime(), ...parsedDays.map((date) => date.getTime())));
   }

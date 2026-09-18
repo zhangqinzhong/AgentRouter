@@ -1,10 +1,10 @@
 import {
   buildChartGeometry, formatCompactNumber, formatPercent, rangeLabel, ranges, ReactNode,
-  TrayComponentVariants, UsageComparisonRow, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useTrayText
+  TrayComponentVariants, TrayUsageRange, UsageComparisonRow, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useTrayText
 } from "../shared";
 import { Tooltip } from "@/components/ui/tooltip";
 import { buildTokenActivity, type TokenActivityCell } from "../../../lib/usage-activity";
-export function RangeSwitch({ range, onChange }: { range: UsageStatsRange; onChange: (range: UsageStatsRange) => void }) {
+export function RangeSwitch({ range, onChange }: { range: TrayUsageRange; onChange: (range: TrayUsageRange) => void }) {
   const t = useTrayText();
 
   return (

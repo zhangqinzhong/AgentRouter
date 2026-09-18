@@ -282,15 +282,6 @@ export function usageStatusTone(point: Pick<UsageTotals, "requestCount" | "succe
   return "error";
 }
 
-export function formatSystemStatusRange(segments: SystemStatusPoint[], range: UsageStatsRange): string {
-  if (segments.length === 0) {
-    return range;
-  }
-  const first = segments[0]?.dateLabel ?? "";
-  const last = segments.at(-1)?.dateLabel ?? first;
-  return first === last ? first : `${first} - ${last}`;
-}
-
 export function formatStatusBucketDate(bucket: string, range: UsageStatsRange): string {
   const parsed = parseStatusBucketDate(bucket);
   if (!parsed) {

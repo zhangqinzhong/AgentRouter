@@ -1,9 +1,10 @@
 import {
-  CircleAlert, Check, cn, formatCompactNumber, formatPercent, formatStatusBucketDate,
-  formatSystemStatusRange, systemStatusIconClass, systemStatusPointTooltip, UsageSeriesPoint, UsageStatsRange,
-  UsageStatsSnapshot, usageStatusTone, useAppText, useEffect, useState
+  Button, Check, ChevronLeft, ChevronRight, CircleAlert, cn, formatCompactNumber, formatPercent,
+  formatStatusBucketDate, parseStatusBucketDate, systemStatusIconClass, systemStatusPointTooltip,
+  UsageSeriesPoint, UsageStatsSnapshot, usageStatusTone, useAppText, useEffect, useMemo, useRef, useState
 } from "../shared/index";
 import { TooltipPortal } from "@/components/ui/tooltip";
+import type { UIEvent } from "react";
 import { Server } from "lucide-react";
 
 type SystemStatusTone = "error" | "idle" | "ok" | "warn";
@@ -26,6 +27,14 @@ const systemStatusTooltipWidth = 190;
 const systemStatusTooltipHeight = 104;
 const systemStatusTooltipGap = 10;
 const systemStatusTooltipViewportMargin = 12;
+
+// Tick geometry, mirrored between the row markup and the visible-window math:
+// each day occupies `tickPitch` px and month boundaries add `monthGap` px.
+const statusTickPitch = 13;
+const statusTickWidth = 10;
+const statusMonthGap = 7;
+
+const statusMonthFormatter = new Intl.DateTimeFormat(undefined, { month: "short", year: "numeric" });
 
 function resolveSystemStatusTooltipPosition(rect: DOMRect): Omit<SystemStatusTooltipState, "segment"> {
   const availableWidth = Math.max(0, window.innerWidth - systemStatusTooltipViewportMargin * 2);
@@ -51,22 +60,108 @@ function resolveSystemStatusTooltipPosition(rect: DOMRect): Omit<SystemStatusToo
   return { arrowLeft, left, placement, top };
 }
 
-export function SystemStatusStrip({
-  usageRange,
-  usageStats
-}: {
-  usageRange: UsageStatsRange;
-  usageStats: UsageStatsSnapshot;
-}) {
+type StatusTickMeta = { monthBoundary: boolean; offset: number };
+
+function buildTickMetadata(segments: SystemStatusPoint[]): StatusTickMeta[] {
+  const meta: StatusTickMeta[] = [];
+  let offset = 0;
+  let previousMonth = "";
+  for (const segment of segments) {
+    const parsed = parseStatusBucketDate(segment.point.bucket);
+    const monthKey = parsed ? `${parsed.getFullYear()}-${parsed.getMonth()}` : "";
+    const monthBoundary = Boolean(previousMonth) && monthKey !== previousMonth;
+    if (meta.length > 0) {
+      offset += statusTickPitch + (monthBoundary ? statusMonthGap : 0);
+    }
+    meta.push({ monthBoundary, offset });
+    previousMonth = monthKey;
+  }
+  return meta;
+}
+
+function visibleMonthRangeLabel(segments: SystemStatusPoint[], meta: StatusTickMeta[], scrollLeft: number, viewportWidth: number): string {
+  if (segments.length === 0) {
+    return "";
+  }
+  const right = scrollLeft + Math.max(statusTickPitch, viewportWidth);
+  let first = 0;
+  while (first < segments.length - 1 && meta[first].offset + statusTickWidth <= scrollLeft) {
+    first += 1;
+  }
+  let last = segments.length - 1;
+  while (last > first && meta[last].offset >= right) {
+    last -= 1;
+  }
+  const label = (index: number) => {
+    const parsed = parseStatusBucketDate(segments[index].point.bucket);
+    return parsed ? statusMonthFormatter.format(parsed) : segments[index].dateLabel;
+  };
+  const from = label(first);
+  const to = label(last);
+  return from === to ? from : `${from} - ${to}`;
+}
+
+export function SystemStatusStrip({ usageStats }: { usageStats: UsageStatsSnapshot }) {
   const t = useAppText();
   const [statusTooltip, setStatusTooltip] = useState<SystemStatusTooltipState>();
-  const segments = usageStats.series.map((point) => ({
-    dateLabel: formatStatusBucketDate(point.bucket, usageRange),
-    point,
-    tone: usageStatusTone(point)
-  }));
-  const overallTone = usageStatusTone(usageStats.totals);
-  const rangeLabel = formatSystemStatusRange(segments, usageRange);
+  const stripRefs = useRef<Array<HTMLDivElement | null>>([]);
+  const syncScroll = useRef(false);
+  const [scrollLeft, setScrollLeft] = useState(0);
+  const [viewportWidth, setViewportWidth] = useState(0);
+  const [maxScroll, setMaxScroll] = useState(0);
+
+  const providerRows = useMemo(
+    () =>
+      (usageStats.providerSeries ?? [])
+        .filter((row) => row.provider && row.provider !== "unknown")
+        .map((row) => ({
+          provider: row.provider,
+          totals: row.totals,
+          tone: usageStatusTone(row.totals),
+          segments: row.series.map((point) => ({
+            dateLabel: formatStatusBucketDate(point.bucket, "30d"),
+            point,
+            tone: usageStatusTone(point)
+          }))
+        })),
+    [usageStats.providerSeries]
+  );
+  const segments = useMemo(
+    () =>
+      usageStats.series.map((point) => ({
+        dateLabel: formatStatusBucketDate(point.bucket, point.bucket.includes(" ") ? "24h" : "30d"),
+        point,
+        tone: usageStatusTone(point)
+      })),
+    [usageStats.series]
+  );
+  const statusRows = providerRows.length > 0
+    ? providerRows
+    : [{
+        provider: t("API Service"),
+        totals: usageStats.totals,
+        tone: usageStatusTone(usageStats.totals),
+        segments
+      }];
+  // The status window is a fixed trailing period, so headline numbers aggregate
+  // the provider series instead of the range-filtered totals.
+  const overallTotals = useMemo(() => {
+    const requestCount = (usageStats.providerSeries ?? []).reduce((sum, row) => sum + row.totals.requestCount, 0);
+    if (requestCount === 0) {
+      return usageStats.totals;
+    }
+    const errorCount = (usageStats.providerSeries ?? []).reduce((sum, row) => sum + row.totals.errorCount, 0);
+    const totalTokens = (usageStats.providerSeries ?? []).reduce((sum, row) => sum + row.totals.totalTokens, 0);
+    return {
+      ...usageStats.totals,
+      errorCount,
+      requestCount,
+      successRate: (requestCount - errorCount) / requestCount,
+      totalTokens
+    };
+  }, [usageStats.providerSeries, usageStats.totals]);
+  const overallTone = usageStatusTone(overallTotals);
+  const tickMeta = useMemo(() => buildTickMetadata(statusRows[0]?.segments ?? []), [statusRows]);
 
   useEffect(() => {
     if (!statusTooltip) {
@@ -81,56 +176,95 @@ export function SystemStatusStrip({
     };
   }, [statusTooltip]);
 
+  const measure = (element: HTMLElement) => {
+    setScrollLeft(element.scrollLeft);
+    setViewportWidth(element.clientWidth);
+    setMaxScroll(element.scrollWidth - element.clientWidth);
+  };
+
+  useEffect(() => {
+    const element = stripRefs.current[0];
+    if (!element) {
+      return;
+    }
+    // Default to the newest window (right edge); earlier history slides in from the left.
+    const latest = element.scrollWidth - element.clientWidth;
+    if (latest > 0) {
+      stripRefs.current.forEach((other) => {
+        if (other) {
+          other.scrollLeft = latest;
+        }
+      });
+    }
+    measure(element);
+  }, [statusRows]);
+
   const showStatusTooltip = (segment: SystemStatusPoint, target: HTMLElement) => {
     setStatusTooltip({ segment, ...resolveSystemStatusTooltipPosition(target.getBoundingClientRect()) });
   };
 
-  const providerRows = (usageStats.providerSeries ?? [])
-    .filter((row) => row.provider && row.provider !== "unknown")
-    .map((row) => ({
-      provider: row.provider,
-      totals: row.totals,
-      tone: usageStatusTone(row.totals),
-      segments: row.series.map((point) => ({
-        dateLabel: formatStatusBucketDate(point.bucket, usageRange),
-        point,
-        tone: usageStatusTone(point)
-      }))
-    }));
-  const statusRows = providerRows.length > 0
-    ? providerRows
-    : [{
-      provider: t("API Service"),
-      totals: usageStats.totals,
-      tone: overallTone,
-      segments
-    }];
+  const handleStripScroll = (index: number) => (event: UIEvent<HTMLDivElement>) => {
+    const element = event.currentTarget;
+    measure(element);
+    if (syncScroll.current) {
+      return;
+    }
+    syncScroll.current = true;
+    try {
+      stripRefs.current.forEach((other, otherIndex) => {
+        if (other && otherIndex !== index && other.scrollLeft !== element.scrollLeft) {
+          other.scrollLeft = element.scrollLeft;
+        }
+      });
+    } finally {
+      syncScroll.current = false;
+    }
+  };
 
-  const statusRangeLabel = statusRows[0]?.segments.length
-    ? formatSystemStatusRange(statusRows[0].segments, usageRange)
-    : rangeLabel;
+  const pageStrip = (direction: -1 | 1) => {
+    const element = stripRefs.current[0];
+    if (!element || maxScroll <= 0) {
+      return;
+    }
+    const step = Math.min(maxScroll, element.clientWidth * 0.75 * direction);
+    const target = Math.max(0, Math.min(maxScroll, element.scrollLeft + step));
+    stripRefs.current.forEach((other) => {
+      other?.scrollTo({ behavior: "smooth", left: target });
+    });
+  };
 
-  const renderTicks = (row: (typeof statusRows)[number]) => (
-    <div className="flex h-4 min-w-0 items-stretch" aria-label={`${row.provider} ${t("System status")}`} style={{ gap: 4 }}>
-      {row.segments.map((segment, index) => (
-        <span
-          aria-label={systemStatusPointTooltip(segment, t)}
-          className="relative min-w-0 flex-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-          key={`${row.provider}-${segment.point.bucket}-${index}`}
-          onBlur={() => setStatusTooltip(undefined)}
-          onFocus={(event) => showStatusTooltip(segment, event.currentTarget)}
-          onMouseEnter={(event) => showStatusTooltip(segment, event.currentTarget)}
-          onMouseLeave={() => setStatusTooltip(undefined)}
-          style={{ height: 16 }}
-          tabIndex={0}
-        >
-          <span className="overview-status-tick block h-full w-full rounded-[1px]" data-tone={segment.tone} />
-        </span>
-      ))}
+  const renderTicks = (row: (typeof statusRows)[number], rowIndex: number) => (
+    <div
+      className="overview-status-strip min-w-0 overflow-x-auto"
+      onScroll={handleStripScroll(rowIndex)}
+      ref={(element) => {
+        stripRefs.current[rowIndex] = element;
+      }}
+    >
+      <div className="flex w-max items-stretch" style={{ gap: statusTickPitch - statusTickWidth }}>
+        {row.segments.map((segment, index) => (
+          <span
+            className="relative flex h-[18px] shrink-0 items-stretch"
+            key={`${row.provider}-${segment.point.bucket}-${index}`}
+            style={{ marginLeft: index > 0 && tickMeta[index]?.monthBoundary ? statusMonthGap : 0, width: statusTickWidth }}
+          >
+            <span
+              aria-label={systemStatusPointTooltip(segment, t)}
+              className="overview-status-tick block h-full w-full rounded-[2px] outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              data-tone={segment.tone}
+              onBlur={() => setStatusTooltip(undefined)}
+              onFocus={(event) => showStatusTooltip(segment, event.currentTarget)}
+              onMouseEnter={(event) => showStatusTooltip(segment, event.currentTarget)}
+              onMouseLeave={() => setStatusTooltip(undefined)}
+              tabIndex={0}
+            />
+          </span>
+        ))}
+      </div>
     </div>
   );
 
-  if (usageStats.series.length === 0) {
+  if (statusRows.length === 0 || (statusRows[0]?.segments.length ?? 0) === 0) {
     return (
       <section>
         <div className="mb-3 flex min-w-0 items-center justify-between gap-3">
@@ -141,6 +275,9 @@ export function SystemStatusStrip({
     );
   }
 
+  const atStart = scrollLeft <= 0;
+  const atEnd = maxScroll <= 0 || scrollLeft >= maxScroll - 1;
+
   return (
     <section>
       <div className="mb-3 flex min-w-0 items-center justify-between gap-3">
@@ -150,14 +287,24 @@ export function SystemStatusStrip({
           </span>
           <h2 className="text-sm font-medium">{t("System status")}</h2>
         </div>
-        <span className="block max-w-[320px] truncate text-[11px] tabular-nums text-muted-foreground">{statusRangeLabel}</span>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <Button aria-label={t("Show earlier")} disabled={atStart} onClick={() => pageStrip(-1)} size="iconSm" title={t("Show earlier")} variant="ghost">
+            <ChevronLeft className="h-3.5 w-3.5" />
+          </Button>
+          <span className="min-w-[120px] text-center text-[11px] tabular-nums text-muted-foreground">
+            {visibleMonthRangeLabel(statusRows[0].segments, tickMeta, scrollLeft, viewportWidth)}
+          </span>
+          <Button aria-label={t("Show later")} disabled={atEnd} onClick={() => pageStrip(1)} size="iconSm" title={t("Show later")} variant="ghost">
+            <ChevronRight className="h-3.5 w-3.5" />
+          </Button>
+        </div>
       </div>
       <div className="mb-4">
-        <div className="text-[28px] font-semibold leading-none tracking-tight">{usageStats.totals.requestCount > 0 ? formatPercent(usageStats.totals.successRate) : "—"}</div>
+        <div className="text-[28px] font-semibold leading-none tracking-tight">{overallTotals.requestCount > 0 ? formatPercent(overallTotals.successRate) : "—"}</div>
         <div className="mt-1 text-[11px] text-muted-foreground">{t("Request success rate")}</div>
       </div>
       <div className="space-y-3">
-        {statusRows.map((row) => {
+        {statusRows.map((row, index) => {
           const RowIcon = row.tone === "ok" ? Check : CircleAlert;
           return (
             <div className="min-w-0" key={row.provider}>
@@ -172,7 +319,7 @@ export function SystemStatusStrip({
                   {row.totals.requestCount > 0 ? `${formatPercent(row.totals.successRate)} ${t("uptime")}` : t("No requests yet")}
                 </span>
               </div>
-              {renderTicks(row)}
+              {renderTicks(row, index)}
             </div>
           );
         })}

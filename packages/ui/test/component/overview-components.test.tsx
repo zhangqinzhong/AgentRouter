@@ -80,6 +80,7 @@ test("OverviewView renders the range filter as flat tabs with one active option"
   assert.match(html, />24h</);
   assert.match(html, />7d</);
   assert.match(html, />30d</);
+  assert.match(html, />Custom</);
   const active = html.match(/aria-pressed="true"/g) ?? [];
   assert.equal(active.length, 1);
   assert.match(html, /font-semibold text-foreground/);

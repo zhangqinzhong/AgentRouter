@@ -14,6 +14,7 @@ import type {
   GatewayProviderProtocol,
   ProviderModelPricing,
   UsageComparisonRow,
+  UsageDateRange,
   UsageStatsFilter,
   UsageSeriesPoint,
   UsageStatsRange,
@@ -111,7 +112,11 @@ type UsageSnapshot = UsageNumbers & {
 };
 
 const usageEvents = new EventEmitter();
-const usageStatsRanges = new Set<UsageStatsRange>(["today", "24h", "7d", "30d"]);
+const usageStatsRanges = new Set<UsageStatsRange>(["today", "24h", "7d", "30d", "custom"]);
+// The system-status strips always cover this many trailing days, independent of
+// the selected usage range; UI tick geometry mirrors this constant.
+const providerStatusDays = 90;
+const customRangeDayLimit = 366;
 const usageStatsResetAtKey = "usage_stats_reset_at";
 const emptyTotals: UsageTotals = {
   avgDurationMs: 0,
@@ -278,15 +283,30 @@ export class UsageStore {
     ).length > 0;
   }
 
-  async getStats(range: UsageStatsRange | null | undefined = "7d", filter: UsageStatsFilter | null | undefined = {}): Promise<UsageStatsSnapshot> {
+  async getStats(
+    range: UsageStatsRange | null | undefined = "7d",
+    filter: UsageStatsFilter | null | undefined = {},
+    customRange?: UsageDateRange | null
+  ): Promise<UsageStatsSnapshot> {
     const database = await this.getDatabase();
     const now = new Date();
-    const normalizedRange = normalizeUsageRange(range);
-    const since = getRangeSince(normalizedRange, now);
-    const statusSince = floorDay(now);
-    statusSince.setDate(statusSince.getDate() - 179);
+    const custom = parseUsageDateRange(customRange);
+    let normalizedRange = normalizeUsageRange(range);
+    if (normalizedRange === "custom" && !custom) {
+      normalizedRange = "7d";
+    }
+    const since = custom && normalizedRange === "custom" ? custom.since : getRangeSince(normalizedRange, now);
+    const statusSince = floorDay(new Date(now));
+    statusSince.setDate(statusSince.getDate() - (providerStatusDays - 1));
     this.backfillFromRequestLogs(database, statusSince < since ? statusSince : since);
     const query = buildUsageWhereClause(since, filter);
+    if (custom && normalizedRange === "custom") {
+      query.where += " AND created_at < ?";
+      query.params.push(custom.until.toISOString());
+    }
+    // System status reads a fixed trailing window so its ticks never follow the
+    // selected usage range (custom windows included).
+    const statusQuery = buildUsageWhereClause(statusSince, filter);
 
     return {
       clientModels: readClientModelRows(database, query),
@@ -295,8 +315,14 @@ export class UsageStore {
       providerModels: readProviderModelRows(database, query),
       range: normalizedRange,
       recentRequests: readRecentRequestRows(database, query),
-      series: readUsageSeries(database, normalizedRange, now, query),
-      providerSeries: readProviderUsageSeries(database, now, query, normalizedRange),
+      series: readUsageSeries(
+        database,
+        normalizedRange,
+        now,
+        query,
+        custom && normalizedRange === "custom" ? buildDayBuckets(custom.days, now, custom.since) : undefined
+      ),
+      providerSeries: readProviderUsageSeries(database, now, statusQuery),
       totals: readUsageTotals(database, query)
     };
   }
@@ -548,9 +574,13 @@ function ensureUsageSchema(database: SqlDatabase): void {
   database.exec("CREATE INDEX IF NOT EXISTS usage_events_credential_created_at_idx ON usage_events(credential_id, created_at)");
 }
 
-export async function getUsageStats(range?: UsageStatsRange | null, filter?: UsageStatsFilter | null): Promise<UsageStatsSnapshot> {
+export async function getUsageStats(
+  range?: UsageStatsRange | null,
+  filter?: UsageStatsFilter | null,
+  customRange?: UsageDateRange | null
+): Promise<UsageStatsSnapshot> {
   try {
-    return await usageStore.getStats(range, filter);
+    return await usageStore.getStats(range, filter, customRange);
   } catch (error) {
     console.warn(`[usage] Failed to read usage stats: ${formatError(error)}`);
     return emptySnapshot(normalizeUsageRange(range));
@@ -655,6 +685,26 @@ function buildUsageWhereClause(
 
 function normalizeUsageRange(range: UsageStatsRange | null | undefined): UsageStatsRange {
   return range && usageStatsRanges.has(range) ? range : "7d";
+}
+
+// Validates a "custom" usage range; until is exclusive (to + 1 day).
+function parseUsageDateRange(custom: UsageDateRange | null | undefined): { since: Date; until: Date; days: number } | undefined {
+  if (!isRecord(custom)) {
+    return undefined;
+  }
+  const from = typeof custom.from === "string" ? custom.from.trim() : "";
+  const to = typeof custom.to === "string" ? custom.to.trim() : "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    return undefined;
+  }
+  const since = new Date(`${from}T00:00:00`);
+  const until = new Date(`${to}T00:00:00`);
+  until.setDate(until.getDate() + 1);
+  if (!Number.isFinite(since.getTime()) || !Number.isFinite(until.getTime()) || since >= until) {
+    return undefined;
+  }
+  const days = Math.min(customRangeDayLimit, Math.round((until.getTime() - since.getTime()) / 86_400_000));
+  return { since, until, days };
 }
 
 function normalizeUsageFilter(filter: UsageStatsFilter | null | undefined): UsageStatsFilter {
@@ -782,13 +832,11 @@ function readUsageTotals(database: SqlDatabase, query: UsageWhereClause): UsageT
 function readProviderUsageSeries(
   database: SqlDatabase,
   now: Date,
-  query: UsageWhereClause,
-  range: UsageStatsRange
+  query: UsageWhereClause
 ): Array<{ provider: string; series: UsageSeriesPoint[]; totals: UsageTotals }> {
-  const unit: "day" | "hour" = range === "today" || range === "24h" ? "hour" : "day";
-  const bucketExpression = unit === "hour"
-    ? "strftime('%Y-%m-%d %H:00', created_at, 'localtime')"
-    : "strftime('%Y-%m-%d', created_at, 'localtime')";
+  // Fixed daily buckets over a trailing window; the strip UI scrolls instead of
+  // re-bucketing when the usage range changes.
+  const bucketExpression = "strftime('%Y-%m-%d', created_at, 'localtime')";
   const rows = queryRows(
     database,
     `
@@ -810,7 +858,7 @@ function readProviderUsageSeries(
     buckets.set(bucket, usageTotalsFromRow(row));
     byProvider.set(provider, buckets);
   }
-  const template = unit === "hour" ? buildBuckets("24h", now) : buildDayBuckets(range === "7d" ? 7 : 30, now);
+  const template = buildDayBuckets(providerStatusDays, now);
   return [...byProvider.entries()]
     .map(([provider, totalsByBucket]) => {
       const series = template.map(({ key, label }) => ({
@@ -837,7 +885,8 @@ function readUsageSeries(
   database: SqlDatabase,
   range: UsageStatsRange,
   now: Date,
-  query: UsageWhereClause
+  query: UsageWhereClause,
+  template?: Array<{ key: string; label: string }>
 ): UsageSeriesPoint[] {
   const unit: "day" | "hour" = range === "today" || range === "24h" ? "hour" : "day";
   const bucketExpression = unit === "hour"
@@ -858,7 +907,7 @@ function readUsageSeries(
   const totalsByBucket = new Map(rows.map((row) => [String(row.bucket ?? ""), usageTotalsFromRow(row)]));
   const modelsByBucket = readUsageModelsByBucket(database, bucketExpression, query);
 
-  return buildBuckets(range, now).map(({ key, label }) => {
+  return (template ?? buildBuckets(range, now)).map(({ key, label }) => {
     const models = modelsByBucket.get(key);
     return {
       ...(totalsByBucket.get(key) ?? { ...emptyTotals }),
@@ -1076,9 +1125,11 @@ function buildSeries(range: UsageStatsRange, now: Date, events: StoredUsageEvent
   }));
 }
 
-function buildDayBuckets(days: number, now: Date): Array<{ key: string; label: string }> {
-  const start = floorDay(now);
-  start.setDate(start.getDate() - (days - 1));
+function buildDayBuckets(days: number, now: Date, startAt?: Date): Array<{ key: string; label: string }> {
+  const start = startAt ? new Date(startAt) : floorDay(now);
+  if (!startAt) {
+    start.setDate(start.getDate() - (days - 1));
+  }
   return Array.from({ length: days }, (_, index) => {
     const date = new Date(start);
     date.setDate(start.getDate() + index);

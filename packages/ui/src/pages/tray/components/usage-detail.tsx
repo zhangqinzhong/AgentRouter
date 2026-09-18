@@ -1,6 +1,6 @@
 import {
   defaultTrayWidgetVariant, formatCompactNumber, formatDuration, formatPercent, formatProviderName, ProviderAccountSnapshot, rangeLabel,
-  TrayComponentVariants, TrayWidgetConfig, UsageStatsRange, UsageStatsSnapshot, useTrayText
+  TrayComponentVariants, TrayWidgetConfig, TrayUsageRange, UsageStatsSnapshot, useTrayText
 } from "../shared";
 import { AccountSummaryPanel } from "./account-panel";
 import { AnimatedUsageChart, ChartShell, ModelShareChart, RangeSwitch, RingMetrics, StatsGrid, TokenActivityPanel, TokenMixPanel } from "./widgets";
@@ -19,10 +19,10 @@ export function UsageDetailPanel({
   accountSnapshots: ProviderAccountSnapshot[];
   accountRefreshing?: boolean;
   provider?: string;
-  range: UsageStatsRange;
+  range: TrayUsageRange;
   widgets: TrayWidgetConfig[];
   onRefreshAccount?: () => void | Promise<void>;
-  onRangeChange: (range: UsageStatsRange) => void;
+  onRangeChange: (range: TrayUsageRange) => void;
 }) {
   const t = useTrayText();
   const totals = activeStats.totals;

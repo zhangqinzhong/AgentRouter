@@ -484,6 +484,11 @@
   .overview-status-tick[data-tone="idle"] { background: #e7e7e7; }
   .dark .overview-status-tick[data-tone="idle"] { background: #3f3f46; }
   .overview-status-tick:hover { filter: brightness(1.06); }
+  .overview-status-strip {
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+  }
+  .overview-status-strip::-webkit-scrollbar { display: none; }
 
   .tray-shell {
     -webkit-backdrop-filter: blur(36px) saturate(170%);

@@ -2142,7 +2142,13 @@ export type RequestLogPage = {
   totalPages: number;
 };
 
-export type UsageStatsRange = "today" | "24h" | "7d" | "30d";
+export type UsageStatsRange = "today" | "24h" | "7d" | "30d" | "custom";
+
+// Local calendar dates (YYYY-MM-DD) backing the "custom" usage range.
+export type UsageDateRange = {
+  from: string;
+  to: string;
+};
 
 export type UsageStatsFilter = {
   credential?: string;

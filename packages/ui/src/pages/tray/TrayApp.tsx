@@ -1,7 +1,7 @@
 import {
   AppConfig, applyTrayThemePreference, createSourceTabs, DEFAULT_TRAY_WIDGETS, defaultTrayWidgetVariant, emptySnapshots, formatCompactNumber, formatProviderName,
   formatPercent, formatUpdated, formatUsdCost, normalizeTrayWidgets, ProviderAccountSnapshot, rangeLabel,
-  SnapshotMap, SourceTab, TrayComponentVariants, TrayWidgetConfig, UsageComparisonRow, UsageStatsFilter, UsageStatsRange, UsageTotals, useCallback, useEffect,
+  SnapshotMap, SourceTab, TrayComponentVariants, TrayWidgetConfig, UsageComparisonRow, UsageStatsFilter, UsageTotals, useCallback, useEffect,
   useMemo, useState, useTrayErrorText, useTrayText, useTrayThemePreference
 } from "./shared";
 import {
@@ -10,7 +10,7 @@ import {
 } from "./components/index";
 import { isGatewayProviderEnabled } from "@agentrouter/core/contracts/app";
 
-type TrayHeaderRange = Exclude<UsageStatsRange, "today">;
+type TrayHeaderRange = "24h" | "7d" | "30d";
 
 const trayHeaderRanges: TrayHeaderRange[] = ["24h", "7d", "30d"];
 

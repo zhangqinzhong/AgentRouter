@@ -29,7 +29,7 @@ import {
   ProxyStatus, readLanguagePreference, RequestLogListFilter, RequestLogPage, ResolvedLanguage,
   ResolvedTheme, resolvePluginInstallPlan, resolveProviderDeepLinkCatalogModels, removeLocalAgentProviderPluginsForProvider, RouterRule, routingRuleFromDraft, SettingsPageId,
   setProviderPresets, splitLines, translateAppErrorMessage, translateText, TrayBalanceProgressConfig, TrayWidgetConfig,
-  uniqueProviderProtocols, updateApiKeyEditableConfig, UsageStatsFilter, UsageStatsRange, UsageStatsSnapshot, useEffect,
+  uniqueProviderProtocols, updateApiKeyEditableConfig, UsageDateRange, UsageStatsFilter, UsageStatsRange, UsageStatsSnapshot, useEffect,
   useMemo, useReducedMotion, useRef, useState, validateVirtualModelDraft, ViewId,
   VirtualModelDraft, virtualModelProfileFromDraft, virtualModelProfilesUseMediaTools
 } from "./shared/index";
@@ -294,6 +294,7 @@ function App() {
   const [usageModelFilter, setUsageModelFilter] = useState("");
   const [usageProviderFilter, setUsageProviderFilter] = useState("");
   const [usageRange, setUsageRange] = useState<UsageStatsRange>("7d");
+  const [usageCustomRange, setUsageCustomRange] = useState<UsageDateRange>({ from: "", to: "" });
   const [usageStats, setUsageStats] = useState<UsageStatsSnapshot>(fallbackUsageStats);
   const [providerAccountSnapshots, setProviderAccountSnapshots] = useState<ProviderAccountSnapshot[]>([]);
   const [providerAccountRefreshing, setProviderAccountRefreshing] = useState(false);
@@ -499,7 +500,7 @@ function App() {
     const refreshUsageStats = () => {
       const requestId = ++usageStatsRequestId.current;
       const filter = overviewUsageStatsFilter(usageRange, usageProviderFilter, usageModelFilter, draftConfig.Providers);
-      void window.agentrouter?.getUsageStats(usageRange, filter).then((snapshot) => {
+      void window.agentrouter?.getUsageStats(usageRange, filter, usageRange === "custom" ? usageCustomRange : undefined).then((snapshot) => {
         if (!cancelled && requestId === usageStatsRequestId.current) {
           setUsageStats(snapshot);
         }
@@ -510,7 +511,7 @@ function App() {
       cancelled = true;
       stopPolling();
     };
-  }, [usageModelFilter, usageProviderFilter, usageRange]);
+  }, [usageCustomRange, usageModelFilter, usageProviderFilter, usageRange]);
 
   useEffect(() => {
     if (!usageProviderFilter) {
@@ -965,7 +966,8 @@ function App() {
     const requestId = ++usageStatsRequestId.current;
     const snapshot = await window.agentrouter.getUsageStats(
       usageRange,
-      overviewUsageStatsFilter(usageRange, usageProviderFilter, usageModelFilter, draftConfig.Providers)
+      overviewUsageStatsFilter(usageRange, usageProviderFilter, usageModelFilter, draftConfig.Providers),
+      usageRange === "custom" ? usageCustomRange : undefined
     );
     if (requestId === usageStatsRequestId.current) {
       setUsageStats(snapshot);
@@ -3343,7 +3345,9 @@ function App() {
                   providerAccounts: providerAccountSnapshots,
                   providerAccountRefreshing,
                   refreshProviderAccounts: () => void refreshProviderAccountsNow(),
+                  setUsageCustomRange,
                   setUsageRange,
+                  usageCustomRange,
                   usageRange,
                   usageStats
                 },

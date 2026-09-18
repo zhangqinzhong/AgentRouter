@@ -74,15 +74,17 @@ function breakdownRows(rows: UsageComparisonRow[], limit: number, translate: (va
   const top = sorted.slice(0, limit);
   const rest = sorted.slice(limit);
   const otherTokens = rest.reduce((sum, row) => sum + (row.totalTokens || 0), 0);
+  const otherInput = rest.reduce((sum, row) => sum + (row.inputTokens || 0), 0);
+  const otherCache = rest.reduce((sum, row) => sum + (row.cacheTokens || 0), 0);
   const all: Array<UsageComparisonRow> = otherTokens > 0
     ? [...top, {
       avgDurationMs: 0,
       caption: "",
-      cacheRatio: 0,
-      cacheTokens: 0,
+      cacheRatio: otherInput + otherCache > 0 ? otherCache / (otherInput + otherCache) : 0,
+      cacheTokens: otherCache,
       costUsd: rest.reduce((sum, row) => sum + (row.costUsd || 0), 0),
       errorCount: 0,
-      inputTokens: rest.reduce((sum, row) => sum + (row.inputTokens || 0), 0),
+      inputTokens: otherInput,
       key: `${translate("Other")}`,
       label: translate("Other"),
       maxShare: 0,
@@ -138,7 +140,7 @@ function BreakdownHoverCard({ row, translate }: { row: BreakdownRow; translate: 
   ];
   const tokenBase = Math.max(row.inputTokens, row.outputTokens, row.cacheTokens, 1);
   return (
-    <div className="pointer-events-none absolute bottom-full left-2 z-30 mb-1.5 hidden w-max min-w-[248px] rounded-xl border border-oai-gray-200/50 bg-white/95 p-3.5 text-left shadow-xl backdrop-blur-md group-hover:block dark:border-oai-gray-800/50 dark:bg-oai-gray-900/95">
+    <div className="pointer-events-none absolute bottom-full left-2 z-30 mb-1.5 hidden w-max min-w-[270px] rounded-xl border border-oai-gray-200/50 bg-white/95 p-3.5 text-left shadow-xl backdrop-blur-md group-hover:block dark:border-oai-gray-800/50 dark:bg-oai-gray-900/95">
       <div className="border-b border-oai-gray-100 pb-1.5 text-[11px] font-semibold text-oai-gray-500 dark:border-oai-gray-800/80 dark:text-oai-gray-400">{row.label}</div>
       <div className="mt-2 flex items-baseline gap-1">
         <span className="text-lg font-bold leading-none text-oai-gray-900 dark:text-white" title={row.tokens.toLocaleString()}>{formatCompactNumber(row.tokens)}</span>
@@ -150,20 +152,26 @@ function BreakdownHoverCard({ row, translate }: { row: BreakdownRow; translate: 
         <span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{formatUsdCost(row.costUsd)}</span> {translate("Cost")}</span>
       </div>
       <div className="mt-2 flex flex-col gap-1 border-t border-oai-gray-100 pt-2 dark:border-oai-gray-800/60">
-        {tokenParts.map((part) => (
-          <div className="flex items-center justify-between gap-3 text-[11px]" key={part.label}>
-            <span className="flex min-w-0 items-center gap-1.5">
-              <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: part.color }} />
-              <span className="text-oai-gray-500 dark:text-oai-gray-400">{part.label}</span>
-            </span>
-            <span className="flex min-w-[110px] items-center gap-2">
-              <span className="h-1 flex-1 overflow-hidden rounded-full bg-oai-gray-100 dark:bg-oai-gray-800/85">
-                <span className="block h-full rounded-full" style={{ width: `${Math.max(2, (part.value / tokenBase) * 100)}%`, backgroundColor: part.color }} />
+        {tokenParts.map((part) => {
+          const partShare = row.tokens > 0 ? part.value / row.tokens : 0;
+          return (
+            <div className="flex items-center justify-between gap-3 text-[11px]" key={part.label}>
+              <span className="flex min-w-0 items-center gap-1.5">
+                <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: part.color }} />
+                <span className="text-oai-gray-500 dark:text-oai-gray-400">{part.label}</span>
               </span>
-              <span className="w-12 text-right font-mono text-[10px] font-semibold text-oai-gray-700 dark:text-oai-gray-200" title={part.value.toLocaleString()}>{formatCompactNumber(part.value)}</span>
-            </span>
-          </div>
-        ))}
+              <span className="flex min-w-[132px] items-center gap-2">
+                <span className="h-1 flex-1 overflow-hidden rounded-full bg-oai-gray-100 dark:bg-oai-gray-800/85">
+                  <span className="block h-full rounded-full" style={{ width: `${Math.max(2, (part.value / tokenBase) * 100)}%`, backgroundColor: part.color }} />
+                </span>
+                <span className="flex w-[86px] items-baseline justify-end gap-1 font-mono text-[10px] font-semibold text-oai-gray-700 dark:text-oai-gray-200" title={part.value.toLocaleString()}>
+                  <span>{formatCompactNumber(part.value)}</span>
+                  <span className="w-[30px] text-right font-sans text-[9px] font-medium text-oai-gray-400">{Math.round(partShare * 100)}%</span>
+                </span>
+              </span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -273,8 +281,16 @@ function collapseAnalysisDisplayRows(kind: "client" | "provider", rows: UsageCom
     const label = analysisDisplayLabel(kind, row);
     const existing = grouped.get(label);
     if (existing) {
-      existing.totalTokens += row.totalTokens || 0;
+      existing.cacheTokens += row.cacheTokens || 0;
+      existing.costUsd += row.costUsd || 0;
+      existing.inputTokens += row.inputTokens || 0;
+      existing.outputTokens += row.outputTokens || 0;
       existing.requestCount += row.requestCount || 0;
+      existing.totalTokens += row.totalTokens || 0;
+      existing.cacheRatio =
+        existing.inputTokens + existing.cacheTokens > 0
+          ? existing.cacheTokens / (existing.inputTokens + existing.cacheTokens)
+          : 0;
       continue;
     }
     grouped.set(label, { ...row, key: `${kind}:${label}`, label });

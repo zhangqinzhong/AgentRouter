@@ -81,6 +81,7 @@ import type {
   RouteScriptTestResult,
   RouteScriptValidationRequest,
   RouteScriptValidationResult,
+  UsageDateRange,
   UsageStatsFilter,
   UsageStatsRange,
   UsageStatsResetResult,
@@ -131,7 +132,7 @@ declare global {
       getLocalUsageHeatmap: (query?: import("@agentrouter/core/collector/usage-page").LocalUsageHeatmapQuery) => Promise<Record<string,unknown>>;
       getLocalUsageSessions: (query?: import("@agentrouter/core/collector/usage-page").LocalUsageSessionsQuery) => Promise<Record<string,unknown>>;
       getLocalUsageCategories: (range: import("@agentrouter/core/collector/usage-page").LocalUsageCategoryRange) => Promise<Record<string,unknown>>;
-      getUsageStats: (range?: UsageStatsRange, filter?: UsageStatsFilter) => Promise<UsageStatsSnapshot>;
+      getUsageStats: (range?: UsageStatsRange, filter?: UsageStatsFilter, customRange?: UsageDateRange) => Promise<UsageStatsSnapshot>;
       installProxyCertificate: () => Promise<ProxyCertificateInstallResult>;
       importLocalAgentProvider: (request: LocalAgentProviderImportRequest) => Promise<LocalAgentProviderImportResult>;
       listMcpServerTools: (serverName: string) => Promise<GatewayMcpToolInfo[]>;

@@ -1,7 +1,7 @@
 import {
   applyTrayThemePreference, DEFAULT_TRAY_WIDGETS, emptySnapshots,
-  normalizeTrayWidgets, ProviderAccountSnapshot, SnapshotMap, TrayWidgetConfig, UsageStatsFilter,
-  UsageStatsRange, useCallback, useEffect, useState, useTrayErrorText, useTrayText, useTrayThemePreference
+  normalizeTrayWidgets, ProviderAccountSnapshot, SnapshotMap, TrayUsageRange, TrayWidgetConfig, UsageStatsFilter,
+  useCallback, useEffect, useState, useTrayErrorText, useTrayText, useTrayThemePreference
 } from "./shared";
 import {
   TrayStatusStrip, UsageDetailPanel
@@ -13,7 +13,7 @@ export function TrayDetailApp({ provider }: { provider?: string }) {
   useTrayThemePreference();
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [range, setRange] = useState<UsageStatsRange>("30d");
+  const [range, setRange] = useState<TrayUsageRange>("30d");
   const [snapshots, setSnapshots] = useState<SnapshotMap>(emptySnapshots);
   const [accountSnapshots, setAccountSnapshots] = useState<ProviderAccountSnapshot[]>([]);
   const [accountRefreshing, setAccountRefreshing] = useState(false);
