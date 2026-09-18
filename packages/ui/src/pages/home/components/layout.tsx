@@ -16,7 +16,8 @@ import {
   useAppText, ViewMotionShell, viewUsesInternalScroll
 } from "../shared/index";
 import { ApiKeysView } from "./api-keys";
-import { AgentAnalysisView, OverviewView } from "./dashboard";
+import { AgentAnalysisView } from "./agent-analysis";
+import { OverviewView } from "./dashboard";
 import { ExtensionsView } from "./extensions";
 import { LogsView, NetworkingView } from "./network-logs";
 import { OnboardingView } from "./onboarding";

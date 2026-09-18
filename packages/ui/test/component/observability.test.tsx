@@ -3,7 +3,7 @@ import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { AgentAnalysisSessionRow, AgentAnalysisTraceRun, RequestLogEntry, RequestLogPage } from "@agentrouter/core/contracts/app.ts";
-import { AgentAnalysisView } from "@agentrouter/ui/pages/home/components/dashboard.tsx";
+import { AgentAnalysisView } from "@agentrouter/ui/pages/home/components/agent-analysis.tsx";
 import { LogsView } from "@agentrouter/ui/pages/home/components/network-logs.tsx";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { createEmptyAgentAnalysis } from "@agentrouter/ui/pages/home/shared/usage.ts";
