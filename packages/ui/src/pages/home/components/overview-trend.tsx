@@ -23,7 +23,7 @@ function overviewTrendRangeDays(range: UsageStatsRange): number {
 // usageStats buckets arrive either as ISO timestamps or as "YYYY-M-D H" keys; both are
 // normalized to day keys, and hour-of-day buckets (today/24h) fold onto the current day
 // so the 24-point axis of the day grain covers the full rolling window.
-function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boolean): TrendRow[] {
+export function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boolean): TrendRow[] {
   const today = overviewTrendDayKey(new Date());
   const byKey = new Map<string, TrendRow>();
   for (const point of series) {
@@ -37,10 +37,19 @@ function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boolean): Tr
     const existing = byKey.get(key);
     const tokens = point.totalTokens || 0;
     const cost = point.costUsd || 0;
+    const requests = point.requestCount || 0;
     if (existing) {
       existing.total_tokens = Number(existing.total_tokens ?? 0) + tokens;
       existing.billable_total_tokens = Number(existing.billable_total_tokens ?? 0) + tokens;
       existing.total_cost_usd = Number(existing.total_cost_usd ?? 0) + cost;
+      existing.total_requests = Number(existing.total_requests ?? 0) + requests;
+      if (point.models) {
+        const models = { ...(existing.models as Record<string, number> | undefined) };
+        for (const [model, value] of Object.entries(point.models)) {
+          models[model] = (models[model] ?? 0) + value;
+        }
+        existing.models = models;
+      }
       continue;
     }
     const row: TrendRow = hourly
@@ -48,6 +57,10 @@ function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boolean): Tr
       : { day: dayKey, total_tokens: tokens };
     row.billable_total_tokens = tokens;
     row.total_cost_usd = cost;
+    row.total_requests = requests;
+    if (point.models && Object.keys(point.models).length > 0) {
+      row.models = { ...point.models };
+    }
     byKey.set(key, row);
   }
   return [...byKey.values()];

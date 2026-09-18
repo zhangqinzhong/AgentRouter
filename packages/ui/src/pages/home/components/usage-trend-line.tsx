@@ -178,7 +178,8 @@ function TrendHoverTooltip({
  const timeLabel=formatBucketRange(row,grain||granularityFromPeriod(period),getCopyLocale());
  const segments=mergeModelSegments(row.models).map((segment)=>({...segment,name:modelDisplayName(segment.name)}));
  const cost=row.total_cost_usd;
- const conversations=Number(row.conversation_count);
+ const conversations=Number(row.conversation_count)||0;
+ const requests=Number(row.total_requests)||0;
  return (
   <div className="max-w-[280px] min-w-[220px] rounded-xl border border-oai-gray-200/50 bg-white/95 p-3.5 shadow-xl backdrop-blur-md dark:border-oai-gray-800/50 dark:bg-oai-gray-900/95">
    <div className="border-b border-oai-gray-100 pb-1.5 text-[11px] font-semibold text-oai-gray-500 dark:border-oai-gray-800/80 dark:text-oai-gray-400">{timeLabel}</div>
@@ -186,10 +187,11 @@ function TrendHoverTooltip({
     <span className="text-lg font-bold leading-none text-oai-gray-900 dark:text-white" title={formatTokenTooltip(tokens)}>{formatTokenCount(tokens)}</span>
     <span className="text-[10px] font-semibold uppercase tracking-wider text-oai-gray-400">{copy('heatmap.unit.tokens')}</span>
    </div>
-   {(cost!=null||conversations>0)&&(
+   {(cost!=null||conversations>0||requests>0)&&(
     <div className="mt-2 flex items-center gap-3 text-[11px] text-oai-gray-500 dark:text-oai-gray-400">
      {cost!=null?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{formatUsdCurrency(cost)}</span> {copy('trend.zoom.tooltip.cost')}</span>:null}
      {conversations>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{conversations.toLocaleString()}</span> {copy('trend.zoom.tooltip.conversations')}</span>:null}
+     {conversations<=0&&requests>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{requests.toLocaleString()}</span> {copy('trend.zoom.tooltip.requests')}</span>:null}
     </div>
    )}
    {segments.length>0?(

@@ -4,6 +4,7 @@ import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { formatCodexResetCardExpiry, formatCodexResetCardNumber } from "@agentrouter/ui/pages/home/components/overview-accounts.tsx";
 import { OverviewStatisticsResetDialog, OverviewView } from "@agentrouter/ui/pages/home/components/overview.tsx";
+import { adaptSeriesToTrendRows } from "@agentrouter/ui/pages/home/components/overview-trend.tsx";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { parseStatusBucketDate } from "@agentrouter/ui/pages/home/shared/controls.tsx";
 import { formatProviderAccountMeterValue, providerAccountMeterDetailValidityProgress } from "@agentrouter/ui/pages/home/shared/provider-accounts.ts";
@@ -390,4 +391,49 @@ test("Codex reset cards format the credit id and expiry like card data", () => {
   assert.deepEqual(formatCodexResetCardNumber("reset-root-1"), ["rese", "t-ro", "ot-1"]);
   assert.equal(formatCodexResetCardExpiry("2026-08-02T00:00:00Z"), "08/02");
   assert.equal(formatCodexResetCardExpiry("not-a-date"), "--/--");
+});
+
+test("overview trend adapter carries model breakdown and request counts", () => {
+  const rows = adaptSeriesToTrendRows(
+    [
+      {
+        avgDurationMs: 0,
+        bucket: "2026-09-17T10:00:00.000Z",
+        cacheRatio: 0,
+        cacheTokens: 0,
+        costUsd: 0.5,
+        errorCount: 0,
+        inputTokens: 10,
+        label: "9/17",
+        models: { "gpt-5.6-sol": 700, "glm-5.3": 300 },
+        outputTokens: 20,
+        requestCount: 4,
+        successRate: 1,
+        totalTokens: 1000
+      },
+      {
+        avgDurationMs: 0,
+        bucket: "2026-09-17T11:00:00.000Z",
+        cacheRatio: 0,
+        cacheTokens: 0,
+        costUsd: 0.25,
+        errorCount: 0,
+        inputTokens: 5,
+        label: "9/17",
+        models: { "gpt-5.6-sol": 200 },
+        outputTokens: 10,
+        requestCount: 2,
+        successRate: 1,
+        totalTokens: 500
+      }
+    ],
+    true
+  );
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].billable_total_tokens, 1000);
+  assert.equal(rows[0].total_requests, 4);
+  assert.deepEqual(rows[0].models, { "gpt-5.6-sol": 700, "glm-5.3": 300 });
+  assert.equal(rows[1].total_requests, 2);
+  assert.equal(rows[1].models && (rows[1].models as Record<string, number>)["gpt-5.6-sol"], 200);
 });

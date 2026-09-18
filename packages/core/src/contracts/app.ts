@@ -2167,6 +2167,7 @@ export type UsageTotals = {
 export type UsageSeriesPoint = UsageTotals & {
   bucket: string;
   label: string;
+  models?: Record<string, number>;
 };
 
 export type UsageProviderSeries = {

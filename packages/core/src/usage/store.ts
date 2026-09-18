@@ -852,12 +852,53 @@ function readUsageSeries(
     query.params
   );
   const totalsByBucket = new Map(rows.map((row) => [String(row.bucket ?? ""), usageTotalsFromRow(row)]));
+  const modelsByBucket = readUsageModelsByBucket(database, bucketExpression, query);
 
-  return buildBuckets(range, now).map(({ key, label }) => ({
-    ...(totalsByBucket.get(key) ?? { ...emptyTotals }),
-    bucket: key,
-    label
-  }));
+  return buildBuckets(range, now).map(({ key, label }) => {
+    const models = modelsByBucket.get(key);
+    return {
+      ...(totalsByBucket.get(key) ?? { ...emptyTotals }),
+      bucket: key,
+      label,
+      ...(models && Object.keys(models).length > 0 ? { models } : {})
+    };
+  });
+}
+
+function readUsageModelsByBucket(
+  database: SqlDatabase,
+  bucketExpression: string,
+  query: UsageWhereClause
+): Map<string, Record<string, number>> {
+  const rows = queryRows(
+    database,
+    `
+      SELECT
+        ${bucketExpression} AS bucket,
+        model AS model,
+        COALESCE(SUM(CASE
+          WHEN total_tokens > input_tokens + output_tokens + cache_read_tokens + cache_write_tokens THEN total_tokens
+          ELSE input_tokens + output_tokens + cache_read_tokens + cache_write_tokens
+        END), 0) AS computed_total_tokens
+      FROM usage_events
+      WHERE ${query.where}
+      GROUP BY bucket, model
+    `,
+    query.params
+  );
+  const modelsByBucket = new Map<string, Record<string, number>>();
+  for (const row of rows) {
+    const bucket = String(row.bucket ?? "");
+    const model = String(row.model ?? "").trim() || "unknown";
+    const value = Number(row.computed_total_tokens) || 0;
+    if (value <= 0) {
+      continue;
+    }
+    const models = modelsByBucket.get(bucket) ?? {};
+    models[model] = (models[model] ?? 0) + value;
+    modelsByBucket.set(bucket, models);
+  }
+  return modelsByBucket;
 }
 
 function readModelRows(database: SqlDatabase, query: UsageWhereClause): UsageComparisonRow[] {
