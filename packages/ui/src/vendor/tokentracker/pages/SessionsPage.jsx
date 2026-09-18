@@ -866,11 +866,11 @@ export function SessionsPage() {
 
   return (
     <div className="flex flex-col flex-1 text-oai-black dark:text-oai-white font-oai antialiased">
-      <main className="flex-1 pt-8 sm:pt-10 pb-12 sm:pb-16">
+      <main className="flex-1 pt-0 pb-12 sm:pb-16">
         <div className="mx-auto max-w-6xl px-4 sm:px-6">
-          <div className="mb-8 flex flex-row items-start justify-between gap-4">
+          <div className="mb-6 flex flex-row items-start justify-between gap-4">
             <div className="min-w-0">
-              <h1 className="mb-3 text-3xl font-semibold tracking-tight text-oai-black dark:text-white sm:text-4xl">
+              <h1 className="mb-1 text-[24px] font-semibold tracking-[-0.025em] text-oai-black dark:text-white">
                 {copy("nav.sessions")}
               </h1>
               <p className="text-sm text-oai-gray-500 dark:text-oai-gray-400 sm:text-base">

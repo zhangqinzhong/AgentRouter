@@ -31,21 +31,16 @@ function breakdownRows(rows: UsageComparisonRow[], limit: number): BreakdownRow[
 function BreakdownList({
   emptyLabel,
   rows,
-  title,
   trailing
 }: {
   emptyLabel: string;
   rows: UsageComparisonRow[];
-  title: string;
   trailing?: string;
 }) {
   const display = breakdownRows(rows, breakdownRowLimit);
   return (
     <div className="min-w-0">
-      <div className="mb-3 flex min-w-0 items-baseline justify-between gap-3">
-        <h3 className="text-sm font-medium">{title}</h3>
-        {trailing ? <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{trailing}</span> : null}
-      </div>
+      {trailing ? <div className="mb-3 text-right text-[11px] tabular-nums text-muted-foreground">{trailing}</div> : null}
       {display.length === 0 ? (
         <p className="text-sm text-muted-foreground">{emptyLabel}</p>
       ) : (
@@ -101,23 +96,29 @@ function breakdownTrailing(rows: UsageComparisonRow[], translate: (value: string
 export function OverviewBreakdowns({ usageStats }: { usageStats: UsageStatsSnapshot }) {
   const t = useAppText();
   return (
-    <section className="grid grid-cols-1 gap-x-10 gap-y-8 lg:grid-cols-3">
-      <BreakdownList
-        emptyLabel={t("No model usage yet")}
-        rows={usageStats.models ?? []}
-        title={t("Models")}
-        trailing={breakdownTrailing(usageStats.models ?? [], t)}
-      />
-      <BreakdownList
-        emptyLabel={t("No client usage yet")}
-        rows={collapseAnalysisDisplayRows("client", usageStats.clientModels ?? [])}
-        title={t("Client Analysis")}
-      />
-      <BreakdownList
-        emptyLabel={t("No provider usage yet")}
-        rows={collapseAnalysisDisplayRows("provider", usageStats.providerModels ?? [])}
-        title={t("Provider Analysis")}
-      />
-    </section>
+    <div className="space-y-10">
+      <section>
+        <h2 className="mb-3 text-sm font-medium">{t("Models")}</h2>
+        <BreakdownList
+          emptyLabel={t("No model usage yet")}
+          rows={usageStats.models ?? []}
+          trailing={breakdownTrailing(usageStats.models ?? [], t)}
+        />
+      </section>
+      <section>
+        <h2 className="mb-3 text-sm font-medium">{t("Client Analysis")}</h2>
+        <BreakdownList
+          emptyLabel={t("No client usage yet")}
+          rows={collapseAnalysisDisplayRows("client", usageStats.clientModels ?? [])}
+        />
+      </section>
+      <section>
+        <h2 className="mb-3 text-sm font-medium">{t("Provider Analysis")}</h2>
+        <BreakdownList
+          emptyLabel={t("No provider usage yet")}
+          rows={collapseAnalysisDisplayRows("provider", usageStats.providerModels ?? [])}
+        />
+      </section>
+    </div>
   );
 }
