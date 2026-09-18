@@ -107,7 +107,7 @@ export function SystemStatusStrip({
     }];
 
   const statusRangeLabel = statusRows[0]?.segments.length
-    ? formatSystemStatusRange(statusRows[0].segments, "30d")
+    ? formatSystemStatusRange(statusRows[0].segments, usageRange)
     : rangeLabel;
 
   const renderTicks = (row: (typeof statusRows)[number]) => (

@@ -287,7 +287,6 @@ export class UsageStore {
     statusSince.setDate(statusSince.getDate() - 179);
     this.backfillFromRequestLogs(database, statusSince < since ? statusSince : since);
     const query = buildUsageWhereClause(since, filter);
-    const statusQuery = buildUsageWhereClause(statusSince, filter);
 
     return {
       clientModels: readClientModelRows(database, query),
@@ -297,7 +296,7 @@ export class UsageStore {
       range: normalizedRange,
       recentRequests: readRecentRequestRows(database, query),
       series: readUsageSeries(database, normalizedRange, now, query),
-      providerSeries: readProviderUsageSeries(database, now, statusQuery, 180),
+      providerSeries: readProviderUsageSeries(database, now, query, normalizedRange),
       totals: readUsageTotals(database, query)
     };
   }
@@ -784,9 +783,12 @@ function readProviderUsageSeries(
   database: SqlDatabase,
   now: Date,
   query: UsageWhereClause,
-  days: number
+  range: UsageStatsRange
 ): Array<{ provider: string; series: UsageSeriesPoint[]; totals: UsageTotals }> {
-  const bucketExpression = "strftime('%Y-%m-%d', created_at, 'localtime')";
+  const unit: "day" | "hour" = range === "today" || range === "24h" ? "hour" : "day";
+  const bucketExpression = unit === "hour"
+    ? "strftime('%Y-%m-%d %H:00', created_at, 'localtime')"
+    : "strftime('%Y-%m-%d', created_at, 'localtime')";
   const rows = queryRows(
     database,
     `
@@ -808,7 +810,7 @@ function readProviderUsageSeries(
     buckets.set(bucket, usageTotalsFromRow(row));
     byProvider.set(provider, buckets);
   }
-  const template = buildDayBuckets(days, now);
+  const template = unit === "hour" ? buildBuckets("24h", now) : buildDayBuckets(range === "7d" ? 7 : 30, now);
   return [...byProvider.entries()]
     .map(([provider, totalsByBucket]) => {
       const series = template.map(({ key, label }) => ({

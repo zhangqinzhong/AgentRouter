@@ -261,7 +261,7 @@ export function OverviewView({
       <div className="space-y-10">
         <SystemStatusStrip usageRange={usageRange} usageStats={displayUsageStats} />
         <UsageTrendSection usageRange={usageRange} usageStats={usageStats} />
-        <OverviewBreakdowns usageStats={displayUsageStats} />
+        <OverviewBreakdowns providers={filterProviders} usageStats={displayUsageStats} />
         <ProviderAccountsSection
           accounts={providerAccounts}
           onConfigure={onConfigureProviderAccounts}

@@ -220,7 +220,7 @@ function ProviderAccountLogo({
   );
 }
 
-function isUsableProviderIconUrl(url: string): boolean {
+export function isUsableProviderIconUrl(url: string): boolean {
   return url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:") || url.startsWith("blob:") || url.startsWith("/") || url.startsWith(".");
 }
 
