@@ -4,13 +4,14 @@ import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { formatCodexResetCardExpiry, formatCodexResetCardNumber } from "@agentrouter/ui/pages/home/components/overview-accounts.tsx";
 import { OverviewStatisticsResetDialog, OverviewView } from "@agentrouter/ui/pages/home/components/overview.tsx";
+import { OverviewBreakdowns } from "@agentrouter/ui/pages/home/components/overview-breakdown.tsx";
 import { adaptSeriesToTrendRows } from "@agentrouter/ui/pages/home/components/overview-trend.tsx";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { parseStatusBucketDate } from "@agentrouter/ui/pages/home/shared/controls.tsx";
 import { formatProviderAccountMeterValue, providerAccountMeterDetailValidityProgress } from "@agentrouter/ui/pages/home/shared/provider-accounts.ts";
 import type { GatewayProviderConfig, ProviderAccountSnapshot } from "@agentrouter/core/contracts/app.ts";
 import type { UsageStatsSnapshot } from "@agentrouter/core/contracts/app.ts";
-import { accountSnapshots, installBrowserGlobals, usageStats } from "../fixtures/index.ts";
+import { accountSnapshots, installBrowserGlobals, usageRow, usageStats } from "../fixtures/index.ts";
 
 installBrowserGlobals();
 
@@ -437,4 +438,23 @@ test("overview trend adapter carries model breakdown and request counts", () => 
   assert.deepEqual(rows[0].models, { "gpt-5.6-sol": 700, "glm-5.3": 300 });
   assert.equal(rows[1].total_requests, 2);
   assert.equal(rows[1].models && (rows[1].models as Record<string, number>)["gpt-5.6-sol"], 200);
+});
+
+test("OverviewBreakdowns merges model rows that share a display name", () => {
+  const stats = usageStats("30d", {
+    models: [
+      usageRow("m1", "glm-5.3-flash", { model: "glm-5.3-flash", provider: "WorkGLM", requestCount: 768, totalTokens: 215368252 }),
+      usageRow("m2", "glm-5.3-flash", { model: "glm-5.3-flash", provider: "WorkGLM", requestCount: 144, totalTokens: 28255705 }),
+      usageRow("m3", "glm-5.3", { model: "glm-5.3", provider: "WorkGLM", requestCount: 544, totalTokens: 125432678 })
+    ]
+  });
+  const html = renderToStaticMarkup(
+    <AppI18nContext.Provider value={appCopy.en}>
+      <OverviewBreakdowns providers={[]} usageStats={stats} />
+    </AppI18nContext.Provider>
+  );
+
+  const occurrences = html.match(/title="glm-5\.3-flash"/g) ?? [];
+  assert.equal(occurrences.length, 1, "duplicate display names must collapse to one row");
+  assert.match(html, /912/);
 });

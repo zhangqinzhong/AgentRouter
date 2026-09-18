@@ -855,7 +855,10 @@ function readProviderUsageSeries(
     const provider = usageProviderLabel(normalizeLabel(String(row.provider ?? ""), "unknown"));
     const bucket = String(row.bucket ?? "");
     const buckets = byProvider.get(provider) ?? new Map<string, UsageTotals>();
-    buckets.set(bucket, usageTotalsFromRow(row));
+    // Credential-suffixed provider keys collapse onto one display provider;
+    // merge instead of overwrite so days served via several keys sum up.
+    const existing = buckets.get(bucket);
+    buckets.set(bucket, existing ? mergeUsageTotals(existing, usageTotalsFromRow(row)) : usageTotalsFromRow(row));
     byProvider.set(provider, buckets);
   }
   const template = buildDayBuckets(providerStatusDays, now);
@@ -960,7 +963,9 @@ function readModelRows(database: SqlDatabase, query: UsageWhereClause): UsageCom
     query,
     "provider, model",
     "provider, model, MAX(credential_id) AS credential_id",
-    8
+    // Same display model can arrive via several providers/credential-suffixed
+    // provider keys; consumers merge by name, so fetch a wide enough slice.
+    25
   ).map((row) => {
     const provider = usageProviderLabel(normalizeLabel(String(row.provider ?? ""), "unknown"));
     return {
@@ -1086,8 +1091,27 @@ function readRecentRequestRows(database: SqlDatabase, query: UsageWhereClause): 
   return buildRecentRequestRows(events);
 }
 
-function usageTotalsFromRow(row: Record<string, SqlValue> | undefined): UsageTotals {
-  const requestCount = normalizeCount(row?.request_count);
+function mergeUsageTotals(left: UsageTotals, right: UsageTotals): UsageTotals {
+  const requestCount = left.requestCount + right.requestCount;
+  const errorCount = left.errorCount + right.errorCount;
+  const cacheTokens = left.cacheTokens + right.cacheTokens;
+  const inputTokens = left.inputTokens + right.inputTokens;
+  const durationTotal = left.avgDurationMs * left.requestCount + right.avgDurationMs * right.requestCount;
+  return {
+    avgDurationMs: requestCount > 0 ? Math.round(durationTotal / requestCount) : 0,
+    cacheRatio: cacheTokens + inputTokens > 0 ? cacheTokens / (cacheTokens + inputTokens) : 0,
+    cacheTokens,
+    costUsd: left.costUsd + right.costUsd,
+    errorCount,
+    inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    requestCount,
+    successRate: requestCount > 0 ? (requestCount - errorCount) / requestCount : 0,
+    totalTokens: left.totalTokens + right.totalTokens
+  };
+}
+
+function usageTotalsFromRow(row: Record<string, SqlValue> | undefined): UsageTotals {  const requestCount = normalizeCount(row?.request_count);
   if (requestCount === 0) {
     return { ...emptyTotals };
   }

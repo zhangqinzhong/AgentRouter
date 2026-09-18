@@ -265,9 +265,12 @@ function BreakdownSection({
   );
 }
 
-function analysisDisplayLabel(kind: "client" | "provider", row: UsageComparisonRow): string {
+function analysisDisplayLabel(kind: "client" | "model" | "provider", row: UsageComparisonRow): string {
   if (kind === "provider") {
     return row.provider && row.provider !== "unknown" ? row.provider : row.label;
+  }
+  if (kind === "model") {
+    return row.model && row.model !== "unknown" ? row.model : row.label;
   }
   if (row.client && row.client !== "unknown") return row.client;
   if (row.provider && row.provider !== "unknown") return row.provider;
@@ -275,7 +278,10 @@ function analysisDisplayLabel(kind: "client" | "provider", row: UsageComparisonR
   return row.label;
 }
 
-function collapseAnalysisDisplayRows(kind: "client" | "provider", rows: UsageComparisonRow[]): UsageComparisonRow[] {
+// The store groups rows by (provider, model), so the same display name can
+// arrive several times — routed via different providers, connectors, or
+// credentials. Collapse onto one row per display label before ranking.
+function collapseAnalysisDisplayRows(kind: "client" | "model" | "provider", rows: UsageComparisonRow[]): UsageComparisonRow[] {
   const grouped = new Map<string, UsageComparisonRow>();
   for (const row of rows) {
     const label = analysisDisplayLabel(kind, row);
@@ -313,7 +319,7 @@ export function OverviewBreakdowns({ providers, usageStats }: { providers: Gatew
         icon={Boxes}
         kind="model"
         providers={providers}
-        rows={usageStats.models ?? []}
+        rows={collapseAnalysisDisplayRows("model", usageStats.models ?? [])}
         title={t("Models")}
         trailing={breakdownTrailing(usageStats.models ?? [], t)}
       />

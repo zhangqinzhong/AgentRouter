@@ -826,3 +826,35 @@ test("UsageStore honors custom date ranges with a fixed provider status window",
     rmSync(dir, { force: true, recursive: true });
   }
 });
+
+test("UsageStore merges credential-suffixed provider keys in the status series", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-compound-provider-test-"));
+  try {
+    const store = new UsageStore(path.join(dir, "usage.sqlite"));
+    const recordEvent = async (provider, requestId) => {
+      await store.record({
+        createdAt: new Date().toISOString(),
+        durationMs: 90,
+        method: "POST",
+        model: "glm-5.3-flash",
+        path: "/v1/messages",
+        provider,
+        requestId,
+        statusCode: 200,
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
+      });
+    };
+    await recordEvent("workglm::openai_compatible", "compound-1");
+    await recordEvent("workglm::openai_compatible::cred:key-2", "compound-2");
+
+    const stats = await store.getStats("today", { includeProxy: true });
+    const workglm = stats.providerSeries.find((row) => row.provider === "workglm");
+    assert.ok(workglm, "credential-suffixed keys should collapse onto the base provider label");
+    assert.equal(workglm.series.length, 90);
+    assert.equal(workglm.totals.requestCount, 2);
+    const todayBucket = workglm.series[workglm.series.length - 1];
+    assert.equal(todayBucket.requestCount, 2, "same-day rows from both keys must sum, not overwrite");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
