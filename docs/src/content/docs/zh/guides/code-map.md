@@ -51,7 +51,7 @@ docs/              Astro 文档站与 Markdown 文档
 | 用量存储与聚合 | [`packages/core/src/usage/store.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/store.ts) | 记录网关用量、按时段和筛选条件聚合、重置概览统计。 |
 | 计费同步 | [`packages/core/src/usage/billing-sync.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/billing-sync.ts) | 同步底层网关的计费用量。 |
 | Token 规范化 | [`packages/core/src/usage/normalization.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/normalization.ts) | 处理不同协议的输入、输出、缓存等用量口径。 |
-| 概览图表 | [`packages/ui/src/pages/home/components/dashboard.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/dashboard.tsx) | 概览账户余额、趋势、客户端分析等组件。 |
+| 概览页 | [`packages/ui/src/pages/home/components/overview.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/overview.tsx) | 扁平化概览页：统计行、系统状态、趋势与模型/客户端/供应商分析。 |
 | 用量页 | [`packages/ui/src/pages/home/components/local-usage.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-usage.tsx) | TokenTracker 风格用量总览与供应商下钻。 |
 | 会话页 | [`packages/ui/src/vendor/tokentracker/pages/SessionsPage.jsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/vendor/tokentracker/pages/SessionsPage.jsx) | 本机会话列表；按档案目录标记 `ar_profile`，恢复入口走档案 CLI/App。 |
 | 趋势页 | [`packages/ui/src/pages/home/components/local-trend.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-trend.tsx) | 日/周/月/年/总计/自定义趋势曲线。 |

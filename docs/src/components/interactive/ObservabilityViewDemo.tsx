@@ -1,6 +1,6 @@
 /** Fictional order-status examples for the interactive documentation. */
 import { useState } from "react";
-import { AgentAnalysisView } from "@/pages/home/components/dashboard";
+import { AgentAnalysisView } from "@/pages/home/components/agent-analysis";
 import { BaseUiProvider } from "@/lib/baseui-provider";
 import { AppI18nContext, appCopy } from "@/pages/home/shared/i18n";
 import { getAgentAnalysisData } from "./mockData";
