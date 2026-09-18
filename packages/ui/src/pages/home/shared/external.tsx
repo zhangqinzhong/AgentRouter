@@ -2,19 +2,11 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 import {
   closestCenter,
   DndContext,
-  DragOverlay,
-  getFirstCollision,
   KeyboardSensor,
-  MeasuringStrategy,
-  pointerWithin,
   PointerSensor,
-  rectIntersection,
   useSensor,
   useSensors,
-  type CollisionDetection,
-  type DragEndEvent,
-  type DragOverEvent,
-  type DragStartEvent
+  type DragEndEvent
 } from "@dnd-kit/core";
 import { arrayMove, rectSortingStrategy, SortableContext, sortableKeyboardCoordinates, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -125,12 +117,10 @@ import {
   BUILTIN_FUSION_TOOL_SERVER_NAME,
   BUILTIN_FUSION_VISION_TOOL_NAME,
   BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME,
-  DEFAULT_OVERVIEW_WIDGETS,
   DEFAULT_TRAY_COMPONENT_VARIANTS,
   DEFAULT_TRAY_WIDGETS,
   DEFAULT_TRAY_WINDOW_MODULES,
   enforceSingleEnabledGlobalProfilePerAgent,
-  OVERVIEW_WIDGET_SIZE_VALUES,
   TRAY_SINGLETON_WIDGET_TYPES,
   TRAY_TOP_WIDGET_TYPES,
   TRAY_WINDOW_MODULE_IDS
@@ -171,11 +161,6 @@ import type {
   GatewayMcpStdioMessageMode,
   GatewayMcpToolInfo,
   GatewayStatus,
-  OverviewMetricKind,
-  OverviewWidgetConfig,
-  OverviewWidgetSize,
-  OverviewWidgetType,
-  OverviewWidgetVariant,
   OpenRouterProviderCatalogItem,
   OpenRouterProviderCatalogRequest,
   OpenRouterProviderCatalogResult,
@@ -344,8 +329,6 @@ import {
   mcpStdioMessageModeOptions,
   navigation,
   onboardingStepOrder,
-  overviewMetricOptions,
-  overviewWidgetSizeOptions,
   profileAgentOptions,
   profileScopeOptions,
   profileSurfaceOptions,
@@ -459,8 +442,6 @@ export {
   mcpStdioMessageModeOptions,
   navigation,
   onboardingStepOrder,
-  overviewMetricOptions,
-  overviewWidgetSizeOptions,
   profileAgentOptions,
   profileScopeOptions,
   profileSurfaceOptions,
@@ -539,8 +520,8 @@ function providerEndpointCanReceiveProviderApiKey(input: {
 
 export {
   createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState,
-  closestCenter, DndContext, DragOverlay, getFirstCollision, KeyboardSensor, MeasuringStrategy, pointerWithin,
-  PointerSensor, rectIntersection, useSensor, useSensors, arrayMove, rectSortingStrategy, SortableContext,
+  closestCenter, DndContext, KeyboardSensor,
+  PointerSensor, useSensor, useSensors, arrayMove, rectSortingStrategy, SortableContext,
   sortableKeyboardCoordinates, useSortable, CSS, AnimatePresence, LayoutGroup, motion, useReducedMotion,
   Activity, ArrowDown, ArrowUp, Box, Boxes, Braces, Check, CheckCircle2,
   ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Copy, Database, Download, FolderOpen,
@@ -555,16 +536,15 @@ export {
   cn, appLogoUrl, claudeCodeLogoUrl, codexLogoUrl, onboardingMascotSpriteUrl, anthropicProviderIconUrl, bailianProviderIconUrl, deepseekProviderIconUrl,
   geminiProviderIconUrl, mistralProviderIconUrl, moonshotProviderIconUrl, openaiProviderIconUrl, openrouterProviderIconUrl, siliconflowProviderIconUrl, zaiGlobalCodingProviderIconUrl,
   zaiGlobalGeneralProviderIconUrl, zhipuCnCodingProviderIconUrl, zhipuCnGeneralProviderIconUrl, BUILTIN_FUSION_TOOL_SERVER_NAME,
-  BUILTIN_FUSION_VISION_TOOL_NAME, BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME, DEFAULT_OVERVIEW_WIDGETS, DEFAULT_TRAY_COMPONENT_VARIANTS, DEFAULT_TRAY_WIDGETS, DEFAULT_TRAY_WINDOW_MODULES, enforceSingleEnabledGlobalProfilePerAgent, OVERVIEW_WIDGET_SIZE_VALUES, TRAY_SINGLETON_WIDGET_TYPES, TRAY_TOP_WIDGET_TYPES, TRAY_WINDOW_MODULE_IDS,
+  BUILTIN_FUSION_VISION_TOOL_NAME, BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME, DEFAULT_TRAY_COMPONENT_VARIANTS, DEFAULT_TRAY_WIDGETS, DEFAULT_TRAY_WINDOW_MODULES, enforceSingleEnabledGlobalProfilePerAgent, TRAY_SINGLETON_WIDGET_TYPES, TRAY_TOP_WIDGET_TYPES, TRAY_WINDOW_MODULE_IDS,
   customProviderPresetId, defaultProviderAccountConfig, findProviderPreset, findProviderPresetByBaseUrl, findProviderPresetByIdentity, primaryProviderPresetEndpoint, providerApiKeySafetyIssue, providerEndpointCanReceiveProviderApiKey,
   providerIdentitySafetyIssue, getProviderPresets, setProviderPresets, standardProviderAccountConfig, normalizeProviderBaseUrl, providerUrlWithDefaultScheme
 };
 export type {
-  HTMLAttributes, ReactDragEvent, ReactPointerEvent, ReactNode, CollisionDetection, DragEndEvent, DragOverEvent, DragStartEvent,
+  HTMLAttributes, ReactDragEvent, ReactPointerEvent, ReactNode, DragEndEvent,
   LucideIcon, AgentAnalysisFilter, AgentAnalysisSessionSelection, AgentAnalysisSnapshot, AgentAnalysisTrace, AgentAnalysisTracePayloadFullResult, AgentAnalysisTracePayloadRequest, AgentAnalysisTraceRun, AgentAnalysisTraceRunKind, AgentKind, AppConfig, AppInfo, AppSaveConfigOptions, AppUpdateStatus, ApiKeyConfig,
   ApiKeyLimitConfig, BotGatewayQrLoginCancelRequest, BotGatewayQrLoginCancelResult, BotGatewayQrLoginStartRequest, BotGatewayQrLoginStartResult, BotGatewayQrLoginWaitRequest, BotGatewayQrLoginWaitResult, BotGatewayQrWindowOpenResult, BotGatewayRuntimeConfig, BotGatewaySavedConfig, BotHandoffScanTarget, GatewayProviderConfig, GatewayProviderCapability, GatewayPluginAppConfig, GatewayProviderProbeResult, GatewayProviderProtocol, GatewayMcpServerConfig,
-  GatewayMcpServerTransport, GatewayMcpStdioMessageMode, GatewayMcpToolInfo, GatewayStatus, OverviewMetricKind, OverviewWidgetConfig, OverviewWidgetSize, OverviewWidgetType,
-  OverviewWidgetVariant, OpenRouterProviderCatalogItem, OpenRouterProviderCatalogRequest, OpenRouterProviderCatalogResult, PluginDependency, PluginDirectorySelection, PluginMarketplaceEntry, ProviderAccountConfig, ProviderAccountConnectorConfig, ProviderAccountHttpJsonConnectorConfig,
+  GatewayMcpServerTransport, GatewayMcpStdioMessageMode, GatewayMcpToolInfo, GatewayStatus, OpenRouterProviderCatalogItem, OpenRouterProviderCatalogRequest, OpenRouterProviderCatalogResult, PluginDependency, PluginDirectorySelection, PluginMarketplaceEntry, ProviderAccountConfig, ProviderAccountConnectorConfig, ProviderAccountHttpJsonConnectorConfig,
   ProviderAccountMeter, ProviderAccountStandardConnectorConfig, ProviderAccountSnapshot, ProviderAccountTestPath, ProviderAccountTestResult, ProviderDeepLinkPayload, ProviderDeepLinkRequest,
   ProviderCredentialConfig,
   ProfileConfig, ProfileOpenSurface, ProfileRuntimeStatus, CodexProfileConfigFormat, ProfileScope, ProfileSurface, ProxyCertificateInstallResult, ProxyCertificateStatus, ProxyNetworkBody,

@@ -6,7 +6,7 @@ import {
 } from "./fallbacks";
 
 import { normalizeApiKeys } from "./api-keys";
-import { normalizeOverviewWidgets, normalizeThemePreference, normalizeTrayBalanceProgressConfig, normalizeTrayComponentVariants, normalizeTrayIconPreference, normalizeTrayProgressTargetTokens, normalizeTrayWidgets, normalizeTrayWindowModules } from "./common";
+import {  normalizeThemePreference, normalizeTrayBalanceProgressConfig, normalizeTrayComponentVariants, normalizeTrayIconPreference, normalizeTrayProgressTargetTokens, normalizeTrayWidgets, normalizeTrayWindowModules } from "./common";
 import { legacyProfileItemsFromProfileConfig, normalizeBotGatewayRuntimeConfig, normalizeBotGatewaySavedConfigs, normalizeCodexConfigFormat, normalizeProfileItems } from "./profiles";
 import { normalizeRouterConfig } from "./routing";
 import { normalizeMcpServers } from "./virtual-models";
@@ -63,7 +63,6 @@ export function normalizeConfig(config: AppConfig): AppConfig {
       },
       profiles
     },
-    overviewWidgets: normalizeOverviewWidgets(config.overviewWidgets),
     plugins: Array.isArray(config.plugins) ? config.plugins : [],
     providerPlugins: Array.isArray(config.providerPlugins) ? config.providerPlugins : [],
     theme: normalizeThemePreference(config.theme),

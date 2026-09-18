@@ -15,7 +15,7 @@ import { LEGACY_ACTIVE_CONFIG_FILE, LEGACY_CONFIG_FILE, LEGACY_WINDOWS_CONFIG_FI
 import { normalizeCodexProviderAccountConfig } from "@agentrouter/core/agents/local-providers/codex";
 import { normalizeGrokProviderAccountConfig, normalizeGrokProviderMediaCapabilities } from "@agentrouter/core/agents/local-providers/grok";
 import { removeOpenCodeProviderAccountConfig } from "@agentrouter/core/agents/local-providers/opencode";
-import { CLAUDE_CODE_DEFAULT_ENV, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV, CLAUDE_DESIGN_PLUGIN_ID, CLAUDE_SHIP_PLUGIN_ID, DEFAULT_TRAY_COMPONENT_VARIANTS, GATEWAY_PLUGIN_PERMISSION_IDS, GATEWAY_PLUGIN_SURFACE_IDS, OVERVIEW_WIDGET_SIZE_VALUES, ROUTER_FALLBACK_MAX_RETRY_COUNT, ROUTER_SCRIPT_API_VERSION, ROUTER_SCRIPT_DEFAULT_TIMEOUT_MS, ROUTER_SCRIPT_MAX_TIMEOUT_MS, TRAY_SINGLETON_WIDGET_TYPES, TRAY_TOP_WIDGET_TYPES, TRAY_WINDOW_MODULE_IDS, enforceSingleEnabledGlobalProfilePerAgent, isEnabledGlobalProfile, knownGatewayPluginDefaultApps, knownGatewayPluginDefaultPermissions, knownGatewayPluginDefaultSurfaces } from "@agentrouter/core/contracts/app";
+import { CLAUDE_CODE_DEFAULT_ENV, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV, CLAUDE_DESIGN_PLUGIN_ID, CLAUDE_SHIP_PLUGIN_ID, DEFAULT_TRAY_COMPONENT_VARIANTS, GATEWAY_PLUGIN_PERMISSION_IDS, GATEWAY_PLUGIN_SURFACE_IDS, ROUTER_FALLBACK_MAX_RETRY_COUNT, ROUTER_SCRIPT_API_VERSION, ROUTER_SCRIPT_DEFAULT_TIMEOUT_MS, ROUTER_SCRIPT_MAX_TIMEOUT_MS, TRAY_SINGLETON_WIDGET_TYPES, TRAY_TOP_WIDGET_TYPES, TRAY_WINDOW_MODULE_IDS, enforceSingleEnabledGlobalProfilePerAgent, isEnabledGlobalProfile, knownGatewayPluginDefaultApps, knownGatewayPluginDefaultPermissions, knownGatewayPluginDefaultSurfaces } from "@agentrouter/core/contracts/app";
 import { createDefaultAppConfig } from "@agentrouter/core/config/default-config";
 import { maxRequestLogBodyBytes } from "@agentrouter/core/observability/request-log-limits";
 import { findProviderPresetByBaseUrl, primaryProviderPresetEndpoint, providerApiKeySafetyIssue, providerEndpointCanReceiveProviderApiKey } from "@agentrouter/core/providers/presets/index";
@@ -42,12 +42,6 @@ import type {
   GatewayProviderConfig,
   MediaToolsConfig,
   ObservabilityConfig,
-  OverviewAccountCardSize,
-  OverviewMetricKind,
-  OverviewWidgetConfig,
-  OverviewWidgetSize,
-  OverviewWidgetType,
-  OverviewWidgetVariant,
   ProviderAccountConfig,
   ProviderAccountConnectorConfig,
   ProviderCredentialConfig,
@@ -934,10 +928,6 @@ function pickConfig(value: Partial<AppConfig>): LoadedAppConfig {
   } else if (trayWindowModules !== undefined) {
     config.trayWidgets = trayWidgetsFromModules(trayWindowModules, resolvedTrayComponentVariants);
   }
-  const overviewWidgets = parseOverviewWidgets((value as Record<string, unknown>).overviewWidgets);
-  if (overviewWidgets !== undefined) {
-    config.overviewWidgets = overviewWidgets;
-  }
 
   return config;
 }
@@ -1106,180 +1096,6 @@ function parseMediaTools(value: unknown): Partial<MediaToolsConfig> | undefined 
 
 export function mediaToolsConfigFromRawForTest(value: unknown): Partial<MediaToolsConfig> | undefined {
   return parseMediaTools(value);
-}
-
-function parseOverviewWidgets(value: unknown): OverviewWidgetConfig[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const widgets = value
-    .map(parseOverviewWidget)
-    .filter((widget): widget is OverviewWidgetConfig => Boolean(widget));
-  return widgets;
-}
-
-function parseOverviewWidget(value: unknown): OverviewWidgetConfig | undefined {
-  if (!isObject(value)) {
-    return undefined;
-  }
-  const type = parseOverviewWidgetType(value.type);
-  if (!type) {
-    return undefined;
-  }
-  const metric = type === "metric" ? parseOverviewMetricKind(value.metric) ?? "requests" : undefined;
-  const accountProviders = type === "account-balance" ? parseOverviewAccountProviders(value) : [];
-  const accountCardOrder = type === "account-balance" ? parseOverviewAccountCardOrder(value.accountCardOrder) : [];
-  const accountCardSizes = type === "account-balance" ? parseOverviewAccountCardSizes(value.accountCardSizes) : undefined;
-  return {
-    ...(accountCardOrder.length > 0 ? { accountCardOrder } : {}),
-    ...(accountCardSizes ? { accountCardSizes } : {}),
-    ...(accountProviders.length === 1 ? { accountProvider: accountProviders[0] } : {}),
-    ...(accountProviders.length > 0 ? { accountProviders } : {}),
-    enabled: typeof value.enabled === "boolean" ? value.enabled : true,
-    id: readString(value.id) || overviewWidgetId(type, metric),
-    ...(metric ? { metric } : {}),
-    size: parseOverviewWidgetSize(value.size, type) ?? defaultOverviewWidgetSize(type),
-    type,
-    variant: parseOverviewWidgetVariant(value.variant) ?? defaultOverviewWidgetVariant(type)
-  };
-}
-
-function parseOverviewAccountProviders(value: Record<string, unknown>): string[] {
-  const accountProvider = readString(value.accountProvider);
-  return uniqueStrings([
-    ...parseStringList(value.accountProviders),
-    ...(accountProvider ? [accountProvider] : [])
-  ]);
-}
-
-function parseOverviewAccountCardOrder(value: unknown): string[] {
-  return uniqueStrings(parseStringList(value));
-}
-
-function parseOverviewAccountCardSizes(value: unknown): Record<string, OverviewAccountCardSize> | undefined {
-  if (!isObject(value)) {
-    return undefined;
-  }
-  const sizes: Record<string, OverviewAccountCardSize> = {};
-  for (const [key, rawSize] of Object.entries(value)) {
-    const accountKey = key.trim();
-    const size = parseOverviewAccountCardSize(rawSize);
-    if (accountKey && size) {
-      sizes[accountKey] = size;
-    }
-  }
-  return Object.keys(sizes).length > 0 ? sizes : undefined;
-}
-
-function parseOverviewAccountCardSize(value: unknown): OverviewAccountCardSize | undefined {
-  if (value === "small") {
-    return "1:1";
-  }
-  if (value === "large") {
-    return "1:2";
-  }
-  return parseEnumValue(value, ["1:1", "1:2", "2:1", "2:2"], undefined);
-}
-
-function parseOverviewWidgetType(value: unknown): OverviewWidgetType | undefined {
-  return parseEnumValue(value, ["account-balance", "client-analysis", "metric", "model-distribution", "provider-analysis", "share-fuel-cockpit", "share-model-leaderboard", "share-route-map", "share-spend-receipt", "share-token-calendar", "share-usage-wrapped", "system-status", "token-activity", "token-mix", "usage-trend"], undefined);
-}
-
-function parseOverviewWidgetSize(value: unknown, _type: OverviewWidgetType): OverviewWidgetSize | undefined {
-  const size = parseEnumValue(value, OVERVIEW_WIDGET_SIZE_VALUES, undefined);
-  if (size) {
-    return size;
-  }
-  if (value === "small") {
-    return "1:1";
-  }
-  if (value === "medium" || value === "large") {
-    return "2:2";
-  }
-  if (value === "wide") {
-    return "3:2";
-  }
-  if (value === "full") {
-    return "4:2";
-  }
-  return undefined;
-}
-
-function parseOverviewWidgetVariant(value: unknown): OverviewWidgetVariant | undefined {
-  return parseEnumValue(value, ["arc", "area", "bar", "bars", "card", "cards", "compact", "composed", "donut", "heatmap", "line", "nested-rings", "pie", "ring", "semicircle", "stacked", "table", "timeline"], undefined);
-}
-
-function parseOverviewMetricKind(value: unknown): OverviewMetricKind | undefined {
-  return parseEnumValue(value, ["avg-latency", "cache-ratio", "cache-tokens", "errors", "estimated-cost", "input-tokens", "output-tokens", "requests", "success-rate", "total-tokens"], undefined);
-}
-
-function defaultOverviewWidgetSize(type: OverviewWidgetType): OverviewWidgetSize {
-  if (type === "metric") {
-    return "1:1";
-  }
-  if (type === "model-distribution") {
-    return "2:2";
-  }
-  if (type === "token-mix") {
-    return "1:2";
-  }
-  if (type === "token-activity") {
-    return "4:2";
-  }
-  if (type === "client-analysis" || type === "provider-analysis") {
-    return "2:2";
-  }
-  if (type === "usage-trend") {
-    return "3:2";
-  }
-  if (type === "system-status") {
-    return "4:2";
-  }
-  if (isShareOverviewWidgetType(type)) {
-    return "1:4";
-  }
-  return "4:2";
-}
-
-function defaultOverviewWidgetVariant(type: OverviewWidgetType): OverviewWidgetVariant {
-  if (type === "account-balance") {
-    return "cards";
-  }
-  if (type === "metric") {
-    return "card";
-  }
-  if (type === "model-distribution") {
-    return "pie";
-  }
-  if (type === "token-mix") {
-    return "bars";
-  }
-  if (type === "token-activity") {
-    return "heatmap";
-  }
-  if (type === "usage-trend") {
-    return "composed";
-  }
-  if (type === "system-status") {
-    return "timeline";
-  }
-  if (isShareOverviewWidgetType(type)) {
-    return "card";
-  }
-  return "table";
-}
-
-function overviewWidgetId(type: OverviewWidgetType, metric?: OverviewMetricKind): string {
-  return type === "metric" ? `metric-${metric ?? "requests"}` : type;
-}
-
-function isShareOverviewWidgetType(type: OverviewWidgetType): boolean {
-  return type === "share-fuel-cockpit" ||
-    type === "share-model-leaderboard" ||
-    type === "share-route-map" ||
-    type === "share-spend-receipt" ||
-    type === "share-token-calendar" ||
-    type === "share-usage-wrapped";
 }
 
 function parseTrayIconPreference(value: unknown): TrayIconPreference | undefined {

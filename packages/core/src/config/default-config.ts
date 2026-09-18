@@ -1,6 +1,5 @@
 import {
   CLAUDE_CODE_DEFAULT_ENV,
-  DEFAULT_OVERVIEW_WIDGETS,
   DEFAULT_TRAY_COMPONENT_VARIANTS,
   DEFAULT_TRAY_WIDGETS,
   DEFAULT_TRAY_WINDOW_MODULES,
@@ -212,7 +211,6 @@ export function createDefaultAppConfig(options: DefaultAppConfigOptions = {}): A
       }
     },
     providerPlugins: [],
-    overviewWidgets: DEFAULT_OVERVIEW_WIDGETS,
     routerEndpoint: "http://127.0.0.1:3466",
     theme: "system",
     trayComponentVariants: DEFAULT_TRAY_COMPONENT_VARIANTS,

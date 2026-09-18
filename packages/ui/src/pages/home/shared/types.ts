@@ -1,11 +1,4 @@
 import {
-  closestCenter,
-  getFirstCollision,
-  pointerWithin,
-  rectIntersection,
-  type CollisionDetection
-} from "@dnd-kit/core";
-import {
   type LucideIcon
 } from "lucide-react";
 import type {
@@ -65,22 +58,6 @@ export type TrayModuleOption = {
   label: string;
   styleKey?: keyof TrayComponentVariants;
   value: TrayEditableModuleId;
-};
-
-export const overviewWidgetCollisionDetection: CollisionDetection = (args) => {
-  const pointerCollisions = pointerWithin(args);
-  const pointerCollision = getFirstCollision(pointerCollisions, "id");
-  if (pointerCollision) {
-    return pointerCollisions;
-  }
-
-  const rectCollisions = rectIntersection(args);
-  const rectCollision = getFirstCollision(rectCollisions, "id");
-  if (rectCollision) {
-    return rectCollisions;
-  }
-
-  return closestCenter(args);
 };
 
 export const fallbackAgentAnalysis = createEmptyAgentAnalysis("7d");

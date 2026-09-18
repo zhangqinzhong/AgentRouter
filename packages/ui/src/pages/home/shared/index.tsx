@@ -20,4 +20,4 @@ export * from "./virtual-models";
 export * from "./extensions";
 export * from "./providers";
 export { isGatewayProviderEnabled } from "@agentrouter/core/contracts/app";
-export type { OverviewAccountCardSize, RouterBuiltInAgentRuleConfig, RouterBuiltInAgentRuleId, RouterBuiltInRulesConfig } from "@agentrouter/core/contracts/app";
+export type { RouterBuiltInAgentRuleConfig, RouterBuiltInAgentRuleId, RouterBuiltInRulesConfig } from "@agentrouter/core/contracts/app";

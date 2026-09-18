@@ -20,8 +20,7 @@ import {
   BUILTIN_FUSION_IMAGE_GENERATION_TOOL_NAME,
   BUILTIN_FUSION_VIDEO_GENERATION_TOOL_NAME,
   BUILTIN_FUSION_VISION_TOOL_NAME,
-  BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME,
-  OVERVIEW_WIDGET_SIZE_VALUES
+  BUILTIN_FUSION_WEB_SEARCH_TOOL_NAME
 } from "@agentrouter/core/contracts/app";
 import type {
   AgentKind,
@@ -29,8 +28,6 @@ import type {
   GatewayMcpServerTransport,
   GatewayMcpStdioMessageMode,
   GatewayProviderProtocol,
-  OverviewMetricKind,
-  OverviewWidgetSize,
   ProviderAccountBrowserCredentialsMode,
   ProfileConfig,
   ProfileScope,
@@ -90,22 +87,6 @@ export const usageRangeOptions: Array<{ label: string; value: UsageStatsRange }>
   { label: "30d", value: "30d" }
 ];
 
-export const overviewWidgetSizeOptions: Array<{ label: string; value: OverviewWidgetSize }> = [
-  ...OVERVIEW_WIDGET_SIZE_VALUES.map((size) => ({ label: size, value: size }))
-];
-
-export const overviewMetricOptions: Array<{ label: string; value: OverviewMetricKind }> = [
-  { label: "Requests", value: "requests" },
-  { label: "Total tokens", value: "total-tokens" },
-  { label: "Input tokens", value: "input-tokens" },
-  { label: "Output tokens", value: "output-tokens" },
-  { label: "Cache tokens", value: "cache-tokens" },
-  { label: "Cache ratio", value: "cache-ratio" },
-  { label: "Estimated cost", value: "estimated-cost" },
-  { label: "Success rate", value: "success-rate" },
-  { label: "Errors", value: "errors" },
-  { label: "Average latency", value: "avg-latency" }
-];
 
 export const agentAnalysisRangeOptions: Array<{ label: string; value: UsageStatsRange }> = [
   { label: "24h", value: "24h" },
