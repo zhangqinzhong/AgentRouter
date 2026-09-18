@@ -272,10 +272,17 @@ function analysisDisplayLabel(kind: "client" | "model" | "provider", row: UsageC
   if (kind === "model") {
     return row.model && row.model !== "unknown" ? row.model : row.label;
   }
-  if (row.client && row.client !== "unknown") return row.client;
-  if (row.provider && row.provider !== "unknown") return row.provider;
-  if (row.model && row.model !== "unknown") return row.model;
-  return row.label;
+  // Client rows must not borrow provider/model names; callers filter out rows
+  // without client attribution, and the label fallback is the raw client value.
+  return row.client && row.client !== "unknown" ? row.client : row.label;
+}
+
+// Events without client attribution (e.g. captured before the client column
+// existed) have no real client to rank; keep them out of the client analysis
+// instead of showing them as an "unknown" bucket. They still count in totals,
+// trend, and provider breakdowns.
+function hasClientAttribution(row: UsageComparisonRow): boolean {
+  return Boolean(row.client && row.client !== "unknown");
 }
 
 // The store groups rows by (provider, model), so the same display name can
@@ -328,7 +335,7 @@ export function OverviewBreakdowns({ providers, usageStats }: { providers: Gatew
         icon={UserRound}
         kind="client"
         providers={providers}
-        rows={collapseAnalysisDisplayRows("client", usageStats.clientModels ?? [])}
+        rows={collapseAnalysisDisplayRows("client", (usageStats.clientModels ?? []).filter(hasClientAttribution))}
         title={t("Client Analysis")}
         trailing={breakdownTrailing(usageStats.clientModels ?? [], t)}
       />

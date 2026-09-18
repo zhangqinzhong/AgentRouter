@@ -48,10 +48,10 @@ docs/              Astro 文档站与 Markdown 文档
 | 路由编译 | [`packages/core/src/routing/config-compiler.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/routing/config-compiler.ts) | 编译规则，检查模型与 fallback 引用。 |
 | 请求记录 | [`packages/core/src/observability/request-log-store.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/observability/request-log-store.ts) | 请求记录与保存期限管理；正文由 request-log-body.ts 管理。 |
 | 原始轨迹同步 | [`packages/core/src/observability/raw-trace-sync.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/observability/raw-trace-sync.ts) | 接收和消费底层网关轨迹，写入请求记录，并补充用量捕获。 |
-| 用量存储与聚合 | [`packages/core/src/usage/store.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/store.ts) | 记录网关用量、按时段和筛选条件聚合、重置概览统计。 |
+| 用量存储与聚合 | [`packages/core/src/usage/store.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/store.ts) | 记录网关用量；按今天 / 24 小时 / 7 / 30 天与自定义区间及供应商、模型筛选聚合，生成 90 天状态序列，并可重置概览统计。 |
 | 计费同步 | [`packages/core/src/usage/billing-sync.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/billing-sync.ts) | 同步底层网关的计费用量。 |
 | Token 规范化 | [`packages/core/src/usage/normalization.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/usage/normalization.ts) | 处理不同协议的输入、输出、缓存等用量口径。 |
-| 概览页 | [`packages/ui/src/pages/home/components/overview.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/overview.tsx) | 扁平化概览页：统计行、系统状态、趋势与模型/客户端/供应商分析。 |
+| 概览页 | [`packages/ui/src/pages/home/components/overview.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/overview.tsx) | 固定扁平布局概览：时间范围与供应商 / 模型筛选、统计行、趋势和账户余额；状态条与拆分见同目录 overview-status、overview-trend、overview-breakdown、overview-accounts。 |
 | 用量页 | [`packages/ui/src/pages/home/components/local-usage.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-usage.tsx) | TokenTracker 风格用量总览与供应商下钻。 |
 | 会话页 | [`packages/ui/src/vendor/tokentracker/pages/SessionsPage.jsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/vendor/tokentracker/pages/SessionsPage.jsx) | 本机会话列表；按档案目录标记 `ar_profile`，恢复入口走档案 CLI/App。 |
 | 趋势页 | [`packages/ui/src/pages/home/components/local-trend.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/local-trend.tsx) | 日/周/月/年/总计/自定义趋势曲线。 |
@@ -59,6 +59,7 @@ docs/              Astro 文档站与 Markdown 文档
 | 本地采集 | [`packages/core/src/collector/usage-page.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/collector/usage-page.ts)、[`packages/core/src/vendor/tokentracker/local-sources.cjs`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/vendor/tokentracker/local-sources.cjs) | 读取 Claude/Codex/Grok 会话与各档案独立 `CODEX_HOME`。 |
 | 会话分析 | [`packages/core/src/vendor/tokentracker/lib/session-analytics.js`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/core/src/vendor/tokentracker/lib/session-analytics.js) | 扫描会话文件、时长、工具调用，并从路径解析档案 id。 |
 | 请求日志列表 | [`packages/ui/src/pages/home/components/network-logs.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/network-logs.tsx) | 日志查询展示、详情、首 Token 与速率列。 |
+| Agent 观测视图 | [`packages/ui/src/pages/home/components/agent-analysis.tsx`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/pages/home/components/agent-analysis.tsx) | 按会话与 Agent 筛选的执行链路分析：会话记录、轨迹与追踪详情，复用 network-logs 的展开详情。 |
 | 速率公式 | [`packages/ui/src/lib/token-rate.ts`](https://github.com/zhangqinzhong/AgentRouter/blob/main/packages/ui/src/lib/token-rate.ts) | 输出速率与平均吞吐率的前端计算。 |
 
 ## 档案启动链路

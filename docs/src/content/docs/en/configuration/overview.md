@@ -2,22 +2,23 @@
 title: Overview dashboard
 pageTitle: Overview dashboard
 eyebrow: Detailed configuration
-lead: Customize the AgentRouter home dashboard to inspect system status, account balance, requests, tokens, cost, and model distribution.
+lead: The AgentRouter home overview — system status, requests, tokens, cost, usage trend, model / client / provider breakdowns, and account balance.
 ---
+
+The overview is a single fixed-layout page. From top to bottom it shows the time range and filters, a stat strip, the system status strip, the usage trend, breakdown sections, and account balance. Layout editing and widget management are no longer available; dashboard layouts configured before 1.4.0 are ignored and do not need manual cleanup.
 
 ## When to use it
 
 | Scenario | What to inspect |
 | --- | --- |
-| Check gateway health | System status, success rate, errors, average latency |
-| Estimate recent spend | Requests, input / output / cache tokens, estimated cost |
-| Compare upstream usage | Provider analysis, model distribution, client analysis |
+| Check gateway health | System status, success rate, errors |
+| Estimate recent spend | Requests, total tokens, estimated cost |
+| Compare upstream usage | Provider analysis, model breakdown, client analysis |
 | Watch account quota | Balance, subscription quota, remaining quota, account status |
-| Report or share usage | AI Usage Wrapped, AgentRouter Route Map, Model Leaderboard, Spend Receipt, and other share cards |
 
-## Time range
+## Time range and filters
 
-The `Usage over time` control at the top drives every widget that depends on usage stats. After you switch ranges, requests, tokens, cost, trends, distribution, and share cards are recomputed for the selected window.
+The `Usage over time` control at the top drives the stat strip, trend, and breakdown sections. After you switch ranges, requests, tokens, cost, and distributions are recomputed for the selected window.
 
 | Option | Window |
 | --- | --- |
@@ -25,107 +26,65 @@ The `Usage over time` control at the top drives every widget that depends on usa
 | `24h` | Last 24 hours, bucketed hourly. |
 | `7d` | Last 7 days, bucketed daily. |
 | `30d` | Last 30 days, bucketed daily. |
+| `Custom` | Any start and end date, both inclusive. Click it, pick the two dates in the panel, then `Apply`. |
 
-The account balance widget does not use this time range. It shows the latest snapshot returned by provider account connectors.
+Two sections ignore the time range:
 
-## Edit layout
-
-Click the pencil button in the upper-right corner to enter editing mode. Editing mode has three columns:
-
-| Area | Purpose |
+| Section | Behavior |
 | --- | --- |
-| Components | Left palette. Click a template to add it to the dashboard. |
-| Preview | Middle layout preview. Drag widgets to reorder them or click a widget to select it. |
-| Component properties | Right property panel for changing type, data, size, style, or removing the selected widget. |
+| System status strip | Always shows the last 90 days; see below. |
+| Account balance | Shows the latest snapshot returned by provider account connectors. |
 
-Common operations:
+Below the range tabs are two filters: `Provider` lists only enabled gateway providers, and `Model` options follow the selected provider. The filters apply to the stat strip, trend, and breakdowns at the same time.
 
-1. Add a widget: click a template in `Components`.
-2. Reorder widgets: drag them in `Preview`.
-3. Resize a widget: select it, then drag the right, bottom, or bottom-right resize handle.
-4. Change data: use `Component category` and `Data` in `Component properties`.
-5. Change presentation: choose `Widget size` and `Style`.
-6. Save the result: click `Done`; the layout is persisted in app configuration.
-7. Restore defaults: click `Reset layout` while editing.
+## Stat strip
 
-Removing a widget only removes that card from the overview layout. It does not delete request logs, providers, account connectors, or upstream configuration. If all widgets are removed, the page shows `No widgets configured`.
+The stat strip shows four numbers for the selected range and filters: requests, total tokens, estimated cost, and request success rate. The error count appears under the success rate; when there are requests, a one-line summary of requests and success rate follows the strip.
 
-## Widget catalog
+## System status strip
 
-Sizes are written as `width:height`, with both dimensions from `1` to `4`. The overview grid has up to 4 columns on desktop and collapses automatically on narrow screens.
+The system status strip always covers the last 90 days regardless of the selected range. Every provider with usage gets one row of daily ticks colored by outcome: OK, warning, error, or no requests. Hover or focus a tick to see its date, requests, and errors for that day.
 
-| Widget | Data | Default size | Default style | Styles |
-| --- | --- | --- | --- | --- |
-| Status component | System status | `4:1` | Timeline | Timeline, Compact |
-| Account component | All accounts or one account | `4:2` | Cards | Cards, Compact, Bars, Ring, Semicircle, Arc, Nested rings |
-| Metric component | Requests, tokens, cost | `1:1` | Cards | Cards, Compact, Bar, Ring |
-| Trend component | Usage over time | `3:2` | Composed | Composed, Area, Line, Bar |
-| Activity component | Token activity | `4:2` | Heatmap | Heatmap |
-| Breakdown component | Token distribution / Model distribution | Token distribution: `1:2`; Model distribution: `2:2` | Token distribution: Bars; Model distribution: Pie | Bars, Stacked, Donut, Pie |
-| Analysis component | Client Analysis / Provider Analysis | `2:2` | Table | Table, Compact |
-| Share card | AI Usage Wrapped, AgentRouter Route Map, Model Leaderboard, AI Fuel Cockpit, Token Calendar Poster, Spend Receipt | `1:4` | Card | Card |
+The strip starts at the most recent day. Rows scroll in sync, the side buttons page through earlier history, and month boundaries are spaced out. The headline summarizes requests, success rate, and errors across the 90-day window. Without provider data, a single `API Service` row is shown.
 
-Size constraints:
+## Usage trend
 
-| Rule | Reason |
+The trend chart follows the selected range: `Today` / `24h` use hourly points, while `7d` / `30d` / `Custom` use daily points. Hover a point to inspect that day's tokens, requests, cost, and per-model detail.
+
+## Breakdowns
+
+Breakdowns come in three sections: `Models`, `Client Analysis`, and `Provider Analysis`. Each section sorts by tokens, shows at most six rows, and folds the rest into `Other`; the section header shows the token and cost totals for that dimension.
+
+Each row has an icon on the left (providers use their configured icon; models and clients are matched by brand), the name, request count, and share bar in the middle, and the token count with share on the right. Hovering a row opens a detail card with:
+
+| Content | Description |
 | --- | --- |
-| Share cards have a minimum size of `1:4`. | PNG export uses a vertical poster ratio and needs enough height. |
-| The account widget has a minimum size of `2:2` when showing All accounts with the Compact style. | Multi-account lists need readable space. |
-| Legacy aliases are still accepted: `small` -> `1:1`, `medium` / `large` -> `2:2`, `wide` -> `3:2`, `full` -> `4:1` or `4:2`. | Backward compatibility for older config. |
+| Tokens and share | Row total and its share of the selected window. |
+| Requests and cost | Request count and estimated cost for the row. |
+| Input / output / cache split | Token counts and shares for the three parts; the cache share indicates cache hit behavior. |
 
-## Metric data
+The usage store groups rows by provider and model, so the same display name can arrive multiple times when a model is routed through different providers; the page merges them into one row before ranking.
 
-`metric` widgets use the `metric` field to choose the displayed value.
+## Account balance
 
-| `metric` | Meaning |
-| --- | --- |
-| `requests` | Request count |
-| `total-tokens` | Total tokens |
-| `input-tokens` | Input tokens |
-| `output-tokens` | Output tokens |
-| `cache-tokens` | Cache tokens |
-| `cache-ratio` | Cache ratio |
-| `estimated-cost` | Estimated cost, calculated from model pricing data |
-| `success-rate` | Success rate |
-| `errors` | Error count |
-| `avg-latency` | Average latency |
+The account balance section reads the account / usage connectors in provider configuration. To show a balance or remaining quota, enable and test `Fetch usage` in the provider settings first. Each account is one row with quota meters and status; the section can be refreshed as a whole, and an unconfigured state links to provider settings.
 
-## Account widget
-
-The account widget reads provider account / usage connectors. To show balance or remaining quota, first enable and test `Fetch usage` in provider configuration.
-
-| Data selection | Behavior |
-| --- | --- |
-| `All accounts` | Shows every available account snapshot. |
-| One account | Shows only one provider or credential snapshot. The internal config value is usually `provider` or `provider::credentialId`. |
-
-If the account widget is empty, check:
+If the section is empty, check:
 
 1. Whether the provider has an account / usage connector configured.
 2. Whether the `Fetch usage` test succeeds.
 3. Whether the API key or account endpoint is still valid.
-4. Whether the selected account was deleted or renamed.
 
-## Share cards
+## Reset statistics
 
-Share card widgets can export PNGs through the download button in the card header. The desktop app uses native export when available; browser environments fall back to frontend canvas export. The exported image size is `1080 x 1350`.
-
-| Card | `type` | Content |
-| --- | --- | --- |
-| AI Usage Wrapped | `share-usage-wrapped` | Total tokens, requests, estimated cost, cache ratio, longest activity streak, top model, top provider, peak day. |
-| AgentRouter Route Map | `share-route-map` | Main client-to-provider/model route relationships, plus client, provider, and model counts. |
-| Model Leaderboard | `share-model-leaderboard` | Models ranked by tokens. |
-| AI Fuel Cockpit | `share-fuel-cockpit` | Up to 3 account quota gauges. Requires account / usage connectors. |
-| Token Calendar Poster | `share-token-calendar` | Contribution-calendar style token activity poster. |
-| Spend Receipt | `share-spend-receipt` | Estimated cost, requests, tokens, latency, and success rate for the selected range. |
+The `Reset statistics` button in the toolbar clears the usage events behind the overview after a confirmation dialog. Resetting affects only overview statistics; request logs, providers, account connectors, and configuration are kept. Cleared data cannot be recovered.
 
 ## Data sources and troubleshooting
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
-| Requests, tokens, or cost are 0 | No requests went through AgentRouter in the selected range, or usage capture has not recorded data yet. | Try `24h` / `7d`, and confirm the client is actually using AgentRouter. |
-| Cost shows `$0.00` | The model has no pricing data, or usage is very small. | Check model catalog matching and provider model names; values under 0.01 USD are shown with extra decimals. |
-| Success rate or errors look unexpected | The overview only aggregates request results captured by AgentRouter. | Compare with records on the Logs page. |
-| Account balance is empty | No account connector exists, or `Fetch usage` failed. | Test account / usage field mapping in provider configuration. |
-| Distribution charts have no data | Request logs lack model, provider, or token information. | Confirm requests go through AgentRouter and upstream responses include token usage. |
-| PNG export fails | Canvas export is unavailable, the element has no size, or the save dialog was canceled. | Retry in the desktop app, and make sure the card is visible and not resized too small. |
+| Requests, tokens, or cost are 0 | No requests went through AgentRouter in the selected range or filters, or usage capture has not recorded them yet. | Switch to `24h` / `7d`, clear the provider / model filters, and confirm client traffic actually goes through AgentRouter. |
+| Cost shows `$0.00` | The model has no pricing data, or usage is very small. | Check that the model catalog and provider model names match prices; values under 0.01 USD are shown with extra decimals. |
+| Success rate or errors look unexpected | Only requests captured by AgentRouter are counted. | Compare with records on the Logs page. |
+| Breakdowns are empty | Usage records are missing model, provider, or client information. | Confirm requests go through AgentRouter and upstream responses include token usage. |
+| Account balance is empty | No account connector exists, or `Fetch usage` failed. | Test the account / usage field mapping in provider configuration. |

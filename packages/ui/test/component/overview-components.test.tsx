@@ -458,3 +458,28 @@ test("OverviewBreakdowns merges model rows that share a display name", () => {
   assert.equal(occurrences.length, 1, "duplicate display names must collapse to one row");
   assert.match(html, /912/);
 });
+
+test("OverviewBreakdowns hides client rows without client attribution", () => {
+  const stats = usageStats("30d", {
+    clientModels: [
+      usageRow("c1", "unknown", { client: "unknown", provider: "公司API", requestCount: 12, totalTokens: 4800 }),
+      usageRow("c2", "unknown", { client: "unknown", provider: "WorkOpenAI", requestCount: 5, totalTokens: 1200 }),
+      usageRow("c3", "Claude", { client: "Claude", provider: "WorkOpenAI", requestCount: 3, totalTokens: 900 })
+    ],
+    providerModels: [
+      usageRow("p1", "公司API", { model: "glm-5.3", provider: "公司API", requestCount: 12, totalTokens: 4800 })
+    ]
+  });
+  const html = renderToStaticMarkup(
+    <AppI18nContext.Provider value={appCopy.en}>
+      <OverviewBreakdowns providers={[]} usageStats={stats} />
+    </AppI18nContext.Provider>
+  );
+
+  const clientSection = html.slice(html.indexOf("Client Analysis"), html.indexOf("Provider Analysis"));
+  assert.match(clientSection, /Claude/);
+  assert.doesNotMatch(clientSection, /Unknown client/, "unattributed rows must not render as an unknown bucket");
+  assert.doesNotMatch(clientSection, /公司API/, "client rows must not borrow provider names");
+  assert.doesNotMatch(clientSection, /WorkOpenAI/, "client rows must not borrow provider names");
+  assert.match(html.slice(html.indexOf("Provider Analysis")), /公司API/);
+});

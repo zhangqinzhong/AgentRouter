@@ -13,7 +13,7 @@ Detailed configuration docs are split into standalone pages. Every left-sidebar 
 
 | Page | Covers |
 | --- | --- |
-| Overview dashboard | System status, account balance, usage widgets, layout editing, and share cards |
+| Overview dashboard | Time range and filters, system status, usage trend, model / client / provider breakdowns, and account balance |
 | Provider config | Upstream services, protocol, Base URL, model list, and credentials |
 | Agent Config | Agent launch method, model, scope, multi-instance launching, and Bot binding |
 | API keys | Client access keys, expiration, and local limits |
