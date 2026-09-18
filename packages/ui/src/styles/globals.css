@@ -1779,4 +1779,4 @@ html[data-window-active="false"] .status-heartbeat {
 
 .local-usage-page { max-width: none; padding-top: 64px; }
 
-.app-usage-surface > .app-page-content:not([data-view="usage"]):not([data-view="heatmap"]):not([data-view="sessions"]):not([data-view="trend"]) { padding:64px 20px 20px; }
+.app-usage-surface > .app-page-content:not([data-view="usage"]):not([data-view="heatmap"]):not([data-view="sessions"]):not([data-view="trend"]):not([data-view="overview"]) { padding:64px 20px 20px; }

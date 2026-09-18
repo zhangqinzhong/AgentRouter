@@ -17,7 +17,7 @@ import {
 } from "../shared/index";
 import { ApiKeysView } from "./api-keys";
 import { AgentAnalysisView } from "./agent-analysis";
-import { OverviewView } from "./dashboard";
+import { OverviewView } from "./overview";
 import { ExtensionsView } from "./extensions";
 import { LogsView, NetworkingView } from "./network-logs";
 import { OnboardingView } from "./onboarding";

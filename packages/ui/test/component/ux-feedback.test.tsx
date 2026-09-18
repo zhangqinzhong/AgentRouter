@@ -2,11 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { DEFAULT_OVERVIEW_WIDGETS, LEGACY_DEFAULT_OVERVIEW_WIDGETS } from "@agentrouter/core/contracts/app.ts";
 import { Dialog, DialogContent, DialogTitle } from "@agentrouter/ui/components/ui/dialog.tsx";
-import { OverviewView } from "@agentrouter/ui/pages/home/components/dashboard.tsx";
+import { OverviewView } from "@agentrouter/ui/pages/home/components/overview.tsx";
 import { FeedbackStack, LightToast, PersistenceFeedback } from "@agentrouter/ui/pages/home/components/feedback.tsx";
-import { normalizeOverviewWidget, normalizeOverviewWidgets } from "@agentrouter/ui/pages/home/shared/common.ts";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { createEmptyUsageStats } from "@agentrouter/ui/pages/home/shared/usage.ts";
 
@@ -53,22 +51,10 @@ test("settings save progress is a live status inside the dialog flow", () => {
   assert.doesNotMatch(html, /class="[^"]*fixed/);
 });
 
-test("only the unchanged legacy dashboard receives the new default order", () => {
-  assert.deepEqual(normalizeOverviewWidgets(LEGACY_DEFAULT_OVERVIEW_WIDGETS), DEFAULT_OVERVIEW_WIDGETS);
-  const customized = LEGACY_DEFAULT_OVERVIEW_WIDGETS.map((widget, index) => index === 0 ? { ...widget, enabled: false } : widget);
-  const expectedCustomized = customized
-    .map(normalizeOverviewWidget)
-    .filter((widget): widget is NonNullable<typeof widget> => Boolean(widget) && widget.type !== "token-mix");
-  assert.deepEqual(normalizeOverviewWidgets(customized), expectedCustomized);
-  assert.deepEqual(normalizeOverviewWidgets([]), []);
-});
-
-test("empty dashboard shows no-data success state and a compact account setup action", () => {
+test("empty overview shows no-data state and an account setup action", () => {
   const html = renderToStaticMarkup(
     <OverviewView
       onConfigureProviderAccounts={() => {}}
-      onWidgetsChange={() => {}}
-      overviewWidgets={DEFAULT_OVERVIEW_WIDGETS}
       providerAccounts={[]}
       setUsageRange={() => {}}
       usageRange="7d"
@@ -77,8 +63,6 @@ test("empty dashboard shows no-data success state and a compact account setup ac
   );
   assert.match(html, /No requests yet/);
   assert.match(html, /Request success rate/);
-  assert.doesNotMatch(html, /Availability/);
   assert.match(html, /Configure account usage/);
-  assert.doesNotMatch(html, /data-overview-widget-id="account-balance"/);
-  assert.ok(html.indexOf('data-overview-widget-id="metric-estimated-cost"') < html.indexOf('data-overview-widget-id="usage-trend"'));
+  assert.doesNotMatch(html, /data-overview-widget-id/);
 });

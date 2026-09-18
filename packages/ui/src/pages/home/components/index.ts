@@ -5,7 +5,7 @@ export { MainLayout, OnboardingLayout, UpdateEntryButton } from "./layout";
 export { AppSettingsDialog } from "./settings";
 export { shouldCheckForUpdateOnOpen, UpdateDialog } from "./update";
 export { AgentAnalysisView } from "./agent-analysis";
-export { OverviewView } from "./dashboard";
+export { OverviewView } from "./overview";
 export { ApiKeysView, AddApiKeyDialog, EditApiKeyDialog } from "./api-keys";
 export { ProfileView, AddProfileForm, AddProfileDialog, DeleteProfileDialog } from "./profiles";
 export { NetworkingView, LogsView } from "./network-logs";
