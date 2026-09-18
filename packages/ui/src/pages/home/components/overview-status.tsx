@@ -1,9 +1,10 @@
 import {
   CircleAlert, Check, cn, formatCompactNumber, formatPercent, formatStatusBucketDate,
-  formatSystemStatusRange, systemStatusPointTooltip, UsageSeriesPoint, UsageStatsRange,
+  formatSystemStatusRange, systemStatusIconClass, systemStatusPointTooltip, UsageSeriesPoint, UsageStatsRange,
   UsageStatsSnapshot, usageStatusTone, useAppText, useEffect, useState
 } from "../shared/index";
 import { TooltipPortal } from "@/components/ui/tooltip";
+import { Server } from "lucide-react";
 
 type SystemStatusTone = "error" | "idle" | "ok" | "warn";
 
@@ -143,8 +144,17 @@ export function SystemStatusStrip({
   return (
     <section>
       <div className="mb-3 flex min-w-0 items-center justify-between gap-3">
-        <h2 className="text-sm font-medium">{t("System status")}</h2>
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span aria-hidden="true" className={cn("flex h-7 w-7 shrink-0 items-center justify-center rounded-lg", systemStatusIconClass(overallTone))}>
+            <Server className="h-4 w-4" />
+          </span>
+          <h2 className="text-sm font-medium">{t("System status")}</h2>
+        </div>
         <span className="block max-w-[320px] truncate text-[11px] tabular-nums text-muted-foreground">{statusRangeLabel}</span>
+      </div>
+      <div className="mb-4">
+        <div className="text-[28px] font-semibold leading-none tracking-tight">{usageStats.totals.requestCount > 0 ? formatPercent(usageStats.totals.successRate) : "—"}</div>
+        <div className="mt-1 text-[11px] text-muted-foreground">{t("Request success rate")}</div>
       </div>
       <div className="space-y-3">
         {statusRows.map((row) => {
@@ -153,13 +163,7 @@ export function SystemStatusStrip({
             <div className="min-w-0" key={row.provider}>
               <div className="mb-1.5 flex min-w-0 items-center justify-between gap-3">
                 <div className="flex min-w-0 items-center gap-2">
-                  <span aria-hidden="true" className={cn(
-                    "flex h-4 w-4 shrink-0 items-center justify-center rounded-full border",
-                    row.tone === "ok" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                      : row.tone === "warn" ? "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400"
-                        : row.tone === "error" ? "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400"
-                          : "border-border bg-muted text-muted-foreground"
-                  )}>
+                  <span aria-hidden="true" className={cn("flex h-4 w-4 shrink-0 items-center justify-center rounded-full", systemStatusIconClass(row.tone))}>
                     <RowIcon className="h-3 w-3" />
                   </span>
                   <span className="min-w-0 truncate text-[13px] font-medium">{row.provider}</span>

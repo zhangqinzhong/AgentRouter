@@ -78,10 +78,15 @@ function localCodexProviderDraftProbeKey(draft: AddProviderDraft): string {
   ]);
 }
 
-function overviewUsageStatsFilter(range: UsageStatsRange, providerFilter: string, modelFilter: string): UsageStatsFilter {
+function overviewUsageStatsFilter(range: UsageStatsRange, providerFilter: string, modelFilter: string, providers: GatewayProviderConfig[] = []): UsageStatsFilter {
+  // The usage store keys providers by id ("provider-x::connector"); the select carries
+  // display names, so resolve the selected name back to its provider id.
+  const providerId = providerFilter
+    ? providers.find((provider) => provider.name === providerFilter)?.id?.trim() || providerFilter
+    : "";
   return {
     ...(range === "today" ? { includeProxy: true } : {}),
-    ...(providerFilter ? { provider: providerFilter } : {}),
+    ...(providerId ? { provider: providerId } : {}),
     ...(modelFilter ? { model: modelFilter } : {})
   };
 }
@@ -493,7 +498,7 @@ function App() {
     let cancelled = false;
     const refreshUsageStats = () => {
       const requestId = ++usageStatsRequestId.current;
-      const filter = overviewUsageStatsFilter(usageRange, usageProviderFilter, usageModelFilter);
+      const filter = overviewUsageStatsFilter(usageRange, usageProviderFilter, usageModelFilter, draftConfig.Providers);
       void window.agentrouter?.getUsageStats(usageRange, filter).then((snapshot) => {
         if (!cancelled && requestId === usageStatsRequestId.current) {
           setUsageStats(snapshot);
@@ -960,7 +965,7 @@ function App() {
     const requestId = ++usageStatsRequestId.current;
     const snapshot = await window.agentrouter.getUsageStats(
       usageRange,
-      overviewUsageStatsFilter(usageRange, usageProviderFilter, usageModelFilter)
+      overviewUsageStatsFilter(usageRange, usageProviderFilter, usageModelFilter, draftConfig.Providers)
     );
     if (requestId === usageStatsRequestId.current) {
       setUsageStats(snapshot);

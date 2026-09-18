@@ -259,7 +259,7 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
  const displayName=String(profile.displayName||profile.username||t('Local usage'));
  const username=String(profile.username||'');
  return (
-  <div className="local-usage-page mx-auto flex h-full min-h-0 w-full max-w-[920px] flex-col !pt-4 px-5 pb-0 sm:px-9">
+  <div className="local-usage-page mx-auto flex h-full min-h-0 w-full max-w-[1120px] flex-col px-5 pb-0 sm:px-9">
    <div className="shrink-0">
    {error?<div role="alert" className="mb-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}<button type="button" className="ml-3 underline" onClick={()=>setRevision((value)=>value+1)}>{t('Retry')}</button></div>:null}
    <div className="mb-6 flex items-center gap-4">

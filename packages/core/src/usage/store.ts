@@ -631,8 +631,10 @@ function buildUsageWhereClause(
   const model = normalizeFilterValue(normalizedFilter.model);
 
   if (provider) {
-    where.push("provider = ?");
-    params.push(provider);
+    // Stored provider keys are compound ("providerId::connector" or with a trailing
+    // credential segment); match the bare id and every compound form of it.
+    where.push("(provider = ? OR provider LIKE ? ESCAPE '\\')");
+    params.push(provider, `${escapeSqlLike(provider)}::%`);
   } else if (!normalizedOptions.includeProxy && normalizedFilter.includeProxy !== true) {
     where.push("provider <> ?");
     params.push("proxy");
@@ -800,7 +802,7 @@ function readProviderUsageSeries(
   );
   const byProvider = new Map<string, Map<string, UsageTotals>>();
   for (const row of rows) {
-    const provider = normalizeLabel(String(row.provider ?? ""), "unknown");
+    const provider = usageProviderLabel(normalizeLabel(String(row.provider ?? ""), "unknown"));
     const bucket = String(row.bucket ?? "");
     const buckets = byProvider.get(provider) ?? new Map<string, UsageTotals>();
     buckets.set(bucket, usageTotalsFromRow(row));
@@ -908,16 +910,19 @@ function readModelRows(database: SqlDatabase, query: UsageWhereClause): UsageCom
     "provider, model",
     "provider, model, MAX(credential_id) AS credential_id",
     8
-  ).map((row) => ({
-    ...usageTotalsFromRow(row),
-    caption: normalizeLabel(String(row.provider ?? ""), "unknown"),
-    credentialId: normalizeFilterValue(String(row.credential_id ?? "")),
-    key: `${normalizeLabel(String(row.provider ?? ""), "unknown")}::${normalizeLabel(String(row.model ?? ""), "unknown")}`,
-    label: normalizeLabel(String(row.model ?? ""), "unknown"),
-    maxShare: 0,
-    model: normalizeLabel(String(row.model ?? ""), "unknown"),
-    provider: normalizeLabel(String(row.provider ?? ""), "unknown")
-  }));
+  ).map((row) => {
+    const provider = usageProviderLabel(normalizeLabel(String(row.provider ?? ""), "unknown"));
+    return {
+      ...usageTotalsFromRow(row),
+      caption: provider,
+      credentialId: normalizeFilterValue(String(row.credential_id ?? "")),
+      key: `${provider}::${normalizeLabel(String(row.model ?? ""), "unknown")}`,
+      label: normalizeLabel(String(row.model ?? ""), "unknown"),
+      maxShare: 0,
+      model: normalizeLabel(String(row.model ?? ""), "unknown"),
+      provider
+    };
+  });
   return applyMaxShare(rows, (row) => row.totalTokens || row.requestCount);
 }
 
@@ -931,7 +936,7 @@ function readClientModelRows(database: SqlDatabase, query: UsageWhereClause): Us
   ).map((row) => {
     const client = normalizeLabel(String(row.client ?? ""), "unknown");
     const model = normalizeLabel(String(row.model ?? ""), "unknown");
-    const provider = normalizeLabel(String(row.provider ?? ""), "unknown");
+    const provider = usageProviderLabel(normalizeLabel(String(row.provider ?? ""), "unknown"));
     const credentialId = normalizeFilterValue(String(row.credential_id ?? "")) ?? "";
     return {
       ...usageTotalsFromRow(row),
@@ -957,7 +962,7 @@ function readProviderModelRows(database: SqlDatabase, query: UsageWhereClause): 
     25
   ).map((row) => {
     const model = normalizeLabel(String(row.model ?? ""), "unknown");
-    const provider = normalizeLabel(String(row.provider ?? ""), "unknown");
+    const provider = usageProviderLabel(normalizeLabel(String(row.provider ?? ""), "unknown"));
     const credentialId = normalizeFilterValue(String(row.credential_id ?? "")) ?? "";
     return {
       ...usageTotalsFromRow(row),
@@ -1441,6 +1446,15 @@ function splitRouteSelector(value: string | undefined): { model?: string; provid
 function normalizeLabel(value: string | undefined, fallback: string): string {
   const trimmed = value?.trim();
   return trimmed || fallback;
+}
+
+function escapeSqlLike(value: string): string {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+function usageProviderLabel(value: string): string {
+  const first = value.split("::")[0]?.trim();
+  return first || value;
 }
 
 function normalizeFilterValue(value: string | undefined): string | undefined {

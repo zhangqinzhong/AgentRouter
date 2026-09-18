@@ -4,6 +4,7 @@ import {
   GatewayProviderConfig, ProviderAccountSnapshot, Select, Trash2, usageRangeOptions,
   UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useState, X
 } from "../shared/index";
+import { useMemo } from "react";
 import { ProviderAccountsSection } from "./overview-accounts";
 import { OverviewBreakdowns } from "./overview-breakdown";
 import { SystemStatusStrip } from "./overview-status";
@@ -155,6 +156,25 @@ export function OverviewView({
   const providerOptions = overviewProviderFilterOptions(filterProviders, t);
   const modelOptions = overviewModelFilterOptions(filterProviders, providerFilter, t);
   const statCells = overviewStatCells(usageStats.totals, t);
+  // The usage store labels providers by id; resolve them to the configured display names.
+  const displayUsageStats = useMemo(() => {
+    const namesById = new Map<string, string>();
+    for (const provider of filterProviders) {
+      const id = provider.id?.trim();
+      if (id && provider.name) {
+        namesById.set(id, provider.name);
+      }
+    }
+    if (namesById.size === 0) {
+      return usageStats;
+    }
+    const resolve = (value: string | undefined) => namesById.get(value ?? "") ?? value ?? "";
+    return {
+      ...usageStats,
+      providerModels: (usageStats.providerModels ?? []).map((row) => ({ ...row, label: resolve(row.label), provider: resolve(row.provider) })),
+      providerSeries: (usageStats.providerSeries ?? []).map((row) => ({ ...row, provider: resolve(row.provider) }))
+    };
+  }, [filterProviders, usageStats]);
 
   function changeProviderFilter(provider: string) {
     usageFilters?.setProviderFilter(provider);
@@ -239,9 +259,9 @@ export function OverviewView({
       ) : null}
 
       <div className="space-y-10">
-        <SystemStatusStrip usageRange={usageRange} usageStats={usageStats} />
+        <SystemStatusStrip usageRange={usageRange} usageStats={displayUsageStats} />
         <UsageTrendSection usageRange={usageRange} usageStats={usageStats} />
-        <OverviewBreakdowns usageStats={usageStats} />
+        <OverviewBreakdowns usageStats={displayUsageStats} />
         <ProviderAccountsSection
           accounts={providerAccounts}
           onConfigure={onConfigureProviderAccounts}

@@ -730,3 +730,50 @@ test("native activity calendar fills local days and filters providers", async ()
     assert.equal((await store.getActivitySeries(1, { includeProxy: true }))[0].totalTokens, 42);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("UsageStore provider filter matches compound provider keys by their id segment", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-test-"));
+  try {
+    const store = new UsageStore(path.join(dir, "usage.sqlite"));
+    const now = new Date();
+    await store.record({
+      createdAt: now.toISOString(),
+      durationMs: 50,
+      method: "POST",
+      model: "glm-5.3",
+      path: "/v1/messages",
+      provider: "provider-workglm-abc::anthropic_messages",
+      requestId: "req-1",
+      statusCode: 200,
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
+    });
+    await store.record({
+      createdAt: now.toISOString(),
+      durationMs: 50,
+      method: "POST",
+      model: "gpt-test",
+      path: "/v1/messages",
+      provider: "api::openai_chat_completions::cred:primary",
+      requestId: "req-2",
+      statusCode: 200,
+      usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 }
+    });
+
+    const workglm = await store.getStats("30d", { provider: "provider-workglm-abc" });
+    assert.equal(workglm.totals.requestCount, 1);
+    assert.equal(workglm.totals.totalTokens, 15);
+
+    const api = await store.getStats("30d", { provider: "api" });
+    assert.equal(api.totals.requestCount, 1);
+    assert.equal(api.totals.totalTokens, 25);
+
+    const none = await store.getStats("30d", { provider: "provider-workglm-xyz" });
+    assert.equal(none.totals.requestCount, 0);
+
+    const stats = await store.getStats("30d", {});
+    assert.equal(stats.providerModels.length, 2);
+    assert.ok(stats.providerModels.every((row) => !row.provider.includes("::")));
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});

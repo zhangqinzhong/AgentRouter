@@ -1373,6 +1373,6 @@ html[data-window-active="false"] .status-heartbeat {
 .app-usage-sidebar .ar-route-toolbar { justify-content:flex-start; gap:8px; margin:4px 12px 8px; }
 
 
-.local-usage-page { max-width: none; padding-top: 64px; }
+.local-usage-page { padding-top: 64px; }
 
 .app-usage-surface > .app-page-content:not([data-view="usage"]):not([data-view="heatmap"]):not([data-view="sessions"]):not([data-view="trend"]):not([data-view="overview"]) { padding:64px 20px 20px; }
