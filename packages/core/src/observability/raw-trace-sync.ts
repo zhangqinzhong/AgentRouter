@@ -1544,6 +1544,9 @@ async function recordUsageCaptureFromRawTrace(
   const responseHeaders = headersFromRawTrace(input.responseHeaders);
   await recordGatewayUsageCaptureIfMissing({
     bodyText: await rawTraceUsageBodyText(input, files.responseBody),
+    // The bundle already inferred the client from the client-request headers;
+    // without this the usage event lands as client=unknown.
+    client: input.client,
     config,
     durationMs: numberValue(input.durationMs) ?? 0,
     fallbackModel: input.model,

@@ -7,6 +7,8 @@ import test from "node:test";
 import { createDefaultAppConfig } from "@agentrouter/core/config/default-config.ts";
 import { rawTraceSyncHeader } from "@agentrouter/core/gateway/internal/shared.ts";
 import { rawTraceHardMaxBodyBytes, rawTraceMaxPartBytes } from "@agentrouter/core/observability/request-log-limits.ts";
+import { createBetterSqliteDatabase } from "@agentrouter/core/storage/sqlite-native.ts";
+import { resolveRuntimeDataDir } from "@agentrouter/core/runtime/app-paths.ts";
 import { usageStore } from "@agentrouter/core/usage/store.ts";
 import {
   applyRawTraceRequestLogPolicy,
@@ -1035,3 +1037,58 @@ async function sendRawTrace(synchronizer, manifest, onResponse) {
   await synchronizer.handle(request, response);
   return result;
 }
+
+test("raw trace usage capture carries the inferred client into usage events", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-trace-usage-client-"));
+  const estimateCost = usageStore.estimateCost;
+  usageStore.estimateCost = async () => undefined;
+  let update;
+  const synchronizer = new RawTraceSynchronizer({
+    allowStandaloneRequestLogs: () => true,
+    enqueueUpdate: (input, files) => {
+      update = input;
+      rmSync(files.cleanupDirectory, { recursive: true, force: true });
+      return { accepted: true, degraded: false };
+    },
+    getConfig: createConfig,
+    spoolDirectory: dir
+  });
+  try {
+    const bundleDir = path.join(dir, "client-attr-bundle");
+    mkdirSync(bundleDir);
+    const responseMetadata = path.join(bundleDir, "response.json");
+    const requestMetadata = path.join(bundleDir, "request.json");
+    const clientMetadata = path.join(bundleDir, "client.json");
+    const body = path.join(bundleDir, "body.json");
+    writeFileSync(responseMetadata, JSON.stringify({ statusCode: 200, headers: { "content-type": "application/json" } }));
+    writeFileSync(requestMetadata, JSON.stringify({ method: "POST", url: "http://localhost/v1/messages" }));
+    writeFileSync(clientMetadata, JSON.stringify({ headers: { "user-agent": "claude-code/2.0.0 (external)" } }));
+    writeFileSync(body, JSON.stringify({ model: "glm-5.3", usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } }));
+    await sendRawTrace(synchronizer, {
+      requestId: "client-attr-request",
+      turnKey: "client-attr-request",
+      target: { model: "glm-5.3", providerName: "WorkGLM" },
+      parts: [
+        { partType: "upstream_response_metadata", filePath: responseMetadata },
+        { partType: "upstream_request_metadata", filePath: requestMetadata },
+        { partType: "client_request_metadata", filePath: clientMetadata },
+        { partType: "upstream_response", filePath: body, contentType: "application/json" }
+      ]
+    });
+    await waitFor(() => update !== undefined);
+    assert.equal(update.client, "Claude Code");
+    assert.equal(await usageStore.hasRequestId("client-attr-request"), true);
+
+    const database = createBetterSqliteDatabase(path.join(resolveRuntimeDataDir(), "usage.sqlite"));
+    try {
+      const row = database.prepare("SELECT client FROM usage_events WHERE request_id = ?").get("client-attr-request");
+      assert.equal(row?.client, "Claude Code", "usage event must carry the client inferred from the raw trace");
+    } finally {
+      database.close();
+    }
+  } finally {
+    await synchronizer.stop();
+    usageStore.estimateCost = estimateCost;
+    rmSync(dir, { force: true, recursive: true });
+  }
+});

@@ -282,6 +282,7 @@ export function OverviewView({
     const resolve = (value: string | undefined) => namesById.get(value ?? "") ?? value ?? "";
     return {
       ...usageStats,
+      clientModels: (usageStats.clientModels ?? []).map((row) => ({ ...row, provider: resolve(row.provider) })),
       providerModels: (usageStats.providerModels ?? []).map((row) => ({ ...row, label: resolve(row.label), provider: resolve(row.provider) })),
       providerSeries: (usageStats.providerSeries ?? []).map((row) => ({ ...row, provider: resolve(row.provider) }))
     };
