@@ -1,64 +1,130 @@
 import {
-  formatCompactNumber, formatUsdCost, UsageComparisonRow, UsageStatsSnapshot, useAppText
+  Boxes, cn, formatCompactNumber, formatUsdCost, motion, Network, UsageComparisonRow,
+  UsageStatsSnapshot, useAppText, UserRound
 } from "../shared/index";
+import { getModelColor } from "@/vendor/tokentracker/ui/dashboard/components/TrendMonitor";
+import type { LucideIcon } from "../shared/index";
 
 const breakdownRowLimit = 6;
-const breakdownBarColor = "#30a14e";
+const breakdownOtherColor = "#8e8e93";
 
 type BreakdownRow = {
+  color: string;
   label: string;
   pct: number;
   requests: number;
+  share: number;
+  sub: string;
   tokens: number;
 };
 
-function breakdownRows(rows: UsageComparisonRow[], limit: number): BreakdownRow[] {
+function breakdownColor(label: string, translate: (value: string) => string): string {
+  return label === translate("Other") ? breakdownOtherColor : getModelColor(label);
+}
+
+function breakdownRows(rows: UsageComparisonRow[], limit: number, translate: (value: string) => string): BreakdownRow[] {
   const positive = rows.filter((row) => (row.totalTokens || 0) > 0);
   const sorted = [...positive].sort((left, right) => (right.totalTokens || 0) - (left.totalTokens || 0));
   const top = sorted.slice(0, limit);
   const otherTokens = sorted.slice(limit).reduce((sum, row) => sum + (row.totalTokens || 0), 0);
   const otherRequests = sorted.slice(limit).reduce((sum, row) => sum + (row.requestCount || 0), 0);
-  const all = otherTokens > 0 ? [...top, { label: "__other__", requestCount: otherRequests, totalTokens: otherTokens }] : top;
+  const all = otherTokens > 0
+    ? [...top, { label: translate("Other"), requestCount: otherRequests, totalTokens: otherTokens }]
+    : top;
+  const total = all.reduce((sum, row) => sum + (row.totalTokens || 0), 0) || 1;
   const max = all.reduce((peak, row) => Math.max(peak, row.totalTokens || 0), 0) || 1;
-  return all.map((row) => ({
-    label: row.label,
-    pct: Math.max(8, ((row.totalTokens || 0) / max) * 100),
-    requests: row.requestCount || 0,
-    tokens: row.totalTokens || 0
-  }));
+  return all.map((row) => {
+    const label = row.label;
+    const requests = row.requestCount || 0;
+    const subParts = [`${formatCompactNumber(requests)} ${translate("Requests")}`];
+    return {
+      color: breakdownColor(label, translate),
+      label,
+      pct: Math.max(8, ((row.totalTokens || 0) / max) * 100),
+      requests,
+      share: (row.totalTokens || 0) / total,
+      sub: subParts.join(" · "),
+      tokens: row.totalTokens || 0
+    };
+  });
 }
 
-function BreakdownList({
+function BreakdownRowLine({ index, row }: { index: number; row: BreakdownRow }) {
+  const delay = 0.05 + index * 0.045;
+  return (
+    <motion.div
+      animate={{ opacity: 1, y: 0 }}
+      className="group grid grid-cols-[minmax(0,1fr)_104px] items-center gap-3 rounded-lg px-2 py-1.5 transition-colors duration-150 hover:bg-muted/45"
+      initial={{ opacity: 0, y: 4 }}
+      key={row.label}
+      transition={{ delay, duration: 0.24, ease: "easeOut" }}
+    >
+      <div className="flex min-w-0 items-center gap-2.5">
+        <span
+          aria-hidden="true"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[11px] font-semibold uppercase transition-transform duration-150 group-hover:scale-105"
+          style={{ backgroundColor: `${row.color}1f`, color: row.color }}
+        >
+          {row.label.trim().slice(0, 1) || "?"}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium" title={row.label}>{row.label}</div>
+          <div className="truncate text-[10px] text-muted-foreground/80 transition-colors group-hover:text-muted-foreground">{row.sub}</div>
+          <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+            <motion.div
+              animate={{ width: `${row.pct}%` }}
+              className="h-full rounded-full transition-[filter] duration-150 group-hover:brightness-110"
+              initial={{ width: 0 }}
+              style={{ backgroundColor: row.color }}
+              transition={{ delay: delay + 0.12, duration: 0.55, ease: [0.22, 1, 0.36, 1] }}
+            />
+          </div>
+        </div>
+      </div>
+      <div className="min-w-0 text-right">
+        <div className="text-sm font-semibold leading-tight tabular-nums transition-colors group-hover:text-foreground" title={row.tokens.toLocaleString()}>{formatCompactNumber(row.tokens)}</div>
+        <div className="text-[10px] tabular-nums text-muted-foreground">{Math.round(row.share * 100)}%</div>
+      </div>
+    </motion.div>
+  );
+}
+
+function BreakdownSection({
   emptyLabel,
+  icon: Icon,
   rows,
+  title,
   trailing
 }: {
   emptyLabel: string;
+  icon: LucideIcon;
   rows: UsageComparisonRow[];
+  title: string;
   trailing?: string;
 }) {
-  const display = breakdownRows(rows, breakdownRowLimit);
+  const t = useAppText();
+  const display = breakdownRows(rows, breakdownRowLimit, t);
   return (
-    <div className="min-w-0">
-      {trailing ? <div className="mb-3 text-right text-[11px] tabular-nums text-muted-foreground">{trailing}</div> : null}
+    <section>
+      <div className="mb-2.5 flex min-w-0 items-center justify-between gap-3 px-2">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span aria-hidden="true" className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+            <Icon className="h-4 w-4" />
+          </span>
+          <h2 className="text-sm font-medium">{title}</h2>
+        </div>
+        {trailing ? <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{trailing}</span> : null}
+      </div>
       {display.length === 0 ? (
-        <p className="text-sm text-muted-foreground">{emptyLabel}</p>
+        <p className="px-2 text-sm text-muted-foreground">{emptyLabel}</p>
       ) : (
-        <div className="flex flex-col gap-2.5">
-          {display.map((row) => (
-            <div className="grid grid-cols-[minmax(0,1fr)_88px] items-center gap-3 text-sm" key={row.label}>
-              <div className="min-w-0">
-                <div className="truncate font-medium" title={row.label}>{row.label}</div>
-                <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
-                  <div className="h-full rounded-full" style={{ backgroundColor: breakdownBarColor, width: `${row.pct}%` }} />
-                </div>
-              </div>
-              <div className="text-right tabular-nums text-muted-foreground" title={`${row.requests} requests`}>{formatCompactNumber(row.tokens)}</div>
-            </div>
+        <div className={cn("flex flex-col")}>
+          {display.map((row, index) => (
+            <BreakdownRowLine index={index} key={row.label} row={row} />
           ))}
         </div>
       )}
-    </div>
+    </section>
   );
 }
 
@@ -90,35 +156,34 @@ function collapseAnalysisDisplayRows(kind: "client" | "provider", rows: UsageCom
 function breakdownTrailing(rows: UsageComparisonRow[], translate: (value: string) => string): string {
   const tokens = rows.reduce((sum, row) => sum + (row.totalTokens || 0), 0);
   const cost = rows.reduce((sum, row) => sum + (row.costUsd || 0), 0);
-  return `${translate("Token")}: ${formatCompactNumber(tokens)} · ${formatUsdCost(cost)}`;
+  return `${translate("Token")} ${formatCompactNumber(tokens)} · ${translate("Cost")} ${formatUsdCost(cost)}`;
 }
 
 export function OverviewBreakdowns({ usageStats }: { usageStats: UsageStatsSnapshot }) {
   const t = useAppText();
   return (
     <div className="space-y-10">
-      <section>
-        <h2 className="mb-3 text-sm font-medium">{t("Models")}</h2>
-        <BreakdownList
-          emptyLabel={t("No model usage yet")}
-          rows={usageStats.models ?? []}
-          trailing={breakdownTrailing(usageStats.models ?? [], t)}
-        />
-      </section>
-      <section>
-        <h2 className="mb-3 text-sm font-medium">{t("Client Analysis")}</h2>
-        <BreakdownList
-          emptyLabel={t("No client usage yet")}
-          rows={collapseAnalysisDisplayRows("client", usageStats.clientModels ?? [])}
-        />
-      </section>
-      <section>
-        <h2 className="mb-3 text-sm font-medium">{t("Provider Analysis")}</h2>
-        <BreakdownList
-          emptyLabel={t("No provider usage yet")}
-          rows={collapseAnalysisDisplayRows("provider", usageStats.providerModels ?? [])}
-        />
-      </section>
+      <BreakdownSection
+        emptyLabel={t("No model usage yet")}
+        icon={Boxes}
+        rows={usageStats.models ?? []}
+        title={t("Models")}
+        trailing={breakdownTrailing(usageStats.models ?? [], t)}
+      />
+      <BreakdownSection
+        emptyLabel={t("No client usage yet")}
+        icon={UserRound}
+        rows={collapseAnalysisDisplayRows("client", usageStats.clientModels ?? [])}
+        title={t("Client Analysis")}
+        trailing={breakdownTrailing(usageStats.clientModels ?? [], t)}
+      />
+      <BreakdownSection
+        emptyLabel={t("No provider usage yet")}
+        icon={Network}
+        rows={collapseAnalysisDisplayRows("provider", usageStats.providerModels ?? [])}
+        title={t("Provider Analysis")}
+        trailing={breakdownTrailing(usageStats.providerModels ?? [], t)}
+      />
     </div>
   );
 }
