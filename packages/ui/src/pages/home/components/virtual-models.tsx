@@ -1,12 +1,13 @@
+import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
 import {
   AnimatedListItem, AnimatedPopover, AnimatePresence, Boxes, Button,
-  Card, CardContent, CardHeader, CardTitle, Check, ChevronDown, ChevronRight,
+  Check, ChevronDown, ChevronRight,
   clampNumber, cn, createMcpServerDraftFromConfig, createRouteModelOptions, defaultFusionWebSearchProvider, Dialog, DialogBody, DialogContent, DialogFooter,
   DialogHeader, DialogTitle, ExtensionInstallDraft, Field, FolderOpen, formatPluginDependencies,
   createFusionWebSearchEnvRows, createKeyValueDraftRow, customFusionToolName, fusionToolExecutionFlagsFromTools, fusionToolOptions,
   fusionWebSearchProviderOptions, GatewayMcpServerConfig, GatewayMcpToolInfo, GatewayProviderConfig, Input, isBuiltInFusionToolName, isFusionImageGenerationToolName, isFusionVideoGenerationToolName, isFusionVisionToolName, isFusionWebSearchToolName, KeyValueRowsControl, LoaderCircle,
   mcpServerConfigFromDraft, mcpServerEndpointSummary, mcpServerTransportOptions,
-  mcpStdioMessageModeOptions, motion, normalizeFusionToolName, Pencil,
+  mcpStdioMessageModeOptions, normalizeFusionToolName, Pencil,
   PluginMarketplaceEntry, pluginSurfaceSummary, Plus, PopoverContent, RouteTargetControl, Search, selectedFusionToolNames,
   SelectControl, Toggle, Trash2, translateOptions, uniqueStrings, useAppErrorText, useAppText, useEffect, useLayoutEffect, useMemo,
   useRef, useState, validateMcpServerDraft, virtualModelBaseModelSummary, VirtualModelDraft, virtualModelMatchesQuery, virtualModelMatchSummary,
@@ -86,20 +87,13 @@ export function VirtualModelsView({
   );
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="flex h-full min-h-0 min-w-0 flex-col gap-3"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <Card className="flex h-full min-h-0 min-w-0 flex-col">
-        <CardHeader className="flex-row items-center gap-2">
-          <CardTitle className="min-w-0 shrink-0 truncate">{t("Virtual Models")}</CardTitle>
-          <div className="relative min-w-0 flex-1">
+    <div className={documentPageClassName}>
+        <PageHeader title={t("Virtual Models")}>
+          <div className="relative w-[280px] max-w-full">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search virtual models")}
-              className="pl-8"
+              className="h-8 pl-8 text-[12px] shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search virtual models")}
               value={query}
@@ -109,10 +103,11 @@ export function VirtualModelsView({
             <Plus className="h-4 w-4" />
             {t("Add")}
           </Button>
-        </CardHeader>
-        <CardContent className="min-h-0 flex-1 overflow-auto p-0">
+        </PageHeader>
+        <SectionHeading icon={Boxes} title={t("Virtual Models")} summary={profiles.length.toLocaleString()} />
+        <div className="@container min-w-0 overflow-x-auto border-y border-border/70">
           {profiles.length === 0 ? (
-            <div className="m-4 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-10 text-center">
+            <div className="px-3 py-12 text-center">
               <Boxes className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
               <div className="text-[13px] font-semibold text-foreground">{t("No virtual models configured")}</div>
               <div className="mx-auto mt-1 max-w-[480px] text-[12px] leading-5 text-muted-foreground">{t("Fusion combines a model with another model or tools into a new model.")}</div>
@@ -120,12 +115,12 @@ export function VirtualModelsView({
             </div>
           ) : null}
           {profiles.length > 0 && visibleProfiles.length === 0 ? (
-            <div className="m-4 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-10 text-center text-[12px] text-muted-foreground">{t("No matching virtual models")}</div>
+            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching virtual models")}</div>
           ) : null}
           {visibleProfiles.length > 0 ? (
             <div className="min-w-0">
               <div className={cn("w-full", virtualModelTableMinWidthClass)}>
-                <div className={cn("sticky top-0 z-10 grid h-10 items-center gap-3 border-b border-border/60 bg-muted/95 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground", virtualModelTableGridClass)}>
+                <div className={cn("sticky top-0 z-10 grid h-10 items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground", virtualModelTableGridClass)}>
                   <div className="truncate">{t("Name")}</div>
                   <div className="truncate">{t("New model")}</div>
                   <div className="truncate">{t("Base model")}</div>
@@ -137,11 +132,11 @@ export function VirtualModelsView({
                   <AnimatePresence initial={false}>
                     {visibleProfiles.map(({ index, profile }) => (
                       <AnimatedListItem
-                        className={cn("grid min-h-[58px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/35", virtualModelTableGridClass)}
+                        className={cn("grid min-h-[58px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/45", virtualModelTableGridClass)}
                         key={`${profile.id || profile.key}-${index}`}
                       >
                         <div className="min-w-0">
-                          <div className="truncate text-[12px] font-semibold" title={profile.displayName || profile.key}>{profile.displayName || profile.key}</div>
+                          <div className="truncate text-[13px] font-medium" title={profile.displayName || profile.key}>{profile.displayName || profile.key}</div>
                           <div className="truncate text-[11px] text-muted-foreground" title={profile.key}>{profile.key}</div>
                         </div>
                         <div className="min-w-0 truncate text-[11px] text-muted-foreground" title={virtualModelMatchSummary(profile)}>
@@ -173,9 +168,8 @@ export function VirtualModelsView({
               </div>
             </div>
           ) : null}
-        </CardContent>
-      </Card>
-    </motion.div>
+        </div>
+    </div>
   );
 }
 

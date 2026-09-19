@@ -2,6 +2,16 @@
 @import "../vendor/cc-switch/preflight.css";
 @import "../vendor/cc-switch/routing.css";
 @import "react-day-picker/style.css";
+@custom-variant dark {
+  &:where(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme]), :root:not([data-theme]) *) {
+      @slot;
+    }
+  }
+}
 @source "../vendor/tokentracker/**/*.{js,jsx}";
 @source "../pages/**/*.{html,ts,tsx}";
 @source "../components/**/*.{ts,tsx}";
@@ -1380,4 +1390,20 @@ html[data-window-active="false"] .status-heartbeat {
 
 .local-usage-page { padding-top: 64px; }
 
-.app-usage-surface > .app-page-content:not([data-view="usage"]):not([data-view="heatmap"]):not([data-view="sessions"]):not([data-view="trend"]):not([data-view="overview"]) { padding:64px 20px 20px; }
+.app-usage-surface > .app-page-content:not([data-view="usage"]):not([data-view="heatmap"]):not([data-view="sessions"]):not([data-view="trend"]):not([data-view="overview"]):not([data-view="logs"]):not([data-view="observability"]):not([data-view="providers"]):not([data-view="models"]):not([data-view="api-keys"]):not([data-view="routing"]):not([data-view="virtual-models"]):not([data-view="extensions"]):not([data-view="server"]):not([data-view="profile"]):not([data-view="networking"]):not([data-view="settings"]) { padding:64px 20px 20px; }
+
+/* Monitor tables share the report palette; detail controls keep their semantics. */
+.local-usage-page {
+  --network-bg: transparent;
+  --network-panel: transparent;
+  --network-panel-alt: var(--muted);
+  --network-panel-muted: color-mix(in srgb, var(--muted) 45%, transparent);
+  --network-border: var(--border);
+  --network-text: var(--foreground);
+  --network-text-subtle: var(--muted-foreground);
+  --network-row: transparent;
+  --network-row-alt: transparent;
+  --network-row-hover: color-mix(in srgb, var(--muted) 45%, transparent);
+  --network-row-selected: color-mix(in srgb, #10b981 10%, transparent);
+  --network-accent: var(--oai-brand);
+}

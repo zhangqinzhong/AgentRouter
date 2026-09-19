@@ -1,8 +1,8 @@
+import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
 import { useDraftClose } from "./unsaved-changes";
 import {
   AddRoutingRuleDraft, AnimatedListItem, AnimatePresence, AppConfig, ArrowDown,
-  ArrowUp, Badge, buildRoutingRuleRows, Button, Card, CardContent,
-  CardHeader, Check, CircleAlert, clampNumber, cn, createRouteModelOptions, createRoutingRewriteDraftRow,
+  ArrowUp, Badge, buildRoutingRuleRows, Button, Check, CircleAlert, clampNumber, cn, createRouteModelOptions, createRoutingRewriteDraftRow,
   Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
   disclosureSpringTransition, Field, formatRouterRuleCondition, formatRouterRuleTarget, GatewayProviderConfig, Input,
   FolderOpen, motion, normalizeRouteScriptSampleRequest, normalizeRouterFallbackConfig, Pencil, Plus, Route, RouterFallbackConfig,
@@ -47,19 +47,13 @@ export function RoutingView({
   );
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="flex h-full min-h-0 min-w-0 flex-col"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <Card className="flex h-full min-h-0 min-w-0 flex-col">
-        <CardHeader className="flex-row items-center gap-2">
-          <div className="relative min-w-0 flex-1">
+    <div className={documentPageClassName}>
+        <PageHeader title={t("Global routing")}>
+          <div className="relative w-[280px] max-w-full">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search routing rules")}
-              className="pl-8"
+              className="h-8 pl-8 text-[12px] shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search routing rules")}
               value={query}
@@ -69,8 +63,9 @@ export function RoutingView({
             <Plus className="h-4 w-4" />
             {t("Add")}
           </Button>
-        </CardHeader>
-        <CardContent className="min-h-0 flex-1 overflow-auto p-0">
+        </PageHeader>
+        <SectionHeading icon={Route} title={t("Routing rules")} summary={rows.length.toLocaleString()} />
+        <div className="@container min-w-0 overflow-x-auto border-y border-border/70">
           <div className="border-b border-border/60 px-4 py-3">
             <RouterFallbackControl
               fallback={fallback}
@@ -80,19 +75,19 @@ export function RoutingView({
             />
           </div>
           {rows.length === 0 ? (
-            <div className="m-4 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-10 text-center">
+            <div className="px-3 py-12 text-center">
               <Route className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
               <div className="text-[12px] text-muted-foreground">{t("No routing rules configured")}</div>
               <div className="mt-1 text-[11px] text-muted-foreground/60">{t("Click Add to create one")}</div>
             </div>
           ) : null}
           {rows.length > 0 && visibleRules.length === 0 ? (
-            <div className="m-4 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-10 text-center text-[12px] text-muted-foreground">{t("No matching routing rules")}</div>
+            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching routing rules")}</div>
           ) : null}
           {visibleRules.length > 0 ? (
             <div className="min-w-0">
               <div className="min-w-[940px]">
-                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(160px,0.8fr)_minmax(220px,1fr)_minmax(240px,1.15fr)_84px_148px] items-center gap-3 border-b border-border/60 bg-muted/95 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(160px,0.8fr)_minmax(220px,1fr)_minmax(240px,1.15fr)_84px_148px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                   <div className="truncate">{t("Name")}</div>
                   <div className="truncate">{t("Condition")}</div>
                   <div className="truncate">{t("Request action")}</div>
@@ -107,12 +102,12 @@ export function RoutingView({
                     const toggleDisabledReason = row.toggleDisabledReason ? t(row.toggleDisabledReason) : undefined;
                     return (
                       <AnimatedListItem
-                        className="grid min-h-[58px] grid-cols-[minmax(160px,0.8fr)_minmax(220px,1fr)_minmax(240px,1.15fr)_84px_148px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/35"
+                        className="grid min-h-[58px] grid-cols-[minmax(160px,0.8fr)_minmax(220px,1fr)_minmax(240px,1.15fr)_84px_148px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/45"
                         key={row.key}
                       >
                       <div className="min-w-0">
                         <div className="flex min-w-0 items-center gap-2">
-                          <div className="truncate text-[12px] font-semibold">{row.name || t("Unnamed")}</div>
+                          <div className="truncate text-[13px] font-medium">{row.name || t("Unnamed")}</div>
                           {row.readonly ? <Badge variant="outline">{t("Plugin")}</Badge> : null}
                         </div>
                         <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={`${rowSourceLabel}: ${row.ruleId}`}>
@@ -185,9 +180,8 @@ export function RoutingView({
               </div>
             </div>
           ) : null}
-        </CardContent>
-      </Card>
-    </motion.div>
+        </div>
+    </div>
   );
 }
 

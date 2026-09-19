@@ -2439,7 +2439,8 @@ export function providerMatchesQuery(provider: GatewayProviderConfig, query: str
 }
 
 export function viewUsesInternalScroll(view: ViewId): boolean {
-  return view === "observability" || view === "api-keys" || view === "profile" || view === "networking" || view === "logs" || view === "providers" || view === "models" || view === "routing" || view === "virtual-models" || view === "extensions" || view === "heatmap";
+  // Monitor workspaces own their table/detail scrolling; reports and forms use the page.
+  return view === "logs" || view === "observability" || view === "networking" || view === "heatmap";
 }
 
 export function uniqueProviderName(providers: GatewayProviderConfig[], baseName = "provider"): string {

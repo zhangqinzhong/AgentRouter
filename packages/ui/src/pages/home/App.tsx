@@ -267,7 +267,13 @@ function App() {
   const [routingRuleDraft, setRoutingRuleDraft] = useState<AddRoutingRuleDraft>(() => createRoutingRuleDraft());
   const [savedConfig, setSavedConfig] = useState<AppConfig>(fallbackConfig);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsOpen = activeView === "settings";
+  const [settingsProfileReturn, setSettingsProfileReturn] = useState<{
+    add: boolean;
+    draft: AddProfileDraft;
+    edit?: number;
+    view: ViewId;
+  }>();
   const [settingsInitialPage, setSettingsInitialPage] = useState<SettingsPageId>("appearance");
   const [settingsBotAddRequestKey, setSettingsBotAddRequestKey] = useState(0);
   const [compactLayout, setCompactLayout] = useState(() => window.matchMedia("(max-width: 720px)").matches);
@@ -316,13 +322,15 @@ function App() {
   useEffect(() => {
     const root = document.documentElement;
     const theme = themePreference;
+    // Vendor charts and the report shell use .dark; core controls use data-theme.
+    root.classList.toggle("dark", (theme === "system" ? systemTheme : theme) === "dark");
     if (theme === "system") {
       root.removeAttribute("data-theme");
       return;
     }
 
     root.dataset.theme = theme;
-  }, [themePreference]);
+  }, [systemTheme, themePreference]);
 
   useEffect(() => {
     document.documentElement.lang = resolvedLanguage === "zh" ? "zh-CN" : "en";
@@ -367,7 +375,7 @@ function App() {
       .catch(() => setActiveView("onboarding"))
       .finally(() => setOnboardingStatusLoaded(true));
     void window.agentrouter.getPluginMarketplace().then(setPluginMarketplace).catch(() => setPluginMarketplace([]));
-    const unsubscribeOpenSettings = window.agentrouter.onOpenSettingsRequest(openSettingsDialog);
+    const unsubscribeOpenSettings = window.agentrouter.onOpenSettingsRequest(openSettingsPage);
     const unsubscribeOpenUpdate = window.agentrouter.onOpenUpdateRequest(openUpdateDialog);
     const refreshRuntimeStatus = async () => {
       const gatewayApi = window.agentrouter;
@@ -630,7 +638,7 @@ function App() {
         });
     };
 
-    const stopPolling = startVisiblePolling(() => refreshAgentAnalysis(), 5000, { immediate: false });
+    const stopPolling = startVisiblePolling(() => refreshAgentAnalysis(), 10000, { immediate: false });
     refreshAgentAnalysis(true);
     return () => {
       cancelled = true;
@@ -679,7 +687,7 @@ function App() {
         });
     };
 
-    const stopPolling = startVisiblePolling(() => refreshRequestLogs(), 5000, { immediate: false });
+    const stopPolling = startVisiblePolling(() => refreshRequestLogs(), 10000, { immediate: false });
     refreshRequestLogs(true);
     return () => {
       cancelled = true;
@@ -2604,19 +2612,40 @@ function App() {
   }
 
   function openBotSettingsWithAddDialog() {
+    setSettingsProfileReturn({
+      add: profileAddOpen,
+      draft: profileEditIndex === undefined ? profileDraft : profileEditDraft,
+      edit: profileEditIndex,
+      view: activeView
+    });
+    setProfileAddOpen(false);
+    setProfileEditIndex(undefined);
     setSettingsInitialPage("bots");
     setSettingsBotAddRequestKey((current) => current + 1);
-    setSettingsOpen(true);
+    setActiveView("settings");
   }
 
-  function openSettingsDialog() {
+  function returnToProfileFromSettings() {
+    if (!settingsProfileReturn) return;
+    setActiveView(settingsProfileReturn.view);
+    if (settingsProfileReturn.edit === undefined) {
+      setProfileDraft(settingsProfileReturn.draft);
+    } else {
+      setProfileEditDraft(settingsProfileReturn.draft);
+    }
+    setProfileAddOpen(settingsProfileReturn.add);
+    setProfileEditIndex(settingsProfileReturn.edit);
+    setSettingsProfileReturn(undefined);
+  }
+
+  function openSettingsPage() {
     setSettingsInitialPage("appearance");
-    setSettingsOpen(true);
+    setActiveView("settings");
   }
 
-  function openGeneralSettingsDialog() {
+  function openGeneralSettingsPage() {
     setSettingsInitialPage("general");
-    setSettingsOpen(true);
+    setActiveView("settings");
   }
 
   function changeLanguagePreference(value: string) {
@@ -3269,8 +3298,8 @@ function App() {
               needsTrafficLightSafeArea={needsTrafficLightSafeArea}
               networkCaptureEnabled={networkCaptureEnabled}
               onOpenUpdate={openSidebarUpdateDialog}
-              onOpenServerSettings={openGeneralSettingsDialog}
-              onOpenSettings={openSettingsDialog}
+              onOpenServerSettings={openGeneralSettingsPage}
+              onOpenSettings={openSettingsPage}
               onSelectNavigationItem={selectNavigationItem}
               onToggleSidebar={() => setSidebarOpen((current) => !current)}
               requestLogsEnabled={requestLogsEnabled}
@@ -3281,6 +3310,43 @@ function App() {
               updateStatus={updateDialogStatus}
               visibleNavigation={visibleNavigation}
               viewProps={{
+                settings: {
+                  saveFeedback: persistenceFeedback,
+                  appInfo,
+                  botAddRequestKey: settingsBotAddRequestKey,
+                  onBotAddRequestHandled: () => setSettingsBotAddRequestKey(0),
+                  botConfigs: draftConfig.botConfigs,
+                  config: draftConfig,
+                  copy,
+                  initialPage: settingsInitialPage,
+                  languagePreference,
+                  launchAtLogin: Boolean(draftConfig.launchAtLogin),
+                  onChangeBotConfigs: changeBotConfigs,
+                  onChangeLaunchAtLogin: changeLaunchAtLogin,
+                  onChangeLanguage: changeLanguagePreference,
+                  onChangeObservability: changeObservabilityConfig,
+                  onChangeProxy: changeProxyConfig,
+                  onChangeTheme: changeThemePreference,
+                  onChangeToolHub: changeToolHubConfig,
+                  onChangeTrayBalanceProgress: changeTrayBalanceProgress,
+                  onChangeTrayIcon: changeTrayIconPreference,
+                  onChangeTrayWidgets: changeTrayWidgets,
+                  onBackToProfile: settingsProfileReturn ? returnToProfileFromSettings : undefined,
+                  observability: draftConfig.observability,
+                  profiles: draftConfig.profile.profiles,
+                  proxy: draftConfig.proxy,
+                  providers: draftConfig.Providers,
+                  systemLanguage,
+                  systemTheme,
+                  themePreference,
+                  toolHub: draftConfig.toolHub,
+                  providerAccountSnapshots,
+                  trayBalanceProgress: normalizeTrayBalanceProgressConfig(draftConfig.trayBalanceProgress),
+                  trayIconPreference: normalizeTrayIconPreference(draftConfig.trayIcon),
+                  traySupported,
+                  trayWidgets: normalizeTrayWidgets(draftConfig.trayWidgets ?? DEFAULT_TRAY_WIDGETS, draftConfig.trayWindowModules, draftConfig.trayComponentVariants),
+                  updateConfig
+                },
                 apiKeys: {
                   addApiKey: openAddApiKeyDialog,
                   apiKeys,
@@ -3421,6 +3487,42 @@ function App() {
               onClose: () => setApiKeyEditIndex(undefined),
               onSubmit: submitApiKeyEditDraft
             } : undefined}
+            profileAdd={profileAddOpen ? {
+              agentOptions: availableProfileAgentOptions,
+              botConfigs: draftConfig.botConfigs,
+              canSubmit: canSubmitProfile,
+              draft: profileDraft,
+              error: profileActionError,
+              mode: "add",
+              onChange: updateProfileDraft,
+              onCreateBot: openBotSettingsWithAddDialog,
+              onClose: () => {
+                setProfileAddOpen(false);
+                setProfileActionError("");
+              },
+              providers: draftConfig.Providers,
+              submitting: profileSubmitBusy === "add",
+              virtualModelProfiles: draftConfig.virtualModelProfiles ?? [],
+              onSubmit: submitProfileDraft
+            } : undefined}
+            profileEdit={profileEditIndex !== undefined ? {
+              agentOptions: availableProfileAgentOptions,
+              botConfigs: draftConfig.botConfigs,
+              canSubmit: canSubmitProfileEdit,
+              draft: profileEditDraft,
+              error: profileActionError,
+              mode: "edit",
+              onChange: updateProfileEditDraft,
+              onCreateBot: openBotSettingsWithAddDialog,
+              onClose: () => {
+                setProfileEditIndex(undefined);
+                setProfileActionError("");
+              },
+              providers: draftConfig.Providers,
+              submitting: profileSubmitBusy === "edit",
+              virtualModelProfiles: draftConfig.virtualModelProfiles ?? [],
+              onSubmit: submitProfileEditDraft
+            } : undefined}
             claudeDesignConfig={pluginRoutingConfigItem && isClaudeDesignPluginConfig(pluginRoutingConfigItem) ? {
               canSubmit: canSubmitClaudeDesignRouting,
               draft: claudeDesignRoutingDraft,
@@ -3472,43 +3574,10 @@ function App() {
               onClose: () => setExtensionConfigTarget(undefined),
               onSubmit: submitPluginSettingsDraft
             } : undefined}
-            profileAdd={profileAddOpen ? {
-              agentOptions: availableProfileAgentOptions,
-              botConfigs: draftConfig.botConfigs,
-              canSubmit: canSubmitProfile,
-              draft: profileDraft,
-              error: profileActionError,
-              mode: "add",
-              onChange: updateProfileDraft,
-              onCreateBot: openBotSettingsWithAddDialog,
-              onClose: () => setProfileAddOpen(false),
-              providers: draftConfig.Providers,
-              submitting: profileSubmitBusy === "add",
-              virtualModelProfiles: draftConfig.virtualModelProfiles ?? [],
-              onSubmit: submitProfileDraft
-            } : undefined}
             profileDelete={profileDeleteItem ? {
               onClose: () => setProfileDeleteIndex(undefined),
               onConfirm: confirmProfileDelete,
               profile: profileDeleteItem
-            } : undefined}
-            profileEdit={profileEditIndex !== undefined ? {
-              agentOptions: availableProfileAgentOptions,
-              botConfigs: draftConfig.botConfigs,
-              canSubmit: canSubmitProfileEdit,
-              draft: profileEditDraft,
-              error: profileActionError,
-              mode: "edit",
-              onChange: updateProfileEditDraft,
-              onCreateBot: openBotSettingsWithAddDialog,
-              onClose: () => {
-                setProfileEditIndex(undefined);
-                setProfileActionError("");
-              },
-              providers: draftConfig.Providers,
-              submitting: profileSubmitBusy === "edit",
-              virtualModelProfiles: draftConfig.virtualModelProfiles ?? [],
-              onSubmit: submitProfileEditDraft
             } : undefined}
             profileOpen={profileOpenDialog ? {
               appRunning: profileRuntimeStatus.profiles.some((entry) =>
@@ -3535,11 +3604,6 @@ function App() {
               presetsLoaded: providerPresetsLoaded,
               request: providerDeepLinkRequest
             } : undefined}
-            providerDelete={providerDeleteItem ? {
-              onClose: () => setProviderDeleteIndex(undefined),
-              onConfirm: confirmProviderDelete,
-              provider: providerDeleteItem
-            } : undefined}
             providerUpsert={providerAddOpen ? {
               canSubmit: canSubmitProvider,
               connectivityLoading: providerConnectivityLoading,
@@ -3547,15 +3611,15 @@ function App() {
               draft: providerDraft,
               error: providerProbeError,
               importProvider: providerImportOpen ? providerImportPayload : undefined,
-              onChange: updateProviderDraft,
               mode: providerEditIndex === undefined ? "add" : "edit",
+              onChange: updateProviderDraft,
+              onCheck: checkProviderDraft,
               onClose: () => {
                 setProviderAddOpen(false);
                 setProviderEditIndex(undefined);
                 setProviderImportOpen(false);
                 setProviderImportPayload(undefined);
               },
-              onCheck: checkProviderDraft,
               onRefreshModels: refreshProviderModels,
               onSubmit: submitProviderDraft,
               probe: providerProbe,
@@ -3564,6 +3628,11 @@ function App() {
               providers: draftConfig.Providers,
               submitLabel: providerImportOpen ? t("Import") : undefined,
               title: providerImportOpen ? t("Import Provider") : undefined
+            } : undefined}
+            providerDelete={providerDeleteItem ? {
+              onClose: () => setProviderDeleteIndex(undefined),
+              onConfirm: confirmProviderDelete,
+              provider: providerDeleteItem
             } : undefined}
             routingDelete={routingDeleteRule ? {
               onClose: () => setRoutingDeleteIndex(undefined),
@@ -3581,42 +3650,6 @@ function App() {
               },
               onSubmit: submitRoutingRuleDraft,
               providers: draftConfig.Providers
-            } : undefined}
-            settings={settingsOpen ? {
-              saveFeedback: persistenceFeedback,
-              appInfo,
-              botAddRequestKey: settingsBotAddRequestKey,
-              botConfigs: draftConfig.botConfigs,
-              config: draftConfig,
-              copy,
-              initialPage: settingsInitialPage,
-              languagePreference,
-              launchAtLogin: Boolean(draftConfig.launchAtLogin),
-              onChangeBotConfigs: changeBotConfigs,
-              onChangeLaunchAtLogin: changeLaunchAtLogin,
-              onChangeLanguage: changeLanguagePreference,
-              onChangeObservability: changeObservabilityConfig,
-              onChangeProxy: changeProxyConfig,
-              onChangeTheme: changeThemePreference,
-              onChangeToolHub: changeToolHubConfig,
-              onChangeTrayBalanceProgress: changeTrayBalanceProgress,
-              onChangeTrayIcon: changeTrayIconPreference,
-              onChangeTrayWidgets: changeTrayWidgets,
-              onClose: () => setSettingsOpen(false),
-              observability: draftConfig.observability,
-              profiles: draftConfig.profile.profiles,
-              proxy: draftConfig.proxy,
-              providers: draftConfig.Providers,
-              systemLanguage,
-              systemTheme,
-              themePreference,
-              toolHub: draftConfig.toolHub,
-              providerAccountSnapshots,
-              trayBalanceProgress: normalizeTrayBalanceProgressConfig(draftConfig.trayBalanceProgress),
-              trayIconPreference: normalizeTrayIconPreference(draftConfig.trayIcon),
-              traySupported,
-              trayWidgets: normalizeTrayWidgets(draftConfig.trayWidgets ?? DEFAULT_TRAY_WIDGETS, draftConfig.trayWindowModules, draftConfig.trayComponentVariants),
-              updateConfig
             } : undefined}
             update={updateDialogOpen ? {
               actionBusy: updateActionBusy,

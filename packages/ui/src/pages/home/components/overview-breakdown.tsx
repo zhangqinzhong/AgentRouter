@@ -36,7 +36,7 @@ const breakdownBrandIcons: Array<{ icon: string; match: RegExp }> = [
   { icon: openrouterIconUrl, match: /openrouter/i }
 ];
 
-function breakdownBrandIconUrl(label: string): string {
+export function breakdownBrandIconUrl(label: string): string {
   return breakdownBrandIcons.find((entry) => entry.match.test(label))?.icon ?? "";
 }
 

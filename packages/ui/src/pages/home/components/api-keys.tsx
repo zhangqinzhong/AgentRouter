@@ -1,7 +1,8 @@
+import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
 import {
   AddApiKeyDraft, AnimatedDisclosure, AnimatedIconSwap, AnimatedListItem, AnimatePresence, apiKeyExpirationOptions, ApiKeyExpirationPreset,
   ApiKeyLimitDraftRow, ApiKeyLimitMetric, apiKeyLimitMetricOptions, ApiKeyListItem, apiKeyMatchesQuery, Button,
-  Card, CardContent, CardHeader, Check, ChevronDown, CircleAlert,
+  Check, ChevronDown, CircleAlert,
   cn, Copy, copyTextToClipboard, createApiKeyLimitDraftRow, Dialog, DialogBody,
   DialogContent, DialogFooter, DialogHeader, DialogTitle, disclosureSpringTransition, Field,
   formatApiKeyExpiration, formatApiKeyLimits, Input, KeyRound, limitWindowOptions, LimitWindowPreset,
@@ -37,19 +38,13 @@ export function ApiKeysView({
   }
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="flex h-full min-h-0 min-w-0 flex-col"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <Card className="flex h-full min-h-0 min-w-0 flex-col">
-        <CardHeader className="flex-row items-center gap-2">
-          <div className="relative min-w-0 flex-1">
+    <div className={documentPageClassName}>
+        <PageHeader title={t("API keys")}>
+          <div className="relative w-[280px] max-w-full">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search API keys")}
-              className="pl-8"
+              className="h-8 pl-8 text-[12px] shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search API keys")}
               value={query}
@@ -59,23 +54,24 @@ export function ApiKeysView({
             <Plus className="h-4 w-4" />
             {t("Add")}
           </Button>
-        </CardHeader>
-        <CardContent className="min-h-0 flex-1 overflow-auto p-0">
+        </PageHeader>
+        <SectionHeading icon={KeyRound} title={t("Access keys")} summary={apiKeys.length.toLocaleString()} />
+        <div className="@container min-w-0 overflow-x-auto border-y border-border/70">
           {error ? <div className="m-4 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive flex items-start gap-2"><CircleAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" /><span>{error}</span></div> : null}
           {apiKeys.length === 0 ? (
-            <div className="m-4 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-10 text-center">
+            <div className="px-3 py-12 text-center">
               <KeyRound className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
               <div className="text-[12px] text-muted-foreground">{t("No API keys configured")}</div>
               <div className="mt-1 text-[11px] text-muted-foreground/60">{t("Click Add to create one")}</div>
             </div>
           ) : null}
           {apiKeys.length > 0 && visibleApiKeys.length === 0 ? (
-            <div className="m-4 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-10 text-center text-[12px] text-muted-foreground">{t("No matching API keys")}</div>
+            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching API keys")}</div>
           ) : null}
           {visibleApiKeys.length > 0 ? (
             <div className="min-w-0">
               <div className="min-w-[980px]">
-                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(140px,0.7fr)_minmax(390px,1.7fr)_132px_minmax(160px,0.7fr)_76px] items-center gap-3 border-b border-border/60 bg-muted/95 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(140px,0.7fr)_minmax(390px,1.7fr)_132px_minmax(160px,0.7fr)_76px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                   <div className="truncate">{t("Name")}</div>
                   <div className="truncate">{t("Key")}</div>
                   <div className="truncate">{t("Expires")}</div>
@@ -86,14 +82,14 @@ export function ApiKeysView({
                   <AnimatePresence initial={false}>
                   {visibleApiKeys.map((apiKey) => (
                     <AnimatedListItem
-                      className="grid min-h-[58px] grid-cols-[minmax(140px,0.7fr)_minmax(390px,1.7fr)_132px_minmax(160px,0.7fr)_76px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/35"
+                      className="grid min-h-[58px] grid-cols-[minmax(140px,0.7fr)_minmax(390px,1.7fr)_132px_minmax(160px,0.7fr)_76px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/45"
                       key={`${apiKey.keyValue}-${apiKey.index}`}
                     >
                       <div className="min-w-0">
-                        <div className="truncate text-[12px] font-semibold" title={apiKey.name}>{apiKey.name}</div>
+                        <div className="truncate text-[13px] font-medium" title={apiKey.name}>{apiKey.name}</div>
                       </div>
                       <div className="min-w-0">
-                        <div className="flex min-w-0 items-center gap-1.5 text-[12px] font-semibold leading-5" title={apiKey.masked}>
+                        <div className="flex min-w-0 items-center gap-1.5 text-[13px] font-medium leading-5" title={apiKey.masked}>
                           <span className="min-w-0 truncate font-mono">{apiKey.masked}</span>
                           <Button
                             className="shrink-0"
@@ -129,9 +125,8 @@ export function ApiKeysView({
               </div>
             </div>
           ) : null}
-        </CardContent>
-      </Card>
-    </motion.div>
+        </div>
+    </div>
   );
 }
 

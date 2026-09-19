@@ -1,8 +1,10 @@
+import { Layers3 } from "lucide-react";
+import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
 import { isValidLaunchAlias } from "@agentrouter/core/profiles/alias-validation";
 import { useDraftClose } from "./unsaved-changes";
 import {
   AddProfileDraft, AddRoutingRuleDraft, AgentLogo, AnimatedIconSwap, AnimatedPopover, AnimatePresence, AppConfig, Badge, BotGatewaySavedConfig, botGatewaySavedConfigLabel, BotHandoffScanTarget, Button,
-  Card, CardContent, CardHeader, CardTitle, Check, ChevronDown, CircleAlert, Copy,
+  Check, ChevronDown, CircleAlert, Copy,
   createKeyValueDraftRow,
   createRoutingRuleDraft, createRoutingRuleDraftFromRule,
   cn, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader,
@@ -51,6 +53,23 @@ type ProfileActionBusy = {
   surface: ProfileOpenSurface;
 };
 
+export type ProfileEditorProps = {
+  agentOptions?: ProfileAgentOption[];
+  botConfigs: BotGatewaySavedConfig[];
+  canSubmit: boolean;
+  draft: AddProfileDraft;
+  error: string;
+  inline?: boolean;
+  mode?: "add" | "edit";
+  onChange: (patch: Partial<AddProfileDraft>) => void;
+  onCreateBot: () => void;
+  onClose: () => void;
+  providers: GatewayProviderConfig[];
+  submitting?: boolean;
+  virtualModelProfiles?: VirtualModelProfileConfig[];
+  onSubmit: () => Promise<boolean> | boolean | void;
+};
+
 export function ProfileView({
   addProfile,
   applyError,
@@ -64,7 +83,8 @@ export function ProfileView({
   profileRuntimeStatus,
   removeProfile,
   stopProfileApp,
-  updateProfileItem
+  updateProfileItem,
+  editor
 }: {
   addProfile: (agent?: ProfileConfig["agent"]) => void;
   agentOptions?: ProfileAgentOption[];
@@ -79,8 +99,13 @@ export function ProfileView({
   removeProfile: (index: number) => void;
   stopProfileApp: (index: number) => void;
   updateProfileItem: (index: number, patch: Partial<ProfileConfig>) => void;
+  editor?: ProfileEditorProps;
 }) {
   const t = useAppText();
+  if (editor) {
+    return <AddProfileDialog {...editor} inline />;
+  }
+
   const profiles = config.profile.profiles;
   const visibleAgentValues = new Set(agentOptions.map((option) => option.value));
   const visibleProfiles = profiles
@@ -88,33 +113,18 @@ export function ProfileView({
     .filter(({ profile }) => visibleAgentValues.has(profile.agent));
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="flex h-full min-h-0 min-w-0 flex-col"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <Card className="flex h-full min-h-0 min-w-0 flex-col">
-        <CardHeader>
-          <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-            <div className="min-w-0">
-              <CardTitle>{t("Agent profiles")}</CardTitle>
-              <p className="mt-1 text-[12px] text-muted-foreground">
-                {t("Create profiles that tell each agent which model and entry mode to use.")}
-              </p>
-            </div>
-            <div className="flex shrink-0 items-center gap-2">
-              <Button onClick={() => addProfile()} size="sm" type="button">
-                <Plus className="h-3.5 w-3.5" />
-                {t("Add profile")}
-              </Button>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="min-h-0 flex-1 overflow-auto max-[720px]:p-3">
-          <div className="grid min-w-0 gap-3 [grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr))] max-[720px]:gap-2.5">
+    <div className={documentPageClassName}>
+        <PageHeader title={t("Agent profiles")}>
+          <Button onClick={() => addProfile()} size="sm" type="button">
+            <Plus className="h-3.5 w-3.5" />
+            {t("Add profile")}
+          </Button>
+        </PageHeader>
+        <SectionHeading icon={Layers3} title={t("Configured profiles")} summary={visibleProfiles.length.toLocaleString()} />
+        <div className="@container min-w-0 overflow-x-auto border-y border-border/70">
+          <div className="divide-y divide-border/60">
             {visibleProfiles.length === 0 ? (
-              <div className="col-span-full flex h-32 items-center justify-center rounded-md border border-dashed border-border bg-muted/20 text-[12px] text-muted-foreground">
+              <div className="flex h-32 items-center justify-center text-[12px] text-muted-foreground">
                 {t("No profiles configured")}
               </div>
             ) : null}
@@ -138,14 +148,14 @@ export function ProfileView({
               return (
                 <div
                   className={cn(
-                    "flex min-h-[220px] min-w-0 flex-col rounded-md border border-border p-3 transition-colors",
+                    "grid min-w-0 grid-cols-1 gap-x-6 py-3.5 transition-colors sm:grid-cols-[minmax(0,1fr)_auto]",
                     profile.enabled
-                      ? "bg-background hover:bg-muted/10"
-                      : "bg-muted/20"
+                      ? "hover:bg-muted/45"
+                      : "text-muted-foreground"
                   )}
                   key={profile.id}
                 >
-                  <div className="flex min-w-0 items-start justify-between gap-3">
+                  <div className="flex min-w-0 items-start justify-between gap-3 sm:col-span-2">
                     <div className="flex min-w-0 items-center gap-2">
                       <AgentLogo agent={profile.agent} />
                       <div className="min-w-0">
@@ -162,45 +172,37 @@ export function ProfileView({
                       title={t(profile.enabled ? "Enabled" : "Disabled")}
                     />
                   </div>
-                  <div className="mt-3 min-w-0 flex-1 space-y-1.5 border-t border-border/60 pt-2">
-                    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                      <Badge variant="secondary">{t(profileAgentLabel(profile.agent))}</Badge>
-                      <Badge variant={scope === "agentrouter" ? "success" : scope === "global" ? "warning" : "outline"}>
-                        {t(profileScopeLabel(scope))}
-                      </Badge>
-                      <Badge variant="outline">{t(profileSurfaceLabel(surface))}</Badge>
-                      {runtimeEntry?.botGateway ? (
-                        <Badge variant={runtimeEntry.botGateway.state === "connected" ? "success" : runtimeEntry.botGateway.lastError ? "warning" : "outline"}>
-                          {t("Bot")} · {t(runtimeEntry.botGateway.state === "connected" ? "Connected" : runtimeEntry.botGateway.state === "starting" ? "Starting" : runtimeEntry.botGateway.state)}
-                        </Badge>
-                      ) : null}
-                    </div>
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">
-                      {t("Configuration")}
-                    </div>
+                  <div className="mt-1.5 flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 text-[11px] leading-5 sm:col-span-2">
+                    <span className="font-medium text-foreground">{t(profileAgentLabel(profile.agent))}</span>
+                    <span aria-hidden="true" className="text-muted-foreground/50">·</span>
+                    <span className="text-muted-foreground">{t(profileScopeLabel(scope))} / {t(profileSurfaceLabel(surface))}</span>
                     {summaryItems.map((item) => (
-                      <div className="grid min-w-0 grid-cols-[92px_minmax(0,1fr)] items-baseline gap-2 text-[12px]" key={item.label}>
-                        <div className="truncate text-muted-foreground">{item.label}</div>
-                        <div className="min-w-0 truncate font-medium text-foreground" title={item.value}>{item.value}</div>
-                      </div>
+                      <span className="flex min-w-0 items-baseline gap-1" key={item.label}>
+                        <span aria-hidden="true" className="text-muted-foreground/50">·</span>
+                        <span className="shrink-0 text-muted-foreground">{item.label}</span>
+                        <span className="min-w-0 truncate font-medium text-foreground" title={item.value}>{item.value}</span>
+                      </span>
                     ))}
                     {runtimeEntry?.botGateway ? (
-                      <div className="grid min-w-0 grid-cols-[92px_minmax(0,1fr)] items-baseline gap-2 text-[12px]">
-                        <div className="truncate text-muted-foreground">{t("Bot activity")}</div>
-                        <div className="min-w-0 truncate font-medium text-foreground" title={runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || ""}>
-                          {runtimeEntry.botGateway.lastError
-                            ? runtimeEntry.botGateway.lastError
-                            : runtimeEntry.botGateway.lastEventAt
-                              ? `${t("Last event")}: ${new Date(runtimeEntry.botGateway.lastEventAt).toLocaleString()}`
-                              : t("Waiting for messages")}
-                          {runtimeEntry.botGateway.outboxCount > 0 ? ` · ${runtimeEntry.botGateway.outboxCount} ${t("pending")}` : ""}
-                        </div>
-                      </div>
+                      <Badge variant={runtimeEntry.botGateway.state === "connected" ? "success" : runtimeEntry.botGateway.lastError ? "warning" : "outline"}>
+                        {t("Bot")} · {t(runtimeEntry.botGateway.state === "connected" ? "Connected" : runtimeEntry.botGateway.state === "starting" ? "Starting" : runtimeEntry.botGateway.state)}
+                      </Badge>
                     ) : null}
                   </div>
+                  {runtimeEntry?.botGateway && (runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || runtimeEntry.botGateway.outboxCount > 0) ? (
+                    <div className="mt-1 flex min-w-0 items-baseline gap-1.5 text-[11px] leading-5 text-muted-foreground sm:col-span-2" title={runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || ""}>
+                      <span aria-hidden="true" className="text-muted-foreground/50">·</span>
+                      <span className="min-w-0 truncate">
+                        {runtimeEntry.botGateway.lastError
+                          ? runtimeEntry.botGateway.lastError
+                          : `${t("Last event")}: ${new Date(runtimeEntry.botGateway.lastEventAt ?? "").toLocaleString()}`}
+                        {runtimeEntry.botGateway.outboxCount > 0 ? ` · ${runtimeEntry.botGateway.outboxCount} ${t("pending")}` : ""}
+                      </span>
+                    </div>
+                  ) : null}
                   <div
                     aria-label={`${profile.name || t("Profile")} ${t("Profile actions")}`}
-                    className="mt-3 flex min-w-0 items-center justify-between gap-2 border-t border-border/60 pt-2"
+                    className="mt-3 flex min-w-0 items-center justify-between gap-2 self-end sm:justify-end"
                     role="group"
                   >
                     <div className="flex min-w-0 items-center gap-1">
@@ -302,9 +304,8 @@ export function ProfileView({
               {t(applyError)}
             </div>
           ) : null}
-        </CardContent>
-      </Card>
-    </motion.div>
+        </div>
+    </div>
   );
 }
 
@@ -1033,7 +1034,7 @@ export function AddProfileForm({
                       onChange={onChange}
                       providers={providers}
                     />
-                    <Field className="sm:col-span-2" label={t("Allowed model list")} requirement="optional" requirementLabel={optionalFieldLabel}>
+                    <Field className="sm:col-span-2" interactive label={t("Allowed model list")} requirement="optional" requirementLabel={optionalFieldLabel}>
                       <ModelMultiSelector
                         providers={providers}
                         hasExplicitSelection={hasExplicitAllowedModelSelection}
@@ -2101,7 +2102,7 @@ function BotGatewaySelectForm({
             </button>
           </Tooltip>
         </span>
-        <Toggle checked={draft.botEnabled} onChange={updateEnabled} />
+        <Toggle checked={draft.botEnabled} onChange={updateEnabled} title={t("Bot")} />
       </div>
       {draft.botEnabled ? (
         <div className="mt-3 space-y-3 border-t border-border/70 pt-3">
@@ -2271,6 +2272,7 @@ export function AddProfileDialog({
   canSubmit,
   draft,
   error,
+  inline = false,
   mode = "add",
   onChange,
   onCreateBot,
@@ -2279,23 +2281,52 @@ export function AddProfileDialog({
   submitting = false,
   virtualModelProfiles = [],
   onSubmit
-}: {
-  agentOptions?: ProfileAgentOption[];
-  botConfigs: BotGatewaySavedConfig[];
-  canSubmit: boolean;
-  draft: AddProfileDraft;
-  error: string;
-  mode?: "add" | "edit";
-  onChange: (patch: Partial<AddProfileDraft>) => void;
-  onCreateBot: () => void;
-  onClose: () => void;
-  providers: GatewayProviderConfig[];
-  submitting?: boolean;
-  virtualModelProfiles?: VirtualModelProfileConfig[];
-  onSubmit: () => Promise<boolean> | boolean | void;
-}) {
+}: ProfileEditorProps) {
   const t = useAppText();
   const { close, confirmation } = useDraftClose(draft, onClose);
+
+  const form = (
+    <AddProfileForm
+      agentOptions={agentOptions}
+      botConfigs={botConfigs}
+      draft={draft}
+      error={error}
+      mode={mode}
+      onChange={onChange}
+      onCreateBot={onCreateBot}
+      providers={providers}
+      virtualModelProfiles={virtualModelProfiles}
+    />
+  );
+  const footer = (
+    <div className="flex justify-end gap-2">
+      <Button disabled={submitting} onClick={close} type="button" variant="outline">{t("Cancel")}</Button>
+      <Button disabled={!canSubmit || submitting} onClick={() => void onSubmit()} type="button">
+        {submitting || mode === "add" ? (
+          <AnimatedIconSwap iconKey={submitting ? "submitting" : "add"}>
+            {submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+          </AnimatedIconSwap>
+        ) : null}
+        {mode === "edit" ? t("Save") : t("Add")}
+      </Button>
+    </div>
+  );
+
+  if (inline) {
+    return (
+      <>
+        <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
+          <PageHeader title={mode === "edit" ? t("Edit Profile") : t("Add Profile")}>
+            <Button disabled={submitting} onClick={close} type="button" variant="ghost">{t("Cancel")}</Button>
+          </PageHeader>
+          <SectionHeading icon={Layers3} title={t("Agent profile")} />
+          <div className="min-w-0 border-y border-border/70 bg-background px-1 py-4 sm:px-5">{form}</div>
+          <div className="border-b border-border/70 py-3">{footer}</div>
+        </div>
+        {confirmation}
+      </>
+    );
+  }
 
   return (
     <>
@@ -2307,32 +2338,10 @@ export function AddProfileDialog({
           </div>
         </DialogHeader>
         <DialogBody>
-          <AddProfileForm
-            agentOptions={agentOptions}
-            botConfigs={botConfigs}
-            draft={draft}
-            error={error}
-            mode={mode}
-            onChange={onChange}
-            onCreateBot={onCreateBot}
-            providers={providers}
-            virtualModelProfiles={virtualModelProfiles}
-          />
+          {form}
         </DialogBody>
         <DialogFooter>
-          <div className="flex justify-end gap-2">
-            <Button disabled={submitting} onClick={close} type="button" variant="outline">
-              {t("Cancel")}
-            </Button>
-            <Button disabled={!canSubmit || submitting} onClick={() => void onSubmit()} type="button">
-              {submitting || mode === "add" ? (
-                <AnimatedIconSwap iconKey={submitting ? "submitting" : "add"}>
-                  {submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                </AnimatedIconSwap>
-              ) : null}
-              {mode === "edit" ? t("Save") : t("Add")}
-            </Button>
-          </div>
+          {footer}
         </DialogFooter>
       </DialogContent>
     </Dialog>

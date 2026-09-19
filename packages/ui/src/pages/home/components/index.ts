@@ -2,7 +2,7 @@ export { OnboardingView } from "./onboarding";
 export { FeedbackStack, LightToast, PersistenceFeedback } from "./feedback";
 export { AppDialogStack } from "./dialog-stack";
 export { MainLayout, OnboardingLayout, UpdateEntryButton } from "./layout";
-export { AppSettingsDialog } from "./settings";
+export { AppSettingsPage } from "./settings";
 export { shouldCheckForUpdateOnOpen, UpdateDialog } from "./update";
 export { AgentAnalysisView } from "./agent-analysis";
 export { OverviewView } from "./overview";

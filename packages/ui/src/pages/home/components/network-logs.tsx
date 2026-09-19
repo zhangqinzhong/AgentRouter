@@ -1,3 +1,4 @@
+import { PageHeader, SectionHeading, tablePageClassName } from "./page-primitives";
 import { outputRateFromTpot } from "@/lib/token-rate";
 import { memo, useId } from "react";
 import { Maximize2, Route, X } from "lucide-react";
@@ -10,7 +11,7 @@ import {
   FormattedLogBody, LogStreamEvent,
   isJsonContainer, isLargeLogBody, jsonChildPath, logRequestModel,
   LogBodyFormatMode, logBodyLargeTextThreshold, logBodyPreviewTextLimit, LogBodyWorkerResponse,
-  logResolvedRouteModel, logSelectOptions, motion, MoveRight, Network, networkCodeLabel,
+  logResolvedRouteModel, logSelectOptions, MoveRight, Network, networkCodeLabel,
   networkExchangeMatchesQuery, networkHeaderRows, networkLifecycleLabel, networkQueryRows, networkRowId, networkSummaryRows,
   Pause, Play, ProxyNetworkBody, ProxyNetworkExchange, ProxyNetworkSnapshot, ProxyStatus,
   ReactNode, ReactPointerEvent, RefreshCw, RequestLogBody, RequestLogBodyChunk, RequestLogEntry, RequestLogListFilter,
@@ -30,6 +31,8 @@ type LogTableColumnId = "time" | "status" | "stream" | "model" | "credential" | 
 type LogTableColumn = {
   id: LogTableColumnId;
   minWidth: number;
+  // Default share of the row's free space; single source for the grid template.
+  grow: number;
 };
 type LogTableColumnWidths = Partial<Record<LogTableColumnId, number>>;
 type LogTableGridStyle = {
@@ -38,17 +41,17 @@ type LogTableGridStyle = {
 };
 
 const baseLogTableColumns: LogTableColumn[] = [
-  { id: "time", minWidth: 150 },
-  { id: "status", minWidth: 116 },
-  { id: "stream", minWidth: 108 },
-  { id: "model", minWidth: 180 },
-  { id: "tokens", minWidth: 140 },
-  { id: "firstToken", minWidth: 92 },
-  { id: "rate", minWidth: 128 },
-  { id: "throughput", minWidth: 110 },
-  { id: "duration", minWidth: 92 }
+  { id: "time", grow: 1.2, minWidth: 150 },
+  { id: "status", grow: 0.5, minWidth: 116 },
+  { id: "stream", grow: 0.55, minWidth: 108 },
+  { id: "model", grow: 1.3, minWidth: 180 },
+  { id: "tokens", grow: 0.9, minWidth: 140 },
+  { id: "firstToken", grow: 0.9, minWidth: 92 },
+  { id: "rate", grow: 1, minWidth: 128 },
+  { id: "throughput", grow: 1, minWidth: 110 },
+  { id: "duration", grow: 1, minWidth: 92 }
 ];
-const credentialLogTableColumn: LogTableColumn = { id: "credential", minWidth: 128 };
+const credentialLogTableColumn: LogTableColumn = { id: "credential", grow: 0.6, minWidth: 128 };
 
 export function NetworkingView({
   clearCaptures,
@@ -147,13 +150,10 @@ export function NetworkingView({
   }
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="network-view min-w-0"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <div className="network-shell flex min-h-0 flex-col overflow-hidden rounded-lg border">
+    <div className={tablePageClassName}>
+      <PageHeader title={t("Networking")} />
+      <SectionHeading icon={Network} title={t("Captured requests")} summary={captures.length.toLocaleString()} />
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden border-y border-border/70">
         <div className="network-toolbar flex h-10 min-w-0 shrink-0 items-center gap-2 border-b px-3 max-[720px]:h-auto max-[720px]:flex-wrap max-[720px]:py-2">
           <div className="relative min-w-[220px] flex-1 max-[720px]:min-w-0 max-[720px]:basis-full">
             <Search className="network-search-icon pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2" />
@@ -200,7 +200,7 @@ export function NetworkingView({
             className="network-table-scroll min-h-0 overflow-auto border-b"
             style={{ flex: selected ? `0 0 ${listHeightPercent}%` : "1 1 auto" }}
           >
-            <div className="grid gap-2 p-2 min-[721px]:hidden">
+            <div className="divide-y divide-border/60 min-[721px]:hidden">
               {captures.map((item, index) => (
                 <NetworkCaptureCard
                   exchange={item}
@@ -302,7 +302,7 @@ export function NetworkingView({
           ) : null}
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }
 
@@ -320,7 +320,7 @@ function NetworkCaptureCard({
   return (
     <button
       className={cn(
-        "network-row rounded-md border px-3 py-2 text-left text-[12px] outline-none transition-colors",
+        "network-row border-b border-border/60 px-3 py-3 text-left text-[12px] outline-none transition-colors",
         selected && "network-row-selected"
       )}
       onClick={onSelect}
@@ -381,6 +381,7 @@ export function LogsView({
   const [detailErrorById, setDetailErrorById] = useState<Record<number, string>>({});
   const [detailLoadingId, setDetailLoadingId] = useState<number>();
   const [logColumnWidths, setLogColumnWidths] = useState<LogTableColumnWidths>({});
+  const [compactLayout, setCompactLayout] = useState(false);
   const logTableHeaderRef = useRef<HTMLDivElement>(null);
   const firstItem = page.total === 0 ? 0 : (page.page - 1) * page.pageSize + 1;
   const lastItem = Math.min(page.total, page.page * page.pageSize);
@@ -388,14 +389,19 @@ export function LogsView({
     page.options.credentials.length > 0 ||
     page.items.some(logHasCredentialInfo);
   const visibleLogColumns = useMemo(() => getLogTableColumns(hasAnyCredentialInfo), [hasAnyCredentialInfo]);
-  const logTableGridClass = hasAnyCredentialInfo
-    ? "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.78fr)_minmax(120px,0.42fr)_minmax(0,0.68fr)_92px_128px_110px_82px]"
-    : "grid-cols-[minmax(0,0.8fr)_minmax(92px,0.38fr)_minmax(98px,0.4fr)_minmax(0,0.9fr)_minmax(0,0.74fr)_92px_128px_110px_82px]";
   const logTableGridStyle = useMemo(
     () => createLogTableGridStyle(visibleLogColumns, logColumnWidths),
     [logColumnWidths, visibleLogColumns]
   );
   const hasActiveFilters = logFilterHasActiveValues(filter);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(max-width: 720px)");
+    const updateCompactLayout = () => setCompactLayout(mediaQuery.matches);
+    updateCompactLayout();
+    mediaQuery.addEventListener("change", updateCompactLayout);
+    return () => mediaQuery.removeEventListener("change", updateCompactLayout);
+  }, []);
   const loadLogDetail = useCallback((id: number) => {
     if (detailById[id] || detailLoadingId === id || !window.agentrouter?.getRequestLogDetail) {
       return;
@@ -463,20 +469,20 @@ export function LogsView({
     const startX = event.clientX;
     const startLeftWidth = measuredWidths[leftColumn.id] ?? leftColumn.minWidth;
     const startRightWidth = measuredWidths[rightColumn.id] ?? rightColumn.minWidth;
-    const minDelta = leftColumn.minWidth - startLeftWidth;
-    const maxDelta = startRightWidth - rightColumn.minWidth;
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
 
     const update = (pointerEvent: PointerEvent) => {
-      const delta = clampNumber(pointerEvent.clientX - startX, minDelta, maxDelta);
+      // Spreadsheet feel: each column stops at its own minimum; the row may
+      // grow past the container and scroll horizontally instead of clamping.
+      const delta = pointerEvent.clientX - startX;
       setLogColumnWidths((current) => ({
         ...current,
         ...measuredWidths,
-        [leftColumn.id]: Math.round(startLeftWidth + delta),
-        [rightColumn.id]: Math.round(startRightWidth - delta)
+        [leftColumn.id]: Math.round(Math.max(leftColumn.minWidth, startLeftWidth + delta)),
+        [rightColumn.id]: Math.round(Math.max(rightColumn.minWidth, startRightWidth - delta))
       }));
     };
     const stop = () => {
@@ -505,49 +511,46 @@ export function LogsView({
   }
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="network-view min-w-0"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <div className="network-shell flex min-h-0 flex-col overflow-hidden rounded-lg border">
-        <div className="network-toolbar flex min-h-10 min-w-0 shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5">
+    <div className={cn(tablePageClassName, "tabular-nums")}>
+      <PageHeader title={t("Request logs")} />
+      <SectionHeading icon={Database} title={t("Requests")} summary={page.total.toLocaleString()} />
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col border-y border-border/70">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border/70 py-3">
           <div className="relative min-w-[220px] flex-1">
             <Search className="network-search-icon pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2" />
             <input
               aria-label={t("Search request logs")}
               className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-[12px] font-semibold outline-none"
               onChange={(event) => updateFilter({ query: event.target.value })}
-              placeholder={t("筛选日志、模型、请求或响应")}
+              placeholder={t("Filter logs, models, requests, or responses")}
               value={filter.query ?? ""}
             />
           </div>
           <Select
             aria-label={t("Filter request log status")}
-            className="h-7 w-[118px] bg-[length:14px] px-2 pr-7 text-[11px]"
+            className="h-8 rounded-md shadow-none w-[118px] bg-[length:14px] px-2 pr-7 text-[11px]"
             onValueChange={(value) => updateFilter({ status: value as RequestLogStatusFilter })}
             options={translateOptions(requestLogStatusOptions, t)}
             value={filter.status ?? "all"}
           />
           <Select
             aria-label={t("Filter request log provider")}
-            className="h-7 w-[148px] bg-[length:14px] px-2 pr-7 text-[11px]"
+            className="h-8 rounded-md shadow-none w-[148px] bg-[length:14px] px-2 pr-7 text-[11px]"
             onValueChange={(value) => updateFilter({ provider: value || undefined })}
-            options={logSelectOptions(t("全部供应商"), page.options.providers, filter.provider)}
+            options={logSelectOptions(t("All providers"), page.options.providers, filter.provider)}
             value={filter.provider ?? ""}
           />
           <Select
             aria-label={t("Filter request log model")}
-            className="h-7 w-[168px] bg-[length:14px] px-2 pr-7 text-[11px]"
+            className="h-8 rounded-md shadow-none w-[168px] bg-[length:14px] px-2 pr-7 text-[11px]"
             onValueChange={(value) => updateFilter({ model: value || undefined })}
-            options={logSelectOptions(t("全部模型"), page.options.models, filter.model)}
+            options={logSelectOptions(t("All models"), page.options.models, filter.model)}
             value={filter.model ?? ""}
           />
           {hasAnyCredentialInfo ? (
             <Select
               aria-label={t("Filter request log credential")}
-              className="h-7 w-[150px] bg-[length:14px] px-2 pr-7 text-[11px]"
+              className="h-8 rounded-md shadow-none w-[150px] bg-[length:14px] px-2 pr-7 text-[11px]"
               onValueChange={(value) => updateFilter({ credential: value || undefined })}
               options={logSelectOptions(t("All credentials"), page.options.credentials, filter.credential)}
               value={filter.credential ?? ""}
@@ -556,30 +559,30 @@ export function LogsView({
           <div className="flex shrink-0 items-center gap-2">
             <button
               aria-label={t("Previous page")}
-              className="network-control-button flex h-7 w-7 items-center justify-center rounded-md border outline-none disabled:cursor-not-allowed disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-ring/30"
+              className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/45 hover:text-foreground outline-none disabled:cursor-not-allowed disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-ring/30"
               disabled={page.page <= 1}
               onClick={() => updateFilter({ page: page.page - 1 }, false)}
-              title={t("上一页")}
+              title={t("Previous page")}
               type="button"
             >
               <ChevronLeft className="h-3.5 w-3.5" />
             </button>
-            <span className="network-count min-w-[132px] rounded-full px-2 py-0.5 text-center text-[11px] font-semibold">
+            <span className="min-w-[132px] px-2 py-0.5 text-center text-[11px] tabular-nums text-muted-foreground">
               {firstItem}-{lastItem} / {page.total}
             </span>
             <button
               aria-label={t("Next page")}
-              className="network-control-button flex h-7 w-7 items-center justify-center rounded-md border outline-none disabled:cursor-not-allowed disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-ring/30"
+              className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/45 hover:text-foreground outline-none disabled:cursor-not-allowed disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-ring/30"
               disabled={page.page >= page.totalPages}
               onClick={() => updateFilter({ page: page.page + 1 }, false)}
-              title={t("下一页")}
+              title={t("Next page")}
               type="button"
             >
               <ChevronRight className="h-3.5 w-3.5" />
             </button>
             <Select
               aria-label={t("Request log page size")}
-              className="h-7 w-[92px] bg-[length:14px] px-2 pr-7 text-[11px]"
+              className="h-8 rounded-md shadow-none w-[92px] bg-[length:14px] px-2 pr-7 text-[11px]"
               onValueChange={(value) => updateFilter({ pageSize: Number(value) })}
               options={translateOptions(requestLogPageSizeOptions, t)}
               value={String(page.pageSize)}
@@ -587,7 +590,7 @@ export function LogsView({
           </div>
           <button
             aria-label={t("Refresh request logs")}
-            className="network-control-button flex h-7 w-7 items-center justify-center rounded-md border outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+            className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/45 hover:text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
             onClick={refreshLogs}
             title={t("Refresh")}
             type="button"
@@ -601,10 +604,10 @@ export function LogsView({
         ) : null}
 
         <div className="flex min-h-0 flex-1 flex-col">
-          <div className="network-table-scroll min-h-0 flex-1 overflow-auto">
+          <div className="network-table-scroll min-h-0 min-w-0 flex-1 overflow-auto">
             <div className="w-full min-w-0">
               <div
-                className={cn("network-table-header sticky top-0 z-10 grid h-9 items-center border-b text-[12px] font-semibold max-[720px]:hidden", logTableGridClass)}
+                className="network-table-header sticky top-0 z-10 grid h-9 items-center border-b text-[11px] font-medium max-[720px]:hidden"
                 ref={logTableHeaderRef}
                 style={logTableGridStyle}
               >
@@ -622,7 +625,7 @@ export function LogsView({
               {page.items.length === 0 ? (
                 <div className="network-empty flex h-[240px] flex-col items-center justify-center gap-2 text-center text-[12px]">
                   <Database className="network-empty-icon h-7 w-7" />
-                  <div>{loading ? t("正在加载日志") : t(hasActiveFilters ? "No request logs match the current filters." : "No request logs yet.")}</div>
+                  <div>{loading ? t("Loading logs") : t(hasActiveFilters ? "No request logs match the current filters." : "No request logs yet.")}</div>
                   {!loading ? (
                     <div className="max-w-[360px] px-4 text-[11px] leading-4 text-muted-foreground">
                       {t(hasActiveFilters
@@ -644,43 +647,45 @@ export function LogsView({
 
               {page.items.length > 0 ? (
                 <>
-                  <div className="grid gap-2 p-2 min-[721px]:hidden">
-                    {page.items.map((item, index) => (
-                      <LogMobileCard
-                        detailError={detailErrorById[item.id]}
-                        detailLoading={detailLoadingId === item.id}
-                        expanded={expandedId === item.id}
-                        hasCredentialInfo={hasAnyCredentialInfo}
-                        index={index}
-                        item={expandedId === item.id ? detailById[item.id] ?? item : item}
-                        key={item.id}
-                        onToggle={toggleExpandedLog}
-                      />
-                    ))}
-                  </div>
-                  <div className="max-[720px]:hidden">
-                    {page.items.map((item, index) => (
-                      <LogRow
-                        detailError={detailErrorById[item.id]}
-                        detailLoading={detailLoadingId === item.id}
-                        expanded={expandedId === item.id}
-                        hasCredentialInfo={hasAnyCredentialInfo}
-                        index={index}
-                        item={expandedId === item.id ? detailById[item.id] ?? item : item}
-                        key={item.id}
-                        logTableGridClass={logTableGridClass}
-                        logTableGridStyle={logTableGridStyle}
-                        onToggle={toggleExpandedLog}
-                      />
-                    ))}
-                  </div>
+                  {compactLayout ? (
+                    <div className="divide-y divide-border/60">
+                      {page.items.map((item, index) => (
+                        <LogMobileCard
+                          detailError={detailErrorById[item.id]}
+                          detailLoading={detailLoadingId === item.id}
+                          expanded={expandedId === item.id}
+                          hasCredentialInfo={hasAnyCredentialInfo}
+                          index={index}
+                          item={expandedId === item.id ? detailById[item.id] ?? item : item}
+                          key={item.id}
+                          onToggle={toggleExpandedLog}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <div>
+                      {page.items.map((item, index) => (
+                        <LogRow
+                          detailError={detailErrorById[item.id]}
+                          detailLoading={detailLoadingId === item.id}
+                          expanded={expandedId === item.id}
+                          hasCredentialInfo={hasAnyCredentialInfo}
+                          index={index}
+                          item={expandedId === item.id ? detailById[item.id] ?? item : item}
+                          key={item.id}
+                          logTableGridStyle={logTableGridStyle}
+                          onToggle={toggleExpandedLog}
+                        />
+                      ))}
+                    </div>
+                  )}
                 </>
               ) : null}
             </div>
           </div>
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }
 
@@ -700,15 +705,11 @@ export function MonitorDisabledView({
   const t = useAppText();
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="network-view min-w-0"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <div className="network-shell flex min-h-[360px] items-center justify-center rounded-lg border px-4 py-8">
+    <div className={cn(tablePageClassName, "tabular-nums")}>
+      <PageHeader title={t("Request logs")} />
+      <div className="flex min-h-[360px] items-center justify-center border-y border-border/70 px-4 py-8">
         <div className="max-w-[440px] text-center">
-          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full border border-border bg-muted/40 text-muted-foreground">
+          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
             {icon}
           </div>
           <div className="mt-4 text-[15px] font-semibold text-foreground">{t(title)}</div>
@@ -724,7 +725,7 @@ export function MonitorDisabledView({
           ) : null}
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }
 
@@ -760,43 +761,54 @@ function getLogTableColumns(hasCredentialColumn: boolean): LogTableColumn[] {
   ];
 }
 
-function createLogTableGridStyle(columns: LogTableColumn[], widths: LogTableColumnWidths): LogTableGridStyle | undefined {
+function createLogTableGridStyle(columns: LogTableColumn[], widths: LogTableColumnWidths): LogTableGridStyle {
   const columnWidths = columns.map((column) => widths[column.id]);
   if (columnWidths.some((width) => typeof width !== "number")) {
-    return undefined;
+    // Default template: flexible report proportions built from the same column
+    // list the resize math uses, so rendered widths never undercut minWidth
+    // (undercut widths made the first drag snap columns and zero the range).
+    return {
+      gridTemplateColumns: columns.map((column) => `minmax(${column.minWidth}px, ${column.grow}fr)`).join(" "),
+      minWidth: `${columns.reduce((total, column) => total + column.minWidth, 0)}px`
+    };
   }
 
+  // Resized columns pin to pixels; only the last track stays flexible so the
+  // row still fills the container. fr units here would redistribute every
+  // drag delta across the whole row instead of the two dragged columns.
+  const pinnedWidths = columns.map((column, index) =>
+    Math.max(column.minWidth, Math.round(columnWidths[index] ?? column.minWidth))
+  );
   return {
-    gridTemplateColumns: columns.map((column, index) => {
-      const width = Math.max(column.minWidth, Math.round(columnWidths[index] ?? column.minWidth));
-      return `minmax(${column.minWidth}px, ${width}fr)`;
-    }).join(" "),
-    minWidth: `${columns.reduce((total, column) => total + column.minWidth, 0)}px`
+    gridTemplateColumns: pinnedWidths
+      .map((width, index) => (index === columns.length - 1 ? `minmax(${columns[index].minWidth}px, 1fr)` : `${width}px`))
+      .join(" "),
+    minWidth: `${pinnedWidths.slice(0, -1).reduce((total, width) => total + width, 0) + columns[columns.length - 1].minWidth}px`
   };
 }
 
 function logTableColumnLabel(columnId: LogTableColumnId, t: (value: string) => string): string {
   switch (columnId) {
     case "time":
-      return t("时间");
+      return t("Time");
     case "status":
-      return t("状态");
+      return t("Status");
     case "stream":
       return t("Stream");
     case "model":
-      return t("模型");
+      return t("Model");
     case "credential":
       return t("Credential");
     case "tokens":
       return t("Token");
     case "firstToken":
-      return t("首 Token");
+      return t("First token");
     case "rate":
-      return t("输出速率");
+      return t("Output rate");
     case "throughput":
-      return t("平均吞吐率");
+      return t("Average throughput");
     case "duration":
-      return t("持续时间");
+      return t("Duration");
   }
 }
 
@@ -823,7 +835,7 @@ function LogMobileCard({
   const tokenSummary = useMemo(() => formatLogTokenSummary(item, t, numberLocale), [item, numberLocale, t]);
 
   return (
-    <div className={cn("network-row rounded-md border text-[12px]", expanded && "network-row-selected")}>
+    <div className={cn("network-row text-[12px] tabular-nums transition-colors", expanded && "network-row-selected")}>
       <button
         aria-expanded={expanded}
         className="w-full px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
@@ -862,10 +874,10 @@ function LogMobileCard({
             </div>
             <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
               <LogCompactMetric label={t("Token")} value={tokenSummary} />
-              <LogCompactMetric label={t("持续时间")} value={formatDuration(item.durationMs)} />
-              <LogCompactMetric label={t("首 Token")} value={formatLogFirstToken(item)} />
-              <LogCompactMetric label={t("输出速率")} value={formatLogOutputRate(item, numberLocale)} />
-              <LogCompactMetric label={t("平均吞吐率")} value={formatLogAverageThroughput(item, numberLocale)} />
+              <LogCompactMetric label={t("Duration")} value={formatDuration(item.durationMs)} />
+              <LogCompactMetric label={t("First token")} value={formatLogFirstToken(item)} />
+              <LogCompactMetric label={t("Output rate")} value={formatLogOutputRate(item, numberLocale)} />
+              <LogCompactMetric label={t("Average throughput")} value={formatLogAverageThroughput(item, numberLocale)} />
               {hasCredentialInfo ? <LogCompactMetric label={t("Credential")} value={logCredentialCellLabel(item)} /> : null}
               <LogCompactMetric label={t("Provider")} value={item.provider || "-"} />
             </div>
@@ -879,7 +891,7 @@ function LogMobileCard({
 
 function LogCompactMetric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-w-0 rounded border border-border/60 px-2 py-1">
+    <div className="min-w-0 py-1">
       <div className="truncate text-[10px] text-muted-foreground">{label}</div>
       <div className="mt-0.5 min-w-0 break-words font-mono font-semibold leading-4" title={value}>{value}</div>
     </div>
@@ -893,7 +905,6 @@ const LogRow = memo(function LogRow({
   hasCredentialInfo,
   index,
   item,
-  logTableGridClass,
   logTableGridStyle,
   onToggle
 }: {
@@ -903,7 +914,6 @@ const LogRow = memo(function LogRow({
   hasCredentialInfo: boolean;
   index: number;
   item: RequestLogEntry;
-  logTableGridClass: string;
   logTableGridStyle?: LogTableGridStyle;
   onToggle: (id: number) => void;
 }) {
@@ -917,8 +927,7 @@ const LogRow = memo(function LogRow({
       <button
         aria-expanded={expanded}
         className={cn(
-          "network-row grid h-10 w-full items-center border-0 px-0 text-left text-[12px] font-semibold outline-none transition-colors",
-          logTableGridClass,
+          "network-row grid h-11 w-full items-center border-b border-border/60 px-0 text-left text-[12px] font-medium tabular-nums outline-none transition-colors",
           index % 2 === 0 ? "network-row-even" : "network-row-odd",
           expanded && "network-row-selected"
         )}
@@ -949,7 +958,7 @@ const LogRow = memo(function LogRow({
         <div className="network-row-secondary truncate px-2 tabular-nums">{formatLogFirstToken(item)}</div>
         <div className="network-row-secondary truncate px-2 tabular-nums">{formatLogOutputRate(item, numberLocale)}</div>
         <div className="network-row-secondary truncate px-2 tabular-nums">{formatLogAverageThroughput(item, numberLocale)}</div>
-        <div className="network-row-secondary truncate px-2">{formatDuration(item.durationMs)}</div>
+        <div className="network-row-secondary truncate px-2" title={`${item.durationMs} ms`}>{formatDuration(item.durationMs)}</div>
       </button>
       {expanded ? <LogExpandedDetails detailError={detailError} detailLoading={detailLoading} entry={item} /> : null}
     </div>
@@ -957,18 +966,18 @@ const LogRow = memo(function LogRow({
 });
 
 function formatLogFirstToken(entry: RequestLogEntry): string {
-  return entry.timeToFirstTokenMs === undefined ? "-" : formatDuration(entry.timeToFirstTokenMs);
+  return entry.timeToFirstTokenMs === undefined ? "—" : formatDuration(entry.timeToFirstTokenMs);
 }
 
 function formatLogOutputRate(entry: RequestLogEntry, numberLocale: Parameters<typeof formatTokenRate>[1]): string {
   const rate = outputRateFromTpot(entry);
-  return rate === undefined ? "-" : `${formatTokenRate(rate, numberLocale)} token/s`;
+  return rate === undefined ? "—" : `${formatTokenRate(rate, numberLocale)} token/s`;
 }
 
 function formatLogAverageThroughput(entry: RequestLogEntry, numberLocale: Parameters<typeof formatTokenRate>[1]): string {
   return entry.outputTokens > 0 && Number.isFinite(entry.durationMs) && entry.durationMs > 0
     ? `${formatTokenRate(entry.outputTokens / (entry.durationMs / 1_000), numberLocale)} token/s`
-    : "-";
+    : "—";
 }
 
 export function LogExpandedDetails({
@@ -998,10 +1007,10 @@ export function LogExpandedDetails({
         </span>
       </div>
       <div className={cn("network-body-meta grid grid-cols-2 gap-y-2 border-b px-3 py-2 text-[12px] sm:grid-cols-4", hasCredentialInfo ? "lg:grid-cols-12" : "lg:grid-cols-10")}>
-        <LogMetric label={t("持续时间")} value={formatDuration(entry.durationMs)} />
-        <LogMetric label={t("首 Token")} value={formatLogFirstToken(entry)} />
-        <LogMetric label={t("输出速率")} value={formatLogOutputRate(entry, numberLocale)} />
-        <LogMetric label={t("平均吞吐率")} value={formatLogAverageThroughput(entry, numberLocale)} />
+        <LogMetric label={t("Duration")} value={formatDuration(entry.durationMs)} />
+        <LogMetric label={t("First token")} value={formatLogFirstToken(entry)} />
+        <LogMetric label={t("Output rate")} value={formatLogOutputRate(entry, numberLocale)} />
+        <LogMetric label={t("Average throughput")} value={formatLogAverageThroughput(entry, numberLocale)} />
         <LogMetric label={t("Stream")} value={entry.isStream ? t("Streaming") : t("Non-streaming")} />
         <LogMetric label={t("Request ID")} value={entry.requestId || "-"} />
         <LogMetric label={t("Client")} value={entry.client || "-"} />
@@ -1011,12 +1020,12 @@ export function LogExpandedDetails({
         {entry.credentialChain.length ? <LogMetric label={t("Credential chain")} value={entry.credentialChain.join(" > ")} /> : null}
         {hasCredentialInfo ? <LogMetric label={t("Credential saturated")} value={entry.credentialSaturated ? t("Yes") : t("No")} /> : null}
         {entry.retryAttempts.length > 0 ? <LogMetric label={t("Retry attempts")} value={String(entry.retryAttempts.length)} /> : null}
-        <LogMetric label={t("输入")} value={formatCompactNumber(entry.inputTokens, numberLocale)} />
-        <LogMetric label={t("输出")} value={formatCompactNumber(entry.outputTokens, numberLocale)} />
+        <LogMetric label={t("Input")} value={formatCompactNumber(entry.inputTokens, numberLocale)} />
+        <LogMetric label={t("Output")} value={formatCompactNumber(entry.outputTokens, numberLocale)} />
         <LogMetric label={t("Thinking")} value={formatCompactNumber(entry.reasoningTokens, numberLocale)} />
-        <LogMetric label={t("缓存读取")} value={formatCompactNumber(entry.cacheReadTokens, numberLocale)} />
-        <LogMetric label={t("缓存写入")} value={formatCompactNumber(entry.cacheWriteTokens, numberLocale)} />
-        <LogMetric label={t("总计")} value={formatCompactNumber(entry.totalTokens, numberLocale)} />
+        <LogMetric label={t("Cache read")} value={formatCompactNumber(entry.cacheReadTokens, numberLocale)} />
+        <LogMetric label={t("Cache write")} value={formatCompactNumber(entry.cacheWriteTokens, numberLocale)} />
+        <LogMetric label={t("Total")} value={formatCompactNumber(entry.totalTokens, numberLocale)} />
         <LogMetric label={t("Cost")} value={formatUsdCost(entry.costUsd ?? 0)} />
       </div>
       {entry.retryAttempts.length > 0 ? <LogRetryAttempts attempts={entry.retryAttempts} /> : null}
@@ -1027,7 +1036,7 @@ export function LogExpandedDetails({
         </div>
       ) : null}
       <div className="network-detail-panes grid h-[440px] min-h-0 grid-cols-1 lg:grid-cols-2">
-        <LogJsonPanel body={entry.requestBody} headerEmptyLabel="No request headers" headers={entry.requestHeaders} requestLogId={entry.id} side="request" title={t("请求")} />
+        <LogJsonPanel body={entry.requestBody} headerEmptyLabel="No request headers" headers={entry.requestHeaders} requestLogId={entry.id} side="request" title={t("Request")} />
         <LogJsonPanel
           body={entry.responseBody}
           className="border-t lg:border-l lg:border-t-0"
@@ -1036,7 +1045,7 @@ export function LogExpandedDetails({
           requestLogId={entry.id}
           side="response"
           subtitle={`HTTP ${entry.statusCode || "-"}`}
-          title={t("响应")}
+          title={t("Response")}
         />
       </div>
     </div>
@@ -2127,7 +2136,7 @@ function LogJsonBodyToolbar({
           aria-label={`${t("Filter")} ${title} JSON`}
           className="network-filter-input h-6 w-full rounded border pl-7 pr-2 text-[11px] font-semibold outline-none"
           onChange={(event) => onQueryChange(event.target.value)}
-          placeholder={t("筛选 JSON...")}
+          placeholder={t("Filter JSON...")}
           value={query}
         />
       </div>
@@ -2506,7 +2515,7 @@ function LogBodyViewer({
             copied && "network-json-copy-success"
           )}
           onClick={() => void copyBody()}
-          title={copied ? t("Copied") : t("复制")}
+          title={copied ? t("Copied") : t("Copy")}
           type="button"
         >
           <AnimatedIconSwap iconKey={copied ? "copied" : "copy"}>
@@ -2706,15 +2715,15 @@ function OutputRateHelp({ average = false }: { average?: boolean }) {
     >?</button>
     <TooltipPortal ref={content} open={Boolean(position)} id={id} role="note" className="pointer-events-auto w-[320px] max-w-[calc(100vw-24px)] p-3 text-[12px] leading-5" style={position}>
       {average ? <>
-        <p className="font-semibold">{t("平均吞吐率")}</p>
-        <p className="mt-1">{t("公式：输出 Token 数 ÷ 请求总耗时（秒）。")}</p>
-        <p className="mt-2">{t("包含等待首 Token 的时间，适用于流式和非流式请求。输出 Token 按供应商返回的用量统计，可能包含思考 Token。")}</p>
-        <p className="mt-2">{t("例如：输出 100 Token，总耗时 5 秒，平均吞吐率为 20 token/s。")}</p>
+        <p className="font-semibold">{t("Average throughput")}</p>
+        <p className="mt-1">{t("Formula: output tokens ÷ total request duration in seconds.")}</p>
+        <p className="mt-2">{t("Includes the wait for the first token and applies to streaming and non-streaming requests. Output usage comes from the provider and may include reasoning tokens.")}</p>
+        <p className="mt-2">{t("Example: 100 output tokens over a 5-second request gives an average throughput of 20 token/s.")}</p>
       </> : <>
-      <p className="font-semibold">{t("输出速率（TPOT 估算）")}</p>
-      <p className="mt-1">{t("公式：(输出 Token 数 − 1) ÷ (总耗时 − 首 Token 延迟)，时间单位为秒。")}</p>
-      <p className="mt-2">{t("仅适用于流式请求，且输出 Token 数大于 1、时间间隔有效。Token 数按供应商返回的输出用量计，可能包含思考 Token。")}</p>
-      <p className="mt-2">{t("这是网关观测到的估算值，受网络缓冲、批量返回和短回复影响，不代表模型内部的真实生成速度。平均吞吐率则包含请求的全部耗时。")}</p>
+      <p className="font-semibold">{t("Output rate (TPOT estimate)")}</p>
+      <p className="mt-1">{t("Formula: (output tokens − 1) ÷ (total duration − time to first token), with time in seconds.")}</p>
+      <p className="mt-2">{t("Available for streaming requests with more than one output token and a valid time interval. Output usage comes from the provider and may include reasoning tokens.")}</p>
+      <p className="mt-2">{t("This gateway-observed estimate is affected by buffering, batched delivery, and short responses. It does not measure internal model generation speed. Average throughput includes the full request duration.")}</p>
       </>}
     </TooltipPortal>
   </>;

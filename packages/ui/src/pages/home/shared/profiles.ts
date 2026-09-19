@@ -1362,10 +1362,20 @@ export function profileSummaryItems(
     : profile.agent === "claude-code"
       ? t("Keep Claude Code default")
       : defaultProfileClientModel(config);
+  const configuredProfileModelKeys = new Set(
+    profileModelProviderOptions(config.Providers, config.virtualModelProfiles ?? []).flatMap((provider) =>
+      provider.models.map((model) => normalizeProfileClientModel(`${provider.name}/${model}`))
+    ).filter(Boolean).map((model) => model.toLowerCase())
+  );
+  const allowedModelCount = uniqueStrings(
+    [profile.model, ...(profile.availableModels ?? [])]
+      .map(normalizeProfileClientModel)
+      .filter((model) => model && configuredProfileModelKeys.has(model.toLowerCase()))
+  ).length;
   const allowedModelSummaryItems = profile.availableModels?.length
     ? [{
         label: t("Allowed model list"),
-        value: String(uniqueStrings([profile.model, ...profile.availableModels].filter(Boolean)).length)
+        value: String(allowedModelCount)
       }]
     : [];
 

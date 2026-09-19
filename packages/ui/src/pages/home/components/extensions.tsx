@@ -1,10 +1,11 @@
+import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
 import {
   AnimatedDisclosure, AnimatedListItem, AnimatePresence, AppConfig, Braces, buildExtensionList, Button,
-  Card, CardContent, CardHeader, Check, ChevronDown, CircleAlert, ClaudeDesignRouteRuleType,
+  Check, ChevronDown, CircleAlert, ClaudeDesignRouteRuleType,
   claudeDesignRouteRuleTypeLabel, claudeDesignRouteRuleTypeOptions, ClaudeDesignRoutingDraft, ClaudeDesignRoutingRuleDraft, createRouteModelOptions, Dialog,
   DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle, ExtensionListItem,
   cn, extensionMatchesQuery, ExtensionSource, Field, GatewayProviderConfig, Input, isClaudeDesignStaticRuleType,
-  Label, motion, normalizeClaudeDesignRuleTypeChange, Play, PluginSettingsDraft, Plus, RouteTargetControl,
+  Label, normalizeClaudeDesignRuleTypeChange, Play, PluginSettingsDraft, Plus, RouteTargetControl,
   Search, SelectControl, Settings, TextAreaControl, Toggle, translateOptions,
   Trash2, useAppText, useMemo, useState, X
 } from "../shared/index";
@@ -33,19 +34,13 @@ export function ExtensionsView({
   );
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="flex h-full min-h-0 min-w-0 flex-col"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <Card className="flex h-full min-h-0 min-w-0 flex-col">
-        <CardHeader className="flex-row items-center gap-2">
-          <div className="relative min-w-0 flex-1">
+    <div className={documentPageClassName}>
+        <PageHeader title={t("Extensions")}>
+          <div className="relative w-[280px] max-w-full">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search extensions")}
-              className="pl-8"
+              className="h-8 pl-8 text-[12px] shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search extensions")}
               value={query}
@@ -55,22 +50,23 @@ export function ExtensionsView({
             <Plus className="h-4 w-4" />
             {t("Install")}
           </Button>
-        </CardHeader>
-        <CardContent className="min-h-0 flex-1 overflow-auto p-0">
+        </PageHeader>
+        <SectionHeading icon={Braces} title={t("Installed extensions")} summary={extensions.length.toLocaleString()} />
+        <div className="@container min-w-0 overflow-x-auto border-y border-border/70">
           {extensions.length === 0 ? (
-            <div className="m-4 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-10 text-center">
+            <div className="px-3 py-12 text-center">
               <Braces className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
               <div className="text-[12px] text-muted-foreground">{t("No extensions installed")}</div>
               <div className="mt-1 text-[11px] text-muted-foreground/60">{t("Click Install to add one")}</div>
             </div>
           ) : null}
           {extensions.length > 0 && visibleExtensions.length === 0 ? (
-            <div className="m-4 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-10 text-center text-[12px] text-muted-foreground">{t("No matching extensions")}</div>
+            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching extensions")}</div>
           ) : null}
           {visibleExtensions.length > 0 ? (
             <div className="min-w-0">
               <div className="min-w-[720px]">
-                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(180px,0.95fr)_minmax(220px,1.15fr)_minmax(240px,1.2fr)_116px_116px] items-center gap-3 border-b border-border/60 bg-muted/95 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(180px,0.95fr)_minmax(220px,1.15fr)_minmax(240px,1.2fr)_116px_116px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                   <div className="truncate">{t("Name")}</div>
                   <div className="truncate">{t("Path")}</div>
                   <div className="truncate">{t("Capability")}</div>
@@ -83,11 +79,11 @@ export function ExtensionsView({
                     const appId = extension.source === "plugins" ? openablePluginAppId(config, extension.index) : undefined;
                     return (
                     <AnimatedListItem
-                      className="grid min-h-[58px] grid-cols-[minmax(180px,0.95fr)_minmax(220px,1.15fr)_minmax(240px,1.2fr)_116px_116px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/35"
+                      className="grid min-h-[58px] grid-cols-[minmax(180px,0.95fr)_minmax(220px,1.15fr)_minmax(240px,1.2fr)_116px_116px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/45"
                       key={`${extension.source}-${extension.index}`}
                     >
                       <div className="min-w-0">
-                        <div className="truncate text-[12px] font-semibold">{extension.name}</div>
+                        <div className="truncate text-[13px] font-medium">{extension.name}</div>
                       </div>
                       <div className="min-w-0 truncate text-[11px] text-muted-foreground" title={extension.target}>
                         {extension.target}
@@ -136,9 +132,8 @@ export function ExtensionsView({
               </div>
             </div>
           ) : null}
-        </CardContent>
-      </Card>
-    </motion.div>
+        </div>
+    </div>
   );
 }
 

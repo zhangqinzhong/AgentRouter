@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.5.0 - 2026-09-19
+
+- Refreshed the management UI across providers, agent profiles, settings, routing, logs and observability with a consistent overview layout.
+- Kept provider and agent profile creation/editing in focused dialogs, with a single checkable model list and accurate allowed-model counts.
+- Improved request logs and observability pages with full-width layouts, responsive headers and smoother data presentation.
+- Fixed stale provider model entries from inflating agent profile allowlists during automatic model refresh.
+- Added UI style guidance and coverage for the refreshed flat pages and provider/profile interactions.
+
+
 ## 1.3.0 - 2026-09-17
 
 - Added Sessions, Trend and Heatmap as first-level sidebar pages next to Usage.

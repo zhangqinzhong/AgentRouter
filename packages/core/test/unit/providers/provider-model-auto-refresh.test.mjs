@@ -86,7 +86,7 @@ function testConfig(overrides = {}) {
   };
 }
 
-test("auto model refresh adds new provider models and extends matching profile allowlists", async () => {
+test("auto model refresh adds new provider models without extending profile allowlists", async () => {
   const config = testConfig();
   const calls = [];
 
@@ -114,10 +114,10 @@ test("auto model refresh adds new provider models and extends matching profile a
   assert.deepEqual(result.config.Providers[0].autoFetchKnownModels, ["alpha", "beta"]);
   assert.deepEqual(result.config.Providers[0].modelDisplayNames, { beta: "Beta" });
   assert.deepEqual(result.config.Providers[1].models, ["omega"]);
-  assert.deepEqual(result.config.profile.profiles[0].availableModels, ["Provider/alpha", "Provider/beta"]);
+  assert.deepEqual(result.config.profile.profiles[0].availableModels, ["Provider/alpha"]);
   assert.deepEqual(result.config.profile.profiles[1].availableModels, ["Other/omega"]);
   assert.equal(result.config.profile.profiles[2].availableModels, undefined);
-  assert.equal(result.profileAllowlistsUpdated, 1);
+  assert.equal(result.profileAllowlistsUpdated, 0);
   assert.deepEqual(result.providers[0].addedModels, ["beta"]);
 });
 
@@ -180,7 +180,7 @@ test("auto model refresh does not re-add known models removed by the user", asyn
   assert.equal(result.changed, true);
   assert.deepEqual(result.config.Providers[0].models, ["alpha", "gamma"]);
   assert.deepEqual(result.config.Providers[0].autoFetchKnownModels, ["alpha", "beta", "gamma"]);
-  assert.deepEqual(result.config.profile.profiles[0].availableModels, ["Provider/alpha", "Provider/gamma"]);
+  assert.deepEqual(result.config.profile.profiles[0].availableModels, ["Provider/alpha"]);
   assert.deepEqual(result.providers[0].addedModels, ["gamma"]);
 });
 
@@ -210,10 +210,10 @@ test("auto model refresh hot-applies saved agent profiles after the switch is en
   assert.equal(savedConfigs.length, 1);
   assert.equal(hotAppliedConfigs.length, 1);
   assert.deepEqual(savedConfigs[0].Providers[0].models, ["alpha", "beta"]);
-  assert.deepEqual(savedConfigs[0].profile.profiles[0].availableModels, ["Provider/alpha", "Provider/beta"]);
+  assert.deepEqual(savedConfigs[0].profile.profiles[0].availableModels, ["Provider/alpha"]);
   assert.equal(hotAppliedConfigs[0].config, savedConfigs[0]);
   assert.equal(hotAppliedConfigs[0].result.config, savedConfigs[0]);
-  assert.equal(hotAppliedConfigs[0].result.profileAllowlistsUpdated, 1);
+  assert.equal(hotAppliedConfigs[0].result.profileAllowlistsUpdated, 0);
 });
 
 test("auto model refresh merges fetched models into the latest config before saving", async () => {
@@ -248,8 +248,8 @@ test("auto model refresh merges fetched models into the latest config before sav
   assert.deepEqual(savedConfigs[0].Router.rules, latestConfig.Router.rules);
   assert.deepEqual(savedConfigs[0].Providers[0].models, ["alpha", "manual", "beta"]);
   assert.deepEqual(savedConfigs[0].Providers[0].autoFetchKnownModels, ["alpha", "manual", "beta"]);
-  assert.deepEqual(savedConfigs[0].profile.profiles[0].availableModels, ["Provider/alpha", "Provider/beta"]);
-  assert.equal(result.profileAllowlistsUpdated, 1);
+  assert.deepEqual(savedConfigs[0].profile.profiles[0].availableModels, ["Provider/alpha"]);
+  assert.equal(result.profileAllowlistsUpdated, 0);
 });
 
 test("auto model refresh does not save stale results after the switch is disabled", async () => {
@@ -363,9 +363,9 @@ test("auto model refresh uses Codex local model catalog during hot apply", async
   assert.deepEqual(result.config.Providers[0].autoFetchKnownModels, ["gpt-5-codex", "gpt-5.1-codex"]);
   assert.equal(result.config.Providers[0].modelDisplayNames["gpt-5.1-codex"], "GPT-5.1 Codex");
   assert.equal(result.config.Providers[0].modelMetadata["gpt-5.1-codex"].supportsReasoningSummaries, true);
-  assert.deepEqual(result.config.profile.profiles[0].availableModels, ["Codex API/gpt-5-codex", "Codex API/gpt-5.1-codex"]);
+  assert.deepEqual(result.config.profile.profiles[0].availableModels, ["Codex API/gpt-5-codex"]);
   assert.equal(hotAppliedConfigs.length, 1);
-  assert.deepEqual(hotAppliedConfigs[0].profile.profiles[0].availableModels, ["Codex API/gpt-5-codex", "Codex API/gpt-5.1-codex"]);
+  assert.deepEqual(hotAppliedConfigs[0].profile.profiles[0].availableModels, ["Codex API/gpt-5-codex"]);
   assert.deepEqual(result.providers[0].addedModels, ["gpt-5.1-codex"]);
 });
 

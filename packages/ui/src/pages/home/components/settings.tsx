@@ -1,3 +1,5 @@
+import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
+import { ArrowLeft } from "lucide-react";
 import {
   Activity, AppConfig, AppCopy, AppInfo, AppLanguagePreference, Boxes, BotGatewayConfigDraft, botGatewayAuthSpecsForPlatform,
   botGatewayDefaultAuthType, botGatewayFieldsForAuth, botGatewayPickAuthFields, botGatewayPlatformLabel, botGatewayPlatformOptions,
@@ -16,12 +18,13 @@ import {
 import { ModelSelector } from "./model-selector";
 import trayLayeredIconUrl from "@/assets/tray-layered.png";
 
-const settingsPageContentWidthClassName = "mx-auto w-full max-w-[900px]";
+const settingsPageContentWidthClassName = "w-full min-w-0";
 
-export function AppSettingsDialog({
+export function AppSettingsPage({
   saveFeedback,
   appInfo,
   botAddRequestKey,
+  onBotAddRequestHandled,
   botConfigs,
   config,
   copy,
@@ -38,7 +41,7 @@ export function AppSettingsDialog({
   onChangeTheme,
   onChangeTrayIcon,
   onChangeTrayWidgets,
-  onClose,
+  onBackToProfile,
   observability,
   profiles,
   proxy,
@@ -57,6 +60,7 @@ export function AppSettingsDialog({
   saveFeedback?: ReactNode;
   appInfo: AppInfo;
   botAddRequestKey?: number;
+  onBotAddRequestHandled?: () => void;
   botConfigs: BotGatewaySavedConfig[];
   config: AppConfig;
   copy: AppCopy;
@@ -73,7 +77,7 @@ export function AppSettingsDialog({
   onChangeTheme: (value: string) => void;
   onChangeTrayIcon: (value: string) => void;
   onChangeTrayWidgets: (widgets: TrayWidgetConfig[]) => void;
-  onClose: () => void;
+  onBackToProfile?: () => void;
   observability: AppConfig["observability"];
   profiles: ProfileConfig[];
   proxy: AppConfig["proxy"];
@@ -94,7 +98,7 @@ export function AppSettingsDialog({
       saveFeedback={saveFeedback}
       copy={copy}
       initialPage={initialPage}
-      onClose={onClose}
+      onBackToProfile={onBackToProfile}
       renderPage={(activePage) => {
         if (activePage === "general") {
           return (
@@ -169,6 +173,7 @@ export function AppSettingsDialog({
           return (
             <BotSettingsPage
               addRequestKey={botAddRequestKey}
+              onAddRequestHandled={onBotAddRequestHandled}
               botConfigs={botConfigs}
               copy={copy}
               onChange={onChangeBotConfigs}
@@ -187,14 +192,14 @@ function SettingsLayout({
   saveFeedback,
   copy,
   initialPage,
-  onClose,
+  onBackToProfile,
   renderPage,
   traySupported
 }: {
   saveFeedback?: ReactNode;
   copy: AppCopy;
   initialPage: SettingsPageId;
-  onClose: () => void;
+  onBackToProfile?: () => void;
   renderPage: (activePage: SettingsPageId) => ReactNode;
   traySupported: boolean;
 }) {
@@ -205,87 +210,36 @@ function SettingsLayout({
     setActivePage(initialPage);
   }, [initialPage]);
 
+  const pages: Array<{ id: SettingsPageId; icon: typeof Palette; label: string }> = [
+    { id: "appearance", icon: Palette, label: copy.settings.appearance },
+    { id: "general", icon: Settings, label: copy.settings.general },
+    { id: "observability", icon: Activity, label: copy.settings.observability },
+    { id: "toolhub", icon: KeyRound, label: copy.settings.toolHub },
+    { id: "bots", icon: Boxes, label: copy.settings.bots },
+    ...(traySupported ? [{ id: "tray" as const, icon: Gauge, label: copy.settings.tray }] : [])
+  ];
+  const t = useAppText();
+
   return (
-    <Dialog onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="h-[min(700px,calc(100dvh-2rem))] max-w-[1160px]">
-        <DialogHeader>
-          <div className="min-w-0">
-            <DialogTitle>{copy.settings.title}</DialogTitle>
-          </div>
-          <Button aria-label={copy.settings.close} onClick={onClose} size="iconSm" title={copy.settings.close} type="button" variant="ghost">
-            <X className="h-4 w-4" />
+    <div className={documentPageClassName}>
+      <PageHeader title={copy.settings.title}>
+        {onBackToProfile ? (
+          <Button onClick={onBackToProfile} size="sm" type="button" variant="ghost">
+            <ArrowLeft className="h-3.5 w-3.5" />
+            {t("Back to profile")}
           </Button>
-        </DialogHeader>
-
-        <DialogBody className="flex overflow-hidden p-0 max-[640px]:flex-col">
-          <div className="hidden shrink-0 border-b border-border p-3 max-[640px]:block">
-            <Select
-              aria-label={copy.settings.title}
-              onChange={(event) => setActivePage(event.target.value as SettingsPageId)}
-              options={[
-                { label: copy.settings.appearance, value: "appearance" },
-                { label: copy.settings.general, value: "general" },
-                { label: copy.settings.observability, value: "observability" },
-                { label: copy.settings.toolHub, value: "toolhub" },
-                { label: copy.settings.bots, value: "bots" },
-                ...(traySupported ? [{ label: copy.settings.tray, value: "tray" }] : [])
-              ]}
-              value={visiblePage}
-            />
-          </div>
-          <aside className="flex w-[220px] shrink-0 flex-col border-r border-border/70 bg-muted/20 p-2 max-[640px]:hidden">
-            <SettingsPageButton
-              active={visiblePage === "appearance"}
-              icon={Palette}
-              label={copy.settings.appearance}
-              onClick={() => setActivePage("appearance")}
-            />
-            <SettingsPageButton
-              active={visiblePage === "general"}
-              className="mt-1"
-              icon={Settings}
-              label={copy.settings.general}
-              onClick={() => setActivePage("general")}
-            />
-            <SettingsPageButton
-              active={visiblePage === "observability"}
-              className="mt-1"
-              icon={Activity}
-              label={copy.settings.observability}
-              onClick={() => setActivePage("observability")}
-            />
-            <SettingsPageButton
-              active={visiblePage === "toolhub"}
-              className="mt-1"
-              icon={KeyRound}
-              label={copy.settings.toolHub}
-              onClick={() => setActivePage("toolhub")}
-            />
-            <SettingsPageButton
-              active={visiblePage === "bots"}
-              className="mt-1"
-              icon={Boxes}
-              label={copy.settings.bots}
-              onClick={() => setActivePage("bots")}
-            />
-            {traySupported ? (
-              <SettingsPageButton
-                active={visiblePage === "tray"}
-                className="mt-1"
-                icon={Gauge}
-                label={copy.settings.tray}
-                onClick={() => setActivePage("tray")}
-              />
-            ) : null}
-          </aside>
-
-          <section className="min-h-0 flex-1 overflow-auto p-5">
-            {renderPage(visiblePage)}
-          </section>
-        </DialogBody>
-        {saveFeedback}
-      </DialogContent>
-    </Dialog>
+        ) : null}
+      </PageHeader>
+      <nav aria-label={copy.settings.title} className="mb-8 flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-border/70 pb-3">
+        {pages.map((page) => (
+          <SettingsPageButton active={visiblePage === page.id} icon={page.icon} key={page.id} label={page.label} onClick={() => setActivePage(page.id)} />
+        ))}
+      </nav>
+      <section aria-label={pages.find((page) => page.id === visiblePage)?.label} key={visiblePage}>
+        {renderPage(visiblePage)}
+      </section>
+      {saveFeedback}
+    </div>
   );
 }
 
@@ -305,10 +259,10 @@ function SettingsPageButton({
   return (
     <Button
       className={cn(
-        "flex h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-[12px] font-medium transition-colors",
+        "flex h-8 min-w-0 items-center gap-1.5 text-left text-[12px] transition-colors",
         active
-          ? "bg-card text-foreground shadow-[0_1px_2px_rgba(0,0,0,0.05)]"
-          : "text-muted-foreground hover:bg-muted hover:text-foreground",
+          ? "font-semibold text-foreground"
+          : "font-normal text-muted-foreground/70 hover:text-foreground",
         className
       )}
       aria-current={active ? "page" : undefined}
@@ -318,7 +272,7 @@ function SettingsPageButton({
     >
       <span className={cn(
         "flex h-6 w-6 shrink-0 items-center justify-center rounded-md",
-        active ? "bg-primary/10 text-primary" : "text-muted-foreground"
+        active ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"
       )}>
         <Icon className="h-3.5 w-3.5" />
       </span>
@@ -357,14 +311,16 @@ function AppearanceSettingsPage({
 
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
-      <h3 className="text-[15px] font-semibold text-foreground">{copy.settings.appearance}</h3>
-      <div className="grid grid-cols-1 gap-4">
-        <Field label={copy.settings.theme}>
-          <SelectControl onChange={onChangeTheme} options={themeOptions} value={themePreference} />
-        </Field>
-        <Field label={copy.settings.language}>
-          <SelectControl onChange={onChangeLanguage} options={languageOptions} value={languagePreference} />
-        </Field>
+      <SectionHeading icon={Palette} title={copy.settings.appearance} />
+      <div className="divide-y divide-border/60 border-y border-border/70">
+        <div className="flex flex-wrap items-center justify-between gap-3 py-4">
+          <span className="text-[13px] font-medium">{copy.settings.theme}</span>
+          <Select aria-label={copy.settings.theme} className="w-[220px] max-w-full text-[12px] shadow-none" onValueChange={onChangeTheme} options={themeOptions} value={themePreference} />
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 py-4">
+          <span className="text-[13px] font-medium">{copy.settings.language}</span>
+          <Select aria-label={copy.settings.language} className="w-[220px] max-w-full text-[12px] shadow-none" onValueChange={onChangeLanguage} options={languageOptions} value={languagePreference} />
+        </div>
       </div>
     </div>
   );
@@ -393,7 +349,7 @@ function GeneralSettingsPage({
 }) {
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
-      <h3 className="text-[15px] font-semibold text-foreground">{copy.settings.general}</h3>
+      <SectionHeading icon={Settings} title={copy.settings.general} />
       <ServerSettingsSection config={config} copy={copy} updateConfig={updateConfig} />
       {launchAtLoginSupported ? (
         <SettingsSwitchRow
@@ -423,10 +379,11 @@ function ServerSettingsSection({
 
   return (
     <section className="grid grid-cols-1 gap-3">
-      <h4 className="text-[13px] font-semibold text-foreground">{t("Server")}</h4>
-      <div className="grid grid-cols-1 gap-3 rounded-md border border-border/70 bg-card/70 p-3 md:grid-cols-2">
+      <SectionHeading icon={Globe} title={t("Server")} />
+      <div className="grid grid-cols-1 gap-x-8 gap-y-4 border-y border-border/70 py-5 md:grid-cols-2">
         <Field label={t("Host")}>
           <Input
+            aria-label={t("Host")}
             value={config.HOST}
             onChange={(event) => updateConfig((next) => {
               const host = event.target.value;
@@ -441,6 +398,7 @@ function ServerSettingsSection({
         </Field>
         <Field label={t("Port")}>
           <Input
+            aria-label={t("Port")}
             type="number"
             value={String(config.PORT)}
             onChange={(event) => updateConfig((next) => {
@@ -499,8 +457,8 @@ function ProxySettingsSection({
 
   return (
     <section className="grid grid-cols-1 gap-3">
-      <h4 className="text-[13px] font-semibold text-foreground">{copy.settings.proxy}</h4>
-      <div className="grid grid-cols-1 gap-3 rounded-md border border-border/70 bg-card/70 p-3 md:grid-cols-2">
+      <SectionHeading icon={Globe} title={copy.settings.proxy} />
+      <div className="grid grid-cols-1 gap-x-8 gap-y-4 border-y border-border/70 py-5 md:grid-cols-2">
         <Field className="md:col-span-2" label={t("Proxy source")}>
           <SelectControl
             onChange={(mode) => patchUpstream({ mode: mode as AppConfig["proxy"]["upstream"]["mode"] })}
@@ -566,7 +524,7 @@ function ObservabilitySettingsPage({
   const t = useAppText();
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
-      <h3 className="text-[15px] font-semibold text-foreground">{copy.settings.observability}</h3>
+      <SectionHeading icon={Activity} title={copy.settings.observability} />
       <div className="grid grid-cols-1 gap-3">
         <SettingsSwitchRow
           checked={observability.requestLogs}
@@ -582,11 +540,12 @@ function ObservabilitySettingsPage({
           label={copy.settings.agentAnalysis}
           onChange={(agentAnalysis) => onChange({ agentAnalysis })}
         />
-        <Field label={t("日志保存天数")}>
-          <SelectControl
+        <Field label={t("Log retention days")}>
+          <Select
+            aria-label={t("Log retention days")}
             value={String(observability.retentionDays ?? 1)}
-            options={[...new Set([1, 3, 7, 14, 30, 90, 365, observability.retentionDays ?? 1])].sort((a, b) => a - b).map((days) => ({ value: String(days), label: `${days} ${t("天")}` }))}
-            onChange={(value) => onChange({ retentionDays: Number(value) })}
+            options={[...new Set([1, 3, 7, 14, 30, 90, 365, observability.retentionDays ?? 1])].sort((a, b) => a - b).map((days) => ({ value: String(days), label: `${days} ${t("days")}` }))}
+            onValueChange={(value) => onChange({ retentionDays: Number(value) })}
           />
         </Field>
       </div>
@@ -719,7 +678,7 @@ function ToolHubSettingsPage({
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
       <div className="grid gap-1">
-        <h3 className="text-[15px] font-semibold text-foreground">{copy.settings.toolHub}</h3>
+        <SectionHeading icon={KeyRound} title={copy.settings.toolHub} />
         <p className="text-[12px] leading-5 text-muted-foreground">{copy.settings.toolHubDescription}</p>
       </div>
       <div className="grid grid-cols-1 gap-3">
@@ -740,7 +699,7 @@ function ToolHubSettingsPage({
             label={copy.settings.toolHubBrowserAutomation}
             onChange={(browserAutomation) => onChange({ browserAutomation })}
           />
-          <div className="grid grid-cols-1 gap-3 rounded-md border border-border/70 bg-card/70 p-3 md:grid-cols-2">
+          <div className="grid grid-cols-1 gap-x-8 gap-y-4 border-y border-border/70 py-5 md:grid-cols-2">
             <Field className="md:col-span-2" label={copy.settings.toolHubModel}>
               <ModelSelector
                 onChange={selectProviderModel}
@@ -769,7 +728,7 @@ function ToolHubSettingsPage({
               />
             </Field>
           </div>
-          <div className="grid grid-cols-1 gap-3 rounded-md border border-border/70 bg-card/70 p-3">
+          <div className="grid grid-cols-1 gap-3 border-y border-border/70 py-5">
             <div className="flex min-w-0 items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="truncate text-[12px] font-semibold text-foreground">{t("MCP servers")}</div>
@@ -785,13 +744,13 @@ function ToolHubSettingsPage({
               </div>
             </div>
             {toolHub.mcpServers.length === 0 ? (
-              <div className="rounded-md border border-dashed border-border/70 px-3 py-3 text-[12px] text-muted-foreground">
+              <div className="border-t border-border/70 py-5 text-[12px] text-muted-foreground">
                 {t("No MCP servers configured")}
               </div>
             ) : (
               <div className="grid grid-cols-1 gap-2">
                 {toolHub.mcpServers.map((server, index) => (
-                  <div key={`${server.name}-${index}`} className="flex min-w-0 items-center gap-2 rounded-md border border-border/70 bg-background/60 px-3 py-2">
+                  <div key={`${server.name}-${index}`} className="flex min-w-0 items-center gap-2 border-b border-border/60 py-3 transition-colors hover:bg-muted/45">
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-[12px] font-semibold text-foreground" title={server.name}>{server.name}</div>
                       <div className="truncate text-[11px] text-muted-foreground" title={mcpServerEndpointSummary(server)}>
@@ -1138,7 +1097,7 @@ function SettingsSwitchRow({
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <div className="flex min-w-0 items-center gap-3 rounded-md border border-border bg-muted/20 px-3 py-3">
+    <div className="flex min-w-0 items-center gap-3 border-b border-border/70 py-4">
       <span className={cn(
         "flex h-8 w-8 shrink-0 items-center justify-center rounded-md",
         checked ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"
@@ -1149,7 +1108,7 @@ function SettingsSwitchRow({
         <div className="text-[13px] font-semibold text-foreground">{label}</div>
         <div className="mt-0.5 text-[11px] leading-4 text-muted-foreground">{description}</div>
       </div>
-      <Switch checked={checked} onCheckedChange={onChange} />
+      <Switch aria-label={label} checked={checked} onCheckedChange={onChange} />
     </div>
   );
 }
@@ -1192,16 +1151,16 @@ function DataSettingsSection({
   return (
     <section className="grid grid-cols-1 gap-3">
       <div className="min-w-0">
-        <h4 className="text-[13px] font-semibold text-foreground">{copy.settings.data}</h4>
+        <SectionHeading icon={Database} title={copy.settings.data} />
       </div>
 
-      <div className="grid gap-2 rounded-md border border-border bg-background p-3">
+      <div className="grid gap-2 border-y border-border/70 py-4">
         <DataPathRow label={t("Config database")} value={appInfo.configDbFile} />
         <DataPathRow label={t("Request log database")} value={appInfo.requestLogsDbFile} />
         <DataPathRow label={t("Usage database")} value={appInfo.usageDbFile} />
       </div>
 
-      <div className="rounded-md border border-border bg-muted/20 px-3 py-3">
+      <div className="border-b border-border/70 py-4">
         <div className="flex min-w-0 items-start gap-3">
           <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
             <Database className="h-4 w-4" />
@@ -1249,12 +1208,14 @@ function DataPathRow({
 
 function BotSettingsPage({
   addRequestKey = 0,
+  onAddRequestHandled,
   botConfigs,
   copy,
   onChange,
   profiles
 }: {
   addRequestKey?: number;
+  onAddRequestHandled?: () => void;
   botConfigs: BotGatewaySavedConfig[];
   copy: AppCopy;
   onChange: (configs: BotGatewaySavedConfig[]) => void;
@@ -1266,12 +1227,13 @@ function BotSettingsPage({
   const lastAddRequestKey = useRef(0);
 
   useEffect(() => {
-    if (addRequestKey === lastAddRequestKey.current) {
+    if (!addRequestKey || addRequestKey === lastAddRequestKey.current) {
       return;
     }
     lastAddRequestKey.current = addRequestKey;
     setEditor({ mode: "add" });
-  }, [addRequestKey]);
+    onAddRequestHandled?.();
+  }, [addRequestKey, onAddRequestHandled]);
 
   function saveBotConfig(config: BotGatewaySavedConfig) {
     const exists = botConfigs.some((item) => item.id === config.id);
@@ -1293,7 +1255,7 @@ function BotSettingsPage({
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
       <div className="flex min-w-0 items-center justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="text-[15px] font-semibold text-foreground">{copy.settings.bots}</h3>
+          <SectionHeading icon={Boxes} title={copy.settings.bots} />
           <div className="mt-1 text-[12px] text-muted-foreground">{t("Manage bots used by agent profiles.")}</div>
         </div>
         <Button onClick={() => setEditor({ mode: "add" })} size="sm" type="button">
@@ -1303,14 +1265,14 @@ function BotSettingsPage({
 
       <div className="grid gap-2">
         {botConfigs.length === 0 ? (
-          <div className="rounded-md border border-dashed border-border bg-muted/20 px-3 py-8 text-center text-[12px] text-muted-foreground">
+          <div className="border-y border-border/70 px-3 py-12 text-center text-[12px] text-muted-foreground">
             {t("No bots configured")}
           </div>
         ) : null}
         {botConfigs.map((config) => {
           const usedByProfiles = botConfigUsageProfiles(config, profiles);
           return (
-            <div className="flex min-w-0 items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2.5" key={config.id}>
+            <div className="flex min-w-0 items-center justify-between gap-3 border-b border-border/60 py-4 transition-colors hover:bg-muted/45" key={config.id}>
               <div className="min-w-0">
                 <div className="truncate text-[13px] font-semibold text-foreground">{config.name}</div>
                 <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
@@ -2126,12 +2088,12 @@ export function TraySettingsPage({
   if (trayTitleSupported) {
     return (
       <div className={cn(settingsPageContentWidthClassName, "grid content-start gap-4")}>
-        <h3 className="text-[15px] font-semibold text-foreground">{copy.settings.tray}</h3>
-        <label className="flex items-center justify-between gap-4 rounded-md border border-border bg-background p-3">
+        <SectionHeading icon={Gauge} title={copy.settings.tray} />
+        <label className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
           <span className="text-[13px] font-semibold">{copy.settings.trayShowTokenUsage}</span>
           <Switch aria-label={copy.settings.trayShowTokenUsage} checked={trayShowTokenUsage} onCheckedChange={onChangeTrayShowTokenUsage} />
         </label>
-        {onChangeTrayPetEnabled ? <label className="flex items-center justify-between gap-4 rounded-md border border-border bg-background p-3">
+        {onChangeTrayPetEnabled ? <label className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
           <span className="text-[13px] font-semibold">{copy.settings.trayPetEnabled}</span>
           <Switch aria-label={copy.settings.trayPetEnabled} checked={trayPetEnabled} onCheckedChange={onChangeTrayPetEnabled} />
         </label> : null}
@@ -2141,8 +2103,8 @@ export function TraySettingsPage({
 
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid min-h-[520px] grid-rows-[auto_auto_auto] gap-4")} ref={pageRef}>
-      <h3 className="text-[15px] font-semibold text-foreground">{copy.settings.tray}</h3>
-      <div className="flex flex-wrap items-end gap-3 rounded-md border border-border bg-background p-3">
+      <SectionHeading icon={Gauge} title={copy.settings.tray} />
+      <div className="flex flex-wrap items-end gap-3 border-y border-border/70 py-5">
         <Field className="min-w-[220px] flex-1" label={copy.settings.trayIcon}>
           <TrayIconSelect onChange={changeTrayIcon} options={trayIconOptions} progress={progressPreviewValue} value={effectiveTrayIconPreference} />
         </Field>
@@ -2181,8 +2143,8 @@ export function TraySettingsPage({
           )
         ) : null}
       </div>
-      <div className="grid min-h-0 grid-cols-[220px_minmax(320px,1fr)_260px] gap-4 max-[1140px]:grid-cols-1">
-        <div className="flex min-h-0 flex-col overflow-hidden rounded-md border border-border bg-background">
+      <div className="grid min-h-0 grid-cols-1 gap-6">
+        <div className="flex min-h-0 flex-col border-y border-border/70">
           <div className="shrink-0 border-b border-border/70 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
             {copy.settings.trayComponents}
           </div>
@@ -2254,7 +2216,7 @@ export function TraySettingsPage({
           </div>
         </div>
 
-        <div className="flex min-h-0 flex-col overflow-hidden rounded-md border border-border bg-muted/15">
+        <div className="flex min-h-0 flex-col border-y border-border/70">
           <div className="shrink-0 border-b border-border/70 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
             {copy.settings.trayPreview}
           </div>
@@ -2274,7 +2236,7 @@ export function TraySettingsPage({
           </div>
         </div>
 
-        <div className="flex min-h-0 flex-col overflow-hidden rounded-md border border-border bg-background">
+        <div className="flex min-h-0 flex-col border-y border-border/70">
           <div className="shrink-0 border-b border-border/70 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
             {copy.settings.trayComponentProperties}
           </div>

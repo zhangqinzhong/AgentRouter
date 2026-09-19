@@ -11,7 +11,7 @@ import {
 } from "@agentrouter/core/contracts/app";
 import { codexDefaultBaseUrl, readCodexLocalModelCatalog } from "@agentrouter/core/agents/local-providers/codex";
 import { localAgentProviderApiKey } from "@agentrouter/core/agents/local-providers/shared";
-import { modelRegistryForConfig, parseProviderModelSelector, providerRuntimeId } from "@agentrouter/core/routing/model-registry";
+import { modelRegistryForConfig, providerRuntimeId } from "@agentrouter/core/routing/model-registry";
 import { probeGatewayProvider } from "@agentrouter/core/providers/probe";
 import { normalizeProviderBaseUrl } from "@agentrouter/core/providers/url";
 
@@ -110,7 +110,6 @@ export async function refreshAutoFetchProviderModels(
   const probeProvider = options.probeProvider ?? probeGatewayProvider;
   let providers = config.Providers;
   const providerResults: ProviderModelAutoRefreshProviderResult[] = [];
-  const addedByProvider: Array<{ addedModels: string[]; provider: GatewayProviderConfig }> = [];
 
   for (const [providerIndex, provider] of config.Providers.entries()) {
     if (!provider.autoFetchModels || !isGatewayProviderEnabled(provider)) {
@@ -165,9 +164,6 @@ export async function refreshAutoFetchProviderModels(
         models: mergedModels
       };
       providers = replaceAt(providers, providerIndex, nextProvider);
-      if (addedModels.length > 0) {
-        addedByProvider.push({ addedModels, provider });
-      }
     } catch (error) {
       const message = formatError(error);
       options.logger?.warn?.(`[providers] Failed to refresh models for ${providerName}: ${message}`);
@@ -181,7 +177,11 @@ export async function refreshAutoFetchProviderModels(
     }
   }
 
-  if (providers === config.Providers) {
+  const profileUpdate = pruneProfileAllowlistsToConfiguredModels({
+    ...config,
+    Providers: providers
+  });
+  if (providers === config.Providers && profileUpdate.changedCount === 0) {
     return {
       changed: false,
       config,
@@ -190,7 +190,6 @@ export async function refreshAutoFetchProviderModels(
     };
   }
 
-  const profileUpdate = profileAllowlistsWithAutoFetchedModels(config, addedByProvider);
   return {
     changed: true,
     config: {
@@ -239,7 +238,6 @@ function mergeProviderModelAutoRefreshResult(
 ): ProviderModelAutoRefreshResult {
   let providers = currentConfig.Providers;
   const providerResults = result.providers.map((item) => ({ ...item }));
-  const addedByProvider: Array<{ addedModels: string[]; provider: GatewayProviderConfig }> = [];
 
   for (const [resultIndex, providerResult] of result.providers.entries()) {
     if (providerResult.error || providerResult.skipped) {
@@ -287,12 +285,14 @@ function mergeProviderModelAutoRefreshResult(
     }
 
     providers = replaceAt(providers, currentProviderIndex, nextProvider);
-    if (addedModels.length > 0) {
-      addedByProvider.push({ addedModels, provider: nextProvider });
-    }
   }
 
-  if (providers === currentConfig.Providers) {
+  const configWithProviders = {
+    ...currentConfig,
+    Providers: providers
+  };
+  const profileUpdate = pruneProfileAllowlistsToConfiguredModels(configWithProviders);
+  if (providers === currentConfig.Providers && profileUpdate.changedCount === 0) {
     return {
       ...result,
       changed: false,
@@ -302,11 +302,6 @@ function mergeProviderModelAutoRefreshResult(
     };
   }
 
-  const configWithProviders = {
-    ...currentConfig,
-    Providers: providers
-  };
-  const profileUpdate = profileAllowlistsWithAutoFetchedModels(configWithProviders, addedByProvider);
   return {
     ...result,
     changed: true,
@@ -513,9 +508,8 @@ function mergeProviderModelCatalogSnapshots(
   };
 }
 
-function profileAllowlistsWithAutoFetchedModels(
-  config: AppConfig,
-  addedByProvider: Array<{ addedModels: string[]; provider: GatewayProviderConfig }>
+function pruneProfileAllowlistsToConfiguredModels(
+  config: AppConfig
 ): { changedCount: number; profiles: ProfileConfig[] } {
   const registry = modelRegistryForConfig(config);
   let changedCount = 0;
@@ -524,24 +518,17 @@ function profileAllowlistsWithAutoFetchedModels(
       return profile;
     }
 
-    const additions = addedByProvider.flatMap(({ addedModels, provider }) =>
-      profileUsesProvider(config, registry, profile, provider)
-        ? addedModels.map((model) => `${provider.name}/${model}`)
-        : []
-    );
-    if (additions.length === 0) {
-      return profile;
-    }
-
-    const availableModels = mergeModelLists(profile.availableModels, additions);
-    if (availableModels.length === profile.availableModels.length) {
+    const availableModels = uniqueModelList(profile.availableModels.filter((model) =>
+      model === profile.model || registry.isConfigured(model)
+    ));
+    if (sameModelList(availableModels, profile.availableModels)) {
       return profile;
     }
 
     changedCount += 1;
     return {
       ...profile,
-      availableModels
+      availableModels: availableModels.length > 0 ? availableModels : undefined
     };
   });
 
@@ -549,59 +536,6 @@ function profileAllowlistsWithAutoFetchedModels(
     changedCount,
     profiles
   };
-}
-
-function profileUsesProvider(
-  config: AppConfig,
-  registry: ReturnType<typeof modelRegistryForConfig>,
-  profile: ProfileConfig,
-  provider: GatewayProviderConfig
-): boolean {
-  const aliases = providerAliases(provider);
-  if ([profile.providerId, profile.providerName].some((value) => value && aliases.has(value.trim().toLowerCase()))) {
-    return true;
-  }
-
-  return profileModelSelectors(profile).some((selector) => {
-    const parsed = parseProviderModelSelector(selector);
-    if (parsed && aliases.has(parsed.provider.trim().toLowerCase())) {
-      return true;
-    }
-
-    const resolved = registry.resolve(selector);
-    return resolved?.kind === "provider" && providersReferToSameProvider(resolved.provider, provider, config);
-  });
-}
-
-function profileModelSelectors(profile: ProfileConfig): string[] {
-  return uniqueModelList([
-    profile.model,
-    profile.fableModel,
-    profile.opusModel,
-    profile.sonnetModel,
-    profile.haikuModel,
-    profile.smallFastModel,
-    ...(profile.availableModels ?? [])
-  ].filter((value): value is string => Boolean(value)));
-}
-
-function providersReferToSameProvider(
-  left: GatewayProviderConfig,
-  right: GatewayProviderConfig,
-  config: Pick<AppConfig, "Providers">
-): boolean {
-  const leftIndex = config.Providers.indexOf(left);
-  const rightIndex = config.Providers.indexOf(right);
-  if (leftIndex >= 0 && rightIndex >= 0) {
-    return leftIndex === rightIndex;
-  }
-  const leftId = left.id?.trim();
-  const rightId = right.id?.trim();
-  if (leftId && rightId) {
-    return leftId.toLowerCase() === rightId.toLowerCase();
-  }
-  return left.name.trim().toLowerCase() === right.name.trim().toLowerCase() &&
-    providerBaseUrl(left).trim().toLowerCase() === providerBaseUrl(right).trim().toLowerCase();
 }
 
 function providerAliases(provider: GatewayProviderConfig): Set<string> {

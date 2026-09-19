@@ -1,7 +1,9 @@
 import type { HTMLAttributes, ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { cn } from "@/lib/utils";
 import type { ViewId } from "./types";
+import { viewUsesInternalScroll } from "./providers";
 
 export const motionEase = [0.22, 1, 0.36, 1] as const;
 export const reducedMotionTransition = { duration: 0.12, ease: "easeOut" } as const;
@@ -15,31 +17,45 @@ export type MotionSafeDivAttributes = Omit<
 >;
 
 export function ViewMotionShell({ children, view }: { children: ReactNode; view: ViewId }) {
-  const shouldReduceMotion = useReducedMotion();
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setEntered(true), 40);
+    return () => clearTimeout(timer);
+  }, []);
 
   return (
-    <motion.div
-      animate={{ opacity: 1, scale: 1, y: 0 }}
-      className="h-full min-h-0"
-      exit={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.995, y: -6 }}
-      initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.995, y: 10 }}
-      transition={shouldReduceMotion ? reducedMotionTransition : pageSpringTransition}
+    <div
+      className={cn(
+        "min-h-0 transition-opacity duration-300 ease-out motion-reduce:transition-none",
+        // Internal-scroll views must get a definite height — min-h-full would
+        // size to content and break the h-full chain down to the scroller.
+        viewUsesInternalScroll(view) ? "h-full" : "min-h-full",
+        entered ? "opacity-100" : "opacity-0"
+      )}
       data-view={view}
     >
       {children}
-    </motion.div>
+    </div>
   );
 }
 
 export function AnimatedListItem({ children, className, ...props }: MotionSafeDivAttributes) {
   const shouldReduceMotion = useReducedMotion();
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setEntered(true), 40);
+    return () => clearTimeout(timer);
+  }, []);
 
   return (
     <motion.div
-      animate={{ opacity: 1, y: 0 }}
-      className={className}
+      className={cn(
+        "transition-[background-color,opacity,transform] duration-300 ease-out motion-reduce:transition-none",
+        entered ? "translate-y-0 opacity-100" : "translate-y-1 opacity-0",
+        className
+      )}
       exit={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
-      initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: 6 }}
+      initial={false}
       layout="position"
       transition={shouldReduceMotion ? reducedMotionTransition : listSpringTransition}
       {...props}

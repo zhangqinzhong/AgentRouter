@@ -53,18 +53,20 @@ import type { KeyValueDraftRow } from "./types";
 export function Field({
   children,
   className,
+  interactive = false,
   label,
   requirement,
   requirementLabel
 }: {
   children: React.ReactNode;
   className?: string;
+  interactive?: boolean;
   label: string;
   requirement?: "optional" | "required";
   requirementLabel?: string;
 }) {
-  return (
-    <Label className={cn("block min-w-0 space-y-1", className)}>
+  const content = (
+    <>
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="truncate text-[12px] font-medium text-muted-foreground">{label}</span>
         {requirement ? (
@@ -79,7 +81,12 @@ export function Field({
         ) : null}
       </span>
       {children}
-    </Label>
+    </>
+  );
+  return interactive ? (
+    <div className={cn("block min-w-0 space-y-1", className)}>{content}</div>
+  ) : (
+    <Label className={cn("block min-w-0 space-y-1", className)}>{content}</Label>
   );
 }
 

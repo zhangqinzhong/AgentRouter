@@ -9,7 +9,7 @@ test.use({ locale: "en-US" });
 
 const cliWebAuthToken = "playwright-provider-edit-token";
 
-// A provider shaped like a hand-written config entry: the dialog renders none of
+// A provider shaped like a hand-written config entry: the editor renders none of
 // extraBody, extraHeaders or transformer, so saving must not drop them.
 const configOnlyProvider = {
   api_base_url: "http://127.0.0.1:9/v1",
@@ -36,7 +36,7 @@ test.afterAll(async () => {
   runtime = undefined;
 });
 
-test("keeps config-only provider fields when the provider is saved from the dialog", async ({ page }) => {
+test("keeps config-only provider fields when the provider is saved from the dialog editor", async ({ page }) => {
   const current = requireRuntime();
 
   await page.goto(`${current.baseUrl}/?ar_web_token=${current.token}`);
@@ -58,7 +58,7 @@ test("keeps config-only provider fields when the provider is saved from the dial
   const saveButton = page.getByRole("button", { name: /^(Save|保存)$/ });
   await expect(saveButton).toBeEnabled();
   await saveButton.click();
-  await expect(saveButton).toBeHidden();
+  await expect(page.getByRole("heading", { name: "Edit Provider", exact: true })).toHaveCount(0);
 
   await expect.poll(async () => page.evaluate(async () => {
     const config = await window.agentrouter!.getConfig();
@@ -101,7 +101,7 @@ test("edits extraBody from the advanced settings section", async ({ page }) => {
   await extraBodyBox.fill('{ "default": { "reasoning_effort": "max" } }');
   const saveButton = page.getByRole("button", { name: /^(Save|保存)$/ });
   await saveButton.click();
-  await expect(saveButton).toBeHidden();
+  await expect(page.getByRole("heading", { name: "Edit Provider", exact: true })).toHaveCount(0);
 
   await expect.poll(async () => page.evaluate(async () => {
     const config = await window.agentrouter!.getConfig();
@@ -149,7 +149,7 @@ test("retries a failed provider creation without adding a duplicate", async ({ p
   expect(await persistedProviderNames(page)).toEqual([configOnlyProvider.name]);
 
   await dialog.getByRole("button", { name: "Done", exact: true }).click();
-  await expect(dialog).toBeHidden();
+  await expect(dialog).toHaveCount(0);
   await expect.poll(() => persistedProviderNames(page)).toEqual([configOnlyProvider.name, "Retry Provider"]);
   expect(saves.attempts).toBe(2);
   await page.reload();
@@ -164,11 +164,11 @@ test("discarding a failed provider creation never saves the abandoned draft", as
 
   await dialog.getByRole("button", { name: "Done", exact: true }).click();
   await expect(dialog.getByRole("alert")).toContainText("Simulated provider save failure");
-  await dialog.getByRole("button", { name: "Close dialog", exact: true }).click();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   const confirmation = page.getByRole("dialog", { name: "Unsaved changes", exact: true });
   await expect(confirmation).toBeVisible();
   await confirmation.getByRole("button", { name: "Discard changes", exact: true }).click();
-  await expect(dialog).toBeHidden();
+  await expect(dialog).toHaveCount(0);
   await expect(confirmation).toBeHidden();
 
   // Observe past the autosave debounce, including a real navigation, so a
@@ -190,14 +190,14 @@ test("discarding a failed provider creation never saves the abandoned draft", as
   expect(await persistedProviderNames(page)).toEqual([configOnlyProvider.name]);
 });
 
-test("renaming a provider in the dialog keeps saved routing and model references", async ({ page }) => {
+test("renaming a provider in the dialog editor keeps saved routing and model references", async ({ page }) => {
   await prepareProviderRegressionPage(page, true);
   await interceptProviderRpc(page, false);
   await page.locator(`button[aria-label="Edit ${configOnlyProvider.name}"]:visible`).first().click();
-  const dialog = page.getByRole("dialog", { name: "Edit Provider", exact: true });
+  const dialog = providerEditor(page, "Edit Provider");
   await dialog.getByLabel("Name", { exact: true }).fill("Renamed Provider");
   await dialog.getByRole("button", { name: "Save", exact: true }).click();
-  await expect(dialog).toBeHidden();
+  await expect(dialog).toHaveCount(0);
 
   await expect.poll(async () => page.evaluate(async () => {
     const config = await window.agentrouter!.getConfig();
@@ -230,38 +230,21 @@ test("renaming a provider in the dialog keeps saved routing and model references
   expect(await persistedProviderNames(page)).toEqual(["Renamed Provider"]);
 });
 
-test("resumes an unrelated pending autosave after the provider form save fails", async ({ page }) => {
+test("leaving the inline provider editor does not leak its unsaved draft", async ({ page }) => {
   await prepareProviderRegressionPage(page, true);
   const saves = await interceptProviderRpc(page, true);
   const dialog = await fillNewProvider(page, "Failed Provider");
 
-  // Keep the completed provider form open while changing an existing routing
-  // setting through its real React controls. This puts a global draft edit
-  // immediately before the explicit form save cancels its debounce timer.
+  // Inline editing intentionally unmounts when navigating away. The abandoned
+  // provider draft must not be folded into the unrelated routing autosave.
   await page.getByRole("button", { name: "Global Routing", exact: true, includeHidden: true })
     .evaluate((button: HTMLButtonElement) => button.click());
-  const ruleRow = page.locator('[data-view="routing"] div.grid')
-    .filter({ has: page.locator('[title="Router: rename-reference"]') });
-  const ruleSwitch = ruleRow.getByRole("switch", { includeHidden: true });
-  await expect(ruleSwitch).toBeChecked();
-  await ruleSwitch.evaluate((input: HTMLInputElement) => input.click());
-  await dialog.getByRole("button", { name: "Done", exact: true }).click();
-
-  await expect(dialog.getByRole("alert")).toContainText("Simulated provider save failure");
-  await expect.poll(async () => page.evaluate(async () => {
-    const config = await window.agentrouter!.getConfig();
-    return {
-      names: config.Providers.map((provider) => provider.name),
-      ruleEnabled: config.Router.rules[0]?.enabled
-    };
-  })).toEqual({ names: [configOnlyProvider.name], ruleEnabled: false });
-  expect(saves.attempts).toBe(2);
-  expect(saves.providerNames).toEqual([
-    [configOnlyProvider.name, "Failed Provider"],
-    [configOnlyProvider.name]
-  ]);
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole("button", { name: "Done", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Providers", exact: true }).click();
+  await page.waitForTimeout(800);
+  expect(saves.attempts).toBe(0);
+  expect(saves.providerNames).toEqual([]);
+  expect(await persistedProviderNames(page)).toEqual([configOnlyProvider.name]);
+  await expect(dialog.getByLabel("Name", { exact: true })).toHaveValue("Failed Provider");
 });
 
 async function prepareProviderRegressionPage(page: Page, withReferences = false): Promise<void> {
@@ -335,7 +318,7 @@ async function interceptProviderRpc(page: Page, failFirstSave: boolean): Promise
 
 async function fillNewProvider(page: Page, name: string) {
   await page.getByRole("button", { name: "Add provider", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Add Provider", exact: true });
+  const dialog = providerEditor(page, "Add Provider");
   await dialog.getByRole("button", { name: "Select preset provider", exact: true }).click();
   await page.getByRole("option", { name: "Other / custom API endpoint", exact: true }).click();
   await dialog.getByLabel("Name", { exact: true }).fill(name);
@@ -349,6 +332,10 @@ async function fillNewProvider(page: Page, name: string) {
   await dialog.getByRole("button", { name: "Next", exact: true }).click();
   await expect(dialog.getByRole("button", { name: "Done", exact: true })).toBeEnabled();
   return dialog;
+}
+
+function providerEditor(page: Page, title: "Add Provider" | "Edit Provider") {
+  return page.getByRole("dialog", { name: title, exact: true });
 }
 
 async function persistedProviderNames(page: Page): Promise<string[]> {

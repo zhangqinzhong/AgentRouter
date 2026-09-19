@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import packageJson from "../../package.json";
 import { loadOnboardingFinished, markOnboardingFinished } from "@agentrouter/core/config/onboarding-state";
 import { scanBotHandoffBluetoothTargets, scanBotHandoffWifiTargets } from "@agentrouter/core/agents/bot-gateway/handoff-scan-service";
@@ -93,6 +94,45 @@ import { GATEWAY_PLUGIN_PERMISSION_IDS, GATEWAY_PLUGIN_SURFACE_IDS } from "@agen
 
 const gatewayPluginPermissionIdSet = new Set<string>(GATEWAY_PLUGIN_PERMISSION_IDS);
 const gatewayPluginSurfaceIdSet = new Set<string>(GATEWAY_PLUGIN_SURFACE_IDS);
+
+// The web app is served over http, where browsers refuse file:// subresources
+// (and the CSP only allows self/data/file images anyway). Inline configured
+// provider icons as data URIs so they survive the origin change.
+async function withWebProviderIconDataUris(config: AppConfig): Promise<AppConfig> {
+  const providers = config.Providers ?? [];
+  if (!providers.some((provider) => provider.icon?.startsWith("file://"))) {
+    return config;
+  }
+  const iconCache = new Map<string, string | undefined>();
+  const resolveIcon = async (icon: string): Promise<string | undefined> => {
+    if (iconCache.has(icon)) {
+      return iconCache.get(icon);
+    }
+    let resolved: string | undefined;
+    try {
+      const filePath = fileURLToPath(icon);
+      const data = readFileSync(filePath);
+      const extension = path.extname(filePath).toLowerCase().replace(".", "");
+      const mimeType = extension === "svg" ? "image/svg+xml" : extension === "png" ? "image/png" : extension === "jpg" || extension === "jpeg" ? "image/jpeg" : extension === "webp" ? "image/webp" : extension === "ico" ? "image/x-icon" : "";
+      resolved = mimeType ? `data:${mimeType};base64,${data.toString("base64")}` : undefined;
+    } catch {
+      resolved = undefined;
+    }
+    iconCache.set(icon, resolved);
+    return resolved;
+  };
+  const nextProviders = await Promise.all(
+    providers.map(async (provider) => {
+      const icon = provider.icon?.trim();
+      if (!icon?.startsWith("file://")) {
+        return provider;
+      }
+      const dataUri = await resolveIcon(icon);
+      return dataUri ? { ...provider, icon: dataUri } : provider;
+    })
+  );
+  return { ...config, Providers: nextProviders };
+}
 
 export type WebManagementServerOptions = {
   authToken?: string;
@@ -317,7 +357,7 @@ const rpcHandlers: Record<string, RpcHandler> = {
   getAgentAnalysis: (filter) => getAgentAnalysis(filter as AgentAnalysisFilter | undefined),
   getAgentTracePayload: (request) => getAgentTracePayload(request as AgentAnalysisTracePayloadRequest),
   getAppInfo: () => getCliAppInfo(),
-  getConfig: () => loadAppConfig(),
+  getConfig: async () => withWebProviderIconDataUris(await loadAppConfig()),
   getGatewayStatus: () => gatewayService.getStatus(),
   getServiceIdentity: (serviceToken) => ({
     pid: process.pid,

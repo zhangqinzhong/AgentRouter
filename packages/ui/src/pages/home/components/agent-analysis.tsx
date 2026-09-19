@@ -1,3 +1,5 @@
+import { PageHeader, SectionHeading, SummaryStrip, tablePageClassName } from "./page-primitives";
+import { Activity } from "lucide-react";
 import {
   AgentAnalysisSessionSelection, AgentAnalysisSnapshot, AgentAnalysisTracePayloadFullResult, AgentAnalysisTracePayloadRequest, AgentAnalysisTraceRun, AgentFilterValue, agentAnalysisRangeOptions,
   agentFilterOptions, agentKindLabel, Badge, Button,
@@ -5,7 +7,7 @@ import {
   Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle,
   formatBytes, formatCompactNumber, formatDuration, formatLogDateTime, formatPercentFixed,
   formatUsdCost, LoaderCircle,
-  motion, normalizeAgentFilterValue, ReactNode, RefreshCw, RequestLogEntry,
+  normalizeAgentFilterValue, ReactNode, RefreshCw, RequestLogEntry,
   Select, Tabs, TabsList, TabsTrigger, translateOptions, UsageStatsRange,
   useAppText, useEffect, useMemo, useState, X
 } from "../shared/index";
@@ -35,35 +37,26 @@ export function AgentAnalysisView({
   snapshot: AgentAnalysisSnapshot;
 }) {
   const t = useAppText();
+  const sessionTokens = snapshot.sessions.reduce((total, session) => total + session.totalTokens, 0);
+  const sessionCost = snapshot.sessions.reduce((total, session) => total + session.costUsd, 0);
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="flex h-full min-h-0 min-w-0 flex-col gap-4 pr-1"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-2">
-        <div className="min-w-0">
-          <div className="text-[13px] font-semibold">{t("Sessions")}</div>
-          <div className="mt-0.5 text-[11px] text-muted-foreground">
-            {formatCompactNumber(snapshot.sessions.length)} {t("Sessions")} / {formatCompactNumber(snapshot.scannedRequestCount)} {t("Requests")}
-          </div>
-        </div>
-        <div className="min-w-0 flex-1" />
+    <div className={tablePageClassName}>
+      <PageHeader title={t("Observability")}>
         <Select
           aria-label={t("Filter agent")}
-          className="h-8 w-[160px] bg-[length:14px] px-2 pr-7 text-[12px]"
+          className="h-8 w-[160px] rounded-md bg-[length:14px] px-2.5 pr-7 text-[12px] shadow-none"
           onValueChange={(value) => setAgentFilter(normalizeAgentFilterValue(value))}
           options={translateOptions(agentFilterOptions, t)}
           value={agentFilter}
         />
-        <div className="flex rounded-md border border-border bg-background p-0.5">
+        <div className="flex flex-wrap items-center gap-3">
           {agentAnalysisRangeOptions.map((option) => (
             <Button
+              aria-pressed={range === option.value}
               className={cn(
-                "h-7 rounded px-2.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground",
-                range === option.value && "bg-card text-foreground shadow-sm"
+                "px-1 py-1 text-[11px] transition-colors",
+                range === option.value ? "font-semibold text-foreground" : "font-normal text-muted-foreground/70 hover:text-muted-foreground"
               )}
               key={option.value}
               onClick={() => setRange(option.value)}
@@ -74,11 +67,16 @@ export function AgentAnalysisView({
             </Button>
           ))}
         </div>
-        <Button aria-label={t("Refresh observability")} className="h-8 gap-1.5 px-2.5 text-[12px]" onClick={refreshAnalysis} title={t("Refresh observability")} type="button" variant="outline">
+        <Button aria-label={t("Refresh observability")} size="iconSm" onClick={refreshAnalysis} title={t("Refresh observability")} type="button" variant="ghost">
           <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
-          {t("Refresh")}
         </Button>
-      </div>
+      </PageHeader>
+      <SummaryStrip items={[
+        { label: t("Sessions"), value: formatCompactNumber(snapshot.sessions.length), fullValue: String(snapshot.sessions.length) },
+        { label: t("Scanned requests"), value: formatCompactNumber(snapshot.scannedRequestCount), fullValue: String(snapshot.scannedRequestCount) },
+        { label: t("Session tokens"), value: formatCompactNumber(sessionTokens), fullValue: String(sessionTokens) },
+        { label: t("Session cost"), value: formatUsdCost(sessionCost), fullValue: `$${sessionCost}` }
+      ]} />
 
       {error ? (
         <div className="flex shrink-0 items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
@@ -102,14 +100,15 @@ export function AgentAnalysisView({
         />
       ) : null}
 
-      <section className="min-h-0 flex-1">
+      <section className="mt-6 flex min-h-0 min-w-0 flex-1 flex-col">
+        <SectionHeading icon={Activity} title={t("Sessions")} summary={snapshot.sessions.length.toLocaleString()} />
         <AgentSessionsCard
           onSelectSession={setSelectedSession}
           selectedSession={selectedSession}
           sessions={snapshot.sessions}
         />
       </section>
-    </motion.div>
+    </div>
   );
 }
 
@@ -234,7 +233,7 @@ function AgentSessionRequestsPanel({ detail }: { detail: AgentSessionDetail }) {
               {requests.map((request) => (
                 <tr className={agentListRowClassName()} key={request.id}>
                   <td className="px-3 py-2 font-mono">{formatLogDateTime(request.createdAt)}</td>
-                  <td className="px-3 py-2 font-semibold">{request.statusCode || "-"}</td>
+                  <td className="px-3 py-2 font-semibold">{request.statusCode || "—"}</td>
                   <td className="max-w-[140px] px-3 py-2" title={formatRouteReason(request.routeReason)}>{formatRouteReason(request.routeReason)}</td>
                   <td className="max-w-[300px] px-3 py-2" title={`${request.provider}/${request.model}`}>{request.provider}/{request.model}</td>
                   <td className="px-3 py-2 text-right" title={request.tools.join(", ")}>{formatCompactNumber(request.toolCallCount)}</td>
@@ -391,7 +390,7 @@ function AgentSessionTrajectoryPanel({ detail }: { detail: AgentSessionDetail })
   };
 
   return (
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-md border border-border/70 bg-card/70 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border-y border-border/70">
       <div className="flex min-w-0 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border/60 px-3 py-2.5">
         <div className="min-w-0 flex-1">
           <div className="text-[12px] font-semibold">{t("Session Trajectory")}</div>
@@ -452,9 +451,9 @@ function AgentSessionTrajectoryPanel({ detail }: { detail: AgentSessionDetail })
   );
 }
 
-export const agentListSurfaceClassName = "rounded-md border border-border/70 bg-card/70 shadow-[0_1px_2px_rgba(15,23,42,0.04)]";
+export const agentListSurfaceClassName = "border-y border-border/70";
 const agentListFrameClassName = cn("overflow-auto", agentListSurfaceClassName);
-export const agentListTableClassName = "w-full border-collapse text-left text-[11px]";
+export const agentListTableClassName = "w-full border-collapse text-left text-[11px] tabular-nums";
 const agentListHeadClassName = "sticky top-0 z-10 border-b border-border/70 bg-muted/80 text-muted-foreground backdrop-blur [&_th]:min-w-[64px] [&_th]:whitespace-nowrap";
 export const agentListBodyClassName = "divide-y divide-border/50";
 
@@ -468,10 +467,10 @@ export function agentListRowClassName({
   warning?: boolean;
 } = {}) {
   return cn(
-    "bg-card/40 transition-colors hover:bg-muted/30",
+    "transition-colors hover:bg-muted/45",
     danger && "bg-rose-500/5 hover:bg-rose-500/10",
     warning && "bg-amber-500/5 hover:bg-amber-500/10",
-    selected && "bg-teal-500/10 shadow-[inset_2px_0_0_rgba(20,184,166,0.7)] hover:bg-teal-500/15"
+    selected && "bg-emerald-500/10 shadow-[inset_2px_0_0_#10b981] hover:bg-emerald-500/15"
   );
 }
 
@@ -1170,7 +1169,7 @@ function AgentTrajectoryNodePreview({ node }: { node: AgentTrajectoryNode }) {
         <div className="truncate font-mono" title={node.requestId}>{node.requestId ? compactId(node.requestId) : "-"}</div>
         <div className="text-muted-foreground">{t("Model")}</div>
         <div className="truncate" title={node.provider && node.model ? `${node.provider}/${node.model}` : node.model}>
-          {node.provider && node.model ? `${node.provider}/${node.model}` : node.model || "-"}
+          {node.provider && node.model ? `${node.provider}/${node.model}` : node.model || "—"}
         </div>
         <div className="text-muted-foreground">{t("Tokens")}</div>
         <div>{node.totalTokens > 0 ? `${formatCompactNumber(node.totalTokens)} tok` : "-"}</div>
@@ -1489,7 +1488,7 @@ function traceRunTarget(run: AgentAnalysisTraceRun): string {
   if (run.routeReason) {
     return run.routeReason;
   }
-  return run.path || "-";
+  return run.path || "—";
 }
 
 function traceRunKindLabel(kind: AgentAnalysisTraceRun["kind"]): string {
@@ -1713,15 +1712,15 @@ function AgentSessionsCard({
                     <td className="max-w-[150px] px-3 py-2" title={session.client}>{session.client}</td>
                     <td className="px-3 py-2 font-mono">{formatLogDateTime(session.startedAt)}</td>
                     <td className="px-3 py-2 font-mono">{formatLogDateTime(session.lastSeenAt)}</td>
-                    <td className="px-3 py-2 text-right">{formatDuration(session.durationMs)}</td>
-                    <td className="px-3 py-2 text-right">{formatCompactNumber(session.requestCount)}</td>
-                    <td className="px-3 py-2 text-right">{formatCompactNumber(session.toolCallCount)}</td>
-                    <td className="px-3 py-2 text-right">{formatCompactNumber(session.subagentCallCount)}</td>
-                    <td className="px-3 py-2 text-right">{formatCompactNumber(session.errorCount)}</td>
-                    <td className="px-3 py-2 text-right">{formatPercentFixed(session.cacheRatio)}</td>
-                    <td className="px-3 py-2 text-right font-semibold">{formatUsdCost(session.costUsd)}</td>
-                    <td className="max-w-[240px] px-3 py-2" title={session.models.join(", ")}>{session.models.join(", ") || "-"}</td>
-                    <td className="max-w-[220px] px-3 py-2" title={session.providers.join(", ")}>{session.providers.join(", ") || "-"}</td>
+                    <td className="px-3 py-2 text-right" title={`${session.durationMs} ms`}>{formatDuration(session.durationMs)}</td>
+                    <td className="px-3 py-2 text-right" title={String(session.requestCount)}>{formatCompactNumber(session.requestCount)}</td>
+                    <td className="px-3 py-2 text-right" title={String(session.toolCallCount)}>{formatCompactNumber(session.toolCallCount)}</td>
+                    <td className="px-3 py-2 text-right" title={String(session.subagentCallCount)}>{formatCompactNumber(session.subagentCallCount)}</td>
+                    <td className="px-3 py-2 text-right" title={String(session.errorCount)}>{formatCompactNumber(session.errorCount)}</td>
+                    <td className="px-3 py-2 text-right" title={`${session.cacheRatio * 100}%`}>{formatPercentFixed(session.cacheRatio)}</td>
+                    <td className="px-3 py-2 text-right font-semibold" title={`$${session.costUsd}`}>{formatUsdCost(session.costUsd)}</td>
+                    <td className="max-w-[240px] px-3 py-2" title={session.models.join(", ")}>{session.models.join(", ") || "—"}</td>
+                    <td className="max-w-[220px] px-3 py-2" title={session.providers.join(", ")}>{session.providers.join(", ") || "—"}</td>
                     <td className="max-w-[220px] px-3 py-2 font-mono" title={session.userAgent}>{compactUserAgent(session.userAgent)}</td>
                     <td className="px-3 py-2 text-right">
                       <Button className="h-7 border-border bg-transparent px-2 text-[11px] shadow-none hover:bg-transparent active:bg-transparent" onClick={() => onSelectSession({ agent: session.agent, id: session.id })} type="button" variant="outline">
@@ -1741,7 +1740,7 @@ function AgentSessionsCard({
 
 function AnalysisEmptyState({ label }: { label: string }) {
   return (
-    <div className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-[12px] text-muted-foreground">
+    <div className="border-y border-border/70 px-3 py-12 text-center text-[12px] text-muted-foreground">
       {label}
     </div>
   );

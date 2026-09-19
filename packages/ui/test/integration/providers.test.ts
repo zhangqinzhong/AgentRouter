@@ -706,7 +706,7 @@ test("AddProviderForm stacks connection statuses with protocol detection guidanc
   assert.doesNotMatch(html, /Protocol detection checks compatibility; connection verification confirms a real model request succeeds\./);
 });
 
-test("AddProviderForm renders a two-column model picker", () => {
+test("AddProviderForm renders a single checkable model list", () => {
   const draft = {
     ...createProviderDraft([]),
     modelDisplayNames: {
@@ -738,17 +738,20 @@ test("AddProviderForm renders a two-column model picker", () => {
 
   assert.match(html, /Pick models/);
   assert.match(html, /Provider models/);
-  assert.match(html, /Added models/);
   assert.match(html, /Search provider models/);
-  assert.match(html, /Search added models/);
   assert.match(html, /Custom model/);
   assert.match(html, /Model A/);
   assert.match(html, /model-b/);
   assert.match(html, /custom-model/);
+  assert.match(html, /Select all/);
   assert.match(html, /overflow-y-auto/);
   assert.doesNotMatch(html, /overscroll-contain/);
-  assert.doesNotMatch(html, /placeholder="Custom model"/);
   assert.doesNotMatch(html, /Select models/);
+  // Every row is a checkbox toggle; selected models carry a check affordance.
+  assert.equal(html.match(/aria-pressed="true"/g)?.length, 2);
+  assert.equal(html.match(/aria-pressed="false"/g)?.length, 1);
+  assert.match(html, /border-emerald-600 bg-emerald-600/);
+  assert.doesNotMatch(html, /Added models/);
 });
 
 test("AddProviderForm renders provider model refresh control when available", () => {
@@ -842,10 +845,9 @@ test("AddProviderForm keeps edit model lists scrollable without blocking dialog 
 
   assert.match(html, /Pick models/);
   assert.match(html, /Provider models/);
-  assert.match(html, /Added models/);
-  assert.match(html, /overflow-y-auto/);
-  assert.match(html, /lg:h-\[min\(500px,calc\(100dvh-300px\)\)\]/);
+  assert.match(html, /max-h-\[300px\] min-w-0 overflow-y-auto/);
   assert.doesNotMatch(html, /overscroll-contain/);
+  assert.doesNotMatch(html, /Added models/);
 });
 
 test("AddProviderForm shows skeleton rows while provider models load", () => {
@@ -872,10 +874,8 @@ test("AddProviderForm shows skeleton rows while provider models load", () => {
   assert.match(html, /Loading provider models/);
   assert.match(html, /provider-skeleton-shimmer/);
   assert.doesNotMatch(html, /No provider models/);
-  // The added-models panel holds local draft state, so it keeps rendering its real contents and
-  // controls while the provider catalog probe is still running.
+  // The custom-model input holds local draft state, so it stays usable while the probe runs.
   assert.match(html, /Custom model/);
-  assert.match(html, /No models added/);
 });
 
 test("AddProviderForm explains an empty provider catalog once the probe settles", () => {

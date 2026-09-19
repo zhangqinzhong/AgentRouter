@@ -1,6 +1,7 @@
+import { AppSettingsPage } from "./settings";
 import {RoutingActivationBrand} from "@/vendor/cc-switch/RoutingActivationBrand";
 import {initializeWindowActivity} from "@/vendor/cc-switch/windowActivity";
-import {useEffect} from "react";
+import {useEffect, useRef} from "react";
 import {LocalHeatmapView} from "./local-heatmap";
 import {LocalSessionsView} from "./local-sessions";
 import {LocalTrendView} from "./local-trend";
@@ -72,6 +73,7 @@ type MainViewProps = {
   profile: ComponentProps<typeof ProfileView>;
   providers: ComponentProps<typeof ProvidersView>;
   routing: ComponentProps<typeof RoutingView>;
+  settings: ComponentProps<typeof AppSettingsPage>;
   virtualModels: ComponentProps<typeof VirtualModelsView>;
 };
 
@@ -148,6 +150,10 @@ export function MainLayout({
   visibleNavigation: MainNavigationItem[];
 }) {
   useEffect(()=>initializeWindowActivity(),[]);
+  const contentRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    contentRef.current?.scrollTo({ top: 0, left: 0 });
+  }, [activeView]);
   const showUpdateButton = updateStatus.supported;
   const windowControlSafeAreaWidth = showUpdateButton
     ? (isMac ? 188 : 124)
@@ -251,7 +257,8 @@ export function MainLayout({
 
             <div className="grid shrink-0 gap-1 border-t border-border/60 p-2 max-[720px]:border-t max-[720px]:pt-2">
               <Button
-                className="flex h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-[13px] font-medium text-muted-foreground transition-all duration-150 hover:bg-muted/80 hover:text-foreground"
+                aria-current={activeView === "settings" ? "page" : undefined}
+                className={cn("flex h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-[13px] font-medium transition-colors", activeView === "settings" ? "bg-card text-foreground" : "text-muted-foreground hover:bg-muted/80 hover:text-foreground")}
                 onClick={onOpenSettings}
                 title={copy.settings.title}
                 type="button"
@@ -277,7 +284,7 @@ export function MainLayout({
           message={gatewayStartupError}
           onOpenServerSettings={onOpenServerSettings}
         />
-        <div data-view={activeView}
+        <div data-view={activeView} ref={contentRef}
           className={cn(
             "app-page-content min-h-0 flex-1 px-5 pb-5 pt-5 max-[720px]:px-3 max-[720px]:pb-3 max-[720px]:pt-3",
             viewUsesInternalScroll(activeView) ? "overflow-hidden" : "overflow-auto"
@@ -316,6 +323,7 @@ function SidebarNavigationButton({
           ? "bg-card text-foreground shadow-[0_1px_3px_rgba(0,0,0,0.06)]"
           : "hover:bg-muted/80 hover:text-foreground"
       )}
+      aria-current={active ? "page" : undefined}
       onClick={onClick}
       type="button"
       unstyled
@@ -444,6 +452,7 @@ function MainViewSwitch({
   return (
     <AnimatePresence initial={false} mode="wait">
       <ViewMotionShell key={activeView} view={activeView}>
+        {activeView === "settings" || activeView === "server" ? <AppSettingsPage {...viewProps.settings} initialPage={activeView === "server" ? "general" : viewProps.settings.initialPage} /> : null}
         {activeView === "usage" ? <LocalUsageView /> : null}
         {activeView === "sessions" ? <LocalSessionsView /> : null}
         {activeView === "trend" ? <LocalTrendView /> : null}

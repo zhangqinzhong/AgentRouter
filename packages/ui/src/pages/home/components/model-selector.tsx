@@ -10,7 +10,6 @@ import {
   cn,
   GatewayProviderConfig,
   Input,
-  Label,
   normalizeProviderModelSelector,
   parseProfileModelValue,
   PopoverContent,
@@ -373,8 +372,8 @@ export function ModelMultiSelector({
   }
 
   return (
-    <div className="rounded-md border border-input bg-card">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border p-2">
+    <div className="min-w-0">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
         <div className="relative min-w-[180px] flex-1">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -386,38 +385,69 @@ export function ModelMultiSelector({
           />
         </div>
         <Button disabled={models.length === 0} onClick={selectVisibleModels} size="sm" type="button" variant="outline">
-          {t("All")}
+          {t("Select all")}
         </Button>
         <Button disabled={!canClearSelection} onClick={clearOptionalModels} size="sm" type="button" variant="outline">
           {t("Clear")}
         </Button>
       </div>
-      <div className="max-h-[220px] overflow-auto p-2">
-        {models.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-6 text-center text-[12px] text-muted-foreground">
-            {t(providerOptions.length === 0 ? "No models configured" : "No matching models")}
-          </div>
-        ) : null}
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-          {models.map((model) => {
-            const key = modelSelectionKey(model.value);
-            const checked = selected.has(key);
-            const locked = checked && required.has(key);
-            return (
-              <Label
-                className={cn(
-                  "flex h-9 min-w-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2 text-left text-[12px] transition-colors hover:bg-muted",
-                  checked && "border-primary bg-accent",
-                  locked && "cursor-not-allowed opacity-75 hover:bg-accent"
-                )}
-                key={model.value}
-                title={`${model.provider}/${model.displayName}`}
+      <div className="border-y border-border/70">
+        <div className="flex min-h-9 items-center justify-between gap-3 border-b border-border/60 px-2.5 py-1.5">
+          <span className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
+            {t("Allowed model list")}
+          </span>
+          <span className="flex items-center gap-2.5 text-[11px] text-muted-foreground">
+            <span className="tabular-nums">{selected.size.toLocaleString()} / {models.length.toLocaleString()}</span>
+            {models.length > 0 ? (
+              <button
+                className="font-medium text-muted-foreground transition-colors hover:text-foreground"
+                onClick={selectVisibleModels}
+                type="button"
               >
-                <Checkbox checked={checked} disabled={locked} onCheckedChange={() => toggleModel(model.value)} />
-                <span className="min-w-0 flex-1 truncate">{model.provider} / {model.displayName}</span>
-              </Label>
-            );
-          })}
+                {t("Select all")}
+              </button>
+            ) : null}
+          </span>
+        </div>
+        <div className="max-h-[300px] min-w-0 overflow-y-auto">
+          {models.length === 0 ? (
+            <div className="px-3 py-6 text-center text-[12px] text-muted-foreground">
+              {t(providerOptions.length === 0 ? "No models configured" : "No matching models")}
+            </div>
+          ) : null}
+          <div>
+            {models.map((model) => {
+              const key = modelSelectionKey(model.value);
+              const checked = selected.has(key);
+              const locked = checked && required.has(key);
+              const modelId = model.value.split("/").slice(1).join("/");
+              return (
+                <button
+                  aria-pressed={checked}
+                  className={cn(
+                    "flex min-h-10 w-full min-w-0 items-center gap-3 border-b border-border/40 px-3 py-1.5 text-left outline-none transition-colors last:border-b-0 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30",
+                    checked ? "bg-emerald-500/[0.045]" : "hover:bg-muted/40",
+                    locked && "cursor-not-allowed opacity-75"
+                  )}
+                  disabled={locked}
+                  key={model.value}
+                  onClick={() => toggleModel(model.value)}
+                  title={`${model.provider}/${model.displayName}`}
+                  type="button"
+                >
+                  <Checkbox aria-hidden="true" checked={checked} className="pointer-events-none" disabled={locked} tabIndex={-1} />
+                  <span className="min-w-0 flex-1">
+                    <span className={cn("block truncate text-[12px]", checked ? "font-medium text-foreground" : "text-foreground/90")}>
+                      {model.provider} / {model.displayName}
+                    </span>
+                    {model.displayName !== modelId ? (
+                      <span className="block truncate font-mono text-[10px] text-muted-foreground">{model.value}</span>
+                    ) : null}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
     </div>

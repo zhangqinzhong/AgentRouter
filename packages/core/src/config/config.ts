@@ -1,7 +1,8 @@
-import { CONFIGDIR } from "@agentrouter/core/config/constants";
+import { CONFIGDIR, LEGACY_CONFIGDIR, PROVIDER_ICON_CACHE_DIR } from "@agentrouter/core/config/constants";
 import { validateProfileAliasFiles } from "@agentrouter/core/profiles/aliases";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import {
   archiveLegacyJsonConfigFiles,
@@ -1256,6 +1257,31 @@ function parseEnumValue<T extends string>(value: unknown, allowed: readonly T[],
   return typeof value === "string" && (allowed as readonly string[]).includes(value) ? value as T : fallback;
 }
 
+// Detected provider icons used to live under the legacy config dir; the files
+// moved to the current data dir but stored file:// paths kept pointing at the
+// old location, so every configured icon silently fell back to a letter.
+function normalizeProviderIconPath(icon: string | undefined): string | undefined {
+  const value = icon?.trim();
+  if (!value || !value.startsWith("file://")) {
+    return value || undefined;
+  }
+  let filePath: string;
+  try {
+    filePath = decodeURIComponent(fileURLToPath(value));
+  } catch {
+    return value;
+  }
+  const legacyDir = path.join(LEGACY_CONFIGDIR, "app-data", "provider-icons");
+  if (!filePath.startsWith(`${legacyDir}${path.sep}`)) {
+    return value;
+  }
+  const migrated = path.join(
+    PROVIDER_ICON_CACHE_DIR,
+    filePath.slice(legacyDir.length + path.sep.length)
+  );
+  return existsSync(migrated) ? pathToFileURL(migrated).toString() : value;
+}
+
 function parseProviders(value: unknown): GatewayProviderConfig[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
@@ -1292,7 +1318,7 @@ function parseProviders(value: unknown): GatewayProviderConfig[] | undefined {
         credentials: parseProviderCredentials(item.credentials ?? item.keys ?? item.apiKeys),
         extraBody: item.extraBody,
         extraHeaders: item.extraHeaders ?? item.extra_headers ?? item.headers,
-        icon: readString(item.icon),
+        icon: normalizeProviderIconPath(readString(item.icon)),
         id: readString(item.id),
         enabled: item.enabled === false ? false : undefined,
         autoFetchModels: readBoolean(item.autoFetchModels ?? item.auto_fetch_models ?? item.autoRefreshModels ?? item.auto_refresh_models),

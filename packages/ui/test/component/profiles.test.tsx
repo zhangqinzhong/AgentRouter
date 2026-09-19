@@ -220,6 +220,10 @@ test("AddProfileForm renders unrestricted allowed models as selected without a d
   assert.ok(betaIndex > alphaIndex);
   assert.match(alphaLabel, /aria-checked="true"/);
   assert.match(betaLabel, /aria-checked="true"/);
+  assert.match(html, /aria-pressed="true"[^>]*title="Provider\/alpha"/);
+  assert.match(html, /aria-pressed="true"[^>]*title="Provider\/beta"/);
+  assert.doesNotMatch(html, /grid-cols-1 gap-2 sm:grid-cols-2/);
+  assert.match(html, /border-y border-border\/70/);
   assert.match(clearButton, /disabled=""/);
 });
 
@@ -254,8 +258,10 @@ test("AddProfileForm keeps the default model locked in allowed model lists", () 
   assert.ok(defaultIndex >= 0);
   assert.ok(otherIndex > defaultIndex);
   assert.match(defaultLabel, /aria-checked="true"/);
+  assert.match(html, /aria-pressed="true"[^>]*title="Provider\/alpha"/);
   assert.match(defaultLabel, /disabled=""/);
   assert.match(otherLabel, /aria-checked="false"/);
+  assert.match(html, /aria-pressed="false"[^>]*title="Provider\/beta"/);
   assert.doesNotMatch(otherLabel, /disabled=""/);
 });
 
@@ -344,8 +350,11 @@ test("AddProfileForm labels Kimi CLI model fields with Kimi-specific copy", () =
 test("AddProfileForm shows Kimi allowed models as selected by default", () => {
   const config = appConfigFixture();
   config.Providers = [{
+    api_base_url: "https://kimi.example/v1",
+    enabled: true,
     models: ["k2", "k3"],
-    name: "Kimi"
+    name: "Kimi",
+    type: "openai_chat_completions"
   }];
   const draft = { ...createProfileDraft("kimi"), model: "Kimi/k2" };
   const html = renderToStaticMarkup(
@@ -418,7 +427,7 @@ test("AddProfileForm treats Claude Design as a AR-only App profile", () => {
   assert.doesNotMatch(html, /Configure at least one enabled provider model/);
 });
 
-test("ProfileView renders agent profiles as compact cards with inline actions", () => {
+test("ProfileView renders flat profile rows with inline actions", () => {
   const config = appConfigFixture();
   config.profile.profiles = [
     {
@@ -453,13 +462,14 @@ test("ProfileView renders agent profiles as compact cards with inline actions", 
   );
 
   assert.equal(html.match(/aria-label="(?:Claude Code Main|ZCode Main) Profile actions"/g)?.length, 2);
-  assert.match(html, /grid-template-columns:repeat\(auto-fit,minmax\(min\(100%,420px\),1fr\)\)/);
-  assert.match(html, /min-h-\[220px\]/);
+  assert.match(html, /local-usage-page mx-auto w-full max-w-\[1120px\]/);
+  assert.match(html, /divide-y divide-border\/60/);
+  assert.doesNotMatch(html, /grid-template-columns:repeat| min-h-\[220px\]/);
   assert.match(html, /class="flex min-w-0 items-center gap-2"/);
-  assert.match(html, /Configuration/);
-  assert.match(html, /class="mt-3 min-w-0 flex-1 space-y-1\.5 border-t border-border\/60 pt-2"><div class="flex min-w-0 flex-wrap items-center gap-1\.5"/);
-  assert.doesNotMatch(html, /class="mt-1 flex min-w-0 flex-wrap items-center gap-1\.5"/);
-  assert.match(html, /aria-label="Claude Code Main Profile actions" class="[^"]*border-t border-border\/60/);
+  assert.match(html, /Model/);
+  assert.match(html, /class="mt-1\.5 flex min-w-0 flex-wrap items-baseline gap-x-1\.5 gap-y-1 text-\[11px\] leading-5 sm:col-span-2"/);
+  assert.doesNotMatch(html, /class="mt-3 grid min-w-0 gap-x-8 gap-y-2 sm:grid-cols-2"/);
+  assert.match(html, /aria-label="Claude Code Main Profile actions" class="[^"]*items-center justify-between/);
   assert.doesNotMatch(html, />Disabled<\/span>/);
   assert.doesNotMatch(html, /aria-label="Claude Code Main Launch actions"/);
   assert.doesNotMatch(html, /aria-label="Claude Code Main Management actions"/);
@@ -473,6 +483,13 @@ test("ProfileView renders agent profiles as compact cards with inline actions", 
 
 test("profileSummaryItems uses Kimi-specific model labels", () => {
   const config = appConfigFixture();
+  config.Providers = [{
+    api_base_url: "https://kimi.example/v1",
+    enabled: true,
+    models: ["k2", "k3"],
+    name: "Kimi",
+    type: "openai_chat_completions"
+  }];
   const items = profileSummaryItems({
     agent: "kimi",
     availableModels: ["kimi/k2", "kimi/k3"],

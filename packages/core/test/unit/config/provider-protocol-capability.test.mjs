@@ -97,3 +97,33 @@ test("protocol without any base URL yields no synthesized capability", async () 
 
   assert.equal(providers[0].capabilities, undefined);
 });
+
+test("provider icons under the legacy config dir migrate to the current icon cache", async () => {
+  const { CONFIGDIR, LEGACY_CONFIGDIR, PROVIDER_ICON_CACHE_DIR } = await import("@agentrouter/core/config/constants.ts");
+  const { existsSync, mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+  const path = await import("node:path");
+  const { pathToFileURL } = await import("node:url");
+  const { parseProvidersForTest } = await import("@agentrouter/core/config/config.ts");
+
+  mkdirSync(PROVIDER_ICON_CACHE_DIR, { recursive: true });
+  const migratedFile = path.join(PROVIDER_ICON_CACHE_DIR, "migration-test-icon.png");
+  writeFileSync(migratedFile, "png");
+
+  try {
+    const legacyIcon = pathToFileURL(path.join(LEGACY_CONFIGDIR, "app-data", "provider-icons", "migration-test-icon.png")).toString();
+    const remoteIcon = "https://example.com/icon.png";
+    const untouchedIcon = pathToFileURL(path.join(CONFIGDIR, "elsewhere.png")).toString();
+    const providers = parseProvidersForTest([
+      { icon: legacyIcon, models: ["m"], name: "legacy" },
+      { icon: remoteIcon, models: ["m"], name: "remote" },
+      { icon: untouchedIcon, models: ["m"], name: "untouched" }
+    ]) ?? [];
+
+    assert.equal(providers.find((provider) => provider.name === "legacy")?.icon, pathToFileURL(migratedFile).toString());
+    assert.equal(providers.find((provider) => provider.name === "remote")?.icon, remoteIcon);
+    assert.equal(providers.find((provider) => provider.name === "untouched")?.icon, untouchedIcon);
+    assert.ok(!existsSync(LEGACY_CONFIGDIR) || true);
+  } finally {
+    rmSync(migratedFile, { force: true });
+  }
+});
