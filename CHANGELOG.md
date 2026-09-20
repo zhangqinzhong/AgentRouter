@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.6.1 - 2026-09-20
+
+- Added Cursor, MiMo and ZCode quick filters to the Sessions page.
+
 ## 1.6.0 - 2026-09-20
 
 - Added direct local usage collection for Cursor and expanded TokenTracker-compatible sources, including MiMo and ZCode, with model, client and session attribution.
