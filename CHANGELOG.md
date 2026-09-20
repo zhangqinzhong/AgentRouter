@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.6.0 - 2026-09-20
+
+- Added direct local usage collection for Cursor and expanded TokenTracker-compatible sources, including MiMo and ZCode, with model, client and session attribution.
+- Added Cursor branding to the usage overview and fixed native tray provider icons that were missing when Swift Package asset-catalog resources were loaded from the wrong bundle.
+- Improved local usage aggregation and overview coverage for provider models, client analysis and session statistics.
+
 ## 1.5.0 - 2026-09-19
 
 - Refreshed the management UI across providers, agent profiles, settings, routing, logs and observability with a consistent overview layout.
