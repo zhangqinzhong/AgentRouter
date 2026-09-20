@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.6.2 - 2026-09-20
+
+- Fixed overview model, client and provider analysis to ignore empty rows and keep aggregate totals aligned with the displayed breakdown.
+- Fixed the Chinese overview empty state so model usage no longer falls back to English.
+
 ## 1.6.1 - 2026-09-20
 
 - Added Cursor, MiMo and ZCode quick filters to the Sessions page.
