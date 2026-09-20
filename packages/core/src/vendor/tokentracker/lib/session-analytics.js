@@ -28,10 +28,17 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
-const { listClaudeProjectFiles, listRolloutFilesDeep, claudeMessageDedupKey } = require("./rollout");
+const {
+  claudeMessageDedupKey,
+  listClaudeProjectFiles,
+  listRolloutFilesDeep,
+  readMimoDbMessages,
+  readZcodeDbMessages,
+} = require("./rollout");
 const { parseCodexRolloutFile } = require("./codex-rollout-parser");
 const { computeRowCost, getModelPricing } = require("./pricing");
 const { USD_TICKS_PER_USD, normalizeGrokUsage } = require("./grok-usage");
+const { resolveZcodeNativeDbPath } = require("./install-resolver");
 const wsl = require("./wsl-probe");
 
 // Bump the sidecar when derived metrics change so cached rows are rebuilt
@@ -1281,6 +1288,154 @@ function sessionFileStatKey(filePath) {
   }
 }
 
+function nativeSessionDatabases(home, env = process.env) {
+  const data = env.XDG_DATA_HOME || path.join(home, ".local", "share");
+  const mimoRoot = env.MIMO_HOME || path.join(data, "mimocode");
+  const zcodePath = resolveZcodeNativeDbPath({
+    home,
+    env: {
+      ...env,
+      ZCODE_HOME: env.ZCODE_HOME || path.join(home, ".zcode"),
+    },
+  });
+  return [
+    { dbPath: path.join(mimoRoot, "mimocode.db"), source: "mimo", read: readMimoDbMessages },
+    { dbPath: zcodePath, source: "zcode", read: readZcodeDbMessages },
+  ].filter((entry) => entry.dbPath && fs.existsSync(entry.dbPath));
+}
+
+function nativeSessionModel(data) {
+  const direct = data?.modelID || data?.modelId;
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  if (typeof data?.model === "string" && data.model.trim()) return data.model.trim();
+  if (data?.model && typeof data.model.id === "string" && data.model.id.trim()) return data.model.id.trim();
+  return "unknown";
+}
+
+function nativeSessionTimestamp(data, fallback) {
+  const value = data?.time?.completed || data?.time?.created || fallback;
+  const number = Number(value);
+  if (Number.isFinite(number) && number > 0) {
+    return new Date(number < 1e12 ? number * 1000 : number).toISOString();
+  }
+  return safeTimestamp(value);
+}
+
+function scanNativeDatabaseSessions(source, dbPath, readMessages) {
+  const messages = (typeof readMessages === "function" ? readMessages(dbPath) : [])
+    .filter((entry) => entry?.data && (entry.sessionID || entry.data.sessionID))
+    .slice()
+    .sort((left, right) => {
+      const leftTime = Number(left?.timeUpdated || left?.data?.time?.created || 0);
+      const rightTime = Number(right?.timeUpdated || right?.data?.time?.created || 0);
+      return leftTime - rightTime;
+    });
+  const bySession = new Map();
+
+  for (const entry of messages) {
+    const data = entry.data;
+    const sessionId = String(entry.sessionID || data.sessionID || "").trim();
+    if (!sessionId) continue;
+    const model = nativeSessionModel(data);
+    const rawTokens = data.tokens || {};
+    const totals = tokenTotals({
+      input_tokens: rawTokens.input,
+      cached_input_tokens: rawTokens.cache?.read,
+      cache_creation_input_tokens: rawTokens.cache?.write,
+      output_tokens: rawTokens.output,
+      reasoning_output_tokens: rawTokens.reasoning,
+    });
+    if (totals.total_tokens <= 0) continue;
+    const timestamp = nativeSessionTimestamp(data, entry.timeUpdated);
+    if (!timestamp) continue;
+    const cwd = typeof data.path?.cwd === "string" && data.path.cwd.trim() ? data.path.cwd.trim() : null;
+    let row = bySession.get(sessionId);
+    if (!row) {
+      row = {
+        _last_ts_ms: null,
+        active_ms: 0,
+        agent_nickname: null,
+        agent_role: null,
+        combined_total_tokens: 0,
+        cost_is_partial: false,
+        cost_source: "model_pricing",
+        cost_usd: 0,
+        direct_subagent_count: 0,
+        descendant_subagent_count: 0,
+        edit_turns: 0,
+        ended_at: null,
+        error_count: 0,
+        first_pass: false,
+        model,
+        model_calls: 0,
+        model_usage: [],
+        one_shot: false,
+        orphaned_subagent: false,
+        parent_link_conflict: false,
+        parent_session_hash: null,
+        parent_session_id: null,
+        productive: false,
+        project_key: cwd || source,
+        project_ref: cwd,
+        retry_turns: 0,
+        root_session_hash: sessionHash(source, sessionId),
+        session_hash: sessionHash(source, sessionId),
+        session_id: sessionId,
+        source,
+        started_at: null,
+        subagent_calls: 0,
+        subagent_total_tokens: 0,
+        title: null,
+        tokens: emptyTotals(),
+        tool_calls: 0,
+        tool_failures: 0,
+        total_tokens: 0,
+        turns: 0,
+        usage_events: 0,
+        usage_is_incomplete: false,
+        usage_precision: "observed",
+      };
+      bySession.set(sessionId, row);
+    }
+    addTotals(row.tokens, totals);
+    row.total_tokens += totals.total_tokens;
+    row.combined_total_tokens = row.total_tokens;
+    row.turns += 1;
+    row.usage_events += 1;
+    row.model_calls += 1;
+    if (cwd && (!row.project_ref || row.project_ref === cwd)) {
+      row.project_ref = cwd;
+      row.project_key = cwd;
+    }
+    updateBounds(row, timestamp);
+    const modelRow = row.model_usage.find((item) => item.model === model);
+    if (modelRow) {
+      for (const field of MODEL_USAGE_SUM_FIELDS) {
+        if (field === "usage_events") {
+          modelRow[field] += 1;
+        } else if (Object.prototype.hasOwnProperty.call(totals, field)) {
+          modelRow[field] += finite(totals[field]);
+        }
+      }
+    } else {
+      row.model_usage.push({
+        model,
+        ...Object.fromEntries(MODEL_USAGE_SUM_FIELDS.map((field) => [field, 0])),
+        input_tokens: totals.input_tokens,
+        cached_input_tokens: totals.cached_input_tokens,
+        cache_creation_input_tokens: totals.cache_creation_input_tokens,
+        output_tokens: totals.output_tokens,
+        reasoning_output_tokens: totals.reasoning_output_tokens,
+        total_tokens: totals.total_tokens,
+        usage_events: 1,
+        selected_models: [model],
+      });
+    }
+  }
+
+  return [...bySession.values()].map((row) => finalizeRecord(row));
+}
+
 // Codex records its own per-thread title (thread_name) in
 // ~/.codex/session_index.jsonl (`{ id, thread_name, updated_at }`). We read it
 // once per build and memoize by the index's stat so repeated scans are cheap.
@@ -1378,6 +1533,7 @@ async function buildSessionAnalyticsInternal({ home = os.homedir(), force = fals
     } catch { /* first run */ }
   }
   const discovered = await discoverSessionFiles(home);
+  const native = nativeSessionDatabases(home);
   // Codex thread titles are stored separately from rollout files. Include the
   // index in the overall signature so an index-only rename reaches the
   // per-file dependency check below on the next refresh. Grok titles/metadata
@@ -1389,6 +1545,7 @@ async function buildSessionAnalyticsInternal({ home = os.homedir(), force = fals
     ...discovered.grok,
     ...discovered.grok.map(grokSummaryPathFor),
     ...discovered.grok.map(grokSignalsPathFor),
+    ...native.map((entry) => entry.dbPath),
   ]);
   if (!force && previousMeta?.version === SIDECAR_VERSION && previousMeta.signature === signature) {
     await writeAtomic(metaPath, `${JSON.stringify({ ...previousMeta, checked_at: new Date().toISOString() })}\n`);
@@ -1445,6 +1602,35 @@ async function buildSessionAnalyticsInternal({ home = os.homedir(), force = fals
     // exposing the user's local session path.
     row._cache_key = cacheKey;
     sessions.push(row);
+    nextFiles[cacheKey] = { stat_key: statKey };
+  }
+  for (const entry of native) {
+    const cacheKey = sessionFileCacheKey(`native:${entry.source}`, entry.dbPath);
+    const statKey = `${analyticsEntryStatKey(entry.source, entry.dbPath)}|wal:${sessionFileStatKey(`${entry.dbPath}-wal`) || "missing"}`;
+    if (!statKey || statKey.startsWith("null|")) {
+      skippedFiles += 1;
+      continue;
+    }
+    const rowPrefix = `${cacheKey}:`;
+    let rows;
+    if (!force && previousFiles[cacheKey]?.stat_key === statKey) {
+      rows = previousRows.filter((row) => typeof row?._cache_key === "string" && row._cache_key.startsWith(rowPrefix));
+    } else {
+      try {
+        rows = scanNativeDatabaseSessions(entry.source, entry.dbPath, entry.read);
+      } catch (error) {
+        rows = [];
+        skippedFiles += 1;
+        if (!process.env.NODE_TEST_CONTEXT) {
+          console.warn(`[session-analytics] skipped ${entry.source} native database: ${error?.message || error}`);
+        }
+      }
+    }
+    for (const row of rows || []) {
+      row.ar_profile = null;
+      row._cache_key = `${rowPrefix}${row.session_hash}`;
+      sessions.push(row);
+    }
     nextFiles[cacheKey] = { stat_key: statKey };
   }
   sessions.sort((a, b) => String(b.ended_at || "").localeCompare(String(a.ended_at || "")));

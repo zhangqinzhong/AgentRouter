@@ -464,6 +464,8 @@ test("Codex app-server merges AgentRouter Fast Mode catalog metadata without spo
     env: {
       ...process.env,
       AR_CODEX_CHATGPT_AUTH_FILE: "",
+      AR_CODEX_MODEL_CATALOG_FILE: "",
+      AR_CODEX_MODEL_CATALOG_PATH: "",
       AR_CODEX_MODEL_CATALOG: JSON.stringify({
         models: [
           { display_name: "Native Fast", slug: "native-model", supports_fast_mode: true },
@@ -473,7 +475,9 @@ test("Codex app-server merges AgentRouter Fast Mode catalog metadata without spo
       AR_CODEX_REMOTE_FRONTEND_MODE: "app",
       AR_REAL_CODEX_CLI_PATH: fakeCodex,
       CODEX_HOME: codexHome,
-      CODEXL_CODEX_CHATGPT_AUTH_FILE: ""
+      CODEXL_CODEX_CHATGPT_AUTH_FILE: "",
+      CODEXL_CODEX_MODEL_CATALOG_FILE: "",
+      CODEXL_CODEX_MODEL_CATALOG_PATH: ""
     },
     input: [
       JSON.stringify({ id: 1, method: "model/list", params: {} }),

@@ -175,7 +175,7 @@ struct LimitsSettingsView: View {
             }
         default:
             if let iconName = LimitsSettingsStore.iconNames[id] {
-                Image(iconName)
+                Image(iconName, bundle: .module)
                     .renderingMode(.original)
                     .resizable()
                     .interpolation(.high)

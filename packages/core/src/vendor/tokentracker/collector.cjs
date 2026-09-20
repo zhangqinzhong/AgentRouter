@@ -53,7 +53,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
       await require('./rebuild-codex.cjs').rebuildCodex({dataDir,cursors,files:codexFiles});
       await rollout.parseRolloutIncremental({rolloutFiles:codexFiles,cursors,queuePath,projectQueuePath,source:'codex'});
       await rollout.parseClaudeIncremental({projectFiles:claudeFiles,cursors,queuePath,projectQueuePath,source:'claude'});
-      const additional=await collectAdditionalSources({home,cursors,queuePath,projectQueuePath});
+      const additional=await collectAdditionalSources({home,cursors,queuePath,projectQueuePath,fetchImpl});
       // Complete queue snapshots are appended by upstream parsers. Compact latest
       // snapshots after each successful scan so this store cannot grow per poll.
       for (const file of [queuePath,projectQueuePath]) await compactQueue(file);

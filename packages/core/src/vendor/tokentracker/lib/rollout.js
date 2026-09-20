@@ -21757,6 +21757,8 @@ module.exports = {
   // Exposed for regression tests covering cache-token accounting.
   normalizeGeminiTokens,
   normalizeOpencodeTokens,
+  readMimoDbMessages,
+  readZcodeDbMessages,
   normalizeQoderTokens,
   normalizeQoderNewTokens,
   sameGeminiTotals,

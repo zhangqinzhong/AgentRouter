@@ -7,7 +7,7 @@ import { RequestLogStore } from "@agentrouter/core/observability/request-log-sto
 import { createBetterSqliteDatabase } from "@agentrouter/core/storage/sqlite-native.ts";
 import { GatewayBillingSynchronizer } from "@agentrouter/core/usage/billing-sync.ts";
 import { resolveUsageModelAttribution } from "@agentrouter/core/usage/model-attribution.ts";
-import { UsageStore } from "@agentrouter/core/usage/store.ts";
+import { mergeLocalOverviewSnapshot, UsageStore } from "@agentrouter/core/usage/store.ts";
 
 const fusionUsageConfig = {
   Providers: [
@@ -96,6 +96,116 @@ test("usage attribution preserves slash-containing physical model IDs", () => {
     logicalModel: model,
     model
   });
+});
+
+test("overview merges local MiMo and ZCode usage without inventing gateway requests", () => {
+  const snapshot = {
+    clientModels: [],
+    generatedAt: new Date().toISOString(),
+    models: [{
+      avgDurationMs: 40,
+      caption: "Gateway",
+      cacheRatio: 0,
+      cacheTokens: 0,
+      costUsd: 1,
+      errorCount: 0,
+      inputTokens: 10,
+      key: "gateway::model",
+      label: "gateway-model",
+      maxShare: 0,
+      outputTokens: 5,
+      provider: "Gateway",
+      requestCount: 1,
+      successRate: 1,
+      totalTokens: 15
+    }],
+    providerModels: [],
+    range: "7d",
+    recentRequests: [],
+    series: [{
+      avgDurationMs: 40,
+      bucket: "2026-09-19",
+      cacheRatio: 0,
+      cacheTokens: 0,
+      costUsd: 1,
+      errorCount: 0,
+      inputTokens: 10,
+      label: "09/19",
+      outputTokens: 5,
+      requestCount: 1,
+      successRate: 1,
+      totalTokens: 15
+    }],
+    totals: {
+      avgDurationMs: 40,
+      cacheRatio: 0,
+      cacheTokens: 0,
+      costUsd: 1,
+      errorCount: 0,
+      inputTokens: 10,
+      outputTokens: 5,
+      requestCount: 1,
+      successRate: 1,
+      totalTokens: 15
+    }
+  };
+  const merged = mergeLocalOverviewSnapshot(snapshot, {
+    series: [{
+      day: "2026-09-19",
+      input_tokens: 140,
+      output_tokens: 30,
+      total_tokens: 170
+    }],
+    sources: [{
+      source: "mimo",
+      models: [{
+        model: "mimo-x-pro-preview",
+        totals: {
+          conversation_count: 2,
+          input_tokens: 100,
+          output_tokens: 20,
+          total_tokens: 120,
+          total_cost_usd: "2.5"
+        }
+      }]
+    }, {
+      source: "zcode",
+      models: [{
+        model: "GLM-5.3",
+        totals: {
+          conversation_count: 1,
+          input_tokens: 40,
+          output_tokens: 10,
+          total_tokens: 50,
+          total_cost_usd: "0.5"
+        }
+      }]
+    }],
+    totals: {
+      input_tokens: 140,
+      output_tokens: 30,
+      total_tokens: 170,
+      total_cost_usd: "3"
+    }
+  }, {});
+
+  assert.equal(merged.totals.totalTokens, 185);
+  assert.equal(merged.totals.costUsd, 4);
+  assert.equal(merged.totals.requestCount, 4);
+  assert.equal(merged.totals.errorCount, 0);
+  assert.deepEqual(
+    merged.models.filter((row) => row.provider === "MiMo" || row.provider === "ZCode").map((row) => row.model),
+    ["mimo-x-pro-preview", "GLM-5.3"]
+  );
+  assert.deepEqual(
+    merged.providerModels.filter((row) => row.provider === "MiMo" || row.provider === "ZCode").map((row) => row.label),
+    ["MiMo", "ZCode"]
+  );
+  assert.deepEqual(
+    merged.clientModels.filter((row) => row.provider === "MiMo" || row.provider === "ZCode").map((row) => [row.client, row.requestCount]),
+    [["MiMo", 2], ["ZCode", 1]]
+  );
+  assert.equal(merged.series[0].totalTokens, 185);
 });
 
 test("UsageStore aggregates stats in SQLite without loading all events", async () => {

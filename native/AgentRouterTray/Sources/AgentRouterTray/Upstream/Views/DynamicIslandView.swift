@@ -245,7 +245,7 @@ struct DynamicIslandView: View {
         return HStack(spacing: 4) {
             if let providerKey = metric.providerKey,
                let iconName = LimitsSettingsStore.iconNames[providerKey] {
-                Image(iconName)
+                Image(iconName, bundle: .module)
                     .renderingMode(.original)
                     .resizable()
                     .interpolation(.high)

@@ -4,7 +4,7 @@ import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { formatCodexResetCardExpiry, formatCodexResetCardNumber } from "@agentrouter/ui/pages/home/components/overview-accounts.tsx";
 import { OverviewStatisticsResetDialog, OverviewView } from "@agentrouter/ui/pages/home/components/overview.tsx";
-import { OverviewBreakdowns } from "@agentrouter/ui/pages/home/components/overview-breakdown.tsx";
+import { breakdownBrandIconUrl, OverviewBreakdowns } from "@agentrouter/ui/pages/home/components/overview-breakdown.tsx";
 import { adaptSeriesToTrendRows } from "@agentrouter/ui/pages/home/components/overview-trend.tsx";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { parseStatusBucketDate } from "@agentrouter/ui/pages/home/shared/controls.tsx";
@@ -457,6 +457,11 @@ test("OverviewBreakdowns merges model rows that share a display name", () => {
   const occurrences = html.match(/title="glm-5\.3-flash"/g) ?? [];
   assert.equal(occurrences.length, 1, "duplicate display names must collapse to one row");
   assert.match(html, /912/);
+});
+
+test("overview breakdown resolves the Cursor brand icon for local Cursor rows", () => {
+  assert.match(breakdownBrandIconUrl("Cursor"), /cursor/i);
+  assert.match(breakdownBrandIconUrl("cursor-grok-4.6-medium"), /cursor/i);
 });
 
 test("OverviewBreakdowns hides client rows without client attribution", () => {

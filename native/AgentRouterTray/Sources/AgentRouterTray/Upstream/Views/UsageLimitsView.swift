@@ -780,7 +780,7 @@ struct UsageLimitsView: View {
                     .scaledToFit()
             }
         default:
-            Image(name)
+            Image(name, bundle: .module)
                 .renderingMode(.original)
                 .resizable()
                 .interpolation(.high)

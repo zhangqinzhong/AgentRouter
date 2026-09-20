@@ -13,9 +13,12 @@ import moonshotIconUrl from "@/assets/provider-icons/moonshot.ico";
 import bailianIconUrl from "@/assets/provider-icons/bailian.ico";
 import minimaxIconUrl from "@/assets/provider-icons/minimax.ico";
 import openrouterIconUrl from "@/assets/provider-icons/openrouter.ico";
+import xiaomiMimoIconUrl from "@/assets/provider-icons/xiaomi-mimo.png";
 import grokIconUrl from "@/assets/agent-logos/grok.ico";
 import codexIconUrl from "@/assets/agent-logos/codex.png";
 import claudeCodeIconUrl from "@/assets/agent-logos/claude-code.png";
+import zcodeIconUrl from "@/assets/agent-logos/zcode.png";
+import cursorIconUrl from "@/assets/agent-logos/cursor.svg";
 
 const breakdownRowLimit = 6;
 const breakdownOtherColor = "#8e8e93";
@@ -24,6 +27,9 @@ const breakdownOtherColor = "#8e8e93";
 const breakdownBrandIcons: Array<{ icon: string; match: RegExp }> = [
   { icon: codexIconUrl, match: /codex/i },
   { icon: claudeCodeIconUrl, match: /claude[- ]?code/i },
+  { icon: xiaomiMimoIconUrl, match: /mimo|xiaomi/i },
+  { icon: zcodeIconUrl, match: /zcode/i },
+  { icon: cursorIconUrl, match: /cursor/i },
   { icon: anthropicIconUrl, match: /claude|anthropic/i },
   { icon: openaiIconUrl, match: /\bgpt\b|\bo[134]\b|openai|dall/i },
   { icon: deepseekIconUrl, match: /deepseek/i },
@@ -42,6 +48,12 @@ export function breakdownBrandIconUrl(label: string): string {
 
 function breakdownProviderIconUrl(label: string, providers: GatewayProviderConfig[]): string {
   const wanted = label.trim().toLowerCase();
+  if (wanted === "mimo") {
+    return xiaomiMimoIconUrl;
+  }
+  if (wanted === "zcode") {
+    return zcodeIconUrl;
+  }
   const provider = providers.find((item) => {
     const name = item.name.trim().toLowerCase();
     const id = item.id?.trim().toLowerCase() || "";

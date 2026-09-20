@@ -287,7 +287,7 @@ struct LimitResetProviderIcon: View {
     var body: some View {
         Group {
             if let provider, let assetName = LimitResetProviderIconCatalog.assetName(for: provider) {
-                Image(assetName)
+                Image(assetName, bundle: .module)
                     .renderingMode(.original)
                     .resizable()
                     .interpolation(.high)

@@ -8,6 +8,17 @@ export type LocalUsagePageData = {
   sources: Array<Record<string,unknown>>;
   firstActivityDay?: string;
 };
+export type LocalUsageOverviewPeriod = "day" | "hour";
+export type LocalUsageOverviewData = LocalUsagePageData & {
+  series: Array<Record<string,unknown>>;
+};
+export const LOCAL_OVERVIEW_SOURCE_KEYS = [
+  'acode','every-code','openclaw','lmstudio','cursor','antigravity',
+  'qoder','qoder-cn','claude-science','kiro','kiro-cli','hermes',
+  'kimi','kimi-code','codebuddy','workbuddy','omp','pi','prime-agent',
+  'craft','reasonix','kilocode','roocode','zed','unsloth','anythingllm',
+  'devin','goose','droid','dsh','copilot','mimo','zcode'
+] as const;
 export type LocalUsageTrendQuery = LocalUsageRange & {
   period: LocalUsagePeriod;
   day?: string;
@@ -52,6 +63,15 @@ function shiftMonth(day:string,delta:number){
   const date=new Date(Date.UTC(Number(match[1]),Number(match[2])-1+delta,Number(match[3])));
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth()+1).padStart(2,'0')}-${String(date.getUTCDate()).padStart(2,'0')}`;
 }
+function listDays(from:string,to:string){
+  const start=new Date(`${from}T00:00:00Z`);
+  const end=new Date(`${to}T00:00:00Z`);
+  const days:string[]=[];
+  for(let cursor=start;cursor<=end;cursor.setUTCDate(cursor.getUTCDate()+1)){
+    days.push(cursor.toISOString().slice(0,10));
+  }
+  return days;
+}
 
 export async function getLocalUsagePage(range:LocalUsageRange):Promise<LocalUsagePageData>{
   if(!range || (range.from!==''&&!validDay(range.from)) || !validDay(range.to) || range.from>range.to)throw new Error('Invalid usage date range');
@@ -64,6 +84,26 @@ export async function getLocalUsagePage(range:LocalUsageRange):Promise<LocalUsag
     queryLocalCollector('/functions/tokentracker-usage-daily',query)
   ]) as [{totals:LocalUsagePageData['totals']},{sources:LocalUsagePageData['sources']},{data:Array<{day:string;total_tokens:number}>}];
   return {totals:summary.totals,sources:models.sources,firstActivityDay:daily.data.find(row=>Number(row.total_tokens)>0)?.day};
+}
+
+export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalUsageOverviewPeriod):Promise<LocalUsageOverviewData>{
+  if(!range || (range.from!==''&&!validDay(range.from)) || !validDay(range.to) || range.from>range.to)throw new Error('Invalid usage date range');
+  const query={from:range.from,to:range.to,tz:zone(range.tz)};
+  const overviewQuery={...query,source:LOCAL_OVERVIEW_SOURCE_KEYS.join(",")};
+  const [summary,models,series] = await Promise.all([
+    queryLocalCollector('/functions/tokentracker-usage-summary',overviewQuery),
+    queryLocalCollector('/functions/tokentracker-usage-model-breakdown',overviewQuery),
+    period==='hour'
+      ? Promise.all(listDays(range.from,range.to).map((day)=>queryLocalCollector('/functions/tokentracker-usage-hourly',{day,tz:query.tz,source:LOCAL_OVERVIEW_SOURCE_KEYS.join(",")}) as Promise<Record<string,unknown>>)).then((responses)=>({
+          data:responses.flatMap((response)=>Array.isArray(response?.data)?response.data:[])
+        }))
+      : queryLocalCollector('/functions/tokentracker-usage-daily',overviewQuery)
+  ]) as [
+    {totals:LocalUsagePageData['totals']},
+    {sources:LocalUsagePageData['sources']},
+    {data:Array<Record<string,unknown>>}
+  ];
+  return {totals:summary.totals,sources:models.sources,series:series.data};
 }
 
 export async function getLocalUsageTrend(query:LocalUsageTrendQuery):Promise<Record<string,unknown>>{

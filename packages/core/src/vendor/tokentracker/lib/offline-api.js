@@ -475,10 +475,19 @@ function getRequestedUsageScope(url) {
 function scopedQueueRows(queuePath, url) {
   const scope = getRequestedUsageScope(url);
   const allRows = readQueueData(queuePath);
+  const requestedSources = new Set(
+    String(url.searchParams.get("source") || "")
+      .split(",")
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const sourceRows = requestedSources.size > 0
+    ? allRows.filter((row) => requestedSources.has(String(row.source || "").trim().toLowerCase()))
+    : allRows;
   return {
     scope,
     allRows,
-    rows: filterRowsByUsageScope(allRows, scope),
+    rows: filterRowsByUsageScope(sourceRows, scope),
     excludedSources: listExcludedSources(allRows, scope),
   };
 }
@@ -1149,7 +1158,7 @@ if (p === "/functions/tokentracker-usage-model-breakdown") {
         const src = row.source || "unknown";
         const mdl = row.model || "unknown";
         if (!bySource.has(src))
-          bySource.set(src, { source: src, source_scope: getSourceScope(src), totals: { total_tokens: 0, billable_total_tokens: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_output_tokens: 0, total_cost_usd: "0" }, models: new Map() });
+          bySource.set(src, { source: src, source_scope: getSourceScope(src), totals: { total_tokens: 0, billable_total_tokens: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_output_tokens: 0, conversation_count: 0, total_cost_usd: "0" }, models: new Map() });
         const sa = bySource.get(src);
         sa.totals.total_tokens += row.total_tokens || 0;
         sa.totals.billable_total_tokens += row.billable_total_tokens ?? row.total_tokens ?? 0;
@@ -1158,8 +1167,9 @@ if (p === "/functions/tokentracker-usage-model-breakdown") {
         sa.totals.cached_input_tokens += row.cached_input_tokens || 0;
         sa.totals.cache_creation_input_tokens += row.cache_creation_input_tokens || 0;
         sa.totals.reasoning_output_tokens += row.reasoning_output_tokens || 0;
+        sa.totals.conversation_count += row.conversation_count || 0;
         if (!sa.models.has(mdl))
-          sa.models.set(mdl, { model: mdl, model_id: mdl, totals: { total_tokens: 0, billable_total_tokens: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_output_tokens: 0, total_cost_usd: "0" } });
+          sa.models.set(mdl, { model: mdl, model_id: mdl, totals: { total_tokens: 0, billable_total_tokens: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_output_tokens: 0, conversation_count: 0, total_cost_usd: "0" } });
         const ma = sa.models.get(mdl);
         ma.totals.total_tokens += row.total_tokens || 0;
         ma.totals.billable_total_tokens += row.billable_total_tokens ?? row.total_tokens ?? 0;
@@ -1168,6 +1178,7 @@ if (p === "/functions/tokentracker-usage-model-breakdown") {
         ma.totals.cached_input_tokens += row.cached_input_tokens || 0;
         ma.totals.cache_creation_input_tokens += row.cache_creation_input_tokens || 0;
         ma.totals.reasoning_output_tokens += row.reasoning_output_tokens || 0;
+        ma.totals.conversation_count += row.conversation_count || 0;
         ma.totals.total_cost_usd = Number(ma.totals.total_cost_usd || 0)
           + (Number(row.total_cost_usd) || 0);
       }

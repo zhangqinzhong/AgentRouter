@@ -36,6 +36,10 @@ test('hourly heatmap and session routes stay on the local collector contract',as
   const hourly=await c.query('/functions/tokentracker-usage-hourly',{day:'2026-09-14',tz:'UTC'});
   assert.ok(Array.isArray(hourly.data));
   assert.ok(hourly.data.some(row=>Number(row.total_tokens)>0));
+  const scoped=await c.query('/functions/tokentracker-usage-summary',{from:'2026-09-14',to:'2026-09-14',tz:'UTC',source:'claude'});
+  assert.equal(scoped.totals.total_tokens,170);
+  const empty=await c.query('/functions/tokentracker-usage-summary',{from:'2026-09-14',to:'2026-09-14',tz:'UTC',source:'mimo,zcode'});
+  assert.equal(empty.totals.total_tokens,0);
   const heatmap=await c.query('/functions/tokentracker-usage-heatmap',{weeks:'8',tz:'UTC'});
   assert.ok(Array.isArray(heatmap.weeks));
   const sessions=await c.query('/functions/tokentracker-sessions',{tz:'UTC'});

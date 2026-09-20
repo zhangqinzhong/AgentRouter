@@ -1,7 +1,7 @@
 import {
   Button, CircleAlert, cn, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
   formatCompactNumber, formatPercent, formatUsdCost, isGatewayProviderEnabled, LoaderCircle,
-  GatewayProviderConfig, ProviderAccountSnapshot, Select, Trash2, usageRangeOptions,
+  GatewayProviderConfig, ProviderAccountSnapshot, Select, Trash2, UsageComparisonRow, usageRangeOptions,
   UsageDateRange, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useEffect, useState, X
 } from "../shared/index";
 import { useMemo } from "react";
@@ -184,7 +184,24 @@ function overviewStatCells(totals: UsageTotals, translate: (value: string) => st
   ];
 }
 
-function overviewProviderFilterOptions(providers: GatewayProviderConfig[], translate: (value: string) => string): Array<{ label: string; value: string }> {
+const localOverviewProviderNames = new Set([
+  "AStudio", "Every Code", "OpenClaw", "LM Studio", "Cursor", "Antigravity",
+  "Qoder", "Qoder CN", "Claude Science", "Kiro", "Kiro CLI", "Hermes",
+  "Kimi", "Kimi Code", "CodeBuddy", "WorkBuddy", "oh-my-pi", "pi",
+  "Prime Agent", "Craft", "Reasonix", "Kilo Code", "Roo Code", "Zed",
+  "Unsloth", "AnythingLLM", "Devin", "Goose", "Droid", "DeepSeek Harness",
+  "GitHub Copilot", "MiMo", "ZCode"
+]);
+
+function isLocalOverviewRow(row: UsageComparisonRow): boolean {
+  return Boolean(row.provider && localOverviewProviderNames.has(row.provider));
+}
+
+function overviewProviderFilterOptions(
+  providers: GatewayProviderConfig[],
+  usageStats: UsageStatsSnapshot,
+  translate: (value: string) => string
+): Array<{ label: string; value: string }> {
   const providerNames = new Set<string>();
   for (const provider of providers) {
     if (!isGatewayProviderEnabled(provider)) {
@@ -195,15 +212,24 @@ function overviewProviderFilterOptions(providers: GatewayProviderConfig[], trans
       providerNames.add(name);
     }
   }
+  for (const row of usageStats.providerModels ?? []) {
+    if (isLocalOverviewRow(row) && row.provider) {
+      providerNames.add(row.provider);
+    }
+  }
   return [
     { label: translate("All providers"), value: "" },
-    ...Array.from(providerNames).map((provider) => ({ label: provider, value: provider }))
+    ...Array.from(providerNames).map((provider) => ({
+      label: localOverviewProviderNames.has(provider) ? `${provider} (local)` : provider,
+      value: provider
+    }))
   ];
 }
 
 function overviewModelFilterOptions(
   providers: GatewayProviderConfig[],
   providerFilter: string,
+  usageStats: UsageStatsSnapshot,
   translate: (value: string) => string
 ): Array<{ label: string; value: string }> {
   const models = new Set<string>();
@@ -221,15 +247,32 @@ function overviewModelFilterOptions(
       }
     }
   }
+  for (const row of usageStats.models ?? []) {
+    if (!isLocalOverviewRow(row) || !row.model) {
+      continue;
+    }
+    if (providerFilter && row.provider !== providerFilter) {
+      continue;
+    }
+    models.add(row.model);
+  }
   return [
     { label: translate("All models"), value: "" },
     ...Array.from(models).map((model) => ({ label: model, value: model }))
   ];
 }
 
-function overviewProviderHasModel(providers: GatewayProviderConfig[], providerFilter: string, modelFilter: string): boolean {
+function overviewProviderHasModel(
+  providers: GatewayProviderConfig[],
+  providerFilter: string,
+  modelFilter: string,
+  usageStats: UsageStatsSnapshot
+): boolean {
   const provider = providers.find((item) => item.name === providerFilter);
-  return Boolean(provider && provider.models.some((model) => model.trim() === modelFilter));
+  if (provider?.models.some((model) => model.trim() === modelFilter)) {
+    return true;
+  }
+  return (usageStats.models ?? []).some((row) => isLocalOverviewRow(row) && row.provider === providerFilter && row.model === modelFilter);
 }
 
 export function OverviewView({
@@ -264,8 +307,8 @@ export function OverviewView({
   const filterProviders = usageFilters?.providers ?? emptyOverviewProviders;
   const providerFilter = usageFilters?.providerFilter ?? "";
   const modelFilter = usageFilters?.modelFilter ?? "";
-  const providerOptions = overviewProviderFilterOptions(filterProviders, t);
-  const modelOptions = overviewModelFilterOptions(filterProviders, providerFilter, t);
+  const providerOptions = overviewProviderFilterOptions(filterProviders, usageStats, t);
+  const modelOptions = overviewModelFilterOptions(filterProviders, providerFilter, usageStats, t);
   const statCells = overviewStatCells(usageStats.totals, t);
   // The usage store labels providers by id; resolve them to the configured display names.
   const displayUsageStats = useMemo(() => {
@@ -290,7 +333,7 @@ export function OverviewView({
 
   function changeProviderFilter(provider: string) {
     usageFilters?.setProviderFilter(provider);
-    if (modelFilter && provider && !overviewProviderHasModel(filterProviders, provider, modelFilter)) {
+    if (modelFilter && provider && !overviewProviderHasModel(filterProviders, provider, modelFilter, usageStats)) {
       usageFilters?.setModelFilter("");
     }
   }

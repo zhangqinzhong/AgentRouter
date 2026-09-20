@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { decodeClaudeAppGatewayRouteId } from "@agentrouter/core/agents/claude-app/gateway-routes";
+import { getLocalUsageOverview, LOCAL_OVERVIEW_SOURCE_KEYS, type LocalUsageOverviewData, type LocalUsageRange } from "@agentrouter/core/collector/usage-page";
 import { REQUEST_LOGS_DB_FILE, USAGE_DB_FILE } from "@agentrouter/core/config/constants";
 import { estimateUsageCostUsd, providerModelPricingForUsage } from "@agentrouter/core/models/pricing-service";
 import { createBetterSqliteDatabase, type BetterSqliteDatabase } from "@agentrouter/core/storage/sqlite-native";
@@ -118,6 +119,48 @@ const usageStatsRanges = new Set<UsageStatsRange>(["today", "24h", "7d", "30d", 
 const providerStatusDays = 90;
 const customRangeDayLimit = 366;
 const usageStatsResetAtKey = "usage_stats_reset_at";
+const localOverviewCacheTtlMs = 30_000;
+const localOverviewSources = new Map<string, string>([
+  ["acode", "AStudio"],
+  ["every-code", "Every Code"],
+  ["openclaw", "OpenClaw"],
+  ["lmstudio", "LM Studio"],
+  ["cursor", "Cursor"],
+  ["antigravity", "Antigravity"],
+  ["qoder", "Qoder"],
+  ["qoder-cn", "Qoder CN"],
+  ["claude-science", "Claude Science"],
+  ["kiro", "Kiro"],
+  ["kiro-cli", "Kiro CLI"],
+  ["hermes", "Hermes"],
+  ["kimi", "Kimi"],
+  ["kimi-code", "Kimi Code"],
+  ["codebuddy", "CodeBuddy"],
+  ["workbuddy", "WorkBuddy"],
+  ["omp", "oh-my-pi"],
+  ["pi", "pi"],
+  ["prime-agent", "Prime Agent"],
+  ["craft", "Craft"],
+  ["reasonix", "Reasonix"],
+  ["kilocode", "Kilo Code"],
+  ["roocode", "Roo Code"],
+  ["zed", "Zed"],
+  ["unsloth", "Unsloth"],
+  ["anythingllm", "AnythingLLM"],
+  ["devin", "Devin"],
+  ["goose", "Goose"],
+  ["droid", "Droid"],
+  ["dsh", "DeepSeek Harness"],
+  ["copilot", "GitHub Copilot"],
+  ["mimo", "MiMo"],
+  ["zcode", "ZCode"]
+]);
+const localOverviewSourceKeys = new Set<string>(LOCAL_OVERVIEW_SOURCE_KEYS);
+let localOverviewCache: {
+  expiresAt: number;
+  key: string;
+  value: LocalUsageOverviewData;
+} | undefined;
 const emptyTotals: UsageTotals = {
   avgDurationMs: 0,
   cacheRatio: 0,
@@ -580,11 +623,232 @@ export async function getUsageStats(
   customRange?: UsageDateRange | null
 ): Promise<UsageStatsSnapshot> {
   try {
-    return await usageStore.getStats(range, filter, customRange);
+    const snapshot = await usageStore.getStats(range, filter, customRange);
+    try {
+      const normalizedRange = normalizeUsageRange(range);
+      const now = new Date();
+      const localRange = localOverviewRange(normalizedRange, customRange, now);
+      const local = await getCachedLocalUsageOverview(localRange.range, localRange.period);
+      return mergeLocalOverviewSnapshot(snapshot, local, filter);
+    } catch (error) {
+      console.warn(`[usage] Failed to merge local usage into overview: ${formatError(error)}`);
+      return snapshot;
+    }
   } catch (error) {
     console.warn(`[usage] Failed to read usage stats: ${formatError(error)}`);
     return emptySnapshot(normalizeUsageRange(range));
   }
+}
+
+async function getCachedLocalUsageOverview(range: LocalUsageRange, period: "day" | "hour"): Promise<LocalUsageOverviewData> {
+  const key = JSON.stringify({ period, range });
+  const now = Date.now();
+  if (localOverviewCache?.key === key && localOverviewCache.expiresAt > now) {
+    return localOverviewCache.value;
+  }
+  const value = await getLocalUsageOverview(range, period);
+  localOverviewCache = { expiresAt: now + localOverviewCacheTtlMs, key, value };
+  return value;
+}
+
+function localOverviewRange(
+  range: UsageStatsRange,
+  customRange: UsageDateRange | null | undefined,
+  now: Date
+): { period: "day" | "hour"; range: LocalUsageRange } {
+  const day = (value: Date) => {
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, "0");
+    const date = String(value.getDate()).padStart(2, "0");
+    return `${year}-${month}-${date}`;
+  };
+  const to = day(now);
+  if (range === "custom" && customRange) {
+    return { period: "day", range: { from: customRange.from, to: customRange.to } };
+  }
+  if (range === "today" || range === "24h") {
+    const from = new Date(now);
+    from.setMinutes(0, 0, 0);
+    if (range === "24h") {
+      from.setHours(from.getHours() - 23);
+    }
+    return { period: "hour", range: { from: day(from), to } };
+  }
+  const days = range === "30d" ? 30 : 7;
+  const from = new Date(now);
+  from.setHours(0, 0, 0, 0);
+  from.setDate(from.getDate() - (days - 1));
+  return { period: "day", range: { from: day(from), to } };
+}
+
+function localOverviewFilterMatches(source: string, model: string, filter: UsageStatsFilter | null | undefined): boolean {
+  const provider = typeof filter?.provider === "string" ? filter.provider.trim().toLowerCase() : "";
+  const requestedModel = typeof filter?.model === "string" ? filter.model.trim() : "";
+  const sourceLabel = localOverviewSources.get(source) ?? source;
+  if (provider && provider !== source && provider !== sourceLabel.toLowerCase()) {
+    return false;
+  }
+  return !requestedModel || requestedModel === model;
+}
+
+function localTotalsToUsageTotals(totals: Record<string, unknown>): UsageTotals {
+  const inputTokens = normalizeCount(totals.input_tokens);
+  const outputTokens = normalizeCount(totals.output_tokens);
+  const cacheTokens = normalizeCount(totals.cached_input_tokens) + normalizeCount(totals.cache_creation_input_tokens);
+  const requestCount = normalizeCount(totals.conversation_count ?? totals.request_count);
+  const totalTokens = normalizeCount(totals.total_tokens);
+  return {
+    ...emptyTotals,
+    avgDurationMs: 0,
+    cacheRatio: inputTokens + cacheTokens > 0 ? cacheTokens / (inputTokens + cacheTokens) : 0,
+    cacheTokens,
+    costUsd: normalizeCost(totals.total_cost_usd),
+    inputTokens,
+    outputTokens,
+    requestCount,
+    successRate: requestCount > 0 ? 1 : 0,
+    totalTokens
+  };
+}
+
+function localSeriesToUsagePoint(row: Record<string, unknown>, period: "day" | "hour"): UsageSeriesPoint | undefined {
+  const rawBucket = String(row.day ?? row.hour ?? "").trim();
+  if (!rawBucket) {
+    return undefined;
+  }
+  const bucket = period === "hour"
+    ? rawBucket.replace("T", " ").replace(/:00:00$/, ":00")
+    : rawBucket;
+  const totals = localTotalsToUsageTotals(row);
+  return {
+    ...totals,
+    bucket,
+    label: period === "hour" ? bucket.slice(11, 16) : `${Number(bucket.slice(5, 7))}/${Number(bucket.slice(8, 10))}`
+  };
+}
+
+function mergeLocalUsageTotals(left: UsageTotals, right: UsageTotals): UsageTotals {
+  const total = left.requestCount + right.requestCount;
+  const cacheTokens = left.cacheTokens + right.cacheTokens;
+  const inputTokens = left.inputTokens + right.inputTokens;
+  return {
+    ...left,
+    avgDurationMs: total > 0
+      ? Math.round((left.avgDurationMs * left.requestCount + right.avgDurationMs * right.requestCount) / total)
+      : 0,
+    cacheRatio: inputTokens + cacheTokens > 0 ? cacheTokens / (inputTokens + cacheTokens) : 0,
+    cacheTokens,
+    costUsd: left.costUsd + right.costUsd,
+    errorCount: left.errorCount + right.errorCount,
+    inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    requestCount: total,
+    successRate: total > 0 ? (total - left.errorCount - right.errorCount) / total : 0,
+    totalTokens: left.totalTokens + right.totalTokens
+  };
+}
+
+function localComparisonRow(
+  source: string,
+  model: string,
+  totals: Record<string, unknown>
+): UsageComparisonRow {
+  const provider = localOverviewSources.get(source) ?? source;
+  return {
+    ...localTotalsToUsageTotals(totals),
+    caption: `${provider} / local session`,
+    key: `local:${source}:${model}`,
+    label: model,
+    maxShare: 0,
+    model,
+    provider
+  };
+}
+
+function localClientComparisonRow(
+  source: string,
+  model: string,
+  totals: Record<string, unknown>
+): UsageComparisonRow {
+  const provider = localOverviewSources.get(source) ?? source;
+  return {
+    ...localTotalsToUsageTotals(totals),
+    caption: `${provider} / ${model}`,
+    client: provider,
+    key: `local-client:${source}:${model}`,
+    label: provider,
+    maxShare: 0,
+    model,
+    provider
+  };
+}
+
+export function mergeLocalOverviewSnapshot(
+  snapshot: UsageStatsSnapshot,
+  local: LocalUsageOverviewData,
+  filter: UsageStatsFilter | null | undefined
+): UsageStatsSnapshot {
+  const localRows: UsageComparisonRow[] = [];
+  const localClientRows: UsageComparisonRow[] = [];
+  for (const entry of local.sources) {
+    const source = String(entry.source ?? "").trim().toLowerCase();
+    if (!localOverviewSources.has(source) || !localOverviewSourceKeys.has(source)) {
+      continue;
+    }
+    for (const model of (Array.isArray(entry.models) ? entry.models : []) as Array<Record<string, unknown>>) {
+      const modelName = String(model?.model ?? model?.model_id ?? "").trim();
+      if (modelName && localOverviewFilterMatches(source, modelName, filter)) {
+        const totals = (model.totals ?? {}) as Record<string, unknown>;
+        localRows.push(localComparisonRow(source, modelName, totals));
+        localClientRows.push(localClientComparisonRow(source, modelName, totals));
+      }
+    }
+  }
+  if (localRows.length === 0) {
+    return snapshot;
+  }
+
+  const localTotals = localRows.reduce(
+    (total, row) => mergeLocalUsageTotals(total, row),
+    { ...emptyTotals }
+  );
+  const localModelsByKey = new Map<string, UsageComparisonRow>();
+  for (const row of localRows) {
+    const key = `${row.provider ?? ""}::${row.model ?? row.label}`;
+    const previous = localModelsByKey.get(key);
+    localModelsByKey.set(key, previous ? {
+      ...previous,
+      ...mergeLocalUsageTotals(previous, row),
+      key: previous.key,
+      label: previous.label,
+      model: previous.model,
+      provider: previous.provider
+    } : row);
+  }
+  const localProviderRows = [...localModelsByKey.values()].map((row) => ({
+    ...row,
+    key: `local-provider:${row.provider ?? row.label}:${row.model ?? row.label}`,
+    label: row.provider ?? row.label,
+    caption: row.model ?? row.label
+  }));
+  const localSeries = local.series
+    .map((row) => localSeriesToUsagePoint(row, local.series.some((item) => item.hour) ? "hour" : "day"))
+    .filter((row): row is UsageSeriesPoint => Boolean(row))
+    .filter((row) => snapshot.series.some((point) => point.bucket === row.bucket));
+  const seriesByBucket = new Map(snapshot.series.map((row) => [row.bucket, row]));
+  for (const row of localSeries) {
+    const existing = seriesByBucket.get(row.bucket);
+    seriesByBucket.set(row.bucket, existing ? { ...mergeLocalUsageTotals(existing, row), bucket: existing.bucket, label: existing.label } : row);
+  }
+
+  return {
+    ...snapshot,
+    clientModels: [...snapshot.clientModels, ...localClientRows],
+    models: [...snapshot.models, ...localRows],
+    providerModels: [...snapshot.providerModels, ...localProviderRows],
+    series: [...seriesByBucket.values()].sort((left, right) => left.bucket.localeCompare(right.bucket)),
+    totals: mergeLocalUsageTotals(snapshot.totals, localTotals)
+  };
 }
 
 export async function resetOverviewStatistics(): Promise<UsageStatsResetResult> {
