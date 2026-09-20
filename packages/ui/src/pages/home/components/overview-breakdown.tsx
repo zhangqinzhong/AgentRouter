@@ -81,7 +81,7 @@ function breakdownColor(label: string, translate: (value: string) => string): st
 }
 
 function breakdownRows(rows: UsageComparisonRow[], limit: number, translate: (value: string) => string): BreakdownRow[] {
-  const positive = rows.filter((row) => (row.totalTokens || 0) > 0);
+  const positive = rows.filter((row) => (row.totalTokens || 0) > 0 || (row.requestCount || 0) > 0);
   const sorted = [...positive].sort((left, right) => (right.totalTokens || 0) - (left.totalTokens || 0));
   const top = sorted.slice(0, limit);
   const rest = sorted.slice(limit);
@@ -331,6 +331,9 @@ function breakdownTrailing(rows: UsageComparisonRow[], translate: (value: string
 
 export function OverviewBreakdowns({ providers, usageStats }: { providers: GatewayProviderConfig[]; usageStats: UsageStatsSnapshot }) {
   const t = useAppText();
+  const modelRows = collapseAnalysisDisplayRows("model", usageStats.models ?? []);
+  const clientRows = collapseAnalysisDisplayRows("client", (usageStats.clientModels ?? []).filter(hasClientAttribution));
+  const providerRows = collapseAnalysisDisplayRows("provider", usageStats.providerModels ?? []);
   return (
     <div className="space-y-10">
       <BreakdownSection
@@ -338,27 +341,27 @@ export function OverviewBreakdowns({ providers, usageStats }: { providers: Gatew
         icon={Boxes}
         kind="model"
         providers={providers}
-        rows={collapseAnalysisDisplayRows("model", usageStats.models ?? [])}
+        rows={modelRows}
         title={t("Models")}
-        trailing={breakdownTrailing(usageStats.models ?? [], t)}
+        trailing={breakdownTrailing(modelRows, t)}
       />
       <BreakdownSection
         emptyLabel={t("No client usage yet")}
         icon={UserRound}
         kind="client"
         providers={providers}
-        rows={collapseAnalysisDisplayRows("client", (usageStats.clientModels ?? []).filter(hasClientAttribution))}
+        rows={clientRows}
         title={t("Client Analysis")}
-        trailing={breakdownTrailing(usageStats.clientModels ?? [], t)}
+        trailing={breakdownTrailing(clientRows, t)}
       />
       <BreakdownSection
         emptyLabel={t("No provider usage yet")}
         icon={Network}
         kind="provider"
         providers={providers}
-        rows={collapseAnalysisDisplayRows("provider", usageStats.providerModels ?? [])}
+        rows={providerRows}
         title={t("Provider Analysis")}
-        trailing={breakdownTrailing(usageStats.providerModels ?? [], t)}
+        trailing={breakdownTrailing(providerRows, t)}
       />
     </div>
   );

@@ -233,25 +233,11 @@ function overviewModelFilterOptions(
   translate: (value: string) => string
 ): Array<{ label: string; value: string }> {
   const models = new Set<string>();
-  for (const provider of providers) {
-    if (!isGatewayProviderEnabled(provider)) {
-      continue;
-    }
-    if (providerFilter && provider.name !== providerFilter) {
-      continue;
-    }
-    for (const rawModel of provider.models) {
-      const model = rawModel.trim();
-      if (model) {
-        models.add(model);
-      }
-    }
-  }
   for (const row of usageStats.models ?? []) {
-    if (!isLocalOverviewRow(row) || !row.model) {
+    if (!row.model || (row.requestCount ?? 0) <= 0 && (row.totalTokens ?? 0) <= 0) {
       continue;
     }
-    if (providerFilter && row.provider !== providerFilter) {
+    if (providerFilter && !usageRowMatchesProviderFilter(row, providerFilter, providers)) {
       continue;
     }
     models.add(row.model);
@@ -260,6 +246,21 @@ function overviewModelFilterOptions(
     { label: translate("All models"), value: "" },
     ...Array.from(models).map((model) => ({ label: model, value: model }))
   ];
+}
+
+function usageRowMatchesProviderFilter(
+  row: UsageComparisonRow,
+  providerFilter: string,
+  providers: GatewayProviderConfig[]
+): boolean {
+  const rowProvider = row.provider?.trim().toLowerCase() ?? "";
+  const normalizedFilter = providerFilter.trim().toLowerCase();
+  if (!normalizedFilter || rowProvider === normalizedFilter || rowProvider.startsWith(`${normalizedFilter}::`)) {
+    return true;
+  }
+  const configuredProvider = providers.find((provider) => provider.name.trim().toLowerCase() === normalizedFilter);
+  const providerId = configuredProvider?.id?.trim().toLowerCase() ?? "";
+  return Boolean(providerId && (rowProvider === providerId || rowProvider.startsWith(`${providerId}::`)));
 }
 
 function overviewProviderHasModel(

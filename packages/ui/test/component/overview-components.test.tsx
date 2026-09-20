@@ -158,6 +158,22 @@ test("OverviewView shows the empty state without usage data", () => {
   assert.doesNotMatch(html, /border-l-2 border-emerald-500/);
 });
 
+test("OverviewBreakdowns translates empty model usage in Chinese", () => {
+  const html = renderToStaticMarkup(
+    <AppI18nContext.Provider value={appCopy.zh}>
+      <OverviewBreakdowns
+        providers={[]}
+        usageStats={usageStats("7d", { clientModels: [], models: [], providerModels: [] })}
+      />
+    </AppI18nContext.Provider>
+  );
+
+  assert.match(html, /暂无模型用量/);
+  assert.doesNotMatch(html, /No model usage yet/);
+  assert.match(html, /暂无客户端用量/);
+  assert.match(html, /暂无供应商用量/);
+});
+
 test("OverviewView keeps Chinese token copy as Token", () => {
   const html = renderToStaticMarkup(
     <AppI18nContext.Provider value={appCopy.zh}>
