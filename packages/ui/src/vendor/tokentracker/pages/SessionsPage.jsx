@@ -28,15 +28,24 @@ const NO_SESSIONS = [];
 // few thousand sessions stay responsive without a virtualization dependency.
 const PAGE_SIZE = 100;
 
-const SOURCE_FILTERS = [
-  { id: "all", label: () => copy("sessions.filter.source_all") },
-  { id: "claude", label: () => "Claude Code" },
-  { id: "codex", label: () => "Codex" },
-  { id: "grok", label: () => "Grok" },
-  { id: "cursor", label: () => "Cursor" },
-  { id: "mimo", label: () => "MiMo" },
-  { id: "zcode", label: () => "ZCode" },
-];
+const SOURCE_LABELS = {
+  claude: "Claude Code",
+  codex: "Codex",
+  grok: "Grok",
+  cursor: "Cursor",
+  mimo: "MiMo",
+  zcode: "ZCode",
+};
+
+const SOURCE_ORDER = ["claude", "codex", "grok", "cursor", "mimo", "zcode"];
+
+function sourceLabel(source) {
+  return SOURCE_LABELS[source] || String(source || "")
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
 
 const DATE_RANGES = [
   { id: "all", days: 0, label: () => copy("sessions.filter.range_all") },
@@ -845,10 +854,25 @@ export function SessionsPage() {
     return () => observer.disconnect();
   }, [hasMore, showMore]);
 
-  const sourceOptions = useMemo(
-    () => SOURCE_FILTERS.map((option) => ({ id: option.id, label: option.label() })),
-    [resolvedLocale],
-  );
+  const sourceOptions = useMemo(() => {
+    const sources = [...new Set(
+      allSessions
+        .map((session) => String(session?.source || "").trim().toLowerCase())
+        .filter(Boolean),
+    )].sort((left, right) => {
+      const leftIndex = SOURCE_ORDER.indexOf(left);
+      const rightIndex = SOURCE_ORDER.indexOf(right);
+      if (leftIndex === -1 && rightIndex === -1) return sourceLabel(left).localeCompare(sourceLabel(right));
+      if (leftIndex === -1) return 1;
+      if (rightIndex === -1) return -1;
+      return leftIndex - rightIndex;
+    });
+
+    return [
+      { id: "all", label: copy("sessions.filter.source_all") },
+      ...sources.map((source) => ({ id: source, label: sourceLabel(source) })),
+    ];
+  }, [allSessions, resolvedLocale]);
   const rangeOptions = useMemo(
     () => DATE_RANGES.map((option) => ({ id: option.id, label: option.label() })),
     [resolvedLocale],
