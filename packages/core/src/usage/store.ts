@@ -113,7 +113,10 @@ type UsageSnapshot = UsageNumbers & {
 };
 
 const usageEvents = new EventEmitter();
-const usageStatsRanges = new Set<UsageStatsRange>(["today", "24h", "7d", "30d", "custom"]);
+const usageStatsRanges = new Set<UsageStatsRange>(["today", "24h", "7d", "30d", "all", "custom"]);
+// Hard ceiling for the "all" trend template so a corrupt earliest row can never
+// generate an unbounded bucket walk.
+const allTimeMaxBuckets = 730;
 // The system-status strips always cover this many trailing days, independent of
 // the selected usage range; UI tick geometry mirrors this constant.
 const providerStatusDays = 90;
@@ -363,7 +366,11 @@ export class UsageStore {
         normalizedRange,
         now,
         query,
-        custom && normalizedRange === "custom" ? buildDayBuckets(custom.days, now, custom.since) : undefined
+        custom && normalizedRange === "custom"
+          ? buildDayBuckets(custom.days, now, custom.since)
+          : normalizedRange === "all"
+            ? buildAllTimeBuckets(database, now)
+            : undefined
       ),
       providerSeries: readProviderUsageSeries(database, now, statusQuery),
       totals: readUsageTotals(database, query)
@@ -666,6 +673,10 @@ function localOverviewRange(
   if (range === "custom" && customRange) {
     return { period: "day", range: { from: customRange.from, to: customRange.to } };
   }
+  if (range === "all") {
+    // Empty from = the collector aggregates from the beginning of local history.
+    return { period: "day", range: { from: "", to } };
+  }
   if (range === "today" || range === "24h") {
     const from = new Date(now);
     from.setMinutes(0, 0, 0);
@@ -831,10 +842,17 @@ export function mergeLocalOverviewSnapshot(
     label: row.provider ?? row.label,
     caption: row.model ?? row.label
   }));
+  // Day-grain rows outside the snapshot template are kept: bounded day ranges
+  // query the same window on both sides, and "all" local history can predate
+  // the first gateway event, so those earlier days must survive the merge (the
+  // daily endpoint only returns active days, so there is no zero-bucket flood).
+  // Hour-grain rows stay template-bound: the local query covers whole calendar
+  // days, which is wider than the rolling today/24h windows.
+  const hourly = local.series.some((item) => item.hour);
   const localSeries = local.series
-    .map((row) => localSeriesToUsagePoint(row, local.series.some((item) => item.hour) ? "hour" : "day"))
+    .map((row) => localSeriesToUsagePoint(row, hourly ? "hour" : "day"))
     .filter((row): row is UsageSeriesPoint => Boolean(row))
-    .filter((row) => snapshot.series.some((point) => point.bucket === row.bucket));
+    .filter((row) => !hourly || snapshot.series.some((point) => point.bucket === row.bucket));
   const seriesByBucket = new Map(snapshot.series.map((row) => [row.bucket, row]));
   for (const row of localSeries) {
     const existing = seriesByBucket.get(row.bucket);
@@ -1428,6 +1446,30 @@ function buildDayBuckets(days: number, now: Date, startAt?: Date): Array<{ key: 
   });
 }
 
+// "all" trend template: daily buckets from the earliest stored usage event to
+// today. The local collector merge appends its own earlier days on top, so the
+// gateway template only needs to span gateway rows.
+function buildAllTimeBuckets(database: SqlDatabase, now: Date): Array<{ key: string; label: string }> {
+  const row = queryRows(database, "SELECT MIN(created_at) AS earliest FROM usage_events")[0];
+  const earliest = row?.earliest ? new Date(String(row.earliest)) : undefined;
+  if (!earliest || !Number.isFinite(earliest.getTime())) {
+    return buildBuckets("30d", now);
+  }
+  const end = floorDay(now);
+  const start = floorDay(earliest);
+  const buckets: Array<{ key: string; label: string }> = [];
+  const cursor = new Date(start);
+  if ((end.getTime() - start.getTime()) / 86_400_000 + 1 > allTimeMaxBuckets) {
+    cursor.setTime(end.getTime());
+    cursor.setDate(end.getDate() - (allTimeMaxBuckets - 1));
+  }
+  while (cursor <= end) {
+    buckets.push({ key: formatBucketKey(cursor, "day"), label: `${cursor.getMonth() + 1}/${cursor.getDate()}` });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return buckets;
+}
+
 function buildBuckets(
   range: UsageStatsRange,
   now: Date
@@ -1807,6 +1849,9 @@ function getRangeSince(range: UsageStatsRange, now: Date): Date {
   const date = new Date(now);
   if (range === "today") {
     return floorDay(date);
+  }
+  if (range === "all") {
+    return new Date(0);
   }
   if (range === "24h") {
     date.setHours(date.getHours() - 24);

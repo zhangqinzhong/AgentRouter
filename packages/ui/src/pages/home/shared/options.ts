@@ -85,6 +85,7 @@ export const usageRangeOptions: Array<{ label: string; value: UsageStatsRange }>
   { label: "24h", value: "24h" },
   { label: "7d", value: "7d" },
   { label: "30d", value: "30d" },
+  { label: "All", value: "all" },
   { label: "Custom", value: "custom" }
 ];
 

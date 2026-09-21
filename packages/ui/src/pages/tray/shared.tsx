@@ -35,9 +35,8 @@ export type {
   UsageStatsFilter, UsageStatsRange, UsageStatsSnapshot, UsageTotals
 };
 
-// Tray windows only ever fetch the fixed ranges; the overview-only "custom"
-// range is intentionally excluded from this map.
-export type TrayUsageRange = Exclude<UsageStatsRange, "custom">;
+// Tray windows only fetch fixed ranges, not the overview's custom/all history.
+export type TrayUsageRange = Extract<UsageStatsRange, "today" | "24h" | "7d" | "30d">;
 export type SnapshotMap = Record<TrayUsageRange, UsageStatsSnapshot>;
 
 export type SourceTab = {

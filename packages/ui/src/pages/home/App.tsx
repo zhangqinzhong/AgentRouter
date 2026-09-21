@@ -300,7 +300,7 @@ function App() {
   const [agentAnalysisSession, setAgentAnalysisSession] = useState<AgentAnalysisSessionSelection>();
   const [usageModelFilter, setUsageModelFilter] = useState("");
   const [usageProviderFilter, setUsageProviderFilter] = useState("");
-  const [usageRange, setUsageRange] = useState<UsageStatsRange>("7d");
+  const [usageRange, setUsageRange] = useState<UsageStatsRange>("all");
   const [usageCustomRange, setUsageCustomRange] = useState<UsageDateRange>({ from: "", to: "" });
   const [usageStats, setUsageStats] = useState<UsageStatsSnapshot>(fallbackUsageStats);
   const [providerAccountSnapshots, setProviderAccountSnapshots] = useState<ProviderAccountSnapshot[]>([]);

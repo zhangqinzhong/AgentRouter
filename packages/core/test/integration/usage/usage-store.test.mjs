@@ -208,6 +208,144 @@ test("overview merges local MiMo and ZCode usage without inventing gateway reque
   assert.equal(merged.series[0].totalTokens, 185);
 });
 
+test("UsageStore all range covers history older than 30 days with an all-time series", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-test-"));
+  const dayKey = (value) => {
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+  };
+  try {
+    const store = new UsageStore(path.join(dir, "usage.sqlite"));
+    const now = new Date();
+    const old = new Date(now.getTime() - 100 * 24 * 60 * 60 * 1000);
+
+    await store.record({
+      createdAt: old.toISOString(),
+      durationMs: 100,
+      method: "POST",
+      model: "old-model",
+      path: "/v1/messages",
+      provider: "alpha",
+      requestId: "req-old",
+      statusCode: 200,
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
+    });
+    await store.record({
+      createdAt: now.toISOString(),
+      durationMs: 100,
+      method: "POST",
+      model: "new-model",
+      path: "/v1/messages",
+      provider: "alpha",
+      requestId: "req-new",
+      statusCode: 200,
+      usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 }
+    });
+
+    const monthStats = await store.getStats("30d", {});
+    assert.equal(monthStats.totals.requestCount, 1);
+
+    const allStats = await store.getStats("all", {});
+    assert.equal(allStats.range, "all");
+    assert.equal(allStats.totals.requestCount, 2);
+    assert.equal(allStats.totals.totalTokens, 20);
+    assert.equal(allStats.series.length, 101);
+    assert.equal(allStats.series[0].bucket, dayKey(old));
+    assert.equal(allStats.series[0].totalTokens, 15);
+    assert.equal(allStats.series.at(-1).bucket, dayKey(now));
+    assert.equal(allStats.series.at(-1).totalTokens, 5);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("UsageStore caps all-time daily buckets relative to today while retaining historical totals", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-all-time-cap-"));
+  const dayKey = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  try {
+    const store = new UsageStore(path.join(dir, "usage.sqlite"));
+    const now = new Date();
+    const old = new Date(now);
+    old.setFullYear(old.getFullYear() - 5);
+    for (const [createdAt, tokens] of [[old, 100], [now, 10]]) {
+      await store.record({
+        createdAt: createdAt.toISOString(),
+        durationMs: 10,
+        method: "POST",
+        model: "history-model",
+        path: "/v1/messages",
+        provider: "alpha",
+        statusCode: 200,
+        costUsd: 0,
+        usage: { inputTokens: tokens, totalTokens: tokens }
+      });
+    }
+    const stats = await store.getStats("all", {});
+    const firstDay = new Date(now);
+    firstDay.setDate(firstDay.getDate() - 729);
+    assert.equal(stats.series.length, 730);
+    assert.equal(stats.series[0].bucket, dayKey(firstDay));
+    assert.equal(stats.series.at(-1).bucket, dayKey(now));
+    assert.equal(stats.totals.totalTokens, 110);
+    assert.equal(stats.totals.requestCount, 2);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("overview merge keeps local series days that predate the gateway template", () => {
+  const snapshot = {
+    clientModels: [],
+    generatedAt: new Date().toISOString(),
+    models: [],
+    providerModels: [],
+    range: "all",
+    recentRequests: [],
+    series: [{
+      bucket: "2026-09-19",
+      cacheRatio: 0,
+      cacheTokens: 0,
+      costUsd: 1,
+      errorCount: 0,
+      inputTokens: 10,
+      label: "09/19",
+      outputTokens: 5,
+      requestCount: 1,
+      successRate: 1,
+      totalTokens: 15
+    }],
+    totals: {
+      cacheRatio: 0,
+      cacheTokens: 0,
+      costUsd: 1,
+      errorCount: 0,
+      inputTokens: 10,
+      outputTokens: 5,
+      requestCount: 1,
+      successRate: 1,
+      totalTokens: 15
+    }
+  };
+  const merged = mergeLocalOverviewSnapshot(snapshot, {
+    series: [
+      { day: "2026-09-19", input_tokens: 5, total_tokens: 6 },
+      { day: "2026-04-01", input_tokens: 10, total_tokens: 12 }
+    ],
+    sources: [{
+      source: "lmstudio",
+      models: [{
+        model: "local-model",
+        totals: { input_tokens: 15, total_tokens: 18, conversation_count: 2 }
+      }]
+    }],
+    totals: { input_tokens: 15, total_tokens: 18, conversation_count: 2 }
+  }, {});
+
+  assert.deepEqual(merged.series.map((point) => point.bucket), ["2026-04-01", "2026-09-19"]);
+  assert.equal(merged.series[0].totalTokens, 12);
+  assert.equal(merged.series[1].totalTokens, 21);
+});
+
 test("UsageStore aggregates stats in SQLite without loading all events", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-test-"));
   try {
