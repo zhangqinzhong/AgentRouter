@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.6.10 - 2026-09-21
+
+- Made the shared Usage-style custom date range activate consistently when opened, so Overview, Usage and Trend use the same period/date-range behavior.
+
 ## 1.6.9 - 2026-09-21
 
 - Finalized the shared period/date-range tabs release and updated Overview component coverage for the unified Usage-style tabs.
