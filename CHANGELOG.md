@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.6.4 - 2026-09-21
+
+- Fixed tray compact number units to follow the selected interface language instead of the operating-system locale.
+- Removed the render-time TokenTracker locale mutation and synchronized locale changes through language preference and system-language events.
+
 ## 1.6.3 - 2026-09-21
 
 - Unified compact number formatting across Overview, Usage, Trend, Heatmap and Sessions so Chinese uses 万/亿/万亿 and English uses K/M/B/T.

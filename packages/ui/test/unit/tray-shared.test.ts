@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_TRAY_COMPONENT_VARIANTS } from "@agentrouter/core/contracts/app.ts";
 import {
+  formatCompactNumber,
   normalizeTrayComponentVariants,
   normalizeTrayIconPreference,
   normalizeTrayWidgets,
@@ -73,4 +74,9 @@ test("tray icon preference accepts supported values and safely defaults", () => 
   }
   assert.equal(normalizeTrayIconPreference(undefined), "layered");
   assert.equal(normalizeTrayIconPreference("unsupported" as never), "layered");
+});
+
+test("tray compact numbers follow the selected interface locale", () => {
+  assert.equal(formatCompactNumber(14_400_000_000, "zh-CN"), "144亿");
+  assert.equal(formatCompactNumber(14_400_000_000, "en-US"), "14.4B");
 });

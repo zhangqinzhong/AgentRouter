@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { LoaderCircle, Power, RefreshCw } from "lucide-react";
 import appLogoUrl from "@/lib/app-icon";
 import codexLogoUrl from "@/assets/agent-logos/codex.png";
+import { formatCompactNumber as formatLocalizedCompactNumber } from "@/lib/number-format.js";
 import { DEFAULT_TRAY_COMPONENT_VARIANTS, DEFAULT_TRAY_WIDGETS, DEFAULT_TRAY_WINDOW_MODULES, TRAY_SINGLETON_WIDGET_TYPES, TRAY_TOP_WIDGET_TYPES, TRAY_WINDOW_MODULE_IDS } from "@agentrouter/core/contracts/app";
 import { formatLocalizedErrorMessage } from "@agentrouter/core/contracts/i18n";
 import { findProviderPreset, findProviderPresetByBaseUrl, providerPresets } from "@agentrouter/core/providers/presets";
@@ -727,11 +728,24 @@ export function rangeLabel(range: UsageStatsRange, translate: (value: string) =>
   return translate(range);
 }
 
-export function formatCompactNumber(value: number): string {
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: value >= 1000 ? 1 : 0,
-    notation: value >= 10000 ? "compact" : "standard"
-  }).format(value);
+export function formatCompactNumber(value: number, locale?: Intl.LocalesArgument): string {
+  const resolvedLocale = locale ?? resolveTrayNumberLocale();
+  return formatLocalizedCompactNumber(value, { locale: resolvedLocale, decimals: 1 });
+}
+
+export function resolveTrayNumberLocale(): "zh-CN" | "en-US" {
+  const preference = readLanguagePreference();
+  if (preference === "zh") {
+    return "zh-CN";
+  }
+  if (preference === "en") {
+    return "en-US";
+  }
+  try {
+    return detectSystemLanguage() === "zh" ? "zh-CN" : "en-US";
+  } catch {
+    return "en-US";
+  }
 }
 
 export function formatUsdCost(value: number | undefined): string {

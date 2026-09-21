@@ -308,7 +308,6 @@ function App() {
   const updateActionBusyRef = useRef(false);
   const usageStatsRequestId = useRef(0);
   const resolvedLanguage = languagePreference === "system" ? systemLanguage : languagePreference;
-  setUsageLocale(resolvedLanguage);
   const copy = appCopy[resolvedLanguage];
   const t = useMemo(() => (value: string) => translateText(copy, value), [copy]);
   const formatError = useMemo(() => (error: unknown) => formatAppError(copy, error), [copy]);
@@ -339,10 +338,16 @@ function App() {
   }, [resolvedLanguage]);
 
   useEffect(() => {
-    const updateSystemLanguage = () => setSystemLanguage(detectSystemLanguage());
+    const updateSystemLanguage = () => {
+      const language = detectSystemLanguage();
+      if (languagePreference === "system") {
+        setUsageLocale(language);
+      }
+      setSystemLanguage(language);
+    };
     window.addEventListener("languagechange", updateSystemLanguage);
     return () => window.removeEventListener("languagechange", updateSystemLanguage);
-  }, []);
+  }, [languagePreference]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -2652,8 +2657,9 @@ function App() {
 
   function changeLanguagePreference(value: string) {
     const language = normalizeLanguagePreference(value);
-    setLanguagePreference(language);
     persistLanguagePreference(language);
+    setUsageLocale(language === "system" ? detectSystemLanguage() : language);
+    setLanguagePreference(language);
   }
 
   async function completeOnboarding() {
