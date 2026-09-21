@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.6.9 - 2026-09-21
+
+- Finalized the shared period/date-range tabs release and updated Overview component coverage for the unified Usage-style tabs.
+
 ## 1.6.8 - 2026-09-21
 
 - Completed the shared period/date-range tabs refactor across Overview, Usage and Trend, including TypeScript declarations for the shared control.
