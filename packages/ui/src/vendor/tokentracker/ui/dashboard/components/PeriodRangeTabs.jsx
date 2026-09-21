@@ -10,7 +10,7 @@ export function PeriodRangeTabs({
   customRangeOpen = false,
   onCustomRangeOpenChange,
   onCustomRangeApply,
-  activateCustomOnOpen = false,
+  activateCustomOnOpen = true,
   ariaLabel,
   tablistRef,
   onKeyDown,
