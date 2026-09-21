@@ -10,18 +10,35 @@ export function PeriodRangeTabs({
   customRangeOpen = false,
   onCustomRangeOpenChange,
   onCustomRangeApply,
-  activateCustomOnOpen = true,
   ariaLabel,
   tablistRef,
   onKeyDown,
   className = "",
 }) {
+  // Match the Usage page's keyboard navigation on every consumer. Calendar
+  // navigation belongs to the popup, even though portal events bubble here.
+  const handleKeyDown = (event) => {
+    onKeyDown?.(event);
+    if (event.defaultPrevented || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tab = event.target.closest('[role="tab"]');
+    if (!tab || !event.currentTarget.contains(tab)) return;
+    const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]')).filter((item) => !item.disabled);
+    const index = tabs.indexOf(tab);
+    if (index === -1) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 0
+      : event.key === "End" ? tabs.length - 1
+      : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[next].focus();
+    tabs[next].click();
+  };
+
   return (
     <div
       ref={tablistRef}
       role="tablist"
       aria-label={ariaLabel}
-      onKeyDown={onKeyDown}
+      onKeyDown={handleKeyDown}
       className={`flex flex-1 min-w-0 gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${className}`}
     >
       {options.map((option) => {
@@ -34,15 +51,14 @@ export function PeriodRangeTabs({
             : "text-oai-gray-500 dark:text-oai-gray-300 hover:text-oai-black dark:hover:text-oai-white hover:bg-oai-gray-50 dark:hover:bg-oai-gray-800"
         }`;
 
-        if (key === customKey && customRange && onCustomRangeOpenChange && onCustomRangeApply) {
+        if (key === customKey) {
+          // A custom tab without a picker must not activate an invalid query.
+          if (!customRange || !onCustomRangeOpenChange || !onCustomRangeApply) return null;
           return (
             <DateRangePickerPopover
               key={String(key)}
               open={Boolean(customRangeOpen)}
-              onOpenChange={(open) => {
-                if (open && activateCustomOnOpen) onChange?.(key);
-                onCustomRangeOpenChange(open);
-              }}
+              onOpenChange={onCustomRangeOpenChange}
               from={customRange.from}
               to={customRange.to}
               active={active}
@@ -56,7 +72,12 @@ export function PeriodRangeTabs({
                   className={tabClass}
                 />
               }
-              onApply={onCustomRangeApply}
+              onApply={(from, to) => {
+                // Commit the dates before activating the query. Opening or
+                // dismissing the picker must never submit an empty/stale range.
+                onCustomRangeApply(from, to);
+                onChange?.(key);
+              }}
             />
           );
         }
@@ -69,7 +90,10 @@ export function PeriodRangeTabs({
             tabIndex={active ? 0 : -1}
             type="button"
             className={tabClass}
-            onClick={() => onChange?.(key)}
+            onClick={() => {
+              onCustomRangeOpenChange?.(false);
+              onChange?.(key);
+            }}
           >
             {label}
           </button>

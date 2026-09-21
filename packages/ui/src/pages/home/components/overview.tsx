@@ -65,7 +65,6 @@ function OverviewRangeTabs({
       onCustomRangeOpenChange={setCustomOpen}
       onCustomRangeApply={(from: string, to: string) => {
         setCustomRange?.({ from, to });
-        setRange("custom");
       }}
       ariaLabel={t("Usage over time")}
       className="w-full"

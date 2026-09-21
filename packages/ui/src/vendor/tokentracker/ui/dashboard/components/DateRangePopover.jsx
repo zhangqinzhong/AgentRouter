@@ -43,25 +43,29 @@ export function DateRangePickerPopover({
   onApply,
   label,
   active = false,
-  trigger,
+  trigger = <button type="button" className="shrink-0 whitespace-nowrap text-xs font-medium px-3 py-1.5 rounded-md transition-colors text-oai-black dark:text-oai-white bg-oai-gray-100 dark:bg-oai-gray-800" />,
   align = "start",
   side = "bottom",
   sideOffset = 8,
 }) {
   const dateLocale = getDateFnsLocale(getCopyLocale());
   const displayLabel = active && from && to
-    ? `${formatDateShort(from, dateLocale)} — ${formatDateShort(to, dateLocale)}`
+    ? from === to
+      ? formatDateShort(from, dateLocale)
+      : `${formatDateShort(from, dateLocale)} — ${formatDateShort(to, dateLocale)}`
     : label;
 
   return (
     <Popover.Root open={open} onOpenChange={onOpenChange}>
-      <Popover.Trigger render={trigger}>
+      <Popover.Trigger render={trigger} aria-label={label}>
         {displayLabel}
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Positioner sideOffset={sideOffset} side={side} align={align} className="!z-[9999]">
           <Popover.Popup className="bg-white dark:bg-oai-gray-900 border border-oai-gray-200 dark:border-oai-gray-700 rounded-xl shadow-lg">
-            <DateRangePopover
+            {/* Unmount on every dismissal, including Escape/outside clicks,
+                so a rapid reopen cannot retain an uncommitted draft. */}
+            {open ? <DateRangePopover
               key={`${from || ""}:${to || ""}`}
               from={from}
               to={to}
@@ -70,7 +74,7 @@ export function DateRangePickerPopover({
                 onOpenChange?.(false);
               }}
               onCancel={() => onOpenChange?.(false)}
-            />
+            /> : null}
           </Popover.Popup>
         </Popover.Positioner>
       </Popover.Portal>

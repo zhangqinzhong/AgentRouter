@@ -330,7 +330,6 @@ export function TrendPeriodTabs({
    customRangeOpen={customRangeOpen}
    onCustomRangeOpenChange={onCustomRangeOpenChange}
    onCustomRangeApply={onCustomRangeApply}
-   activateCustomOnOpen
    ariaLabel={copy('usage.overview.tablist_aria')}
   />
  );

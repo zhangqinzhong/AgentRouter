@@ -1,9 +1,8 @@
 import React from "react";
-import { Popover } from "@base-ui/react/popover";
 import { X, ChevronLeft, ChevronRight, Terminal } from "lucide-react";
 import { copy } from "../../../lib/copy";
 import { cn } from "../../../lib/cn";
-import { DateRangePopover } from "./DateRangePopover.jsx";
+import { DateRangePickerPopover } from "./DateRangePopover.jsx";
 import { useCurrency } from "../../../hooks/useCurrency.js";
 import { useTokenFormat } from "../../../hooks/useTokenFormat.js";
 import { formatTokenCount } from "../../../lib/token-format.js";
@@ -142,6 +141,8 @@ export function TrendMonitorZoomModal({
 
   // Switch tier; Day/Month reset to their default window so the range stays sane.
   const selectGranularity = (next) => {
+    setDayPickerOpen(false);
+    setRangePickerOpen(false);
     setZoomPeriod(next);
     if (next !== "day") setRangeSel(defaultRangeForPeriod(next, todayKey));
   };
@@ -191,11 +192,11 @@ export function TrendMonitorZoomModal({
 
   React.useEffect(() => {
     const onKey = (e) => {
-      if (e.key === "Escape") handleClose();
+      if (e.key === "Escape" && !dayPickerOpen && !rangePickerOpen) handleClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleClose]);
+  }, [handleClose, dayPickerOpen, rangePickerOpen]);
 
   if (typeof document === "undefined") return null;
 
@@ -367,29 +368,16 @@ export function TrendMonitorZoomModal({
                 >
                   <ChevronLeft size={16} />
                 </button>
-                <Popover.Root open={dayPickerOpen} onOpenChange={setDayPickerOpen}>
-                  <Popover.Trigger
-                    aria-label={copy("trend.zoom.pick_day")}
-                    className="text-[12px] font-medium text-oai-gray-700 dark:text-oai-gray-200 tabular-nums min-w-[100px] text-center px-2 py-0.5 rounded-md border border-oai-gray-200 dark:border-oai-gray-800 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 transition-colors"
-                  >
-                    {selectedDay || "—"}
-                  </Popover.Trigger>
-                  <Popover.Portal>
-                    <Popover.Positioner sideOffset={8} side="bottom" align="center" className="!z-[9999]">
-                      <Popover.Popup className="bg-white dark:bg-oai-gray-900 border border-oai-gray-200 dark:border-oai-gray-700 rounded-xl shadow-lg">
-                        <DateRangePopover
-                          from={selectedDay}
-                          to={selectedDay}
-                          onApply={(fromStr) => {
-                            if (fromStr) setSelectedDay(fromStr);
-                            setDayPickerOpen(false);
-                          }}
-                          onCancel={() => setDayPickerOpen(false)}
-                        />
-                      </Popover.Popup>
-                    </Popover.Positioner>
-                  </Popover.Portal>
-                </Popover.Root>
+                <DateRangePickerPopover
+                  open={dayPickerOpen}
+                  onOpenChange={setDayPickerOpen}
+                  from={selectedDay}
+                  to={selectedDay}
+                  active
+                  label={copy("trend.zoom.pick_day")}
+                  align="center"
+                  onApply={(fromStr) => setSelectedDay(fromStr)}
+                />
                 <button
                   type="button"
                   onClick={() => canNextDay && setSelectedDay((d) => shiftDay(d, 1))}
@@ -401,33 +389,16 @@ export function TrendMonitorZoomModal({
                 </button>
               </div>
             ) : (
-              <Popover.Root open={rangePickerOpen} onOpenChange={setRangePickerOpen}>
-                <Popover.Trigger
-                  aria-label={copy("trend.zoom.pick_range")}
-                  className="text-xs font-medium text-oai-gray-600 dark:text-oai-gray-300 tabular-nums px-2.5 py-1 rounded-md border border-oai-gray-200 dark:border-oai-gray-800 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 transition-colors select-none"
-                >
-                  {rangeSel.from && rangeSel.to
-                    ? rangeSel.from === rangeSel.to
-                      ? rangeSel.from
-                      : `${rangeSel.from} → ${rangeSel.to}`
-                    : "—"}
-                </Popover.Trigger>
-                <Popover.Portal>
-                  <Popover.Positioner sideOffset={8} side="bottom" align="end" className="!z-[9999]">
-                    <Popover.Popup className="bg-white dark:bg-oai-gray-900 border border-oai-gray-200 dark:border-oai-gray-700 rounded-xl shadow-lg">
-                      <DateRangePopover
-                        from={rangeSel.from}
-                        to={rangeSel.to}
-                        onApply={(f, t) => {
-                          if (f) setRangeSel({ from: f, to: t || f });
-                          setRangePickerOpen(false);
-                        }}
-                        onCancel={() => setRangePickerOpen(false)}
-                      />
-                    </Popover.Popup>
-                  </Popover.Positioner>
-                </Popover.Portal>
-              </Popover.Root>
+              <DateRangePickerPopover
+                open={rangePickerOpen}
+                onOpenChange={setRangePickerOpen}
+                from={rangeSel.from}
+                to={rangeSel.to}
+                active
+                label={copy("trend.zoom.pick_range")}
+                align="end"
+                onApply={(from, to) => setRangeSel({ from, to })}
+              />
             )}
           </div>
 

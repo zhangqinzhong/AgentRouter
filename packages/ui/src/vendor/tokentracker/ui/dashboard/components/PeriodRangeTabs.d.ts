@@ -1,23 +1,20 @@
-import type { ComponentType, KeyboardEventHandler, ReactElement, Ref } from "react";
+import type { KeyboardEventHandler, ReactElement, Ref } from "react";
 
-export type PeriodRangeOption = {
-  key?: string;
-  value?: string;
+export type PeriodRangeOption<T extends string = string> = {
   label?: string;
-};
+} & ({ key: T; value?: T } | { key?: T; value: T });
 
-export const PeriodRangeTabs: ComponentType<{
-  value?: string;
-  options: PeriodRangeOption[];
-  onChange?: (value: any) => void;
-  customKey?: string;
+export function PeriodRangeTabs<T extends string>(props: {
+  value?: T;
+  options: PeriodRangeOption<T>[];
+  onChange?: (value: T) => void;
+  customKey?: T;
   customRange?: { from?: string; to?: string };
   customRangeOpen?: boolean;
   onCustomRangeOpenChange?: (open: boolean) => void;
   onCustomRangeApply?: (from: string, to: string) => void;
-  activateCustomOnOpen?: boolean;
   ariaLabel?: string;
   tablistRef?: Ref<HTMLDivElement>;
   onKeyDown?: KeyboardEventHandler<HTMLDivElement>;
   className?: string;
-}>;
+}): ReactElement;

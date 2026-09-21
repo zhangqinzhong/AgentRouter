@@ -94,15 +94,13 @@ hover 卡 / 弹层统一：`rounded-xl border border-oai-gray-200/50 bg-white/95
 
 ## 5. 组件模式
 
-### 5.1 时间范围 tabs（概览页实现，勿用 SegmentedControl）
+### 5.1 时间范围与自定义日期（以用量页为基准）
 
-```tsx
-<button aria-pressed={active}
-  className={cn("px-1 py-1 text-[11px]",
-    active ? "font-semibold text-foreground"
-           : "font-normal text-muted-foreground/70 hover:text-muted-foreground")}>
-```
-无底色、无边框，纯字重+颜色切换。自定义范围 tab 点击弹日期面板（两个原生 `<input type="date">` + 应用按钮，`overview.tsx` 的 `OverviewRangeTabs`）。
+- 概览、用量、趋势的时间范围栏统一复用 `PeriodRangeTabs`（`packages/ui/src/vendor/tokentracker/ui/dashboard/components/PeriodRangeTabs.jsx`），使用用量页的小尺寸圆角标签、选中底色和单行横向滚动布局。各页保留自己的时间范围选项，不混淆滚动 7 天与自然周等查询口径。
+- 自定义日期统一复用 `DateRangePickerPopover`（同目录 `DateRangePopover.jsx`）：双月历、年月下拉、范围选择、应用与取消按钮。趋势放大窗口也使用这个组件，不再手写 Popover 包壳或原生日期输入框。
+- 打开弹层、编辑日期、点击取消、按 Escape 或点击外部都不改变已生效的查询范围。只有“应用”才提交日期并切换到自定义；关闭后丢弃未应用的草稿。
+- `onCustomRangeApply` 只保存日期，公共 tabs 组件负责随后调用 `onChange("custom")`。普通标签切换会关闭日历，禁止页面自行实现“打开即生效”或特殊拦截自定义标签。
+- 日期标签、日历和按钮跟随当前界面语言；标签使用 `role="tab"` / `aria-selected`，公共组件统一处理方向键、Home / End 导航。
 
 ### 5.2 筛选器与次要操作
 

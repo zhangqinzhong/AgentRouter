@@ -294,25 +294,6 @@ export function UsageOverview({
     setExpandedProvider(ALL_PROVIDERS_KEY);
   }, [period, from, to, selectedDevice]);
 
-  const handleTablistKeyDown = (event) => {
-    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-    const tabElements = Array.from(
-      event.currentTarget.querySelectorAll('[role="tab"]'),
-    ).filter((tab) => !tab.disabled);
-    const currentIndex = tabElements.indexOf(event.target.closest('[role="tab"]'));
-    if (currentIndex === -1 || tabElements.length === 0) return;
-
-    event.preventDefault();
-    let nextIndex = currentIndex;
-    if (event.key === "Home") nextIndex = 0;
-    else if (event.key === "End") nextIndex = tabElements.length - 1;
-    else if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % tabElements.length;
-    else nextIndex = (currentIndex - 1 + tabElements.length) % tabElements.length;
-
-    tabElements[nextIndex].focus();
-    tabElements[nextIndex].click();
-  };
-
   const summaryContent = showAnimatedSummary ? (
     <Counter
       value={summaryCounterValue}
@@ -373,10 +354,8 @@ export function UsageOverview({
             customRangeOpen={customRangeOpen}
             onCustomRangeOpenChange={onCustomRangeOpenChange}
             onCustomRangeApply={onCustomRangeApply}
-            activateCustomOnOpen
             ariaLabel={copy("usage.overview.tablist_aria")}
             tablistRef={tablistRef}
-            onKeyDown={handleTablistKeyDown}
           />
           <div className="flex items-center gap-1.5 shrink-0">
             {deviceOptions.length > 1 ? (

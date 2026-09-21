@@ -42,11 +42,8 @@ export const LocalTrendView=memo(function LocalTrendView(){
       customRange={custom}
       customRangeOpen={calendarOpen}
       onCustomRangeOpenChange={setCalendarOpen}
-      onCustomRangeApply={(from:string,to:string)=>{setCustom({from,to});setPeriod('custom');}}
-      onPeriodChange={(value)=>{
-       if(value!=='custom')setCalendarOpen(false);
-       setPeriod(value);
-      }}
+      onCustomRangeApply={(from:string,to:string)=>setCustom({from,to})}
+      onPeriodChange={setPeriod}
      />
     </div>
    </div>

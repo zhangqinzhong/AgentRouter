@@ -42,13 +42,13 @@ export const LocalUsageView=memo(function LocalUsageView(){
  return <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
    <h1 className="mb-8 text-[24px] font-semibold tracking-[-0.025em]">{t('Usage')}</h1>
    {error ? <div role="alert" className="mb-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}<button type="button" className="ml-3 underline" onClick={()=>setRevision(v=>v+1)}>{t('Retry')}</button></div>:null}
-   <UsageOverview period={period} periods={['day','week','month','total','custom']} onPeriodChange={value=>{if(value==='custom'){setCalendarOpen(true);return;}setPeriod(value as Period)}}
+   <UsageOverview period={period} periods={['day','week','month','total','custom']} onPeriodChange={value=>setPeriod(value as Period)}
     summaryValue={display} summaryFullValue={formatTokenCount(tokens,{forceFull:true,locale:numberLocale})} onToggleSummaryFormat={()=>setFull(v=>!v)} summaryLabel={language==='zh'?'TOKEN 总数':'TOTAL TOKENS'}
     summaryCostValue={data?new Intl.NumberFormat(numberLocale,{style:'currency',currency:'USD'}).format(Number(data.totals.total_cost_usd??0)):''}
     onCostInfo={()=>setCostOpen(true)}
     fleetData={fleet} onRefresh={()=>setRevision(v=>v+1)} loading={loading} summaryLoading={loading||(!data&&!error)} providersLoading={loading||(!data&&!error)} hasSummary={!!data}
     from={period==='total'?(data?.firstActivityDay??range.to):range.from} to={range.to} customFrom={custom.from} customTo={custom.to}
-    customRangeOpen={calendarOpen} onCustomRangeOpenChange={setCalendarOpen} onCustomRangeApply={(from,to)=>{setCustom({from,to});setPeriod('custom');setCalendarOpen(false)}}/>
+    customRangeOpen={calendarOpen} onCustomRangeOpenChange={setCalendarOpen} onCustomRangeApply={(from,to)=>setCustom({from,to})}/>
    <CostAnalysisModal isOpen={costOpen} onClose={()=>setCostOpen(false)} fleetData={fleet}/>
  </div>;
 });
