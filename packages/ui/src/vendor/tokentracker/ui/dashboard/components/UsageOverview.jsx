@@ -31,7 +31,8 @@ import { useTokenFormat } from "../../../hooks/useTokenFormat.js";
 import { copy, getCopyLocale } from "../../../lib/copy";
 import { CURRENCY_USD, getCurrencySymbol } from "../../../lib/currency";
 import { formatProviderDisplayName } from "../../../lib/provider-display";
-import { DateRangePickerPopover, formatDateShort, getDateFnsLocale } from "./DateRangePopover.jsx";
+import { formatDateShort, getDateFnsLocale } from "./DateRangePopover.jsx";
+import { PeriodRangeTabs } from "./PeriodRangeTabs.jsx";
 import { ProviderIcon } from "./ProviderIcon.jsx";
 import { formatUsdCurrency } from "../../../lib/format";
 import { buildAllModels } from "../../../lib/model-breakdown";
@@ -364,57 +365,19 @@ export function UsageOverview({
         {/* Header: Period Tabs + Refresh. Tabs are a single horizontal-scroll
             strip (never wrap into stacked rows); actions stay pinned right. */}
         <div className="flex items-center gap-2 mb-6">
-          <div ref={tablistRef} role="tablist" aria-label={copy("usage.overview.tablist_aria")} onKeyDown={handleTablistKeyDown} className="flex flex-1 min-w-0 gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-            {tabs.map((p) => {
-              const isActive = period === p.key;
-              const tabClass = `shrink-0 whitespace-nowrap text-xs font-medium px-3 py-1.5 rounded-md transition-colors ${
-                isActive
-                  ? "text-oai-black dark:text-oai-white bg-oai-gray-100 dark:bg-oai-gray-800"
-                  : "text-oai-gray-500 dark:text-oai-gray-300 hover:text-oai-black dark:hover:text-oai-white hover:bg-oai-gray-50 dark:hover:bg-oai-gray-800"
-              }`;
-
-              if (p.key === "custom") {
-                return (
-                  <DateRangePickerPopover
-                    key="custom"
-                    open={customRangeOpen}
-                    onOpenChange={(open) => {
-                      if (open) onPeriodChange?.("custom");
-                      onCustomRangeOpenChange?.(open);
-                    }}
-                    from={customFrom}
-                    to={customTo}
-                    active={isActive}
-                    label={p.label}
-                    trigger={
-                      <button
-                        role="tab"
-                        aria-selected={isActive}
-                        tabIndex={isActive ? 0 : -1}
-                        type="button"
-                        className={tabClass}
-                      />
-                    }
-                    onApply={onCustomRangeApply}
-                  />
-                );
-              }
-
-              return (
-                <button
-                  key={p.key}
-                  role="tab"
-                  aria-selected={isActive}
-                  tabIndex={isActive ? 0 : -1}
-                  type="button"
-                  className={tabClass}
-                  onClick={() => onPeriodChange?.(p.key)}
-                >
-                  {p.label}
-                </button>
-              );
-            })}
-          </div>
+          <PeriodRangeTabs
+            value={period}
+            options={tabs}
+            onChange={onPeriodChange}
+            customRange={{ from: customFrom, to: customTo }}
+            customRangeOpen={customRangeOpen}
+            onCustomRangeOpenChange={onCustomRangeOpenChange}
+            onCustomRangeApply={onCustomRangeApply}
+            activateCustomOnOpen
+            ariaLabel={copy("usage.overview.tablist_aria")}
+            tablistRef={tablistRef}
+            onKeyDown={handleTablistKeyDown}
+          />
           <div className="flex items-center gap-1.5 shrink-0">
             {deviceOptions.length > 1 ? (
               <Select
