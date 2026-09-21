@@ -1,6 +1,6 @@
 {
   "name": "@agentrouter/electron",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "private": true,
   "description": "AgentRouter Electron desktop shell.",
   "author": "zhangqinzhong",

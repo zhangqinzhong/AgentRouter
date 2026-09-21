@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.6.3 - 2026-09-21
+
+- Unified compact number formatting across Overview, Usage, Trend, Heatmap and Sessions so Chinese uses 万/亿/万亿 and English uses K/M/B/T.
+- Made full-value tooltips and ordinary counters follow the selected interface locale, and removed the separate TokenTracker unit-system localStorage preference.
+- Replaced per-page language inference with a single app-level locale sync for vendored TokenTracker views.
+
 ## 1.6.2 - 2026-09-20
 
 - Fixed overview model, client and provider analysis to ignore empty rows and keep aggregate totals aligned with the displayed breakdown.
