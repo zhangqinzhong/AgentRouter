@@ -2,7 +2,7 @@ import {
   Button, CircleAlert, cn, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
   formatCompactNumber, formatPercent, formatUsdCost, isGatewayProviderEnabled, LoaderCircle,
   GatewayProviderConfig, ProviderAccountSnapshot, Select, Trash2, UsageComparisonRow, usageRangeOptions,
-  UsageDateRange, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useEffect, useState, X
+  UsageDateRange, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useState, X
 } from "../shared/index";
 import { useMemo } from "react";
 import { DateRangePickerPopover } from "@/vendor/tokentracker/ui/dashboard/components/DateRangePopover";

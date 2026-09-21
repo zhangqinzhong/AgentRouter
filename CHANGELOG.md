@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.6.6 - 2026-09-21
+
+- Fixed the release build after the shared custom date-range picker refactor.
+
 ## 1.6.5 - 2026-09-21
 
 - Unified custom date-range selection across Overview, Usage and Trend with the Usage page calendar popover.
