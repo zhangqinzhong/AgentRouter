@@ -1,7 +1,7 @@
 import {useEffect,useId,useMemo,useRef} from 'react';
 import {Area,AreaChart,CartesianGrid,ResponsiveContainer,Tooltip,XAxis,YAxis} from 'recharts';
 import {getModelColor,mergeModelSegments} from '@/vendor/tokentracker/ui/dashboard/components/TrendMonitor';
-import {DateRangePickerPopover} from '@/vendor/tokentracker/ui/dashboard/components/DateRangePopover';
+import {PeriodRangeTabs} from '@/vendor/tokentracker/ui/dashboard/components/PeriodRangeTabs';
 import {copy,getCopyLocale} from '@/vendor/tokentracker/lib/copy';
 import {formatUsdCurrency} from '@/vendor/tokentracker/lib/format';
 import {modelDisplayName} from '@/vendor/tokentracker/lib/model-display';
@@ -320,41 +320,19 @@ export function TrendPeriodTabs({
  onCustomRangeOpenChange?:(open:boolean)=>void;
  onCustomRangeApply?:(from:string,to:string)=>void;
 }){
+ const options=periods.map((value)=>({key:value,label:copy(`usage.period.${value}`)}));
  return (
-  <div className="flex flex-wrap items-center gap-2.5">
-   {periods.map((value)=>{
-    const active=period===value;
-    const tabClass=`px-1 py-1 text-[11px] ${active?'font-semibold text-foreground':'font-normal text-muted-foreground/70 hover:text-muted-foreground'}`;
-    if(value==='custom'&&customRange&&onCustomRangeOpenChange&&onCustomRangeApply){
-     return (
-      <DateRangePickerPopover
-       key="custom"
-       open={Boolean(customRangeOpen)}
-       onOpenChange={(open)=>{
-        if(open)onPeriodChange('custom');
-        onCustomRangeOpenChange(open);
-       }}
-       from={customRange.from}
-       to={customRange.to}
-       active={active}
-       label={copy('usage.period.custom')}
-       trigger={<button type="button" className={tabClass}/>}
-       onApply={onCustomRangeApply}
-      />
-     );
-    }
-    return (
-     <button
-      key={value}
-      type="button"
-      onClick={()=>onPeriodChange(value)}
-      className={tabClass}
-     >
-      {copy(`usage.period.${value}`)}
-     </button>
-    );
-   })}
-  </div>
+  <PeriodRangeTabs
+   value={period}
+   options={options}
+   onChange={onPeriodChange}
+   customRange={customRange}
+   customRangeOpen={customRangeOpen}
+   onCustomRangeOpenChange={onCustomRangeOpenChange}
+   onCustomRangeApply={onCustomRangeApply}
+   activateCustomOnOpen
+   ariaLabel={copy('usage.overview.tablist_aria')}
+  />
  );
 }
 
