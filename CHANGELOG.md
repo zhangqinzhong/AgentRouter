@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.6.7 - 2026-09-21
+
+- Extracted the Usage period/custom date-range tabs into a shared component and reused it in Overview and Trend for consistent styling and behavior.
+
 ## 1.6.6 - 2026-09-21
 
 - Fixed the release build after the shared custom date-range picker refactor.
