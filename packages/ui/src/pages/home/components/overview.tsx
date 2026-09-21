@@ -5,7 +5,7 @@ import {
   UsageDateRange, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useState, X
 } from "../shared/index";
 import { useMemo } from "react";
-import { DateRangePickerPopover } from "@/vendor/tokentracker/ui/dashboard/components/DateRangePopover";
+import { PeriodRangeTabs } from "@/vendor/tokentracker/ui/dashboard/components/PeriodRangeTabs";
 import { ProviderAccountsSection } from "./overview-accounts";
 import { OverviewBreakdowns } from "./overview-breakdown";
 import { SystemStatusStrip } from "./overview-status";
@@ -50,56 +50,26 @@ function OverviewRangeTabs({
 }) {
   const t = useAppText();
   const [customOpen, setCustomOpen] = useState(false);
+  const options = useMemo(
+    () => usageRangeOptions.map((option) => ({ key: option.value, label: t(option.label) })),
+    [t]
+  );
 
   return (
-    <div aria-label={t("Usage over time")} className="flex flex-wrap items-center gap-2.5" role="group">
-      {usageRangeOptions.map((option) => {
-        const active = range === option.value;
-        const tabClass = cn(
-          "px-1 py-1 text-[11px]",
-          active
-            ? "font-semibold text-foreground"
-            : "font-normal text-muted-foreground/70 hover:text-muted-foreground"
-        );
-
-        if (option.value === "custom") {
-          return (
-            <DateRangePickerPopover
-              key="custom"
-              open={customOpen}
-              onOpenChange={setCustomOpen}
-              from={customRange?.from}
-              to={customRange?.to}
-              active={range === "custom"}
-              label={t("Custom")}
-              trigger={
-                <button
-                  aria-pressed={range === "custom"}
-                  className={tabClass}
-                  type="button"
-                />
-              }
-              onApply={(from, to) => {
-                setCustomRange?.({ from, to });
-                setRange("custom");
-              }}
-            />
-          );
-        }
-
-        return (
-          <button
-            aria-pressed={active}
-            className={tabClass}
-            key={option.value}
-            onClick={() => setRange(option.value)}
-            type="button"
-          >
-            {t(option.label)}
-          </button>
-        );
-      })}
-    </div>
+    <PeriodRangeTabs
+      value={range}
+      options={options}
+      onChange={(value: UsageStatsRange) => setRange(value)}
+      customRange={customRange}
+      customRangeOpen={customOpen}
+      onCustomRangeOpenChange={setCustomOpen}
+      onCustomRangeApply={(from: string, to: string) => {
+        setCustomRange?.({ from, to });
+        setRange("custom");
+      }}
+      ariaLabel={t("Usage over time")}
+      className="w-full"
+    />
   );
 }
 
