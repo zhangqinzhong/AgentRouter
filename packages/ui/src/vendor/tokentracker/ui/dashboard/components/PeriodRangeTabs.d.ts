@@ -9,7 +9,7 @@ export type PeriodRangeOption = {
 export const PeriodRangeTabs: ComponentType<{
   value?: string;
   options: PeriodRangeOption[];
-  onChange?: (value: string) => void;
+  onChange?: (value: any) => void;
   customKey?: string;
   customRange?: { from?: string; to?: string };
   customRangeOpen?: boolean;
