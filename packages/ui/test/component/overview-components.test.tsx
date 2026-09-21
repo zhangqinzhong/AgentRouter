@@ -82,9 +82,9 @@ test("OverviewView renders the range filter as flat tabs with one active option"
   assert.match(html, />7d</);
   assert.match(html, />30d</);
   assert.match(html, />Custom</);
-  const active = html.match(/aria-pressed="true"/g) ?? [];
+  const active = html.match(/aria-selected="true"/g) ?? [];
   assert.equal(active.length, 1);
-  assert.match(html, /font-semibold text-foreground/);
+  assert.match(html, /bg-oai-gray-100/);
   assert.doesNotMatch(html, /overview-segmented/);
 });
 
