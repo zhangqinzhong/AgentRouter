@@ -1,6 +1,6 @@
 import {memo,useEffect,useMemo,useRef,useState,type MouseEvent} from 'react';
 import {createPortal} from 'react-dom';
-import {copy,setUsageLocale} from '@/vendor/tokentracker/lib/copy';
+import {copy} from '@/vendor/tokentracker/lib/copy';
 import {buildActivityHeatmap,computeActiveStreakDays} from '@/vendor/tokentracker/lib/activity-heatmap';
 import {formatTokenCount,formatTokenTooltip} from '@/vendor/tokentracker/lib/token-format';
 import {formatTimeZoneLabel,getBrowserTimeZone,getBrowserTimeZoneOffsetMinutes} from '@/vendor/tokentracker/lib/timezone';
@@ -171,7 +171,7 @@ function initials(name:string){
 }
 
 export const LocalHeatmapView=memo(function LocalHeatmapView(){
- const t=useAppText();setUsageLocale(t('Usage')==='用量'?'zh':'en');
+ const t=useAppText();
  const [heatmap,setHeatmap]=useState<HeatmapPayload>();
  const [tools,setTools]=useState<HeatmapTool[]>([]);
  const [toolsLoading,setToolsLoading]=useState(true);

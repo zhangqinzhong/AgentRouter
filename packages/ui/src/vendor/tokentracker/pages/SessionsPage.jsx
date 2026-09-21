@@ -11,7 +11,8 @@ import { LocalOnlyNotice } from "../components/LocalOnlyNotice.jsx";
 import { copy } from "../lib/copy";
 import { cn } from "../lib/cn";
 import { getSessions } from "../lib/sessions-api";
-import { formatCompactNumber, formatUsdCurrency } from "../lib/format";
+import { formatUsdCurrency, toDisplayNumber } from "../lib/format";
+import { formatTokenCount } from "../lib/token-format";
 import { useCurrency } from "../hooks/useCurrency";
 import { useLocale } from "../hooks/useLocale";
 import { isLocalDashboardHost } from "../lib/host-mode";
@@ -266,7 +267,7 @@ function modelUsageLabel(session) {
   const rows = modelUsageRows(session);
   if (rows.length === 1) return rows[0].model;
   return rows
-    .map((row) => `${row.model} ${formatCompactNumber(Number(row.total_tokens || 0))}`)
+    .map((row) => `${row.model} ${formatTokenCount(Number(row.total_tokens || 0))}`)
     .join(" · ");
 }
 
@@ -338,25 +339,25 @@ const SessionRow = React.memo(function SessionRow({
   const isGrok = String(session.source || "").toLowerCase() === "grok";
   const grokTokenBreakdown = isGrok && session.usage_precision
     ? copy("sessions.grok.token_breakdown", {
-        input: formatCompactNumber(session.input_tokens),
-        cacheRead: formatCompactNumber(session.cached_input_tokens),
-        cacheWrite: formatCompactNumber(session.cache_creation_input_tokens),
-        output: formatCompactNumber(session.output_tokens),
-        reasoning: formatCompactNumber(session.reasoning_output_tokens),
+        input: formatTokenCount(session.input_tokens),
+        cacheRead: formatTokenCount(session.cached_input_tokens),
+        cacheWrite: formatTokenCount(session.cache_creation_input_tokens),
+        output: formatTokenCount(session.output_tokens),
+        reasoning: formatTokenCount(session.reasoning_output_tokens),
       })
     : null;
   const grokRuntimeBreakdown = isGrok && session.usage_precision
     ? copy("sessions.grok.runtime_breakdown", {
-        calls: formatCompactNumber(session.model_calls),
+        calls: toDisplayNumber(session.model_calls, locale),
         seconds: (Number(session.api_duration_ms || 0) / 1000).toFixed(1),
-        tools: formatCompactNumber(session.tool_calls),
-        errors: formatCompactNumber(session.error_count),
+        tools: toDisplayNumber(session.tool_calls, locale),
+        errors: toDisplayNumber(session.error_count, locale),
       })
     : null;
   const grokContextBreakdown = isGrok && Number(session.context_window_tokens) > 0
     ? copy("sessions.grok.context_breakdown", {
-        used: formatCompactNumber(session.context_tokens_used),
-        window: formatCompactNumber(session.context_window_tokens),
+        used: formatTokenCount(session.context_tokens_used),
+        window: formatTokenCount(session.context_window_tokens),
         percent: Number(session.context_usage_percent || 0).toFixed(0),
       })
     : null;
@@ -547,17 +548,17 @@ const SessionRow = React.memo(function SessionRow({
             <dd
               title={Number(session.subagent_total_tokens)
                 ? copy("sessions.thread.tokens_summary", {
-                    own: formatCompactNumber(session.own_total_tokens),
-                    subagents: formatCompactNumber(session.subagent_total_tokens),
-                    combined: formatCompactNumber(session.combined_total_tokens),
+                    own: toDisplayNumber(session.own_total_tokens, locale),
+                    subagents: toDisplayNumber(session.subagent_total_tokens, locale),
+                    combined: formatTokenCount(session.combined_total_tokens),
                   })
                 : undefined}
               className="tabular-nums text-sm font-medium text-oai-black dark:text-white"
             >
-              {formatCompactNumber(session.total_tokens)}
+              {formatTokenCount(session.total_tokens)}
               {Number(session.subagent_total_tokens) ? (
                 <span className="block text-[9px] font-normal text-oai-gray-400 dark:text-oai-gray-500">
-                  Σ {formatCompactNumber(session.combined_total_tokens)}
+                  Σ {formatTokenCount(session.combined_total_tokens)}
                 </span>
               ) : null}
             </dd>
@@ -573,11 +574,11 @@ const SessionRow = React.memo(function SessionRow({
           </div>
           <div className="hidden w-10 flex-col-reverse sm:flex">
             <dt className="text-[11px] text-oai-gray-400 dark:text-oai-gray-500">{copy("sessions.col.turns")}</dt>
-            <dd className="tabular-nums text-sm font-medium text-oai-black dark:text-white">{formatCompactNumber(session.turns)}</dd>
+            <dd className="tabular-nums text-sm font-medium text-oai-black dark:text-white">{toDisplayNumber(session.turns, locale)}</dd>
           </div>
           <div className="hidden w-10 flex-col-reverse sm:flex">
             <dt className="text-[11px] text-oai-gray-400 dark:text-oai-gray-500">{copy("sessions.col.edits")}</dt>
-            <dd className="tabular-nums text-sm font-medium text-oai-black dark:text-white">{formatCompactNumber(session.edit_turns)}</dd>
+            <dd className="tabular-nums text-sm font-medium text-oai-black dark:text-white">{toDisplayNumber(session.edit_turns, locale)}</dd>
           </div>
         </dl>
 
@@ -667,7 +668,7 @@ function ThreadModelUsage({ sessions, selectedModel, onSelect }) {
         >
           {copy("sessions.thread.model_all", {
             count: sessions.length,
-            tokens: formatCompactNumber(totalTokens),
+            tokens: formatTokenCount(totalTokens),
           })}
         </button>
         {groups.map((group) => (
@@ -681,7 +682,7 @@ function ThreadModelUsage({ sessions, selectedModel, onSelect }) {
             {copy("sessions.thread.model_item", {
               model: group.model,
               count: group.count,
-              tokens: formatCompactNumber(group.tokens),
+              tokens: formatTokenCount(group.tokens),
             })}
           </button>
         ))}

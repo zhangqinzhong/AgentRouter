@@ -1,12 +1,12 @@
 import {memo,useEffect,useMemo,useRef,useState} from 'react';
 import {DateRangePopover} from '@/vendor/tokentracker/ui/dashboard/components/DateRangePopover';
-import {copy,setUsageLocale} from '@/vendor/tokentracker/lib/copy';
+import {copy} from '@/vendor/tokentracker/lib/copy';
 import {formatUsdCurrency} from '@/vendor/tokentracker/lib/format';
 import {formatTokenCount,formatTokenTooltip} from '@/vendor/tokentracker/lib/token-format';
 import {computeZoomStats,getTrendInsightKey} from '@/vendor/tokentracker/lib/trend-stats';
 import {formatTimeZoneLabel,getBrowserTimeZone,getBrowserTimeZoneOffsetMinutes} from '@/vendor/tokentracker/lib/timezone';
 import {useTrendData} from '@/vendor/tokentracker/hooks/use-trend-data';
-import {useAppText} from '../shared/index';
+import {useAppNumberLocale,useAppText} from '../shared/index';
 import {heatmapTrendRange,TrendPeriod,TrendPeriodTabs,UsageTrendLineChart} from './usage-trend-line';
 
 function StatCell({label,value,sub,title}:{label:string;value:string;sub?:string;title?:string}){
@@ -20,7 +20,7 @@ function StatCell({label,value,sub,title}:{label:string;value:string;sub?:string
 }
 
 export const LocalTrendView=memo(function LocalTrendView(){
- const t=useAppText();setUsageLocale(t('Usage')==='用量'?'zh':'en');
+ const t=useAppText();const numberLocale=useAppNumberLocale();
  const [period,setPeriod]=useState<TrendPeriod>('month');
  const [custom,setCustom]=useState(()=>heatmapTrendRange('day'));
  const [calendarOpen,setCalendarOpen]=useState(false);
@@ -70,7 +70,7 @@ export const LocalTrendView=memo(function LocalTrendView(){
    <div className="mb-6 grid grid-cols-2 gap-x-8 gap-y-5 border-y border-border/70 py-5 sm:grid-cols-4">
     <StatCell label={copy('trend.zoom.stats.tokens')} value={formatTokenCount(Number(stats.totalTokens)||0)} title={formatTokenTooltip(Number(stats.totalTokens)||0)}/>
     {stats.totalCostUsd!=null?<StatCell label={copy('trend.zoom.stats.cost')} value={formatUsdCurrency(stats.totalCostUsd)}/>:null}
-    <StatCell label={copy('trend.zoom.stats.conversations')} value={Number(stats.conversationCount||0).toLocaleString()}/>
+    <StatCell label={copy('trend.zoom.stats.conversations')} value={Number(stats.conversationCount||0).toLocaleString(numberLocale)}/>
     {stats.peak&&typeof stats.peak==='object'?<StatCell label={copy('trend.zoom.stats.peak')} value={formatTokenCount(Number((stats.peak as {value?:number}).value)||0)} title={formatTokenTooltip(Number((stats.peak as {value?:number}).value)||0)} sub={peakLabel.slice(0,16)}/>:null}
    </div>
    <p className="mb-8 border-l-2 border-emerald-500 pl-3 text-[13px] leading-relaxed text-muted-foreground">

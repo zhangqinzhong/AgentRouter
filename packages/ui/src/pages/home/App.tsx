@@ -1,3 +1,4 @@
+import { setUsageLocale } from "@/vendor/tokentracker/lib/copy";
 import {
   AddApiKeyDraft, AddProfileDraft, AddProviderDraft, AddRoutingRuleDraft, AgentAnalysisSessionSelection, AgentAnalysisSnapshot, AgentFilterValue,
   ApiKeyConfig, AppConfig, appCopy, AppI18nContext, AppInfo, AppSaveConfigOptions, AppUpdateStatus,
@@ -307,6 +308,7 @@ function App() {
   const updateActionBusyRef = useRef(false);
   const usageStatsRequestId = useRef(0);
   const resolvedLanguage = languagePreference === "system" ? systemLanguage : languagePreference;
+  setUsageLocale(resolvedLanguage);
   const copy = appCopy[resolvedLanguage];
   const t = useMemo(() => (value: string) => translateText(copy, value), [copy]);
   const formatError = useMemo(() => (error: unknown) => formatAppError(copy, error), [copy]);

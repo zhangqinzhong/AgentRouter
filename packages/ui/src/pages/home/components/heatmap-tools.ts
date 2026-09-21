@@ -135,5 +135,5 @@ export function toolIcon(id:string):LucideIcon{
 
 export function formatToolCalls(value:number){
  const count=Math.round(Number(value)||0);
- return new Intl.NumberFormat('en-US').format(count);
+ return new Intl.NumberFormat(getCopyLocale()).format(count);
 }

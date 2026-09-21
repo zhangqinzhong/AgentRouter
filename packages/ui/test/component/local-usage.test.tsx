@@ -17,12 +17,22 @@ test('tool proportions use collected totals without double adding cached tokens'
 
 import {modelDisplayName,compareOtherLast} from '../../src/vendor/tokentracker/lib/model-display';
 import {setUsageLocale} from '../../src/vendor/tokentracker/lib/copy';
+import {formatTokenCount,formatTokenTooltip} from '../../src/vendor/tokentracker/lib/token-format';
 import {matchingSessionProfiles,profileOpenSurfaces,resumeExtraArgs} from '../../src/vendor/tokentracker/pages/SessionsPage';
 import {formatToolCalls,toolDisplayName} from '../../src/pages/home/components/heatmap-tools';
 import {dailyRowsFromHeatmap,heatmapCellTokens} from '../../src/pages/home/components/local-heatmap';
 import {heatmapTrendRange,trendChartPoints} from '../../src/pages/home/components/usage-trend-line';
 import {buildActivityHeatmap} from '../../src/vendor/tokentracker/lib/activity-heatmap';
 test('unattributed models display Other and sort behind concrete models regardless of usage',()=>{setUsageLocale('zh');assert.equal(modelDisplayName('unknown'),'其他');const rows=[{name:'unknown',usage:999},{name:'gpt-test',usage:1}].sort((a,b)=>compareOtherLast(a,b)||b.usage-a.usage);assert.equal(rows[1].name,'unknown');setUsageLocale('en');assert.equal(modelDisplayName('unknown'),'Other');setUsageLocale('zh');});
+test('token units follow the active interface language without a separate unit preference',()=>{
+ setUsageLocale('zh');
+ assert.equal(formatTokenCount(14_400_000_000),'144亿');
+ assert.equal(formatTokenTooltip(14_400_000_000),'144亿 · 14,400,000,000');
+ setUsageLocale('en');
+ assert.equal(formatTokenCount(14_400_000_000),'14.4B');
+ assert.equal(formatTokenTooltip(14_400_000_000),'14.4B · 14,400,000,000');
+ setUsageLocale('zh');
+});
 test('heatmap trend range follows menu-bar day week month year windows',()=>{
  const date=new Date(2026,8,16,12);
  const empty={from:'',to:''};

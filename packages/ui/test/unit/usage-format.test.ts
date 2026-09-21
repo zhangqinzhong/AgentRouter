@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { formatLogTokenSummary, logRequestModel, logResponseModel } from "@agentrouter/ui/pages/home/shared/logs.ts";
-import { formatCompactNumber, formatPercentFixed, formatTokenRate, formatUsdCost as formatHomeUsdCost } from "@agentrouter/ui/pages/home/shared/usage.ts";
+import { formatCompactNumber, formatFullNumber, formatPercentFixed, formatTokenRate, formatUsdCost as formatHomeUsdCost } from "@agentrouter/ui/pages/home/shared/usage.ts";
 import { formatUsdCost as formatTrayUsdCost } from "@agentrouter/ui/pages/tray/shared.tsx";
 import type { RequestLogEntry } from "@agentrouter/core/contracts/app.ts";
 
-test("formatCompactNumber can be bound to the UI language locale", () => {
+test("formatCompactNumber follows English and Chinese UI units", () => {
   assert.equal(formatCompactNumber(123456, "en-US"), "123.5K");
   assert.equal(formatCompactNumber(123456, "zh-CN"), "12.3万");
+  assert.equal(formatCompactNumber(14_400_000_000, "en-US"), "14.4B");
+  assert.equal(formatCompactNumber(14_400_000_000, "zh-CN"), "144亿");
+  assert.equal(formatFullNumber(14_400_000_000, "zh-CN"), "14,400,000,000");
 });
 
 test("formatTokenRate keeps slow rates from rounding down to zero", () => {

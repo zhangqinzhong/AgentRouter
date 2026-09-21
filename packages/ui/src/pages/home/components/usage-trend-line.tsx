@@ -190,8 +190,8 @@ function TrendHoverTooltip({
    {(cost!=null||conversations>0||requests>0)&&(
     <div className="mt-2 flex items-center gap-3 text-[11px] text-oai-gray-500 dark:text-oai-gray-400">
      {cost!=null?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{formatUsdCurrency(cost)}</span> {copy('trend.zoom.tooltip.cost')}</span>:null}
-     {conversations>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{conversations.toLocaleString()}</span> {copy('trend.zoom.tooltip.conversations')}</span>:null}
-     {conversations<=0&&requests>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{requests.toLocaleString()}</span> {copy('trend.zoom.tooltip.requests')}</span>:null}
+     {conversations>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{conversations.toLocaleString(getCopyLocale())}</span> {copy('trend.zoom.tooltip.conversations')}</span>:null}
+     {conversations<=0&&requests>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{requests.toLocaleString(getCopyLocale())}</span> {copy('trend.zoom.tooltip.requests')}</span>:null}
     </div>
    )}
    {segments.length>0?(

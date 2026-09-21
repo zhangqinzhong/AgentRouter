@@ -1,3 +1,4 @@
+import { formatCompactNumber as formatLocalizedCompactNumber, formatFullNumber as formatLocalizedFullNumber } from "@/lib/number-format.js";
 import type {
   AgentAnalysisSnapshot,
   AgentKind,
@@ -141,10 +142,11 @@ export function emptyUsageTotals(): UsageTotals {
 }
 
 export function formatCompactNumber(value: number, locale?: Intl.LocalesArgument): string {
-  return new Intl.NumberFormat(locale, {
-    maximumFractionDigits: value >= 1000 ? 1 : 0,
-    notation: value >= 10000 ? "compact" : "standard"
-  }).format(value);
+  return formatLocalizedCompactNumber(value, { locale, decimals: 1 });
+}
+
+export function formatFullNumber(value: number, locale?: Intl.LocalesArgument): string {
+  return formatLocalizedFullNumber(value, { locale });
 }
 
 // Token rates are frequently below 10/s, and formatCompactNumber rounds those to
