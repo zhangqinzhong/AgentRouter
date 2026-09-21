@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.6.11 - 2026-09-21
+
+- Unified custom date selection across Overview, Usage, Trend and enlarged trend charts with the Usage page calendar.
+- Apply date changes only after confirmation; Cancel, Escape and outside clicks preserve the active range and discard unsubmitted selections.
+- Standardized localized date labels and keyboard navigation across shared period controls.
+- Preserved all-time Overview statistics and earlier local history, fixed the daily trend window limit for older gateway records, and kept tray ranges independent of Overview-only options.
+
 ## 1.6.10 - 2026-09-21
 
 - Made the shared Usage-style custom date range activate consistently when opened, so Overview, Usage and Trend use the same period/date-range behavior.
