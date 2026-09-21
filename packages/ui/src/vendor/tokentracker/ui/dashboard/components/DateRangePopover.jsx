@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Popover } from "@base-ui/react/popover";
 import { DayPicker, getDefaultClassNames } from "react-day-picker";
 import { format } from "date-fns";
 import { enUS, zhCN, zhTW, ja, ko } from "date-fns/locale";
@@ -32,6 +33,49 @@ export function formatDateShort(dateStr, locale) {
   const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
   if (!Number.isFinite(d.getTime())) return dateStr;
   return format(d, "MMM d", locale ? { locale } : undefined);
+}
+
+export function DateRangePickerPopover({
+  open,
+  onOpenChange,
+  from,
+  to,
+  onApply,
+  label,
+  active = false,
+  trigger,
+  align = "start",
+  side = "bottom",
+  sideOffset = 8,
+}) {
+  const dateLocale = getDateFnsLocale(getCopyLocale());
+  const displayLabel = active && from && to
+    ? `${formatDateShort(from, dateLocale)} — ${formatDateShort(to, dateLocale)}`
+    : label;
+
+  return (
+    <Popover.Root open={open} onOpenChange={onOpenChange}>
+      <Popover.Trigger render={trigger}>
+        {displayLabel}
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Positioner sideOffset={sideOffset} side={side} align={align} className="!z-[9999]">
+          <Popover.Popup className="bg-white dark:bg-oai-gray-900 border border-oai-gray-200 dark:border-oai-gray-700 rounded-xl shadow-lg">
+            <DateRangePopover
+              key={`${from || ""}:${to || ""}`}
+              from={from}
+              to={to}
+              onApply={(nextFrom, nextTo) => {
+                onApply?.(nextFrom, nextTo);
+                onOpenChange?.(false);
+              }}
+              onCancel={() => onOpenChange?.(false)}
+            />
+          </Popover.Popup>
+        </Popover.Positioner>
+      </Popover.Portal>
+    </Popover.Root>
+  );
 }
 
 /**

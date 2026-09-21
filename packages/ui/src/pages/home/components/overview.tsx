@@ -5,6 +5,7 @@ import {
   UsageDateRange, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useEffect, useState, X
 } from "../shared/index";
 import { useMemo } from "react";
+import { DateRangePickerPopover } from "@/vendor/tokentracker/ui/dashboard/components/DateRangePopover";
 import { ProviderAccountsSection } from "./overview-accounts";
 import { OverviewBreakdowns } from "./overview-breakdown";
 import { SystemStatusStrip } from "./overview-status";
@@ -36,14 +37,6 @@ function StatCell({ label, sub, title, value }: { label: string; sub?: string; t
 
 const emptyOverviewCustomRange: UsageDateRange = { from: "", to: "" };
 
-function formatCustomRangeLabel(value: string): string {
-  const date = new Date(`${value}T00:00:00`);
-  if (!Number.isFinite(date.getTime())) {
-    return value;
-  }
-  return new Intl.DateTimeFormat(undefined, { day: "2-digit", month: "2-digit" }).format(date);
-}
-
 function OverviewRangeTabs({
   customRange,
   range,
@@ -57,116 +50,55 @@ function OverviewRangeTabs({
 }) {
   const t = useAppText();
   const [customOpen, setCustomOpen] = useState(false);
-  const [draftFrom, setDraftFrom] = useState("");
-  const [draftTo, setDraftTo] = useState("");
-
-  useEffect(() => {
-    if (!customOpen) {
-      return;
-    }
-    const dismiss = (event: MouseEvent) => {
-      if (!(event.target instanceof Node) || !event.target.isConnected) {
-        return;
-      }
-      const panel = document.getElementById("overview-custom-range-panel");
-      if (panel && !panel.contains(event.target)) {
-        setCustomOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", dismiss);
-    return () => document.removeEventListener("mousedown", dismiss);
-  }, [customOpen]);
-
-  function openCustomPanel() {
-    setDraftFrom(customRange?.from ?? "");
-    setDraftTo(customRange?.to ?? "");
-    setCustomOpen(true);
-  }
-
-  function applyCustomRange() {
-    if (!draftFrom || !draftTo || draftFrom > draftTo) {
-      return;
-    }
-    setCustomRange?.({ from: draftFrom, to: draftTo });
-    setRange("custom");
-    setCustomOpen(false);
-  }
-
-  const draftReady = Boolean(draftFrom && draftTo && draftFrom <= draftTo);
-  const customActive = range === "custom" && customRange?.from && customRange.to;
-  const customLabel = customActive
-    ? `${formatCustomRangeLabel(customRange.from)} — ${formatCustomRangeLabel(customRange.to)}`
-    : t("Custom");
 
   return (
     <div aria-label={t("Usage over time")} className="flex flex-wrap items-center gap-2.5" role="group">
-      {usageRangeOptions.map((option) =>
-        option.value === "custom" ? (
-          <div className="relative" key="custom">
-            <button
-              aria-pressed={range === "custom"}
-              className={cn(
-                "px-1 py-1 text-[11px]",
-                range === "custom"
-                  ? "font-semibold text-foreground"
-                  : "font-normal text-muted-foreground/70 hover:text-muted-foreground"
-              )}
-              onClick={() => (customOpen ? setCustomOpen(false) : openCustomPanel())}
-              type="button"
-            >
-              {customLabel}
-            </button>
-            {customOpen ? (
-              <div
-                className="absolute right-0 top-[calc(100%+8px)] z-40 flex items-center gap-2 rounded-xl border border-border bg-popover p-3 shadow-lg"
-                id="overview-custom-range-panel"
-              >
-                <input
-                  aria-label={t("Start date")}
-                  className="h-8 rounded-md border border-border bg-background px-2 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-                  max={draftTo || undefined}
-                  onChange={(event) => setDraftFrom(event.target.value)}
-                  type="date"
-                  value={draftFrom}
-                />
-                <span className="text-[12px] text-muted-foreground">—</span>
-                <input
-                  aria-label={t("End date")}
-                  className="h-8 rounded-md border border-border bg-background px-2 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-                  min={draftFrom || undefined}
-                  onChange={(event) => setDraftTo(event.target.value)}
-                  type="date"
-                  value={draftTo}
-                />
-                <Button
-                  className="h-8 px-3 text-[12px]"
-                  disabled={!draftReady}
-                  onClick={applyCustomRange}
-                  size="sm"
+      {usageRangeOptions.map((option) => {
+        const active = range === option.value;
+        const tabClass = cn(
+          "px-1 py-1 text-[11px]",
+          active
+            ? "font-semibold text-foreground"
+            : "font-normal text-muted-foreground/70 hover:text-muted-foreground"
+        );
+
+        if (option.value === "custom") {
+          return (
+            <DateRangePickerPopover
+              key="custom"
+              open={customOpen}
+              onOpenChange={setCustomOpen}
+              from={customRange?.from}
+              to={customRange?.to}
+              active={range === "custom"}
+              label={t("Custom")}
+              trigger={
+                <button
+                  aria-pressed={range === "custom"}
+                  className={tabClass}
                   type="button"
-                >
-                  {t("Apply")}
-                </Button>
-              </div>
-            ) : null}
-          </div>
-        ) : (
+                />
+              }
+              onApply={(from, to) => {
+                setCustomRange?.({ from, to });
+                setRange("custom");
+              }}
+            />
+          );
+        }
+
+        return (
           <button
-            aria-pressed={range === option.value}
-            className={cn(
-              "px-1 py-1 text-[11px]",
-              range === option.value
-                ? "font-semibold text-foreground"
-                : "font-normal text-muted-foreground/70 hover:text-muted-foreground"
-            )}
+            aria-pressed={active}
+            className={tabClass}
             key={option.value}
             onClick={() => setRange(option.value)}
             type="button"
           >
             {t(option.label)}
           </button>
-        )
-      )}
+        );
+      })}
     </div>
   );
 }

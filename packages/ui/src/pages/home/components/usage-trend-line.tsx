@@ -1,6 +1,7 @@
 import {useEffect,useId,useMemo,useRef} from 'react';
 import {Area,AreaChart,CartesianGrid,ResponsiveContainer,Tooltip,XAxis,YAxis} from 'recharts';
 import {getModelColor,mergeModelSegments} from '@/vendor/tokentracker/ui/dashboard/components/TrendMonitor';
+import {DateRangePickerPopover} from '@/vendor/tokentracker/ui/dashboard/components/DateRangePopover';
 import {copy,getCopyLocale} from '@/vendor/tokentracker/lib/copy';
 import {formatUsdCurrency} from '@/vendor/tokentracker/lib/format';
 import {modelDisplayName} from '@/vendor/tokentracker/lib/model-display';
@@ -305,24 +306,54 @@ export function UsageTrendLineChart({
 export function TrendPeriodTabs({
  period,
  periods=PERIODS,
- onPeriodChange
+ onPeriodChange,
+ customRange,
+ customRangeOpen,
+ onCustomRangeOpenChange,
+ onCustomRangeApply
 }:{
  period:TrendPeriod;
  periods?:TrendPeriod[];
  onPeriodChange:(value:TrendPeriod)=>void;
+ customRange?:{from:string;to:string};
+ customRangeOpen?:boolean;
+ onCustomRangeOpenChange?:(open:boolean)=>void;
+ onCustomRangeApply?:(from:string,to:string)=>void;
 }){
  return (
   <div className="flex flex-wrap items-center gap-2.5">
-   {periods.map((value)=>(
-    <button
-     key={value}
-     type="button"
-     onClick={()=>onPeriodChange(value)}
-     className={`px-1 py-1 text-[11px] ${period===value?'font-semibold text-foreground':'font-normal text-muted-foreground/70 hover:text-muted-foreground'}`}
-    >
-     {copy(`usage.period.${value}`)}
-    </button>
-   ))}
+   {periods.map((value)=>{
+    const active=period===value;
+    const tabClass=`px-1 py-1 text-[11px] ${active?'font-semibold text-foreground':'font-normal text-muted-foreground/70 hover:text-muted-foreground'}`;
+    if(value==='custom'&&customRange&&onCustomRangeOpenChange&&onCustomRangeApply){
+     return (
+      <DateRangePickerPopover
+       key="custom"
+       open={Boolean(customRangeOpen)}
+       onOpenChange={(open)=>{
+        if(open)onPeriodChange('custom');
+        onCustomRangeOpenChange(open);
+       }}
+       from={customRange.from}
+       to={customRange.to}
+       active={active}
+       label={copy('usage.period.custom')}
+       trigger={<button type="button" className={tabClass}/>}
+       onApply={onCustomRangeApply}
+      />
+     );
+    }
+    return (
+     <button
+      key={value}
+      type="button"
+      onClick={()=>onPeriodChange(value)}
+      className={tabClass}
+     >
+      {copy(`usage.period.${value}`)}
+     </button>
+    );
+   })}
   </div>
  );
 }

@@ -1,5 +1,4 @@
-import {memo,useEffect,useMemo,useRef,useState} from 'react';
-import {DateRangePopover} from '@/vendor/tokentracker/ui/dashboard/components/DateRangePopover';
+import {memo,useMemo,useState} from 'react';
 import {copy} from '@/vendor/tokentracker/lib/copy';
 import {formatUsdCurrency} from '@/vendor/tokentracker/lib/format';
 import {formatTokenCount,formatTokenTooltip} from '@/vendor/tokentracker/lib/token-format';
@@ -24,20 +23,11 @@ export const LocalTrendView=memo(function LocalTrendView(){
  const [period,setPeriod]=useState<TrendPeriod>('month');
  const [custom,setCustom]=useState(()=>heatmapTrendRange('day'));
  const [calendarOpen,setCalendarOpen]=useState(false);
- const calendarRef=useRef<HTMLDivElement>(null);
  const timeZone=getBrowserTimeZone()||Intl.DateTimeFormat().resolvedOptions().timeZone;
  const range=useMemo(()=>heatmapTrendRange(period,custom),[custom,period]);
  const trend=useTrendData({period,from:range.from,to:range.to,timeZone,tzOffsetMinutes:getBrowserTimeZoneOffsetMinutes()});
  const stats=useMemo(()=>computeZoomStats(trend.rows),[trend.rows]);
  const peakLabel=typeof stats.peak==='object'&&stats.peak&&'label'in stats.peak?String((stats.peak as {label?:string}).label||''):'';
- useEffect(()=>{
-  if(!calendarOpen)return undefined;
-  const onPointer=(event:MouseEvent)=>{
-   if(calendarRef.current&&!calendarRef.current.contains(event.target as Node))setCalendarOpen(false);
-  };
-  document.addEventListener('mousedown',onPointer);
-  return()=>document.removeEventListener('mousedown',onPointer);
- },[calendarOpen]);
  return (
   <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
    <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
@@ -46,25 +36,18 @@ export const LocalTrendView=memo(function LocalTrendView(){
      <h1 className="mt-1 text-[24px] font-semibold tracking-[-0.025em]">{t('Trend')}</h1>
      <p className="mt-1 font-mono text-[11px] text-muted-foreground">{formatTimeZoneLabel({timeZone,offsetMinutes:getBrowserTimeZoneOffsetMinutes()})}</p>
     </div>
-    <div ref={calendarRef} className="relative">
+    <div className="relative">
      <TrendPeriodTabs
-      period={calendarOpen?'custom':period}
+      period={period}
+      customRange={custom}
+      customRangeOpen={calendarOpen}
+      onCustomRangeOpenChange={setCalendarOpen}
+      onCustomRangeApply={(from:string,to:string)=>{setCustom({from,to});setPeriod('custom');}}
       onPeriodChange={(value)=>{
-       if(value==='custom'){setCalendarOpen(true);return;}
-       setCalendarOpen(false);
+       if(value!=='custom')setCalendarOpen(false);
        setPeriod(value);
       }}
      />
-     {calendarOpen?(
-      <div className="absolute right-0 top-[calc(100%+8px)] z-[80] w-max max-w-[min(100vw-2rem,40rem)] overflow-x-auto rounded-xl border border-border bg-white shadow-xl dark:bg-oai-gray-900">
-       <DateRangePopover
-        from={custom.from}
-        to={custom.to}
-        onApply={(from:string,to:string)=>{setCustom({from,to});setPeriod('custom');setCalendarOpen(false);}}
-        onCancel={()=>setCalendarOpen(false)}
-       />
-      </div>
-     ):null}
     </div>
    </div>
    <div className="mb-6 grid grid-cols-2 gap-x-8 gap-y-5 border-y border-border/70 py-5 sm:grid-cols-4">

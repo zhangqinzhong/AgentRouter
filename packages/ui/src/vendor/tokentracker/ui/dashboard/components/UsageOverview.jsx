@@ -23,7 +23,6 @@ function AllToolsIcon({ size = 15, className = "" }) {
     </svg>
   );
 }
-import { Popover } from "@base-ui/react/popover";
 import { Button, Counter } from "../../components";
 import { Select } from "../../components/Select.jsx";
 import { useTheme } from "../../../hooks/useTheme.js";
@@ -32,7 +31,7 @@ import { useTokenFormat } from "../../../hooks/useTokenFormat.js";
 import { copy, getCopyLocale } from "../../../lib/copy";
 import { CURRENCY_USD, getCurrencySymbol } from "../../../lib/currency";
 import { formatProviderDisplayName } from "../../../lib/provider-display";
-import { DateRangePopover, formatDateShort, getDateFnsLocale } from "./DateRangePopover.jsx";
+import { DateRangePickerPopover, formatDateShort, getDateFnsLocale } from "./DateRangePopover.jsx";
 import { ProviderIcon } from "./ProviderIcon.jsx";
 import { formatUsdCurrency } from "../../../lib/format";
 import { buildAllModels } from "../../../lib/model-breakdown";
@@ -375,45 +374,29 @@ export function UsageOverview({
               }`;
 
               if (p.key === "custom") {
-                const customLabel = isActive && customFrom && customTo
-                  ? `${formatDateShort(customFrom, dateLocale)} — ${formatDateShort(customTo, dateLocale)}`
-                  : p.label;
-
                 return (
-                  <Popover.Root
+                  <DateRangePickerPopover
                     key="custom"
                     open={customRangeOpen}
                     onOpenChange={(open) => {
                       if (open) onPeriodChange?.("custom");
-                      else onCustomRangeOpenChange?.(open);
+                      onCustomRangeOpenChange?.(open);
                     }}
-                  >
-                    <Popover.Trigger
-                      render={
-                        <button
-                          role="tab"
-                          aria-selected={isActive}
-                          tabIndex={isActive ? 0 : -1}
-                          type="button"
-                          className={tabClass}
-                        />
-                      }
-                    >
-                      {customLabel}
-                    </Popover.Trigger>
-                    <Popover.Portal>
-                      <Popover.Positioner sideOffset={8} side="bottom" align="start" className="!z-[9999]">
-                        <Popover.Popup className="bg-white dark:bg-oai-gray-900 border border-oai-gray-200 dark:border-oai-gray-700 rounded-xl shadow-lg">
-                          <DateRangePopover
-                            from={customFrom}
-                            to={customTo}
-                            onApply={onCustomRangeApply}
-                            onCancel={() => onCustomRangeOpenChange?.(false)}
-                          />
-                        </Popover.Popup>
-                      </Popover.Positioner>
-                    </Popover.Portal>
-                  </Popover.Root>
+                    from={customFrom}
+                    to={customTo}
+                    active={isActive}
+                    label={p.label}
+                    trigger={
+                      <button
+                        role="tab"
+                        aria-selected={isActive}
+                        tabIndex={isActive ? 0 : -1}
+                        type="button"
+                        className={tabClass}
+                      />
+                    }
+                    onApply={onCustomRangeApply}
+                  />
                 );
               }
 

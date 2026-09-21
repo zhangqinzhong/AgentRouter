@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.6.5 - 2026-09-21
+
+- Unified custom date-range selection across Overview, Usage and Trend with the Usage page calendar popover.
+- Replaced Overview's native date inputs and Trend's hand-built popup with the shared date-range picker.
+
 ## 1.6.4 - 2026-09-21
 
 - Fixed tray compact number units to follow the selected interface language instead of the operating-system locale.
