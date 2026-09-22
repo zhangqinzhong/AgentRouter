@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createDefaultAppConfig } from "@agentrouter/core/config/default-config.ts";
 import {
+  arAnthropicReasoningResponseHookKey,
   arCodexApplyPatchBridgeHeader,
   arCodexBridgeRequestTransformKey,
   arCodexBridgeResponseHookKey,
   arCodexBridgeStreamHookKey,
   arCodexMultiAgentBridgeHeader,
+  arLiveTokenRateConfigMessageType,
+  arLiveTokenRateSnapshotMessageType,
+  arLiveTokenRateStreamHookKey,
   arOpenRouterDiscountFinalizeResponseHookKey,
   arRuntimeConfigReloadMessageType,
   arRouteReasonHeader,
@@ -16,6 +20,7 @@ import {
   arRouterRouteResolverKey,
   arRouterRequestTransformKey
 } from "@agentrouter/core/gateway/core-runtime/router-plugin-contract.ts";
+import { coalesceAnthropicReasoningResponse } from "@agentrouter/core/gateway/features/anthropic-reasoning-response.ts";
 import { coreGatewayAuthHeader } from "@agentrouter/core/gateway/internal/shared.ts";
 import { arRemoteControlPathPrefix } from "@agentrouter/core/gateway/remote-control-service.ts";
 import { gatewayRuntimeConfigControlPath, gatewayRuntimeConfigRevision } from "@agentrouter/core/gateway/runtime-config-control.ts";
@@ -81,6 +86,110 @@ test("AgentRouter router core plugin exposes route endpoint and beforeRouting tr
   assert.equal(resolved.targetProviderName, providerRuntimeId(config.Providers[1]));
   assert.equal(resolved.model, "beta");
   assert.equal(resolved.requestBody.model, "beta");
+});
+
+test("AgentRouter router core plugin publishes live token rate snapshots from the single runtime", async () => {
+  const originalSend = process.send;
+  const messages = [];
+  process.send = (message) => {
+    messages.push(message);
+    return true;
+  };
+  try {
+    const config = createDefaultAppConfig();
+    const plugin = await createGatewayPlugin({ plugin: { config: { appConfig: config } } });
+    const streamHook = plugin.streamHooks.find((item) => item.key === arLiveTokenRateStreamHookKey);
+    assert.ok(streamHook);
+    const disabledResult = await streamHook.transformResponse({
+      request: { id: "single-runtime-rate-disabled" },
+      targetProvider: "openai",
+      targetProviderConfig: { type: "openai_chat_completions" },
+      upstreamResponse: new Response("disabled", {
+        headers: { "content-type": "text/event-stream" },
+        status: 200
+      })
+    });
+    assert.equal(disabledResult, undefined);
+    process.emit("message", {
+      enabled: true,
+      protocolVersion: 1,
+      type: arLiveTokenRateConfigMessageType
+    });
+    const encoder = new TextEncoder();
+    const upstreamResponse = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"first token"}}]}\n\n'));
+        setTimeout(() => {
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":" second token"}}]}\n\n'));
+        }, 275);
+        setTimeout(() => controller.close(), 325);
+      }
+    }), {
+      headers: { "content-type": "text/event-stream" },
+      status: 200
+    });
+    const meteredResponse = await streamHook.transformResponse({
+      request: {
+        headers: {},
+        id: "single-runtime-rate-test",
+        method: "POST",
+        url: "/v1/chat/completions"
+      },
+      targetProvider: "openai",
+      targetProviderConfig: {
+        provider: "openai_chat_completions",
+        type: "openai_chat_completions"
+      },
+      upstreamResponse
+    });
+
+    assert.ok(meteredResponse instanceof Response);
+    await meteredResponse.text();
+    assert.ok(messages.some((message) =>
+      message?.type === arLiveTokenRateSnapshotMessageType &&
+      message.activeRequests === 1 &&
+      message.tokensPerSecond > 0
+    ));
+
+    let cancelled = false;
+    const cancellable = await streamHook.transformResponse({
+      request: { id: "single-runtime-rate-cancelled" },
+      targetProviderConfig: { type: "openai_chat_completions" },
+      upstreamResponse: new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+        },
+        cancel() { cancelled = true; }
+      }), { headers: { "content-type": "text/event-stream" } })
+    });
+    const reader = cancellable.body.getReader();
+    await reader.read();
+    await reader.cancel();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cancelled, true);
+    assert.equal(messages.at(-1).activeRequests, 0);
+
+    const failed = await streamHook.transformResponse({
+      request: { id: "single-runtime-rate-error" },
+      targetProviderConfig: { type: "openai_chat_completions" },
+      upstreamResponse: new Response(new ReadableStream({
+        pull(controller) { controller.error(new Error("meter upstream reset")); }
+      }), { headers: { "content-type": "text/event-stream" } })
+    });
+    await assert.rejects(failed.text(), /meter upstream reset/);
+    assert.equal(messages.at(-1).activeRequests, 0);
+  } finally {
+    process.emit("message", {
+      enabled: false,
+      protocolVersion: 1,
+      type: arLiveTokenRateConfigMessageType
+    });
+    if (originalSend) {
+      process.send = originalSend;
+    } else {
+      delete process.send;
+    }
+  }
 });
 
 test("AgentRouter router core plugin resolves bare Codex companion models through the authenticated profile provider", async () => {
@@ -306,6 +415,37 @@ test("AgentRouter router core plugin applies Codex bridge request and response h
   assert.equal(streamed.headers.get("content-length"), null);
   assert.match(streamText, /"type":"custom_tool_call"/);
   assert.match(streamText, /"name":"apply_patch"/);
+});
+
+test("AgentRouter router core plugin coalesces adjacent unsigned Anthropic thinking fragments", async () => {
+  const payload = {
+    id: "msg_reasoning",
+    type: "message",
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "Choose " },
+      { type: "thinking", thinking: "carefully." },
+      { type: "text", text: "California." },
+      { type: "thinking", thinking: "signed", signature: "signature-1" },
+      { type: "thinking", thinking: "separate" }
+    ]
+  };
+
+  const transformed = coalesceAnthropicReasoningResponse(payload);
+  assert.equal(transformed.changed, true);
+  assert.deepEqual(transformed.value.content, [
+    { type: "thinking", thinking: "Choose carefully." },
+    { type: "text", text: "California." },
+    { type: "thinking", thinking: "signed", signature: "signature-1" },
+    { type: "thinking", thinking: "separate" }
+  ]);
+
+  const config = createDefaultAppConfig();
+  const plugin = await createGatewayPlugin({ plugin: { config: { appConfig: config } } });
+  const responseHook = plugin.responseHooks.find((item) => item.key === arAnthropicReasoningResponseHookKey);
+  assert.ok(responseHook);
+  const hookResult = await responseHook.transformResponse({ responsePayload: payload, statusCode: 200 });
+  assert.deepEqual(hookResult.responsePayload, transformed.value);
 });
 
 test("AgentRouter router core plugin skips Codex bridge for native Responses passthrough", async () => {

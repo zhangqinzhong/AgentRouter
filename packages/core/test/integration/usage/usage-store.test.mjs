@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { RequestLogStore } from "@agentrouter/core/observability/request-log-store.ts";
+import { providerRuntimeId } from "@agentrouter/core/routing/model-registry.ts";
 import { createBetterSqliteDatabase } from "@agentrouter/core/storage/sqlite-native.ts";
 import { GatewayBillingSynchronizer } from "@agentrouter/core/usage/billing-sync.ts";
 import { resolveUsageModelAttribution } from "@agentrouter/core/usage/model-attribution.ts";
@@ -537,6 +538,111 @@ test("UsageStore keeps the Fusion logical model while grouping by the upstream m
   }
 });
 
+test("UsageStore prices the routed upstream model when the response echoes a rule alias", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-alias-pricing-test-"));
+  try {
+    const pricing = {
+      inputUsdPerMillionTokens: 1,
+      outputUsdPerMillionTokens: 2
+    };
+    const provider = {
+      baseUrl: "https://api.example.com",
+      modelMetadata: { "Vendor/some-model": { pricing } },
+      models: ["Vendor/some-model"],
+      name: "ProviderA",
+      type: "anthropic_messages"
+    };
+    const estimatedInputs = [];
+    const store = new UsageStore(path.join(dir, "usage.sqlite"), {
+      estimateCost: async (input) => {
+        estimatedInputs.push({
+          model: input.model,
+          pricing: input.pricing,
+          provider: input.provider
+        });
+        return input.pricing
+          ? { amountUsd: 2, model: input.model, source: "custom" }
+          : undefined;
+      }
+    });
+
+    await store.recordCapture({
+      bodyText: JSON.stringify({
+        model: "my-alias",
+        usage: { input_tokens: 1000000, output_tokens: 500000 }
+      }),
+      config: { Providers: [provider] },
+      durationMs: 40,
+      fallbackModel: `${providerRuntimeId(provider)}::anthropic_messages/Vendor/some-model`,
+      method: "POST",
+      path: "/v1/messages",
+      providerName: "ProviderA",
+      requestId: "alias-pricing-request",
+      responseHeaders: new Headers({ "content-type": "application/json" }),
+      statusCode: 200
+    });
+
+    const stats = await store.getStats("today", { includeProxy: true });
+    assert.equal(stats.models[0]?.model, "my-alias");
+    assert.equal(stats.models[0]?.provider, "ProviderA");
+    assert.equal(stats.totals.costUsd, 2);
+    assert.deepEqual(estimatedInputs, [{
+      model: "my-alias",
+      pricing,
+      provider: "ProviderA"
+    }]);
+
+    const database = createBetterSqliteDatabase(path.join(dir, "usage.sqlite"));
+    try {
+      const row = database.prepare("SELECT model, cost_source, cost_usd FROM usage_events").get();
+      assert.equal(row.model, "my-alias");
+      assert.equal(row.cost_source, "custom");
+      assert.equal(row.cost_usd, 2);
+    } finally {
+      database.close();
+    }
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("#1791 UsageStore records DeepSeek-native prompt cache hits", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-deepseek-cache-test-"));
+  try {
+    const store = new UsageStore(path.join(dir, "usage.sqlite"));
+    await store.recordCapture({
+      bodyText: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        usage: {
+          completion_tokens: 10,
+          prompt_cache_hit_tokens: 800,
+          prompt_cache_miss_tokens: 200,
+          prompt_tokens: 1000,
+          prompt_tokens_details: {},
+          total_tokens: 1010
+        }
+      }),
+      durationMs: 40,
+      fallbackModel: "deepseek-v4.1-flash",
+      method: "POST",
+      path: "/v1/messages",
+      providerName: "OpenCode Go",
+      providerProtocol: "openai_chat_completions",
+      requestId: "deepseek-native-cache-usage",
+      responseHeaders: new Headers({ "content-type": "application/json" }),
+      statusCode: 200
+    });
+
+    const stats = await store.getStats("today", { includeProxy: true });
+    assert.equal(stats.totals.inputTokens, 200);
+    assert.equal(stats.totals.cacheTokens, 800);
+    assert.equal(stats.totals.outputTokens, 10);
+    assert.equal(stats.totals.totalTokens, 1010);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("UsageStore attributes Claude App encoded response model IDs to the routed upstream model", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-claude-app-encoded-model-test-"));
   try {
@@ -568,6 +674,98 @@ test("UsageStore attributes Claude App encoded response model IDs to the routed 
     assert.equal(stats.models[0]?.provider, "Kimi Code - Coding Plan");
     assert.equal(stats.recentRequests[0]?.logicalModel, "Fusion/kimisearch");
     assert.notEqual(stats.models[0]?.model, encodedModel);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("UsageStore attributes client-visible provider-prefixed response models to the bare model", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-client-visible-selector-test-"));
+  try {
+    const store = new UsageStore(path.join(dir, "usage.sqlite"));
+    const config = {
+      Providers: [
+        {
+          baseUrl: "https://dashscope.example.com/api/v2/apps/anthropic",
+          models: ["ZHIPU/GLM-5.3"],
+          name: "dashscope-private",
+          type: "anthropic_messages"
+        }
+      ],
+      virtualModelProfiles: []
+    };
+
+    await store.recordCapture({
+      bodyText: [
+        "event: message_start",
+        'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"dashscope-private/ZHIPU/GLM-5.3","usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20}}}',
+        "",
+        "data: [DONE]",
+        ""
+      ].join("\n"),
+      client: "Claude Code",
+      config,
+      durationMs: 100,
+      fallbackModel: "dashscope-private/ZHIPU/GLM-5.3",
+      method: "POST",
+      path: "/v1/messages",
+      providerProtocol: "anthropic_messages",
+      requestId: "client-visible-selector-model",
+      responseHeaders: new Headers({ "content-type": "text/event-stream; charset=utf-8" }),
+      statusCode: 200
+    });
+
+    const stats = await store.getStats("today", { includeProxy: true });
+    assert.equal(stats.models[0]?.model, "ZHIPU/GLM-5.3");
+    assert.equal(stats.models[0]?.provider, "dashscope-private");
+    assert.notEqual(stats.models[0]?.model, "dashscope-private/ZHIPU/GLM-5.3");
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("UsageStore keeps physical response models with unknown provider prefixes verbatim", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-physical-slash-model-test-"));
+  try {
+    const store = new UsageStore(path.join(dir, "usage.sqlite"));
+    const config = {
+      Providers: [
+        {
+          baseUrl: "https://dashscope.example.com/api/v2/apps/anthropic",
+          models: ["ZHIPU/GLM-5.3"],
+          name: "dashscope-private",
+          type: "anthropic_messages"
+        }
+      ],
+      virtualModelProfiles: []
+    };
+
+    // The upstream echoes the physical model id, whose own name contains a
+    // slash; "ZHIPU" is not a configured provider, so the echo must be kept
+    // verbatim instead of being re-attributed as a route selector.
+    await store.recordCapture({
+      bodyText: [
+        "event: message_start",
+        'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"ZHIPU/GLM-5.3","usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20}}}',
+        "",
+        "data: [DONE]",
+        ""
+      ].join("\n"),
+      client: "Claude Code",
+      config,
+      durationMs: 100,
+      fallbackModel: "dashscope-private/ZHIPU/GLM-5.3",
+      method: "POST",
+      path: "/v1/messages",
+      providerProtocol: "anthropic_messages",
+      requestId: "physical-slash-model",
+      responseHeaders: new Headers({ "content-type": "text/event-stream; charset=utf-8" }),
+      statusCode: 200
+    });
+
+    const stats = await store.getStats("today", { includeProxy: true });
+    assert.equal(stats.models[0]?.model, "ZHIPU/GLM-5.3");
+    assert.equal(stats.models[0]?.provider, "dashscope-private");
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

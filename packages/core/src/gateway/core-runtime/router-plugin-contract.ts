@@ -2,6 +2,7 @@ import type { RouterFallbackConfig } from "@agentrouter/core/contracts/app";
 
 export const arRouterPluginKey = "ar-router";
 export const arRouterRequestTransformKey = "ar-router-request-transform";
+export const arAnthropicReasoningResponseHookKey = "ar-anthropic-reasoning-response-hook";
 export const arCodexBridgeRequestTransformKey = "ar-codex-bridge-request-transform";
 export const arCodexBridgeResponseHookKey = "ar-codex-bridge-response-hook";
 export const arCodexBridgeStreamHookKey = "ar-codex-bridge-stream-hook";
@@ -12,6 +13,22 @@ export const arRouterHttpRouteKey = "ar-router-route";
 export const arRouterHttpRoutePath = "/__ar/route";
 export const arRawTraceSyncAckRouteKey = "ar-raw-trace-sync-ack";
 export const arRuntimeConfigReloadMessageType = "ar:runtime-config-reload";
+export const arLiveTokenRateConfigMessageType = "ar:live-token-rate-config";
+export const arLiveTokenRateSnapshotMessageType = "ar:live-token-rate-snapshot";
+export const arLiveTokenRateStreamHookKey = "ar-live-token-rate-stream-hook";
+
+export type ArLiveTokenRateConfigMessage = {
+  enabled: boolean;
+  protocolVersion: 1;
+  type: typeof arLiveTokenRateConfigMessageType;
+};
+
+export type ArLiveTokenRateSnapshotMessage = {
+  activeRequests: number;
+  protocolVersion: 1;
+  tokensPerSecond: number;
+  type: typeof arLiveTokenRateSnapshotMessageType;
+};
 
 export const arRouteStageHeader = "x-ar-route-stage";
 export const arRouteReasonHeader = "x-ar-route-reason";

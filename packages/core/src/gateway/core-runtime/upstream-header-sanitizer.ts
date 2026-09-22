@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { applyMetaTokenFloor } from "@agentrouter/core/gateway/core-runtime/meta-token-floor";
-import { applyResponsesSessionAffinity } from "@agentrouter/core/gateway/core-runtime/responses-session-affinity";
+import { applyResponsesSessionAffinity, inboundMetadataUserId, resolveResponsesSessionKey } from "@agentrouter/core/gateway/core-runtime/responses-session-affinity";
 import type { ResponsesSessionAffinityInput } from "@agentrouter/core/gateway/core-runtime/responses-session-affinity";
 import { applyResponsesToolStrictness } from "@agentrouter/core/gateway/core-runtime/responses-tool-strictness";
 import type { ResponsesToolStrictnessInput } from "@agentrouter/core/gateway/core-runtime/responses-tool-strictness";
+import {
+  normalizeDeepSeekCacheUsage,
+  normalizeDeepSeekCacheUsageStream
+} from "@agentrouter/core/gateway/features/opencode-cache-usage";
 import { sdkCompatibleTokenHeaderNames } from "@agentrouter/core/gateway/internal/shared";
 
 type UpstreamRequest = {
@@ -19,6 +23,7 @@ type ProviderPluginRequestInput = {
     anthropicBaseUrl?: string;
   };
   request?: {
+    body?: unknown;
     id?: string;
     headers?: Record<string, string | string[] | undefined>;
   };
@@ -28,6 +33,22 @@ type ProviderPluginRequestInput = {
     type?: string;
   };
   upstreamRequest: UpstreamRequest;
+};
+
+type ProviderPluginResponseInput = {
+  targetProviderConfig?: {
+    baseurl?: string;
+  };
+  upstreamPayload: unknown;
+  upstreamRequest: UpstreamRequest;
+};
+
+type GatewayPluginStreamInput = {
+  targetProviderConfig?: {
+    baseurl?: string;
+  };
+  upstreamRequest?: UpstreamRequest;
+  upstreamResponse: Response;
 };
 
 const arAuthHeaderNames = new Set([
@@ -65,6 +86,82 @@ const transportHeaderNames = new Set([
   "transfer-encoding",
   "upgrade"
 ]);
+
+const openCodeSessionFallbackId = randomUUID();
+const openCodeSessionHeaderMaxLength = 200;
+
+/**
+ * Body fields such as `metadata.user_id` are client-controlled and can carry
+ * control characters, non-ByteString code points, or unbounded length. Those
+ * values would make Node's fetch throw before the request leaves the process,
+ * so reject anything not header-safe and fall back to the generated session id.
+ */
+function sanitizeOpenCodeSessionHeaderValue(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  for (const character of trimmed) {
+    const code = character.charCodeAt(0);
+    if (code < 0x20 || code === 0x7f || code > 0xff) {
+      return undefined;
+    }
+  }
+  return trimmed.slice(0, openCodeSessionHeaderMaxLength);
+}
+
+function requestHeaderValue(
+  headers: Record<string, string | string[] | undefined> | undefined,
+  name: string
+): string | undefined {
+  for (const [headerName, headerValue] of Object.entries(headers ?? {})) {
+    if (headerName.trim().toLowerCase() !== name) {
+      continue;
+    }
+    const values = Array.isArray(headerValue) ? headerValue : [headerValue];
+    for (const value of values) {
+      const trimmed = value?.trim();
+      if (trimmed) {
+        return trimmed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function isOfficialOpenCodeGoUrl(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "opencode.ai" &&
+      (url.port === "" || url.port === "443") &&
+      /^\/zen\/go\/v1(?:\/|$)/.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isOfficialOpenCodeGoChatUrl(value: string | undefined): boolean {
+  if (!value || !isOfficialOpenCodeGoUrl(value)) return false;
+  const url = new URL(value);
+  return /^\/zen\/go\/v1\/chat\/completions\/?$/.test(url.pathname);
+}
+
+function isOfficialOpenCodeGoChatRequest(
+  upstreamUrl: string | undefined,
+  configuredBaseUrl: string | undefined
+): boolean {
+  if (isOfficialOpenCodeGoChatUrl(upstreamUrl)) return true;
+  if (!upstreamUrl || !isOfficialOpenCodeGoUrl(configuredBaseUrl)) return false;
+  try {
+    return /^\/zen\/go\/v1\/chat\/completions\/?$/.test(new URL(upstreamUrl).pathname);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Removes AR-owned routing, authentication and observability metadata at the
@@ -201,9 +298,17 @@ export function createGatewayPlugin() {
         const apiKey = input.targetProviderConfig?.apikey?.trim();
         if (!upstreamRequest.headers["x-opencode-session"]?.trim()) {
           try {
-            const url = new URL(upstreamRequest.url);
-            if (url.protocol === "https:" && url.hostname === "opencode.ai" && /^\/zen\/go\/v1(?:\/|$)/.test(url.pathname)) {
-              upstreamRequest.headers["x-opencode-session"] = `ar-${input.request?.id || randomUUID()}`;
+            if (isOfficialOpenCodeGoUrl(upstreamRequest.url)) {
+              const explicitClientSession = sanitizeOpenCodeSessionHeaderValue(
+                requestHeaderValue(input.request?.headers, "x-opencode-session")
+              );
+              const claudeSessionId = explicitClientSession || sanitizeOpenCodeSessionHeaderValue(
+                resolveResponsesSessionKey(
+                  input.request?.headers,
+                  inboundMetadataUserId(input.request?.body)
+                )
+              );
+              upstreamRequest.headers["x-opencode-session"] = claudeSessionId || `ar-${openCodeSessionFallbackId}`;
             }
           } catch {
             // Invalid URLs are reported by the upstream transport.
@@ -226,6 +331,18 @@ export function createGatewayPlugin() {
           ok: true as const,
           value: applyMetaTokenFloor(upstreamRequest)
         };
+      },
+      transformResponse(input: ProviderPluginResponseInput) {
+        const transformed = isOfficialOpenCodeGoChatRequest(
+          input.upstreamRequest.url,
+          input.targetProviderConfig?.baseurl
+        )
+          ? normalizeDeepSeekCacheUsage(input.upstreamPayload)
+          : { changed: false, value: input.upstreamPayload };
+        return {
+          ok: true as const,
+          value: transformed.value
+        };
       }
     }, {
       key: "ar-responses-session-affinity",
@@ -242,6 +359,16 @@ export function createGatewayPlugin() {
           ok: true as const,
           value: applyResponsesToolStrictness(input)
         };
+      }
+    }],
+    streamHooks: [{
+      key: "ar-opencode-go-cache-usage-stream",
+      transformResponse(input: GatewayPluginStreamInput) {
+        if (!isOfficialOpenCodeGoChatRequest(
+          input.upstreamRequest?.url,
+          input.targetProviderConfig?.baseurl
+        )) return undefined;
+        return normalizeDeepSeekCacheUsageStream(input.upstreamResponse);
       }
     }]
   };

@@ -11,6 +11,7 @@ import { minimaxChinaProviderPreset, minimaxGlobalProviderPreset } from "@agentr
 import { mistralProviderPreset } from "@agentrouter/core/providers/presets/mistral/index";
 import { moonshotChinaProviderPreset, moonshotGlobalProviderPreset } from "@agentrouter/core/providers/presets/moonshot/index";
 import { nvidiaProviderPreset } from "@agentrouter/core/providers/presets/nvidia/index";
+import { openCodeGoProviderPreset } from "@agentrouter/core/providers/presets/opencode-go/index";
 import { openaiProviderPreset } from "@agentrouter/core/providers/presets/openai/index";
 import { openRouterProviderPreset } from "@agentrouter/core/providers/presets/openrouter/index";
 import { qiniuAiProviderPreset } from "@agentrouter/core/providers/presets/qiniu-ai/index";
@@ -45,6 +46,7 @@ export const providerPresets: ProviderPreset[] = [
   geminiProviderPreset,
   openRouterProviderPreset,
   nvidiaProviderPreset,
+  openCodeGoProviderPreset,
   deepSeekProviderPreset,
   xiaomiMimoProviderPreset,
   xiaomiMimoTokenPlanChinaProviderPreset,

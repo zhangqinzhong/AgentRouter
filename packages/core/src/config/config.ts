@@ -1,4 +1,5 @@
 import { CONFIGDIR, LEGACY_CONFIGDIR, PROVIDER_ICON_CACHE_DIR } from "@agentrouter/core/config/constants";
+import { normalizePageDefaultRanges } from "@agentrouter/core/config/page-default-ranges";
 import { validateProfileAliasFiles } from "@agentrouter/core/profiles/aliases";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -903,7 +904,12 @@ function pickConfig(value: Partial<AppConfig>): LoadedAppConfig {
     config.trayIcon = trayIcon;
   }
   config.trayShowTokenUsage = value.trayShowTokenUsage === true;
+  config.pageDefaultRanges = normalizePageDefaultRanges(value.pageDefaultRanges);
   config.trayPetEnabled = value.trayPetEnabled !== false;
+  const trayShowTokenRate = (value as Record<string, unknown>).trayShowTokenRate;
+  if (typeof trayShowTokenRate === "boolean") {
+    config.trayShowTokenRate = trayShowTokenRate;
+  }
   const trayBalanceProgress = parseTrayBalanceProgress((value as Record<string, unknown>).trayBalanceProgress);
   if (trayBalanceProgress) {
     config.trayBalanceProgress = trayBalanceProgress;

@@ -318,6 +318,69 @@ test("RequestLogStore keeps list rows lightweight and detail rows complete", asy
   }
 });
 
+test("RequestLogStore persists stream experience metrics and derives authoritative TPS", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-request-log-speed-test-"));
+  let store;
+  try {
+    store = new RequestLogStore(path.join(dir, "request-logs.sqlite"));
+    await store.record({
+      completedAt: new Date().toISOString(),
+      durationMs: 900,
+      method: "POST",
+      path: "/v1/messages",
+      providerName: "test-provider",
+      requestBody: Buffer.from(JSON.stringify({ messages: [], model: "test-model", stream: true })),
+      requestHeaders: { "content-type": "application/json" },
+      requestId: "request-log-speed-test",
+      timeToFirstTokenMs: 170,
+      streamOutputDurationMs: 500,
+      responseBodyText: [
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}',
+        "",
+        'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":21}}',
+        "",
+        'event: message_stop\ndata: {"type":"message_stop"}',
+        ""
+      ].join("\n"),
+      responseHeaders: { "content-type": "text/event-stream" },
+      startedAt: new Date().toISOString(),
+      statusCode: 200,
+      streamMetrics: {
+        activeOutputMs: 500,
+        estimatedOutputTokens: 19,
+        maxInterEventGapMs: 180,
+        p95InterEventGapMs: 120,
+        reasoningObserved: false,
+        responseHeadersMs: 100,
+        sampleStatus: "complete",
+        tailMs: 40,
+        textObserved: true,
+        timeToFirstSignalMs: 150,
+        timeToFirstTextMs: 170,
+        toolObserved: false,
+        upstreamTimeToFirstSignalMs: 80
+      },
+      url: "http://127.0.0.1:3456/v1/messages"
+    });
+
+    const entry = (await store.list({ pageSize: 25 })).items[0];
+    assert.equal(entry.outputTokens, 21);
+    assert.equal(entry.outputTokensPerSecond, 40);
+    assert.equal(entry.timeToFirstSignalMs, 150);
+    assert.equal(entry.timeToFirstTextMs, 170);
+    assert.equal(entry.maxInterEventGapMs, 180);
+    assert.equal(entry.streamSpeedSampleStatus, "complete");
+    assert.equal(entry.timeToFirstTokenMs, 170);
+    assert.equal(entry.streamOutputDurationMs, 500);
+    const detail = await store.getDetail({ id: entry.id });
+    assert.equal(detail.outputTokensPerSecond, 40);
+    assert.equal(detail.timeToFirstTokenMs, 170);
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("RequestLogStore keeps large request bodies in sidecar storage and reads them by chunk", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ar-request-log-sidecar-test-"));
   let store;
@@ -634,6 +697,51 @@ test("RequestLogStore redacts secrets and records AgentRouter metadata", async (
     assert.equal(detail.cacheReadTokens, 10);
     assert.equal(detail.outputTokens, 20);
     assert.equal(detail.totalTokens, 130);
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("#1791 RequestLogStore records DeepSeek-native prompt cache hits", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-request-log-deepseek-cache-test-"));
+  let store;
+  try {
+    store = new RequestLogStore(path.join(dir, "request-logs.sqlite"));
+    const startedAt = new Date().toISOString();
+    await store.record({
+      completedAt: startedAt,
+      durationMs: 75,
+      method: "POST",
+      path: "/v1/messages",
+      providerName: "OpenCode Go",
+      providerProtocol: "openai_chat_completions",
+      requestBody: Buffer.from(JSON.stringify({ model: "deepseek-v4.1-flash" }), "utf8"),
+      requestHeaders: { "content-type": "application/json" },
+      requestId: "request-log-deepseek-cache",
+      responseBodyText: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        usage: {
+          completion_tokens: 10,
+          prompt_cache_hit_tokens: 800,
+          prompt_cache_miss_tokens: 200,
+          prompt_tokens: 1000,
+          prompt_tokens_details: {},
+          total_tokens: 1010
+        }
+      }),
+      responseHeaders: { "content-type": "application/json" },
+      startedAt,
+      statusCode: 200,
+      url: "http://127.0.0.1:3456/v1/messages"
+    });
+
+    const page = await store.list({ pageSize: 25 });
+    const detail = await store.getDetail({ id: page.items[0].id });
+    assert.equal(detail?.inputTokens, 200);
+    assert.equal(detail?.cacheReadTokens, 800);
+    assert.equal(detail?.outputTokens, 10);
+    assert.equal(detail?.totalTokens, 1010);
   } finally {
     await store?.close();
     rmSync(dir, { force: true, recursive: true });

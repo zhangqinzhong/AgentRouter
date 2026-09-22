@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildClaudeAppGatewayModelRoutes } from "@agentrouter/core/agents/claude-app/gateway-routes.ts";
+import { createDefaultAppConfig } from "@agentrouter/core/config/default-config.ts";
+import {
+  arRoutedModelHeader,
+  arRouterRouteResolverKey
+} from "@agentrouter/core/gateway/core-runtime/router-plugin-contract.ts";
+import { createGatewayPlugin } from "@agentrouter/core/gateway/core-runtime/router-plugin.ts";
 import { prepareClaudeAppDiscoveredModelRequest } from "@agentrouter/core/gateway/features/model-discovery.ts";
 import { fetchUpstreamWithFallback, prepareGatewayUpstreamAttemptForTest } from "@agentrouter/core/gateway/upstream/executor.ts";
 import { RequestRouteTraceRecorder } from "@agentrouter/core/observability/route-trace.ts";
@@ -517,6 +523,100 @@ test("fallback cancels unfinished error bodies without waiting for cancellation"
       assert.equal(result.failedAttempts.length, 1, cancellation);
       assert.equal(result.failedAttempts[0].statusCode, 429, cancellation);
     }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model-chain fallback refreshes the routed model before core gateway resolution", async () => {
+  const config = createDefaultAppConfig();
+  config.Providers = [
+    {
+      api_base_url: "https://primary.example/v1/chat/completions",
+      id: "primary",
+      models: ["k3"],
+      name: "Primary",
+      type: "openai_chat_completions"
+    },
+    {
+      api_base_url: "https://fallback.example/v1/chat/completions",
+      id: "fallback",
+      models: ["glm-5.3"],
+      name: "智谱 AI（国内）",
+      type: "openai_chat_completions"
+    }
+  ];
+  const fallback = {
+    mode: "model-chain",
+    models: ["智谱 AI（国内）/glm-5.3"],
+    retryCount: 0
+  };
+  const plugin = await createGatewayPlugin({ plugin: { config: { appConfig: config } } });
+  const resolver = plugin.routeResolvers.find((item) => item.key === arRouterRouteResolverKey);
+  assert.ok(resolver);
+
+  const resolvedAttempts = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    const resolved = resolver.resolve({
+      model: body.model,
+      request: {
+        headers: init.headers,
+        method: "POST",
+        url: "/v1/chat/completions"
+      },
+      requestBody: body,
+      route: {
+        method: "POST",
+        url: "/v1/chat/completions"
+      }
+    });
+    resolvedAttempts.push({
+      headerModel: init.headers[arRoutedModelHeader],
+      model: resolved?.model,
+      provider: resolved?.targetProviderName
+    });
+    return new Response('{"ok":true}', {
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "0.001"
+      },
+      status: resolvedAttempts.length === 1 ? 403 : 200
+    });
+  };
+
+  try {
+    const result = await fetchUpstreamWithFallback({
+      body: Buffer.from(JSON.stringify({
+        messages: [{ content: "hello", role: "user" }],
+        model: "k3"
+      })),
+      config,
+      coreAuthToken: "core-token",
+      fallback,
+      headers: {
+        [arRoutedModelHeader]: "Primary/k3"
+      },
+      method: "POST",
+      path: "/v1/chat/completions",
+      routedModel: "Primary/k3",
+      upstreamUrl: "http://127.0.0.1:3457/v1/chat/completions"
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(resolvedAttempts, [
+      {
+        headerModel: "Primary/k3",
+        model: "k3",
+        provider: "Primary"
+      },
+      {
+        headerModel: "fallback/glm-5.3",
+        model: "glm-5.3",
+        provider: "fallback"
+      }
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }

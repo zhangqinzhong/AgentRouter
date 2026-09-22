@@ -20,7 +20,11 @@ import { GatewayBillingSynchronizer } from "@agentrouter/core/usage/billing-sync
 import { assertLoopbackCoreHost, endpoint, formatCoreGatewayChildExit, gatewayNetworkEndpoints, gatewayRuntimeSupportsRouterPlugin, generateCoreGatewayAuthToken, isCoreGatewayHealthy, loopbackCoreHostError, removeManagedCoreGatewayMarker, shouldRunGatewayRuntime, shouldRunUnifiedServer, spawnGatewayProcess, stopPreviousManagedCoreGateway, waitForCoreGatewayStop, waitForManagedCoreGatewayReady, writeManagedCoreGatewayMarker } from "@agentrouter/core/gateway/core-runtime/supervisor";
 import { coreGatewayAuthHeader } from "@agentrouter/core/gateway/internal/shared";
 import type { BrowserAutomationMcpIntegration, BrowserWebSearchMcpIntegration, GatewayStopOptions } from "@agentrouter/core/gateway/internal/shared";
-import { arRuntimeConfigReloadMessageType } from "@agentrouter/core/gateway/core-runtime/router-plugin-contract";
+import {
+  arLiveTokenRateConfigMessageType,
+  arLiveTokenRateSnapshotMessageType,
+  arRuntimeConfigReloadMessageType
+} from "@agentrouter/core/gateway/core-runtime/router-plugin-contract";
 import { GatewayRequestPipeline } from "@agentrouter/core/gateway/request/pipeline";
 import { GatewayHttpRequestHandler } from "@agentrouter/core/gateway/http/request-handler";
 import { gatewayRuntimeConfigRevision } from "@agentrouter/core/gateway/runtime-config-control";
@@ -34,8 +38,11 @@ import { mediaToolsGatewayEndpoint } from "@agentrouter/core/mcp/grok-media-conf
 import { browserAutomationMcpEnabled } from "@agentrouter/core/mcp/toolhub-config";
 import { installSocketTypeOfServiceCompat } from "@agentrouter/core/platform/socket-compat";
 import { profileApiKeyId } from "@agentrouter/core/profiles/api-key";
+import { setExternalLiveTokenRateSnapshot } from "@agentrouter/core/observability/stream-experience";
 
 installSocketTypeOfServiceCompat();
+
+const coreGatewayLiveTokenRateSourceId = "core-gateway";
 
 type RouteScriptTestHeaders = Record<string, string | string[] | undefined>;
 type SingleGatewayRuntimeBlockerOptions = {
@@ -343,6 +350,7 @@ class GatewayService {
     const child = this.child;
     const childCoreEndpoint = child ? this.status.coreEndpoint : "";
     this.child = undefined;
+    setExternalLiveTokenRateSnapshot(coreGatewayLiveTokenRateSourceId);
     this.coreAuthToken = "";
     this.externalGatewayApiKey = undefined;
     if (child && !child.killed) {
@@ -427,6 +435,7 @@ class GatewayService {
       gatewayManagedExternally: undefined,
       networkEndpoints: gatewayNetworkEndpoints(config.gateway.host, config.gateway.port)
     };
+    this.sendCoreGatewayLiveTokenRateConfig(config.trayShowTokenRate);
   }
 
   validateRouteScript(request: RouteScriptValidationRequest): Promise<RouteScriptValidationResult> {
@@ -525,6 +534,7 @@ class GatewayService {
       return;
     }
     this.child = undefined;
+    setExternalLiveTokenRateSnapshot(coreGatewayLiveTokenRateSourceId);
     this.coreAuthToken = "";
     await removeManagedCoreGatewayMarkerBestEffort();
     this.status = {
@@ -537,12 +547,35 @@ class GatewayService {
   }
 
   private handleCoreGatewayMessage(child: ChildProcess, message: unknown): void {
-    if (this.child !== child) return;
-    if (this.rawTraceSynchronizer.acceptResponseStatus(message)) return;
-    if (!isRuntimeConfigReloadMessage(message)) {
+    if (this.child !== child) {
       return;
     }
-    this.schedulePersistedRuntimeConfigReload(message.configRevision, message.forceRestart === true);
+    if (this.rawTraceSynchronizer.acceptResponseStatus(message)) return;
+    if (isLiveTokenRateSnapshotMessage(message)) {
+      setExternalLiveTokenRateSnapshot(coreGatewayLiveTokenRateSourceId, {
+        activeRequests: message.activeRequests,
+        tokensPerSecond: message.tokensPerSecond
+      });
+      return;
+    }
+    if (isRuntimeConfigReloadMessage(message)) {
+      this.schedulePersistedRuntimeConfigReload(message.configRevision, message.forceRestart === true);
+    }
+  }
+
+  private sendCoreGatewayLiveTokenRateConfig(enabled: boolean): void {
+    if (!this.child?.connected || !this.child.send) {
+      return;
+    }
+    try {
+      this.child.send({
+        enabled,
+        protocolVersion: 1,
+        type: arLiveTokenRateConfigMessageType
+      });
+    } catch {
+      // The runtime may exit between the connected check and send().
+    }
   }
 
   private async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -611,6 +644,7 @@ class GatewayService {
     this.child = undefined;
     this.server = undefined;
     this.coreAuthToken = "";
+    setExternalLiveTokenRateSnapshot(coreGatewayLiveTokenRateSourceId);
     this.externalGatewayApiKey = apiKey;
     this.status = {
       coreEndpoint: endpoint(config.gateway.coreHost, config.gateway.corePort),
@@ -713,6 +747,19 @@ function isRuntimeConfigReloadMessage(message: unknown): message is { configRevi
     typeof record.configRevision === "string" &&
     /^[a-f0-9]{64}$/i.test(record.configRevision) &&
     (record.forceRestart === undefined || typeof record.forceRestart === "boolean");
+}
+
+function isLiveTokenRateSnapshotMessage(
+  message: unknown
+): message is { activeRequests: number; tokensPerSecond: number } {
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    return false;
+  }
+  const record = message as Record<string, unknown>;
+  return record.type === arLiveTokenRateSnapshotMessageType &&
+    record.protocolVersion === 1 &&
+    typeof record.activeRequests === "number" && Number.isFinite(record.activeRequests) &&
+    typeof record.tokensPerSecond === "number" && Number.isFinite(record.tokensPerSecond);
 }
 
 function withCoreRuntimeEndpoint(config: AppConfig, host: string, port: number): AppConfig {

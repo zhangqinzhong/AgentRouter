@@ -1,7 +1,7 @@
 import { createGatewayStreamMetrics, recordGatewayResponseStatus } from "@agentrouter/core/observability/gateway-stream-metrics";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { Readable } from "node:stream";
+import { pipeline, Readable } from "node:stream";
 import type { ApiKeyConfig, AppConfig, GatewayProviderConfig, GatewayProviderProtocol, ProfileConfig, RouterRule } from "@agentrouter/core/contracts/app";
 import {
   claudeCodeWifTokenPath,
@@ -14,11 +14,15 @@ import {
   type ClaudeCodeRouteDecision
 } from "@agentrouter/core/gateway/claude-code-router-plugin";
 import {
+  arAnthropicReasoningResponseHookKey,
   arCodexApplyPatchBridgeHeader,
   arCodexBridgeRequestTransformKey,
   arCodexBridgeResponseHookKey,
   arCodexBridgeStreamHookKey,
   arCodexMultiAgentBridgeHeader,
+  arLiveTokenRateConfigMessageType,
+  arLiveTokenRateSnapshotMessageType,
+  arLiveTokenRateStreamHookKey,
   arOpenRouterDiscountFinalizeResponseHookKey,
   arOpenRouterDiscountFinalizeStreamHookKey,
   arOpenRouterDiscountRequestIdHeader,
@@ -40,6 +44,7 @@ import {
   encodeArRouteFallbackHeader,
   type ArRouterPluginRouteRequest
 } from "@agentrouter/core/gateway/core-runtime/router-plugin-contract";
+import { coalesceAnthropicReasoningResponse } from "@agentrouter/core/gateway/features/anthropic-reasoning-response";
 import { coreGatewayAuthHeader, rawTraceSyncHeader, rawTraceSyncPath, sdkCompatibleTokenHeaderNames } from "@agentrouter/core/gateway/internal/shared";
 import { gatewayRuntimeConfigControlPath, gatewayRuntimeConfigRevision } from "@agentrouter/core/gateway/runtime-config-control";
 import {
@@ -58,6 +63,7 @@ import {
   transformCodexMultiAgentBridgeResponseValue
 } from "@agentrouter/core/gateway/features/codex-multi-agent-bridge";
 import { requestLogRequestedModel } from "@agentrouter/core/observability/request-log-model";
+import { createStreamExperienceMeter, LiveTokenRateTracker } from "@agentrouter/core/observability/stream-experience";
 import {
   finalizeOpenRouterDiscountProviderRouterSelection,
   openRouterDiscountProviderRouterTransform
@@ -171,6 +177,8 @@ type GatewayStreamHookInput = {
     method?: string;
     url?: string;
   };
+  targetProvider?: string;
+  targetProviderConfig?: Pick<GatewayProviderConfig, "provider" | "type">;
   upstreamRequest?: UpstreamRequest;
   upstreamResponse: Response;
 };
@@ -204,6 +212,7 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
   });
   const streamMetrics = createGatewayStreamMetrics();
   const openRouterDiscountContext = openRouterDiscountTransformContext(config);
+  const liveTokenRatePublisher = coreGatewayLiveTokenRatePublisherFor(config.trayShowTokenRate);
 
   return {
     httpRoutes: [{
@@ -446,6 +455,12 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
         return undefined;
       }
     }, {
+      key: arAnthropicReasoningResponseHookKey,
+      transformResponse: (responseInput: GatewayResponseHookInput) => {
+        const transformed = coalesceAnthropicReasoningResponse(responseInput.responsePayload);
+        return transformed.changed ? { responsePayload: transformed.value } : undefined;
+      }
+    }, {
       key: arCodexBridgeResponseHookKey,
       transformResponse: (responseInput: GatewayResponseHookInput) =>
         applyCodexBridgeResponseTransform(responseInput)
@@ -470,6 +485,10 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
         finalizeOpenRouterDiscountSelection(streamInput);
         return undefined;
       }
+    }, {
+      key: arLiveTokenRateStreamHookKey,
+      transformResponse: (streamInput: GatewayStreamHookInput) =>
+        applyLiveTokenRateStreamTransform(streamInput, liveTokenRatePublisher)
     }],
     routeResolvers: [{
       key: arRouterRouteResolverKey,
@@ -477,6 +496,129 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
         resolveArGatewayRoute(config, requestInput)
     }]
   };
+}
+
+const liveTokenRatePublishIntervalMs = 250;
+let sharedCoreGatewayLiveTokenRatePublisher: CoreGatewayLiveTokenRatePublisher | undefined;
+
+class CoreGatewayLiveTokenRatePublisher {
+  readonly tracker = new LiveTokenRateTracker();
+  private enabled = false;
+  private lastPublishedAt = 0;
+  private publishTimer?: NodeJS.Timeout;
+
+  constructor(enabled: boolean) {
+    process.on("message", this.handleMessage);
+    this.configure(enabled);
+  }
+
+  configure(enabled: boolean): void {
+    const nextEnabled = enabled && typeof process.send === "function";
+    if (this.enabled === nextEnabled) {
+      return;
+    }
+    this.enabled = nextEnabled;
+    if (!nextEnabled) {
+      this.tracker.clear();
+    }
+    this.publishNow();
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  notifyActivity(urgent: boolean): void {
+    if (!this.enabled) {
+      return;
+    }
+    const delayMs = liveTokenRatePublishIntervalMs - (Date.now() - this.lastPublishedAt);
+    if (urgent || delayMs <= 0) {
+      this.publishNow();
+      return;
+    }
+    if (this.publishTimer) {
+      return;
+    }
+    this.publishTimer = setTimeout(() => {
+      this.publishTimer = undefined;
+      this.publishNow();
+    }, delayMs);
+    this.publishTimer.unref?.();
+  }
+
+  private readonly handleMessage = (message: unknown): void => {
+    if (!isRecord(message) || message.type !== arLiveTokenRateConfigMessageType || message.protocolVersion !== 1) {
+      return;
+    }
+    this.configure(message.enabled === true);
+  };
+
+  private publishNow(): void {
+    if (this.publishTimer) {
+      clearTimeout(this.publishTimer);
+      this.publishTimer = undefined;
+    }
+    this.lastPublishedAt = Date.now();
+    const snapshot = this.enabled
+      ? this.tracker.snapshot()
+      : { activeRequests: 0, tokensPerSecond: 0 };
+    try {
+      process.send?.({
+        ...snapshot,
+        protocolVersion: 1,
+        type: arLiveTokenRateSnapshotMessageType
+      });
+    } catch {
+      this.enabled = false;
+      this.tracker.clear();
+      return;
+    }
+    if (this.enabled && snapshot.activeRequests > 0) {
+      this.publishTimer = setTimeout(() => {
+        this.publishTimer = undefined;
+        this.publishNow();
+      }, liveTokenRatePublishIntervalMs);
+      this.publishTimer.unref?.();
+    }
+  }
+}
+
+function coreGatewayLiveTokenRatePublisherFor(enabled: boolean): CoreGatewayLiveTokenRatePublisher {
+  sharedCoreGatewayLiveTokenRatePublisher ??= new CoreGatewayLiveTokenRatePublisher(enabled);
+  sharedCoreGatewayLiveTokenRatePublisher.configure(enabled);
+  return sharedCoreGatewayLiveTokenRatePublisher;
+}
+
+function applyLiveTokenRateStreamTransform(
+  streamInput: GatewayStreamHookInput,
+  publisher: CoreGatewayLiveTokenRatePublisher
+): Response | undefined {
+  if (!publisher.isEnabled() || !streamInput.upstreamResponse.body) {
+    return undefined;
+  }
+  const protocol = normalizeProviderProtocol(streamInput.targetProviderConfig?.type) ??
+    normalizeProviderProtocol(streamInput.targetProviderConfig?.provider) ??
+    normalizeProviderProtocol(streamInput.targetProvider);
+  const meter = createStreamExperienceMeter({
+    contentType: streamInput.upstreamResponse.headers.get("content-type") ?? undefined,
+    liveRateTracker: publisher.tracker,
+    onLiveRateActivity: (urgent) => publisher.notifyActivity(urgent),
+    protocol,
+    publishLiveRate: true,
+    requestId: readGatewayRequestId(streamInput) ?? randomUUID()
+  });
+  const source = Readable.fromWeb(
+    streamInput.upstreamResponse.body as unknown as Parameters<typeof Readable.fromWeb>[0]
+  );
+  // Propagate cancellation/errors through the meter instead of leaving a
+  // detached upstream reader (and live-rate request) behind.
+  const metered = pipeline(source, meter.stream, () => {});
+  return new Response(Readable.toWeb(metered) as ReadableStream<Uint8Array>, {
+    headers: new Headers(streamInput.upstreamResponse.headers),
+    status: streamInput.upstreamResponse.status,
+    statusText: streamInput.upstreamResponse.statusText
+  });
 }
 
 async function handleRuntimeConfigControlRoute(

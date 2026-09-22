@@ -7,6 +7,7 @@ import {
   type ProxyRouteTarget
 } from "@agentrouter/core/contracts/app";
 import { defaultRequestLogBodyBytes } from "@agentrouter/core/observability/request-log-limits";
+import { DEFAULT_PAGE_RANGES } from "@agentrouter/core/config/page-default-ranges";
 
 export const DEFAULT_PROXY_TARGETS: ProxyRouteTarget[] = [
   { host: "api.anthropic.com", paths: ["/v1/messages", "/v1/messages/count_tokens"] },
@@ -213,10 +214,12 @@ export function createDefaultAppConfig(options: DefaultAppConfigOptions = {}): A
     providerPlugins: [],
     routerEndpoint: "http://127.0.0.1:3466",
     theme: "system",
+    pageDefaultRanges: { ...DEFAULT_PAGE_RANGES },
     trayComponentVariants: DEFAULT_TRAY_COMPONENT_VARIANTS,
     trayIcon: "layered",
     trayShowTokenUsage: false,
     trayPetEnabled: true,
+    trayShowTokenRate: false,
     trayProgressTargetTokens: 100000,
     trayWidgets: DEFAULT_TRAY_WIDGETS,
     trayWindowModules: DEFAULT_TRAY_WINDOW_MODULES,

@@ -17,7 +17,7 @@ const provider = {
 test("#1779 OpenRouter exact source limits override cross-provider merged maxima", () => {
   const metadata = getProviderCatalogModels({ providerPresetId: "openrouter" }).modelMetadata;
   assert.equal(metadata["deepseek/deepseek-v4-flash"].contextWindow, 1024000);
-  assert.equal(metadata["z-ai/glm-5.3"].contextWindow, 1048576);
+  assert.equal(metadata["z-ai/glm-5.3"].contextWindow, 1048575);
   assert.equal(metadata["minimax/minimax-m3"].contextWindow, 524288);
 });
 

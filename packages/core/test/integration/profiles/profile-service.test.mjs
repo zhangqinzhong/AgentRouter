@@ -885,6 +885,61 @@ test("#1779 profile service defaults to apiKeyHelper even on Claude Code 2.1.235
   }
 });
 
+test("#1798 profile service removes boolean autoMode when apiKeyHelper manages authentication", { skip: !process.env.AR_INTERNAL_HOME_DIR }, async () => {
+  const profileId = "claude-auto-mode-api-key-helper";
+  const config = createDefaultAppConfig();
+  config.APIKEY = "ar-auto-mode-api-key-helper-test";
+  config.APIKEYS = [{
+    createdAt: "2026-01-01T00:00:00.000Z",
+    id: `profile:${profileId}`,
+    key: "ar-auto-mode-api-key-helper-test",
+    name: "Profile: Claude Auto Mode API Key Helper Test"
+  }];
+  config.Providers = [{
+    api_base_url: "https://example.test/v1",
+    api_key: "provider-key",
+    models: ["model"],
+    name: "Provider"
+  }];
+  config.profile.profiles = [{
+    agent: "claude-code",
+    claudeSettings: {
+      autoCompactEnabled: true,
+      autoMemoryEnabled: true,
+      autoMode: true
+    },
+    enabled: true,
+    env: {},
+    id: profileId,
+    model: "Provider/model",
+    name: "Claude Auto Mode API Key Helper",
+    scope: "agentrouter",
+    settingsFile: "~/.claude/settings.json",
+    smallFastModel: "",
+    surface: "auto"
+  }];
+
+  const result = await applyProfileFixture(config);
+  assert.equal(result.clients[0].ok, true, result.clients[0].message);
+  const settingsFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "settings.json");
+  const firstSettings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  assert.equal(firstSettings.autoMode, undefined, "persisted boolean autoMode must not override helper auth");
+  assert.equal(firstSettings.autoMemoryEnabled, true);
+  assert.equal(firstSettings.autoCompactEnabled, true);
+  assert.match(firstSettings.apiKeyHelper, /ar-claude-code-api-key-/);
+
+  writeFileSync(settingsFile, `${JSON.stringify({ ...firstSettings, autoMode: true }, null, 2)}\n`);
+  await applyProfileFixture(config);
+  const secondSettings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  assert.equal(secondSettings.autoMode, undefined, "a session-written boolean autoMode must be removed on the next apply");
+  assert.match(secondSettings.apiKeyHelper, /ar-claude-code-api-key-/);
+
+  config.profile.profiles[0].claudeSettings.autoMode = { classifyAllShell: true };
+  await applyProfileFixture(config);
+  const structuredSettings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  assert.deepEqual(structuredSettings.autoMode, { classifyAllShell: true });
+});
+
 test("Codex profile launcher bypasses middleware for Browser and Computer Use helpers", { skip: process.platform === "win32" || !process.env.AR_INTERNAL_HOME_DIR }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "ar-browser-helper-bypass-"));
   const profileId = "browser-helper-bypass-test";
@@ -1496,7 +1551,7 @@ test("profile service writes a multi-model Kimi CLI home that points inference t
   assert.match(legacyProfileConfigContent, /\[models\."Provider\/gpt-5\.5-pro"\][\s\S]*?capabilities = \["tool_use", "image_in", "thinking"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Provider\/legacy-extra"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Custom Gemini\/gemini-2\.5-pro"\]\nprovider = "claude-code-router"\nmodel = "Custom Gemini\/gemini-2\.5-pro"\nmax_context_size = 1065535/);
-  assert.match(legacyProfileConfigContent, /\[models\."DeepSeek\/deepseek-v4-flash"\]\nprovider = "claude-code-router"\nmodel = "DeepSeek\/deepseek-v4-flash"\nmax_context_size = 1050000\ncapabilities = \["tool_use", "thinking"\]/);
+  assert.match(legacyProfileConfigContent, /\[models\."DeepSeek\/deepseek-v4-flash"\]\nprovider = "claude-code-router"\nmodel = "DeepSeek\/deepseek-v4-flash"\nmax_context_size = 1050000\ncapabilities = \["tool_use", "image_in", "thinking"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Zhipu Coding\/glm-5\.2"\]\nprovider = "claude-code-router"\nmodel = "Zhipu Coding\/glm-5\.2"\nmax_context_size = 1049000\ncapabilities = \["tool_use", "image_in", "thinking"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Fusion\/catalog-context"\]\nprovider = "claude-code-router"\nmodel = "Fusion\/catalog-context"\nmax_context_size = 1050000\ncapabilities = \["tool_use", "image_in", "thinking"\]/);
 });
