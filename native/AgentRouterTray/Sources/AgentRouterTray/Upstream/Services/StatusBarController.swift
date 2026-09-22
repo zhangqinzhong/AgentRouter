@@ -58,6 +58,10 @@ final class StatusBarController: NSObject {
     private let emptyAttributedTitle = NSAttributedString(string: "")
     private var isUpdatingDisplay = false
     private var isHideIconPromptPending = false
+    private var statusButtonMonitor: Any?
+    /// Left button is down on the status item. Icon frames and width stay frozen
+    /// so a menu-bar reorder is not cancelled by the animator.
+    private var statusItemPointerDown = false
 
     private static let showStatsKey = "MenuBarShowStats"
     private var showStats: Bool {
@@ -274,6 +278,13 @@ final class StatusBarController: NSObject {
             }
             NotificationCenter.default.post(name: .menuBarIconFrameUpdated, object: image)
         }
+        statusButtonMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self, weak button] event in
+            guard let button, event.window === button.window else { return event }
+            MainActor.assumeIsolated {
+                self?.setStatusItemPointerDown(event.type == .leftMouseDown)
+            }
+            return event
+        }
 
         // Real-time activity: queue.jsonl appends make the runner icon sprint.
         queueActivityMonitor.onActivity = { [weak self] in
@@ -385,7 +396,29 @@ final class StatusBarController: NSObject {
             .store(in: &cancellables)
     }
 
+    private func setStatusItemPointerDown(_ down: Bool) {
+        guard down != statusItemPointerDown else { return }
+        statusItemPointerDown = down
+        animator?.setDisplayUpdatesSuspended(down)
+        if !down {
+            updateStatsDisplay()
+        }
+    }
+
+    deinit {
+        if let statusButtonMonitor {
+            NSEvent.removeMonitor(statusButtonMonitor)
+        }
+    }
+
     private func updateStatsDisplay() {
+        if statusItemPointerDown {
+            if NSEvent.pressedMouseButtons & 1 != 0 {
+                return
+            }
+            statusItemPointerDown = false
+            animator?.setDisplayUpdatesSuspended(false)
+        }
         guard !isUpdatingDisplay else { return }
         isUpdatingDisplay = true
         defer { isUpdatingDisplay = false }

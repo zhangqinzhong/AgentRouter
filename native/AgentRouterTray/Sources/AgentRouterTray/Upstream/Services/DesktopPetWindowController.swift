@@ -54,8 +54,12 @@ final class DesktopPetWindowController: NSObject, NSWindowDelegate {
 
     private let viewModel: DashboardViewModel
     private var panel: NSPanel?
+    private var downMonitor: Any?
     private var dragMonitor: Any?
     private var upMonitor: Any?
+    /// Anchor for the press that started in this panel. Screen points, so the
+    /// window follows the pointer even after it leaves the panel.
+    private var dragAnchor: PetDragTranslation?
     /// nil → freely placed; otherwise the edge the pet is tucked against.
     private var hiddenEdge: Edge?
     private var isRevealed = false
@@ -169,7 +173,9 @@ final class DesktopPetWindowController: NSObject, NSWindowDelegate {
         // and stay out of Cmd-Tab cycling. Never activate the app on click.
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        panel.isMovableByWindowBackground = true
+        // SwiftUI handles the mouse on the sprite, so window-background dragging
+        // never starts. The drag monitors below move the panel instead.
+        panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.acceptsMouseMovedEvents = true
@@ -260,37 +266,57 @@ final class DesktopPetWindowController: NSObject, NSWindowDelegate {
 
     private func installDragMonitors(_ panel: NSPanel) {
         // Closed-hand "grab" cursor while dragging the pet; restore the open hand on drop.
-        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self, weak panel] event in
-            if event.window === panel {
-                let deltaX = event.deltaX
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.didDrag = true
-                    self.uiState.isDragging = true
-                    if deltaX < 0 {
-                        self.uiState.dragDirection = .left
-                    } else if deltaX > 0 {
-                        self.uiState.dragDirection = .right
-                    }
-                    NSCursor.closedHand.set()
-                }
+        // Monitors run on the main thread. Move synchronously so the panel stays under
+        // the pointer; hopping to a later turn lets the cursor leave the window first.
+        downMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self, weak panel] event in
+            guard let panel, event.window === panel else { return event }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.dragAnchor = PetDragTranslation(
+                    anchorMouse: NSEvent.mouseLocation,
+                    anchorOrigin: panel.frame.origin
+                )
+                self.didDrag = false
             }
             return event
         }
-        upMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { [weak self, weak panel] event in
-            if event.window === panel {
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.keepActive()
-                    if self.didDrag {            // only after a real drag, not a tap
-                        NSCursor.openHand.set()
-                        self.snapToEdgeIfNeeded()
-                    }
-                    self.uiState.isDragging = false
-                    self.didDrag = false
-                }
+        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self, weak panel] event in
+            var consume = false
+            MainActor.assumeIsolated {
+                guard let self, let panel, let anchor = self.dragAnchor else { return }
+                guard event.window === panel || self.didDrag else { return }
+                let mouse = NSEvent.mouseLocation
+                guard anchor.movedFarEnough(to: mouse) else { return }
+                self.didDrag = true
+                self.uiState.isDragging = true
+                self.uiState.dragDirection = mouse.x < anchor.anchorMouse.x ? .left : .right
+                panel.setFrameOrigin(anchor.origin(at: mouse))
+                NSCursor.closedHand.set()
+                consume = true
             }
-            return event
+            // Swallow the drag once the panel is moving so the sprite's tap gesture
+            // does not also fire: the pointer stays at the same point inside the window.
+            return consume ? nil : event
+        }
+        upMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { [weak self, weak panel] event in
+            var consume = false
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard event.window === panel || self.dragAnchor != nil else { return }
+                self.keepActive()
+                if self.didDrag {
+                    NSCursor.openHand.set()
+                    self.snapToEdgeIfNeeded()
+                    if self.hiddenEdge == nil {
+                        panel?.saveFrame(usingName: Self.frameAutosaveName)
+                    }
+                    consume = true
+                }
+                self.uiState.isDragging = false
+                self.didDrag = false
+                self.dragAnchor = nil
+            }
+            return consume ? nil : event
         }
     }
 
@@ -329,7 +355,9 @@ final class DesktopPetWindowController: NSObject, NSWindowDelegate {
         if hovering {
             keepActive()
         }
-        guard hiddenEdge != nil else { return }
+        // A drag owns the frame. Hover must not animate a tucked pet back to the edge
+        // underneath the pointer.
+        guard hiddenEdge != nil, !uiState.isDragging, !didDrag else { return }
         if hovering, !isRevealed {
             isRevealed = true
             applyEdgeFrame(animated: true)
@@ -463,6 +491,7 @@ final class DesktopPetWindowController: NSObject, NSWindowDelegate {
 
     deinit {
         lookTimer?.invalidate()
+        if let downMonitor { NSEvent.removeMonitor(downMonitor) }
         if let dragMonitor { NSEvent.removeMonitor(dragMonitor) }
         if let upMonitor { NSEvent.removeMonitor(upMonitor) }
     }
@@ -497,6 +526,27 @@ final class DesktopPetWindowController: NSObject, NSWindowDelegate {
             }
         }
         RunLoop.main.add(lookTimer!, forMode: .common)
+    }
+}
+
+/// Screen-space drag anchor. Both `NSEvent.mouseLocation` and the panel origin use
+/// a bottom-left origin with Y increasing upward, so the deltas add.
+struct PetDragTranslation: Equatable {
+    var anchorMouse: CGPoint
+    var anchorOrigin: CGPoint
+    var threshold: CGFloat = 3
+
+    func movedFarEnough(to mouse: CGPoint) -> Bool {
+        let dx = mouse.x - anchorMouse.x
+        let dy = mouse.y - anchorMouse.y
+        return dx * dx + dy * dy >= threshold * threshold
+    }
+
+    func origin(at mouse: CGPoint) -> CGPoint {
+        CGPoint(
+            x: anchorOrigin.x + (mouse.x - anchorMouse.x),
+            y: anchorOrigin.y + (mouse.y - anchorMouse.y)
+        )
     }
 }
 
@@ -556,6 +606,18 @@ enum PetSizePreset: String, CaseIterable {
 struct PetCharacter: RawRepresentable, Hashable, Identifiable, CaseIterable {
     let rawValue: String
     var id: String { rawValue }
+
+    // Hashable must be written out. A compiler-synthesized hash(into:) for this
+    // RawRepresentable calls hashValue, and that getter calls hash(into:) again.
+    // The right-click character menu hashes every case and overflows the stack,
+    // which kills the native menu bar and leaves the Electron tray behind.
+    static func == (lhs: PetCharacter, rhs: PetCharacter) -> Bool {
+        lhs.rawValue == rhs.rawValue
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(rawValue)
+    }
 
     static let clawd = PetCharacter(rawValue: "clawd")!
     static let bot = PetCharacter(rawValue: "bot")!

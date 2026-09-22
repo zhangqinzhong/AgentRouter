@@ -58,6 +58,9 @@ final class MenuBarAnimator {
     /// The current icon image (for external use, e.g. stats rendering)
     var currentImage: NSImage { renderedImage }
     var onImageUpdated: ((NSImage) -> Void)?
+    /// While the status item is pressed, keep the button image still. Replacing it
+    /// mid-drag makes macOS cancel a menu-bar reorder and snap the item back.
+    private var displayUpdatesSuspended = false
 
     private lazy var idleFrame = buildFrame(eyesClosed: false, yShift: 0)
     private lazy var blinkFrame = buildFrame(eyesClosed: true, yShift: 0)
@@ -111,6 +114,15 @@ final class MenuBarAnimator {
             Task { @MainActor in animator.applyCurrentState() }
         }
         if !wasSprinting { applyCurrentState() }
+    }
+
+    func setDisplayUpdatesSuspended(_ suspended: Bool) {
+        guard suspended != displayUpdatesSuspended else { return }
+        displayUpdatesSuspended = suspended
+        if !suspended {
+            button?.image = renderedImage
+            onImageUpdated?(renderedImage)
+        }
     }
 
     func applyCurrentState() {
@@ -517,6 +529,10 @@ final class MenuBarAnimator {
 
     private func setButtonImage(_ image: NSImage) {
         renderedImage = image
+        if displayUpdatesSuspended, NSEvent.pressedMouseButtons & 1 == 0 {
+            displayUpdatesSuspended = false
+        }
+        guard !displayUpdatesSuspended else { return }
         button?.image = image
         onImageUpdated?(image)
     }
