@@ -86,6 +86,8 @@ test("settings sections render in the document, not in a modal", () => {
         trayWidgets={[]} updateConfig={noop}
       />, language);
       assertDocument(html, appCopy[language].settings.title);
+      const sectionTitle = appCopy[language].settings[initialPage === "toolhub" ? "toolHub" : initialPage];
+      assert.ok(!new RegExp(`<h2[^>]*>${sectionTitle}</h2>`).test(html), `Repeated category heading: ${initialPage}`);
       assert.match(html, /<nav aria-label=/);
       assert.match(html, /aria-current="page"/);
       assert.doesNotMatch(html, /max-w-\[1160px\]|max-w-\[900px\]/);

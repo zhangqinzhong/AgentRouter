@@ -12,3 +12,19 @@ export function outputRateFromTpot(entry: {
   const decodeDurationMs = durationMs - timeToFirstTokenMs;
   return decodeDurationMs > 0 ? (outputTokens - 1) * 1_000 / decodeDurationMs : undefined;
 }
+
+/** Prefer a validated stream sample; only legacy rows fall back to TPOT. */
+export function outputRateForRequestLog(entry: Parameters<typeof outputRateFromTpot>[0] & {
+  outputTokensPerSecond?: number;
+  streamSpeedSampleStatus?: string;
+}): number | undefined {
+  if (!entry.isStream) return undefined;
+  if (entry.streamSpeedSampleStatus !== undefined || entry.outputTokensPerSecond !== undefined) {
+    const rate = entry.outputTokensPerSecond;
+    return entry.streamSpeedSampleStatus === "complete" &&
+      rate !== undefined && Number.isFinite(rate) && rate >= 0
+      ? rate
+      : undefined;
+  }
+  return outputRateFromTpot(entry);
+}

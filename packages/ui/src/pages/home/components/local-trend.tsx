@@ -1,3 +1,5 @@
+import {DEFAULT_PAGE_RANGES} from "@agentrouter/core/config/page-default-ranges";
+import type {PageDefaultRanges} from "@agentrouter/core/contracts/app";
 import {memo,useMemo,useState} from 'react';
 import {copy} from '@/vendor/tokentracker/lib/copy';
 import {formatUsdCurrency} from '@/vendor/tokentracker/lib/format';
@@ -18,9 +20,9 @@ function StatCell({label,value,sub,title}:{label:string;value:string;sub?:string
  );
 }
 
-export const LocalTrendView=memo(function LocalTrendView(){
+export const LocalTrendView=memo(function LocalTrendView({defaultRange=DEFAULT_PAGE_RANGES.trend}:{defaultRange?:PageDefaultRanges["trend"]}){
  const t=useAppText();const numberLocale=useAppNumberLocale();
- const [period,setPeriod]=useState<TrendPeriod>('month');
+ const [period,setPeriod]=useState<TrendPeriod>(defaultRange);
  const [custom,setCustom]=useState(()=>heatmapTrendRange('day'));
  const [calendarOpen,setCalendarOpen]=useState(false);
  const timeZone=getBrowserTimeZone()||Intl.DateTimeFormat().resolvedOptions().timeZone;

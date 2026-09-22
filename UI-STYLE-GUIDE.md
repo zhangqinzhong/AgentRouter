@@ -101,6 +101,7 @@ hover 卡 / 弹层统一：`rounded-xl border border-oai-gray-200/50 bg-white/95
 - 打开弹层、编辑日期、点击取消、按 Escape 或点击外部都不改变已生效的查询范围。只有“应用”才提交日期并切换到自定义；关闭后丢弃未应用的草稿。
 - `onCustomRangeApply` 只保存日期，公共 tabs 组件负责随后调用 `onChange("custom")`。普通标签切换会关闭日历，禁止页面自行实现“打开即生效”或特殊拦截自定义标签。
 - 日期标签、日历和按钮跟随当前界面语言；标签使用 `role="tab"` / `aria-selected`，公共组件统一处理方向键、Home / End 导航。
+- “设置 → 通用 → 默认时间范围”分别保存概览、用量、会话、趋势四个页面的初始范围。热力图保持原有 53 周展示和累计统计，不提供时间筛选。保留 11px 小格子、3px 网格间距及原有配色、月份和星期排布；宽屏完整展示，只有内容超出时自然横向滚动，窄屏默认显示最近日期。不要为了可滑动而放大格子、强行撑宽或自动补载更早的空白日期。各页保留自身时间口径（滚动天数或自然周期），进入页面后仍可临时切换；不要先发起“全部”查询再加载默认配置。
 
 ### 5.2 筛选器与次要操作
 
@@ -114,6 +115,8 @@ hover 卡 / 弹层统一：`rounded-xl border border-oai-gray-200/50 bg-white/95
 <div className="grid grid-cols-2 gap-x-8 gap-y-5 border-y border-border/70 py-5 sm:grid-cols-4">
 ```
 每格：`text-[9px] font-bold uppercase tracking-widest text-muted-foreground` 标签 + `text-xl font-semibold tabular-nums tracking-tight` 数值（全量数字放 `title`）。无值显示 `—`。
+
+概览的四项摘要采用首尾贴齐内容区域、项间等距的排列：桌面使用 `flex justify-between`，第一项左对齐、最后一项右对齐，不将各项居中；窄屏保留两列布局。设置页选中分类后不再重复该分类的标题和图标，只有真正的子分节保留区块头。
 
 ### 5.4 区块头（图标 + 标题 + 右侧辅助信息）
 

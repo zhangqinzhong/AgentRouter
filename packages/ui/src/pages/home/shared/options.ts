@@ -1,3 +1,4 @@
+import openCodeProviderIconUrl from "@/assets/agent-logos/opencode.ico";
 import {
   Activity,
   Box,
@@ -367,6 +368,7 @@ export const providerPresetIconUrls: Record<string, string> = {
   "moonshot-global": moonshotProviderIconUrl,
   nvidia: nvidiaProviderIconUrl,
   openai: openaiProviderIconUrl,
+  "opencode-go": openCodeProviderIconUrl,
   openrouter: openrouterProviderIconUrl,
   "qiniu-ai": qiniuAiProviderIconUrl,
   runapi: runapiProviderIconUrl,

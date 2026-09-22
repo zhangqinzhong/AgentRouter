@@ -4,7 +4,7 @@ import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { AgentAnalysisSessionRow, AgentAnalysisTraceRun, RequestLogEntry, RequestLogPage } from "@agentrouter/core/contracts/app.ts";
 import { AgentAnalysisView } from "@agentrouter/ui/pages/home/components/agent-analysis.tsx";
-import { LogsView } from "@agentrouter/ui/pages/home/components/network-logs.tsx";
+import { LogExpandedDetails, LogsView } from "@agentrouter/ui/pages/home/components/network-logs.tsx";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { createEmptyAgentAnalysis } from "@agentrouter/ui/pages/home/shared/usage.ts";
 
@@ -54,6 +54,63 @@ const sampleRequestLogEntry: RequestLogEntry = {
   totalTokens: 150,
   url: "/v1/messages"
 };
+
+test("request details display localized stream metrics without adding table columns", () => {
+  const entry: RequestLogEntry = {
+    ...sampleRequestLogEntry,
+    durationMs: 3000,
+    timeToFirstTokenMs: 1000,
+    outputTokensPerSecond: 80.5,
+    streamSpeedSampleStatus: "complete",
+    activeOutputMs: 600,
+    responseHeadersMs: 0,
+    timeToFirstSignalMs: 100,
+    timeToFirstTextMs: 150,
+    upstreamTimeToFirstSignalMs: 90,
+    p95InterEventGapMs: 50,
+    maxInterEventGapMs: 100,
+    tailMs: 20
+  };
+  for (const lang of ["en", "zh"] as const) {
+    const html = renderToStaticMarkup(
+      <AppI18nContext.Provider value={appCopy[lang]}>
+        <LogExpandedDetails entry={entry} />
+      </AppI18nContext.Provider>
+    );
+    assert.match(html, /80\.5 token\/s/);
+    for (const key of ["Headers ready", "First signal", "First text", "Upstream first signal", "Output window", "P95 gap", "Max stall", "Tail wait", "Speed sample", "Complete speed sample"]) {
+      assert.ok(html.includes(appCopy[lang].text[key]), `${lang}: ${key}`);
+    }
+    assert.doesNotMatch(html, /NaN|Infinity/);
+    if (lang === "zh") assert.doesNotMatch(html, /Headers ready|First text|Complete speed sample/);
+  }
+});
+
+test("request detail sample states are localized and legacy logs have no empty metrics section", () => {
+  const statuses = {
+    partial: "未完整结束",
+    usage_missing: "缺少用量数据",
+    insufficient_tokens: "Token 不足",
+    unsupported_protocol: "协议不支持",
+    hidden_reasoning: "包含隐藏推理",
+    batched_output: "输出被批量合并"
+  } as const;
+  for (const [status, label] of Object.entries(statuses)) {
+    const html = renderToStaticMarkup(
+      <AppI18nContext.Provider value={appCopy.zh}>
+        <LogExpandedDetails entry={{
+          ...sampleRequestLogEntry, durationMs: 3000, timeToFirstTokenMs: 1000,
+          outputTokensPerSecond: 80.5,
+          streamSpeedSampleStatus: status as RequestLogEntry["streamSpeedSampleStatus"]
+        }} />
+      </AppI18nContext.Provider>
+    );
+    assert.ok(html.includes(label));
+    assert.doesNotMatch(html, /80\.5 token\/s/);
+  }
+  const legacy = renderToStaticMarkup(<LogExpandedDetails entry={sampleRequestLogEntry} />);
+  assert.doesNotMatch(legacy, /Stream metrics|Speed sample/);
+});
 
 test("LogsView keeps disabled request logs discoverable with an enable action", () => {
   const html = renderToStaticMarkup(

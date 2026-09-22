@@ -55,19 +55,26 @@ const DATE_RANGES = [
   { id: "90d", days: 90, label: () => copy("sessions.filter.range_90d") },
 ];
 
-// Earliest timestamp a range chip admits, as epoch ms in the *viewer's* time
-// zone. The whole list is fetched once and filtered here, so the range chips
-// never re-query: switching them is instant and cannot drop rows the way a
-// server-side day-string comparison did (a UTC-sliced day boundary put a
-// UTC+8 user's early-morning sessions on the wrong calendar day).
-function rangeStartMs(rangeId) {
+// Filter by local calendar boundaries; the server receives a coarse UTC window.
+function rangeStartMs(rangeId, now = new Date()) {
   const days = DATE_RANGES.find((range) => range.id === rangeId)?.days || 0;
   if (!days) return 0;
-  const start = new Date();
+  const start = new Date(now);
   // Inclusive range: "7d" is today plus the previous six local calendar days.
   start.setDate(start.getDate() - (days - 1));
   start.setHours(0, 0, 0, 0);
   return start.getTime();
+}
+
+export function sessionQueryRange(rangeId, now = new Date()) {
+  const start = rangeStartMs(rangeId, now);
+  if (!start) return {};
+  // Include boundary days on either side, then apply exact local timestamps
+  // below. The collector compares UTC day strings; never drop overnight or
+  // resumed sessions merely because the viewer is in another time zone.
+  const from = new Date(start - 86400000).toISOString().slice(0, 10);
+  const to = new Date(now.getTime() + 86400000).toISOString().slice(0, 10);
+  return { from, to };
 }
 
 // A session counts as inside the window when it *overlaps* it: one that started
@@ -691,13 +698,13 @@ function ThreadModelUsage({ sessions, selectedModel, onSelect }) {
   );
 }
 
-export function SessionsPage() {
+export function SessionsPage({ defaultRange = "7d" } = {}) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [sourceFilter, setSourceFilter] = useState("all");
-  const [rangeFilter, setRangeFilter] = useState("all");
+  const [rangeFilter, setRangeFilter] = useState(defaultRange);
   const [projectFilter, setProjectFilter] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
@@ -719,18 +726,15 @@ export function SessionsPage() {
     return () => { active = false; };
   }, []);
 
-  // Fetch the whole list once. The payload is metadata only (~0.5KB/session)
-  // over loopback, and the server builds every session regardless of the date
-  // range anyway, so a server-side window would cost a round trip without
-  // saving any work — and it would make the source/project/search filters mean
-  // "within the fetched page" instead of "within your sessions".
+  // Request only the chosen window; source/project/search filters apply to it.
   const load = useCallback(async (refresh = false) => {
     const requestId = ++requestIdRef.current;
     if (refresh) setRefreshing(true);
     else setIsLoading(true);
     setError(null);
+    if (!refresh) setData(null);
     try {
-      const result = await getSessions({ refresh });
+      const result = await getSessions({ refresh, ...sessionQueryRange(rangeFilter) });
       // A cold scan can take several seconds; never let an older response
       // overwrite a newer one.
       if (requestId === requestIdRef.current) setData(result);
@@ -742,11 +746,12 @@ export function SessionsPage() {
         setRefreshing(false);
       }
     }
-  }, []);
+  }, [rangeFilter]);
 
   useEffect(() => {
     if (IS_LOCAL_HOST || isMockEnabled()) void load(false);
     else setIsLoading(false);
+    return () => { requestIdRef.current += 1; };
   }, [load]);
 
   const allSessions = data?.sessions || NO_SESSIONS;

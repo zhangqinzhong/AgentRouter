@@ -1,3 +1,5 @@
+import { normalizePageDefaultRanges, PAGE_DEFAULT_RANGE_OPTIONS } from "@agentrouter/core/config/page-default-ranges";
+import type { PageDefaultRanges } from "@agentrouter/core/contracts/app";
 import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
 import { ArrowLeft } from "lucide-react";
 import {
@@ -311,7 +313,6 @@ function AppearanceSettingsPage({
 
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
-      <SectionHeading icon={Palette} title={copy.settings.appearance} />
       <div className="divide-y divide-border/60 border-y border-border/70">
         <div className="flex flex-wrap items-center justify-between gap-3 py-4">
           <span className="text-[13px] font-medium">{copy.settings.theme}</span>
@@ -349,7 +350,7 @@ function GeneralSettingsPage({
 }) {
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
-      <SectionHeading icon={Settings} title={copy.settings.general} />
+      <PageDefaultRangeSettings config={config} updateConfig={updateConfig} />
       <ServerSettingsSection config={config} copy={copy} updateConfig={updateConfig} />
       {launchAtLoginSupported ? (
         <SettingsSwitchRow
@@ -364,6 +365,36 @@ function GeneralSettingsPage({
       <DataSettingsSection appInfo={appInfo} copy={copy} />
     </div>
   );
+}
+
+export function PageDefaultRangeSettings({ config, updateConfig }: {
+  config: AppConfig;
+  updateConfig: (mutator: (config: AppConfig) => AppConfig) => void;
+}) {
+  const t = useAppText();
+  const ranges = normalizePageDefaultRanges(config.pageDefaultRanges);
+  const pages: Array<[keyof PageDefaultRanges, string]> = [
+    ["overview", "Overview"], ["usage", "Usage"], ["sessions", "Sessions"], ["trend", "Trend"]
+  ];
+  const labels: Record<string, string> = {
+    today: "Today", "24h": "Last 24 hours", "7d": "Last 7 days", "30d": "Last 30 days", "90d": "Last 90 days",
+    all: "All", total: "All", day: "Today", week: "This week", month: "This month", year: "This year"
+  };
+  return <section className="grid gap-3">
+    <h2 className="text-sm font-medium">{t("Default time ranges")}</h2>
+    <p className="text-[12px] text-muted-foreground">{t("Choose the initial time range for each page. Changes apply the next time you open that page.")}</p>
+    <div className="divide-y divide-border/60 border-y border-border/70">
+      {pages.map(([page, label]) => <div key={page} className="flex flex-wrap items-center justify-between gap-3 py-4">
+        <span className="text-[13px] font-medium">{t(label)}</span>
+        <Select aria-label={`${t(label)} · ${t("Default time range")}`} className="w-[220px] max-w-full text-[12px] shadow-none"
+          value={String(ranges[page])}
+          options={PAGE_DEFAULT_RANGE_OPTIONS[page].map(value => ({ value: String(value), label: t(labels[String(value)]) }))}
+          onValueChange={value => updateConfig(current => ({ ...current,
+            pageDefaultRanges: normalizePageDefaultRanges({ ...normalizePageDefaultRanges(current.pageDefaultRanges), [page]: value })
+          }))} />
+      </div>)}
+    </div>
+  </section>;
 }
 
 function ServerSettingsSection({
@@ -524,7 +555,6 @@ function ObservabilitySettingsPage({
   const t = useAppText();
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
-      <SectionHeading icon={Activity} title={copy.settings.observability} />
       <div className="grid grid-cols-1 gap-3">
         <SettingsSwitchRow
           checked={observability.requestLogs}
@@ -678,7 +708,6 @@ function ToolHubSettingsPage({
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
       <div className="grid gap-1">
-        <SectionHeading icon={KeyRound} title={copy.settings.toolHub} />
         <p className="text-[12px] leading-5 text-muted-foreground">{copy.settings.toolHubDescription}</p>
       </div>
       <div className="grid grid-cols-1 gap-3">
@@ -1255,8 +1284,7 @@ function BotSettingsPage({
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
       <div className="flex min-w-0 items-center justify-between gap-3">
         <div className="min-w-0">
-          <SectionHeading icon={Boxes} title={copy.settings.bots} />
-          <div className="mt-1 text-[12px] text-muted-foreground">{t("Manage bots used by agent profiles.")}</div>
+          <div className="text-[12px] text-muted-foreground">{t("Manage bots used by agent profiles.")}</div>
         </div>
         <Button onClick={() => setEditor({ mode: "add" })} size="sm" type="button">
           {t("Add bot")}
@@ -2088,7 +2116,6 @@ export function TraySettingsPage({
   if (trayTitleSupported) {
     return (
       <div className={cn(settingsPageContentWidthClassName, "grid content-start gap-4")}>
-        <SectionHeading icon={Gauge} title={copy.settings.tray} />
         <label className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
           <span className="text-[13px] font-semibold">{copy.settings.trayShowTokenUsage}</span>
           <Switch aria-label={copy.settings.trayShowTokenUsage} checked={trayShowTokenUsage} onCheckedChange={onChangeTrayShowTokenUsage} />
@@ -2102,8 +2129,7 @@ export function TraySettingsPage({
   }
 
   return (
-    <div className={cn(settingsPageContentWidthClassName, "grid min-h-[520px] grid-rows-[auto_auto_auto] gap-4")} ref={pageRef}>
-      <SectionHeading icon={Gauge} title={copy.settings.tray} />
+    <div className={cn(settingsPageContentWidthClassName, "grid content-start gap-4")} ref={pageRef}>
       <div className="flex flex-wrap items-end gap-3 border-y border-border/70 py-5">
         <Field className="min-w-[220px] flex-1" label={copy.settings.trayIcon}>
           <TrayIconSelect onChange={changeTrayIcon} options={trayIconOptions} progress={progressPreviewValue} value={effectiveTrayIconPreference} />

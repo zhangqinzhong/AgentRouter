@@ -11,6 +11,8 @@ import { legacyProfileItemsFromProfileConfig, normalizeBotGatewayRuntimeConfig, 
 import { normalizeRouterConfig } from "./routing";
 import { normalizeMcpServers } from "./virtual-models";
 
+import { normalizePageDefaultRanges } from "@agentrouter/core/config/page-default-ranges";
+
 export function normalizeConfig(config: AppConfig): AppConfig {
   const router = normalizeRouterConfig(config.Router);
   const apiKeys = normalizeApiKeys(config.APIKEYS, config.APIKEY);
@@ -24,6 +26,7 @@ export function normalizeConfig(config: AppConfig): AppConfig {
   return {
     ...fallbackConfig,
     ...config,
+    pageDefaultRanges: normalizePageDefaultRanges(config.pageDefaultRanges),
     APIKEY: apiKeys[0]?.key ?? "",
     APIKEYS: apiKeys,
     Providers: Array.isArray(config.Providers) ? config.Providers : [],

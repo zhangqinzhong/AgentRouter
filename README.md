@@ -62,6 +62,8 @@ If a profile should always use one model, select it in the profile. Configure gl
 
 ## Local data
 
+**Settings → General → Default time ranges** sets independent initial ranges for Overview, Usage, Sessions, and Trend. Overview and Usage start with today, Sessions with the last 7 days, and Trend with the current month. Heatmap keeps its 53-week small-cell layout, with natural horizontal scrolling only when the window is too narrow.
+
 Configuration and runtime data live under `~/.agentrouter` on macOS and Linux, or `%APPDATA%\agentrouter` on Windows.
 
 **Settings → Logs & Observability → Log retention days** controls request history retention. The default is one day, measured as a rolling 24-hour period. Logs and observability share request data; expired records, related traces, and unreferenced body files are cleaned together. Overview usage statistics are separate and have their own reset action.

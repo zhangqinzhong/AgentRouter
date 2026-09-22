@@ -27,7 +27,7 @@ function formatDialogError(error: unknown): string {
 
 function StatCell({ label, sub, title, value }: { label: string; sub?: string; title?: string; value: string }) {
   return (
-    <div className="flex min-w-0 flex-col gap-1.5">
+    <div className="flex min-w-0 flex-col items-start gap-1.5 text-left">
       <span className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground">{label}</span>
       <span className="text-xl font-semibold tabular-nums tracking-tight" title={title}>{value}</span>
       {sub ? <span className="text-[10px] tabular-nums text-muted-foreground">{sub}</span> : null}
@@ -272,14 +272,16 @@ export function OverviewView({
 
   return (
     <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
-      <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
-        <h1 className="text-[24px] font-semibold tracking-[-0.025em]">{t("Overview")}</h1>
-        <OverviewRangeTabs
-          customRange={usageCustomRange ?? emptyOverviewCustomRange}
-          range={usageRange}
-          setCustomRange={setUsageCustomRange}
-          setRange={setUsageRange}
-        />
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <h1 className="shrink-0 text-[24px] font-semibold tracking-[-0.025em]">{t("Overview")}</h1>
+        <div className="ml-auto min-w-0 max-w-full">
+          <OverviewRangeTabs
+            customRange={usageCustomRange ?? emptyOverviewCustomRange}
+            range={usageRange}
+            setCustomRange={setUsageCustomRange}
+            setRange={setUsageRange}
+          />
+        </div>
       </div>
       <div className="mb-6 flex flex-wrap items-center gap-2">
         <Select
@@ -309,9 +311,11 @@ export function OverviewView({
         </Button>
       </div>
 
-      <div className="mb-6 grid grid-cols-2 gap-x-8 gap-y-5 border-y border-border/70 py-5 sm:grid-cols-4">
+      <div className="mb-6 grid w-full grid-cols-2 gap-x-4 gap-y-5 border-y border-border/70 py-5 sm:flex sm:justify-between sm:gap-x-8">
         {statCells.map((cell) => (
-          <StatCell key={cell.label} label={cell.label} sub={cell.sub} title={cell.title} value={cell.value} />
+          <div key={cell.label} className="min-w-0 even:justify-self-end last:[&>div]:items-end last:[&>div]:text-right">
+            <StatCell label={cell.label} sub={cell.sub} title={cell.title} value={cell.value} />
+          </div>
         ))}
       </div>
       {usageStats.totals.requestCount > 0 ? (

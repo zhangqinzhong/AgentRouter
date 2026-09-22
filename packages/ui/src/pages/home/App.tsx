@@ -1,3 +1,4 @@
+import {DEFAULT_PAGE_RANGES, normalizePageDefaultRanges} from "@agentrouter/core/config/page-default-ranges";
 import { setUsageLocale } from "@/vendor/tokentracker/lib/copy";
 import {
   AddApiKeyDraft, AddProfileDraft, AddProviderDraft, AddRoutingRuleDraft, AgentAnalysisSessionSelection, AgentAnalysisSnapshot, AgentFilterValue,
@@ -300,7 +301,7 @@ function App() {
   const [agentAnalysisSession, setAgentAnalysisSession] = useState<AgentAnalysisSessionSelection>();
   const [usageModelFilter, setUsageModelFilter] = useState("");
   const [usageProviderFilter, setUsageProviderFilter] = useState("");
-  const [usageRange, setUsageRange] = useState<UsageStatsRange>("all");
+  const [usageRange, setUsageRange] = useState<UsageStatsRange>(DEFAULT_PAGE_RANGES.overview);
   const [usageCustomRange, setUsageCustomRange] = useState<UsageDateRange>({ from: "", to: "" });
   const [usageStats, setUsageStats] = useState<UsageStatsSnapshot>(fallbackUsageStats);
   const [providerAccountSnapshots, setProviderAccountSnapshots] = useState<ProviderAccountSnapshot[]>([]);
@@ -368,7 +369,10 @@ function App() {
       .catch(() => setProviderPresets([]))
       .finally(() => setProviderPresetsLoaded(true));
     void window.agentrouter.getConfig()
-      .then(syncConfigState)
+      .then(config => {
+        syncConfigState(config);
+        setUsageRange(normalizePageDefaultRanges(config.pageDefaultRanges).overview);
+      })
       .catch(() => {
         // Fall back to the bundled defaults; the rest of the UI can still render.
       })
@@ -506,6 +510,7 @@ function App() {
   }, [configLoaded, providerDeepLinkRequest?.id, providerDeepLinkRequest?.provider, providerPresetsLoaded]);
 
   useEffect(() => {
+    if (!configLoaded || activeView !== "overview") return;
     if (!window.agentrouter) {
       setUsageStats(createEmptyUsageStats(usageRange));
       return;
@@ -515,7 +520,7 @@ function App() {
     const refreshUsageStats = () => {
       const requestId = ++usageStatsRequestId.current;
       const filter = overviewUsageStatsFilter(usageRange, usageProviderFilter, usageModelFilter, draftConfig.Providers);
-      void window.agentrouter?.getUsageStats(usageRange, filter, usageRange === "custom" ? usageCustomRange : undefined).then((snapshot) => {
+      return window.agentrouter?.getUsageStats(usageRange, filter, usageRange === "custom" ? usageCustomRange : undefined).then((snapshot) => {
         if (!cancelled && requestId === usageStatsRequestId.current) {
           setUsageStats(snapshot);
         }
@@ -526,7 +531,7 @@ function App() {
       cancelled = true;
       stopPolling();
     };
-  }, [usageCustomRange, usageModelFilter, usageProviderFilter, usageRange]);
+  }, [configLoaded, activeView, usageCustomRange, usageModelFilter, usageProviderFilter, usageRange]);
 
   useEffect(() => {
     if (!usageProviderFilter) {
@@ -2677,6 +2682,7 @@ function App() {
   }
 
   function selectNavigationItem(id: NavigationId) {
+    if (id === "overview" && activeView !== "overview") setUsageRange(normalizePageDefaultRanges(draftConfig.pageDefaultRanges).overview);
     setActiveView(id);
   }
 
@@ -3292,6 +3298,7 @@ function App() {
             />
           ) : (
             <MainLayout
+              configLoaded={configLoaded}
               activeView={activeView}
               agentAnalysisEnabled={agentAnalysisEnabled}
               compactLayout={compactLayout}

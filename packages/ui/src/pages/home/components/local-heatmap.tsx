@@ -183,6 +183,7 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
  const [hoveredCell,setHoveredCell]=useState<BuiltCell>();
  const [tooltipPos,setTooltipPos]=useState({x:0,y:0,shiftX:0,flipY:false});
  const hideTimeoutRef=useRef<ReturnType<typeof setTimeout>|null>(null);
+ const heatmapScrollRef=useRef<HTMLDivElement>(null);
  const timeZone=getBrowserTimeZone()||Intl.DateTimeFormat().resolvedOptions().timeZone;
  const isDark=typeof document!=='undefined'&&document.documentElement.classList.contains('dark');
  const palette=isDark?DARK_GREEN:GREEN;
@@ -212,6 +213,10 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
   return()=>{active=false};
  },[revision,timeZone,t]);
  useEffect(()=>()=>{if(hideTimeoutRef.current)clearTimeout(hideTimeoutRef.current);},[]);
+ useEffect(()=>{
+  const node=heatmapScrollRef.current;
+  if(node&&heatmap)node.scrollLeft=node.scrollWidth;
+ },[heatmap]);
  const showCellTooltip=(event:MouseEvent<HTMLButtonElement>,cell:BuiltCell)=>{
   if(hideTimeoutRef.current){clearTimeout(hideTimeoutRef.current);hideTimeoutRef.current=null;}
   setHoveredCell(cell);
@@ -290,7 +295,7 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
    </div>
    <h2 className="mb-3 text-sm font-medium">{t('Token activity')}</h2>
    {loading&&!heatmap?<p className="text-sm text-muted-foreground">{copy('qpd.card.updating')}</p>:(
-    <div className="w-full overflow-x-auto">
+    <div ref={heatmapScrollRef} role="region" aria-label={t('Token activity')} tabIndex={0} className="w-full overflow-x-auto">
      <div className="relative mb-1 h-4 min-w-[720px]">
       {monthLabels.map((marker)=>(
        <span key={`${marker.label}-${marker.index}`} className="absolute text-[10px] text-muted-foreground" style={{left:`${(marker.index/Math.max(built.weeks.length,1))*100}%`}}>{marker.label}</span>
@@ -305,6 +310,8 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
         <button
          key={`${weekIndex}-${dayIndex}`}
          type="button"
+         data-heatmap-day={cell?.day}
+         data-heatmap-level={cell?.level??0}
          disabled={!cell}
          onMouseEnter={(event)=>{if(cell)showCellTooltip(event,cell as BuiltCell);}}
          onMouseLeave={hideCellTooltip}

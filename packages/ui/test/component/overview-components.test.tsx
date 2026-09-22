@@ -72,6 +72,8 @@ test("OverviewView renders four flat stat cells in a bordered grid", () => {
   assert.match(html, /128/);
   assert.match(html, /\$1\.23/);
   assert.match(html, /98%/);
+  assert.match(html, /grid w-full grid-cols-2[^"]*sm:flex sm:justify-between sm:gap-x-8/);
+  assert.equal((html.match(/flex min-w-0 flex-col items-start gap-1\.5 text-left/g) ?? []).length, 4);
 });
 
 test("OverviewView renders the range filter as flat tabs with one active option", () => {
@@ -87,6 +89,7 @@ test("OverviewView renders the range filter as flat tabs with one active option"
   assert.equal(active.length, 1);
   assert.match(html, /bg-oai-gray-100/);
   assert.doesNotMatch(html, /overview-segmented/);
+  assert.match(html, /class="ml-auto min-w-0 max-w-full"><div[^>]*role="tablist"/);
 });
 
 test("OverviewView marks the All tab active for all-time usage", () => {

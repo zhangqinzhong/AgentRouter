@@ -8,7 +8,7 @@ import { minimaxChinaProviderPreset } from "@agentrouter/core/providers/presets/
 import { moonshotGlobalProviderPreset } from "@agentrouter/core/providers/presets/moonshot/index.ts";
 import { qiniuAiProviderPreset } from "@agentrouter/core/providers/presets/qiniu-ai/index.ts";
 import { xiaomiMimoProviderPreset } from "@agentrouter/core/providers/presets/xiaomi/index.ts";
-import { AddProviderDialog, AddProviderForm, ProviderConnectivityCheckDialog, ProvidersView, uniqueProviderProbeProtocolRows } from "@agentrouter/ui/pages/home/components/providers.tsx";
+import { AddProviderDialog, AddProviderForm, ProviderConnectivityCheckDialog, ProvidersView, localAgentProviderAlreadyImported, localAgentProviderPluginSuffixesForCandidate, uniqueProviderProbeProtocolRows } from "@agentrouter/ui/pages/home/components/providers.tsx";
 import {
   applyProviderProbeResult,
   createProviderConfigFromDeepLink,
@@ -36,6 +36,7 @@ import {
   providerPresetIconUrls,
   providerProtocolOptions,
   providerProbeCandidates,
+  providerProbeModelsForProtocol,
   providerSelectableProtocolsFromProbe,
   removeLocalAgentProviderPluginsForProvider,
   setProviderPresets
@@ -1584,6 +1585,127 @@ test("New API user balance template adds configurable user self connector", () =
   assert.equal(connectors[1].headers.Authorization, "Bearer <new-api-access-token>");
   assert.equal(connectors[1].headers["New-Api-User"], "42");
   assert.equal(connectors[1].mapping.meters[0].id, "new_api_user_balance");
+});
+
+test("Zen and Go candidates use distinct local agent plugin suffixes", () => {
+  const zenCandidate = {
+    id: "opencode-api-anthropic-messages",
+    importable: true,
+    kind: "opencode",
+    models: ["shared-model"],
+    name: "OpenCode Zen (Anthropic)",
+    protocol: "anthropic_messages",
+    status: "available"
+  };
+  const goCandidate = {
+    ...zenCandidate,
+    id: "opencode-go-api-anthropic-messages",
+    name: "OpenCode Go (Anthropic)"
+  };
+
+  assert.deepEqual(localAgentProviderPluginSuffixesForCandidate(zenCandidate), [
+    "-opencode-anthropic-messages-api-key",
+    "-opencode-anthropic-messages-api-key-internal"
+  ]);
+  assert.deepEqual(localAgentProviderPluginSuffixesForCandidate(goCandidate), [
+    "-opencode-go-anthropic-messages-api-key",
+    "-opencode-go-anthropic-messages-api-key-internal"
+  ]);
+
+  const zenProvider = {
+    api_key: "ar-local-agent-login",
+    models: ["shared-model"],
+    name: "OpenCode Zen (Anthropic)"
+  };
+  const zenPlugin = {
+    key: "ar-local-agent-opencode-zen-anthropic-opencode-anthropic-messages-api-key",
+    providerName: "OpenCode Zen (Anthropic)"
+  };
+  assert.equal(localAgentProviderAlreadyImported(zenCandidate, [zenProvider], [zenPlugin]), true);
+  assert.equal(localAgentProviderAlreadyImported(goCandidate, [zenProvider], [zenPlugin]), false);
+});
+
+test("provider probe models prefer the protocol-scoped list", () => {
+  const probe = {
+    models: ["chat-model", "responses-model"],
+    normalizedBaseUrl: "https://opencode.ai/zen/go",
+    protocolModels: {
+      openai_chat_completions: ["chat-model"],
+      openai_responses: ["responses-model"]
+    },
+    protocols: []
+  };
+  assert.deepEqual(providerProbeModelsForProtocol(probe, "openai_responses"), ["responses-model"]);
+  assert.deepEqual(providerProbeModelsForProtocol(probe, "anthropic_messages"), ["chat-model", "responses-model"]);
+  assert.deepEqual(providerProbeModelsForProtocol({ ...probe, protocolModels: undefined }, "openai_responses"), ["chat-model", "responses-model"]);
+  assert.deepEqual(providerProbeModelsForProtocol(undefined, "openai_responses"), []);
+  assert.deepEqual(providerProbeModelsForProtocol({
+    ...probe, protocolModels: { openai_responses: [] }
+  }, "openai_responses"), [], "an explicitly empty protocol must not fall back to every model");
+});
+
+test("provider probe auto-selection uses the selected protocol and preserves manual models", () => {
+  const probe = {
+    detectedProtocol: "openai_chat_completions" as const,
+    models: ["chat-only", "responses-only"],
+    normalizedBaseUrl: "https://opencode.ai/zen/go/v1",
+    protocolModels: {
+      openai_chat_completions: ["chat-only"],
+      openai_responses: ["responses-only"]
+    },
+    protocols: [
+      { protocol: "openai_chat_completions" as const, supported: true, endpoint: "https://opencode.ai/zen/go/v1/chat/completions", message: "ok" },
+      { protocol: "openai_responses" as const, supported: true, endpoint: "https://opencode.ai/zen/go/v1/responses", message: "ok" }
+    ]
+  };
+  const draft = {
+    ...createProviderDraft([]),
+    protocol: "openai_responses" as const,
+    selectedProtocols: ["openai_responses" as const],
+    protocolDetectionMode: "manual" as const
+  };
+  const updated = applyProviderProbeResult(draft, probe);
+  assert.deepEqual(updated.selectedModels, ["responses-only"]);
+  assert.equal(updated.protocol, "openai_responses");
+  const manual = applyProviderProbeResult({ ...draft, modelsText: "my-private-model" }, probe);
+  assert.equal(manual.modelsText, "my-private-model");
+  assert.deepEqual(manual.selectedModels, []);
+});
+
+test("add and edit provider model lists follow the selected protocol instead of stale detection", () => {
+  const probe = {
+    detectedProtocol: "openai_chat_completions" as const,
+    models: ["chat-only", "responses-only"],
+    normalizedBaseUrl: "https://opencode.ai/zen/go/v1",
+    protocolModels: {
+      openai_chat_completions: ["chat-only"],
+      openai_responses: ["responses-only"]
+    },
+    protocols: []
+  };
+  for (const mode of ["add", "edit"] as const) {
+    for (const protocol of ["openai_chat_completions", "openai_responses"] as const) {
+      const html = renderToStaticMarkup(React.createElement(AddProviderForm, {
+        activeStep: "models",
+        draft: {
+          ...createProviderDraft([]),
+          protocol: "openai_chat_completions",
+          selectedProtocols: [protocol]
+        },
+        error: "",
+        mode,
+        onChange: () => undefined,
+        probe,
+        probeLoading: false,
+        providers: []
+      }));
+      const selected = protocol === "openai_responses" ? "responses-only" : "chat-only";
+      const excluded = protocol === "openai_responses" ? "chat-only" : "responses-only";
+      assert.ok(html.includes(selected), `${mode}: ${protocol}`);
+      assert.ok(!html.includes(excluded), `${mode}: excluded ${excluded}`);
+      assert.match(html, /type="checkbox"/);
+    }
+  }
 });
 
 function providerInstallLinkPayload(link) {

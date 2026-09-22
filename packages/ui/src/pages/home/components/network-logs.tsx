@@ -1,5 +1,5 @@
 import { PageHeader, SectionHeading, tablePageClassName } from "./page-primitives";
-import { outputRateFromTpot } from "@/lib/token-rate";
+import { outputRateForRequestLog } from "@/lib/token-rate";
 import { memo, useId } from "react";
 import { Maximize2, Route, X } from "lucide-react";
 import type { RequestRouteTrace, RequestRouteTraceChange, RequestRouteTraceHop } from "@agentrouter/core/contracts/app";
@@ -970,7 +970,7 @@ function formatLogFirstToken(entry: RequestLogEntry): string {
 }
 
 function formatLogOutputRate(entry: RequestLogEntry, numberLocale: Parameters<typeof formatTokenRate>[1]): string {
-  const rate = outputRateFromTpot(entry);
+  const rate = outputRateForRequestLog(entry);
   return rate === undefined ? "—" : `${formatTokenRate(rate, numberLocale)} token/s`;
 }
 
@@ -1028,6 +1028,7 @@ export function LogExpandedDetails({
         <LogMetric label={t("Total")} value={formatCompactNumber(entry.totalTokens, numberLocale)} />
         <LogMetric label={t("Cost")} value={formatUsdCost(entry.costUsd ?? 0)} />
       </div>
+      <LogStreamMetrics entry={entry} />
       {entry.retryAttempts.length > 0 ? <LogRetryAttempts attempts={entry.retryAttempts} /> : null}
       {entry.routeTrace ? <LogRouteTrace trace={entry.routeTrace} /> : null}
       {detailLoading || detailError ? (
@@ -1050,6 +1051,44 @@ export function LogExpandedDetails({
       </div>
     </div>
   );
+}
+
+function LogStreamMetrics({ entry }: { entry: RequestLogEntry }) {
+  const t = useAppText();
+  const metrics: Array<[string, number | undefined]> = [
+    ["Headers ready", entry.responseHeadersMs],
+    ["First signal", entry.timeToFirstSignalMs],
+    ["First text", entry.timeToFirstTextMs],
+    ["Upstream first signal", entry.upstreamTimeToFirstSignalMs],
+    ["Output window", entry.activeOutputMs],
+    ["P95 gap", entry.p95InterEventGapMs],
+    ["Max stall", entry.maxInterEventGapMs],
+    ["Tail wait", entry.tailMs]
+  ];
+  const availableMetrics = metrics.filter(([, value]) => value !== undefined && Number.isFinite(value) && value >= 0);
+  if (!entry.isStream || (!availableMetrics.length && !entry.streamSpeedSampleStatus)) return null;
+  return (
+    <div aria-label={t("Stream metrics")} className="network-body-meta grid grid-cols-2 gap-y-2 border-b px-3 py-2 text-[12px] sm:grid-cols-4 lg:grid-cols-5">
+      {availableMetrics.map(([label, value]) => (
+        <LogMetric key={label} label={t(label)} value={formatDuration(value!)} />
+      ))}
+      {entry.streamSpeedSampleStatus ? (
+        <LogMetric label={t("Speed sample")} value={t(streamSpeedSampleLabel(entry.streamSpeedSampleStatus))} />
+      ) : null}
+    </div>
+  );
+}
+
+function streamSpeedSampleLabel(status: NonNullable<RequestLogEntry["streamSpeedSampleStatus"]>): string {
+  switch (status) {
+    case "complete": return "Complete speed sample";
+    case "partial": return "Partial speed sample";
+    case "usage_missing": return "Usage missing speed sample";
+    case "insufficient_tokens": return "Insufficient tokens speed sample";
+    case "unsupported_protocol": return "Unsupported protocol speed sample";
+    case "hidden_reasoning": return "Hidden reasoning speed sample";
+    case "batched_output": return "Batched output speed sample";
+  }
 }
 
 const hiddenLegacyRouteHopNames = new Set([
@@ -2720,9 +2759,10 @@ function OutputRateHelp({ average = false }: { average?: boolean }) {
         <p className="mt-2">{t("Includes the wait for the first token and applies to streaming and non-streaming requests. Output usage comes from the provider and may include reasoning tokens.")}</p>
         <p className="mt-2">{t("Example: 100 output tokens over a 5-second request gives an average throughput of 20 token/s.")}</p>
       </> : <>
-      <p className="font-semibold">{t("Output rate (TPOT estimate)")}</p>
-      <p className="mt-1">{t("Formula: (output tokens − 1) ÷ (total duration − time to first token), with time in seconds.")}</p>
-      <p className="mt-2">{t("Available for streaming requests with more than one output token and a valid time interval. Output usage comes from the provider and may include reasoning tokens.")}</p>
+      <p className="font-semibold">{t("Output rate")}</p>
+      <p className="mt-1">{t("Validated samples: (output tokens − 1) ÷ active output window in seconds.")}</p>
+      <p className="mt-2">{t("Legacy logs use the TPOT estimate: (output tokens − 1) ÷ (total duration − time to first token), with time in seconds.")}</p>
+      <p className="mt-2">{t("Incomplete or unreliable samples show no rate. Expand the request to see the sample status.")}</p>
       <p className="mt-2">{t("This gateway-observed estimate is affected by buffering, batched delivery, and short responses. It does not measure internal model generation speed. Average throughput includes the full request duration.")}</p>
       </>}
     </TooltipPortal>

@@ -1,3 +1,4 @@
+import {normalizePageDefaultRanges} from "@agentrouter/core/config/page-default-ranges";
 import { AppSettingsPage } from "./settings";
 import {RoutingActivationBrand} from "@/vendor/cc-switch/RoutingActivationBrand";
 import {initializeWindowActivity} from "@/vendor/cc-switch/windowActivity";
@@ -100,6 +101,7 @@ export function OnboardingLayout({
 export function MainLayout({
   activeView,
   compactLayout,
+  configLoaded = true,
   config,
   copy,
   gatewayActionBusy,
@@ -125,6 +127,7 @@ export function MainLayout({
   activeView: ViewId;
   agentAnalysisEnabled: boolean;
   compactLayout: boolean;
+  configLoaded?: boolean;
   config: AppConfig;
   copy: AppCopy;
   gatewayActionBusy: boolean;
@@ -291,6 +294,7 @@ export function MainLayout({
           )}
         >
           <MainViewSwitch
+            configLoaded={configLoaded}
             activeView={activeView}
             agentAnalysisEnabled={agentAnalysisEnabled}
             networkCaptureEnabled={networkCaptureEnabled}
@@ -439,6 +443,7 @@ export function GatewayStartupErrorBanner({
 }
 
 function MainViewSwitch({
+  configLoaded,
   activeView,
   agentAnalysisEnabled,
   networkCaptureEnabled,
@@ -448,15 +453,17 @@ function MainViewSwitch({
   agentAnalysisEnabled: boolean;
   networkCaptureEnabled: boolean;
   viewProps: MainViewProps;
+  configLoaded: boolean;
 }) {
+  const defaults = normalizePageDefaultRanges(viewProps.settings?.config?.pageDefaultRanges);
   return (
     <AnimatePresence initial={false} mode="wait">
       <ViewMotionShell key={activeView} view={activeView}>
         {activeView === "settings" || activeView === "server" ? <AppSettingsPage {...viewProps.settings} initialPage={activeView === "server" ? "general" : viewProps.settings.initialPage} /> : null}
-        {activeView === "usage" ? <LocalUsageView /> : null}
-        {activeView === "sessions" ? <LocalSessionsView /> : null}
-        {activeView === "trend" ? <LocalTrendView /> : null}
-        {activeView === "heatmap" ? <LocalHeatmapView /> : null}
+        {activeView === "usage" && configLoaded ? <LocalUsageView defaultRange={defaults.usage} /> : null}
+        {activeView === "sessions" && configLoaded ? <LocalSessionsView defaultRange={defaults.sessions} /> : null}
+        {activeView === "trend" && configLoaded ? <LocalTrendView defaultRange={defaults.trend} /> : null}
+        {activeView === "heatmap" && configLoaded ? <LocalHeatmapView /> : null}
         {activeView === "overview" ? <OverviewView {...viewProps.overview} /> : null}
         {activeView === "observability" && agentAnalysisEnabled ? <AgentAnalysisView {...viewProps.observability} /> : null}
         {activeView === "api-keys" ? <ApiKeysView {...viewProps.apiKeys} /> : null}

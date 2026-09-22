@@ -1,3 +1,5 @@
+import {DEFAULT_PAGE_RANGES} from "@agentrouter/core/config/page-default-ranges";
+import type {PageDefaultRanges} from "@agentrouter/core/contracts/app";
 import {memo,useEffect,useMemo,useState} from 'react';
 import type {LocalUsagePageData} from '@agentrouter/core/collector/usage-page';
 import {CostAnalysisModal} from '@/vendor/tokentracker/ui/dashboard/components/CostAnalysisModal';
@@ -17,9 +19,9 @@ export function localUsageRange(period:Period, custom:{from:string;to:string}, n
  if(period==='year'){start.setMonth(0,1);end.setMonth(11,31);}
  return {from:period==='total'?'':day(start),to:day(end)};
 }
-export const LocalUsageView=memo(function LocalUsageView(){
+export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_PAGE_RANGES.usage}:{defaultRange?:PageDefaultRanges["usage"]}){
  const t=useAppText();const language=useResolvedAppLanguage();const numberLocale=useAppNumberLocale();
- const [period,setPeriod]=useState<Period>('total');
+ const [period,setPeriod]=useState<Period>(defaultRange);
  const [custom,setCustom]=useState(()=>localUsageRange('day',{from:'',to:''}));
  const [costOpen,setCostOpen]=useState(false);
  const [calendarOpen,setCalendarOpen]=useState(false);
