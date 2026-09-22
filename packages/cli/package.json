@@ -1,6 +1,6 @@
 {
   "name": "@zhangqinzhong/agentrouter",
-  "version": "1.6.11",
+  "version": "1.7.0",
   "license": "MIT",
   "description": "Local AgentRouter gateway with CLI and web management UI.",
   "keywords": [

@@ -1,6 +1,6 @@
 # AgentRouter 版本发布
 
-AgentRouter 使用独立的 1.x 版本号，当前为 1.1.2。上游仓库版本号不作为 AgentRouter 发布版本。
+AgentRouter 使用独立的 1.x 版本号，当前版本以根目录及各 workspace 的 `package.json` 为准。上游仓库版本号不作为 AgentRouter 发布版本。
 
 ## 版本与检查
 

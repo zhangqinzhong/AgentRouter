@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 1.7.0 - 2026-09-22
+
+### Features
+- Added independent default time ranges for Overview, Usage, Sessions, and Trend under Settings → General.
+- Added OpenCode Go provider discovery, credentials, session headers, model discovery, and official account usage mapping (upstream by @Aser-Osama).
+- Added validated stream-speed samples and detailed timing metrics to request logs while preserving existing first-token metrics (upstream by @musistudio).
+- Filtered provider model candidates by protocol and distinguished OpenCode Zen and Go imports.
+- Updated the bundled model catalog to 4,732 models.
+
+### Fixes
+- Price routed models instead of rule aliases and recognize provider-prefixed response models in usage attribution (upstream by @cpruijsen and @zeal-up).
+- Refresh routed-model headers during fallback, normalize DeepSeek/OpenCode cache usage, coalesce unsigned Anthropic thinking fragments, and resolve Claude Code helper-auth conflicts (upstream by @musistudio).
+- Include per-attempt upstream causes in gateway errors and improve context-limit error messages (upstream by @zeal-up and @musistudio).
+- Raise the gateway configuration-acceptance timeout to 30 seconds and allow overrides (upstream by @fszcd).
+- Propagate stream cancellation and upstream read errors without leaving detached readers.
+- Restore Overview's right-aligned date controls and evenly spaced, edge-aligned statistics; remove duplicate settings headings.
+- Preserve Heatmap's original 11px cells, layout, and colors, with natural horizontal scrolling only when needed.
+- Accept CLI `--daemon`, include the log-body worker in Docker builds, and correct TypeScript project configuration (upstream by @syf2211, @deymosh, and @ntdatt812).
+
+### Performance
+- Wait for configuration before the initial Overview query, default to today instead of all history, and prevent overlapping polls.
+- Request the selected Sessions date window rather than loading all session metadata first.
+
 ## 1.6.11 - 2026-09-21
 
 - Unified custom date selection across Overview, Usage, Trend and enlarged trend charts with the Usage page calendar.
