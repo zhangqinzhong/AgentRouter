@@ -99,6 +99,44 @@ const ICONS:Record<string,LucideIcon>={
  LSP:SquareCode
 };
 
+const ACCENTS:Record<string,string>={
+ exec_command:'#f97316',
+ Bash:'#f97316',
+ write_stdin:'#fb923c',
+ send_input:'#fb923c',
+ update_plan:'#eab308',
+ TodoWrite:'#eab308',
+ 'node-repl/js':'#6366f1',
+ 'cua-repl/js':'#8b5cf6',
+ send_message:'#0ea5e9',
+ wait_agent:'#64748b',
+ wait:'#64748b',
+ view_image:'#ec4899',
+ imagegen:'#d946ef',
+ list_agents:'#a855f7',
+ Agent:'#a855f7',
+ Task:'#a855f7',
+ request_user_input:'#f43f5e',
+ request_user_input_async:'#f43f5e',
+ AskUserQuestion:'#f43f5e',
+ 'computer-use':'#8b5cf6',
+ 'computer-use/set_tool_value':'#8b5cf6',
+ Read:'#3b82f6',
+ Write:'#8b5cf6',
+ Edit:'#7c3aed',
+ apply_patch:'#c026d3',
+ Grep:'#06b6d4',
+ Glob:'#0891b2',
+ WebFetch:'#0284c7',
+ WebSearch:'#2563eb',
+ browser:'#0ea5e9',
+ 'control-in-app-browser':'#0284c7',
+ Skill:'#d946ef',
+ LSP:'#4f46e5'
+};
+
+const ACCENT_FALLBACK=['#38bdf8','#f472b6','#a78bfa','#fbbf24','#2dd4bf','#fb7185','#818cf8','#f97316','#22d3ee','#e879f9'];
+
 function titleCase(part:string){
  const known:Record<string,string>={js:'JS',repl:'REPL',mcp:'MCP',stdin:'Stdin',cwd:'CWD',url:'URL'};
  const lower=part.toLowerCase();
@@ -120,6 +158,56 @@ export function toolDisplayName(id:string){
  return humanizeToolId(id);
 }
 
+const VSCODE_ICONS:Record<string,string>={
+ exec_command:'file-type-shell',
+ Bash:'file-type-shell',
+ write_stdin:'file-type-shell',
+ send_input:'file-type-log',
+ update_plan:'file-type-todo',
+ TodoWrite:'file-type-todo',
+ 'node-repl/js':'file-type-js',
+ 'cua-repl/js':'file-type-html',
+ send_message:'file-type-log',
+ wait_agent:'file-type-log',
+ wait:'file-type-log',
+ view_image:'file-type-image',
+ imagegen:'file-type-image',
+ list_agents:'file-type-agents',
+ Agent:'file-type-agents',
+ Task:'file-type-agents',
+ request_user_input:'file-type-text',
+ request_user_input_async:'file-type-text',
+ AskUserQuestion:'file-type-text',
+ 'computer-use':'file-type-html',
+ 'computer-use/set_tool_value':'file-type-html',
+ Read:'file-type-text',
+ Write:'file-type-text',
+ Edit:'file-type-diff',
+ apply_patch:'file-type-patch',
+ Grep:'file-type-search-result',
+ Glob:'default-folder',
+ WebFetch:'file-type-html',
+ WebSearch:'file-type-search-result',
+ browser:'file-type-html',
+ 'control-in-app-browser':'file-type-html',
+ Skill:'folder-type-tools',
+ LSP:'file-type-json'
+};
+
+export function toolVscodeIcon(id:string):string|undefined{
+ if(VSCODE_ICONS[id])return VSCODE_ICONS[id];
+ if(id.startsWith('mcp__'))return 'folder-type-tools';
+ if(/agent/i.test(id))return 'file-type-agents';
+ if(/image|screenshot|photo/i.test(id))return 'file-type-image';
+ if(/browser|web|fetch|search/i.test(id))return 'file-type-search-result';
+ if(/glob|dir|folder/i.test(id))return 'default-folder';
+ if(/read|file/i.test(id))return 'file-type-text';
+ if(/bash|shell|exec|command|repl/i.test(id))return 'file-type-shell';
+ if(/plan|todo/i.test(id))return 'file-type-todo';
+ if(/patch|diff/i.test(id))return 'file-type-patch';
+ return undefined;
+}
+
 export function toolIcon(id:string):LucideIcon{
  if(ICONS[id])return ICONS[id];
  if(id.startsWith('mcp__'))return Plug;
@@ -131,6 +219,21 @@ export function toolIcon(id:string):LucideIcon{
  if(/bash|shell|exec|command|repl/i.test(id))return Terminal;
  if(/plan|todo/i.test(id))return ListTodo;
  return Wrench;
+}
+
+export function toolAccent(id:string){
+ if(ACCENTS[id])return ACCENTS[id];
+ if(id.startsWith('mcp__'))return '#f59e0b';
+ if(/agent/i.test(id))return '#a855f7';
+ if(/wait|sleep/i.test(id))return '#64748b';
+ if(/image|screenshot|photo/i.test(id))return '#ec4899';
+ if(/browser|web|fetch|search/i.test(id))return '#0ea5e9';
+ if(/read|file|glob/i.test(id))return '#3b82f6';
+ if(/bash|shell|exec|command|repl/i.test(id))return '#f97316';
+ if(/plan|todo/i.test(id))return '#eab308';
+ let hash=0;
+ for(let index=0;index<id.length;index+=1)hash=id.charCodeAt(index)+((hash<<5)-hash);
+ return ACCENT_FALLBACK[Math.abs(hash)%ACCENT_FALLBACK.length];
 }
 
 export function formatToolCalls(value:number){

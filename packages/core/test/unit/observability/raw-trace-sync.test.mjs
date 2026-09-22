@@ -948,6 +948,7 @@ test("fallback raw bundles keep unique bundle ids while sharing the logical requ
     for (const bundle of bundles) {
       assert.equal(bundle.update.timeToFirstTokenMs, 240);
       assert.equal(bundle.update.streamOutputDurationMs, 1500);
+      assert.equal(bundle.update.streamMetrics, undefined);
     }
     assert.deepEqual(bundles.map((bundle) => ({
       attempt: bundle.update.attempt,
@@ -957,6 +958,49 @@ test("fallback raw bundles keep unique bundle ids while sharing the logical requ
       { attempt: 1, bundleId: "core-bundle-1", requestId: "shared-logical-request" },
       { attempt: 2, bundleId: "core-bundle-2", requestId: "shared-logical-request" }
     ]);
+  } finally {
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("raw trace bundle carries single-gateway stream experience metrics into the log update", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-raw-trace-stream-experience-test-"));
+  const spoolDirectory = path.join(dir, "spool");
+  const bundleDirectory = path.join(spoolDirectory, "bundle");
+  const clientMetadata = path.join(bundleDirectory, "client_request_metadata.json");
+  const responseMetadata = path.join(bundleDirectory, "upstream_response_metadata.json");
+  const experience = {
+    activeOutputMs: 800,
+    estimatedOutputTokens: 12,
+    reasoningObserved: false,
+    responseHeadersMs: 40,
+    sampleStatus: "complete",
+    textObserved: true,
+    timeToFirstTextMs: 260,
+    toolObserved: false
+  };
+  try {
+    mkdirSync(bundleDirectory, { recursive: true });
+    writeFileSync(clientMetadata, JSON.stringify({
+      headers: {
+        "x-ar-stream-timing": "[240,1500]",
+        "x-ar-stream-experience": JSON.stringify(experience)
+      }
+    }));
+    writeFileSync(responseMetadata, JSON.stringify({ statusCode: 200 }));
+    const bundle = await readRawTraceRequestLogBundle({
+      parts: [
+        { filePath: clientMetadata, partType: "client_request_metadata" },
+        { filePath: responseMetadata, partType: "upstream_response_metadata" }
+      ],
+      requestId: "stream-experience-bundle",
+      turnKey: "stream-experience-request"
+    }, spoolDirectory);
+    assert.equal(bundle.update.timeToFirstTokenMs, 240);
+    assert.equal(bundle.update.streamOutputDurationMs, 1500);
+    assert.equal(bundle.update.streamMetrics.timeToFirstTextMs, 260);
+    assert.equal(bundle.update.streamMetrics.sampleStatus, "complete");
+    assert.equal(bundle.update.streamMetrics.activeOutputMs, 800);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

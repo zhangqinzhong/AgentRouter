@@ -381,6 +381,66 @@ test("RequestLogStore persists stream experience metrics and derives authoritati
   }
 });
 
+test("raw trace update persists stream experience metrics onto an existing log", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ar-request-log-raw-stream-metrics-test-"));
+  let store;
+  try {
+    store = new RequestLogStore(path.join(dir, "request-logs.sqlite"));
+    await store.record({
+      completedAt: new Date().toISOString(),
+      durationMs: 900,
+      method: "POST",
+      path: "/v1/responses",
+      providerName: "test-provider",
+      requestBody: Buffer.from(JSON.stringify({ model: "test-model", stream: true })),
+      requestHeaders: { "content-type": "application/json" },
+      requestId: "raw-trace-stream-metrics",
+      responseBodyText: [
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}',
+        "",
+        'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":21}}',
+        "",
+        'event: message_stop\ndata: {"type":"message_stop"}',
+        ""
+      ].join("\n"),
+      responseHeaders: { "content-type": "text/event-stream" },
+      startedAt: new Date().toISOString(),
+      statusCode: 200,
+      timeToFirstTokenMs: 240,
+      streamOutputDurationMs: 1500,
+      url: "http://127.0.0.1:3456/v1/responses"
+    });
+    const before = (await store.list({ pageSize: 25 })).items[0];
+    assert.equal(before.timeToFirstTextMs, undefined);
+    assert.equal(before.outputTokens, 21);
+    const applied = await store.updateFromRawTrace({
+      requestId: "raw-trace-stream-metrics",
+      streamMetrics: {
+        activeOutputMs: 800,
+        estimatedOutputTokens: 12,
+        reasoningObserved: false,
+        responseHeadersMs: 40,
+        sampleStatus: "complete",
+        textObserved: true,
+        timeToFirstTextMs: 260,
+        toolObserved: false
+      },
+      timeToFirstTokenMs: 240,
+      streamOutputDurationMs: 1500
+    });
+    assert.equal(applied, true);
+    const detail = await store.getDetail({ id: before.id });
+    assert.equal(detail.timeToFirstTextMs, 260);
+    assert.equal(detail.responseHeadersMs, 40);
+    assert.equal(detail.activeOutputMs, 800);
+    assert.equal(detail.streamSpeedSampleStatus, "complete");
+    assert.equal(detail.timeToFirstTokenMs, 240);
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("RequestLogStore keeps large request bodies in sidecar storage and reads them by chunk", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ar-request-log-sidecar-test-"));
   let store;

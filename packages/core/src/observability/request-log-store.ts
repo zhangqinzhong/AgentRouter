@@ -183,6 +183,7 @@ export type RequestLogRawTraceUpdateInput = {
   startedAt?: string;
   statusCode?: number;
   timeToFirstTokenMs?: number;
+  streamMetrics?: RequestStreamMetrics;
   streamOutputDurationMs?: number;
   url?: string;
 };
@@ -903,6 +904,7 @@ export class RequestLogStore {
       }
       const input = captureResolution.input;
       const existingUsageContext = readRequestLogUsageContext(database, requestId);
+      let metricTokenCounts: { outputTokens: number; reasoningTokens: number } | undefined;
 
       const sets: string[] = [];
       const params: SqlValue[] = [];
@@ -944,6 +946,16 @@ export class RequestLogStore {
       pushValue("response_model", responseModelFromTrace);
       pushValue("time_to_first_token_ms", rawInput.timeToFirstTokenMs === undefined ? undefined : optionalCount(rawInput.timeToFirstTokenMs));
       pushValue("stream_output_duration_ms", rawInput.streamOutputDurationMs === undefined ? undefined : optionalCount(rawInput.streamOutputDurationMs));
+      if (rawInput.streamMetrics) {
+        const measuredTokens = metricTokenCounts;
+        const storedTokens = measuredTokens ?? readStoredOutputTokenCounts(database, requestId);
+        const storedMetrics = resolveStoredStreamMetrics(
+          rawInput.streamMetrics,
+          storedTokens.outputTokens,
+          storedTokens.reasoningTokens
+        );
+        if (storedMetrics) pushValue("stream_metrics_json", JSON.stringify(storedMetrics));
+      }
       // The gateway's terminal failure is authoritative, even when it has only
       // an HTTP error status and no error string. A final-attempt raw failure may
       // still refine a gateway success (for example an SSE error inside HTTP 200).
@@ -1010,6 +1022,7 @@ export class RequestLogStore {
             ? estimateUsageCostUsdFromLoadedCatalog(costInput)
             : await estimateUsageCostUsd(costInput);
 
+          metricTokenCounts = { outputTokens, reasoningTokens };
           pushValue("input_tokens", inputTokens);
           pushValue("output_tokens", outputTokens);
           pushValue("reasoning_tokens", reasoningTokens);
@@ -1772,6 +1785,7 @@ function standaloneRecordInputFromRawTrace(
     durationMs,
     timeToFirstTokenMs: input.timeToFirstTokenMs,
     streamOutputDurationMs: input.streamOutputDurationMs,
+    ...(input.streamMetrics ? { streamMetrics: input.streamMetrics } : {}),
     ...(input.bundleId ? { eventId: `raw-trace:${input.bundleId}` } : {}),
     fallbackModel: input.model,
     maxBodyBytes,
@@ -5260,6 +5274,18 @@ function toRequestLogEntry(row: Record<string, SqlValue>): StoredRequestLogEntry
       ? { upstreamTimeToFirstSignalMs: streamMetrics.upstreamTimeToFirstSignalMs }
       : {}),
     url: String(row.url ?? "")
+  };
+}
+
+function readStoredOutputTokenCounts(database: SqlDatabase, requestId: string): { outputTokens: number; reasoningTokens: number } {
+  const row = queryRows(
+    database,
+    "SELECT output_tokens, reasoning_tokens FROM request_logs WHERE request_id = ? LIMIT 1",
+    [requestId]
+  )[0];
+  return {
+    outputTokens: normalizeCount(row?.output_tokens),
+    reasoningTokens: normalizeCount(row?.reasoning_tokens)
   };
 }
 

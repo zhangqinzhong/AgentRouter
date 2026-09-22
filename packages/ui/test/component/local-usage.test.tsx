@@ -19,7 +19,7 @@ import {modelDisplayName,compareOtherLast} from '../../src/vendor/tokentracker/l
 import {setUsageLocale} from '../../src/vendor/tokentracker/lib/copy';
 import {formatTokenCount,formatTokenTooltip} from '../../src/vendor/tokentracker/lib/token-format';
 import {matchingSessionProfiles,profileOpenSurfaces,resumeExtraArgs} from '../../src/vendor/tokentracker/pages/SessionsPage';
-import {formatToolCalls,toolDisplayName} from '../../src/pages/home/components/heatmap-tools';
+import {formatToolCalls,toolAccent,toolDisplayName,toolVscodeIcon} from '../../src/pages/home/components/heatmap-tools';
 import {dailyRowsFromHeatmap,heatmapCellTokens} from '../../src/pages/home/components/local-heatmap';
 import {heatmapTrendRange,trendChartPoints} from '../../src/pages/home/components/usage-trend-line';
 import {buildActivityHeatmap} from '../../src/vendor/tokentracker/lib/activity-heatmap';
@@ -106,6 +106,16 @@ test('heatmap tool names map raw ids and format integer call counts',()=>{
  assert.equal(formatToolCalls(17.626),'18');
  assert.equal(toolDisplayName('exec_command'),'执行命令');
  assert.equal(toolDisplayName('mcp__browser__click'),'Browser / Click');
+ assert.equal(toolVscodeIcon('Read'),'file-type-text');
+ assert.equal(toolVscodeIcon('Bash'),'file-type-shell');
+ assert.equal(toolVscodeIcon('Grep'),'file-type-search-result');
+ assert.equal(toolAccent('Read'),'#3b82f6');
+ assert.equal(toolAccent('Bash'),'#f97316');
+ assert.notEqual(toolAccent('Read'),toolAccent('Bash'));
+ assert.notEqual(toolAccent('Grep'),toolAccent('Bash'));
+ assert.equal(toolAccent('mcp__browser__click'),'#f59e0b');
+ assert.match(toolAccent('some-unknown-tool'),/^#[0-9a-f]{6}$/);
+ assert.equal(toolAccent('some-unknown-tool'),toolAccent('some-unknown-tool'));
 });
 test('heatmap cells read billable tokens when value is missing',()=>{
  const rows=dailyRowsFromHeatmap({weeks:[[{day:'2026-03-07',billable_total_tokens:150,total_tokens:150,level:2}]]});

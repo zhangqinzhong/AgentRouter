@@ -22,6 +22,23 @@ import trayLayeredIconUrl from "@/assets/tray-layered.png";
 
 const settingsPageContentWidthClassName = "w-full min-w-0";
 
+function SettingsPanel({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cn("overflow-hidden rounded-xl border border-border/70 bg-muted/[0.28]", className)}>
+      {children}
+    </div>
+  );
+}
+
+function SettingsControlRow({ children, label }: { children: ReactNode; label: string }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 py-3.5">
+      <span className="text-[13px] font-medium">{label}</span>
+      <div className="w-full min-w-[180px] sm:w-[240px]">{children}</div>
+    </div>
+  );
+}
+
 export function AppSettingsPage({
   saveFeedback,
   appInfo,
@@ -232,14 +249,16 @@ function SettingsLayout({
           </Button>
         ) : null}
       </PageHeader>
-      <nav aria-label={copy.settings.title} className="mb-8 flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-border/70 pb-3">
-        {pages.map((page) => (
-          <SettingsPageButton active={visiblePage === page.id} icon={page.icon} key={page.id} label={page.label} onClick={() => setActivePage(page.id)} />
-        ))}
-      </nav>
-      <section aria-label={pages.find((page) => page.id === visiblePage)?.label} key={visiblePage}>
-        {renderPage(visiblePage)}
-      </section>
+      <div className="grid items-start gap-6 lg:grid-cols-[188px_minmax(0,1fr)] lg:gap-10">
+        <nav aria-label={copy.settings.title} className="-mx-1 flex gap-1 overflow-x-auto px-1 pb-1 lg:sticky lg:top-16 lg:mx-0 lg:flex-col lg:overflow-visible lg:px-0 lg:pb-0">
+          {pages.map((page) => (
+            <SettingsPageButton active={visiblePage === page.id} icon={page.icon} key={page.id} label={page.label} onClick={() => setActivePage(page.id)} />
+          ))}
+        </nav>
+        <section aria-label={pages.find((page) => page.id === visiblePage)?.label} className={cn("min-w-0", visiblePage === "tray" ? "" : "max-w-[720px]")} key={visiblePage}>
+          {renderPage(visiblePage)}
+        </section>
+      </div>
       {saveFeedback}
     </div>
   );
@@ -261,10 +280,10 @@ function SettingsPageButton({
   return (
     <Button
       className={cn(
-        "flex h-8 min-w-0 items-center gap-1.5 text-left text-[12px] transition-colors",
+        "flex h-9 shrink-0 items-center gap-2 rounded-lg px-2.5 text-left text-[13px] transition-colors lg:w-full",
         active
-          ? "font-semibold text-foreground"
-          : "font-normal text-muted-foreground/70 hover:text-foreground",
+          ? "bg-foreground/[0.06] font-medium text-foreground"
+          : "font-normal text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
         className
       )}
       aria-current={active ? "page" : undefined}
@@ -272,13 +291,8 @@ function SettingsPageButton({
       type="button"
       unstyled
     >
-      <span className={cn(
-        "flex h-6 w-6 shrink-0 items-center justify-center rounded-md",
-        active ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"
-      )}>
-        <Icon className="h-3.5 w-3.5" />
-      </span>
-      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <Icon className={cn("h-4 w-4 shrink-0", active ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground")} />
+      <span className="min-w-0 truncate">{label}</span>
     </Button>
   );
 }
@@ -313,16 +327,14 @@ function AppearanceSettingsPage({
 
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
-      <div className="divide-y divide-border/60 border-y border-border/70">
-        <div className="flex flex-wrap items-center justify-between gap-3 py-4">
-          <span className="text-[13px] font-medium">{copy.settings.theme}</span>
-          <Select aria-label={copy.settings.theme} className="w-[220px] max-w-full text-[12px] shadow-none" onValueChange={onChangeTheme} options={themeOptions} value={themePreference} />
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-3 py-4">
-          <span className="text-[13px] font-medium">{copy.settings.language}</span>
-          <Select aria-label={copy.settings.language} className="w-[220px] max-w-full text-[12px] shadow-none" onValueChange={onChangeLanguage} options={languageOptions} value={languagePreference} />
-        </div>
-      </div>
+      <SettingsPanel className="divide-y divide-border/60">
+        <SettingsControlRow label={copy.settings.theme}>
+          <Select aria-label={copy.settings.theme} className="w-full text-[12px] shadow-none" onValueChange={onChangeTheme} options={themeOptions} value={themePreference} />
+        </SettingsControlRow>
+        <SettingsControlRow label={copy.settings.language}>
+          <Select aria-label={copy.settings.language} className="w-full text-[12px] shadow-none" onValueChange={onChangeLanguage} options={languageOptions} value={languagePreference} />
+        </SettingsControlRow>
+      </SettingsPanel>
     </div>
   );
 }
@@ -353,13 +365,15 @@ function GeneralSettingsPage({
       <PageDefaultRangeSettings config={config} updateConfig={updateConfig} />
       <ServerSettingsSection config={config} copy={copy} updateConfig={updateConfig} />
       {launchAtLoginSupported ? (
-        <SettingsSwitchRow
-          checked={launchAtLogin}
-          description={copy.settings.launchAtLoginDescription}
-          icon={Power}
-          label={copy.settings.launchAtLogin}
-          onChange={onChangeLaunchAtLogin}
-        />
+        <SettingsPanel>
+          <SettingsSwitchRow
+            checked={launchAtLogin}
+            description={copy.settings.launchAtLoginDescription}
+            icon={Power}
+            label={copy.settings.launchAtLogin}
+            onChange={onChangeLaunchAtLogin}
+          />
+        </SettingsPanel>
       ) : null}
       <ProxySettingsSection copy={copy} onChange={onChangeProxy} proxy={proxy} />
       <DataSettingsSection appInfo={appInfo} copy={copy} />
@@ -383,17 +397,16 @@ export function PageDefaultRangeSettings({ config, updateConfig }: {
   return <section className="grid gap-3">
     <h2 className="text-sm font-medium">{t("Default time ranges")}</h2>
     <p className="text-[12px] text-muted-foreground">{t("Choose the initial time range for each page. Changes apply the next time you open that page.")}</p>
-    <div className="divide-y divide-border/60 border-y border-border/70">
-      {pages.map(([page, label]) => <div key={page} className="flex flex-wrap items-center justify-between gap-3 py-4">
-        <span className="text-[13px] font-medium">{t(label)}</span>
-        <Select aria-label={`${t(label)} · ${t("Default time range")}`} className="w-[220px] max-w-full text-[12px] shadow-none"
+    <SettingsPanel className="divide-y divide-border/60">
+      {pages.map(([page, label]) => <SettingsControlRow key={page} label={t(label)}>
+        <Select aria-label={`${t(label)} · ${t("Default time range")}`} className="w-full text-[12px] shadow-none"
           value={String(ranges[page])}
           options={PAGE_DEFAULT_RANGE_OPTIONS[page].map(value => ({ value: String(value), label: t(labels[String(value)]) }))}
           onValueChange={value => updateConfig(current => ({ ...current,
             pageDefaultRanges: normalizePageDefaultRanges({ ...normalizePageDefaultRanges(current.pageDefaultRanges), [page]: value })
           }))} />
-      </div>)}
-    </div>
+      </SettingsControlRow>)}
+    </SettingsPanel>
   </section>;
 }
 
@@ -411,7 +424,7 @@ function ServerSettingsSection({
   return (
     <section className="grid grid-cols-1 gap-3">
       <SectionHeading icon={Globe} title={t("Server")} />
-      <div className="grid grid-cols-1 gap-x-8 gap-y-4 border-y border-border/70 py-5 md:grid-cols-2">
+      <SettingsPanel className="grid grid-cols-1 gap-x-6 gap-y-4 p-4 md:grid-cols-2">
         <Field label={t("Host")}>
           <Input
             aria-label={t("Host")}
@@ -443,7 +456,7 @@ function ServerSettingsSection({
             })}
           />
         </Field>
-      </div>
+      </SettingsPanel>
     </section>
   );
 }
@@ -489,7 +502,7 @@ function ProxySettingsSection({
   return (
     <section className="grid grid-cols-1 gap-3">
       <SectionHeading icon={Globe} title={copy.settings.proxy} />
-      <div className="grid grid-cols-1 gap-x-8 gap-y-4 border-y border-border/70 py-5 md:grid-cols-2">
+      <SettingsPanel className="grid grid-cols-1 gap-x-6 gap-y-4 p-4 md:grid-cols-2">
         <Field className="md:col-span-2" label={t("Proxy source")}>
           <SelectControl
             onChange={(mode) => patchUpstream({ mode: mode as AppConfig["proxy"]["upstream"]["mode"] })}
@@ -538,7 +551,7 @@ function ProxySettingsSection({
             </Field>
           </>
         ) : null}
-      </div>
+      </SettingsPanel>
     </section>
   );
 }
@@ -555,7 +568,7 @@ function ObservabilitySettingsPage({
   const t = useAppText();
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
-      <div className="grid grid-cols-1 gap-3">
+      <SettingsPanel className="divide-y divide-border/60">
         <SettingsSwitchRow
           checked={observability.requestLogs}
           description={copy.settings.requestLogsDescription}
@@ -570,15 +583,18 @@ function ObservabilitySettingsPage({
           label={copy.settings.agentAnalysis}
           onChange={(agentAnalysis) => onChange({ agentAnalysis })}
         />
-        <Field label={t("Log retention days")}>
-          <Select
-            aria-label={t("Log retention days")}
-            value={String(observability.retentionDays ?? 1)}
-            options={[...new Set([1, 3, 7, 14, 30, 90, 365, observability.retentionDays ?? 1])].sort((a, b) => a - b).map((days) => ({ value: String(days), label: `${days} ${t("days")}` }))}
-            onValueChange={(value) => onChange({ retentionDays: Number(value) })}
-          />
-        </Field>
-      </div>
+        <div className="px-4 py-3.5">
+          <Field label={t("Log retention days")}>
+            <Select
+              aria-label={t("Log retention days")}
+              className="w-full sm:max-w-[240px]"
+              value={String(observability.retentionDays ?? 1)}
+              options={[...new Set([1, 3, 7, 14, 30, 90, 365, observability.retentionDays ?? 1])].sort((a, b) => a - b).map((days) => ({ value: String(days), label: `${days} ${t("days")}` }))}
+              onValueChange={(value) => onChange({ retentionDays: Number(value) })}
+            />
+          </Field>
+        </div>
+      </SettingsPanel>
     </div>
   );
 }
@@ -710,7 +726,7 @@ function ToolHubSettingsPage({
       <div className="grid gap-1">
         <p className="text-[12px] leading-5 text-muted-foreground">{copy.settings.toolHubDescription}</p>
       </div>
-      <div className="grid grid-cols-1 gap-3">
+      <SettingsPanel>
         <SettingsSwitchRow
           checked={toolHub.enabled}
           description={copy.settings.toolHubEnabledDescription}
@@ -718,9 +734,10 @@ function ToolHubSettingsPage({
           label={copy.settings.toolHubEnabled}
           onChange={(enabled) => onChange({ enabled })}
         />
-      </div>
+      </SettingsPanel>
       {toolHub.enabled ? (
         <>
+          <SettingsPanel className="divide-y divide-border/60">
           <SettingsSwitchRow
             checked={toolHub.browserAutomation}
             description={copy.settings.toolHubBrowserAutomationDescription}
@@ -728,7 +745,7 @@ function ToolHubSettingsPage({
             label={copy.settings.toolHubBrowserAutomation}
             onChange={(browserAutomation) => onChange({ browserAutomation })}
           />
-          <div className="grid grid-cols-1 gap-x-8 gap-y-4 border-y border-border/70 py-5 md:grid-cols-2">
+          <div className="grid grid-cols-1 gap-x-6 gap-y-4 p-4 md:grid-cols-2">
             <Field className="md:col-span-2" label={copy.settings.toolHubModel}>
               <ModelSelector
                 onChange={selectProviderModel}
@@ -757,7 +774,7 @@ function ToolHubSettingsPage({
               />
             </Field>
           </div>
-          <div className="grid grid-cols-1 gap-3 border-y border-border/70 py-5">
+          <div className="grid grid-cols-1 gap-3 px-4 py-4">
             <div className="flex min-w-0 items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="truncate text-[12px] font-semibold text-foreground">{t("MCP servers")}</div>
@@ -797,6 +814,7 @@ function ToolHubSettingsPage({
               </div>
             )}
           </div>
+          </SettingsPanel>
           <ToolHubMcpServerDialog
             draft={mcpDialogDraft}
             error={mcpDialogError}
@@ -1126,7 +1144,7 @@ function SettingsSwitchRow({
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <div className="flex min-w-0 items-center gap-3 border-b border-border/70 py-4">
+    <div className="flex min-w-0 items-center gap-3 px-4 py-3.5">
       <span className={cn(
         "flex h-8 w-8 shrink-0 items-center justify-center rounded-md",
         checked ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"
@@ -1183,13 +1201,14 @@ function DataSettingsSection({
         <SectionHeading icon={Database} title={copy.settings.data} />
       </div>
 
-      <div className="grid gap-2 border-y border-border/70 py-4">
+      <SettingsPanel className="divide-y divide-border/60">
+      <div className="grid gap-2 px-4 py-3">
         <DataPathRow label={t("Config database")} value={appInfo.configDbFile} />
         <DataPathRow label={t("Request log database")} value={appInfo.requestLogsDbFile} />
         <DataPathRow label={t("Usage database")} value={appInfo.usageDbFile} />
       </div>
 
-      <div className="border-b border-border/70 py-4">
+      <div className="px-4 py-3.5">
         <div className="flex min-w-0 items-start gap-3">
           <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
             <Database className="h-4 w-4" />
@@ -1216,6 +1235,7 @@ function DataSettingsSection({
           </div>
         ) : null}
       </div>
+      </SettingsPanel>
     </section>
   );
 }
@@ -1291,16 +1311,16 @@ function BotSettingsPage({
         </Button>
       </div>
 
-      <div className="grid gap-2">
+      <SettingsPanel className="divide-y divide-border/60">
         {botConfigs.length === 0 ? (
-          <div className="border-y border-border/70 px-3 py-12 text-center text-[12px] text-muted-foreground">
+          <div className="px-4 py-12 text-center text-[12px] text-muted-foreground">
             {t("No bots configured")}
           </div>
         ) : null}
         {botConfigs.map((config) => {
           const usedByProfiles = botConfigUsageProfiles(config, profiles);
           return (
-            <div className="flex min-w-0 items-center justify-between gap-3 border-b border-border/60 py-4 transition-colors hover:bg-muted/45" key={config.id}>
+            <div className="flex min-w-0 items-center justify-between gap-3 px-4 py-3.5 transition-colors hover:bg-muted/45" key={config.id}>
               <div className="min-w-0">
                 <div className="truncate text-[13px] font-semibold text-foreground">{config.name}</div>
                 <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
@@ -1320,7 +1340,7 @@ function BotSettingsPage({
             </div>
           );
         })}
-      </div>
+      </SettingsPanel>
 
       {editor ? (
         <BotConfigDialog
@@ -2115,16 +2135,16 @@ export function TraySettingsPage({
 
   if (trayTitleSupported) {
     return (
-      <div className={cn(settingsPageContentWidthClassName, "grid content-start gap-4")}>
-        <label className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
-          <span className="text-[13px] font-semibold">{copy.settings.trayShowTokenUsage}</span>
+      <SettingsPanel className={cn(settingsPageContentWidthClassName, "divide-y divide-border/60")}>
+        <label className="flex items-center justify-between gap-4 px-4 py-3.5">
+          <span className="text-[13px] font-medium">{copy.settings.trayShowTokenUsage}</span>
           <Switch aria-label={copy.settings.trayShowTokenUsage} checked={trayShowTokenUsage} onCheckedChange={onChangeTrayShowTokenUsage} />
         </label>
-        {onChangeTrayPetEnabled ? <label className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
-          <span className="text-[13px] font-semibold">{copy.settings.trayPetEnabled}</span>
+        {onChangeTrayPetEnabled ? <label className="flex items-center justify-between gap-4 px-4 py-3.5">
+          <span className="text-[13px] font-medium">{copy.settings.trayPetEnabled}</span>
           <Switch aria-label={copy.settings.trayPetEnabled} checked={trayPetEnabled} onCheckedChange={onChangeTrayPetEnabled} />
         </label> : null}
-      </div>
+      </SettingsPanel>
     );
   }
 

@@ -23,9 +23,17 @@ test("gateway streaming preserves bytes and carries measured deltas into trace m
       controller.enqueue(new TextEncoder().encode(text));
     }
   }, { highWaterMark: 0 });
-  const response = metrics.wrap(new Response(stream, { headers: { "content-type": "text/event-stream" } }), headers);
+  const response = metrics.wrap(new Response(stream, { headers: { "content-type": "text/event-stream" } }), headers, {
+    protocol: "openai_responses"
+  });
   assert.equal(await response.text(), chunks.map(([, text]) => text).join(""));
-  assert.deepEqual(readGatewayStreamMetrics(headers), { timeToFirstTokenMs: 200, streamOutputDurationMs: 500 });
+  const measured = readGatewayStreamMetrics(headers);
+  assert.equal(measured.timeToFirstTokenMs, 200);
+  assert.equal(measured.streamOutputDurationMs, 500);
+  assert.equal(measured.streamMetrics?.timeToFirstTextMs, 200);
+  assert.equal(measured.streamMetrics?.activeOutputMs, 500);
+  assert.equal(measured.streamMetrics?.sampleStatus, "complete");
+  assert.equal(measured.streamMetrics?.textObserved, true);
 });
 
 test("metadata-only and non-stream responses have no invented token timings", async () => {

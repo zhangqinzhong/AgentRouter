@@ -122,7 +122,8 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
   return (
     <div className={documentPageClassName}>
         <PageHeader title={t("Providers")}>
-          <div className="relative w-[280px] max-w-full">
+          <span className="text-[12px] tabular-nums text-muted-foreground">{providers.length.toLocaleString()}</span>
+          <div className="relative w-[240px] max-w-full">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search providers")}
@@ -137,8 +138,7 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
             {t("Add")}
           </Button>
         </PageHeader>
-        <SectionHeading icon={Layers3} title={t("Configured providers")} summary={providers.length.toLocaleString()} />
-        <div className="@container min-w-0 overflow-x-auto border-y border-border/70">
+        <div className="@container min-w-0 overflow-hidden rounded-xl border border-border/70 bg-muted/[0.28]">
           {providers.length === 0 ? (
             <div className="px-3 py-12 text-center">
               <Layers3 className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
@@ -175,15 +175,7 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                 </AnimatePresence>
               </div>
               <div className="hidden min-w-0 @[900px]:block">
-                <div className="min-w-[900px]">
-                  <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(180px,1fr)_64px_minmax(120px,0.65fr)_minmax(190px,1fr)_124px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                    <div className="truncate">{t("Provider")}</div>
-                    <div className="truncate">{t("Models")}</div>
-                    <div className="truncate">{t("Account Usage")}</div>
-                    <div className="truncate">{t("Endpoint")}</div>
-                    <div aria-hidden="true" />
-                  </div>
-                  <div className="divide-y divide-border/60">
+                <div className="divide-y divide-border/60">
                     <AnimatePresence initial={false}>
                       {visibleProviders.map(({ provider, index }) => {
                         const itemKey = providerListItemKey(provider, index);
@@ -195,8 +187,8 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                           <AnimatedListItem key={itemKey}>
                             <div
                               className={cn(
-                                "grid min-h-[58px] grid-cols-[minmax(180px,1fr)_64px_minmax(120px,0.65fr)_minmax(190px,1fr)_124px] items-center gap-3 px-4 py-2.5 transition-colors",
-                                providerEnabled ? "cursor-pointer hover:bg-muted/45" : "bg-muted/10 text-muted-foreground"
+                                "flex min-h-[68px] items-center gap-4 px-4 py-3 transition-colors",
+                                providerEnabled ? "cursor-pointer hover:bg-foreground/[0.03]" : "text-muted-foreground"
                               )}
                               onClick={() => toggleProvider(provider, index)}
                               onKeyDown={(event) => {
@@ -208,7 +200,7 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                               role={providerEnabled ? "button" : undefined}
                               tabIndex={providerEnabled ? 0 : undefined}
                             >
-                              <div className="flex min-w-0 items-center gap-2">
+                              <div className="flex min-w-[220px] max-w-[320px] flex-1 items-center gap-2">
                                 {providerEnabled ? (
                                   <button
                                     aria-expanded={expanded}
@@ -230,29 +222,34 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                                   <div className="mt-0.5 truncate text-[10px] text-muted-foreground" title={providerCapabilitiesSummary(provider, t)}>
                                     {providerCapabilitiesSummary(provider, t)}
                                   </div>
+                                  <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground" title={providerBaseUrl(provider)}>
+                                    {providerBaseUrl(provider) || t("Not set")}
+                                  </div>
                                 </div>
                               </div>
-                              <div className="min-w-0">
-                                {providerEnabled ? (
-                                  <button
-                                    aria-expanded={expanded}
-                                    className="rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      toggleProvider(provider, index);
-                                    }}
-                                    title={expanded ? t("Collapse models") : t("Expand models")}
-                                    type="button"
-                                  >
-                                    <Badge variant={provider.models.length > 0 ? "outline" : "warning"}>{provider.models.length}</Badge>
-                                  </button>
-                                ) : <span className="text-[11px] text-muted-foreground">-</span>}
+                              <div className="flex min-w-0 flex-1 items-center gap-6">
+                                <div className="w-[88px] shrink-0">
+                                  {providerEnabled ? (
+                                    <button
+                                      aria-expanded={expanded}
+                                      className="rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        toggleProvider(provider, index);
+                                      }}
+                                      title={expanded ? t("Collapse models") : t("Expand models")}
+                                      type="button"
+                                    >
+                                      <div className="text-[13px] font-medium tabular-nums text-foreground">{provider.models.length}</div>
+                                      <div className="text-[10px] text-muted-foreground">{t("Models")}</div>
+                                    </button>
+                                  ) : <span className="text-[11px] text-muted-foreground">-</span>}
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <ProviderAccountListCell provider={provider} snapshots={providerAccountSnapshots} />
+                                </div>
                               </div>
-                              <ProviderAccountListCell provider={provider} snapshots={providerAccountSnapshots} />
-                              <div className="min-w-0 truncate font-mono text-[11px] text-muted-foreground" title={providerBaseUrl(provider)}>
-                                {providerBaseUrl(provider) || t("Not set")}
-                              </div>
-                              <div className="flex items-center justify-end gap-2">
+                              <div className="flex shrink-0 items-center justify-end gap-2">
                                 <div
                                   onClick={(event) => event.stopPropagation()}
                                   role="presentation"
@@ -335,7 +332,6 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                         );
                       })}
                     </AnimatePresence>
-                  </div>
                 </div>
               </div>
             </>
@@ -373,7 +369,7 @@ function ProviderMobileCard({
 
   return (
     <AnimatedListItem>
-      <article className={cn("py-4 transition-colors hover:bg-muted/45", providerEnabled ? "" : "text-muted-foreground")}>
+      <article className={cn("px-4 py-4 transition-colors hover:bg-foreground/[0.03]", providerEnabled ? "" : "text-muted-foreground")}>
         <div className="flex min-w-0 items-start gap-3">
           <ProviderPresetIcon className="h-9 w-9 rounded-md" iconUrl={providerIconUrl} />
           <div className="min-w-0 flex-1">

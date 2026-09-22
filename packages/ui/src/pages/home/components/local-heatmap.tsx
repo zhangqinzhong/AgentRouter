@@ -4,7 +4,8 @@ import {copy} from '@/vendor/tokentracker/lib/copy';
 import {buildActivityHeatmap,computeActiveStreakDays} from '@/vendor/tokentracker/lib/activity-heatmap';
 import {formatTokenCount,formatTokenTooltip} from '@/vendor/tokentracker/lib/token-format';
 import {formatTimeZoneLabel,getBrowserTimeZone,getBrowserTimeZoneOffsetMinutes} from '@/vendor/tokentracker/lib/timezone';
-import {formatToolCalls,toolDisplayName,toolIcon} from './heatmap-tools';
+import {formatToolCalls,toolAccent,toolDisplayName,toolIcon,toolVscodeIcon} from './heatmap-tools';
+import {ToolVscodeMark} from './tool-vscode-mark';
 import {useAppText} from '../shared/index';
 
 type HeatmapCell={day?:string;value?:number;level?:number;billable_total_tokens?:number;total_tokens?:number;models?:unknown}|null;
@@ -170,6 +171,60 @@ function initials(name:string){
  return name.slice(0,2).toUpperCase()||'AR';
 }
 
+function prefersReducedMotion(){
+ return typeof window!=='undefined'&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function ToolRankList({tools}:{tools:HeatmapTool[]}){
+ const names=tools.map((tool)=>tool.name).join('\n');
+ const [grown,setGrown]=useState(()=>prefersReducedMotion());
+ useEffect(()=>{
+  if(prefersReducedMotion()){setGrown(true);return;}
+  setGrown(false);
+  let second=0;
+  const first=requestAnimationFrame(()=>{second=requestAnimationFrame(()=>setGrown(true));});
+  return ()=>{cancelAnimationFrame(first);cancelAnimationFrame(second);};
+ },[names]);
+ const maxCalls=Math.max(tools[0]?.calls??1,1);
+ return (
+  <div className="min-h-0 flex-1 overflow-y-auto pb-6 [scrollbar-width:thin]">
+   <div className="flex flex-col gap-2.5">
+    {tools.map((tool,index)=>{
+     const width=Math.max(8,(tool.calls/maxCalls)*100);
+     const vscodeIcon=toolVscodeIcon(tool.name);
+     const Icon=toolIcon(tool.name);
+     const accent=toolAccent(tool.name);
+     const label=toolDisplayName(tool.name);
+     return (
+      <div key={tool.name} className="grid grid-cols-[minmax(0,1fr)_88px] items-center gap-3 text-sm">
+       <div className="flex min-w-0 items-start gap-2.5">
+        <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-muted">
+         {vscodeIcon?<ToolVscodeMark name={vscodeIcon}/>:<Icon size={14} color={accent}/>}
+        </span>
+        <div className="min-w-0 flex-1">
+         <div className="truncate font-medium" title={tool.name}>{label}</div>
+         {label!==tool.name?<div className="truncate font-mono text-[10px] text-muted-foreground">{tool.name}</div>:null}
+         <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+          <div
+           className="h-full rounded-full motion-reduce:transition-none"
+           style={{
+            width:grown?`${width}%`:'0%',
+            backgroundColor:accent,
+            transition:prefersReducedMotion()?'none':`width 680ms cubic-bezier(0.22,1,0.36,1) ${Math.min(index,14)*40}ms`
+           }}
+          />
+         </div>
+        </div>
+       </div>
+       <div className="text-right tabular-nums text-muted-foreground">{formatToolCalls(tool.calls)}</div>
+      </div>
+     );
+    })}
+   </div>
+  </div>
+ );
+}
+
 export const LocalHeatmapView=memo(function LocalHeatmapView(){
  const t=useAppText();
  const [heatmap,setHeatmap]=useState<HeatmapPayload>();
@@ -331,32 +386,7 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
    <div className="mt-6 flex min-h-0 flex-1 flex-col">
     <h2 className="mb-3 shrink-0 text-sm font-medium">{t('Most used tools')}</h2>
     {toolsLoading?<p className="text-sm text-muted-foreground">{copy('qpd.card.updating')}</p>:tools.length===0?<p className="text-sm text-muted-foreground">{t('No local tool usage yet')}</p>:(
-     <div className="min-h-0 flex-1 overflow-y-auto pb-6 [scrollbar-width:thin]">
-      <div className="flex flex-col gap-2.5">
-       {tools.map((tool)=>{
-        const width=Math.max(8,(tool.calls/Math.max(tools[0].calls,1))*100);
-        const Icon=toolIcon(tool.name);
-        const label=toolDisplayName(tool.name);
-        return (
-         <div key={tool.name} className="grid grid-cols-[minmax(0,1fr)_88px] items-center gap-3 text-sm">
-          <div className="flex min-w-0 items-start gap-2.5">
-           <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-emerald-500/10 text-emerald-700 dark:text-emerald-400">
-            <Icon size={14}/>
-           </span>
-           <div className="min-w-0 flex-1">
-            <div className="truncate font-medium" title={tool.name}>{label}</div>
-            {label!==tool.name?<div className="truncate font-mono text-[10px] text-muted-foreground">{tool.name}</div>:null}
-            <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
-             <div className="h-full rounded-full bg-[#30a14e]" style={{width:`${width}%`}}/>
-            </div>
-           </div>
-          </div>
-          <div className="text-right tabular-nums text-muted-foreground">{formatToolCalls(tool.calls)}</div>
-         </div>
-        );
-       })}
-      </div>
-     </div>
+     <ToolRankList tools={tools}/>
     )}
    </div>
    {hoveredCell&&typeof document!=='undefined'?<HeatmapHoverTooltip cell={hoveredCell} isDark={isDark} palette={palette} pos={tooltipPos}/>:null}

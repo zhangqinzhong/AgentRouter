@@ -115,13 +115,13 @@ export function ProfileView({
   return (
     <div className={documentPageClassName}>
         <PageHeader title={t("Agent profiles")}>
+          <span className="text-[12px] tabular-nums text-muted-foreground">{visibleProfiles.length.toLocaleString()}</span>
           <Button onClick={() => addProfile()} size="sm" type="button">
             <Plus className="h-3.5 w-3.5" />
             {t("Add profile")}
           </Button>
         </PageHeader>
-        <SectionHeading icon={Layers3} title={t("Configured profiles")} summary={visibleProfiles.length.toLocaleString()} />
-        <div className="@container min-w-0 overflow-x-auto border-y border-border/70">
+        <div className="@container min-w-0 overflow-hidden rounded-xl border border-border/70 bg-muted/[0.28]">
           <div className="divide-y divide-border/60">
             {visibleProfiles.length === 0 ? (
               <div className="flex h-32 items-center justify-center text-[12px] text-muted-foreground">
@@ -148,31 +148,20 @@ export function ProfileView({
               return (
                 <div
                   className={cn(
-                    "grid min-w-0 grid-cols-1 gap-x-6 py-3.5 transition-colors sm:grid-cols-[minmax(0,1fr)_auto]",
+                    "flex min-w-0 flex-col gap-3 px-4 py-3 transition-colors sm:flex-row sm:items-center",
                     profile.enabled
-                      ? "hover:bg-muted/45"
+                      ? "hover:bg-foreground/[0.03]"
                       : "text-muted-foreground"
                   )}
                   key={profile.id}
                 >
-                  <div className="flex min-w-0 items-start justify-between gap-3 sm:col-span-2">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <AgentLogo agent={profile.agent} />
-                      <div className="min-w-0">
-                        <div className="truncate text-[13px] font-semibold">
-                          {profile.name || t("Unnamed")}
-                        </div>
+                  <div className="flex min-w-0 flex-1 items-start gap-3">
+                    <AgentLogo agent={profile.agent} />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[13px] font-medium">
+                        {profile.name || t("Unnamed")}
                       </div>
-                    </div>
-                    <Toggle
-                      checked={profile.enabled}
-                      onChange={(enabled) =>
-                        updateProfileItem(index, { enabled })
-                      }
-                      title={t(profile.enabled ? "Enabled" : "Disabled")}
-                    />
-                  </div>
-                  <div className="mt-1.5 flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 text-[11px] leading-5 sm:col-span-2">
+                  <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 text-[11px] leading-5">
                     <span className="font-medium text-foreground">{t(profileAgentLabel(profile.agent))}</span>
                     <span aria-hidden="true" className="text-muted-foreground/50">·</span>
                     <span className="text-muted-foreground">{t(profileScopeLabel(scope))} / {t(profileSurfaceLabel(surface))}</span>
@@ -188,9 +177,9 @@ export function ProfileView({
                         {t("Bot")} · {t(runtimeEntry.botGateway.state === "connected" ? "Connected" : runtimeEntry.botGateway.state === "starting" ? "Starting" : runtimeEntry.botGateway.state)}
                       </Badge>
                     ) : null}
-                  </div>
+                    </div>
                   {runtimeEntry?.botGateway && (runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || runtimeEntry.botGateway.outboxCount > 0) ? (
-                    <div className="mt-1 flex min-w-0 items-baseline gap-1.5 text-[11px] leading-5 text-muted-foreground sm:col-span-2" title={runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || ""}>
+                    <div className="mt-0.5 flex min-w-0 items-baseline gap-1.5 text-[11px] leading-5 text-muted-foreground" title={runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || ""}>
                       <span aria-hidden="true" className="text-muted-foreground/50">·</span>
                       <span className="min-w-0 truncate">
                         {runtimeEntry.botGateway.lastError
@@ -200,9 +189,11 @@ export function ProfileView({
                       </span>
                     </div>
                   ) : null}
+                    </div>
+                  </div>
                   <div
                     aria-label={`${profile.name || t("Profile")} ${t("Profile actions")}`}
-                    className="mt-3 flex min-w-0 items-center justify-between gap-2 self-end sm:justify-end"
+                    className="flex min-w-0 items-center justify-between gap-2 sm:justify-end"
                     role="group"
                   >
                     <div className="flex min-w-0 items-center gap-1">
@@ -293,6 +284,13 @@ export function ProfileView({
                         </Button>
                       </ProfileActionTooltip>
                     </div>
+                    <Toggle
+                      checked={profile.enabled}
+                      onChange={(enabled) =>
+                        updateProfileItem(index, { enabled })
+                      }
+                      title={t(profile.enabled ? "Enabled" : "Disabled")}
+                    />
                   </div>
                 </div>
               );

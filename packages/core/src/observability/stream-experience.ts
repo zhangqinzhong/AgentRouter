@@ -45,6 +45,7 @@ export type StreamExperienceSnapshot = {
 
 export type StreamExperienceMeter = {
   finish: () => void;
+  observe: (chunk: Buffer | string) => void;
   snapshot: () => StreamExperienceSnapshot;
   stream: Transform;
 };
@@ -183,20 +184,24 @@ export function createStreamExperienceMeter(input: {
     }
   };
 
+  const observe = (chunk: Buffer | string) => {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    try {
+      input.onChunk?.(buffer);
+      const estimatedTokens = parser.append(buffer);
+      if (publishLiveRate && requestId && estimatedTokens > 0) {
+        rateTracker.record(requestId, estimatedTokens);
+        input.onLiveRateActivity?.(false);
+      }
+    } catch {
+      // Metrics are fail-open: malformed provider events must never interrupt forwarding.
+    }
+  };
+
   const stream = new Transform({
     transform(chunk: Buffer | string, _encoding, callback) {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      try {
-        input.onChunk?.(buffer);
-        const estimatedTokens = parser.append(buffer);
-        if (publishLiveRate && requestId && estimatedTokens > 0) {
-          rateTracker.record(requestId, estimatedTokens);
-          input.onLiveRateActivity?.(false);
-        }
-      } catch {
-        // Metrics are fail-open: malformed provider events must never interrupt forwarding.
-      }
-      callback(null, buffer);
+      observe(chunk);
+      callback(null, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     },
     flush(callback) {
       finish();
@@ -207,6 +212,7 @@ export function createStreamExperienceMeter(input: {
 
   return {
     finish,
+    observe,
     snapshot: () => parser.snapshot(),
     stream
   };

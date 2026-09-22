@@ -474,7 +474,11 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
     streamHooks: [{
       key: "ar-stream-metrics",
       transformResponse: (streamInput: GatewayStreamHookInput) =>
-        streamMetrics.wrap(streamInput.upstreamResponse, streamInput.request?.headers)
+        streamMetrics.wrap(streamInput.upstreamResponse, streamInput.request?.headers, {
+          protocol: normalizeProviderProtocol(streamInput.targetProviderConfig?.type) ??
+            normalizeProviderProtocol(streamInput.targetProviderConfig?.provider) ??
+            normalizeProviderProtocol(streamInput.targetProvider)
+        })
     }, {
       key: arCodexBridgeStreamHookKey,
       transformResponse: (streamInput: GatewayStreamHookInput) =>

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.8.0 - 2026-09-22
+
+### Features
+- Restyled Settings, Providers, and Agent Profiles as grouped lists instead of sparse full-width tables.
+- Colored heatmap tool ranks with VS Code Icons and animate usage bars from zero when the page opens.
+
+### Fixes
+- Record stream timing on the single-gateway path: first text, output gaps, and speed-sample status now flow from collection through raw-trace sync into request logs. Older logs without those timestamps stay unchanged.
+
 ## 1.7.0 - 2026-09-22
 
 ### Features
