@@ -77,7 +77,7 @@ const workbuddyVirtualAuthToken = "ar-local-profile";
 const workbuddyVirtualAuthExpiresAt = 1_999_999_999_999;
 
 const codexAppSpec: CodexCompatibleAppSpec = {
-  bundledCliNames: ["codex", "Codex", "OpenAI Codex"],
+  bundledCliNames: ["codex-cli/CodexCLI.app/Contents/MacOS/codex", "codex-cli/bin/codex", "codex", "Codex", "OpenAI Codex"],
   defaultCliCommand: "codex",
   displayName: codexDesktopAppName,
   envPathKeys: ["AR_CHATGPT_APP_PATH", "CHATGPT_APP_PATH", "CODEXL_CHATGPT_PATH", "AR_CODEX_APP_PATH", "CODEX_APP_PATH", "CODEXL_CODEX_PATH"],
@@ -936,6 +936,10 @@ function sanitizeCodexCompatibleAppEnv(env: NodeJS.ProcessEnv, kind: CodexCompat
     delete env.CODEBUDDY_ELECTRON_USER_DATA_PATH;
     delete env.CODEBUDDY_HOME;
   }
+}
+
+export function bundledCodexCliPathForTest(appExecutable: string): string | undefined {
+  return bundledCodexCliPath(appExecutable, codexAppSpec);
 }
 
 function bundledCodexCliPath(appExecutable: string, spec: CodexCompatibleAppSpec): string | undefined {

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  bundledCodexCliPathForTest,
   codexDesktopAppName,
   codexSharedChatGptAuthEnvForTest,
   findInstalledCodexAppExecutable,
@@ -514,4 +515,25 @@ test("ChatGPT migration removes only the exact legacy AgentRouter auth marker", 
   } finally {
     rmSync(root, { force: true, recursive: true });
   }
+});
+
+test("Codex app discovers relocated bundled CLI before legacy paths", { skip: process.platform !== "darwin" }, () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "ar-codex-cli-layout-"));
+  const app = path.join(root, "ChatGPT.app");
+  const executable = path.join(app, "Contents", "MacOS", "ChatGPT");
+  const resources = path.join(app, "Contents", "Resources");
+  const paths = ["codex-cli/CodexCLI.app/Contents/MacOS/codex", "codex-cli/bin/codex", "codex"];
+  try {
+    mkdirSync(path.dirname(executable), { recursive: true });
+    writeFileSync(executable, "");
+    assert.equal(bundledCodexCliPathForTest(executable), undefined);
+    for (const relative of [...paths].reverse()) {
+      const file = path.join(resources, relative);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, "");
+      assert.equal(bundledCodexCliPathForTest(executable), file);
+    }
+    rmSync(path.join(resources, paths[0]));
+    assert.equal(bundledCodexCliPathForTest(executable), path.join(resources, paths[1]));
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
