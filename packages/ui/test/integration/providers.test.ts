@@ -1561,8 +1561,8 @@ test("ProvidersView puts provider enabled state in actions and hides disabled mo
   );
 
   assert.doesNotMatch(html, /Status/);
-  assert.match(html, /Endpoint/);
-  assert.match(html, /Account Usage/);
+  assert.match(html, /https:\/\/ready\.example\/v1/);
+  assert.match(html, /Disable provider Ready Provider/);
   assert.doesNotMatch(html, /Usable/);
   assert.match(html, /Disabled Provider/);
   assert.match(html, /Enable provider Disabled Provider/);

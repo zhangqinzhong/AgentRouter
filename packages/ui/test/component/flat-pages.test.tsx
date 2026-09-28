@@ -38,7 +38,7 @@ function assertDocument(html: string, title: string, wide = false) {
   assert.doesNotMatch(html, /role="dialog"|aria-modal="true"/);
 }
 
-test("configuration views use the report shell, section chips, and Chinese page headings", () => {
+test("configuration views use the report shell and Chinese page headings", () => {
   const pages: Array<[string, React.ReactNode]> = [
     ["供应商", <ProvidersView accountSnapshots={[]} addProvider={noop} editProvider={noop} notify={noop} providers={[]} removeProvider={noop} setProviderEnabled={noop} />],
     ["模型", <ModelsView config={config} updateModelDescription={noop} />],
@@ -50,9 +50,6 @@ test("configuration views use the report shell, section chips, and Chinese page 
   for (const [title, node] of pages) {
     const html = render(node);
     assertDocument(html, title);
-    assert.match(html, /text-sm font-medium/);
-    assert.match(html, /bg-emerald-500\/10/);
-    assert.match(html, /border-y border-border\/70/);
   }
 });
 

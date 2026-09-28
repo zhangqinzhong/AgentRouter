@@ -465,9 +465,7 @@ test("ProfileView renders flat profile rows with inline actions", () => {
   assert.match(html, /local-usage-page mx-auto w-full max-w-\[1120px\]/);
   assert.match(html, /divide-y divide-border\/60/);
   assert.doesNotMatch(html, /grid-template-columns:repeat| min-h-\[220px\]/);
-  assert.match(html, /class="flex min-w-0 items-center gap-2"/);
-  assert.match(html, /Model/);
-  assert.match(html, /class="mt-1\.5 flex min-w-0 flex-wrap items-baseline gap-x-1\.5 gap-y-1 text-\[11px\] leading-5 sm:col-span-2"/);
+  assert.match(html, /openai\/gpt-5\.2/);
   assert.doesNotMatch(html, /class="mt-3 grid min-w-0 gap-x-8 gap-y-2 sm:grid-cols-2"/);
   assert.match(html, /aria-label="Claude Code Main Profile actions" class="[^"]*items-center justify-between/);
   assert.doesNotMatch(html, />Disabled<\/span>/);
