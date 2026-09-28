@@ -28,6 +28,7 @@ import {
   uniqueStrings
 } from "@agentrouter/core/agents/local-providers/shared";
 import { findProviderPresetByBaseUrl } from "@agentrouter/core/providers/presets/index";
+import { openCodePublicFreeTierPlugin } from "@agentrouter/core/agents/local-providers/opencode-freetier";
 
 type OpenCodeCredential = {
   apiKey?: string;
@@ -191,7 +192,13 @@ export function importOpenCodeProvider(
         ...provider,
         apiKey: "public"
       },
-      providerPlugins: []
+      // Marker plugins only: the gateway runtime hook mints a fresh OpenCode
+      // free-tier client fingerprint per request. No auth section here on
+      // purpose, so a later real api_key edit is never overridden.
+      providerPlugins: [
+        openCodePublicFreeTierPlugin(),
+        openCodePublicFreeTierPlugin(providerInternalNamePlaceholder, "-internal")
+      ]
     };
   }
   const apiKey = credential?.apiKey;

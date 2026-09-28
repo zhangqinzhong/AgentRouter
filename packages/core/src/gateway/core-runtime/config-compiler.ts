@@ -1,6 +1,7 @@
 /**
  * Extracted from gateway/service.ts. Keep this module focused on its named gateway boundary.
  */
+import { isOpenCodePublicFreeTierPlugin } from "@agentrouter/core/agents/local-providers/opencode-freetier";
 import { isGatewayProviderEnabled } from "@agentrouter/core/contracts/app";
 import type { AppConfig, GatewayProviderConfig, GatewayProviderProtocol, VirtualModelProfileConfig } from "@agentrouter/core/contracts/app";
 import { codexDefaultBaseUrl, kimiAccessTokenExpired, kimiIdentityHeaders, localAgentProviderApiKey, readClaudeCodeOauth, readCodexAuth, readGrokAuth, readKimiAuth, resolveGrokAuth, resolveKimiAuth } from "@agentrouter/core/agents/local-providers/service";
@@ -219,7 +220,7 @@ function coreGatewayStaticAuthKeys(
 }
 
 function localAgentAuthProviderHookPluginConfig(providerPlugins: unknown[]): Record<string, unknown> | undefined {
-  if (!providerPlugins.some(isLocalAgentOauthProviderPlugin)) {
+  if (!providerPlugins.some((plugin) => isLocalAgentOauthProviderPlugin(plugin) || isOpenCodePublicFreeTierPlugin(plugin))) {
     return undefined;
   }
   return {
