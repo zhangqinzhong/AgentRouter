@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.9.1 - 2026-09-29
+
+### Features
+- Added Serply to Fusion web search (upstream by @googio).
+
+### Fixes
+- Discover the relocated bundled Codex CLI in newer ChatGPT desktop apps, so isolated profiles launch without relying on the desktop shell PATH.
+- Preserve tool results when replacing Claude Code automatic compaction prompts (upstream by @pomelogo).
+- Restore public OpenCode Zen free-tier import compatibility (upstream by @diogomcd).
+
 ## 1.9.0 - 2026-09-23
 
 ### Fixes
