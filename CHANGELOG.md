@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.9.2 - 2026-09-30
+
+### Fixes
+- Use rolling windows for local usage and trends, preserving cross-day hours and cross-year months.
+- Keep the full 24-hour trend axis for empty and sparse activity, including zero-usage hours.
+- Retain the boundary aggregation bucket and document the local collector's time precision.
+
 ## 1.9.1 - 2026-09-29
 
 ### Features
