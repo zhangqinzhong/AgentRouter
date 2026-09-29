@@ -1,13 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {localUsageRange} from '../../src/pages/home/components/local-usage';
+import {localUsageRange,localUsageSince} from '../../src/pages/home/components/local-usage';
 import {buildFleetData} from '../../src/vendor/tokentracker/lib/model-breakdown';
 
-test('local usage calendar ranges preserve week/month boundaries and custom dates',()=>{
+test('local usage ranges roll from now instead of anchoring to calendar boundaries',()=>{
  const date=new Date(2026,2,1,12);
- assert.deepEqual(localUsageRange('week',{from:'',to:''},date),{from:'2026-02-23',to:'2026-03-01'});
- assert.deepEqual(localUsageRange('month',{from:'',to:''},date),{from:'2026-03-01',to:'2026-03-31'});
+ assert.deepEqual(localUsageRange('week',{from:'',to:''},date),{from:'2026-02-22',to:'2026-03-01'});
+ assert.deepEqual(localUsageRange('month',{from:'',to:''},date),{from:'2026-01-30',to:'2026-03-01'});
  assert.deepEqual(localUsageRange('custom',{from:'2025-12-31',to:'2026-01-02'},date),{from:'2025-12-31',to:'2026-01-02'});
+});
+test('local usage since instants match the rolling windows',()=>{
+ const date=new Date(2026,8,16,12);
+ assert.equal(localUsageSince('day',date),new Date(date.getTime()-24*3600000).toISOString());
+ assert.equal(localUsageSince('week',date),new Date(date.getTime()-7*24*3600000).toISOString());
+ assert.equal(localUsageSince('month',date),new Date(date.getTime()-30*24*3600000).toISOString());
+ assert.equal(localUsageSince('year',date),new Date(date.getTime()-365*24*3600000).toISOString());
+ assert.equal(localUsageSince('total',date),'');
+ assert.equal(localUsageSince('custom',date),'');
 });
 test('tool proportions use collected totals without double adding cached tokens',()=>{
  const providers=buildFleetData({sources:[{source:'codex',totals:{total_tokens:100,billable_total_tokens:100,total_cost_usd:'1'},models:[{model:'gpt-fixture',totals:{total_tokens:100,billable_total_tokens:100,input_tokens:10,cached_input_tokens:80,output_tokens:10,total_cost_usd:'1'}}]},{source:'claude',totals:{total_tokens:100,billable_total_tokens:100,total_cost_usd:'2'},models:[{model:'claude-fixture',totals:{total_tokens:100,billable_total_tokens:100,total_cost_usd:'2'}}]}]});
@@ -33,13 +42,13 @@ test('token units follow the active interface language without a separate unit p
  assert.equal(formatTokenTooltip(14_400_000_000),'14.4B · 14,400,000,000');
  setUsageLocale('zh');
 });
-test('heatmap trend range follows menu-bar day week month year windows',()=>{
+test('heatmap trend range follows rolling day week month year windows',()=>{
  const date=new Date(2026,8,16,12);
  const empty={from:'',to:''};
- assert.deepEqual(heatmapTrendRange('day',empty,date),{from:'2026-09-16',to:'2026-09-16'});
- assert.deepEqual(heatmapTrendRange('week',empty,date),{from:'2026-09-14',to:'2026-09-20'});
- assert.deepEqual(heatmapTrendRange('month',empty,date),{from:'2026-09-01',to:'2026-09-30'});
- assert.deepEqual(heatmapTrendRange('year',empty,date),{from:'2026-01-01',to:'2026-12-31'});
+ assert.deepEqual(heatmapTrendRange('day',empty,date),{from:'2026-09-15',to:'2026-09-16'});
+ assert.deepEqual(heatmapTrendRange('week',empty,date),{from:'2026-09-09',to:'2026-09-16'});
+ assert.deepEqual(heatmapTrendRange('month',empty,date),{from:'2026-08-17',to:'2026-09-16'});
+ assert.deepEqual(heatmapTrendRange('year',empty,date),{from:'2025-09-16',to:'2026-09-16'});
  assert.equal(heatmapTrendRange('total',empty,date).to,'2026-09-16');
 });
 test('trend line fills a complete month axis and keeps zero days',()=>{

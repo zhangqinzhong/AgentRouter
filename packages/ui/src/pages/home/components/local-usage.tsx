@@ -10,13 +10,20 @@ import {formatTokenCount} from '@/vendor/tokentracker/lib/token-format';
 import {useAppNumberLocale,useAppText,useResolvedAppLanguage} from '../shared/index';
 
 type Period='day'|'week'|'month'|'year'|'total'|'custom';
+// Rolling windows, unified with the Overview page: a period ends at "now" and
+// starts an exact duration earlier (24h / 7d / 30d / 365d) instead of a
+// calendar boundary, so curves never anchor to 00:00 or a weekday.
+const rollingPeriodHours:Record<string,number>= {day:24,week:7*24,month:30*24,year:365*24};
+export function localUsageSince(period:Period, now=new Date()){
+ const hours=rollingPeriodHours[period];
+ return hours?new Date(now.getTime()-hours*3600000).toISOString():'';
+}
 export function localUsageRange(period:Period, custom:{from:string;to:string}, now=new Date()){
  const day=(d:Date)=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
  if(period==='custom')return custom;
- const start=new Date(now);const end=new Date(now);
- if(period==='week'){start.setDate(start.getDate()-((start.getDay()+6)%7));end.setTime(start.getTime());end.setDate(start.getDate()+6);}
- if(period==='month'){start.setDate(1);end.setMonth(end.getMonth()+1,0);}
- if(period==='year'){start.setMonth(0,1);end.setMonth(11,31);}
+ const end=new Date(now);
+ const hours=rollingPeriodHours[period];
+ const start=hours?new Date(end.getTime()-hours*3600000):new Date(end);
  return {from:period==='total'?'':day(start),to:day(end)};
 }
 export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_PAGE_RANGES.usage}:{defaultRange?:PageDefaultRanges["usage"]}){
@@ -34,7 +41,10 @@ export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_P
  useEffect(()=>{let active=true;setLoading(true);setError('');
    const api=window.agentrouter;
    if(!api?.getLocalUsagePage){setError(t('Local usage data is unavailable.'));setLoading(false);return;}
-   void api.getLocalUsagePage({...range,tz}).then(data=>{if(active)setResult({key:rangeKey,data})}).catch(e=>{if(active)setError(e instanceof Error?e.message:String(e))}).finally(()=>{if(active)setLoading(false)});
+   // Recomputed inside the effect so the rolling window slides on each poll
+   // without churning the result cache key.
+   const since=localUsageSince(period);
+   void api.getLocalUsagePage({...range,tz,since}).then(data=>{if(active)setResult({key:rangeKey,data})}).catch(e=>{if(active)setError(e instanceof Error?e.message:String(e))}).finally(()=>{if(active)setLoading(false)});
    return()=>{active=false};
  },[rangeKey,revision]);
  useEffect(()=>{const timer=setInterval(()=>setRevision(v=>v+1),60000);return()=>clearInterval(timer)},[]);

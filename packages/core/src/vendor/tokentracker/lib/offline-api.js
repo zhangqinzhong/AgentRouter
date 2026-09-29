@@ -472,6 +472,22 @@ function getRequestedUsageScope(url) {
   return normalizeUsageScope(url.searchParams.get("scope"));
 }
 
+// AgentRouter rolling windows: an optional `since` (ISO datetime) param cuts the
+// queue rows at an exact instant so day/month aggregations can honor windows
+// like "past 7 days ending now" instead of whole calendar days. Rows without a
+// parseable hour_start are excluded under `since`; they never contributed to
+// day/month/hour buckets anyway.
+function rowsSince(rows, url) {
+  const raw = String(url.searchParams.get("since") || "").trim();
+  if (!raw) return rows;
+  const sinceMs = Date.parse(raw);
+  if (!Number.isFinite(sinceMs)) return rows;
+  return rows.filter((row) => {
+    const ts = Date.parse(String(row?.hour_start || ""));
+    return Number.isFinite(ts) && ts >= sinceMs;
+  });
+}
+
 function scopedQueueRows(queuePath, url) {
   const scope = getRequestedUsageScope(url);
   const allRows = readQueueData(queuePath);
@@ -487,7 +503,7 @@ function scopedQueueRows(queuePath, url) {
   return {
     scope,
     allRows,
-    rows: filterRowsByUsageScope(sourceRows, scope),
+    rows: rowsSince(filterRowsByUsageScope(sourceRows, scope), url),
     excludedSources: listExcludedSources(allRows, scope),
   };
 }

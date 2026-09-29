@@ -1,7 +1,7 @@
 import {execFileSync} from 'node:child_process';
 import os from 'node:os';
 import {queryLocalCollector} from './service';
-export type LocalUsageRange = {from:string;to:string;tz?:string};
+export type LocalUsageRange = {from:string;to:string;tz?:string;since?:string};
 export type LocalUsagePeriod = 'day'|'week'|'month'|'year'|'total'|'custom';
 export type LocalUsagePageData = {
   totals: Record<string,number|string>;
@@ -73,9 +73,31 @@ function listDays(from:string,to:string){
   return days;
 }
 
+// Rolling windows share the Overview page's semantics: a period ends at "now"
+// and starts an exact duration earlier, never at a calendar boundary. `since`
+// is an absolute ISO instant the collector cuts rows at; `from`/`to` are the
+// calendar days (in the target time zone) that contain the window and only
+// drive bucket enumeration.
+const rollingPeriodMs:Record<string,number>={
+  day:24*3600_000,
+  week:7*24*3600_000,
+  month:30*24*3600_000,
+  year:365*24*3600_000
+};
+function dayKeyInTz(date:Date,tz:string){
+  return new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).format(date);
+}
+export function rollingWindow(period:LocalUsagePeriod,tz:string,now:Date=new Date()):{since:string;from:string;to:string}|null{
+  const ms=rollingPeriodMs[period];
+  if(!ms)return null;
+  const since=new Date(now.getTime()-ms);
+  return {since:since.toISOString(),from:dayKeyInTz(since,tz),to:dayKeyInTz(now,tz)};
+}
+
 export async function getLocalUsagePage(range:LocalUsageRange):Promise<LocalUsagePageData>{
   if(!range || (range.from!==''&&!validDay(range.from)) || !validDay(range.to) || range.from>range.to)throw new Error('Invalid usage date range');
-  const query={from:range.from,to:range.to,tz:zone(range.tz)};
+  if(range.since!==undefined&&range.since!==''&&!Number.isFinite(Date.parse(range.since)))throw new Error('Invalid usage date range');
+  const query={from:range.from,to:range.to,tz:zone(range.tz),...(range.since?{since:range.since}:{})};
   // Same collector and aggregation contract as the native menu. Gateway
   // request usage is deliberately not added to these local-session totals.
   const [summary,models,daily]=await Promise.all([
@@ -106,17 +128,62 @@ export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalU
   return {totals:summary.totals,sources:models.sources,series:series.data};
 }
 
+// A rolling "day" spans two calendar days, so its hourly buckets are folded
+// onto the current day's clock-hour axis (the same presentation the Overview
+// trend uses). Each clock hour sums the partial pieces the 24h window covers,
+// keeping the row shape and totals the single-day endpoint produced before.
+export function foldHourlyRowsOntoDay(rows:Array<Record<string,unknown>>,day:string):Array<Record<string,unknown>>{
+  const numericFields=['total_tokens','billable_total_tokens','input_tokens','output_tokens','cached_input_tokens','cache_creation_input_tokens','reasoning_output_tokens','conversation_count'] as const;
+  const byClockHour=new Map<string,Record<string,unknown>>();
+  for(const row of rows){
+    const match=/T(\d{2}):/.exec(String(row.hour??''));
+    if(!match)continue;
+    const target=`${day}T${match[1]}:00:00`;
+    const existing=byClockHour.get(target);
+    if(!existing){
+      byClockHour.set(target,{...row,hour:target});
+      continue;
+    }
+    for(const field of numericFields){
+      existing[field]=Number(existing[field]??0)+Number(row[field]??0);
+    }
+    if(row.models&&typeof row.models==='object'){
+      const models={...(existing.models as Record<string,number>|undefined??{})};
+      for(const [model,value] of Object.entries(row.models as Record<string,number>)){
+        models[model]=(models[model]??0)+Number(value??0);
+      }
+      existing.models=models;
+    }
+  }
+  return [...byClockHour.values()].sort((left,right)=>String(left.hour).localeCompare(String(right.hour)));
+}
+
 export async function getLocalUsageTrend(query:LocalUsageTrendQuery):Promise<Record<string,unknown>>{
   if(!query||!['day','week','month','year','total','custom'].includes(query.period))throw new Error('Invalid usage trend period');
   const tz=zone(query.tz);
-  if(query.period==='day'){
-    const day=query.day||query.to;
-    if(!validDay(day))throw new Error('Invalid usage date range');
-    return queryLocalCollector('/functions/tokentracker-usage-hourly',{day,tz}) as Promise<Record<string,unknown>>;
+  // day/week/month/year are rolling windows ending at "now"; the window is
+  // derived here so the UI cannot drift from the Overview page's semantics.
+  const window=rollingWindow(query.period,tz);
+  if(query.period==='day'&&window){
+    const today=window.to;
+    const previous=window.from;
+    const responses=await Promise.all(
+      (previous===today?[today]:[previous,today]).map((day)=>queryLocalCollector('/functions/tokentracker-usage-hourly',{day,tz,since:window.since}) as Promise<Record<string,unknown>>)
+    );
+    const rows=responses.flatMap((response)=>Array.isArray(response?.data)?response.data:[]);
+    return {day:today,from:today,to:today,data:foldHourlyRowsOntoDay(rows,today)};
+  }
+  if(query.period==='week'||query.period==='month'){
+    if(!window)throw new Error('Invalid usage trend period');
+    return queryLocalCollector('/functions/tokentracker-usage-daily',{from:window.from,to:window.to,tz,since:window.since}) as Promise<Record<string,unknown>>;
+  }
+  if(query.period==='year'){
+    if(!window)throw new Error('Invalid usage trend period');
+    return queryLocalCollector('/functions/tokentracker-usage-monthly',{from:window.from,to:window.to,tz,since:window.since}) as Promise<Record<string,unknown>>;
   }
   const to=query.to||'';
   if(!validDay(to))throw new Error('Invalid usage date range');
-  if(query.period==='year'||query.period==='total'){
+  if(query.period==='total'){
     const months=Number.isFinite(query.months)&&Number(query.months)>0?Math.min(Math.floor(Number(query.months)),120):24;
     const from=query.from&&validDay(query.from)?query.from:shiftMonth(to,-(months-1));
     return queryLocalCollector('/functions/tokentracker-usage-monthly',{from,to,tz}) as Promise<Record<string,unknown>>;

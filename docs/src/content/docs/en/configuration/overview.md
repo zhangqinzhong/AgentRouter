@@ -37,6 +37,20 @@ Two sections ignore the time range:
 
 Below the range tabs are two filters: `Provider` lists only enabled gateway providers, and `Model` options follow the selected provider. The filters apply to the stat strip, trend, and breakdowns at the same time.
 
+## Time range semantics
+
+The overview (gateway-captured usage) and the Usage / Trend pages (local session collection) are two independent data sources whose totals are never added together, but they share one set of time-range semantics: **rolling windows**.
+
+| Period | Window |
+| --- | --- |
+| Day / 24h | The last 24 hours up to now |
+| Week | The last 7 days up to now |
+| Month | The last 30 days up to now |
+| Year (Trend page) | The last year up to now |
+| Custom | Any start and end date, both inclusive |
+
+Window ends always anchor to "now", never to a calendar day, week, or month boundary, so curves never show empty leading segments from midnight or Monday anchors. The overview additionally keeps a `Today` option that counts from local midnight.
+
 ## Stat strip
 
 The stat strip shows four numbers for the selected range and filters: requests, total tokens, estimated cost, and request success rate. The error count appears under the success rate; when there are requests, a one-line summary of requests and success rate follows the strip.

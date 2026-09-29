@@ -48,6 +48,28 @@ test('hourly heatmap and session routes stay on the local collector contract',as
  }finally{await fs.rm(home,{recursive:true,force:true})}
 });
 
+test('usage endpoints honor an exact since instant for rolling windows',async()=>{
+ const home=await fs.mkdtemp(path.join(os.tmpdir(),'ar-collector-since-'));
+ try {
+  const root=path.join(home,'.claude','projects','fixture');await fs.mkdir(root,{recursive:true});
+  const record=(timestamp,requestId)=>JSON.stringify({type:'assistant',timestamp,requestId,message:{id:requestId,model:'claude-sonnet-4',usage:{input_tokens:100,output_tokens:20}}})+'\n';
+  await fs.writeFile(path.join(root,'main.jsonl'),record('2026-09-13T23:30:00Z','request-before')+record('2026-09-14T01:00:00Z','request-after'));
+  const c=createCollector({home,fetchImpl:async()=>{throw new Error("offline test")}});await c.sync(true);
+  const since='2026-09-14T00:00:00Z';
+  const windowed=await c.query('/functions/tokentracker-usage-summary',{from:'2026-09-13',to:'2026-09-14',tz:'UTC',since});
+  assert.equal(windowed.totals.total_tokens,120);
+  const full=await c.query('/functions/tokentracker-usage-summary',{from:'2026-09-13',to:'2026-09-14',tz:'UTC'});
+  assert.equal(full.totals.total_tokens,240);
+  const daily=await c.query('/functions/tokentracker-usage-daily',{from:'2026-09-13',to:'2026-09-14',tz:'UTC',since});
+  assert.deepEqual(daily.data.map(row=>row.day),['2026-09-14']);
+  const monthly=await c.query('/functions/tokentracker-usage-monthly',{from:'2026-09-13',to:'2026-09-14',tz:'UTC',since});
+  assert.equal(monthly.data.length,1);
+  assert.equal(monthly.data[0].total_tokens,120);
+  const hourly=await c.query('/functions/tokentracker-usage-hourly',{day:'2026-09-13',tz:'UTC',since});
+  assert.equal(hourly.data.length,0);
+ }finally{await fs.rm(home,{recursive:true,force:true})}
+});
+
 test('quota observer cannot rotate active CLI credentials',async()=>{
  const home=await fs.mkdtemp(path.join(os.tmpdir(),'ar-credentials-test-'));
  try {const dir=path.join(home,'.codex');await fs.mkdir(dir);const file=path.join(dir,'auth.json');const original=JSON.stringify({tokens:{access_token:'expired-access',refresh_token:'private-refresh'}});await fs.writeFile(file,original);resetUsageLimitsCache();let refreshed=false;
