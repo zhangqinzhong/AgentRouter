@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { hourKeyInTz, rollingWindow } from "@agentrouter/core/collector/usage-page.ts";
+import { hourKeyInTz, rollingWindow, rollingDayAxis } from "@agentrouter/core/collector/usage-page.ts";
 
 test("rolling windows end at now and start an exact duration earlier", () => {
   const now = new Date("2026-09-16T12:34:56Z");
@@ -35,4 +35,16 @@ test("hour keys render in the requested time zone with the collector's key shape
   const instant = new Date("2026-09-28T20:34:00Z");
   assert.equal(hourKeyInTz(instant, "UTC"), "2026-09-28T20:00:00");
   assert.equal(hourKeyInTz(instant, "Asia/Shanghai"), "2026-09-29T04:00:00");
+});
+
+// No event rows are needed to determine the axis, including an empty day.
+test("rolling day axis covers the full window and includes the boundary bucket", () => {
+  const now = new Date("2026-09-29T12:34:56Z");
+  const window = rollingWindow("day", "UTC", now);
+  assert.deepEqual(rollingDayAxis(window.since, "UTC", now), {
+    from: "2026-09-28T12:00:00", to: "2026-09-29T12:00:00"
+  });
+  assert.deepEqual(rollingDayAxis(window.since, "Asia/Shanghai", now), {
+    from: "2026-09-28T20:00:00", to: "2026-09-29T20:00:00"
+  });
 });

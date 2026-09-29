@@ -94,6 +94,12 @@ export function hourKeyInTz(date:Date,tz:string){
   const value=(type:string)=>parts.find(part=>part.type===type)?.value??'00';
   return `${value('year')}-${value('month')}-${value('day')}T${value('hour')}:00:00`;
 }
+// Match the collector's boundary-bucket inclusion while keeping the full axis
+// independent of whether any events were observed in that bucket.
+export function rollingDayAxis(since:string,tz:string,now:Date){
+  const boundary=new Date(Math.floor(Date.parse(since)/3600_000)*3600_000);
+  return {from:hourKeyInTz(boundary,tz),to:hourKeyInTz(now,tz)};
+}
 export function rollingWindow(period:LocalUsagePeriod,tz:string,now:Date=new Date()):{since:string;from:string;to:string}|null{
   const ms=rollingPeriodMs[period];
   if(!ms)return null;
@@ -144,7 +150,8 @@ export async function getLocalUsageTrend(query:LocalUsageTrendQuery):Promise<Rec
   const tz=zone(query.tz);
   // day/week/month/year are rolling windows ending at "now"; the window is
   // derived here so the UI cannot drift from the Overview page's semantics.
-  const window=rollingWindow(query.period,tz);
+  const now=new Date();
+  const window=rollingWindow(query.period,tz,now);
   if(query.period==='day'&&window){
     const today=window.to;
     const previous=window.from;
@@ -154,9 +161,7 @@ export async function getLocalUsageTrend(query:LocalUsageTrendQuery):Promise<Rec
     const rows=responses
       .flatMap((response)=>Array.isArray(response?.data)?response.data:[])
       .sort((left,right)=>String(left.hour??'').localeCompare(String(right.hour??'')));
-    const now=new Date();
-    const startKey=rows.length?`${String(rows[0].hour??'').slice(0,13)}:00:00`:hourKeyInTz(now,tz);
-    return {day:today,from:startKey,to:hourKeyInTz(now,tz),data:rows};
+    return {day:today,...rollingDayAxis(window.since,tz,now),data:rows};
   }
   if(query.period==='week'||query.period==='month'){
     if(!window)throw new Error('Invalid usage trend period');

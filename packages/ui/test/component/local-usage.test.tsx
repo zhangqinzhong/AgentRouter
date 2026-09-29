@@ -173,3 +173,14 @@ test('custom short range keeps a daily axis',()=>{
  assert.equal(points[0].tokens,10);
  assert.equal(points[1].tokens,0);
 });
+
+test('rolling day keeps leading zero hours for empty and sparse data',()=>{
+ const from='2026-09-28T12:00:00',to='2026-09-29T12:00:00';
+ for(const rows of [[],[{hour:'2026-09-29T11:00:00',total_tokens:120}]]){
+  const points=trendChartPoints(rows,'day',from,to);
+  assert.equal(points.length,25);
+  assert.equal(points[0].row.hour,from);
+  assert.equal(points[0].tokens,0);
+  assert.equal(points[23].tokens,rows.length?120:0);
+ }
+});

@@ -51,6 +51,8 @@ The overview (gateway-captured usage) and the Usage / Trend pages (local session
 
 Window ends always anchor to "now", never to a calendar day, week, or month boundary, so curves never show empty leading segments from midnight or Monday anchors. The overview additionally keeps a `Today` option that counts from local midnight.
 
+Local session usage is stored in half-hour or hourly buckets. Rolling windows include the entire UTC hour containing the start boundary, which can include less than one extra hour of usage before the window. This aggregation limit means local totals are not second-accurate equivalents of gateway request-time statistics. The 24-hour chart retains the full time axis, with zeroes for inactive hours.
+
 ## Stat strip
 
 The stat strip shows four numbers for the selected range and filters: requests, total tokens, estimated cost, and request success rate. The error count appears under the success rate; when there are requests, a one-line summary of requests and success rate follows the strip.
