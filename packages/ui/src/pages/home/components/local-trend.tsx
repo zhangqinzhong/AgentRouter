@@ -63,8 +63,8 @@ export const LocalTrendView=memo(function LocalTrendView({defaultRange=DEFAULT_P
     onPeriodChange={setPeriod}
     rows={trend.rows as Array<Record<string,unknown>>}
     loading={trend.loading}
-    from={range.from}
-    to={range.to}
+    from={trend.from||range.from}
+    to={trend.to||range.to}
     size="full"
     showHeader={false}
    />

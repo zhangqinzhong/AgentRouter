@@ -25,7 +25,7 @@ test('tool proportions use collected totals without double adding cached tokens'
 });
 
 import {modelDisplayName,compareOtherLast} from '../../src/vendor/tokentracker/lib/model-display';
-import {setUsageLocale} from '../../src/vendor/tokentracker/lib/copy';
+import {setUsageLocale,copy} from '../../src/vendor/tokentracker/lib/copy';
 import {formatTokenCount,formatTokenTooltip} from '../../src/vendor/tokentracker/lib/token-format';
 import {matchingSessionProfiles,profileOpenSurfaces,resumeExtraArgs} from '../../src/vendor/tokentracker/pages/SessionsPage';
 import {formatToolCalls,toolAccent,toolDisplayName,toolVscodeIcon} from '../../src/pages/home/components/heatmap-tools';
@@ -61,10 +61,31 @@ test('trend line fills a complete month axis and keeps zero days',()=>{
  assert.equal(points[7].tokens,200);
  assert.equal(points[1].tokens,0);
 });
-test('day trend axis is 24 hours and year trend axis is 12 months',()=>{
+test('day trend axis is 24 hours and year trend axis covers every month from from to to',()=>{
  assert.equal(trendChartPoints([],'day','2026-09-16','2026-09-16').length,24);
  assert.equal(trendChartPoints([],'year','2026-01-01','2026-12-31').length,12);
  assert.equal(trendChartPoints([],'week','2026-09-14','2026-09-20').length,7);
+});
+test('year trend axis spans the rolling window across two calendar years',()=>{
+ const points=trendChartPoints([
+  {month:'2025-09',total_tokens:100,billable_total_tokens:100},
+  {month:'2026-09',total_tokens:200,billable_total_tokens:200}
+ ],'year','2025-09-29','2026-09-29');
+ assert.equal(points.length,13);
+ assert.equal(points[0].row.month,'2025-09');
+ assert.equal(points[0].tokens,100);
+ assert.equal(points[12].row.month,'2026-09');
+ assert.equal(points[12].tokens,200);
+ assert.equal(points[5].tokens,0);
+});
+test('week day labels follow the rolling window start, not a Monday anchor',()=>{
+ setUsageLocale('en');
+ const points=trendChartPoints([],'week','2026-09-09','2026-09-16');
+ assert.equal(points.length,8);
+ assert.equal(points[0].label,copy('heatmap.day.wed'));
+ assert.equal(points[3].label,copy('heatmap.day.sat'));
+ assert.equal(points[7].label,copy('heatmap.day.wed'));
+ setUsageLocale('zh');
 });
 test('year and day axes map collector month and hour keys onto the fixed buckets',()=>{
  const year=trendChartPoints([{month:'2026-09',total_tokens:100,billable_total_tokens:100}],'year','2026-01-01','2026-12-31');

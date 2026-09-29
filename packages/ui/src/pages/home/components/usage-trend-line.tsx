@@ -16,7 +16,6 @@ type TrendRow=Record<string,unknown>;
 const PERIODS:TrendPeriod[]=['day','week','month','year','total','custom'];
 const LINE='#007aff';
 const WEEKDAYS=['mon','tue','wed','thu','fri','sat','sun'] as const;
-const MONTHS=['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'] as const;
 
 function pad(value:number){return String(value).padStart(2,'0');}
 function dayKey(date:Date){return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;}
@@ -130,13 +129,11 @@ export function completeTrendPoints(rows:TrendRow[],period:TrendPeriod,from:stri
   return points;
  }
  if(period==='year'){
-  const year=(from||to||dayKey(new Date())).slice(0,4);
-  for(let month=1;month<=12;month+=1){
-   const key=`${year}-${pad(month)}`;
-   const row=byMonth.get(key);
-   points.push({label:copy(`heatmap.month.${MONTHS[month-1]}`),tokens:rowTokens(row),row:row||{month:key}});
-  }
-  return points;
+  // Rolling windows span two calendar years (e.g. 2025-09-29 → 2026-09-29);
+  // enumerate every month between from and to instead of from's Jan–Dec.
+  const yearStart=parseDay(from)||end;
+  const yearEnd=parseDay(to)||yearStart;
+  return fillMonthPoints(byMonth,yearStart,yearEnd,locale,true);
  }
  if(period==='total'||(period==='custom'&&trendAxisGrain(period,from,to)==='monthly')){
   const last=end;
@@ -144,14 +141,14 @@ export function completeTrendPoints(rows:TrendRow[],period:TrendPeriod,from:stri
   return fillMonthPoints(byMonth,first,last,locale,true);
  }
  let cursor=new Date(start);
- let index=0;
  while(cursor<=end){
   const key=dayKey(cursor);
   const row=byDay.get(key);
-  const label=period==='week'?copy(`heatmap.day.${WEEKDAYS[index]||'mon'}`):period==='custom'?formatTickLabel({day:key},'daily',locale):String(cursor.getDate());
+  // Rolling windows start on an arbitrary weekday; derive the label from the
+  // actual date instead of a Monday-anchored index.
+  const label=period==='week'?copy(`heatmap.day.${WEEKDAYS[(cursor.getDay()+6)%7]||'mon'}`):period==='custom'?formatTickLabel({day:key},'daily',locale):String(cursor.getDate());
   points.push({label,tokens:rowTokens(row),row:row||{day:key}});
   cursor=addDays(cursor,1);
-  index+=1;
  }
  return points;
 }

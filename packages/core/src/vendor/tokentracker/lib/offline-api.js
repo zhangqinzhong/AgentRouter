@@ -473,18 +473,23 @@ function getRequestedUsageScope(url) {
 }
 
 // AgentRouter rolling windows: an optional `since` (ISO datetime) param cuts the
-// queue rows at an exact instant so day/month aggregations can honor windows
-// like "past 7 days ending now" instead of whole calendar days. Rows without a
-// parseable hour_start are excluded under `since`; they never contributed to
-// day/month/hour buckets anyway.
+// queue rows so day/month/hour aggregations can honor windows like "past 7 days
+// ending now" instead of whole calendar days. Queue rows are half-hour/hour
+// aggregation buckets keyed by hour_start, so `since` is clamped to its
+// containing UTC hour: an exact sub-bucket cut would silently drop in-window
+// events that share the boundary bucket (at most one hour of over-inclusion).
+// Rows without a parseable hour_start are excluded under `since`; they never
+// contributed to day/month/hour buckets anyway.
 function rowsSince(rows, url) {
   const raw = String(url.searchParams.get("since") || "").trim();
   if (!raw) return rows;
   const sinceMs = Date.parse(raw);
   if (!Number.isFinite(sinceMs)) return rows;
+  const boundary = new Date(sinceMs);
+  boundary.setUTCMinutes(0, 0, 0);
   return rows.filter((row) => {
     const ts = Date.parse(String(row?.hour_start || ""));
-    return Number.isFinite(ts) && ts >= sinceMs;
+    return Number.isFinite(ts) && ts >= boundary.getTime();
   });
 }
 
