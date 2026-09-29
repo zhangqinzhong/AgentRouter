@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.9.3 - 2026-09-30
+
+### Fixes
+- Show saved overview usage immediately while slow local collection refreshes in the background, with loading and failure states.
+- Refresh only the selected provider credential from an account row, and add a separate refresh-all action.
+- Preserve displayed balances on refresh failures and prevent older polling responses from overwriting manual refreshes.
+
 ## 1.9.2 - 2026-09-30
 
 ### Fixes
