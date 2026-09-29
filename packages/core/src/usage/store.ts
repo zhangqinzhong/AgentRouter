@@ -642,7 +642,7 @@ export async function getUsageStats(
       const now = new Date();
       const localRange = localOverviewRange(normalizedRange, customRange, now);
       const local = await getCachedLocalUsageOverview(localRange.range, localRange.period);
-      return mergeLocalOverviewSnapshot(snapshot, local, filter);
+      return { ...mergeLocalOverviewSnapshot(snapshot, local, filter), localCollectionState: local.collectionState };
     } catch (error) {
       console.warn(`[usage] Failed to merge local usage into overview: ${formatError(error)}`);
       return snapshot;
@@ -660,7 +660,7 @@ async function getCachedLocalUsageOverview(range: LocalUsageRange, period: "day"
     return localOverviewCache.value;
   }
   const value = await getLocalUsageOverview(range, period);
-  localOverviewCache = { expiresAt: now + localOverviewCacheTtlMs, key, value };
+  localOverviewCache = { expiresAt: value.collectionState === "loading" ? 0 : now + localOverviewCacheTtlMs, key, value };
   return value;
 }
 

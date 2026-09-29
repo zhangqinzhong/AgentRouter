@@ -15,6 +15,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
   const projectQueuePath = path.join(dataDir, 'project.queue.jsonl');
   const cursorsPath = path.join(dataDir, 'cursors.json');
   let inFlight, lastSync = 0, pricingReady;
+  let backgroundRefresh, lastBackgroundAttempt = 0, backgroundFailed = false;
   function pricing() {
     if (!pricingReady) pricingReady=(async()=>{
       await fs.mkdir(dataDir,{recursive:true,mode:0o700});
@@ -85,6 +86,20 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
       return {subscriptions:[...new Map([...inherited,...own].map(row=>[row.id,row])).values()]};
     }
     if(endpoint.endsWith('local-sync')) { await sync(query.auto!=='true'); if(query.auto!=='true')resetUsageLimitsCache();return {ok:true,code:0}; }
+    // Overview reads the persisted snapshot first; optional network sources and
+    // price refresh must never hold its initial response hostage.
+    if (query.background === '1') {
+      const data = await queryOffline(queuePath,endpoint,query);
+      if (!backgroundRefresh && Date.now() - lastBackgroundAttempt >= 60000) {
+        lastBackgroundAttempt = Date.now();
+        backgroundFailed = false;
+        backgroundRefresh = new Promise(resolve => setImmediate(resolve))
+          .then(() => Promise.all([sync(),pricing()]))
+          .catch(() => { backgroundFailed = true; })
+          .finally(() => { backgroundRefresh = undefined; });
+      }
+      return {...data, collectionState: backgroundRefresh ? 'loading' : backgroundFailed ? 'error' : 'ready'};
+    }
     await Promise.all([sync(),pricing()]);
     return queryOffline(queuePath,endpoint,query);
   }

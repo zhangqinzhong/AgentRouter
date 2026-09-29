@@ -416,6 +416,7 @@ export type ProviderAccountSnapshot = {
 };
 
 export type ProviderAccountSnapshotRequestOptions = {
+  credentialId?: string;
   forceRefresh?: boolean;
 };
 
@@ -2241,6 +2242,7 @@ export type UsageComparisonRow = UsageTotals & {
 };
 
 export type UsageStatsSnapshot = {
+  localCollectionState?: "loading" | "ready" | "error";
   clientModels: UsageComparisonRow[];
   generatedAt: string;
   models: UsageComparisonRow[];

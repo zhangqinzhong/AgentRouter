@@ -515,3 +515,15 @@ test("OverviewBreakdowns hides client rows without client attribution", () => {
   assert.doesNotMatch(clientSection, /WorkOpenAI/, "client rows must not borrow provider names");
   assert.match(html.slice(html.indexOf("Provider Analysis")), /公司API/);
 });
+
+test("Overview keeps statistics visible while local collection refreshes", () => {
+  const snapshot = usageStats("7d");
+  const html = renderOverview({ usageStats: { ...snapshot, localCollectionState: "loading" } });
+  assert.match(html, /Updating local usage/);
+  assert.match(html, /animate-spin/);
+  assert.match(html, /Total tokens/);
+  const ready = renderOverview({ usageStats: { ...snapshot, localCollectionState: "ready" } });
+  assert.doesNotMatch(ready, /Updating local usage/);
+  const failed = renderOverview({ usageStats: { ...snapshot, localCollectionState: "error" } });
+  assert.match(failed, /Showing saved data/);
+});

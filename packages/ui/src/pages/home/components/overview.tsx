@@ -181,6 +181,7 @@ export function OverviewView({
   onConfigureProviderAccounts,
   providerAccounts,
   providerAccountRefreshing = false,
+  providerAccountRefreshingKeys = [],
   refreshProviderAccounts,
   resetOverviewStatistics,
   setUsageCustomRange,
@@ -193,7 +194,8 @@ export function OverviewView({
   onConfigureProviderAccounts?: () => void;
   providerAccounts: ProviderAccountSnapshot[];
   providerAccountRefreshing?: boolean;
-  refreshProviderAccounts?: () => void | Promise<void>;
+  providerAccountRefreshingKeys?: string[];
+  refreshProviderAccounts?: (account?: ProviderAccountSnapshot) => void | Promise<void>;
   resetOverviewStatistics?: () => void | Promise<void>;
   setUsageCustomRange?: (range: UsageDateRange) => void;
   setUsageRange: (range: UsageStatsRange) => void;
@@ -274,6 +276,15 @@ export function OverviewView({
     <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <h1 className="shrink-0 text-[24px] font-semibold tracking-[-0.025em]">{t("Overview")}</h1>
+        {usageStats.localCollectionState === "loading" && (
+          <span role="status" className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <LoaderCircle aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
+            {t("Updating local usage…")}
+          </span>
+        )}
+        {usageStats.localCollectionState === "error" && (
+          <span role="status" className="text-xs text-muted-foreground">{t("Local usage update failed. Showing saved data.")}</span>
+        )}
         <div className="ml-auto min-w-0 max-w-full">
           <OverviewRangeTabs
             customRange={usageCustomRange ?? emptyOverviewCustomRange}
@@ -334,6 +345,7 @@ export function OverviewView({
           onRefresh={refreshProviderAccounts}
           providers={filterProviders}
           refreshing={providerAccountRefreshing}
+          refreshingKeys={providerAccountRefreshingKeys}
         />
       </div>
 

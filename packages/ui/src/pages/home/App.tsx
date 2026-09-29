@@ -1,3 +1,4 @@
+import { providerAccountSnapshotKey } from "./shared/provider-accounts";
 import {DEFAULT_PAGE_RANGES, normalizePageDefaultRanges} from "@agentrouter/core/config/page-default-ranges";
 import { setUsageLocale } from "@/vendor/tokentracker/lib/copy";
 import {
@@ -154,11 +155,11 @@ function providerNameSlug(value: string): string {
     .replace(/^-+|-+$/g, "") || "provider";
 }
 
-async function loadProviderAccountSnapshots(forceRefresh = false): Promise<ProviderAccountSnapshot[]> {
+async function loadProviderAccountSnapshots(forceRefresh = false, account?: ProviderAccountSnapshot): Promise<ProviderAccountSnapshot[]> {
   if (!window.agentrouter) {
     return [];
   }
-  return window.agentrouter.getProviderAccountSnapshots(undefined, forceRefresh ? { forceRefresh: true } : undefined);
+  return window.agentrouter.getProviderAccountSnapshots(account?.provider, forceRefresh ? { forceRefresh: true, ...(account ? { credentialId: account.credentialId ?? "" } : {}) } : undefined);
 }
 
 function providerRefreshModelsInputKey(
@@ -306,6 +307,9 @@ function App() {
   const [usageStats, setUsageStats] = useState<UsageStatsSnapshot>(fallbackUsageStats);
   const [providerAccountSnapshots, setProviderAccountSnapshots] = useState<ProviderAccountSnapshot[]>([]);
   const [providerAccountRefreshing, setProviderAccountRefreshing] = useState(false);
+  const [providerAccountRefreshingKeys, setProviderAccountRefreshingKeys] = useState<string[]>([]);
+  const accountRefreshes = useRef(new Set<string>());
+  const accountRefreshEpoch = useRef(0);
   const updateActionBusyRef = useRef(false);
   const usageStatsRequestId = useRef(0);
   const resolvedLanguage = languagePreference === "system" ? systemLanguage : languagePreference;
@@ -564,15 +568,17 @@ function App() {
 
     let cancelled = false;
     const refreshProviderAccounts = () => {
-      void loadProviderAccountSnapshots()
+      if (accountRefreshes.current.size) return;
+      const epoch = accountRefreshEpoch.current;
+      return loadProviderAccountSnapshots()
         .then((snapshots) => {
-          if (!cancelled) {
+          if (!cancelled && epoch === accountRefreshEpoch.current && !accountRefreshes.current.size) {
             setProviderAccountSnapshots(snapshots);
           }
         })
         .catch(() => {
-          if (!cancelled) {
-            setProviderAccountSnapshots([]);
+          if (!cancelled && epoch === accountRefreshEpoch.current && !accountRefreshes.current.size) {
+            // Retain the last successful account snapshots.
           }
         });
     };
@@ -583,17 +589,26 @@ function App() {
     };
   }, [draftConfig.Providers]);
 
-  async function refreshProviderAccountsNow() {
-    if (providerAccountRefreshing) {
-      return;
-    }
-    setProviderAccountRefreshing(true);
+  async function refreshProviderAccountsNow(account?: ProviderAccountSnapshot) {
+    const key = account ? providerAccountSnapshotKey(account) : "*";
+    if (accountRefreshes.current.has("*") || accountRefreshes.current.has(key) || (!account && accountRefreshes.current.size)) return;
+    accountRefreshes.current.add(key);
+    accountRefreshEpoch.current++;
+    setProviderAccountRefreshing(!account);
+    setProviderAccountRefreshingKeys([...accountRefreshes.current]);
     try {
-      setProviderAccountSnapshots(await loadProviderAccountSnapshots(true));
+      const snapshots = await loadProviderAccountSnapshots(true, account);
+      setProviderAccountSnapshots((previous) => account
+        ? previous.map((item) => providerAccountSnapshotKey(item) === key
+          ? snapshots.find((next) => providerAccountSnapshotKey(next) === key) ?? item : item)
+        : snapshots);
     } catch {
-      setProviderAccountSnapshots([]);
+      // Keep successful balances visible when transport fails.
     } finally {
-      setProviderAccountRefreshing(false);
+      accountRefreshes.current.delete(key);
+      accountRefreshEpoch.current++;
+      setProviderAccountRefreshing(accountRefreshes.current.has("*"));
+      setProviderAccountRefreshingKeys([...accountRefreshes.current]);
     }
   }
 
@@ -3425,7 +3440,8 @@ function App() {
                   resetOverviewStatistics,
                   providerAccounts: providerAccountSnapshots,
                   providerAccountRefreshing,
-                  refreshProviderAccounts: () => void refreshProviderAccountsNow(),
+                  providerAccountRefreshingKeys,
+                  refreshProviderAccounts: (account?: ProviderAccountSnapshot) => refreshProviderAccountsNow(account),
                   setUsageCustomRange,
                   setUsageRange,
                   usageCustomRange,

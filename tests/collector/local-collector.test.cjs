@@ -79,3 +79,41 @@ test('quota observer cannot rotate active CLI credentials',async()=>{
  await getUsageLimits({home,platform:'linux',env:{},allowCodexTokenRefresh:false,providerTimeoutMs:30,securityRunner:()=>({status:1,stdout:''}),commandRunner:()=>({status:1,stdout:''}),fetchImpl:async url=>{if(String(url).includes('/oauth/token'))refreshed=true;return {ok:false,status:401,json:async()=>({})}}});assert.equal(refreshed,false);assert.equal(await fs.readFile(file,'utf8'),original);
  }finally{resetUsageLimitsCache();await fs.rm(home,{recursive:true,force:true})}
 });
+
+test('overview returns saved usage while refresh is pending, then exposes completion',async()=>{
+ const home=await fs.mkdtemp(path.join(os.tmpdir(),'ar-overview-background-'));
+ const pricing=require('../../packages/core/src/vendor/tokentracker/lib/pricing');
+ let release;const gate=new Promise(resolve=>{release=resolve});let started=false;
+ try {
+  pricing.resetPricingForTests();
+  const dir=path.join(home,'.agentrouter/collector');await fs.mkdir(dir,{recursive:true});
+  await fs.writeFile(path.join(dir,'queue.jsonl'),JSON.stringify({source:'claude',model:'claude-sonnet-4',hour_start:'2026-09-14T01:00:00Z',input_tokens:100,output_tokens:20,total_tokens:120})+'\n');
+  const project=path.join(home,'.claude/projects/fixture');await fs.mkdir(project,{recursive:true});
+  await fs.writeFile(path.join(project,'new.jsonl'),JSON.stringify({type:'assistant',timestamp:'2026-09-14T02:00:00Z',requestId:'new-request',message:{id:'new-message',model:'claude-sonnet-4',usage:{input_tokens:200,output_tokens:20}}})+'\n');
+  const c=createCollector({home,fetchImpl:async()=>{started=true;await gate;throw Error('offline')}});
+  const query={from:'2026-09-14',to:'2026-09-14',tz:'UTC',background:'1'};
+  const first=await c.query('/functions/tokentracker-usage-summary',query);
+  assert.equal(first.collectionState,'loading');assert.equal(first.totals.total_tokens,120);
+  while(!started)await new Promise(resolve=>setImmediate(resolve));
+  const pending=await c.query('/functions/tokentracker-usage-summary',query);
+  assert.equal(pending.collectionState,'loading');assert.equal(pending.totals.total_tokens,120);
+  release();await c.sync();
+  let result;
+  for(let i=0;i<100;i++) {result=await c.query('/functions/tokentracker-usage-summary',query);if(result.collectionState==='ready')break;await new Promise(resolve=>setTimeout(resolve,5));}
+  assert.equal(result.collectionState,'ready');assert.equal(result.totals.total_tokens,340);
+ } finally {release();pricing.resetPricingForTests();await fs.rm(home,{recursive:true,force:true});}
+});
+
+test('failed background scan retains saved data and stops the loading state',async()=>{
+ const home=await fs.mkdtemp(path.join(os.tmpdir(),'ar-overview-failure-'));
+ try {
+  const dir=path.join(home,'.agentrouter/collector');await fs.mkdir(dir,{recursive:true});
+  await fs.writeFile(path.join(dir,'cursors.json'),'invalid');
+  const c=createCollector({home,fetchImpl:async()=>{throw Error('offline')}});
+  const query={from:'2026-09-14',to:'2026-09-14',tz:'UTC',background:'1'};
+  assert.equal((await c.query('/functions/tokentracker-usage-summary',query)).collectionState,'loading');
+  let result;
+  for(let i=0;i<100;i++){result=await c.query('/functions/tokentracker-usage-summary',query);if(result.collectionState==='error')break;await new Promise(resolve=>setTimeout(resolve,5));}
+  assert.equal(result.collectionState,'error');assert.equal(result.totals.total_tokens,0);
+ }finally{await fs.rm(home,{recursive:true,force:true})}
+});

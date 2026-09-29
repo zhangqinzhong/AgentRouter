@@ -138,11 +138,12 @@ export async function getProviderAccountSnapshots(
 
   const snapshots = await Promise.all(
     providers.flatMap((provider) => {
-      const targets = providerAccountTargets(provider);
+      const targets = providerAccountTargets(provider).filter((target) => options.credentialId === undefined ||
+        (target.credential ? providerCredentialRuntimeId(target.provider, target.credential) : "") === options.credentialId);
       if (targets.length > 0) {
         return targets.map((target) => resolveProviderAccountSnapshot(config, target, options));
       }
-      return providerAccountUnavailableSnapshots(provider).map((snapshot) => Promise.resolve(snapshot));
+      return providerAccountUnavailableSnapshots(provider).filter((snapshot) => options.credentialId === undefined || (snapshot.credentialId ?? "") === options.credentialId).map((snapshot) => Promise.resolve(snapshot));
     })
   );
   return snapshots.filter((snapshot): snapshot is ProviderAccountSnapshot => Boolean(snapshot));

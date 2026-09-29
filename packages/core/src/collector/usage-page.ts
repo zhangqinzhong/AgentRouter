@@ -10,6 +10,7 @@ export type LocalUsagePageData = {
 };
 export type LocalUsageOverviewPeriod = "day" | "hour";
 export type LocalUsageOverviewData = LocalUsagePageData & {
+  collectionState?: "loading" | "ready" | "error";
   series: Array<Record<string,unknown>>;
 };
 export const LOCAL_OVERVIEW_SOURCE_KEYS = [
@@ -124,21 +125,21 @@ export async function getLocalUsagePage(range:LocalUsageRange):Promise<LocalUsag
 export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalUsageOverviewPeriod):Promise<LocalUsageOverviewData>{
   if(!range || (range.from!==''&&!validDay(range.from)) || !validDay(range.to) || range.from>range.to)throw new Error('Invalid usage date range');
   const query={from:range.from,to:range.to,tz:zone(range.tz)};
-  const overviewQuery={...query,source:LOCAL_OVERVIEW_SOURCE_KEYS.join(",")};
+  const overviewQuery={...query,background:'1',source:LOCAL_OVERVIEW_SOURCE_KEYS.join(",")};
   const [summary,models,series] = await Promise.all([
     queryLocalCollector('/functions/tokentracker-usage-summary',overviewQuery),
     queryLocalCollector('/functions/tokentracker-usage-model-breakdown',overviewQuery),
     period==='hour'
-      ? Promise.all(listDays(range.from,range.to).map((day)=>queryLocalCollector('/functions/tokentracker-usage-hourly',{day,tz:query.tz,source:LOCAL_OVERVIEW_SOURCE_KEYS.join(",")}) as Promise<Record<string,unknown>>)).then((responses)=>({
+      ? Promise.all(listDays(range.from,range.to).map((day)=>queryLocalCollector('/functions/tokentracker-usage-hourly',{day,tz:query.tz,background:'1',source:LOCAL_OVERVIEW_SOURCE_KEYS.join(",")}) as Promise<Record<string,unknown>>)).then((responses)=>({
           data:responses.flatMap((response)=>Array.isArray(response?.data)?response.data:[])
         }))
       : queryLocalCollector('/functions/tokentracker-usage-daily',overviewQuery)
   ]) as [
-    {totals:LocalUsagePageData['totals']},
+    {totals:LocalUsagePageData['totals'];collectionState?: LocalUsageOverviewData['collectionState']},
     {sources:LocalUsagePageData['sources']},
     {data:Array<Record<string,unknown>>}
   ];
-  return {totals:summary.totals,sources:models.sources,series:series.data};
+  return {totals:summary.totals,sources:models.sources,series:series.data,collectionState:summary.collectionState};
 }
 
 // A rolling "day" spans two calendar days, so its hour buckets keep their real
