@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { foldHourlyRowsOntoDay, rollingWindow } from "@agentrouter/core/collector/usage-page.ts";
+import { hourKeyInTz, rollingWindow } from "@agentrouter/core/collector/usage-page.ts";
 
 test("rolling windows end at now and start an exact duration earlier", () => {
   const now = new Date("2026-09-16T12:34:56Z");
@@ -31,21 +31,8 @@ test("rolling window day keys follow the requested time zone", () => {
   assert.equal(window.to, "2026-09-17");
 });
 
-test("hourly rows from a two-day window fold onto the target day's clock hours", () => {
-  const folded = foldHourlyRowsOntoDay(
-    [
-      { hour: "2026-09-15T14:00:00", total_tokens: 30, billable_total_tokens: 30, conversation_count: 1, models: { "glm-5.3": 30 } },
-      { hour: "2026-09-16T14:00:00", total_tokens: 70, billable_total_tokens: 70, conversation_count: 2, models: { "glm-5.3": 70 } },
-      { hour: "2026-09-16T15:00:00", total_tokens: 10, billable_total_tokens: 10, conversation_count: 1 }
-    ],
-    "2026-09-16"
-  );
-
-  assert.equal(folded.length, 2);
-  assert.equal(folded[0].hour, "2026-09-16T14:00:00");
-  assert.equal(folded[0].total_tokens, 100);
-  assert.equal(folded[0].conversation_count, 3);
-  assert.deepEqual(folded[0].models, { "glm-5.3": 100 });
-  assert.equal(folded[1].hour, "2026-09-16T15:00:00");
-  assert.equal(folded[1].total_tokens, 10);
+test("hour keys render in the requested time zone with the collector's key shape", () => {
+  const instant = new Date("2026-09-28T20:34:00Z");
+  assert.equal(hourKeyInTz(instant, "UTC"), "2026-09-28T20:00:00");
+  assert.equal(hourKeyInTz(instant, "Asia/Shanghai"), "2026-09-29T04:00:00");
 });

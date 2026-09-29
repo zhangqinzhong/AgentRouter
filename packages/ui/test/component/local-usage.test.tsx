@@ -115,6 +115,17 @@ test('custom long range uses monthly ticks instead of every day',()=>{
  assert.equal(points.find((point)=>point.row.month==='2026-03')?.tokens,40);
  assert.equal(points[points.length-1].row.month,'2026-09');
 });
+test('rolling day trend axis keeps real cross-day hour keys without future slots',()=>{
+ const points=trendChartPoints([
+  {hour:'2026-09-28T20:00:00',total_tokens:120,billable_total_tokens:120},
+  {hour:'2026-09-29T12:00:00',total_tokens:30,billable_total_tokens:30}
+ ],'day','2026-09-28T12:00:00','2026-09-29T12:00:00');
+ assert.equal(points.length,25);
+ assert.equal(points[8].tokens,120,'yesterday 20:00 stays in the axis');
+ assert.equal(points[24].tokens,30,'the current hour is the last slot');
+ assert.equal(points[0].label,'12:00');
+ assert.equal(points[24].label,'12:00');
+});
 test('session resume args follow each agent CLI and prefer tagged AgentRouter profiles',()=>{
  assert.deepEqual(resumeExtraArgs('codex','abc-123'),['resume','abc-123']);
  assert.deepEqual(resumeExtraArgs('claude','abc-123'),['--resume','abc-123']);

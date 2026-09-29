@@ -48,8 +48,15 @@ export function useTrendData({
       if (mode === "daily") {
         nextRows = fillDailyGaps(nextRows, nextFrom || from, nextTo || to, gapOptions);
       } else if (mode === "hourly") {
-        nextRows = fillHourlyGaps(nextRows, nextFrom || from || response?.day, gapOptions);
-        nextRows = markHourlyFuture(nextRows, gapOptions);
+        if (String(nextFrom || "").includes("T")) {
+          // Rolling 24h windows arrive as real cross-day hour buckets whose
+          // axis already ends at the current hour. Filling single-day slots or
+          // marking hours after "now" as future would discard yesterday's
+          // tail, which is genuine in-window data — keep the rows untouched.
+        } else {
+          nextRows = fillHourlyGaps(nextRows, nextFrom || from || response?.day, gapOptions);
+          nextRows = markHourlyFuture(nextRows, gapOptions);
+        }
       } else {
         nextRows = markMonthlyFuture(nextRows, gapOptions);
       }

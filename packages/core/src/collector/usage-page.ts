@@ -87,6 +87,13 @@ const rollingPeriodMs:Record<string,number>={
 function dayKeyInTz(date:Date,tz:string){
   return new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).format(date);
 }
+// "YYYY-MM-DDTHH:00:00" in the target time zone — the same key shape the
+// collector's hourly endpoint emits, so chart axes and rows compare directly.
+export function hourKeyInTz(date:Date,tz:string){
+  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(date);
+  const value=(type:string)=>parts.find(part=>part.type===type)?.value??'00';
+  return `${value('year')}-${value('month')}-${value('day')}T${value('hour')}:00:00`;
+}
 export function rollingWindow(period:LocalUsagePeriod,tz:string,now:Date=new Date()):{since:string;from:string;to:string}|null{
   const ms=rollingPeriodMs[period];
   if(!ms)return null;
@@ -128,36 +135,10 @@ export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalU
   return {totals:summary.totals,sources:models.sources,series:series.data};
 }
 
-// A rolling "day" spans two calendar days, so its hourly buckets are folded
-// onto the current day's clock-hour axis (the same presentation the Overview
-// trend uses). Each clock hour sums the partial pieces the 24h window covers,
-// keeping the row shape and totals the single-day endpoint produced before.
-export function foldHourlyRowsOntoDay(rows:Array<Record<string,unknown>>,day:string):Array<Record<string,unknown>>{
-  const numericFields=['total_tokens','billable_total_tokens','input_tokens','output_tokens','cached_input_tokens','cache_creation_input_tokens','reasoning_output_tokens','conversation_count'] as const;
-  const byClockHour=new Map<string,Record<string,unknown>>();
-  for(const row of rows){
-    const match=/T(\d{2}):/.exec(String(row.hour??''));
-    if(!match)continue;
-    const target=`${day}T${match[1]}:00:00`;
-    const existing=byClockHour.get(target);
-    if(!existing){
-      byClockHour.set(target,{...row,hour:target});
-      continue;
-    }
-    for(const field of numericFields){
-      existing[field]=Number(existing[field]??0)+Number(row[field]??0);
-    }
-    if(row.models&&typeof row.models==='object'){
-      const models={...(existing.models as Record<string,number>|undefined??{})};
-      for(const [model,value] of Object.entries(row.models as Record<string,number>)){
-        models[model]=(models[model]??0)+Number(value??0);
-      }
-      existing.models=models;
-    }
-  }
-  return [...byClockHour.values()].sort((left,right)=>String(left.hour).localeCompare(String(right.hour)));
-}
-
+// A rolling "day" spans two calendar days, so its hour buckets keep their real
+// date-time keys and the axis bounds are datetimes (window start hour → current
+// hour). Folding them onto the current day's clock hours would make the UI's
+// future-hour filter discard yesterday's tail, which is real in-window data.
 export async function getLocalUsageTrend(query:LocalUsageTrendQuery):Promise<Record<string,unknown>>{
   if(!query||!['day','week','month','year','total','custom'].includes(query.period))throw new Error('Invalid usage trend period');
   const tz=zone(query.tz);
@@ -170,8 +151,12 @@ export async function getLocalUsageTrend(query:LocalUsageTrendQuery):Promise<Rec
     const responses=await Promise.all(
       (previous===today?[today]:[previous,today]).map((day)=>queryLocalCollector('/functions/tokentracker-usage-hourly',{day,tz,since:window.since}) as Promise<Record<string,unknown>>)
     );
-    const rows=responses.flatMap((response)=>Array.isArray(response?.data)?response.data:[]);
-    return {day:today,from:today,to:today,data:foldHourlyRowsOntoDay(rows,today)};
+    const rows=responses
+      .flatMap((response)=>Array.isArray(response?.data)?response.data:[])
+      .sort((left,right)=>String(left.hour??'').localeCompare(String(right.hour??'')));
+    const now=new Date();
+    const startKey=rows.length?`${String(rows[0].hour??'').slice(0,13)}:00:00`:hourKeyInTz(now,tz);
+    return {day:today,from:startKey,to:hourKeyInTz(now,tz),data:rows};
   }
   if(query.period==='week'||query.period==='month'){
     if(!window)throw new Error('Invalid usage trend period');

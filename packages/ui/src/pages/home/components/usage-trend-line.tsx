@@ -120,6 +120,20 @@ export function completeTrendPoints(rows:TrendRow[],period:TrendPeriod,from:stri
  const end=parseDay(to)||start;
  const points:{label:string;tokens:number;row:TrendRow}[]=[];
  if(period==='day'){
+  if(from&&from.indexOf('T')>=0){
+   // Rolling 24h axis: from/to are tz-local "YYYY-MM-DDTHH:00:00" bounds from
+   // the collector (window start hour → current hour). Enumerate every hour in
+   // between on the real dates; there are no future slots by construction.
+   const startMs=Date.parse(`${from}Z`);
+   const endMs=Date.parse(`${to&&to.indexOf('T')>=0?to:from}Z`);
+   for(let ts=startMs;ts<=endMs;ts+=3600000){
+    const stamp=new Date(ts).toISOString().slice(0,13);
+    const key=`${stamp.slice(0,10)}T${stamp.slice(11,13)}`;
+    const row=byHour.get(key);
+    points.push({label:`${stamp.slice(11,13)}:00`,tokens:rowTokens(row),row:row||{hour:`${stamp}:00:00`}});
+   }
+   return points;
+  }
   const day=from||to||dayKey(new Date());
   for(let hour=0;hour<24;hour+=1){
    const key=`${day}T${pad(hour)}`;
