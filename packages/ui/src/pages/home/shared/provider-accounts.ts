@@ -14,6 +14,17 @@ export function compareProviderAccountSnapshots(a: ProviderAccountSnapshot, b: P
   );
 }
 
+// Overview groups subscriptions before provider balances. A gateway-backed
+// subscription (for example Codex OAuth) may not have localSource, and may
+// carry a credit balance alongside its quota. Refresh status must not move rows.
+export function compareOverviewProviderAccounts(a: ProviderAccountSnapshot, b: ProviderAccountSnapshot): number {
+  const isSubscription = (account: ProviderAccountSnapshot) => Boolean(account.localSource) ||
+    account.meters.some((meter) => ["subscription", "quota", "time_window"].includes(meter.kind));
+  return Number(isSubscription(b)) - Number(isSubscription(a)) ||
+    a.provider.localeCompare(b.provider) ||
+    providerAccountSnapshotCredentialLabel(a).localeCompare(providerAccountSnapshotCredentialLabel(b));
+}
+
 export function providerAccountSnapshotKey(account: ProviderAccountSnapshot): string {
   return account.credentialId ? `${account.provider}::${account.credentialId}` : account.provider;
 }

@@ -1,10 +1,8 @@
-import cursorQuotaIcon from "@/assets/agent-logos/cursor.svg";
-import zcodeQuotaIcon from "@/assets/agent-logos/zcode.png";
-import grokQuotaIcon from "@/assets/agent-logos/grok.ico";
+import { localAccountIcons } from "../shared/local-account-icons";
 import {
   AnimatePresence, AnimatedDisclosure, AnimatedIconSwap, Button,
   ChevronDown, ChevronLeft, ChevronRight, CheckCircle2, CircleAlert,
-  cn, codexLogoUrl, compareProviderAccountSnapshots, Dialog, DialogBody, DialogContent,
+  cn, codexLogoUrl, compareOverviewProviderAccounts, Dialog, DialogBody, DialogContent,
   formatProviderAccountDetailDate, formatProviderAccountMeterTitle, formatProviderAccountMeterValue,
   isProviderAccountManualResetMeter, LoaderCircle, motion,
   providerAccountMeterDetailValidityProgress, providerAccountMeterProgress, providerAccountMetersForDisplay,
@@ -32,7 +30,7 @@ export function ProviderAccountsSection({
   refreshingKeys?: string[];
 }) {
   const t = useAppText();
-  const sortedAccounts = accounts.map(providerAccountSnapshotForOverview).sort(compareProviderAccountSnapshots);
+  const sortedAccounts = accounts.map(providerAccountSnapshotForOverview).sort(compareOverviewProviderAccounts);
   const visibleAccounts = sortedAccounts.filter((account) => account.meters.length > 0 || (!account.localSource && account.status === "error"));
   const unconfigured = accounts.length === 0 && !providers.some((provider) => provider.account?.enabled);
 
@@ -220,7 +218,7 @@ function ProviderAccountLogo({
   if (iconUrl && !failed) {
     return (
       <span className={cn("flex shrink-0 items-center justify-center overflow-hidden border border-border bg-background p-0.5", className)}>
-        <img alt="" className="h-full w-full object-contain" draggable={false} src={iconUrl} onError={() => setFailed(true)} />
+        <img alt="" className={cn("h-full w-full object-contain", account.localSource && localAccountIcons[account.localSource]?.monochrome && "dark:invert")} draggable={false} src={iconUrl} onError={() => setFailed(true)} />
       </span>
     );
   }
@@ -238,8 +236,8 @@ export function isUsableProviderIconUrl(url: string): boolean {
 
 function providerAccountIconUrl(account: ProviderAccountSnapshot, providers: GatewayProviderConfig[]): string {
   if (account.localSource) {
-    const localIcons: Record<string, string> = {codex: codexLogoUrl, cursor: cursorQuotaIcon, zcode: zcodeQuotaIcon, grok: grokQuotaIcon, grokbot: grokQuotaIcon};
-    if (localIcons[account.localSource]) return localIcons[account.localSource];
+    const icon = localAccountIcons[account.localSource];
+    if (icon) return icon.url;
   }
   const providerName = account.provider.trim().toLowerCase();
   if (!providerName) {
