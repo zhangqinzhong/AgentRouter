@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.9.7 - 2026-09-30
+
+### Fixes
+- Reuse menu bar brand assets for local subscription icons, including GitHub Copilot, with dark-mode support.
+- Sort overview subscriptions before provider balances and keep name ordering stable across refresh status changes.
+
 ## 1.9.6 - 2026-09-30
 
 ### Fixes

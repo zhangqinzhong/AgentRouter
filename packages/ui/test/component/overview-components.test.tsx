@@ -559,3 +559,44 @@ test('overview omits failed local logins without quota, but retains saved quota 
   assert.match(html,/Grok Bot/);
   assert.match(html,/Configured provider/);
 });
+
+
+test("all supported local subscriptions render bundled logos, including Copilot plans", () => {
+  for (const localSource of ["claude", "codex", "cursor", "grokbot", "grok", "copilot", "zcode", "kimi", "gemini", "kiro", "antigravity", "opencodeGo", "commandCode", "qoder", "qoderCn", "codingPlan", "agentPlan"]) {
+    const html = renderOverview({ providerAccounts: [{
+      provider: localSource === "copilot" ? "GitHub Copilot" : localSource,
+      displayName: localSource === "copilot" ? "GitHub Copilot Individual" : localSource,
+      localSource, credentialId: "local-subscription", source: "standard", status: "ok",
+      updatedAt: "2026-09-30T00:00:00Z",
+      meters: [{ id: "primary", label: "Quota", kind: "quota", unit: "%", remaining: 90, limit: 100 }]
+    }] });
+    const accounts = html.slice(html.lastIndexOf("Account Balance"));
+    assert.match(accounts, /<img[^>]+src="[^"]+"/, `${localSource} should not fall back to a letter`);
+    if (localSource === "copilot") {
+      assert.match(accounts, /src="[^"]*copilot[^"]*\.svg"/);
+      assert.match(accounts, /dark:invert/);
+    }
+  }
+});
+
+
+test("overview groups subscriptions before provider balances regardless of refresh status", () => {
+  const base = { source: "standard", status: "ok", updatedAt: "2026-09-30T00:00:00Z" } as const;
+  const quota = { id: "quota", label: "Quota", kind: "quota", unit: "%", remaining: 90, limit: 100 } as const;
+  const balance = { id: "balance", label: "Balance", kind: "balance", unit: "USD", remaining: 100 } as const;
+  const accounts: ProviderAccountSnapshot[] = [
+    { ...base, provider: "WorkGLM", meters: [balance, { id: "today_cost", label: "Today cost", kind: "quota", unit: "USD", used: 10 }] },
+    { ...base, provider: "ZCode", localSource: "zcode", meters: [quota] },
+    { ...base, provider: "DeepSeek", status: "error", meters: [balance] },
+    { ...base, provider: "Codex", meters: [quota, balance] },
+    { ...base, provider: "GitHub Copilot", localSource: "copilot", meters: [quota] },
+  ];
+  for (const input of [accounts, [...accounts].reverse(), accounts.map(account => ({ ...account, status: "error" as const }))]) {
+    const html = renderOverview({ providerAccounts: input });
+    const section = html.slice(html.lastIndexOf("Account Balance"));
+    const labels = ["Codex", "GitHub Copilot", "ZCode", "DeepSeek", "WorkGLM"];
+    const offsets = labels.map(label => section.indexOf(`>${label}</span>`));
+    assert.ok(offsets.every(offset => offset >= 0));
+    assert.deepEqual([...offsets].sort((a, b) => a - b), offsets);
+  }
+});
