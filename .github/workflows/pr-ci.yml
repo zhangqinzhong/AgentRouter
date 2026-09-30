@@ -37,4 +37,4 @@ jobs:
         with:
           node-version: 22
       - run: node build/check-native-parity.mjs
-      - run: swift test --package-path native/AgentRouterTray
+      - run: swift test --build-system xcode --package-path native/AgentRouterTray

@@ -103,7 +103,7 @@ jobs:
       - name: Validate native source
         run: |
           node build/check-native-parity.mjs
-          swift test --package-path native/AgentRouterTray
+          swift test --build-system xcode --package-path native/AgentRouterTray
 
       - name: Build ad-hoc macOS artifacts
         run: |
