@@ -585,7 +585,7 @@ test("overview groups subscriptions before provider balances regardless of refre
   const quota = { id: "quota", label: "Quota", kind: "quota", unit: "%", remaining: 90, limit: 100 } as const;
   const balance = { id: "balance", label: "Balance", kind: "balance", unit: "USD", remaining: 100 } as const;
   const accounts: ProviderAccountSnapshot[] = [
-    { ...base, provider: "WorkGLM", meters: [balance] },
+    { ...base, provider: "WorkGLM", meters: [balance, { id: "today_cost", label: "Today cost", kind: "quota", unit: "USD", used: 10 }] },
     { ...base, provider: "ZCode", localSource: "zcode", meters: [quota] },
     { ...base, provider: "DeepSeek", status: "error", meters: [balance] },
     { ...base, provider: "Codex", meters: [quota, balance] },
