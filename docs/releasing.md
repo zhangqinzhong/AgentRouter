@@ -4,7 +4,7 @@
 
 修复版本默认递增补丁号。发布 PR 同时更新根目录和四个 workspace 的 `package.json`、`package-lock.json`、`CHANGELOG.md`、`docs/releases/<version>.md`、`.github/release-request`。
 
-提交前执行 `node build/verify-release-version.mjs`。PR CI 检查类型、采集器、核心、UI、原生视图差异和 Swift 测试。合并前用 `gh pr checks <PR> --watch` 确认全部通过，不跳过失败检查。
+提交前执行 `node build/verify-release-version.mjs`。PR CI 检查类型、采集器、核心、UI、原生视图差异和 Swift 测试。原生测试使用 `node build/test-native.mjs`，兼容旧版 SwiftPM 的资源解析；生产构建仍由 Xcode 编译资源。合并前用 `gh pr checks <PR> --watch` 确认全部通过，不跳过失败检查。
 
 合并到 main 后，Release Kickoff 按 `.github/release-request` 创建 tag 并显式启动 Release（工作流 token 创建 tag 不会触发另一个 push 工作流）。不要同时手动推同名 tag。已有 tag 指向不同提交时停止，禁止移动已发布 tag。
 
