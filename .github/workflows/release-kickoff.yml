@@ -51,7 +51,12 @@ jobs:
         run: |
           set -euo pipefail
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "$TAG already exists"
+            existing="$(git rev-parse "$TAG^{commit}")"
+            if [[ "$existing" != "$GITHUB_SHA" ]]; then
+              echo "$TAG already points to a different commit; refusing to republish"
+              exit 1
+            fi
+            echo "$TAG already exists at the requested commit"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

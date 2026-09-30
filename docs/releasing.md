@@ -1,33 +1,22 @@
-# AgentRouter 版本发布
+# 发布流程
 
-AgentRouter 使用独立的 1.x 版本号，当前版本以根目录及各 workspace 的 `package.json` 为准。上游仓库版本号不作为 AgentRouter 发布版本。
+## PR → CI → tag → Release
 
-## 版本与检查
+修复版本默认递增补丁号。发布 PR 同时更新根目录和四个 workspace 的 `package.json`、`package-lock.json`、`CHANGELOG.md`、`docs/releases/<version>.md`、`.github/release-request`。
 
-根目录及 `packages/core`、`packages/ui`、`packages/cli`、`packages/electron` 的 `package.json` 版本应一致，同时同步 `package-lock.json` 的根包和 workspace 版本。更新 `CHANGELOG.md` 和 `docs/releases/<版本>.md` 后执行：
+提交前执行 `node build/verify-release-version.mjs`。PR CI 检查类型、采集器、核心、UI、原生视图差异和 Swift 测试。合并前用 `gh pr checks <PR> --watch` 确认全部通过，不跳过失败检查。
 
-```sh
-node build/verify-release-version.mjs
-npm run typecheck
-npm run test:core
-npm run test:ui
-npm run test:electron
-```
+合并到 main 后，Release Kickoff 按 `.github/release-request` 创建 tag 并显式启动 Release（工作流 token 创建 tag 不会触发另一个 push 工作流）。不要同时手动推同名 tag。已有 tag 指向不同提交时停止，禁止移动已发布 tag。
 
-桌面版本来自 `packages/electron/package.json`，打包不会自动递增版本。同版本的重复构建不会被当作更高版本的更新。
+Release 再次校验源码和版本，构建 Apple Silicon、Intel，发布 macOS 后继续 Windows、Linux。用 `gh run list --workflow release.yml` 和 `gh release view v<version>` 检查状态。
 
-## GitHub Releases
+## 本机安装
 
-发布仓库：<https://github.com/zhangqinzhong/AgentRouter/releases>
+在用户要求替换本机时，从 GitHub Release 下载匹配架构的 ZIP 和 `latest-mac.yml`。校验 ZIP 的 SHA-512 与更新元数据一致，并校验 app 签名、版本和原生 SQLite 模块。GitHub macOS 产物采用 ad-hoc 签名，未公证。
 
-推送验证后的提交及 `v<版本>` 标签，触发 `.github/workflows/release.yml`。例如版本更新为 1.0.2 后：
+安装前用 SQLite backup API 备份现有数据库（包含 WAL 中已提交数据），记录配置摘要；保留旧 app 以便恢复。说明短暂网关中断后退出 app，将新 app 放到 /Applications 同卷临时路径并原子交换，启动并验证版本、数据库 quick_check、供应商配置和实际服务状态。失败则保留证据并恢复原 app，不重置数据库。
 
-```sh
-git tag -a v1.0.2 -m "AgentRouter 1.0.2"
-git push --atomic origin HEAD refs/tags/v1.0.2
-```
-
-工作流检查版本和源码，构建两种 macOS 架构并合并更新描述，再构建上传 Windows 和 Linux 安装包。macOS 当前使用本地签名，未配置 Developer ID 或 Apple 公证。正式签名构建需提供证书和公证凭据，并验证完整升级流程。
+本机安装由当前机器执行，GitHub 托管 runner 无法替换用户的 /Applications。只要求 commit/push 的任务不自动发版或安装。
 
 ## 更新源
 

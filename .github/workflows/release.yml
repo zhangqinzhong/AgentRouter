@@ -36,6 +36,7 @@ jobs:
       - name: Validate source
         run: |
           npm run typecheck
+          npm run test:collector
           npm run test:core
           npm run test:ui
 
@@ -98,6 +99,11 @@ jobs:
             echo "Tag v$tag_version does not match package.json version $package_version"
             exit 1
           fi
+
+      - name: Validate native source
+        run: |
+          node build/check-native-parity.mjs
+          swift test --package-path native/AgentRouterTray
 
       - name: Build ad-hoc macOS artifacts
         run: |
