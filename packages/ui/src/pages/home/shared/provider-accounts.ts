@@ -19,6 +19,7 @@ export function providerAccountSnapshotKey(account: ProviderAccountSnapshot): st
 }
 
 export function providerAccountSnapshotLabel(account: ProviderAccountSnapshot): string {
+  if (account.localSource) return account.displayName || account.provider;
   const credential = providerAccountSnapshotCredentialLabel(account);
   return credential ? `${account.provider} / ${credential}` : account.provider;
 }

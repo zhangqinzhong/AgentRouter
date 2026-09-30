@@ -540,3 +540,8 @@ test("overview Today axis ends this hour while 24h retains yesterday's date", ()
   ], true);
   assert.deepEqual(rows.map(row=>[row.hour,row.total_tokens]), [["2026-09-29T10:00:00",100],["2026-09-30T10:00:00",200]]);
 });
+
+test('local subscription accounts show all four Cursor quotas without internal credential IDs', () => {
+  const html = renderOverview({providerAccounts:[{provider:'Cursor',localSource:'cursor',displayName:'Cursor Pro',credentialId:'local-subscription',source:'standard',status:'ok',updatedAt:'2026-09-30T00:00:00Z',meters:['Plan','Auto','API','Grok bot'].map((label,i)=>({id:String(i),label,kind:'quota',unit:'%',remaining:99,limit:100}))}]});
+  assert.match(html,/Cursor Pro/);assert.match(html,/Grok (机器人|bot)/);assert.doesNotMatch(html,/Cursor \/ local-subscription/);
+});

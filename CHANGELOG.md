@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.9.5 - 2026-09-30
+
+### Fixes
+- Include locally authenticated subscription quotas in overview account balances while retaining gateway balances and deduplicating the same Codex login.
+- Display Grok Bot separately from Cursor with its reported subscription name, including SuperGrok Heavy.
+- Refresh only the selected subscription account and retain saved quotas when refresh fails.
+
 ## 1.9.4 - 2026-09-30
 
 ### Fixes

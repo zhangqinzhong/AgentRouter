@@ -401,13 +401,21 @@ async function fetchCursorSandAccessStatus({ accessToken, timeoutMs, fetchImpl =
 }
 
 async function fetchCursorSandUsageStatus({ accessToken, timeoutMs, fetchImpl = fetch }) {
-  const body = await fetchCursorProtoRpc({
-    url: CURSOR_SAND_USAGE_URL,
-    accessToken,
-    timeoutMs,
-    fetchImpl,
+  // JSON exposes plan metadata without guessing undocumented protobuf field IDs.
+  const res = await fetchImpl(CURSOR_SAND_USAGE_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json",
+      "Connect-Protocol-Version": "1", "x-cursor-client-type": "sand",
+      "x-cursor-client-version": "0.1.0", "x-sand-box-namespace": "prod" },
+    body: "{}", redirect: "error", signal: AbortSignal.timeout(timeoutMs ?? 15000),
   });
-  return decodeCursorSandUsageStatus(body);
+  if (res.status !== 200) throw new Error(`Grok Bot API returned HTTP ${res.status}`);
+  const body = await res.json();
+  return {
+    ...body,
+    nextResetAt: body.nextResetTimestampUtc ?? body.nextResetAt,
+    grokPlanLabel: typeof body.grokPlanLabel === "string" ? body.grokPlanLabel.trim() || null : null,
+  };
 }
 
 function fetchUrlRaw({ urlStr, cookie, timeoutMs = 30000, fetchImpl = fetch }) {
