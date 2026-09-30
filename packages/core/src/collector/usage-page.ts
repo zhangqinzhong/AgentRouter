@@ -13,13 +13,6 @@ export type LocalUsageOverviewData = LocalUsagePageData & {
   collectionState?: "loading" | "ready" | "error";
   series: Array<Record<string,unknown>>;
 };
-export const LOCAL_OVERVIEW_SOURCE_KEYS = [
-  'acode','every-code','openclaw','lmstudio','cursor','antigravity',
-  'qoder','qoder-cn','claude-science','kiro','kiro-cli','hermes',
-  'kimi','kimi-code','codebuddy','workbuddy','omp','pi','prime-agent',
-  'craft','reasonix','kilocode','roocode','zed','unsloth','anythingllm',
-  'devin','goose','droid','dsh','copilot','mimo','zcode'
-] as const;
 export type LocalUsageTrendQuery = LocalUsageRange & {
   period: LocalUsagePeriod;
   day?: string;
@@ -57,12 +50,6 @@ function zone(tz?:string){
   const value=tz||Intl.DateTimeFormat().resolvedOptions().timeZone;
   new Intl.DateTimeFormat('en-US',{timeZone:value});
   return value;
-}
-function shiftMonth(day:string,delta:number){
-  const match=/^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
-  if(!match)return day;
-  const date=new Date(Date.UTC(Number(match[1]),Number(match[2])-1+delta,Number(match[3])));
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth()+1).padStart(2,'0')}-${String(date.getUTCDate()).padStart(2,'0')}`;
 }
 function listDays(from:string,to:string){
   const start=new Date(`${from}T00:00:00Z`);
@@ -122,15 +109,15 @@ export async function getLocalUsagePage(range:LocalUsageRange):Promise<LocalUsag
   return {totals:summary.totals,sources:models.sources,firstActivityDay:daily.data.find(row=>Number(row.total_tokens)>0)?.day};
 }
 
-export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalUsageOverviewPeriod):Promise<LocalUsageOverviewData>{
+export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalUsageOverviewPeriod, filter?:{source?:string;model?:string}):Promise<LocalUsageOverviewData>{
   if(!range || (range.from!==''&&!validDay(range.from)) || !validDay(range.to) || range.from>range.to)throw new Error('Invalid usage date range');
-  const query={from:range.from,to:range.to,tz:zone(range.tz)};
-  const overviewQuery={...query,background:'1',source:LOCAL_OVERVIEW_SOURCE_KEYS.join(",")};
+  const query={from:range.from,to:range.to,tz:zone(range.tz),...(range.since?{since:range.since}:{}),...filter};
+  const overviewQuery={...query,background:'1',};
   const [summary,models,series] = await Promise.all([
     queryLocalCollector('/functions/tokentracker-usage-summary',overviewQuery),
     queryLocalCollector('/functions/tokentracker-usage-model-breakdown',overviewQuery),
     period==='hour'
-      ? Promise.all(listDays(range.from,range.to).map((day)=>queryLocalCollector('/functions/tokentracker-usage-hourly',{day,tz:query.tz,background:'1',source:LOCAL_OVERVIEW_SOURCE_KEYS.join(",")}) as Promise<Record<string,unknown>>)).then((responses)=>({
+      ? Promise.all(listDays(range.from,range.to).map((day)=>queryLocalCollector('/functions/tokentracker-usage-hourly',{...overviewQuery,day}) as Promise<Record<string,unknown>>)).then((responses)=>({
           data:responses.flatMap((response)=>Array.isArray(response?.data)?response.data:[])
         }))
       : queryLocalCollector('/functions/tokentracker-usage-daily',overviewQuery)
@@ -147,40 +134,9 @@ export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalU
 // hour). Folding them onto the current day's clock hours would make the UI's
 // future-hour filter discard yesterday's tail, which is real in-window data.
 export async function getLocalUsageTrend(query:LocalUsageTrendQuery):Promise<Record<string,unknown>>{
-  if(!query||!['day','week','month','year','total','custom'].includes(query.period))throw new Error('Invalid usage trend period');
-  const tz=zone(query.tz);
-  // day/week/month/year are rolling windows ending at "now"; the window is
-  // derived here so the UI cannot drift from the Overview page's semantics.
-  const now=new Date();
-  const window=rollingWindow(query.period,tz,now);
-  if(query.period==='day'&&window){
-    const today=window.to;
-    const previous=window.from;
-    const responses=await Promise.all(
-      (previous===today?[today]:[previous,today]).map((day)=>queryLocalCollector('/functions/tokentracker-usage-hourly',{day,tz,since:window.since}) as Promise<Record<string,unknown>>)
-    );
-    const rows=responses
-      .flatMap((response)=>Array.isArray(response?.data)?response.data:[])
-      .sort((left,right)=>String(left.hour??'').localeCompare(String(right.hour??'')));
-    return {day:today,...rollingDayAxis(window.since,tz,now),data:rows};
-  }
-  if(query.period==='week'||query.period==='month'){
-    if(!window)throw new Error('Invalid usage trend period');
-    return queryLocalCollector('/functions/tokentracker-usage-daily',{from:window.from,to:window.to,tz,since:window.since}) as Promise<Record<string,unknown>>;
-  }
-  if(query.period==='year'){
-    if(!window)throw new Error('Invalid usage trend period');
-    return queryLocalCollector('/functions/tokentracker-usage-monthly',{from:window.from,to:window.to,tz,since:window.since}) as Promise<Record<string,unknown>>;
-  }
-  const to=query.to||'';
-  if(!validDay(to))throw new Error('Invalid usage date range');
-  if(query.period==='total'){
-    const months=Number.isFinite(query.months)&&Number(query.months)>0?Math.min(Math.floor(Number(query.months)),120):24;
-    const from=query.from&&validDay(query.from)?query.from:shiftMonth(to,-(months-1));
-    return queryLocalCollector('/functions/tokentracker-usage-monthly',{from,to,tz}) as Promise<Record<string,unknown>>;
-  }
-  if((query.from!==''&&!validDay(query.from))||query.from>to)throw new Error('Invalid usage date range');
-  return queryLocalCollector('/functions/tokentracker-usage-daily',{from:query.from,to,tz}) as Promise<Record<string,unknown>>;
+  return queryLocalCollector('/functions/tokentracker-usage-trend', {
+    period: query.period, tz: zone(query.tz), from: query.from || '', to: query.to || ''
+  }) as Promise<Record<string,unknown>>;
 }
 
 export async function getLocalUsageHeatmap(query:LocalUsageHeatmapQuery={}):Promise<Record<string,unknown>>{

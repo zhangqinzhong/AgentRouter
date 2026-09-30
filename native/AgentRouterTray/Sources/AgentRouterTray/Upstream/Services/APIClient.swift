@@ -43,12 +43,14 @@ actor APIClient {
         try await fetchSummaryWithSource(from: from, to: to).summary
 	}
 
-    func fetchSummaryWithSource(from: String, to: String) async throws -> UsageSummaryFetchResult {
+    func fetchSummaryWithSource(from: String, to: String, period: DateHelpers.Period? = nil) async throws -> UsageSummaryFetchResult {
         let result: AccountFetchResult<UsageSummaryResponse> = try await fetchWithSource(
-            "/functions/tokentracker-usage-summary",
+            period == nil ? "/functions/tokentracker-usage-summary" : "/functions/tokentracker-usage-trend",
             queryItems: withAccountQueryItems([
                 URLQueryItem(name: "from", value: from),
-                URLQueryItem(name: "to", value: to)
+                URLQueryItem(name: "to", value: to),
+                URLQueryItem(name: "period", value: period?.rawValue),
+                URLQueryItem(name: "view", value: period == nil ? nil : "summary")
             ])
         )
         let completedAt = result.completedAt
@@ -75,8 +77,10 @@ actor APIClient {
 		]))
 	}
 
-	func fetchModelBreakdown(from: String, to: String) async throws -> AccountFetchResult<ModelBreakdownResponse> {
-		try await fetchWithSource("/functions/tokentracker-usage-model-breakdown", queryItems: withAccountQueryItems([
+	func fetchModelBreakdown(from: String, to: String, period: DateHelpers.Period? = nil) async throws -> AccountFetchResult<ModelBreakdownResponse> {
+		try await fetchWithSource(period == nil ? "/functions/tokentracker-usage-model-breakdown" : "/functions/tokentracker-usage-trend", queryItems: withAccountQueryItems([
+            URLQueryItem(name: "period", value: period?.rawValue),
+            URLQueryItem(name: "view", value: period == nil ? nil : "models"),
 			URLQueryItem(name: "from", value: from),
 			URLQueryItem(name: "to", value: to)
 		]))
@@ -102,6 +106,12 @@ actor APIClient {
 			URLQueryItem(name: "day", value: day)
 		]))
 	}
+
+    func fetchTrend<T: Decodable>(period: DateHelpers.Period) async throws -> AccountFetchResult<T> {
+        try await fetchWithSource("/functions/tokentracker-usage-trend", queryItems: withAccountQueryItems([
+            URLQueryItem(name: "period", value: period.rawValue)
+        ]))
+    }
 
     /// `devinEnabled` is the user's Settings provider selection. Only when it is
     /// true does the request carry `devin=1` plus the local-auth header that

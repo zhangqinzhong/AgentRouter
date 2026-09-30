@@ -47,6 +47,7 @@ class DashboardViewModel: ObservableObject {
     @Published var daily: [DailyEntry] = []
     @Published var monthly: [MonthlyEntry] = []
     @Published var hourly: [HourlyEntry] = []
+    @Published var trendDaily: [DailyEntry] = []
     @Published var heatmap: HeatmapResponse?
     @Published var modelBreakdown: ModelBreakdownResponse?
     @Published var projectUsage: ProjectUsageResponse?
@@ -187,6 +188,7 @@ class DashboardViewModel: ObservableObject {
         // Keep every date-scoped query and the resulting widget snapshot on one
         // calendar-day reference even when the refresh crosses local midnight.
         let capturedAt = Date()
+        let selectedPeriod = period
         let range = DateHelpers.rangeForPeriod(period, referenceDate: capturedAt)
         let rollingRange = DateHelpers.dayRange(daysBack: 30, endingAt: capturedAt)
         let rollingFrom = rollingRange.from
@@ -227,7 +229,8 @@ class DashboardViewModel: ObservableObject {
                 do {
                     let result = try await APIClient.shared.fetchSummaryWithSource(
                         from: range.from,
-                        to: range.to
+                        to: range.to,
+                        period: selectedPeriod
                     )
                     if self.shouldPublish(
                         result.accountSource,
@@ -271,7 +274,8 @@ class DashboardViewModel: ObservableObject {
                 do {
                     let result = try await APIClient.shared.fetchSummaryWithSource(
                         from: totalRange.from,
-                        to: totalRange.to
+                        to: totalRange.to,
+                        period: .total
                     )
                     guard self.shouldPublish(
                         result.accountSource,
@@ -310,35 +314,19 @@ class DashboardViewModel: ObservableObject {
             }
             group.addTask { @MainActor in
                 do {
-                    if self.period == .day {
-                        let result = try await APIClient.shared.fetchHourly(day: rollingTo)
-                        if self.shouldPublish(
-                            result.source,
-                            for: .hourly,
-                            scope: AccountViewStateStore.Scope.day(rollingTo),
-                            hasExistingValue: !self.hourly.isEmpty
-                        ) {
-                            self.hourly = result.value.data
-                        }
-                        self.monthly = []
-                        self.accountViewState.clear(.monthly)
-                    } else if self.period == .total {
-                        let result = try await APIClient.shared.fetchMonthly(from: range.from, to: range.to)
-                        if self.shouldPublish(
-                            result.source,
-                            for: .monthly,
-                            scope: AccountViewStateStore.Scope.range(range.from, range.to),
-                            hasExistingValue: !self.monthly.isEmpty
-                        ) {
-                            self.monthly = result.value.data
-                        }
-                        self.hourly = []
-                        self.accountViewState.clear(.hourly)
-                    } else {
-                        self.hourly = []
-                        self.monthly = []
-                        self.accountViewState.clear(.hourly)
-                        self.accountViewState.clear(.monthly)
+                    switch selectedPeriod {
+                    case .day:
+                        let result: AccountFetchResult<HourlyUsageResponse> = try await APIClient.shared.fetchTrend(period: selectedPeriod)
+                        guard self.period == selectedPeriod else { return }
+                        self.hourly = result.value.data
+                    case .week, .month:
+                        let result: AccountFetchResult<DailyUsageResponse> = try await APIClient.shared.fetchTrend(period: selectedPeriod)
+                        guard self.period == selectedPeriod else { return }
+                        self.trendDaily = result.value.data
+                    case .total:
+                        let result: AccountFetchResult<MonthlyUsageResponse> = try await APIClient.shared.fetchTrend(period: selectedPeriod)
+                        guard self.period == selectedPeriod else { return }
+                        self.monthly = result.value.data
                     }
                 } catch {
                     errorCount += 1
@@ -365,7 +353,7 @@ class DashboardViewModel: ObservableObject {
             // Model breakdown (for selected period)
             group.addTask { @MainActor in
                 do {
-                    let result = try await APIClient.shared.fetchModelBreakdown(from: range.from, to: range.to)
+                    let result = try await APIClient.shared.fetchModelBreakdown(from: range.from, to: range.to, period: selectedPeriod)
                     if self.shouldPublish(
                         result.source,
                         for: .modelBreakdown,
@@ -665,7 +653,8 @@ class DashboardViewModel: ObservableObject {
                         let range = DateHelpers.rangeForPeriod(.total)
                         let result = try await APIClient.shared.fetchSummaryWithSource(
                             from: range.from,
-                            to: range.to
+                            to: range.to,
+                            period: .total
                         )
                         if self.shouldPublish(
                             result.accountSource,

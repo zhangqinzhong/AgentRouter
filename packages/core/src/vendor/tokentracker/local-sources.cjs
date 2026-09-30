@@ -49,7 +49,7 @@ async function parseQoderSource({home,env,cursors,queuePath,projectQueuePath,sou
  }
  return result;
 }
-async function collectAdditionalSources({home,cursors,queuePath,projectQueuePath,fetchImpl=fetch}){
+async function collectAdditionalSources({home,cursors,queuePath,projectQueuePath,fetchImpl=fetch,includeCursor=true}){
  const native=home===require('node:os').homedir();
  const env={...(native?process.env:{}),HOME:home,USERPROFILE:home};
  env.TOKENTRACKER_GROK_HOME=env.TOKENTRACKER_GROK_HOME||env.GROK_HOME||path.join(home,'.grok');
@@ -66,7 +66,7 @@ async function collectAdditionalSources({home,cursors,queuePath,projectQueuePath
  for(const[source,dbPath,reader,cursorKey]of databases)if(dbPath&&fs.existsSync(dbPath))await run(source,()=>rollout.parseOpencodeDbIncremental({...common,dbMessages:rollout[reader](dbPath),dbPath,source,cursorKey}));
  // Older OpenCode versions used individual message files instead of SQLite.
  if(!fs.existsSync(databases[0][1]))await run('opencode',async()=>rollout.parseOpencodeIncremental({...common,messageFiles:await rollout.listOpencodeMessageFiles(path.join(data,'opencode/storage')),source:'opencode'}));
- await runOptional(results,'cursor',async()=>{
+ if(includeCursor) await runOptional(results,'cursor',async()=>{
   if(!cursor.isCursorInstalled({home,env}))return{};
   const auth=cursor.extractCursorSessionToken({home,env});
   if(!auth?.cookie)return{};

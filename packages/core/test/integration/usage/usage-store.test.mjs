@@ -190,9 +190,9 @@ test("overview merges local MiMo and ZCode usage without inventing gateway reque
     }
   }, {});
 
-  assert.equal(merged.totals.totalTokens, 185);
-  assert.equal(merged.totals.costUsd, 4);
-  assert.equal(merged.totals.requestCount, 4);
+  assert.equal(merged.totals.totalTokens, 170);
+  assert.equal(merged.totals.costUsd, 3);
+  assert.equal(merged.totals.requestCount, 3);
   assert.equal(merged.totals.errorCount, 0);
   assert.deepEqual(
     merged.models.filter((row) => row.provider === "MiMo" || row.provider === "ZCode").map((row) => row.model),
@@ -206,7 +206,7 @@ test("overview merges local MiMo and ZCode usage without inventing gateway reque
     merged.clientModels.filter((row) => row.provider === "MiMo" || row.provider === "ZCode").map((row) => [row.client, row.requestCount]),
     [["MiMo", 2], ["ZCode", 1]]
   );
-  assert.equal(merged.series[0].totalTokens, 185);
+  assert.equal(merged.series[0].totalTokens, 170);
 });
 
 test("UsageStore all range covers history older than 30 days with an all-time series", async () => {
@@ -344,7 +344,7 @@ test("overview merge keeps local series days that predate the gateway template",
 
   assert.deepEqual(merged.series.map((point) => point.bucket), ["2026-04-01", "2026-09-19"]);
   assert.equal(merged.series[0].totalTokens, 12);
-  assert.equal(merged.series[1].totalTokens, 21);
+  assert.equal(merged.series[1].totalTokens, 6);
 });
 
 test("UsageStore aggregates stats in SQLite without loading all events", async () => {
@@ -1303,4 +1303,24 @@ test("UsageStore merges credential-suffixed provider keys in the status series",
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
+});
+
+test('overview uses all local sources once and preserves gateway health separately', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'ar-overview-local-'));
+  try {
+    const store = new UsageStore(path.join(dir, 'usage.sqlite'));
+    await store.record({client:'Codex',provider:'company',model:'model-a',method:'POST',path:'/v1/responses',statusCode:200,usage:{totalTokens:999,inputTokens:999,outputTokens:0},durationMs:10});
+    await store.record({client:'Codex',provider:'company',model:'model-a',method:'POST',path:'/v1/responses',statusCode:500,usage:{totalTokens:0,inputTokens:0,outputTokens:0},durationMs:10});
+    const gateway = await store.getStats('today');
+    const sources = ['codex','claude','zcode','future-tool'].map(source => ({source,models:[{model:'model-a',totals:{total_tokens:100,conversation_count:1}}]}));
+    const result = mergeLocalOverviewSnapshot(gateway,{totals:{total_tokens:400},sources,series:[]},{});
+    assert.equal(result.totals.totalTokens,400);
+    assert.equal(result.models.length,4);
+    assert.equal(result.gatewayTotals.totalTokens,999);
+    assert.equal(result.gatewayTotals.errorCount,1);
+    const empty = mergeLocalOverviewSnapshot(gateway,{totals:{},sources:[],series:[]},{});
+    assert.equal(empty.totals.totalTokens,0);
+    assert.equal(empty.models.length,0);
+    assert.equal(empty.series.reduce((n,row)=>n+row.totalTokens,0),0);
+  } finally {rmSync(dir,{recursive:true,force:true});}
 });

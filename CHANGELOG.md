@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.9.4 - 2026-09-30
+
+### Fixes
+- Use local session collection consistently for overview usage, including Codex and Claude sessions outside the gateway.
+- Recover missing Codex compaction usage without counting repeated response records twice.
+- Share rolling day/week/month/all-time trend queries between the window and native menu, preserving cross-midnight points and full history.
+- Distinguish calendar-today and rolling-24-hour overview chart axes.
+
+### Maintenance
+- Validate source and native macOS code in pull requests before release; publish tags and packages from the merged release request.
+
 ## 1.9.3 - 2026-09-30
 
 ### Fixes

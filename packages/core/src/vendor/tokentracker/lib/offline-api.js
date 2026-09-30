@@ -508,7 +508,7 @@ function scopedQueueRows(queuePath, url) {
   return {
     scope,
     allRows,
-    rows: rowsSince(filterRowsByUsageScope(sourceRows, scope), url),
+    rows: rowsSince(filterRowsByUsageScope(sourceRows, scope).filter(row => !url.searchParams.get("model") || row.model === url.searchParams.get("model")), url),
     excludedSources: listExcludedSources(allRows, scope),
   };
 }
@@ -1320,7 +1320,11 @@ if (p === "/functions/tokentracker-usage-hourly") {
       const day = url.searchParams.get("day") || new Date().toISOString().slice(0, 10);
       const timeZoneContext = getTimeZoneContext(url);
       const { rows, scope, excludedSources } = scopedQueueRows(qp, url);
-      const data = aggregateHourlyByDay(rows, day, timeZoneContext);
+      // A since-only query spans calendar days (native rolling 24h chart).
+      const days = !url.searchParams.get("day") && url.searchParams.get("since")
+        ? [...new Set(rows.map(row => rowDayKey(row, timeZoneContext)).filter(Boolean))].sort()
+        : [day];
+      const data = days.flatMap(key => aggregateHourlyByDay(rows, key, timeZoneContext));
       json(res, { day, scope, excluded_sources: excludedSources, data });
       return true;
     }

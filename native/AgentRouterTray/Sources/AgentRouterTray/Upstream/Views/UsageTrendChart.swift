@@ -40,9 +40,7 @@ struct UsageTrendChart: View {
 	}()
 
 	private var dailyChartData: [(date: Date, tokens: Int)] {
-		let range = DateHelpers.rangeForPeriod(period)
 		return daily
-			.filter { $0.day >= range.from && $0.day <= range.to }
 			.compactMap { entry in
 				guard let date = DateHelpers.parseDay(entry.day) else { return nil }
 				return (date: date, tokens: entry.totalTokens)
@@ -59,23 +57,11 @@ struct UsageTrendChart: View {
 	}
 
 	private var hourlyChartData: [(date: Date, tokens: Int)] {
-		let calendar = Calendar.current
-		let currentHour = calendar.dateInterval(of: .hour, for: Date())?.start ?? Date()
-
-		let grouped = Dictionary(grouping: hourly.compactMap { entry -> (date: Date, tokens: Int)? in
-			guard let date = Self.parseHourlyDate(entry.hour),
-				  let hourStart = calendar.dateInterval(of: .hour, for: date)?.start else {
-				return nil
-			}
-			return (date: hourStart, tokens: entry.totalTokens)
-		}, by: \.date)
-		.map { hourStart, entries in
-			(date: hourStart, tokens: entries.reduce(0) { $0 + $1.tokens })
-		}
-		.sorted { $0.date < $1.date }
-
-		return grouped.filter { $0.date <= currentHour }
-	}
+        hourly.compactMap { entry in
+            guard let date = Self.parseHourlyDate(entry.hour) else { return nil }
+            return (date: date, tokens: entry.totalTokens)
+        }.sorted { $0.date < $1.date }
+    }
 
 	private static func parseHourlyDate(_ raw: String) -> Date? {
 		if let date = isoFormatterWithFractionalSeconds.date(from: raw) {

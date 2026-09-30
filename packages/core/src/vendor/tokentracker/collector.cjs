@@ -14,7 +14,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
   const queuePath = path.join(dataDir, 'queue.jsonl');
   const projectQueuePath = path.join(dataDir, 'project.queue.jsonl');
   const cursorsPath = path.join(dataDir, 'cursors.json');
-  let inFlight, lastSync = 0, pricingReady;
+  let inFlight, lastSync = 0, pricingReady, lastRemoteSync = 0;
   let backgroundRefresh, lastBackgroundAttempt = 0, backgroundFailed = false;
   function pricing() {
     if (!pricingReady) pricingReady=(async()=>{
@@ -30,7 +30,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
   }
   async function sync(force = false) {
     if (inFlight) return inFlight;
-    if (!force && Date.now() - lastSync < 60000) return;
+    if (!force && Date.now() - lastSync < 10000) return;
     inFlight = (async () => {
       await fs.mkdir(dataDir, {recursive:true,mode:0o700});
       let cursors;
@@ -54,7 +54,9 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
       await require('./rebuild-codex.cjs').rebuildCodex({dataDir,cursors,files:codexFiles});
       await rollout.parseRolloutIncremental({rolloutFiles:codexFiles,cursors,queuePath,projectQueuePath,source:'codex'});
       await rollout.parseClaudeIncremental({projectFiles:claudeFiles,cursors,queuePath,projectQueuePath,source:'claude'});
-      const additional=await collectAdditionalSources({home,cursors,queuePath,projectQueuePath,fetchImpl});
+      const includeCursor = force || Date.now() - lastRemoteSync >= 60000;
+      if (includeCursor) lastRemoteSync = Date.now();
+      const additional=await collectAdditionalSources({home,cursors,queuePath,projectQueuePath,fetchImpl,includeCursor});
       // Complete queue snapshots are appended by upstream parsers. Compact latest
       // snapshots after each successful scan so this store cannot grow per poll.
       for (const file of [queuePath,projectQueuePath]) await compactQueue(file);
@@ -66,7 +68,8 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
     })().finally(()=>{inFlight=undefined});
     return inFlight;
   }
-  async function query(endpoint, query = {}) {
+  async function queryEndpoint(endpoint, query = {}) {
+    if(endpoint.endsWith('usage-trend')) return require('./trend.cjs').queryTrend(query,(path,params)=>queryEndpoint(path,params));
     if(endpoint.endsWith('usage-category-breakdown')) {
       const {getCategoryBreakdown}=require('./context.cjs');
       return getCategoryBreakdown({home,...query});
@@ -90,7 +93,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
     // price refresh must never hold its initial response hostage.
     if (query.background === '1') {
       const data = await queryOffline(queuePath,endpoint,query);
-      if (!backgroundRefresh && Date.now() - lastBackgroundAttempt >= 60000) {
+      if (!backgroundRefresh && Date.now() - lastBackgroundAttempt >= 10000) {
         lastBackgroundAttempt = Date.now();
         backgroundFailed = false;
         backgroundRefresh = new Promise(resolve => setImmediate(resolve))
@@ -103,7 +106,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
     await Promise.all([sync(),pricing()]);
     return queryOffline(queuePath,endpoint,query);
   }
-  return {sync,query};
+  return {sync,query:queryEndpoint};
 }
 async function compactQueue(file) {
   let raw;try{raw=await fs.readFile(file,'utf8')}catch(e){if(e.code==='ENOENT')return;throw e}

@@ -30,6 +30,15 @@ const {
   currentCodexModel,
   snapshotCodexModelAttributionState,
 } = require("./codex-model-attribution");
+const {
+  createUsageRecordState,
+  extractTokenUsageRecord,
+  noteLineAfterUsageRecord,
+  noteTokenCount,
+  noteUsageRecord,
+  snapshotUsageRecordState,
+  takeCompactionOnTokenCount,
+} = require("./codex-usage-record");
 
 const DISCOVERY_FULL_AUDIT_INTERVAL_MS = 60 * 1000;
 const MAX_DISCOVERY_INVENTORIES = 32;
@@ -638,9 +647,36 @@ async function parseCodexRolloutFile(filePath, {
 
   let turnCount = 0;
 
-  function recordModelUsage(delta, rawRequestUsage) {
+  // Compaction records (issue #652, rules in codex-usage-record.js). A resume
+  // state from before #652 with prevTotals has seen a token_count.
+  const usageRecordState = createUsageRecordState(
+    isResuming
+      ? resumeState.usageRecordState || (resumeState.prevTotals ? { sawTokenCount: true } : null)
+      : null,
+  );
+  // Compactions counted in this session, by response_id: the files merged for
+  // a session can repeat a record (an archived copy, a split fragment), and a
+  // resumed parse must not count one from an earlier chunk again.
+  const compactionResponseIds = new Set(
+    isResuming && Array.isArray(resumeState.compactionResponseIds)
+      ? resumeState.compactionResponseIds
+      : [],
+  );
+
+  // Attribution as of now. A compaction record is counted later than it is
+  // read, so it carries the attribution captured when it was read.
+  function currentUsageAttribution() {
+    return {
+      model: currentCodexModel(modelAttributionState) || "unknown",
+      selectedModel: modelAttributionState.selectedModel || null,
+      rerouted: Boolean(modelAttributionState.rerouted),
+      rerouteReason: modelAttributionState.rerouteReason || null,
+    };
+  }
+
+  function recordModelUsage(delta, rawRequestUsage, attribution = currentUsageAttribution()) {
     if (!collectModelUsage || !delta || delta.total_tokens <= 0) return;
-    const effectiveModel = currentCodexModel(modelAttributionState) || "unknown";
+    const effectiveModel = attribution.model;
     let row = byModel.get(effectiveModel);
     if (!row) {
       row = {
@@ -661,13 +697,13 @@ async function parseCodexRolloutFile(filePath, {
     }
     addInto(row, delta);
     row.usage_events += 1;
-    if (modelAttributionState.selectedModel) {
-      row.selected_models.add(modelAttributionState.selectedModel);
+    if (attribution.selectedModel) {
+      row.selected_models.add(attribution.selectedModel);
     }
-    if (modelAttributionState.rerouted) {
+    if (attribution.rerouted) {
       row.rerouted_usage_events += 1;
-      if (modelAttributionState.rerouteReason) {
-        row.reroute_reasons.add(modelAttributionState.rerouteReason);
+      if (attribution.rerouteReason) {
+        row.reroute_reasons.add(attribution.rerouteReason);
       }
     }
     // OpenAI applies the long-context tier to the whole request when its raw
@@ -846,6 +882,14 @@ async function parseCodexRolloutFile(filePath, {
     pendingExecDetails = [];
   }
 
+  function countCompactionRecord(record) {
+    if (compactionResponseIds.has(record.responseId)) return;
+    compactionResponseIds.add(record.responseId);
+    if (!record.inRequestedRange) return;
+    recordModelUsage(record.delta, record.rawUsage, record.attribution);
+    attributeTurn(record.delta);
+  }
+
   function usageEventSignature(lastUsage, totalUsage) {
     return JSON.stringify({ lastUsage, totalUsage });
   }
@@ -913,6 +957,8 @@ async function parseCodexRolloutFile(filePath, {
     // turn_context.payload.model itself would make codex-model-attribution.js
     // one of two authorities on the same question.
     if (typeof onObject === "function") onObject(obj, attributedModel);
+    const usageRecord = extractTokenUsageRecord(obj);
+    if (!usageRecord) noteLineAfterUsageRecord(usageRecordState, obj?.type === "compacted");
     const ts = typeof obj?.timestamp === "string" ? obj.timestamp : null;
     if (!ts) continue;
     const inRequestedRange = isTimestampInRequestedDayRange(ts, { from, to, timeZoneContext });
@@ -958,13 +1004,42 @@ async function parseCodexRolloutFile(filePath, {
       continue;
     }
 
+    if (usageRecord) {
+      const delta = normalizeUsage(usageRecord.usage);
+      noteUsageRecord(
+        usageRecordState,
+        // Without a response_id a compaction cannot be deduplicated.
+        delta.total_tokens > 0 && usageRecord.responseId
+          ? {
+              responseId: usageRecord.responseId,
+              timestamp: usageRecord.timestamp,
+              inRequestedRange,
+              rawUsage: usageRecord.usage,
+              delta,
+              attribution: currentUsageAttribution(),
+            }
+          : null,
+      );
+      continue;
+    }
+
     const tokenCount = extractTokenCount(obj);
     if (tokenCount) {
       const info = tokenCount.info;
       const lastUsage = info?.last_token_usage;
       const totalUsage = info?.total_token_usage;
+      let compaction = null;
+      if (info && typeof info === "object") {
+        noteTokenCount(usageRecordState);
+        compaction = takeCompactionOnTokenCount(
+          usageRecordState,
+          usageDeltaState.lastTotal,
+          totalUsage,
+        );
+      }
       const rawDelta = consumeUsageDelta(usageDeltaState, lastUsage, totalUsage);
       const delta = rawDelta ? normalizeUsage(rawDelta) : null;
+      if (compaction) countCompactionRecord(compaction);
       const isNewResumeEvent = noteTokenEvent(ts, lastUsage, totalUsage);
       if (inRequestedRange) {
         const eventSessionId = sessionId || rolloutSessionIdFromPath(primaryFilePath) || primaryFilePath;
@@ -1036,6 +1111,8 @@ async function parseCodexRolloutFile(filePath, {
       pendingExecDetails,
       lastTokenTimestamp,
       lastTimestampEventSignatures: Array.from(materializeLastTimestampSignatures()),
+      usageRecordState: snapshotUsageRecordState(usageRecordState),
+      compactionResponseIds: Array.from(compactionResponseIds),
     };
     result.endOffset = readProgress.endOffset;
     result.appendable = Boolean(contentHasher) && (

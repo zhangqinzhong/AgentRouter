@@ -77,25 +77,12 @@ function overviewStatCells(totals: UsageTotals, translate: (value: string) => st
     { label: translate("Requests"), value: formatCompactNumber(totals.requestCount) },
     { label: translate("Total tokens"), title: totals.totalTokens.toLocaleString(), value: formatCompactNumber(totals.totalTokens) },
     { label: translate("Estimated cost"), value: formatUsdCost(totals.costUsd) },
-    {
-      label: translate("Request success rate"),
-      sub: totals.errorCount > 0 ? `${formatCompactNumber(totals.errorCount)} ${translate("Errors")}` : undefined,
-      value: totals.requestCount > 0 ? formatPercent(totals.successRate) : "—"
-    }
+    { label: translate("Cache ratio"), value: totals.totalTokens > 0 ? formatPercent(totals.cacheRatio) : "—" }
   ];
 }
 
-const localOverviewProviderNames = new Set([
-  "AStudio", "Every Code", "OpenClaw", "LM Studio", "Cursor", "Antigravity",
-  "Qoder", "Qoder CN", "Claude Science", "Kiro", "Kiro CLI", "Hermes",
-  "Kimi", "Kimi Code", "CodeBuddy", "WorkBuddy", "oh-my-pi", "pi",
-  "Prime Agent", "Craft", "Reasonix", "Kilo Code", "Roo Code", "Zed",
-  "Unsloth", "AnythingLLM", "Devin", "Goose", "Droid", "DeepSeek Harness",
-  "GitHub Copilot", "MiMo", "ZCode"
-]);
-
 function isLocalOverviewRow(row: UsageComparisonRow): boolean {
-  return Boolean(row.provider && localOverviewProviderNames.has(row.provider));
+  return row.key.startsWith("local:") || row.key.startsWith("local-");
 }
 
 function overviewProviderFilterOptions(
@@ -121,7 +108,7 @@ function overviewProviderFilterOptions(
   return [
     { label: translate("All providers"), value: "" },
     ...Array.from(providerNames).map((provider) => ({
-      label: localOverviewProviderNames.has(provider) ? `${provider} (local)` : provider,
+      label: provider,
       value: provider
     }))
   ];
@@ -310,11 +297,11 @@ export function OverviewView({
           value={modelFilter}
         />
         <Button
-          aria-label={t("Reset statistics")}
+          aria-label={t("Reset gateway statistics")}
           className="ml-auto text-muted-foreground hover:bg-muted/60 hover:text-destructive"
           onClick={openResetDialog}
           size="iconSm"
-          title={t("Reset statistics")}
+          title={t("Reset gateway statistics")}
           type="button"
           variant="ghost"
         >
@@ -329,12 +316,6 @@ export function OverviewView({
           </div>
         ))}
       </div>
-      {usageStats.totals.requestCount > 0 ? (
-        <p className="mb-8 border-l-2 border-emerald-500 pl-3 text-[13px] leading-relaxed text-muted-foreground">
-          {formatCompactNumber(usageStats.totals.requestCount)} {t("Requests")} · {formatPercent(usageStats.totals.successRate)} {t("Request success rate")} · {formatCompactNumber(usageStats.totals.errorCount)} {t("Errors")}
-        </p>
-      ) : null}
-
       <div className="space-y-10">
         <SystemStatusStrip usageStats={displayUsageStats} />
         <UsageTrendSection usageRange={usageRange} usageStats={usageStats} />
@@ -384,7 +365,7 @@ export function OverviewStatisticsResetDialog({
       <DialogContent className="max-w-[520px]">
         <DialogHeader>
           <div className="min-w-0">
-            <DialogTitle>{t("Reset overview statistics")}</DialogTitle>
+            <DialogTitle>{t("Reset gateway statistics")}</DialogTitle>
           </div>
           <Button aria-label={t("Close dialog")} disabled={busy} onClick={onClose} size="iconSm" title={t("Close")} type="button" variant="ghost">
             <X className="h-4 w-4" />
@@ -395,11 +376,11 @@ export function OverviewStatisticsResetDialog({
           <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
             <div className="flex items-start gap-2 text-[12px] font-medium text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>{t("Reset Overview statistics?")}</span>
+              <span>{t("Reset gateway statistics?")}</span>
             </div>
             <div className="mt-2 space-y-1 text-[11px] text-muted-foreground">
-              <div>{t("Overview statistics data will be deleted and cannot be recovered.")}</div>
-              <div>{t("This clears the usage events used by the Overview page. Request logs and configuration are not deleted.")}</div>
+              <div>{t("Gateway statistics data will be deleted and cannot be recovered.")}</div>
+              <div>{t("This clears gateway statistics. Local usage, session files, request logs and configuration are not deleted.")}</div>
             </div>
           </div>
           {error ? <div className="mt-3 rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">{error}</div> : null}

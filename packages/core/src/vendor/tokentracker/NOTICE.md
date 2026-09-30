@@ -23,3 +23,13 @@ dates are read as manually maintained data. Session analytics sidecars stay unde
 `context.cjs` hosts Claude, Codex and Grok breakdowns. Claude and Codex include
 managed profile roots; Claude ranges use the selected time zone. Categorizer
 cache files stay under AgentRouter with private permissions and a 16-file bound.
+
+Codex compaction accounting is additionally backported from upstream commit
+`39b4a915` (token_usage_record, rollout and session parsers), with its regression
+tests. AgentRouter retains its model-attribution rules; priority-tier pricing is
+not part of this backport. Collector schema 4 rebuilds Codex aggregates and
+preserves response-ID deduplication; session sidecar schema 15 invalidates old
+cached summaries. Unlike upstream's dated cold-scan inventory, this coordinator
+lists all managed/default rollout files on each scan, including older sessions.
+Overview usage now reads the same local source scope as the usage page; gateway
+metrics remain separate internally for system status and request diagnostics.

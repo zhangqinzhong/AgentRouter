@@ -2242,6 +2242,7 @@ export type UsageComparisonRow = UsageTotals & {
 };
 
 export type UsageStatsSnapshot = {
+  gatewayTotals?: UsageTotals;
   localCollectionState?: "loading" | "ready" | "error";
   clientModels: UsageComparisonRow[];
   generatedAt: string;
