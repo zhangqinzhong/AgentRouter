@@ -1,3 +1,4 @@
+import { collectorFetchOptions } from "./fetch-options";
 import { parentPort } from "node:worker_threads";
 import { createRequire } from "node:module";
 const {createCollector} = createRequire(__filename)("./tokentracker/collector.cjs");
@@ -12,8 +13,11 @@ const fetchFromHost:typeof fetch=async(input,init={})=>new Promise<Response>((re
   init.signal?.addEventListener("abort",abort,{once:true});
   const cleanup=()=>init.signal?.removeEventListener("abort",abort);
   fetches.set(id,{resolve,reject,cleanup});
-  const {signal:_,...options}=init;
-  parentPort?.postMessage({fetchId:id,url:String(input),init:{...options,headers:Object.fromEntries(new Headers(init.headers))}});
+  try {
+    parentPort?.postMessage({fetchId:id,url:String(input),init:collectorFetchOptions(init)});
+  } catch (error) {
+    fetches.delete(id);cleanup();reject(error instanceof Error ? error : new Error("Provider request could not be transferred"));
+  }
 });
 const collector = createCollector({fetchImpl:fetchFromHost});
 parentPort?.on("message", async (message) => {

@@ -545,3 +545,17 @@ test('local subscription accounts show all four Cursor quotas without internal c
   const html = renderOverview({providerAccounts:[{provider:'Cursor',localSource:'cursor',displayName:'Cursor Pro',credentialId:'local-subscription',source:'standard',status:'ok',updatedAt:'2026-09-30T00:00:00Z',meters:['Plan','Auto','API','Grok bot'].map((label,i)=>({id:String(i),label,kind:'quota',unit:'%',remaining:99,limit:100}))}]});
   assert.match(html,/Cursor Pro/);assert.match(html,/Grok (机器人|bot)/);assert.doesNotMatch(html,/Cursor \/ local-subscription/);
 });
+
+
+test('overview omits failed local logins without quota, but retains saved quota and configured-provider errors', () => {
+  const base = {credentialId:'local-subscription',source:'standard',status:'error',updatedAt:'2026-09-30T00:00:00Z',meters:[]};
+  const html = renderOverview({providerAccounts:[
+    {...base,provider:'Claude Code',localSource:'claude',message:'Claude token expired'},
+    {...base,provider:'Antigravity',localSource:'antigravity',message:'Cannot clone object of unsupported type.'},
+    {...base,provider:'Grok Bot',localSource:'grokbot',message:'Showing saved quota.',meters:[{id:'weekly',label:'Weekly',kind:'quota',unit:'%',remaining:95,limit:100}]},
+    {...base,provider:'Configured provider',message:'Provider request failed'},
+  ]});
+  assert.doesNotMatch(html,/Claude Code|Claude token expired|Antigravity|Cannot clone/);
+  assert.match(html,/Grok Bot/);
+  assert.match(html,/Configured provider/);
+});
