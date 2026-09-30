@@ -38,7 +38,7 @@ struct DashboardView: View {
                                 showsTransientLocalData: viewModel.activityShowsTransientLocalData
                             )
                             UsageTrendChartWrapper(
-                                daily: viewModel.daily,
+                                daily: viewModel.trendDaily,
                                 monthly: viewModel.monthly,
                                 hourly: viewModel.hourly,
                                 period: $viewModel.period,

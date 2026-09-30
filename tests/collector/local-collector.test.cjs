@@ -117,3 +117,17 @@ test('failed background scan retains saved data and stops the loading state',asy
   assert.equal(result.collectionState,'error');assert.equal(result.totals.total_tokens,0);
  }finally{await fs.rm(home,{recursive:true,force:true})}
 });
+
+test('native rolling hourly query spans midnight without folding clock hours',async()=>{
+ const {queryOffline}=require('../../packages/core/src/vendor/tokentracker/lib/offline-api');
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'ar-tray-hours-'));
+ try {
+  const qp=path.join(dir,'queue.jsonl');
+  const rows=['2026-09-29T01:00:00Z','2026-09-29T02:00:00Z','2026-09-30T02:00:00Z'].map((hour_start,i)=>({source:'claude',model:'fixture',hour_start,input_tokens:(i+1)*100,total_tokens:(i+1)*100}));
+  await fs.writeFile(qp,rows.map(JSON.stringify).join('\n')+'\n');
+  const r=await queryOffline(qp,'/functions/tokentracker-usage-hourly',{since:'2026-09-29T02:35:00Z',tz:'Asia/Shanghai'});
+  assert.deepEqual(r.data.map(x=>[x.hour,x.total_tokens]),[['2026-09-29T10:00:00',200],['2026-09-30T10:00:00',300]]);
+  const today=await queryOffline(qp,'/functions/tokentracker-usage-hourly',{day:'2026-09-30',tz:'Asia/Shanghai'});
+  assert.deepEqual(today.data.map(x=>x.total_tokens),[300]);
+ } finally {await fs.rm(dir,{recursive:true,force:true})}
+});

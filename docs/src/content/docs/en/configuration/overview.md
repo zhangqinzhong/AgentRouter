@@ -39,7 +39,7 @@ Below the range tabs are two filters: `Provider` lists only enabled gateway prov
 
 ## Time range semantics
 
-The overview (gateway-captured usage) and the Usage / Trend pages (local session collection) are two independent data sources whose totals are never added together, but they share one set of time-range semantics: **rolling windows**.
+Overview usage, cost, trends and breakdowns share the local collector with the Usage / Trend pages, including Codex, Claude and ZCode. Gateway usage is not added to those totals. System status, success rates and errors still use gateway records; account balances use provider APIs. Time ranges include today and **rolling windows**.
 
 | Period | Window |
 | --- | --- |

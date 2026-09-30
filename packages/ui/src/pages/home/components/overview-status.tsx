@@ -148,7 +148,7 @@ export function SystemStatusStrip({ usageStats }: { usageStats: UsageStatsSnapsh
   const overallTotals = useMemo(() => {
     const requestCount = (usageStats.providerSeries ?? []).reduce((sum, row) => sum + row.totals.requestCount, 0);
     if (requestCount === 0) {
-      return usageStats.totals;
+      return usageStats.gatewayTotals ?? usageStats.totals;
     }
     const errorCount = (usageStats.providerSeries ?? []).reduce((sum, row) => sum + row.totals.errorCount, 0);
     const totalTokens = (usageStats.providerSeries ?? []).reduce((sum, row) => sum + row.totals.totalTokens, 0);
@@ -159,7 +159,7 @@ export function SystemStatusStrip({ usageStats }: { usageStats: UsageStatsSnapsh
       successRate: (requestCount - errorCount) / requestCount,
       totalTokens
     };
-  }, [usageStats.providerSeries, usageStats.totals]);
+  }, [usageStats.providerSeries, usageStats.totals, usageStats.gatewayTotals]);
   const overallTone = usageStatusTone(overallTotals);
   const tickMeta = useMemo(() => buildTickMetadata(statusRows[0]?.segments ?? []), [statusRows]);
 

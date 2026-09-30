@@ -20,11 +20,9 @@ function overviewTrendRangeDays(range: UsageStatsRange): number {
   return 1;
 }
 
-// usageStats buckets arrive either as ISO timestamps or as "YYYY-M-D H" keys; both are
-// normalized to day keys, and hour-of-day buckets (today/24h) fold onto the current day
-// so the 24-point axis of the day grain covers the full rolling window.
+// Preserve the calendar date of every hour: yesterday and today can contain
+// the same clock hour in a rolling window and must never be merged.
 export function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boolean): TrendRow[] {
-  const today = overviewTrendDayKey(new Date());
   const byKey = new Map<string, TrendRow>();
   for (const point of series) {
     const date = parseStatusBucketDate(point.bucket);
@@ -33,7 +31,7 @@ export function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boole
     }
     const dayKey = overviewTrendDayKey(date);
     const hour = String(date.getHours()).padStart(2, "0");
-    const key = hourly ? `${today}T${hour}` : dayKey;
+    const key = hourly ? `${dayKey}T${hour}` : dayKey;
     const existing = byKey.get(key);
     const tokens = point.totalTokens || 0;
     const cost = point.costUsd || 0;
@@ -53,7 +51,7 @@ export function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boole
       continue;
     }
     const row: TrendRow = hourly
-      ? { day: today, hour: `${today}T${hour}:00:00`, total_tokens: tokens }
+      ? { day: dayKey, hour: `${dayKey}T${hour}:00:00`, total_tokens: tokens }
       : { day: dayKey, total_tokens: tokens };
     row.billable_total_tokens = tokens;
     row.total_cost_usd = cost;
@@ -66,10 +64,16 @@ export function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boole
   return [...byKey.values()];
 }
 
-function overviewTrendFromTo(series: UsageSeriesPoint[], range: UsageStatsRange): { from: string; to: string } {
+export function overviewTrendFromTo(series: UsageSeriesPoint[], range: UsageStatsRange, now: Date = new Date()): { from: string; to: string } {
   const days = overviewTrendRangeDays(range);
-  const to = new Date();
+  const to = new Date(now);
   const from = new Date(to);
+  if (range === "today" || range === "24h") {
+    if (range === "today") from.setHours(0, 0, 0, 0);
+    else from.setTime(to.getTime() - 24 * 60 * 60 * 1000);
+    const hourKey = (date: Date) => `${overviewTrendDayKey(date)}T${String(date.getHours()).padStart(2, "0")}:00:00`;
+    return { from: hourKey(from), to: hourKey(to) };
+  }
   from.setDate(from.getDate() - (days - 1));
   const parsedDays = series
     .map((point) => parseStatusBucketDate(point.bucket))
@@ -99,7 +103,7 @@ export function UsageTrendSection({
     () => adaptSeriesToTrendRows(usageStats.series, period === "day"),
     [period, usageStats.series]
   );
-  const { from, to } = useMemo(() => overviewTrendFromTo(usageStats.series, usageRange), [usageRange, usageStats.series]);
+  const { from, to } = useMemo(() => overviewTrendFromTo(usageStats.series, usageRange, new Date(usageStats.generatedAt)), [usageRange, usageStats.series, usageStats.generatedAt]);
 
   return (
     <section>

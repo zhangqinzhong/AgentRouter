@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { decodeClaudeAppGatewayRouteId } from "@agentrouter/core/agents/claude-app/gateway-routes";
-import { getLocalUsageOverview, LOCAL_OVERVIEW_SOURCE_KEYS, type LocalUsageOverviewData, type LocalUsageRange } from "@agentrouter/core/collector/usage-page";
+import { getLocalUsageOverview, type LocalUsageOverviewData, type LocalUsageRange } from "@agentrouter/core/collector/usage-page";
 import { REQUEST_LOGS_DB_FILE, USAGE_DB_FILE } from "@agentrouter/core/config/constants";
 import { estimateUsageCostUsd, providerModelPricingForUsage } from "@agentrouter/core/models/pricing-service";
 import { createBetterSqliteDatabase, type BetterSqliteDatabase } from "@agentrouter/core/storage/sqlite-native";
@@ -122,8 +122,9 @@ const allTimeMaxBuckets = 730;
 const providerStatusDays = 90;
 const customRangeDayLimit = 366;
 const usageStatsResetAtKey = "usage_stats_reset_at";
-const localOverviewCacheTtlMs = 30_000;
+const localOverviewCacheTtlMs = 1_000;
 const localOverviewSources = new Map<string, string>([
+  ["codex", "Codex"], ["claude", "Claude"], ["grok", "Grok"], ["gemini", "Gemini"], ["opencode", "OpenCode"],
   ["acode", "AStudio"],
   ["every-code", "Every Code"],
   ["openclaw", "OpenClaw"],
@@ -158,7 +159,6 @@ const localOverviewSources = new Map<string, string>([
   ["mimo", "MiMo"],
   ["zcode", "ZCode"]
 ]);
-const localOverviewSourceKeys = new Set<string>(LOCAL_OVERVIEW_SOURCE_KEYS);
 let localOverviewCache: {
   expiresAt: number;
   key: string;
@@ -641,11 +641,11 @@ export async function getUsageStats(
       const normalizedRange = normalizeUsageRange(range);
       const now = new Date();
       const localRange = localOverviewRange(normalizedRange, customRange, now);
-      const local = await getCachedLocalUsageOverview(localRange.range, localRange.period);
+      const local = await getCachedLocalUsageOverview(localRange.range, localRange.period, filter);
       return { ...mergeLocalOverviewSnapshot(snapshot, local, filter), localCollectionState: local.collectionState };
     } catch (error) {
-      console.warn(`[usage] Failed to merge local usage into overview: ${formatError(error)}`);
-      return snapshot;
+      console.warn(`[usage] Failed to read local overview usage: ${formatError(error)}`);
+      return { ...mergeLocalOverviewSnapshot(snapshot, { totals: {}, sources: [], series: [] }, filter), localCollectionState: "error" };
     }
   } catch (error) {
     console.warn(`[usage] Failed to read usage stats: ${formatError(error)}`);
@@ -653,13 +653,15 @@ export async function getUsageStats(
   }
 }
 
-async function getCachedLocalUsageOverview(range: LocalUsageRange, period: "day" | "hour"): Promise<LocalUsageOverviewData> {
-  const key = JSON.stringify({ period, range });
+async function getCachedLocalUsageOverview(range: LocalUsageRange, period: "day" | "hour", filter?: UsageStatsFilter | null): Promise<LocalUsageOverviewData> {
+  const source = [...localOverviewSources].find(([key, label]) => key === filter?.provider?.toLowerCase() || label.toLowerCase() === filter?.provider?.toLowerCase())?.[0] ?? filter?.provider;
+  const queryFilter = { ...(source ? { source } : {}), ...(filter?.model ? { model: filter.model } : {}) };
+  const key = JSON.stringify({ period, range, queryFilter });
   const now = Date.now();
   if (localOverviewCache?.key === key && localOverviewCache.expiresAt > now) {
     return localOverviewCache.value;
   }
-  const value = await getLocalUsageOverview(range, period);
+  const value = await getLocalUsageOverview(range, period, queryFilter);
   localOverviewCache = { expiresAt: value.collectionState === "loading" ? 0 : now + localOverviewCacheTtlMs, key, value };
   return value;
 }
@@ -683,19 +685,8 @@ function localOverviewRange(
     // Empty from = the collector aggregates from the beginning of local history.
     return { period: "day", range: { from: "", to } };
   }
-  if (range === "today" || range === "24h") {
-    const from = new Date(now);
-    from.setMinutes(0, 0, 0);
-    if (range === "24h") {
-      from.setHours(from.getHours() - 23);
-    }
-    return { period: "hour", range: { from: day(from), to } };
-  }
-  const days = range === "30d" ? 30 : 7;
-  const from = new Date(now);
-  from.setHours(0, 0, 0, 0);
-  from.setDate(from.getDate() - (days - 1));
-  return { period: "day", range: { from: day(from), to } };
+  const from = getRangeSince(range, now);
+  return { period: range === "today" || range === "24h" ? "hour" : "day", range: { from: day(from), to, since: from.toISOString() } };
 }
 
 function localOverviewFilterMatches(source: string, model: string, filter: UsageStatsFilter | null | undefined): boolean {
@@ -809,7 +800,7 @@ export function mergeLocalOverviewSnapshot(
   const localClientRows: UsageComparisonRow[] = [];
   for (const entry of local.sources) {
     const source = String(entry.source ?? "").trim().toLowerCase();
-    if (!localOverviewSources.has(source) || !localOverviewSourceKeys.has(source)) {
+    if (!source) {
       continue;
     }
     for (const model of (Array.isArray(entry.models) ? entry.models : []) as Array<Record<string, unknown>>) {
@@ -820,9 +811,6 @@ export function mergeLocalOverviewSnapshot(
         localClientRows.push(localClientComparisonRow(source, modelName, totals));
       }
     }
-  }
-  if (localRows.length === 0) {
-    return snapshot;
   }
 
   const localTotals = localRows.reduce(
@@ -848,30 +836,22 @@ export function mergeLocalOverviewSnapshot(
     label: row.provider ?? row.label,
     caption: row.model ?? row.label
   }));
-  // Day-grain rows outside the snapshot template are kept: bounded day ranges
-  // query the same window on both sides, and "all" local history can predate
-  // the first gateway event, so those earlier days must survive the merge (the
-  // daily endpoint only returns active days, so there is no zero-bucket flood).
-  // Hour-grain rows stay template-bound: the local query covers whole calendar
-  // days, which is wider than the rolling today/24h windows.
   const hourly = local.series.some((item) => item.hour);
   const localSeries = local.series
     .map((row) => localSeriesToUsagePoint(row, hourly ? "hour" : "day"))
-    .filter((row): row is UsageSeriesPoint => Boolean(row))
-    .filter((row) => !hourly || snapshot.series.some((point) => point.bucket === row.bucket));
-  const seriesByBucket = new Map(snapshot.series.map((row) => [row.bucket, row]));
-  for (const row of localSeries) {
-    const existing = seriesByBucket.get(row.bucket);
-    seriesByBucket.set(row.bucket, existing ? { ...mergeLocalUsageTotals(existing, row), bucket: existing.bucket, label: existing.label } : row);
-  }
+    .filter((row): row is UsageSeriesPoint => Boolean(row));
+  // Keep the empty time axis, but never add gateway usage to local totals.
+  const seriesByBucket = new Map(snapshot.series.map((row) => [row.bucket, { ...emptyTotals, bucket: row.bucket, label: row.label }]));
+  for (const row of localSeries) seriesByBucket.set(row.bucket, row);
 
   return {
     ...snapshot,
-    clientModels: [...snapshot.clientModels, ...localClientRows],
-    models: [...snapshot.models, ...localRows],
-    providerModels: [...snapshot.providerModels, ...localProviderRows],
+    gatewayTotals: snapshot.totals,
+    clientModels: localClientRows,
+    models: localRows,
+    providerModels: localProviderRows,
     series: [...seriesByBucket.values()].sort((left, right) => left.bucket.localeCompare(right.bucket)),
-    totals: mergeLocalUsageTotals(snapshot.totals, localTotals)
+    totals: localTotals
   };
 }
 

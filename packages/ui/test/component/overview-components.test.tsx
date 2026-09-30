@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { formatCodexResetCardExpiry, formatCodexResetCardNumber } from "@agentrouter/ui/pages/home/components/overview-accounts.tsx";
 import { OverviewStatisticsResetDialog, OverviewView } from "@agentrouter/ui/pages/home/components/overview.tsx";
 import { breakdownBrandIconUrl, OverviewBreakdowns } from "@agentrouter/ui/pages/home/components/overview-breakdown.tsx";
-import { adaptSeriesToTrendRows } from "@agentrouter/ui/pages/home/components/overview-trend.tsx";
+import { adaptSeriesToTrendRows, overviewTrendFromTo } from "@agentrouter/ui/pages/home/components/overview-trend.tsx";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { parseStatusBucketDate } from "@agentrouter/ui/pages/home/shared/controls.tsx";
 import { formatProviderAccountMeterValue, providerAccountMeterDetailValidityProgress } from "@agentrouter/ui/pages/home/shared/provider-accounts.ts";
@@ -102,9 +102,9 @@ test("OverviewView marks the All tab active for all-time usage", () => {
 test("OverviewView keeps the reset statistics action as a discreet icon button", () => {
   const html = renderOverview();
 
-  const labels = html.match(/aria-label="Reset statistics"/g) ?? [];
+  const labels = html.match(/aria-label="Reset gateway statistics"/g) ?? [];
   assert.equal(labels.length, 1);
-  assert.match(html, /title="Reset statistics"/);
+  assert.match(html, /title="Reset gateway statistics"/);
 });
 
 test("OverviewView renders flat account balance rows", () => {
@@ -213,10 +213,10 @@ test("OverviewStatisticsResetDialog warns before deleting statistics", () => {
     />
   );
 
-  assert.match(html, /Reset overview statistics/);
-  assert.match(html, /Reset Overview statistics\?/);
-  assert.match(html, /Overview statistics data will be deleted and cannot be recovered\./);
-  assert.match(html, /Request logs and configuration are not deleted\./);
+  assert.match(html, /Reset gateway statistics/);
+  assert.match(html, /Reset gateway statistics\?/);
+  assert.match(html, /Gateway statistics data will be deleted and cannot be recovered\./);
+  assert.match(html, /Local usage, session files, request logs and configuration are not deleted\./);
   assert.match(html, />Cancel<\/button>/);
   assert.match(html, />Reset<\/button>/);
 });
@@ -233,10 +233,10 @@ test("OverviewStatisticsResetDialog renders Chinese warning copy", () => {
     </AppI18nContext.Provider>
   );
 
-  assert.match(html, /重置概览统计/);
-  assert.match(html, /要重置概览统计数据吗？/);
-  assert.match(html, /概览统计数据将被删除且无法恢复。/);
-  assert.match(html, /请求日志和配置不会被删除。/);
+  assert.match(html, /重置网关统计/);
+  assert.match(html, /要重置网关统计数据吗？/);
+  assert.match(html, /网关统计数据将被删除且无法恢复。/);
+  assert.match(html, /本地用量、会话文件、请求日志和配置不会被删除。/);
   assert.match(html, />取消<\/button>/);
   assert.match(html, />重置<\/button>/);
 });
@@ -526,4 +526,17 @@ test("Overview keeps statistics visible while local collection refreshes", () =>
   assert.doesNotMatch(ready, /Updating local usage/);
   const failed = renderOverview({ usageStats: { ...snapshot, localCollectionState: "error" } });
   assert.match(failed, /Showing saved data/);
+});
+
+
+test("overview Today axis ends this hour while 24h retains yesterday's date", () => {
+  const now = new Date(2026, 8, 30, 10, 35);
+  assert.deepEqual(overviewTrendFromTo([], "today", now), {from:"2026-09-30T00:00:00",to:"2026-09-30T10:00:00"});
+  assert.deepEqual(overviewTrendFromTo([], "24h", now), {from:"2026-09-29T10:00:00",to:"2026-09-30T10:00:00"});
+  const base = {avgDurationMs:0,cacheRatio:0,cacheTokens:0,costUsd:0,errorCount:0,inputTokens:0,label:"",outputTokens:0,requestCount:1,successRate:1};
+  const rows = adaptSeriesToTrendRows([
+    {...base,bucket:"2026-09-29 10:00",totalTokens:100},
+    {...base,bucket:"2026-09-30 10:00",totalTokens:200},
+  ], true);
+  assert.deepEqual(rows.map(row=>[row.hour,row.total_tokens]), [["2026-09-29T10:00:00",100],["2026-09-30T10:00:00",200]]);
 });

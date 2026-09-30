@@ -67,7 +67,7 @@ const wsl = require("./wsl-probe");
 // v13 stores per-model Codex usage (including observed reroutes and the exact
 // long-context subset) and folds delivery signals into the token parser's
 // single pass instead of parsing every Codex file twice.
-const SIDECAR_VERSION = 14;
+const SIDECAR_VERSION = 15;
 const EDIT_TOOLS = new Set([
   "apply_patch",
   "edit",
