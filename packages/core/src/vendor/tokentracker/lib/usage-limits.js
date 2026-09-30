@@ -55,7 +55,7 @@ const cacheByDevinSelection = {
   on: { data: null, expiresAtMs: 0 },
 };
 function devinSelectionKey(options) {
-  return options?.devinEnabled === true ? "on" : "off";
+  return (options?.devinEnabled === true ? "on" : "off") + (options?.provider ? `:${options.provider}` : "");
 }
 const CACHE_TTL_MS = 2 * 60 * 1000;
 // Must stay below the macOS app's post-reset re-fetch grace (10s in
@@ -738,7 +738,7 @@ function normalizeCursorSandUsageStatus(body, { eligible = true } = {}) {
   return buildWindow({ usedPercent, resetAt, windowSeconds });
 }
 
-async function fetchCursorLimits({ home, fetchImpl = fetch } = {}) {
+async function fetchCursorLimits({ home, fetchImpl = fetch, scope } = {}) {
   if (!isCursorInstalled({ home })) {
     return { configured: false };
   }
@@ -753,18 +753,20 @@ async function fetchCursorLimits({ home, fetchImpl = fetch } = {}) {
     // isolated: older Cursor accounts/servers must keep their existing three
     // monthly windows instead of turning the whole provider red.
     const [body, sandAccessResult, sandUsageResult] = await Promise.all([
-      fetchCursorUsageSummary({ cookie: auth.cookie, fetchImpl }),
-      fetchCursorSandAccessStatus({ accessToken: auth.accessToken, fetchImpl }).catch(() => null),
-      fetchCursorSandUsageStatus({ accessToken: auth.accessToken, fetchImpl }).catch(() => null),
+      scope === "grokbot" ? null : fetchCursorUsageSummary({ cookie: auth.cookie, fetchImpl }),
+      scope === "cursor" ? null : fetchCursorSandAccessStatus({ accessToken: auth.accessToken, fetchImpl }).catch(() => null),
+      scope === "cursor" ? null : fetchCursorSandUsageStatus({ accessToken: auth.accessToken, fetchImpl }).catch(() => null),
     ]);
+    if (scope === "grokbot" && !sandUsageResult) throw new Error("Grok Bot quota unavailable");
     const grokBotWindow = normalizeCursorSandUsageStatus(sandUsageResult, {
       eligible: sandAccessResult?.granted === true,
     });
     return {
       configured: true,
       error: null,
-      ...normalizeCursorUsageSummary(body),
+      ...(body ? normalizeCursorUsageSummary(body) : {}),
       quaternary_window: grokBotWindow,
+      grok_bot_plan_label: sandUsageResult?.grokPlanLabel || null,
     };
   } catch (error) {
     return {
@@ -3695,6 +3697,7 @@ function withPlanLabel(obj, raw, brand) {
 // hammered). Survives an external resetUsageLimitsCache() (refresh=1 path in
 // local-api.js): a refresh arriving while a fetch is already running reuses that
 // in-flight fetch and returns its result.
+const USAGE_LIMIT_PROVIDERS = ["claude","codex","cursor","grokbot","kimi","gemini","kiro","antigravity","copilot","grok","zcode","opencodeGo","qoder","qoderCn","codingPlan","agentPlan","commandCode","devin"];
 const inFlightByDevinSelection = { off: null, on: null };
 
 // Codex stamps reset_at as unix seconds; every other provider (and Claude's
@@ -3734,9 +3737,10 @@ function cacheExpiresAtMs(data, fetchedAtMs) {
 
 async function getUsageLimits(options = {}) {
   const selection = devinSelectionKey(options);
-  const cache = cacheByDevinSelection[selection];
+  if (options.provider && !USAGE_LIMIT_PROVIDERS.includes(options.provider)) throw new Error("Unknown quota provider");
+  const cache = cacheByDevinSelection[selection] || { data: null, expiresAtMs: 0 };
   const nowMs = Date.now();
-  if (cache.data && nowMs < cache.expiresAtMs) {
+  if (!options.forceRefresh && cache.data && nowMs < cache.expiresAtMs) {
     return cache.data;
   }
   if (inFlightByDevinSelection[selection]) {
@@ -3762,13 +3766,16 @@ async function fetchUsageLimitsUncached({
   forceRefresh = false,
   allowCodexTokenRefresh = true,
   devinEnabled = false,
+  provider,
 } = {}) {
+  const selected = (key) => !provider || provider === key;
+  const selectProvider = (key, read) => selected(key) ? read() : Promise.resolve({ configured: false });
   const nowMs = Date.now();
 
   const [claudeOauth, claudeSubscription, codexAuth] = await Promise.all([
-    Promise.resolve().then(() => readClaudeCodeOauthToken({ platform, securityRunner, home, nowMs })),
-    Promise.resolve().then(() => detectClaudeCodeSubscriptionDetails({ platform, securityRunner, home })),
-    readCodexAuthBundle({ home, env }),
+    !selected("claude") ? null : Promise.resolve().then(() => readClaudeCodeOauthToken({ platform, securityRunner, home, nowMs })),
+    !selected("claude") ? null : Promise.resolve().then(() => detectClaudeCodeSubscriptionDetails({ platform, securityRunner, home })),
+    selected("codex") ? readCodexAuthBundle({ home, env }) : null,
   ]);
   const claudeToken = claudeOauth?.accessToken || null;
   const claudeTokenExpiresAtMs = claudeOauth?.expiresAtMs ?? null;
@@ -3824,13 +3831,13 @@ async function fetchUsageLimitsUncached({
 
   const providerFetch = withFetchTimeout(fetchImpl, providerTimeoutMs);
   const [claudeResult, codexResult, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGoRaw, qoder, qoderCn, codingPlan, agentPlan, commandCodeRaw, devinRaw, claudeServiceStatus] = await Promise.all([
-    claudeToken && !freshClaudeCache && !claudeRetryAtMs
+    selectProvider('claude', () => claudeToken && !freshClaudeCache && !claudeRetryAtMs
       ? withProviderTimeout(fetchClaudeUsageLimits(claudeToken, { fetchImpl: providerFetch, maxAttempts: 1 }), "Claude", providerTimeoutMs).then(
           (value) => ({ status: "fulfilled", value }),
           (reason) => ({ status: "rejected", reason }),
         )
-      : Promise.resolve(null),
-    codexToken
+      : Promise.resolve(null)),
+    selectProvider('codex', () => codexToken
       ? fetchCodexUsageLimits(codexToken, {
           fetchImpl: providerFetch,
           accountId: codexAccountId,
@@ -3839,18 +3846,18 @@ async function fetchUsageLimitsUncached({
           (value) => ({ status: "fulfilled", value }),
           (reason) => ({ status: "rejected", reason }),
         )
-      : Promise.resolve(null),
-    withProviderTimeout(fetchCursorLimits({ home, fetchImpl: providerFetch }), "Cursor", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchKimiLimits({ home, env, fetchImpl: providerFetch }), "Kimi", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchGeminiLimits({ home, env, fetchImpl: providerFetch, commandRunner }), "Gemini", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    fetchKiroLimits({ commandRunner, now, platform, home }),
+      : Promise.resolve(null)),
+    selectProvider(provider === 'grokbot' ? 'grokbot' : 'cursor', () => withProviderTimeout(fetchCursorLimits({ home, fetchImpl: providerFetch, scope: provider }), "Cursor", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('kimi', () => withProviderTimeout(fetchKimiLimits({ home, env, fetchImpl: providerFetch }), "Kimi", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('gemini', () => withProviderTimeout(fetchGeminiLimits({ home, env, fetchImpl: providerFetch, commandRunner }), "Gemini", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('kiro', () => fetchKiroLimits({ commandRunner, now, platform, home })),
     // Antigravity's own budget keeps the serial chain inside providerTimeoutMs; this
     // outer race is the enforcing backstop every other provider already has, and the
     // signal makes a fired race actually kill the spawned scans and open sockets.
-    withAbortableProviderTimeout(
+    selectProvider('antigravity', () => withAbortableProviderTimeout(
       (signal) => fetchAntigravityLimits({
         home,
         commandRunner,
@@ -3864,19 +3871,19 @@ async function fetchUsageLimitsUncached({
       }),
       "Antigravity",
       providerTimeoutMs,
-    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchCopilotLimits({ home, env, fetchImpl: providerFetch, platform, securityRunner }), "GitHub Copilot", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), "Grok Build", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchZcodeLimits({ home, env, fetchImpl: providerFetch }), "ZCode", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
+    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('copilot', () => withProviderTimeout(fetchCopilotLimits({ home, env, fetchImpl: providerFetch, platform, securityRunner }), "GitHub Copilot", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('grok', () => withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), "Grok Build", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('zcode', () => withProviderTimeout(fetchZcodeLimits({ home, env, fetchImpl: providerFetch }), "ZCode", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
     // OpenCode Go: authoritative subscription windows come from the dashboard
     // scrape; local opencode.db cost is available only as an explicit estimate.
     // See src/lib/opencode-go-limits.js.
-    withProviderTimeout(fetchOpencodeGoLimits({ home, env, fetchImpl: providerFetch }), "OpenCode Go", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(
+    selectProvider('opencodeGo', () => withProviderTimeout(fetchOpencodeGoLimits({ home, env, fetchImpl: providerFetch }), "OpenCode Go", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('qoder', () => withProviderTimeout(
       fetchQoderLimits({
         home,
         env,
@@ -3885,8 +3892,8 @@ async function fetchUsageLimitsUncached({
       }),
       "Qoder",
       providerTimeoutMs,
-    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(
+    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('qoderCn', () => withProviderTimeout(
       fetchQoderCnLimits({
         home,
         env,
@@ -3895,12 +3902,12 @@ async function fetchUsageLimitsUncached({
       }),
       "Qoder CN",
       providerTimeoutMs,
-    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
+    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
     // Ark Coding Plan / Agent Plan (火山方舟): two parallel subscription
     // products sharing the same arkcli binary. No token-consumption source —
     // consumption for the compatible CLIs is already counted from their
     // local files; these only surface the 5h/week/month quota percentages.
-    withAbortableProviderTimeout(
+    selectProvider('codingPlan', () => withAbortableProviderTimeout(
       (signal) => fetchArkCodingPlanLimits({
         commandRunner,
         home,
@@ -3911,8 +3918,8 @@ async function fetchUsageLimitsUncached({
       }),
       "Ark Coding Plan",
       providerTimeoutMs,
-    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withAbortableProviderTimeout(
+    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('agentPlan', () => withAbortableProviderTimeout(
       (signal) => fetchArkAgentPlanLimits({
         commandRunner,
         home,
@@ -3923,7 +3930,7 @@ async function fetchUsageLimitsUncached({
       }),
       "Ark Agent Plan",
       providerTimeoutMs,
-    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
+    ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
     // CommandCode (commandcode.ai): official subscription windows (5h + weekly)
     // from the CLI's own alpha endpoints, keyed by the apiKey the CLI stores in
     // ~/.commandcode/auth.json (or COMMAND_CODE_API_KEY). No local fallback —
@@ -3932,31 +3939,33 @@ async function fetchUsageLimitsUncached({
     // outer race bounds the whole slot: without it three sequential per-request
     // timeouts (whoami, then credits+subscriptions) could hold the aggregate
     // ~2x longer than any sibling provider.
-    withProviderTimeout(fetchCommandcodeLimits({ home, env, fetchImpl: providerFetch }), "CommandCode", providerTimeoutMs)
+    selectProvider('commandCode', () => withProviderTimeout(fetchCommandcodeLimits({ home, env, fetchImpl: providerFetch }), "CommandCode", providerTimeoutMs)
       .then(
         (value) => ({ status: "fulfilled", value }),
         (reason) => ({ status: "rejected", reason }),
-      ),
+      )),
     // Devin (devin.ai): daily/weekly subscription quota from the official
     // GetPlanStatus RPC, keyed by the session token the Devin CLI stores in
     // ~/.local/share/devin/credentials.toml. No local fallback — window state
     // lives server-side. fetchDevinLimits throws on auth expiry so the
     // assemble step below can flag auth_action_required.
-    withProviderTimeout(fetchDevinLimits({ home, env, enabled: devinEnabled === true, fetchImpl: providerFetch }), "Devin", providerTimeoutMs)
+    selectProvider('devin', () => withProviderTimeout(fetchDevinLimits({ home, env, enabled: devinEnabled === true, fetchImpl: providerFetch }), "Devin", providerTimeoutMs)
       .then(
         (value) => ({ status: "fulfilled", value }),
         (reason) => ({ status: "rejected", reason }),
-      ),
+      )),
     // Public status-page probe (fail-soft, own 5-min cache in provider-status.js).
     // Only probed for configured accounts — without a token the Claude section
     // never renders, so the reading would have nowhere to go.
-    claudeToken
+    selectProvider('claude', () => claudeToken
       ? fetchProviderServiceStatus("claude", { fetchImpl, nowMs })
-      : Promise.resolve(null),
+      : Promise.resolve(null)),
   ]);
 
   let claude;
-  if (!claudeToken) {
+  if (!selected("claude")) {
+    claude = { configured: false };
+  } else if (!claudeToken) {
     // Claude Code blanks `accessToken`/`refreshToken` in place when its login expires
     // (macOS Keychain item and .credentials.json alike) instead of removing the entry,
     // so "no token" is ambiguous: never signed in, or signed in and expired. An entry
@@ -4224,7 +4233,26 @@ async function fetchUsageLimitsUncached({
     };
   }
 
-  cacheByDevinSelection[devinSelectionKey({ devinEnabled })] = {
+  if (provider === "grokbot") {
+    data.grokbot = { ...data.cursor, primary_window: data.cursor.quaternary_window,
+      plan_label: data.cursor.grok_bot_plan_label, quaternary_window: undefined };
+  }
+  if (provider) {
+    for (const key of Object.keys(data)) if (key !== "fetched_at" && key !== provider) delete data[key];
+    // Share a targeted result with the menu without extending other accounts' TTL.
+    const aggregate = cacheByDevinSelection[devinSelectionKey({ devinEnabled })];
+    if (aggregate?.data) {
+      if (provider === "grokbot") {
+        aggregate.data.cursor = { ...aggregate.data.cursor, quaternary_window: data.grokbot.primary_window,
+          grok_bot_plan_label: data.grokbot.plan_label, grok_bot_updated_at: data.fetched_at };
+      } else if (provider === "cursor") {
+        aggregate.data.cursor = { ...data.cursor, quaternary_window: aggregate.data.cursor?.quaternary_window,
+          grok_bot_plan_label: aggregate.data.cursor?.grok_bot_plan_label,
+          grok_bot_updated_at: aggregate.data.cursor?.grok_bot_updated_at || aggregate.data.cursor?.provenance?.captured_at };
+      } else aggregate.data = { ...aggregate.data, [provider]: data[provider] };
+    }
+  }
+  cacheByDevinSelection[devinSelectionKey({ devinEnabled, provider })] = {
     data,
     expiresAtMs: cacheExpiresAtMs(data, nowMs),
   };
@@ -4232,8 +4260,7 @@ async function fetchUsageLimitsUncached({
 }
 
 function resetUsageLimitsCache() {
-  cacheByDevinSelection.off = { data: null, expiresAtMs: 0 };
-  cacheByDevinSelection.on = { data: null, expiresAtMs: 0 };
+  for (const key of Object.keys(cacheByDevinSelection)) delete cacheByDevinSelection[key];
 }
 
 module.exports = {

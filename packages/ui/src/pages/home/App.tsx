@@ -159,7 +159,7 @@ async function loadProviderAccountSnapshots(forceRefresh = false, account?: Prov
   if (!window.agentrouter) {
     return [];
   }
-  return window.agentrouter.getProviderAccountSnapshots(account?.provider, forceRefresh ? { forceRefresh: true, ...(account ? { credentialId: account.credentialId ?? "" } : {}) } : undefined);
+  return window.agentrouter.getProviderAccountSnapshots(account?.provider, forceRefresh ? { forceRefresh: true, ...(account ? { credentialId: account.credentialId ?? "", localSource: account.localSource } : {}) } : undefined);
 }
 
 function providerRefreshModelsInputKey(

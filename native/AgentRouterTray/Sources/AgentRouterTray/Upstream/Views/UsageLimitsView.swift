@@ -99,7 +99,16 @@ struct UsageLimitsView: View {
     }
 
     private func buildVisibleGroups(_ limits: UsageLimitsResponse) -> [AnyView] {
-        settings.providerOrder.compactMap { sectionIfContent(id: $0, limits: limits) }
+        var groups: [AnyView] = []
+        for id in settings.providerOrder {
+            if let section = sectionIfContent(id: id, limits: limits) { groups.append(section) }
+            if id == "cursor", settings.isVisible(id), let window = limits.cursor.quaternaryWindow {
+                if let section = toolSection(id: "grokbot", title: limits.cursor.grokBotPlanLabel.map { "Grok Bot · \($0)" } ?? "Grok Bot", assetName: "GrokLogo", toolName: "Grok Bot", specs: [makeSpec("7d", window.usedPercent, windowSeconds: window.limitWindowSeconds, iso: window.resetAt)]) {
+                    groups.append(section)
+                }
+            }
+        }
+        return groups
     }
 
     /// Builds one provider's section, or nil when it would carry no quota rows
@@ -382,14 +391,6 @@ struct UsageLimitsView: View {
         if let w = c.tertiaryWindow {
             s.append(makeSpec(
                 "API",
-                w.usedPercent,
-                windowSeconds: w.limitWindowSeconds,
-                iso: w.resetAt
-            ))
-        }
-        if let w = c.quaternaryWindow {
-            s.append(makeSpec(
-                Strings.cursorGrokBotLabel,
                 w.usedPercent,
                 windowSeconds: w.limitWindowSeconds,
                 iso: w.resetAt

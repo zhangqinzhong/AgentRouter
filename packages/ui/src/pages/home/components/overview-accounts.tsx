@@ -1,3 +1,6 @@
+import cursorQuotaIcon from "@/assets/agent-logos/cursor.svg";
+import zcodeQuotaIcon from "@/assets/agent-logos/zcode.png";
+import grokQuotaIcon from "@/assets/agent-logos/grok.ico";
 import {
   AnimatePresence, AnimatedDisclosure, AnimatedIconSwap, Button,
   ChevronDown, ChevronLeft, ChevronRight, CheckCircle2, CircleAlert,
@@ -82,7 +85,7 @@ function ProviderAccountRow({
   refreshing?: boolean;
 }) {
   const t = useAppText();
-  const meterLimit = providerAccountMeterLimitAvoidingOrphanExtra(account, providerAccountMeterLineLimit);
+  const meterLimit = account.localSource ? account.meters.length : providerAccountMeterLimitAvoidingOrphanExtra(account, providerAccountMeterLineLimit);
   const meters = providerAccountMetersForDisplayOrdered(account, meterLimit);
   const updatedAt = formatProviderAccountUpdatedAt(account.updatedAt);
 
@@ -96,6 +99,7 @@ function ProviderAccountRow({
             <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground" title={formatProviderAccountRefreshTime(account, t)}>{updatedAt}</span>
           ) : null}
         </div>
+        {account.localSource && account.message && meters.length > 0 ? <p className="mt-1 text-xs text-muted-foreground" role="status">{t(account.message)}</p> : null}
         {meters.length > 0 ? (
           <div className="mt-1.5 min-w-0 space-y-1.5">
             {meters.map((meter) => (
@@ -233,6 +237,10 @@ export function isUsableProviderIconUrl(url: string): boolean {
 }
 
 function providerAccountIconUrl(account: ProviderAccountSnapshot, providers: GatewayProviderConfig[]): string {
+  if (account.localSource) {
+    const localIcons: Record<string, string> = {codex: codexLogoUrl, cursor: cursorQuotaIcon, zcode: zcodeQuotaIcon, grok: grokQuotaIcon, grokbot: grokQuotaIcon};
+    if (localIcons[account.localSource]) return localIcons[account.localSource];
+  }
   const providerName = account.provider.trim().toLowerCase();
   if (!providerName) {
     return "";

@@ -373,6 +373,7 @@ struct CursorLimits: Codable, Equatable {
     let configured: Bool
     let error: String?
     let planLabel: String?
+    var grokBotPlanLabel: String? = nil
     let membershipType: String?
     let primaryWindow: GenericLimitWindow?
     let secondaryWindow: GenericLimitWindow?
@@ -382,6 +383,7 @@ struct CursorLimits: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case configured, error
         case planLabel = "plan_label"
+        case grokBotPlanLabel = "grok_bot_plan_label"
         case membershipType = "membership_type"
         case primaryWindow = "primary_window"
         case secondaryWindow = "secondary_window"

@@ -403,6 +403,8 @@ export type ProviderAccountConnectorError = {
 };
 
 export type ProviderAccountSnapshot = {
+  localSource?: string;
+  displayName?: string;
   credentialId?: string;
   credentialLabel?: string;
   errors?: ProviderAccountConnectorError[];
@@ -416,6 +418,7 @@ export type ProviderAccountSnapshot = {
 };
 
 export type ProviderAccountSnapshotRequestOptions = {
+  localSource?: string;
   credentialId?: string;
   forceRefresh?: boolean;
 };

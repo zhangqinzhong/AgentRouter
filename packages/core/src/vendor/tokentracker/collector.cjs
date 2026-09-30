@@ -75,10 +75,10 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
       return getCategoryBreakdown({home,...query});
     }
     if(endpoint.endsWith('usage-limits')) {
-      if(query.refresh==='1') resetUsageLimitsCache();
+      if(query.refresh==='1' && !query.provider) resetUsageLimitsCache();
       // Never rotate a refresh token concurrently with the user's active CLI.
       // The CLI owns login renewal; this observer reads its current credentials.
-      return getUsageLimits({home,env:{...process.env,CODEX_HOME:path.join(home,'.codex')},fetchImpl,allowCodexTokenRefresh:false,forceRefresh:query.refresh==='1',devinEnabled:query.devin==='1'});
+      return getUsageLimits({home,env:{...process.env,CODEX_HOME:path.join(home,'.codex')},fetchImpl,allowCodexTokenRefresh:false,forceRefresh:query.refresh==='1',provider:query.provider,devinEnabled:query.devin==='1'});
     }
     if(endpoint.endsWith('subscription-manager')) {
       const own=await subscriptions.listSubscriptions({trackerDir:dataDir});

@@ -1,3 +1,4 @@
+import { getLocalAccountSnapshots, mergeAccountSnapshots } from "./local-account-snapshots";
 import { createHash, randomUUID } from "node:crypto";
 import { loadAppConfig } from "@agentrouter/core/config/config";
 import { attachCodexRateLimitResetCreditDetails } from "@agentrouter/core/agents/local-providers/codex";
@@ -123,6 +124,8 @@ export async function getProviderAccountSnapshots(
   providerName?: string,
   options: ProviderAccountSnapshotRequestOptions = {}
 ): Promise<ProviderAccountSnapshot[]> {
+  if (options.localSource) return getLocalAccountSnapshots(options.localSource, options.forceRefresh);
+  const local = providerName ? Promise.resolve([]) : getLocalAccountSnapshots(undefined, options.forceRefresh).catch(() => []);
   const config = await loadAppConfig();
   pruneProviderAccountCache();
   const normalizedProviderName = normalizeProviderName(providerName);
@@ -146,7 +149,7 @@ export async function getProviderAccountSnapshots(
       return providerAccountUnavailableSnapshots(provider).filter((snapshot) => options.credentialId === undefined || (snapshot.credentialId ?? "") === options.credentialId).map((snapshot) => Promise.resolve(snapshot));
     })
   );
-  return snapshots.filter((snapshot): snapshot is ProviderAccountSnapshot => Boolean(snapshot));
+  return mergeAccountSnapshots(providers, snapshots.filter((snapshot): snapshot is ProviderAccountSnapshot => Boolean(snapshot)), await local);
 }
 
 export function invalidateProviderAccountSnapshotCache(providerName?: string): void {
