@@ -285,7 +285,7 @@ export function UsageTrendLineChart({
     <div ref={scrollerRef} className={`w-full ${height} ${pan?'overflow-x-auto overflow-y-hidden [scrollbar-width:thin]':''}`}>
      <div className="h-full" style={innerWidth?{width:innerWidth,minWidth:'100%'}:{width:'100%'}}>
       <ResponsiveContainer width="100%" height="100%">
-       <AreaChart data={points} margin={{top:8,right:12,left:0,bottom:4}}>
+       <AreaChart data={points} margin={{top:8,right:32,left:0,bottom:4}}>
         <defs>
          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={LINE} stopOpacity={0.32}/>
@@ -293,7 +293,7 @@ export function UsageTrendLineChart({
          </linearGradient>
         </defs>
         <CartesianGrid stroke="rgba(128,128,128,0.18)" strokeDasharray="2 5" vertical={false}/>
-        <XAxis axisLine={false} dataKey="label" interval={longAxis||pan?'preserveStartEnd':0} minTickGap={longAxis||pan?24:8} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickLine={false}/>
+        <XAxis axisLine={false} dataKey="label" interval="preserveStartEnd" minTickGap={longAxis||pan?24:8} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickLine={false}/>
         <YAxis axisLine={false} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickFormatter={(value)=>formatTokenCount(Number(value)||0)} tickLine={false} width={44}/>
         <Tooltip content={<TrendHoverTooltip grain={grain} period={period}/>} cursor={{stroke:'rgba(60,60,60,0.28)',strokeWidth:1}} wrapperStyle={{zIndex:40,outline:'none'}}/>
         <Area

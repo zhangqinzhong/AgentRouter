@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.9.6 - 2026-09-30
+
+### Fixes
+- Hide failed local login entries without usable quota from overview accounts, while retaining saved quota and configured-provider errors.
+- Encode OAuth form bodies before crossing the collector worker bridge, fixing Antigravity structured-clone failures.
+- Keep trend endpoint labels inside the chart and avoid overlapping ticks at narrow widths.
+
 ## 1.9.5 - 2026-09-30
 
 ### Fixes

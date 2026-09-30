@@ -33,7 +33,7 @@ export function ProviderAccountsSection({
 }) {
   const t = useAppText();
   const sortedAccounts = accounts.map(providerAccountSnapshotForOverview).sort(compareProviderAccountSnapshots);
-  const visibleAccounts = sortedAccounts.filter((account) => account.meters.length > 0 || account.status === "error");
+  const visibleAccounts = sortedAccounts.filter((account) => account.meters.length > 0 || (!account.localSource && account.status === "error"));
   const unconfigured = accounts.length === 0 && !providers.some((provider) => provider.account?.enabled);
 
   if (visibleAccounts.length === 0) {
