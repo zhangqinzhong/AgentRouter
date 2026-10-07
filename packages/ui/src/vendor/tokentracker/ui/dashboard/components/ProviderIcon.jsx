@@ -439,6 +439,7 @@ const PROVIDER_LOGO_MAP = {
   "COMMAND-CODE": providerAsset6,
   GEMINI: providerAsset9,
   GROK: grokBrandLogo,
+  "GROK BOT": grokBrandLogo,
   "KILO-CLI": providerAsset10,
   "KILO-CODE": providerAsset10,
   LMSTUDIO: providerAsset11,

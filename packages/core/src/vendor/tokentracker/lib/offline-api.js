@@ -167,6 +167,12 @@ function normalizeQueueRow(row) {
       normalized = { ...normalized, billable_total_tokens: totalTokens };
     }
   }
+  // Cursor exports Grok Bot account usage alongside editor usage. Preserve the
+  // raw queue identity for snapshot deduplication, but classify before filtering
+  // or aggregation so old and new records share the same presentation.
+  if (sourceName === "cursor" && /^grok-bot(?:-|$)/i.test(String(normalized.model || ""))) {
+    normalized = { ...normalized, source: "grokbot" };
+  }
   return normalized;
 }
 

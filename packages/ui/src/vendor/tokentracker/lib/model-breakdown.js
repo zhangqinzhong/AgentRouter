@@ -157,7 +157,7 @@ export function buildFleetData(modelBreakdown, { copyFn } = {}) {
         .slice()
         .sort((a, b) => b.totalTokens - a.totalTokens)
         .map((entry) => {
-        const label = entry.source
+        const label = entry.source === "grokbot" ? "Grok Bot" : entry.source
             ? String(entry.source).toUpperCase()
             : safeCopy("shared.placeholder.short");
         const totalPercentRaw = grandTotal > 0 ? (entry.totalTokens / grandTotal) * 100 : 0;
