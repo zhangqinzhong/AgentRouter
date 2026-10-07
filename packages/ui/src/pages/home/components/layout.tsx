@@ -1,5 +1,6 @@
 import {normalizePageDefaultRanges} from "@agentrouter/core/config/page-default-ranges";
 import { AppSettingsPage } from "./settings";
+import { MemoryView } from "./memory";
 import {RoutingActivationBrand} from "@/vendor/cc-switch/RoutingActivationBrand";
 import {initializeWindowActivity} from "@/vendor/cc-switch/windowActivity";
 import {useEffect, useRef} from "react";
@@ -44,7 +45,7 @@ const sidebarNavigationGroupDefinitions: Array<{
   itemIds: NavigationId[];
   label: string;
 }> = [
-  { id: "workspace", itemIds: ["overview", "usage", "sessions", "trend", "heatmap"], label: "Workspace" },
+  { id: "workspace", itemIds: ["overview", "usage", "sessions", "trend", "heatmap", "memory"], label: "Workspace" },
   { id: "setup", itemIds: ["providers", "profile", "routing"], label: "Setup" },
   { id: "monitor", itemIds: ["logs", "observability"], label: "Monitor" },
   { id: "advanced", itemIds: ["virtual-models", "models", "api-keys", "extensions"], label: "Advanced" }
@@ -464,6 +465,7 @@ function MainViewSwitch({
         {activeView === "sessions" && configLoaded ? <LocalSessionsView defaultRange={defaults.sessions} /> : null}
         {activeView === "trend" && configLoaded ? <LocalTrendView defaultRange={defaults.trend} /> : null}
         {activeView === "heatmap" && configLoaded ? <LocalHeatmapView /> : null}
+        {activeView === "memory" ? <MemoryView /> : null}
         {activeView === "overview" ? <OverviewView {...viewProps.overview} /> : null}
         {activeView === "observability" && agentAnalysisEnabled ? <AgentAnalysisView {...viewProps.observability} /> : null}
         {activeView === "api-keys" ? <ApiKeysView {...viewProps.apiKeys} /> : null}

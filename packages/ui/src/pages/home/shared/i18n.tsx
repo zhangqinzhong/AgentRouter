@@ -1,7 +1,8 @@
 import { createContext, useContext, useMemo } from "react";
+import { memoryCopyZh } from "./memory-copy";
 import { translateErrorMessage } from "@agentrouter/core/contracts/i18n";
 
-type NavigationId = "onboarding" | "overview" | "usage" | "sessions" | "trend" | "heatmap" | "observability" | "api-keys" | "server" | "settings" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
+type NavigationId = "memory" | "onboarding" | "overview" | "usage" | "sessions" | "trend" | "heatmap" | "observability" | "api-keys" | "server" | "settings" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
 type ResolvedLanguage = "en" | "zh";
 
 export type AppCopy = {
@@ -109,6 +110,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       onboarding: "Onboarding",
       "api-keys": "API Keys",
       extensions: "Extensions",
+      memory: "Memory",
       logs: "Logs",
       networking: "Networking",
       observability: "Observability",
@@ -775,6 +777,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       onboarding: "上手引导",
       "api-keys": "API 密钥",
       extensions: "扩展",
+      memory: "记忆",
       logs: "日志",
       networking: "网络",
       observability: "观测",
@@ -2597,6 +2600,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
   }
 };
 
+Object.assign(appCopy.zh.text, memoryCopyZh);
 export const AppI18nContext = createContext<AppCopy>(appCopy.en);
 
 export function useAppText() {

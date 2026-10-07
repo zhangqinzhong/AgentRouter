@@ -39,6 +39,7 @@
   "files": [
     "dist",
     "package.json",
+    "!dist/ai-memory/**",
     "!node_modules/better-sqlite3/deps/**",
     "!node_modules/better-sqlite3/src/**",
     "!node_modules/better-sqlite3/binding.gyp",
@@ -74,6 +75,10 @@
           "Assets.car",
           "AgentRouter.icns"
         ]
+      },
+      {
+        "from": "packages/electron/dist/main/app-launcher/AgentRouterAppLauncher",
+        "to": "app-launcher/AgentRouterAppLauncher"
       }
     ],
     "sign": "build/sign-mac.cjs",
@@ -121,6 +126,10 @@
   },
   "copyright": "Copyright \u00a9 2026 zhangqinzhong",
   "extraResources": [
+    {
+      "from": "packages/electron/dist/ai-memory",
+      "to": "ai-memory"
+    },
     {
       "from": "LICENSE",
       "to": "licenses/AgentRouter-LICENSE"

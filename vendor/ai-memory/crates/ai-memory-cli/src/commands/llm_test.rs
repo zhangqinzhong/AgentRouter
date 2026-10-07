@@ -1,0 +1,120 @@
+//! `ai-memory llm-test` — smoke test an LLM provider end-to-end.
+
+use ai_memory_llm::{ChatRequest, ProviderChoice, ProviderConfig, build_provider};
+use anyhow::{Context, Result};
+use tracing::info;
+
+use crate::cli::{LlmProviderChoice, LlmTestArgs};
+use crate::config::Config;
+
+/// Run the `llm-test` subcommand.
+///
+/// # Errors
+/// Returns an error if the provider cannot be constructed, the env
+/// lacks the required keys, or the HTTP call fails.
+pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
+    let provider = ProviderChoice::from(args.provider);
+    let api_key_override = args
+        .api_key
+        .filter(|s| !s.is_empty())
+        .map(secrecy::SecretString::from);
+    let provider_config = ProviderConfig {
+        provider,
+        model: args.model,
+        auth: config.provider_auth(provider, api_key_override),
+        base_url: args.base_url.or_else(|| config.llm_test_base_url(provider)),
+        compat_strict: config.llm_compat_strict,
+        request_timeout_secs: config.llm_timeout_secs,
+        reasoning_effort: config.llm_reasoning_effort,
+        extra_headers: config
+            .llm_extra_headers()
+            .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?,
+    };
+    let client = build_provider(provider_config).context("building LLM provider")?;
+    info!(
+        provider = client.name(),
+        model = client.model(),
+        "sending prompt",
+    );
+    let request = representative_request(args.prompt);
+    if args.structured {
+        let value = client
+            .complete_structured_raw(
+                request,
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"]
+                }),
+            )
+            .await
+            .context("calling provider for structured output")?;
+        println!("--- model: {} ---", client.model());
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    let resp = client.complete(request).await.context("calling provider")?;
+
+    println!("--- model: {} ---", resp.model);
+    if let Some(u) = resp.usage {
+        println!(
+            "--- usage: in={} out={} ---",
+            u.input_tokens, u.output_tokens
+        );
+    }
+    println!("{}", resp.text);
+    Ok(())
+}
+
+/// Use the same sampling value as bootstrap and consolidation so this smoke
+/// test exercises provider-specific request normalization.
+fn representative_request(prompt: String) -> ChatRequest {
+    let mut request = ChatRequest::user_prompt(prompt);
+    request.temperature = Some(0.2);
+    request
+}
+
+impl From<LlmProviderChoice> for ProviderChoice {
+    fn from(value: LlmProviderChoice) -> Self {
+        match value {
+            LlmProviderChoice::Anthropic => Self::Anthropic,
+            LlmProviderChoice::AnthropicOauth => Self::AnthropicOAuth,
+            LlmProviderChoice::Openai => Self::OpenAi,
+            LlmProviderChoice::Gemini => Self::Gemini,
+            LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
+            LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
+            LlmProviderChoice::Codex => Self::Codex,
+            LlmProviderChoice::Copilot => Self::Copilot,
+            LlmProviderChoice::Opencode => Self::OpenCode,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_oauth_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
+            ProviderChoice::AnthropicOAuth
+        );
+    }
+
+    #[test]
+    fn codex_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Codex),
+            ProviderChoice::Codex
+        );
+    }
+
+    #[test]
+    fn llm_test_exercises_pipeline_sampling_compatibility() {
+        let request = representative_request("diagnostic".into());
+
+        assert_eq!(request.temperature, Some(0.2));
+        assert_eq!(request.messages[0].content, "diagnostic");
+    }
+}

@@ -19,6 +19,7 @@ lead: 详细配置按应用内的实际顺序拆成独立页面，覆盖概览�
 | API 密钥 | 客户端访问 Key、过期时间和本地限额 |
 | 日志与可观测性 | 请求日志、Agent 执行追踪、工具调用和工具结果 |
 | 服务配置 | Host、Port、代理模式、系统代理、网络捕获和 CA 证书 |
+| 记忆 | 跨客户端共享项目知识、会话历史、任务交接和客户端接入 |
 
 ## 设置页
 
@@ -29,4 +30,4 @@ lead: 详细配置按应用内的实际顺序拆成独立页面，覆盖概览�
 
 ## 内容关系
 
-概览仪表盘用于查看系统状态和用量；供应商配置覆盖上游模型服务如何进入 AgentRouter；Agent 配置页面覆盖 Claude Code、Codex、OpenCode、Grok CLI、Kimi CLI、Kilo CLI、Pi、ZCode 和 Claude Design 的启动、多开与模型选择；API 密钥控制客户端访问 AgentRouter；日志与可观测性覆盖请求日志和 Agent 执行链路；服务配置控制本地网关监听和代理能力。配置数据库位置和托盘配置对应设置弹窗中的同名配置页。需要配置特色能力时，进入顶部的 [AgentClaw](/agentclaw/)、[Fusion](/fusion/)、[ToolHub](/toolhub/)、[智能路由](/routing/)、[一键导入](/provider-import/) 或 [扩展](/extensions/)。
+概览仪表盘用于查看系统状态和用量；供应商配置覆盖上游模型服务如何进入 AgentRouter；Agent 配置页面覆盖 Claude Code、Codex、OpenCode、Grok CLI、Kimi CLI、Kilo CLI、Pi、ZCode 和 Claude Design 的启动、多开与模型选择；API 密钥控制客户端访问 AgentRouter；日志与可观测性覆盖请求日志和 Agent 执行链路；服务配置控制本地网关监听和代理能力；记忆页覆盖内嵌 ai-memory 运行时的跨客户端知识库、会话采集与任务交接。配置数据库位置和托盘配置对应设置弹窗中的同名配置页。需要配置特色能力时，进入顶部的 [AgentClaw](/agentclaw/)、[Fusion](/fusion/)、[ToolHub](/toolhub/)、[智能路由](/routing/)、[一键导入](/provider-import/) 或 [扩展](/extensions/)。

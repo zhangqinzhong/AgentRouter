@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
+import type { MemoryRequest } from "@agentrouter/core/contracts/memory";
 import { browserErrorI18nLanguage, formatLocalizedErrorMessage } from "@agentrouter/core/contracts/i18n";
 import { IPC_CHANNELS } from "@agentrouter/core/contracts/ipc-channels";
 import type {
@@ -105,6 +106,7 @@ function localizedIpcError(error: unknown): Error {
 }
 
 contextBridge.exposeInMainWorld("agentrouter", {
+  memory: (request: MemoryRequest) => invoke(IPC_CHANNELS.appMemory, request) as Promise<unknown>,
   applyClaudeAppGateway: (config?: AppConfig) => invoke(IPC_CHANNELS.appApplyClaudeAppGateway, config) as Promise<ClaudeAppGatewayApplyResult>,
   applyProfile: () => invoke(IPC_CHANNELS.appApplyProfile) as Promise<ProfileApplyResult>,
   cancelBotGatewayQrLogin: (request: BotGatewayQrLoginCancelRequest) => invoke(IPC_CHANNELS.appBotGatewayQrLoginCancel, request) as Promise<BotGatewayQrLoginCancelResult>,

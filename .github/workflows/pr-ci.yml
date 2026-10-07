@@ -26,8 +26,11 @@ jobs:
       - run: node build/verify-release-version.mjs
       - run: npm run typecheck
       - run: npm run test:collector
+      - run: npm run build:memory
       - run: npm run test:core
       - run: npm run test:ui
+      - run: npm run test:architecture
+      - run: npm run test:gateway-stream
   native:
     name: Native macOS checks
     runs-on: macos-15

@@ -66,6 +66,41 @@ test("web RPC ignores Origin and Referer when the auth token is valid", async ()
   }
 });
 
+test("memory RPC requires management authentication and is available without starting the gateway", async () => {
+  const { startWebManagementServer } = await import("@agentrouter/core/web/management-server.ts");
+  const { gatewayService } = await import("@agentrouter/core/gateway/service.ts");
+  const authToken = "isolated-memory-rpc-token";
+  const runtime = await startWebManagementServer({ authToken, host: "127.0.0.1", port: 0, startGateway: false });
+  assert.equal(gatewayService.getStatus().state, "stopped");
+  const originalStop = gatewayService.stop;
+  let gatewayStopCalls = 0;
+  gatewayService.stop = function (...args) { gatewayStopCalls++; return originalStop.apply(this, args); };
+  try {
+    const unauthenticated = await fetch(new URL("/api/ar/rpc", runtime.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method: "memory", args: [{ action: "status" }] })
+    });
+    assert.equal(unauthenticated.status, 401);
+    const result = await rpc(runtime.url, authToken, "memory", [{ action: "status" }]);
+    assert.equal(result.ok, true);
+    assert.equal(result.value.settings.autoStart, false);
+    assert.equal(result.value.dataDir, path.join(runtimeRoot, "home", ".agentrouter", "ai-memory"));
+    assert.equal("token" in result.value, false);
+    const invalid = await fetch(new URL("/api/ar/rpc", runtime.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-ar-web-auth": authToken },
+      body: JSON.stringify({ method: "memory", args: [{ action: "unknown" }] })
+    });
+    assert.equal(invalid.status, 500);
+    assert.equal((await invalid.json()).ok, false);
+  } finally {
+    try { await runtime.close(); }
+    finally { gatewayService.stop = originalStop; }
+  }
+  assert.equal(gatewayStopCalls, 0, "management-only shutdown must not restore another instance's client/proxy state");
+});
+
 test("startGateway reuses an already healthy AgentRouter gateway on the configured port", async () => {
   const { saveAppConfig } = await import("@agentrouter/core/config/config.ts");
   const { createDefaultAppConfig } = await import("@agentrouter/core/config/default-config.ts");

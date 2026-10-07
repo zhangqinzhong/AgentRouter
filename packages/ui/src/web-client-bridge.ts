@@ -105,6 +105,7 @@ function normalizeExternalHttpUrl(value: string): string {
 }
 
 const webClientBridge: AgentRouterApi = {
+  memory: (request) => rpc("memory", [request]),
   applyClaudeAppGateway: (config) => rpc("applyClaudeAppGateway", [config]) as ReturnType<AgentRouterApi["applyClaudeAppGateway"]>,
   applyProfile: () => rpc("applyProfile") as ReturnType<AgentRouterApi["applyProfile"]>,
   cancelBotGatewayQrLogin: (request) => rpc("cancelBotGatewayQrLogin", [request]) as ReturnType<AgentRouterApi["cancelBotGatewayQrLogin"]>,
