@@ -1,4 +1,5 @@
 export {};
+import type { MemoryRequest } from "@agentrouter/core/contracts/memory";
 
 import type {
   AgentAnalysisFilter,
@@ -92,6 +93,7 @@ import type { ProviderPreset } from "@agentrouter/core/providers/presets/types";
 declare global {
   interface Window {
     agentrouter?: {
+      memory: (request: MemoryRequest) => Promise<unknown>;
       applyClaudeAppGateway: (config?: AppConfig) => Promise<ClaudeAppGatewayApplyResult>;
       applyProfile: () => Promise<ProfileApplyResult>;
       cancelBotGatewayQrLogin: (request: BotGatewayQrLoginCancelRequest) => Promise<BotGatewayQrLoginCancelResult>;

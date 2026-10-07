@@ -20,6 +20,8 @@ playwright-report
 blob-report
 .tmp
 .test-dist
+.cache/
+vendor/ai-memory/target/
 output/
 
 # npm pack output

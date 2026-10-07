@@ -42,6 +42,7 @@ import { getPluginMarketplace } from "@agentrouter/core/plugins/marketplace";
 import { ensureProxyCertificateAuthority } from "@agentrouter/core/proxy/certificates";
 import { proxyService } from "@agentrouter/core/proxy/service";
 import { listMcpServerTools } from "@agentrouter/core/mcp/tool-discovery";
+import { memoryService } from "@agentrouter/core/memory/service";
 import { closeRequestLogRuntime, getAgentAnalysis, getAgentTracePayload, getRequestLogBodyChunk, getRequestLogDetail, getRequestLogs } from "@agentrouter/core/observability/request-log-store";
 import { shouldRecordRequestLogs } from "@agentrouter/core/observability/raw-trace-sync";
 import { getUsageStats, resetOverviewStatistics } from "@agentrouter/core/usage/store";
@@ -195,6 +196,7 @@ export async function startWebManagementServer(options: WebManagementServerOptio
   const url = urlWithWebAuthToken(baseUrl, authToken);
   security = createWebManagementSecurityContext(host, port, authToken);
 
+  void memoryService.autoStart().catch((error) => console.error(`[memory] ${formatError(error)}`));
   if (options.startGateway !== false) {
     await startConfiguredServices("web startup");
   }
@@ -207,7 +209,14 @@ export async function startWebManagementServer(options: WebManagementServerOptio
   return {
     close: async () => {
       await closeServer(server);
-      await stopConfiguredServices();
+      // A management-only preview may share the desktop's real configuration.
+      // If it never started a gateway, do not restore global client/proxy
+      // settings belonging to the still-running desktop instance.
+      if (gatewayService.getStatus().state === "stopped") {
+        await memoryService.shutdown();
+      } else {
+        await stopConfiguredServices();
+      }
       await closeRequestLogRuntime();
     },
     server,
@@ -303,6 +312,7 @@ const unsupportedUpdateStatus: AppUpdateStatus = {
 };
 
 const rpcHandlers: Record<string, RpcHandler> = {
+  memory: (request) => memoryService.request(request),
   applyClaudeAppGateway: async (config?: unknown) => {
     const previousConfig = await loadAppConfig();
     const baseConfig = config ? await saveAppConfig(config as AppConfig) : previousConfig;
@@ -566,6 +576,7 @@ async function startConfiguredServices(reason: string): Promise<void> {
 }
 
 async function stopConfiguredServices(): Promise<void> {
+  await memoryService.shutdown().catch((error) => console.error(`[memory] ${formatError(error)}`));
   stopProviderModelAutoRefreshService();
   await gatewayService.stop({ proxyRestoreTimeoutMs: 30_000 }).catch((error) => {
     console.error(`Failed to stop gateway: ${formatError(error)}`);

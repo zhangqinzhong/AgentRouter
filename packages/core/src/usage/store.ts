@@ -130,6 +130,7 @@ const localOverviewSources = new Map<string, string>([
   ["openclaw", "OpenClaw"],
   ["lmstudio", "LM Studio"],
   ["cursor", "Cursor"],
+  ["grokbot", "Grok Bot"],
   ["antigravity", "Antigravity"],
   ["qoder", "Qoder"],
   ["qoder-cn", "Qoder CN"],

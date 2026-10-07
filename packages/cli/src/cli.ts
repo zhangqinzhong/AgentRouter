@@ -206,8 +206,8 @@ async function main(): Promise<void> {
       return;
     }
     if (profile.agent === "zcode" && resolvedSurface === "app" && profileOptions.agentArgs.length === 0) {
-      const launch = launchZcodeAppProfile(configDir, profile, launchConfig);
-      const spawnError = await waitForImmediateSpawnError(launch.child, 500);
+      const launch = await launchZcodeAppProfile(configDir, profile, launchConfig);
+      const spawnError = launch.child ? await waitForImmediateSpawnError(launch.child, 500) : undefined;
       if (spawnError) {
         throw new Error(`Failed to open ZCode App: ${spawnError}`);
       }

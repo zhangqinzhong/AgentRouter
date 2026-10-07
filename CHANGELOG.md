@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.9.8 - 2026-10-07
+
+### Features
+- Add native memory management with bundled ai-memory 2.5.2, scoped project setup, client integration, and local authenticated access.
+- Capture completed MiMo turns automatically and recall them in subsequent conversations without manual session finalization.
+
+### Fixes
+- Classify Grok Bot usage separately from Cursor across historical statistics and filters without changing token totals.
+- Launch macOS desktop profiles through LaunchServices while preserving proxy environments, isolated configuration, and process tracking.
+- Handle non-JSON gateway error responses without crashing the response pipeline.
+
 ## 1.9.7 - 2026-09-30
 
 ### Fixes

@@ -1324,3 +1324,20 @@ test('overview uses all local sources once and preserves gateway health separate
     assert.equal(empty.series.reduce((n,row)=>n+row.totalTokens,0),0);
   } finally {rmSync(dir,{recursive:true,force:true});}
 });
+
+
+test('overview gives Grok Bot its own client and provider without merging Cursor or Grok Build', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'ar-overview-grokbot-'));
+  try {
+    const store = new UsageStore(path.join(dir, 'usage.sqlite'));
+    const snapshot = await store.getStats('today');
+    const sources = ['grokbot', 'cursor', 'grok'].map(source => ({source, models:[{model:source+'-model',totals:{total_tokens:100}}]}));
+    const result = mergeLocalOverviewSnapshot(snapshot,{totals:{},sources,series:[]},{});
+    assert.deepEqual(result.clientModels.map(r=>r.client),['Grok Bot','Cursor','Grok']);
+    assert.deepEqual(result.providerModels.map(r=>r.provider),['Grok Bot','Cursor','Grok']);
+    assert.equal(result.totals.totalTokens,300);
+    const filtered = mergeLocalOverviewSnapshot(snapshot,{totals:{},sources,series:[]},{provider:'Grok Bot'});
+    assert.equal(filtered.totals.totalTokens,100);
+    assert.equal(filtered.clientModels[0].client,'Grok Bot');
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});

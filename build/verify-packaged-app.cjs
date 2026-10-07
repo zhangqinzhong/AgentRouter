@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 const betterSqliteNativeRelativePath = path.join(
   "app.asar.unpacked",
@@ -44,6 +45,11 @@ module.exports = async function verifyPackagedApp(context) {
     }
     assertFile(path.join(resourcesDir, "AgentRouter.icns"), "Native app icon fallback");
     assertFile(path.join(resourcesDir, "native", "AgentRouterTray"), "Native menu bar executable");
+    const launcher = path.join(resourcesDir, "app-launcher", "AgentRouterAppLauncher");
+    assertFile(launcher, "LaunchServices application launcher");
+    if (arch && !nativeArchMatches(inspectNativeModule(launcher), arch)) {
+      throw new Error("Application launcher architecture does not match the app");
+    }
     const widget = path.join(resourcesDir, "..", "PlugIns", "AgentRouterWidget.appex");
     const widgetInfo = path.join(widget, "Contents", "Info.plist");
     assertFile(widgetInfo, "WidgetKit extension metadata");
@@ -55,6 +61,14 @@ module.exports = async function verifyPackagedApp(context) {
   }
 
   const nativeModule = path.join(resourcesDir, betterSqliteNativeRelativePath);
+  const memoryDir = path.join(resourcesDir, "ai-memory");
+  const memoryManifest = JSON.parse(fs.readFileSync(path.join(memoryDir, "manifest.json"), "utf8"));
+  const memoryBinary = path.join(memoryDir, platform === "win32" ? "ai-memory.exe" : "ai-memory");
+  assertFile(memoryBinary, "Memory runtime");
+  const memoryDigest = crypto.createHash("sha256").update(fs.readFileSync(memoryBinary)).digest("hex");
+  if (memoryManifest.platform !== platform || (arch && memoryManifest.arch !== arch) || memoryDigest !== memoryManifest.binarySha256) {
+    throw new Error("Packaged memory runtime platform or checksum mismatch");
+  }
   assertFile(nativeModule, "better-sqlite3 native module");
 
   const nativeInfo = inspectNativeModule(nativeModule);

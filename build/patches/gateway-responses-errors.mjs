@@ -1,3 +1,4 @@
+import {patchGatewayNonJsonResponse} from './gateway-non-json.mjs';
 import ts from 'typescript';
 import {readFile} from 'node:fs/promises';
 import path from 'node:path';
@@ -88,7 +89,7 @@ export function gatewayResponsesErrorsPlugin(packageRoot){
     build.onLoad({filter:/\.(?:js|ts)$/},async args=>{
       if(!targets.has(path.resolve(args.path)))return;
       const patched=patchGatewayResponsesErrors(await readFile(args.path,'utf8'));
-      return {contents:patched.contents,loader:args.path.endsWith('.ts')?'ts':'js',resolveDir:path.dirname(args.path)};
+      return {contents:patchGatewayNonJsonResponse(patched.contents),loader:args.path.endsWith('.ts')?'ts':'js',resolveDir:path.dirname(args.path)};
     });
   }};
 }

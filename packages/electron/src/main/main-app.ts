@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, shell } from "electron";
+import { memoryService } from "@agentrouter/core/memory/service";
 import { setupApplicationMenu } from "./app-menu";
 import { loadAppConfig } from "@agentrouter/core/config/config";
 import { loadOnboardingFinished } from "@agentrouter/core/config/onboarding-state";
@@ -47,6 +48,7 @@ function startPrimaryInstance(): void {
   });
 
   void app.whenReady().then(async () => {
+    void memoryService.autoStart().catch((error) => console.error(`[memory] ${formatError(error)}`));
     const config = await loadAppConfig();
     applyNativeThemePreference(config.theme);
     windowsManager.setOnboardingFinished(await loadOnboardingFinished());
@@ -186,6 +188,7 @@ function stopServicesForQuit(): Promise<void> {
         console.error(`Failed to stop services before quit: ${formatError(error)}`);
       })
       .finally(async () => {
+        await memoryService.shutdown().catch((error) => console.error(`[memory] ${formatError(error)}`));
         await closeRequestLogRuntime().catch((error) => {
           console.error(`Failed to flush request logs before quit: ${formatError(error)}`);
         });

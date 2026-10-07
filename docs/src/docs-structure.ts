@@ -232,6 +232,13 @@ export const docPages: DocPageDef[] = [
     source: { zh: "configuration/server.md", en: "configuration/server.md" },
   },
   {
+    key: "configuration/memory",
+    section: "configuration",
+    label: { zh: "记忆", en: "Memory" },
+    path: { zh: "/configuration/memory/", en: "/en/configuration/memory/" },
+    source: { zh: "configuration/memory.md", en: "configuration/memory.md" },
+  },
+  {
     key: "configuration/config-file",
     section: "configuration",
     label: { zh: "配置数据库位置", en: "Config database location" },
@@ -472,6 +479,7 @@ export const docSections: DocSectionDef[] = [
           pageItem("configuration/api-keys"),
           pageItem("configuration/observability"),
           pageItem("configuration/server"),
+          pageItem("configuration/memory"),
         ],
       },
       {

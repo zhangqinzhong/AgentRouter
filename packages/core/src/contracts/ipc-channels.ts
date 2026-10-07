@@ -1,4 +1,5 @@
 export const IPC_CHANNELS = {
+  appMemory: "ar:app:memory",
   appBeforeQuit: "ar:app:before-quit",
   appCaptureElementPng: "ar:app:capture-element-png",
   appCloseTray: "ar:app:close-tray",

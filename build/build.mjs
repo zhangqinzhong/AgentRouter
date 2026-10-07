@@ -1,4 +1,6 @@
+import {buildMacOSAppLauncher} from "./macos-app-launcher.mjs";
 import {buildNativeAppIcon} from "./native-app-icon.mjs";
+import { bundleMemoryRuntime } from "./ai-memory-runtime.mjs";
 import {buildNativeWidget} from "./native-widget.mjs";
 import {syncBrand} from "./brand.mjs";
 import { buildNativeTray } from "./native-tray.mjs";
@@ -7,6 +9,7 @@ import { buildBrowserRenderer, buildMain, buildRenderer, buildRequestLogBodyWork
 const mode = process.argv.includes("--dev") ? "development" : "production";
 
 cleanDist();
+buildMacOSAppLauncher();
 buildNativeAppIcon();
 syncBrand();
 copyAppAssets();
@@ -27,6 +30,7 @@ await Promise.all([
 ]);
 
 syncUiRendererToRuntimeDists();
+await bundleMemoryRuntime({ platform: process.env.AR_BUILD_PLATFORM || process.platform, arch: process.env.AR_BUILD_ARCH || process.arch });
 buildNativeTray();
 buildNativeWidget();
 

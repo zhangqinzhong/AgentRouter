@@ -17,7 +17,7 @@ test("sidebar navigation groups pages and hides networking from the sidebar", ()
 
   assert.deepEqual(groups.map((group) => group.label), ["Workspace", "Setup", "Monitor", "Advanced"]);
   assert.deepEqual(groups.map((group) => group.items.map((item) => item.id)), [
-    ["overview", "usage", "sessions", "trend", "heatmap"],
+    ["overview", "usage", "sessions", "trend", "heatmap", "memory"],
     ["providers", "profile", "routing"],
     ["logs", "observability"],
     ["virtual-models", "models", "api-keys", "extensions"]
@@ -26,7 +26,7 @@ test("sidebar navigation groups pages and hides networking from the sidebar", ()
 
   const filteredGroups = groupSidebarNavigation(navigation.filter((item) => item.id !== "observability"));
   assert.deepEqual(filteredGroups.map((group) => group.items.map((item) => item.id)), [
-    ["overview", "usage", "sessions", "trend", "heatmap"],
+    ["overview", "usage", "sessions", "trend", "heatmap", "memory"],
     ["providers", "profile", "routing"],
     ["logs"],
     ["virtual-models", "models", "api-keys", "extensions"]
