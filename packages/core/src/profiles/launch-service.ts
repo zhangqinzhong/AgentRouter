@@ -1,7 +1,8 @@
+import { macOSAppLauncherPath } from "@agentrouter/core/platform/macos-app-launcher";
 import { profileTerminalLaunch } from "@agentrouter/core/profiles/terminal-launch";
 import { syncProfileAliases } from "@agentrouter/core/profiles/aliases";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { assertAvailableGatewayModels, type AppConfig, type ProfileConfig, type ProfileOpenCommandResult, type ProfileOpenRequest, type ProfileOpenResult, type ProfileRuntimeEntry, type ProfileRuntimeStatus, type ProfileStopResult } from "@agentrouter/core/contracts/app";
@@ -102,7 +103,7 @@ type EnsureArCliLauncherOptions = {
 };
 
 type ProfileAppLaunchResult = {
-  child: ChildProcess;
+  child?: ChildProcess;
   command: string;
   launchSignature?: string;
   pidIsLauncher?: boolean;
@@ -321,7 +322,23 @@ async function openOpenCodeAppProfile(config: AppConfig, profile: ReturnType<typ
   };
 }
 
+const pendingCodexAppLaunches = new Map<string, Promise<ProfileOpenResult>>();
+
 async function openCodexAppProfile(config: AppConfig, profile: ReturnType<typeof findProfileForOpen>): Promise<ProfileOpenResult> {
+  if (process.platform !== "darwin") return openCodexAppProfileOnce(config, profile);
+  const key = profileRuntimeKey(profile.id, "app");
+  const pending = pendingCodexAppLaunches.get(key);
+  if (pending) return pending;
+  const launch = openCodexAppProfileOnce(config, profile);
+  pendingCodexAppLaunches.set(key, launch);
+  try {
+    return await launch;
+  } finally {
+    if (pendingCodexAppLaunches.get(key) === launch) pendingCodexAppLaunches.delete(key);
+  }
+}
+
+async function openCodexAppProfileOnce(config: AppConfig, profile: ReturnType<typeof findProfileForOpen>): Promise<ProfileOpenResult> {
   const appName = profile.agent === "zcode"
     ? "ZCode App"
     : profile.agent === "workbuddy"
@@ -362,12 +379,14 @@ async function openCodexAppProfile(config: AppConfig, profile: ReturnType<typeof
     }
   }
   const launch = profile.agent === "zcode"
-    ? launchZcodeAppProfile(CONFIGDIR, profile, profileGatewayConfig)
+    ? await launchZcodeAppProfile(CONFIGDIR, profile, profileGatewayConfig)
     : profile.agent === "workbuddy"
-      ? launchWorkbuddyAppProfile(CONFIGDIR, profile, profileGatewayConfig)
-      : launchCodexAppProfile(CONFIGDIR, profile, profileGatewayConfig);
+      ? await launchWorkbuddyAppProfile(CONFIGDIR, profile, profileGatewayConfig)
+      : await launchCodexAppProfile(CONFIGDIR, profile, profileGatewayConfig);
   const entry = registerProfileApp(profile, "app", launch);
-  const started = await waitForProfileAppStart(entry, 12000);
+  const started = process.platform === "darwin"
+    ? await waitForStableProfileAppStart(entry, 12000, 1000)
+    : await waitForProfileAppStart(entry, 12000);
   if (!started) {
     cleanupProfileAppEntry(profileRuntimeKey(profile.id, "app"), entry);
     sendProfileProcessSignal(entry.pid, "SIGTERM");
@@ -792,6 +811,8 @@ export async function stopProfileFromAr(config: AppConfig, request: ProfileOpenR
   }
 
   const key = profileRuntimeKey(profile.id, surface);
+  // A stop during LaunchServices completion must stop the app once its PID is known.
+  await pendingCodexAppLaunches.get(key)?.catch(() => undefined);
   const entry = runningProfileApps.get(key);
   if (!entry) {
     return {
@@ -853,8 +874,15 @@ function registerProfileApp(
     userDataDir: launch.userDataDir
   };
   runningProfileApps.set(key, entry);
+  if (!launch.child) {
+    // LaunchServices owns the app process; the short-lived helper is not its parent.
+    entry.monitor = setInterval(() => {
+      if (!isProfileAppRunning(entry)) cleanupProfileAppEntry(key, entry);
+    }, 2_000);
+    entry.monitor.unref();
+  }
 
-  launch.child.once("exit", () => {
+  launch.child?.once("exit", () => {
     if (process.platform === "win32" && entry.userDataDir) {
       setTimeout(() => {
         if (isProfileAppRunning(entry)) {
@@ -869,7 +897,7 @@ function registerProfileApp(
     }
     cleanupProfileAppEntry(key, entry);
   });
-  launch.child.once("error", (error) => {
+  launch.child?.once("error", (error) => {
     entry.spawnError = formatError(error);
     cleanupProfileAppEntry(key, entry);
   });
@@ -1619,6 +1647,14 @@ export function prepareArCliLauncherRuntime(): ArCliLauncherPreparation {
   chmodSafe(runtimeFile);
   syncArCliCompanionRuntimes(runtimeSource, binDir);
   syncArCliModelCatalog(runtimeSource, binDir);
+  if (process.platform === "darwin") {
+    const launcherDir = path.join(binDir, "app-launcher");
+    mkdirSync(launcherDir, { recursive: true });
+    const source = macOSAppLauncherPath();
+    const destination = path.join(launcherDir, "AgentRouterAppLauncher");
+    if (source !== destination) copyFileSync(source, destination);
+    chmodSafe(path.join(launcherDir, "AgentRouterAppLauncher"));
+  }
   ensureBundledToolHubMcpRuntime(path.join(binDir, TOOL_HUB_MCP_RUNTIME_FILE_NAME));
   prependProcessPath(binDir);
 

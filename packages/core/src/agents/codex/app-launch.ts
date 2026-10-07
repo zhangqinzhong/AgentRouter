@@ -1,3 +1,4 @@
+import { launchMacOSApplication } from "@agentrouter/core/platform/macos-app-launcher";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -39,7 +40,7 @@ type CodexCompatibleAppSpec = {
 type CodexCompatibleAppModelCatalogConfig = Partial<Pick<AppConfig, "Providers" | "Router" | "virtualModelProfiles">>;
 
 export type CodexAppLaunchResult = {
-  child: ChildProcess;
+  child?: ChildProcess;
   command: string;
   pidIsLauncher?: boolean;
   pid?: number;
@@ -230,7 +231,7 @@ const workbuddyAppSpec: CodexCompatibleAppSpec = {
   ]
 };
 
-export function launchCodexAppProfile(configDir: string, profile: ProfileConfig, config?: AppConfig): CodexAppLaunchResult {
+export async function launchCodexAppProfile(configDir: string, profile: ProfileConfig, config?: AppConfig): Promise<CodexAppLaunchResult> {
   return launchCodexCompatibleAppProfile(configDir, profile, codexAppSpec, config);
 }
 
@@ -242,7 +243,7 @@ export function findInstalledZcodeAppExecutable(profileAppPath?: string): CodexA
   return findInstalledCodexCompatibleAppExecutable(zcodeAppSpec, profileAppPath);
 }
 
-export function launchZcodeAppProfile(configDir: string, profile: ProfileConfig, config?: AppConfig): CodexAppLaunchResult {
+export async function launchZcodeAppProfile(configDir: string, profile: ProfileConfig, config?: AppConfig): Promise<CodexAppLaunchResult> {
   return launchCodexCompatibleAppProfile(configDir, profile, zcodeAppSpec, config);
 }
 
@@ -250,7 +251,7 @@ export function findInstalledWorkbuddyAppExecutable(profileAppPath?: string): Co
   return findInstalledCodexCompatibleAppExecutable(workbuddyAppSpec, profileAppPath);
 }
 
-export function launchWorkbuddyAppProfile(configDir: string, profile: ProfileConfig, config?: AppConfig): CodexAppLaunchResult {
+export async function launchWorkbuddyAppProfile(configDir: string, profile: ProfileConfig, config?: AppConfig): Promise<CodexAppLaunchResult> {
   return launchCodexCompatibleAppProfile(configDir, profile, workbuddyAppSpec, config);
 }
 
@@ -562,12 +563,12 @@ export function removeLegacyCodexVirtualAuthMarker(codexHome: string): boolean {
   }
 }
 
-function launchCodexCompatibleAppProfile(
+async function launchCodexCompatibleAppProfile(
   configDir: string,
   profile: ProfileConfig,
   spec: CodexCompatibleAppSpec,
   config?: AppConfig
-): CodexAppLaunchResult {
+): Promise<CodexAppLaunchResult> {
   const lookup = findInstalledCodexCompatibleAppExecutable(spec, profile.appPath);
   if (!lookup.executable) {
     throw new Error([
@@ -616,6 +617,12 @@ function launchCodexCompatibleAppProfile(
   sanitizeCodexCompatibleAppEnv(env, spec.kind);
 
   const launch = codexAppLaunchCommand(lookup.executable, userDataDir);
+  if (process.platform === "darwin") {
+    const bundle = macAppBundleFromExecutable(lookup.executable);
+    if (!bundle) throw new Error("macOS desktop profiles require an application bundle.");
+    const pid = await launchMacOSApplication(bundle, launch.args, env);
+    return { command: lookup.executable, pid, userDataDir };
+  }
   const child = spawn(launch.command, launch.args, {
     detached: true,
     env,
