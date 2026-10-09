@@ -124,7 +124,9 @@ test('rolling day trend axis keeps real cross-day hour keys without future slots
  assert.equal(points[8].tokens,120,'yesterday 20:00 stays in the axis');
  assert.equal(points[24].tokens,30,'the current hour is the last slot');
  assert.equal(points[0].label,'12:00');
- assert.equal(points[24].label,'12:00');
+ assert.equal(points[12].label,'29日 00:00');
+ assert.equal(points[24].label,'29日 12:00');
+ assert.equal(new Set(points.map((point)=>point.label)).size,points.length);
 });
 test('session resume args follow each agent CLI and prefer tagged AgentRouter profiles',()=>{
  assert.deepEqual(resumeExtraArgs('codex','abc-123'),['resume','abc-123']);
