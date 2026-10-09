@@ -6,7 +6,7 @@ import { formatCodexResetCardExpiry, formatCodexResetCardNumber } from "@agentro
 import { OverviewStatisticsResetDialog, OverviewView } from "@agentrouter/ui/pages/home/components/overview.tsx";
 import { breakdownBrandIconUrl, OverviewBreakdowns } from "@agentrouter/ui/pages/home/components/overview-breakdown.tsx";
 import { adaptSeriesToTrendRows, overviewTrendFromTo } from "@agentrouter/ui/pages/home/components/overview-trend.tsx";
-import { completeTrendPoints } from "@agentrouter/ui/pages/home/components/usage-trend-line.tsx";
+import { completeTrendPoints, trendAxisTicks } from "@agentrouter/ui/pages/home/components/usage-trend-line.tsx";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { parseStatusBucketDate } from "@agentrouter/ui/pages/home/shared/controls.tsx";
 import { formatProviderAccountMeterValue, providerAccountMeterDetailValidityProgress, providerAccountProgressClass } from "@agentrouter/ui/pages/home/shared/provider-accounts.ts";
@@ -530,6 +530,19 @@ test("Overview keeps statistics visible while local collection refreshes", () =>
 });
 
 
+test("overview trend scale uses a short even axis that covers the peak", () => {
+  assert.deepEqual(trendAxisTicks(30_000_000, 2), [0, 15_000_000, 30_000_000]);
+  assert.deepEqual(trendAxisTicks(28_000_000, 2), [0, 15_000_000, 30_000_000]);
+  assert.deepEqual(trendAxisTicks(30_000_000, 4), [0, 10_000_000, 20_000_000, 30_000_000]);
+  assert.deepEqual(trendAxisTicks(0, 2), [0]);
+  assert.deepEqual(trendAxisTicks(Number.NaN, 2), [0]);
+  assert.deepEqual(trendAxisTicks(1, 2), [0, 1]);
+  assert.deepEqual(trendAxisTicks(1, 4), [0, 1]);
+  const small = trendAxisTicks(3, 4);
+  assert.deepEqual(small, [...new Set(small)]);
+  assert.ok(small[small.length - 1] >= 3);
+});
+
 test("overview Today axis ends this hour while 24h retains yesterday's date", () => {
   const now = new Date(2026, 8, 30, 10, 35);
   assert.deepEqual(overviewTrendFromTo([], "today", now), {from:"2026-09-30T00:00:00",to:"2026-09-30T10:00:00"});
@@ -545,6 +558,17 @@ test("overview Today axis ends this hour while 24h retains yesterday's date", ()
   assert.equal(todayPoints[0].label, "00:00");
   assert.equal(todayPoints[10].label, "10:00");
   assert.equal(todayPoints[10].tokens, 200);
+  const rolling = completeTrendPoints(rows, "day", "2026-09-29T10:00:00", "2026-09-30T10:00:00");
+  assert.equal(rolling.length, 25);
+  assert.equal(rolling[0].label, "10:00");
+  assert.equal(rolling[0].tokens, 100);
+  assert.equal(rolling[14].label, "30日 00:00");
+  assert.equal(rolling[24].label, "30日 10:00");
+  assert.equal(rolling[24].tokens, 200);
+  assert.equal(new Set(rolling.map((point) => point.label)).size, rolling.length);
+  const acrossMonths = completeTrendPoints([], "day", "2026-09-30T22:00:00", "2026-10-01T22:00:00");
+  assert.equal(acrossMonths[2].label, "10月1日 00:00");
+  assert.equal(acrossMonths[acrossMonths.length - 1].label, "10月1日 22:00");
 });
 
 test('local subscription accounts show all four Cursor quotas without internal credential IDs', () => {

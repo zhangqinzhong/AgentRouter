@@ -74,9 +74,52 @@ function fillMonthPoints(
  return points;
 }
 
+// A fixed 44px axis clips labels such as 3000万, and five ticks collide in the
+// 140px overview chart. Pick a short 1–1.5–2–2.5–5 step that still covers the peak.
+// Token counts are whole numbers, so the step never drops below 1.
+export function trendAxisTicks(maxValue:number,intervals=2){
+ const safeMax=Number.isFinite(maxValue)&&maxValue>0?maxValue:0;
+ if(safeMax===0)return [0];
+ const slots=Math.max(1,Math.round(intervals));
+ const rough=Math.max(safeMax/slots,1);
+ const magnitude=10**Math.floor(Math.log10(rough));
+ const normalized=rough/magnitude;
+ const nice=[1,1.5,2,2.5,5,10].find((value)=>value>=normalized-1e-6)??10;
+ const step=Math.max(1,nice*magnitude);
+ const count=Math.max(1,Math.ceil(safeMax/step-1e-9));
+ const ticks=[0];
+ let last=0;
+ for(let index=1;index<=count;index+=1){
+  const tick=Math.round(step*index);
+  if(tick<=last)continue;
+  ticks.push(tick);
+  last=tick;
+ }
+ return ticks;
+}
+
 function rowTokens(row:TrendRow|undefined){
  const value=Number(row?.billable_total_tokens??row?.total_tokens??0);
  return Number.isFinite(value)&&value>0?value:0;
+}
+
+// A rolling window repeats the starting clock hour at the right edge. Recharts
+// looks the tooltip up by that text, so a second "07:00" would resolve to the
+// first point and draw yesterday after today. Date the later copy.
+function rollingHourLabel(date:Date,state:{previousDay:string;seen:Map<string,number>;spanMonths:boolean;locale:string}){
+ const clock=`${pad(date.getHours())}:00`;
+ const day=dayKey(date);
+ const seen=(state.seen.get(clock)??0)+1;
+ state.seen.set(clock,seen);
+ const dayChanged=state.previousDay!==''&&state.previousDay!==day;
+ state.previousDay=day;
+ if(!dayChanged&&seen===1)return clock;
+ const dayNumber=date.getDate();
+ if(state.locale.startsWith('zh')){
+  const dateText=state.spanMonths?`${date.getMonth()+1}月${dayNumber}日`:`${dayNumber}日`;
+  return `${dateText} ${clock}`;
+ }
+ return `${formatTickLabel({day},'daily',state.locale)} ${clock}`;
 }
 
 function addTokenRows(left:TrendRow|undefined,right:TrendRow):TrendRow{
@@ -126,11 +169,14 @@ export function completeTrendPoints(rows:TrendRow[],period:TrendPeriod,from:stri
    // between on the real dates; there are no future slots by construction.
    const startMs=new Date(from).getTime();
    const endMs=new Date(to&&to.indexOf('T')>=0?to:from).getTime();
+   const startDate=new Date(startMs);
+   const endDate=new Date(endMs);
+   const hourState={previousDay:'',seen:new Map<string,number>(),spanMonths:startDate.getFullYear()!==endDate.getFullYear()||startDate.getMonth()!==endDate.getMonth(),locale};
    for(let ts=startMs;ts<=endMs;ts+=3600000){
     const d=new Date(ts);
     const key=`${dayKey(d)}T${pad(d.getHours())}`;
     const row=byHour.get(key);
-    points.push({label:`${pad(d.getHours())}:00`,tokens:rowTokens(row),row:row||{hour:`${key}:00:00`}});
+    points.push({label:rollingHourLabel(d,hourState),tokens:rowTokens(row),row:row||{hour:`${key}:00:00`}});
    }
    return points;
   }
@@ -259,10 +305,13 @@ export function UsageTrendLineChart({
  const scrollerRef=useRef<HTMLDivElement>(null);
  const grain=useMemo(()=>trendAxisGrain(period,from,to),[from,period,to]);
  const points=useMemo(()=>completeTrendPoints(rows,period,from,to),[from,period,rows,to]);
+ const yTicks=useMemo(()=>trendAxisTicks(Math.max(0,...points.map((point)=>point.tokens)),size==='full'?4:2),[points,size]);
+ const yMax=yTicks[yTicks.length-1]||0;
  const height=size==='full'?'h-[min(52vh,520px)] min-h-[320px]':'h-[140px]';
  const pan=size==='full'&&points.length>14;
  const innerWidth=pan?Math.max(points.length*(grain==='monthly'?64:40),720):undefined;
  const longAxis=period==='custom'||period==='total'||period==='month';
+ const marginRight=points.some((point)=>point.label.length>5)?64:32;
  useEffect(()=>{
   const node=scrollerRef.current;
   if(!node||!pan)return undefined;
@@ -285,7 +334,7 @@ export function UsageTrendLineChart({
     <div ref={scrollerRef} className={`w-full ${height} ${pan?'overflow-x-auto overflow-y-hidden [scrollbar-width:thin]':''}`}>
      <div className="h-full" style={innerWidth?{width:innerWidth,minWidth:'100%'}:{width:'100%'}}>
       <ResponsiveContainer width="100%" height="100%">
-       <AreaChart data={points} margin={{top:8,right:32,left:0,bottom:4}}>
+       <AreaChart data={points} margin={{top:16,right:marginRight,left:0,bottom:4}}>
         <defs>
          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={LINE} stopOpacity={0.32}/>
@@ -294,7 +343,7 @@ export function UsageTrendLineChart({
         </defs>
         <CartesianGrid stroke="rgba(128,128,128,0.18)" strokeDasharray="2 5" vertical={false}/>
         <XAxis axisLine={false} dataKey="label" interval="preserveStartEnd" minTickGap={longAxis||pan?24:8} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickLine={false}/>
-        <YAxis axisLine={false} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickFormatter={(value)=>formatTokenCount(Number(value)||0)} tickLine={false} width={44}/>
+        <YAxis allowDecimals={false} axisLine={false} domain={yMax>0?[0,yMax]:[0,1]} fontSize={11} interval={0} padding={{top:0,bottom:8}} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickFormatter={(value)=>formatTokenCount(Number(value)||0)} tickLine={false} ticks={yTicks} width="auto"/>
         <Tooltip content={<TrendHoverTooltip grain={grain} period={period}/>} cursor={{stroke:'rgba(60,60,60,0.28)',strokeWidth:1}} wrapperStyle={{zIndex:40,outline:'none'}}/>
         <Area
          activeDot={{r:4,stroke:LINE,fill:LINE,strokeWidth:0}}

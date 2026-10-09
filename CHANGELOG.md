@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.9.10 - 2026-10-09
+
+### Fixes
+- Keep overview usage-trend labels inside the chart. The compact axis uses a short scale that covers the peak, and the label width follows the text.
+- Keep a rolling 24-hour trend in chronological order when the window starts and ends on the same clock hour. The later copy and each new calendar day include the date, so the right edge stays on the current hour.
+
 ## 1.9.9 - 2026-10-09
 
 ### Fixes
