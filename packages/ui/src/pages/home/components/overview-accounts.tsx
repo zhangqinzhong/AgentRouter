@@ -353,13 +353,13 @@ function ProviderAccountMeterLine({
       )}
       {progress !== undefined ? (
         <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
-          <div className={cn("h-full rounded-full", providerAccountProgressClass(account.status))} style={{ width: `${progress}%` }} />
+          <div className={cn("h-full rounded-full", providerAccountProgressClass(meter))} style={{ width: `${progress}%` }} />
         </div>
       ) : null}
       <AnimatePresence initial={false}>
         {canExpandDetails && detailsOpen ? (
           <AnimatedDisclosure>
-            <ProviderAccountMeterDetails account={account} detailsId={detailsId} meter={meter} onReset={setResetDialogDetail} />
+            <ProviderAccountMeterDetails detailsId={detailsId} meter={meter} onReset={setResetDialogDetail} />
           </AnimatedDisclosure>
         ) : null}
       </AnimatePresence>
@@ -376,12 +376,10 @@ function ProviderAccountMeterLine({
 }
 
 function ProviderAccountMeterDetails({
-  account,
   detailsId,
   meter,
   onReset
 }: {
-  account: ProviderAccountSnapshot;
   detailsId: string;
   meter: ProviderAccountMeter;
   onReset: (detail: NonNullable<ProviderAccountMeter["details"]>[number]) => void;
@@ -426,7 +424,7 @@ function ProviderAccountMeterDetails({
             </div>
             {detailProgress !== undefined ? (
               <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted">
-                <div className={cn("h-full rounded-full", providerAccountProgressClass(account.status))} style={{ width: `${detailProgress}%` }} />
+                <div className="h-full rounded-full bg-emerald-500" style={{ width: `${detailProgress}%` }} />
               </div>
             ) : null}
           </div>

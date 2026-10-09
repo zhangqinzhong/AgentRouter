@@ -149,13 +149,11 @@ export function providerAccountBadgeVariant(status: ProviderAccountSnapshot["sta
   return "outline";
 }
 
-export function providerAccountProgressClass(status: ProviderAccountSnapshot["status"]): string {
-  if (status === "critical" || status === "error") {
-    return "bg-red-500";
-  }
-  if (status === "warning") {
-    return "bg-amber-500";
-  }
+// Quota colors describe this meter, not account refresh health or another meter.
+export function providerAccountProgressClass(meter: ProviderAccountMeter): string {
+  const remaining = providerAccountMeterRemainingRatio(meter);
+  if (remaining !== undefined && remaining <= 0.1) return "bg-red-500";
+  if (remaining !== undefined && remaining <= 0.25) return "bg-amber-500";
   return "bg-emerald-500";
 }
 
