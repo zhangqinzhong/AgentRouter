@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.9.9 - 2026-10-09
+
+### Fixes
+- Fix overview hourly usage trend axis in non-UTC timezones to align 24h and today hourly buckets with local calendar hours.
+- Fix overview subscription account meter bar colors to reflect remaining allowance rather than account refresh status.
+
 ## 1.9.8 - 2026-10-07
 
 ### Features

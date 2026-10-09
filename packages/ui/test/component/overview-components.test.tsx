@@ -6,9 +6,10 @@ import { formatCodexResetCardExpiry, formatCodexResetCardNumber } from "@agentro
 import { OverviewStatisticsResetDialog, OverviewView } from "@agentrouter/ui/pages/home/components/overview.tsx";
 import { breakdownBrandIconUrl, OverviewBreakdowns } from "@agentrouter/ui/pages/home/components/overview-breakdown.tsx";
 import { adaptSeriesToTrendRows, overviewTrendFromTo } from "@agentrouter/ui/pages/home/components/overview-trend.tsx";
+import { completeTrendPoints } from "@agentrouter/ui/pages/home/components/usage-trend-line.tsx";
 import { AppI18nContext, appCopy } from "@agentrouter/ui/pages/home/shared/i18n.tsx";
 import { parseStatusBucketDate } from "@agentrouter/ui/pages/home/shared/controls.tsx";
-import { formatProviderAccountMeterValue, providerAccountMeterDetailValidityProgress } from "@agentrouter/ui/pages/home/shared/provider-accounts.ts";
+import { formatProviderAccountMeterValue, providerAccountMeterDetailValidityProgress, providerAccountProgressClass } from "@agentrouter/ui/pages/home/shared/provider-accounts.ts";
 import type { GatewayProviderConfig, ProviderAccountSnapshot } from "@agentrouter/core/contracts/app.ts";
 import type { UsageStatsSnapshot } from "@agentrouter/core/contracts/app.ts";
 import { accountSnapshots, installBrowserGlobals, usageRow, usageStats } from "../fixtures/index.ts";
@@ -539,6 +540,11 @@ test("overview Today axis ends this hour while 24h retains yesterday's date", ()
     {...base,bucket:"2026-09-30 10:00",totalTokens:200},
   ], true);
   assert.deepEqual(rows.map(row=>[row.hour,row.total_tokens]), [["2026-09-29T10:00:00",100],["2026-09-30T10:00:00",200]]);
+  const todayPoints = completeTrendPoints(rows, "day", "2026-09-30T00:00:00", "2026-09-30T10:00:00");
+  assert.equal(todayPoints.length, 11);
+  assert.equal(todayPoints[0].label, "00:00");
+  assert.equal(todayPoints[10].label, "10:00");
+  assert.equal(todayPoints[10].tokens, 200);
 });
 
 test('local subscription accounts show all four Cursor quotas without internal credential IDs', () => {
@@ -598,5 +604,19 @@ test("overview groups subscriptions before provider balances regardless of refre
     const offsets = labels.map(label => section.indexOf(`>${label}</span>`));
     assert.ok(offsets.every(offset => offset >= 0));
     assert.deepEqual([...offsets].sort((a, b) => a - b), offsets);
+  }
+});
+
+
+test("account quota colors follow each remaining allowance, not refresh errors", () => {
+  const meter = {id:"quota",label:"Quota",kind:"quota" as const,unit:"%",limit:100,remaining:88};
+  assert.equal(providerAccountProgressClass(meter), "bg-emerald-500");
+  assert.equal(providerAccountProgressClass({...meter,remaining:25}), "bg-amber-500");
+  assert.equal(providerAccountProgressClass({...meter,remaining:10}), "bg-red-500");
+  const base = accountSnapshots()[0];
+  for (const status of ["error", "critical", "warning"] as const) {
+    const html = renderOverview({providerAccounts:[{...base,status,meters:[meter,{...meter,id:"low",remaining:5}]}]});
+    assert.match(html, /bg-emerald-500[^>]*style="width:88%"/);
+    assert.match(html, /bg-red-500[^>]*style="width:5%"/);
   }
 });
