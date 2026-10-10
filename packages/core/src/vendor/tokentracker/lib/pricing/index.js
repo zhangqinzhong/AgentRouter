@@ -129,6 +129,50 @@ function getModelPricing(model, opts = {}) {
   return ZERO_PRICING;
 }
 
+// Callers hit this once per queue row, and a miss walks the whole LiteLLM map,
+// so results are memoized per pricing revision. Copies go out so a caller that
+// mutates its object cannot poison the cache.
+const pricingInfoCache = { revision: -1, entries: new Map() };
+
+// Preserve matcher provenance: a known zero rate is free, a missing model is
+// unpriced. Both return zero dollars, but they mean different things in the UI.
+function getModelPricingInfo(model, opts = {}) {
+  const source = typeof opts === "string" ? opts : opts.source;
+  const sourceKey = typeof source === "string" ? source.toLowerCase() : null;
+  if (pricingInfoCache.revision !== state.revision) {
+    pricingInfoCache.revision = state.revision;
+    pricingInfoCache.entries.clear();
+  }
+  const cacheKey = `${sourceKey || ""}\0${model || ""}`;
+  let info = pricingInfoCache.entries.get(cacheKey);
+  if (!info) {
+    info = computeModelPricingInfo(model, opts, sourceKey);
+    pricingInfoCache.entries.set(cacheKey, info);
+  }
+  return { ...info };
+}
+
+function computeModelPricingInfo(model, opts, sourceKey) {
+  if (LOCAL_INFERENCE_SOURCES.has(sourceKey) || PI_SUBSCRIPTION_SOURCES.has(sourceKey)) {
+    return { status: "free", source: LOCAL_INFERENCE_SOURCES.has(sourceKey) ? "local_inference" : "subscription", ...ZERO_PRICING };
+  }
+  const result = lookupPricing(model, {
+    curated: curatedOverrides,
+    litellm: state.litellmPerMillionMap,
+    source: sourceKey,
+  });
+  const rates = getModelPricing(model, opts);
+  return {
+    status: !result.hit ? "unpriced" : [rates.input, rates.output, rates.cache_read, rates.cache_write]
+      .some((value) => Number(value) > 0) ? "priced" : "free",
+    source: result.hit ? result.source : null,
+    input: Number(rates.input) || 0,
+    output: Number(rates.output) || 0,
+    cache_read: Number(rates.cache_read) || 0,
+    cache_write: Number(rates.cache_write) || 0,
+  };
+}
+
 function isDeepSeekTimePricedModel(model) {
   const lower = String(model || "").toLowerCase();
   return DEEPSEEK_TIME_PRICED_MODELS.some((name) => lower.includes(name));
@@ -252,6 +296,7 @@ module.exports = {
   ensurePricingLoaded,
   getPricingRevision,
   getModelPricing,
+  getModelPricingInfo,
   getRowPricing,
   computeRowCost,
   resetPricingForTests,

@@ -608,15 +608,28 @@ async function fetchGrokBilling(
       headers,
       deadlineMs,
     );
-    if (creditsResult.ok) return creditsResult.body;
-    creditsFailure = `HTTP ${creditsResult.status}`;
+    if (creditsResult.ok) {
+      // Keep the unified pool even when its fields are malformed. The caller
+      // must surface its parse error rather than substitute a legacy pool.
+      if (creditsResult.body?.config?.currentPeriod) return creditsResult.body;
+      try {
+        // Only a response without a unified period is eligible for shape
+        // fallback; a parseable legacy response can already be used as-is.
+        normalizeGrokBillingResponse(creditsResult.body);
+        return creditsResult.body;
+      } catch (error) {
+        creditsFailure = `unrecognized response (${error?.message || "invalid billing data"})`;
+      }
+    } else {
+      creditsFailure = `HTTP ${creditsResult.status}`;
+    }
   } catch (error) {
     if (error?.code === "GROK_AUTH_REQUIRED") throw error;
     if (error?.code === "GROK_BILLING_TIMEOUT") throw error;
   }
 
-  // Non-auth HTTP, network, or response-decoding failure → try the legacy
-  // shape once, while sharing the original request deadline.
+  // Non-auth HTTP, network, response-decoding, or shape failure → try the
+  // legacy shape once, while sharing the original request deadline.
   let legacyResult;
   try {
     legacyResult = await fetchGrokBillingAttempt(

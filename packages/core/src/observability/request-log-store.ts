@@ -973,9 +973,10 @@ export class RequestLogStore {
       if (mergedRequestHeaders) {
         pushValue("request_headers", JSON.stringify(mergedRequestHeaders));
       }
-      if (responseHeaders) {
-        pushValue("response_headers", JSON.stringify(responseHeaders));
-      }
+      // Gateway response headers include retry/status metadata absent from raw
+      // upstream traces. Keep those authoritative headers; use trace headers
+      // below only to refine body usage and billing.
+
       if (input.responseBodyText !== undefined || responseHeaders) {
         const bodyUsage = input.responseBodyText === undefined
           ? undefined
