@@ -570,6 +570,7 @@ async function parseCodexRolloutFile(filePath, {
   collectBreakdowns = true,
   collectModelUsage = false,
   onObject = null,
+  onUsage = null,
 } = {}) {
   const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
   const primaryFilePath = filePaths[0] || String(filePath || "");
@@ -1039,16 +1040,20 @@ async function parseCodexRolloutFile(filePath, {
       }
       const rawDelta = consumeUsageDelta(usageDeltaState, lastUsage, totalUsage);
       const delta = rawDelta ? normalizeUsage(rawDelta) : null;
+      // Timing consumers receive canonical, deduplicated usage below. A null
+      // delta is a snapshot, not another model response.
       if (compaction) countCompactionRecord(compaction);
       const isNewResumeEvent = noteTokenEvent(ts, lastUsage, totalUsage);
       if (inRequestedRange) {
         const eventSessionId = sessionId || rolloutSessionIdFromPath(primaryFilePath) || primaryFilePath;
         const eventKey = `${eventSessionId}:${ts}:${usageEventSignature(lastUsage, totalUsage)}`;
         if (!isNewResumeEvent || (seenTokenEvents && seenTokenEvents.has(eventKey))) {
+          if (typeof onUsage === "function") onUsage({ timestamp: ts, delta: null, rawUsage: lastUsage, model: attributedModel });
           attributeTurn(null);
         } else {
           if (seenTokenEvents && delta?.total_tokens > 0) seenTokenEvents.add(eventKey);
           recordModelUsage(delta, lastUsage || rawDelta);
+          if (typeof onUsage === "function") onUsage({ timestamp: ts, delta, rawUsage: lastUsage || rawDelta, model: attributedModel });
           attributeTurn(delta);
         }
       } else {

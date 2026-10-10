@@ -1,3 +1,4 @@
+const { claudeUserIdentity, collectClaudeForkAliases } = require("./claude-user-identity");
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
 const os = require("node:os");
@@ -909,6 +910,35 @@ async function parseClaudeIncremental({
   const prevHashes = Array.isArray(cursors.claudeHashes) ? cursors.claudeHashes : [];
   const seenMessageHashes = new Set(prevHashes);
   const defaultSource = normalizeSourceInput(source) || "claude";
+  // Resolve all changed-file lineage before counting: fork files may sort first.
+  const forkTimes = new Map();
+  const forkAliases = await collectClaudeForkAliases(files, cursors,
+    (obj) => { if (typeof obj.timestamp === "string") forkTimes.set(obj.uuid, obj.timestamp); });
+  {
+    // Correct only copies whose old UUID identities prove they were counted.
+    // Preserve all token totals and history whose source files were removed.
+    const families = new Map();
+    const familyTimes = new Map();
+    for (const [uuid, ts] of forkTimes) familyTimes.set(claudeUserIdentity({ uuid }, forkAliases), ts);
+    for (const hash of prevHashes) {
+      if (typeof hash !== "string" || !hash.startsWith("u:")) continue;
+      const canonical = claudeUserIdentity({ uuid: hash.slice(2) }, forkAliases);
+      families.set(canonical, (families.get(canonical) || 0) + 1);
+      seenMessageHashes.delete(hash);
+      seenMessageHashes.add(canonical);
+    }
+    for (const [canonical, count] of families) {
+      if (count < 2) continue;
+      const ts = familyTimes.get(canonical);
+      const hour = ts ? toUtcHalfHourStart(ts) : null;
+      if (!hour) continue;
+      const key = bucketKey(defaultSource, DEFAULT_MODEL, hour);
+      const bucket = hourlyState.buckets[key];
+      if (!bucket || bucket.totals.conversation_count < count - 1) continue;
+      bucket.totals.conversation_count -= count - 1;
+      touchedBuckets.add(key);
+    }
+  }
 
   if (!cursors.files || typeof cursors.files !== "object") {
     cursors.files = {};
@@ -1082,11 +1112,13 @@ async function parseClaudeIncremental({
       projectRef,
       projectKey,
       seenMessageHashes,
+      forkAliases,
     });
 
     cursors.files[key] = {
       inode,
       offset: result.endOffset,
+      claudeForkIndexed: true,
       updatedAt: new Date().toISOString(),
       ...(fileId ? { fileId, fileIdSize: st.size } : {}),
       ...(projectEnabled
@@ -1125,6 +1157,7 @@ async function parseClaudeIncremental({
     cursors.projectHourly = projectState;
   }
   // Persist message hashes for cross-sync dedup; cap at 100k entries to bound size.
+  cursors.claudeForkAliases = forkAliases;
   const allHashes = Array.from(seenMessageHashes);
   cursors.claudeHashes =
     allHashes.length > 100_000 ? allHashes.slice(allHashes.length - 100_000) : allHashes;
@@ -2559,6 +2592,7 @@ async function parseClaudeFile({
   projectRef,
   projectKey,
   seenMessageHashes,
+  forkAliases,
 }) {
   const st = fileStat || (await fs.stat(filePath).catch(() => null));
   if (!st || !st.isFile()) return { endOffset: startOffset, eventsAggregated: 0 };
@@ -2593,15 +2627,9 @@ async function parseClaudeFile({
           typeof content === "string" ||
           (Array.isArray(content) && content.some((b) => b?.type === "text"));
         if (hasText) {
-          // Dedup by the line's uuid so a synced copy of the session file
-          // (WSL mirror of a divergent native file, inode-reset re-read)
-          // cannot re-count the conversation. Usage rows get the same
-          // guarantee from claudeMessageDedupKey; user lines have no
-          // message.id, so the line uuid is the identity.
-          const userKey =
-            seenMessageHashes && typeof userObj?.uuid === "string" && userObj.uuid
-              ? `u:${userObj.uuid}`
-              : null;
+          // Copied user rows share their original identity through the full
+          // fork lineage. Token dedup remains independent.
+          const userKey = seenMessageHashes ? claudeUserIdentity(userObj, forkAliases) : null;
           if (!userKey || !seenMessageHashes.has(userKey)) {
             if (userKey) seenMessageHashes.add(userKey);
             const userTs = typeof userObj?.timestamp === "string" ? userObj.timestamp : null;
@@ -3548,10 +3576,9 @@ function deriveOpencodeMessageFingerprint({ msg, totals, source }) {
   return crypto.createHash("sha256").update(raw).digest("base64url").slice(0, 22);
 }
 
-// `fingerprint -> messageKey` for counted messages in this cursor namespace.
-// Rebuilt per parse run. Pre-#426 entries are fingerprinted as they are read;
-// the first claims ownership and later cross-session matches are retracted from
-// persisted buckets once. Tombstoned copies never claim ownership themselves.
+// `fingerprint -> Set<messageKey>` for counted messages in this cursor namespace.
+// Same-session duplicates are all retained as owners; the first session remains
+// canonical for cross-session fork copies. Tombstoned copies never claim ownership.
 function buildOpencodeFingerprintIndex(messageIndex, wantedFingerprints = null) {
   const byFingerprint = new Map();
   if (!messageIndex || typeof messageIndex !== "object") return byFingerprint;
@@ -3559,12 +3586,9 @@ function buildOpencodeFingerprintIndex(messageIndex, wantedFingerprints = null) 
     const entry = messageIndex[key];
     if (entry?.dedupedForkCopy === true) continue;
     const fingerprint = entry && typeof entry.fingerprint === "string" ? entry.fingerprint : null;
-    if (
-      fingerprint &&
-      (!wantedFingerprints || wantedFingerprints.has(fingerprint)) &&
-      !byFingerprint.has(fingerprint)
-    ) {
-      byFingerprint.set(fingerprint, key);
+    if (fingerprint && (!wantedFingerprints || wantedFingerprints.has(fingerprint))) {
+      if (!byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, new Set());
+      byFingerprint.get(fingerprint).add(key);
     }
   }
   return byFingerprint;
@@ -3582,12 +3606,18 @@ function opencodeMessageKeySession(messageKey) {
 // must not delete usage.
 function isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey) {
   if (!fingerprint || !fingerprintIndex) return false;
-  const owner = fingerprintIndex.get(fingerprint);
-  if (!owner || owner === messageKey) return false;
-  const ownerSession = opencodeMessageKeySession(owner);
+  const owners = fingerprintIndex.get(fingerprint);
+  if (!owners) return false;
   const session = opencodeMessageKeySession(messageKey);
-  if (!ownerSession || !session) return false;
-  return ownerSession !== session;
+  if (!session) return false;
+  let hasCrossSessionOwner = false;
+  for (const owner of owners instanceof Set ? owners : [owners]) {
+    const ownerSession = opencodeMessageKeySession(owner);
+    if (!ownerSession) continue;
+    if (owner === messageKey) return false;
+    if (ownerSession !== session) hasCrossSessionOwner = true;
+  }
+  return hasCrossSessionOwner;
 }
 
 function normalizeOpencodeAttribution(raw) {
@@ -3665,8 +3695,16 @@ function recordOpencodeMessage({
     prevDeduped === Boolean(dedupedForkCopy)
   ) return;
 
-  if (fingerprintIndex && prevFingerprint && prevFingerprint !== nextFingerprint) {
-    if (fingerprintIndex.get(prevFingerprint) === messageKey) {
+  if (
+    fingerprintIndex &&
+    prevFingerprint &&
+    (prevFingerprint !== nextFingerprint || dedupedForkCopy)
+  ) {
+    const owners = fingerprintIndex.get(prevFingerprint);
+    if (owners instanceof Set) {
+      owners.delete(messageKey);
+      if (owners.size === 0) fingerprintIndex.delete(prevFingerprint);
+    } else if (owners === messageKey) {
       fingerprintIndex.delete(prevFingerprint);
     }
   }
@@ -3675,13 +3713,12 @@ function recordOpencodeMessage({
   if (nextAttribution) entry.attribution = encodeOpencodeAttribution(nextAttribution);
   if (dedupedForkCopy) entry.dedupedForkCopy = true;
   messageIndex[messageKey] = entry;
-  if (
-    fingerprintIndex &&
-    nextFingerprint &&
-    !dedupedForkCopy &&
-    !fingerprintIndex.has(nextFingerprint)
-  ) {
-    fingerprintIndex.set(nextFingerprint, messageKey);
+  if (fingerprintIndex && nextFingerprint && !dedupedForkCopy) {
+    if (!fingerprintIndex.has(nextFingerprint)) {
+      fingerprintIndex.set(nextFingerprint, new Set());
+    }
+    const owners = fingerprintIndex.get(nextFingerprint);
+    if (owners instanceof Set) owners.add(messageKey);
   }
 }
 
@@ -21887,6 +21924,7 @@ module.exports = {
   toUtcHalfHourStart,
   totalsKey,
   claudeMessageDedupKey,
+  normalizeClaudeUsage,
   groupBucketKey,
   // Exposed for regression tests covering nested-group remote URLs.
   canonicalizeProjectRef,

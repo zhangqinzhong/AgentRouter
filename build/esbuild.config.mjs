@@ -538,7 +538,18 @@ export async function buildMain(options = {}) {
     buildCli(options)
   ]);
   copyCliRuntimeToElectronDist();
-  for (const out of [electronMainOutDir, coreMainOutDir, cliMainOutDir]) cpSync(path.join(coreSourceRoot, "vendor", "tokentracker"), path.join(out, "tokentracker"), {recursive:true});
+  for (const out of [electronMainOutDir, coreMainOutDir, cliMainOutDir]) {
+    cpSync(path.join(coreSourceRoot, "vendor", "tokentracker"), path.join(out, "tokentracker"), {recursive:true});
+    // Collectors are copied rather than bundled. Inline the Kimi TOML parser
+    // so desktop/CLI packages do not depend on the workspace node_modules.
+    await esbuild.build({
+      entryPoints: [path.join(coreSourceRoot, "vendor/tokentracker/lib/kimi-profile.js")],
+      outfile: path.join(out, "tokentracker/lib/kimi-profile.js"),
+      bundle: true, platform: "node", format: "cjs", target: "node22"
+    });
+    cpSync(path.resolve(path.dirname(requireFromHere.resolve("smol-toml")), "../LICENSE"),
+      path.join(out, "tokentracker/lib/kimi-profile.LICENSE"));
+  }
   validateLightweightMcpBundles(mainBuildResult.metafile);
 }
 

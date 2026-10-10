@@ -1,6 +1,6 @@
 {
   "name": "agentrouter-monorepo",
-  "version": "1.9.10",
+  "version": "1.9.11",
   "private": true,
   "license": "MIT",
   "description": "Local AgentRouter gateway with CLI and web management UI.",
@@ -63,7 +63,7 @@
     "benchmark:request-logs": "node build/benchmark-request-logs.mjs",
     "typecheck": "tsc --noEmit",
     "rebuild:sqlite3": "electron-rebuild -f -w better-sqlite3",
-    "test:collector": "node --test tests/collector/*.test.cjs",
+    "test:collector": "node --test tests/collector/*.test.cjs tests/collector/upstream/*.test.cjs",
     "test:gateway-stream": "node --test tests/gateway-stream/*.test.mjs"
   },
   "dependencies": {

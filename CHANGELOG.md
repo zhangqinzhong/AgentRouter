@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.9.11 - 2026-10-09
+
+### Features
+- Add session details with per-model usage, pricing provenance, partial-cost indicators and estimated request performance, while preserving existing client filters and resume actions.
+
+### Fixes
+- Handle interrupted upstream streams, preserve response headers in traces, and improve Codex session affinity and protocol-aware model routing.
+- Bound OpenRouter catalog requests and preserve custom model-list endpoints.
+- Correct Claude fork deduplication, OpenCode fingerprint ownership, Grok quota fallback, Kimi credential discovery and Claude account-specific quota cache selection.
+- Translate session token breakdown labels and prevent narrow columns from wrapping numbers vertically.
+
 ## 1.9.10 - 2026-10-09
 
 ### Fixes

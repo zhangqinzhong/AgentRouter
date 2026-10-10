@@ -1078,7 +1078,7 @@ function resolveArGatewayRoute(
 
   const publicModel = resolveGatewayPublicModelId(routedModel, config) ?? routedModel;
   const modelRegistry = modelRegistryForConfig(config);
-  const resolved = modelRegistry.resolve(publicModel) ??
+  const resolved = modelRegistry.resolve(publicModel, { protocol }) ??
     resolveProfileProviderModel(config, requestInput.request?.headers, publicModel, modelRegistry);
   if (!resolved) {
     return undefined;
@@ -1188,10 +1188,7 @@ function isCoreGatewayRuntimeProviderName(
   if (!normalized) {
     return false;
   }
-  const runtimeId = providerRuntimeId(provider).toLowerCase();
-  if (normalized === runtimeId) {
-    return true;
-  }
+  // Bare provider IDs are shared aliases; resolve their protocol and credential.
   const capabilityName = providerCapabilityInternalName(provider, protocol).toLowerCase();
   return normalized === capabilityName || normalized.startsWith(`${capabilityName}::cred:`);
 }

@@ -1,3 +1,4 @@
+const { claudeUserIdentity, collectClaudeForkAliases } = require("./claude-user-identity");
 // Claude Code "Context Breakdown" categorizer.
 //
 // Reads ~/.claude/projects/**/*.jsonl and splits each assistant message's
@@ -1212,6 +1213,7 @@ async function computeClaudeGroundTruthBuckets({ rootDir = null, rootDirs = null
   const buckets = new Map(); // `${model}|${hourStart}` → totals
   const seenHashes = new Set();
   const userMessageBuckets = new Map(); // for conversation_count tracking
+  const forkAliases = await collectClaudeForkAliases(files);
 
   for (const fp of files) {
     let stream;
@@ -1243,13 +1245,7 @@ async function computeClaudeGroundTruthBuckets({ rootDir = null, rootDirs = null
             typeof content === "string" ||
             (Array.isArray(content) && content.some((b) => b?.type === "text"));
           if (hasText) {
-            // Dedup by line uuid (mirrors parseClaudeFile): with multiple
-            // roots the same session file exists under both the native and
-            // the \\wsl$ path, and without this every user message — and so
-            // conversation_count — would double. Usage rows are already
-            // guarded by claudeMessageDedupKey below.
-            const userKey =
-              typeof userObj?.uuid === "string" && userObj.uuid ? `u:${userObj.uuid}` : null;
+            const userKey = claudeUserIdentity(userObj, forkAliases);
             if (!userKey || !seenHashes.has(userKey)) {
               if (userKey) seenHashes.add(userKey);
               const ts = typeof userObj?.timestamp === "string" ? userObj.timestamp : null;
@@ -1330,6 +1326,7 @@ async function computeClaudeGroundTruthBuckets({ rootDir = null, rootDirs = null
   return {
     rows: out,
     seenHashes: Array.from(seenHashes),
+    forkAliases,
     fileList: files,
   };
 }

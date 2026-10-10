@@ -36,6 +36,7 @@ const { fetchQoderLimits, fetchQoderCnLimits } = require("./qoder-limits");
 const { fetchArkCodingPlanLimits } = require("./ark-coding-plan-limits");
 const { fetchArkAgentPlanLimits } = require("./ark-agent-plan-limits");
 const { fetchProviderServiceStatus } = require("./provider-status");
+const { resolveKimiProfile } = require("./kimi-profile");
 const { readSqliteJsonRows, readSqliteJsonRowsAsync } = require("./sqlite-reader");
 const {
   runCommand,
@@ -294,14 +295,19 @@ async function fetchClaudeUsageLimits(accessToken, { fetchImpl = fetch, maxAttem
       throw new Error(`Claude API returned ${res.status}`);
     }
     const body = await res.json();
-    return {
-      five_hour: body.five_hour ?? null,
-      seven_day: body.seven_day ?? null,
-      seven_day_opus: body.seven_day_opus ?? null,
-      weekly_scoped: extractClaudeScopedWeekly(body),
-      extra_usage: body.extra_usage ?? null,
-    };
+    return mapClaudeUsageBody(body);
   }
+}
+
+/** Map an /api/oauth/usage body (live, or Claude Code's cached copy) onto the limits shape. */
+function mapClaudeUsageBody(body) {
+  return {
+    five_hour: body?.five_hour ?? null,
+    seven_day: body?.seven_day ?? null,
+    seven_day_opus: body?.seven_day_opus ?? null,
+    weekly_scoped: extractClaudeScopedWeekly(body),
+    extra_usage: body?.extra_usage ?? null,
+  };
 }
 
 // Classify a wham window by `limit_window_seconds` rather than its slot name.
@@ -776,28 +782,9 @@ async function fetchCursorLimits({ home, fetchImpl = fetch, scope } = {}) {
   }
 }
 
-function resolveKimiHome({ home, env } = {}) {
-  const explicit = typeof env?.KIMI_HOME === "string" ? env.KIMI_HOME.trim() : "";
-  if (explicit) return path.resolve(explicit);
-  const base = home || os.homedir();
-  // Prefer the official Kimi Code (@moonshot-ai/kimi-code, ~/.kimi-code) when it
-  // holds a login — its credential file shape (kimi-code.json) and the
-  // auth/usages endpoints are identical to the legacy kimi-cli (~/.kimi), so the
-  // existing fetch path works unchanged. Fall back to legacy when kimi-code has
-  // no credentials, keeping old kimi-cli users untouched.
-  const explicitCode = typeof env?.KIMI_CODE_HOME === "string" ? env.KIMI_CODE_HOME.trim() : "";
-  const codeHome = explicitCode ? path.resolve(explicitCode) : path.join(base, ".kimi-code");
-  const codeCredsPath = path.join(codeHome, "credentials", "kimi-code.json");
-  try {
-    const raw = fs.readFileSync(codeCredsPath, "utf8").trim();
-    if (raw && JSON.parse(raw)?.access_token) return codeHome;
-  } catch { /* missing / empty / corrupt — fall through to legacy */ }
-  return path.join(base, ".kimi");
-}
-
-function loadKimiCredentials({ home, env } = {}) {
-  const kimiHome = resolveKimiHome({ home, env });
-  const credsPath = path.join(kimiHome, "credentials", "kimi-code.json");
+function loadKimiCredentials({ home, env, profile = resolveKimiProfile({ home, env }) } = {}) {
+  if (profile.error) return null;
+  const { credsPath } = profile;
   if (!fs.existsSync(credsPath)) return null;
   try {
     return JSON.parse(fs.readFileSync(credsPath, "utf8"));
@@ -806,15 +793,10 @@ function loadKimiCredentials({ home, env } = {}) {
   }
 }
 
-function saveKimiCredentials(creds, { home, env } = {}) {
-  const kimiHome = resolveKimiHome({ home, env });
-  const credsPath = path.join(kimiHome, "credentials", "kimi-code.json");
+function saveKimiCredentials(creds, { home, env, profile = resolveKimiProfile({ home, env }) } = {}) {
+  const { credsPath } = profile;
   fs.mkdirSync(path.dirname(credsPath), { recursive: true });
-  fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2));
-}
-
-function hasKimiConfig({ home, env } = {}) {
-  return fs.existsSync(path.join(resolveKimiHome({ home, env }), "config.toml"));
+  fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 
 function kimiNumber(value) {
@@ -866,7 +848,7 @@ function kimiCredentialsExpired(creds, nowMs = Date.now()) {
   return expiresAt * 1000 <= nowMs + 30_000;
 }
 
-async function refreshKimiAccessToken({ refreshToken, home, env, fetchImpl = fetch } = {}) {
+async function refreshKimiAccessToken({ refreshToken, profile, fetchImpl = fetch } = {}) {
   if (typeof refreshToken !== "string" || !refreshToken.trim()) {
     throw new Error("Not logged in to Kimi. Run 'kimi' in Terminal to authenticate.");
   }
@@ -877,8 +859,9 @@ async function refreshKimiAccessToken({ refreshToken, home, env, fetchImpl = fet
     refresh_token: refreshToken,
   });
 
-  const res = await fetchImpl("https://auth.kimi.com/api/oauth/token", {
+  const res = await fetchImpl(`${profile.oauthHost}/api/oauth/token`, {
     method: "POST",
+    redirect: "error",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       "X-Msh-Platform": "kimi_cli",
@@ -906,13 +889,14 @@ async function refreshKimiAccessToken({ refreshToken, home, env, fetchImpl = fet
     token_type: String(json.token_type || "Bearer"),
     expires_in: Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 900,
   };
-  saveKimiCredentials(next, { home, env });
+  saveKimiCredentials(next, { profile });
   return next.access_token;
 }
 
-async function fetchKimiUsage(accessToken, { fetchImpl = fetch } = {}) {
-  const res = await fetchImpl("https://api.kimi.com/coding/v1/usages", {
+async function fetchKimiUsage(accessToken, { profile, fetchImpl = fetch } = {}) {
+  const res = await fetchImpl(`${profile.baseUrl}/usages`, {
     method: "GET",
+    redirect: "error",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       Accept: "application/json",
@@ -928,10 +912,12 @@ async function fetchKimiUsage(accessToken, { fetchImpl = fetch } = {}) {
 }
 
 async function fetchKimiLimits({ home, env, fetchImpl = fetch } = {}) {
-  if (!hasKimiConfig({ home, env })) {
+  const profile = resolveKimiProfile({ home, env });
+  if (!profile.configured) {
     return { configured: false };
   }
-  const creds = loadKimiCredentials({ home, env });
+  if (profile.error) return { configured: true, error: profile.error };
+  const creds = loadKimiCredentials({ profile });
   let accessToken = typeof creds?.access_token === "string" ? creds.access_token.trim() : "";
   if (!accessToken) {
     return { configured: false };
@@ -940,23 +926,21 @@ async function fetchKimiLimits({ home, env, fetchImpl = fetch } = {}) {
     if (kimiCredentialsExpired(creds) && creds?.refresh_token) {
       accessToken = await refreshKimiAccessToken({
         refreshToken: creds.refresh_token,
-        home,
-        env,
+        profile,
         fetchImpl,
       });
     }
     let body;
     try {
-      body = await fetchKimiUsage(accessToken, { fetchImpl });
+      body = await fetchKimiUsage(accessToken, { profile, fetchImpl });
     } catch (error) {
       if (error?.message === "token_expired" && creds?.refresh_token) {
         accessToken = await refreshKimiAccessToken({
           refreshToken: creds.refresh_token,
-          home,
-          env,
+          profile,
           fetchImpl,
         });
-        body = await fetchKimiUsage(accessToken, { fetchImpl });
+        body = await fetchKimiUsage(accessToken, { profile, fetchImpl });
       } else {
         throw error;
       }
@@ -2367,7 +2351,9 @@ function readClaudeLimitsCache({
   maxAgeMs = CLAUDE_LIMITS_CACHE_MAX_AGE_MS,
   stale = true,
 } = {}) {
-  return normalizeClaudeCachedLimits(readClaudeLimitsCacheRaw({ home }), { nowMs, maxAgeMs, stale });
+  return pickNewestClaudeSnapshot(readClaudeLimitsCacheCandidates({ home }).map((raw) => (
+    normalizeClaudeCachedLimits(raw, { nowMs, maxAgeMs, stale })
+  )));
 }
 
 // A cached snapshot stops being "fresh" the moment any of its windows crosses the
@@ -2390,14 +2376,60 @@ function claudeCacheCrossedReset(raw, { nowMs } = {}) {
   });
 }
 
+// Claude Code keeps its last /api/oauth/usage response in its global config
+// (`cachedUsageUtilization` in ~/.claude.json). That endpoint is throttled hard and its
+// budget is shared with Claude Code itself, so reading this copy costs no request. Only
+// usage figures are read — no credentials. The path deliberately ignores CLAUDE_CONFIG_DIR:
+// readClaudeCodeOauthToken reads the default profile's credentials (default Keychain item,
+// ~/.claude/.credentials.json), and the cache must come from that same profile so it can
+// never describe a different account than the token this process would query with.
+function resolveClaudeCodeGlobalConfigPath({ home } = {}) {
+  return path.join(home || os.homedir(), ".claude.json");
+}
+
+/**
+ * Claude Code's cached usage as a raw cache entry (same shape as our own disk cache),
+ * or null when absent, unparsable, or recorded for a different account than the one
+ * Claude Code is currently signed in to.
+ */
+function readClaudeCodeUsageCacheRaw({ home } = {}) {
+  try {
+    const config = JSON.parse(fs.readFileSync(resolveClaudeCodeGlobalConfigPath({ home }), "utf8"));
+    const cached = config?.cachedUsageUtilization;
+    const fetchedAtMs = Number(cached?.fetchedAtMs);
+    if (!cached?.utilization || typeof cached.utilization !== "object" || !Number.isFinite(fetchedAtMs)) return null;
+    const cachedAccount = typeof cached.accountUuid === "string" ? cached.accountUuid : null;
+    const currentAccount = typeof config?.oauthAccount?.accountUuid === "string" ? config.oauthAccount.accountUuid : null;
+    if (!cachedAccount || !currentAccount || cachedAccount !== currentAccount) return null;
+    return { ...mapClaudeUsageBody(cached.utilization), cached_at: new Date(fetchedAtMs).toISOString() };
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** Raw snapshots from both sources: our own disk cache and Claude Code's cached read. */
+function readClaudeLimitsCacheCandidates({ home } = {}) {
+  return [readClaudeLimitsCacheRaw({ home }), readClaudeCodeUsageCacheRaw({ home })].filter(Boolean);
+}
+
+/** Newest of the already-validated snapshots, by cached_at. */
+function pickNewestClaudeSnapshot(snapshots) {
+  let newest = null;
+  for (const snapshot of snapshots) {
+    if (!snapshot) continue;
+    if (!newest || parseTimeMs(snapshot.cached_at) > parseTimeMs(newest.cached_at)) newest = snapshot;
+  }
+  return newest;
+}
+
+// Each source is validated on its own before picking the newest, so a newer snapshot
+// whose windows are all unusable can never displace an older usable one.
 function readFreshClaudeLimitsCache({ home, nowMs = Date.now() } = {}) {
-  const raw = readClaudeLimitsCacheRaw({ home });
-  if (!raw || claudeCacheCrossedReset(raw, { nowMs })) return null;
-  return normalizeClaudeCachedLimits(raw, {
-    nowMs,
-    maxAgeMs: CLAUDE_LIMITS_CACHE_FRESH_TTL_MS,
-    stale: false,
-  });
+  return pickNewestClaudeSnapshot(readClaudeLimitsCacheCandidates({ home }).map((raw) => (
+    claudeCacheCrossedReset(raw, { nowMs })
+      ? null
+      : normalizeClaudeCachedLimits(raw, { nowMs, maxAgeMs: CLAUDE_LIMITS_CACHE_FRESH_TTL_MS, stale: false })
+  )));
 }
 
 function writeClaudeLimitsCache(limits, { home, nowMs = Date.now() } = {}) {
@@ -3822,7 +3854,8 @@ async function fetchUsageLimitsUncached({
     : null;
   // Also avoid cross-process hammering after a recent successful read: embedded-server
   // restarts and background polls read the disk cache instead of spending another Claude
-  // OAuth usage request. An explicit user refresh (refresh=1 → forceRefresh) punches
+  // OAuth usage request. Claude Code's own cached read counts too, so a session that just
+  // refreshed its usage spares this process a call against the same throttled budget. An explicit user refresh (refresh=1 → forceRefresh) punches
   // through this cache — but never through the 429 cooldown above, which is exactly the
   // hammering the cooldown exists to prevent.
   const freshClaudeCache = claudeToken && !forceRefresh
@@ -4271,6 +4304,7 @@ module.exports = {
   runCommand,
   extractGeminiOauthClientCredentials,
   loadKimiCredentials,
+  fetchKimiLimits,
   normalizeCursorUsageSummary,
   normalizeCursorSandUsageStatus,
   normalizeGeminiQuotaResponse,

@@ -1,6 +1,6 @@
 {
   "name": "@agentrouter/core",
-  "version": "1.9.10",
+  "version": "1.9.11",
   "private": true,
   "description": "AgentRouter core gateway, routing, provider, and storage services.",
   "main": "dist/main/server.js",
@@ -22,6 +22,7 @@
     "jsonc-parser": "3.3.1",
     "node-forge": "^1.4.0",
     "pm2": "^7.0.3",
+    "smol-toml": "1.6.0",
     "undici": "^7.29.0"
   }
 }

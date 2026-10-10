@@ -1,5 +1,6 @@
 import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { SessionDetailModal } from "../ui/dashboard/components/SessionDetailModal.jsx";
 import { Calendar, Copy, Loader2, Play, RefreshCw, Search, Terminal, X as XIcon } from "lucide-react";
 import { Input } from "../ui/components";
 import { SegmentedControl } from "../ui/components/SegmentedControl.jsx";
@@ -329,6 +330,7 @@ const SessionRow = React.memo(function SessionRow({
   childCount = 0,
   expanded = false,
   onToggle,
+  onDetails,
   profiles = [],
 }) {
   const { currency, rate } = useCurrency();
@@ -465,6 +467,13 @@ const SessionRow = React.memo(function SessionRow({
                 {title}
               </span>
             )}
+            <button
+              type="button"
+              onClick={() => onDetails(session)}
+              className="rounded text-xs text-oai-gray-500 hover:text-oai-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 dark:hover:text-white"
+            >
+              {copy("sessions.action.details")}
+            </button>
             {isSubagent ? (
               <span className="inline-flex items-center rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-500/10 dark:text-sky-300">
                 {copy("sessions.badge.subagent")}
@@ -699,6 +708,8 @@ function ThreadModelUsage({ sessions, selectedModel, onSelect }) {
 }
 
 export function SessionsPage({ defaultRange = "7d" } = {}) {
+  const [selectedSession, setSelectedSession] = useState(null);
+  const closeDetails = useCallback(() => setSelectedSession(null), []);
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -1048,6 +1059,7 @@ export function SessionsPage({ defaultRange = "7d" } = {}) {
                         expanded={expanded}
                         onToggle={() => toggleThread(session.session_hash)}
                         profiles={profiles}
+                        onDetails={setSelectedSession}
                       />
                       {expanded && children.length ? (
                         <ThreadModelUsage
@@ -1064,6 +1076,7 @@ export function SessionsPage({ defaultRange = "7d" } = {}) {
                               locale={resolvedLocale}
                               nested
                               profiles={profiles}
+                              onDetails={setSelectedSession}
                             />
                           ))
                         : null}
@@ -1090,6 +1103,14 @@ export function SessionsPage({ defaultRange = "7d" } = {}) {
           </p>
         </div>
       </main>
+      {selectedSession ? createPortal(
+        <SessionDetailModal
+          session={selectedSession}
+          subagents={grouped.childrenByRoot.get(selectedSession.session_hash) || []}
+          onClose={closeDetails}
+        />,
+        document.body,
+      ) : null}
     </div>
   );
 }
