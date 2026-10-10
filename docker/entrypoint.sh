@@ -160,8 +160,8 @@ server {
   location = /api/ar/rpc {
     proxy_http_version 1.1;
     proxy_set_header Host ${AR_WEB_HOST}:${AR_WEB_PORT};
-    proxy_set_header Origin http://${AR_WEB_HOST}:${AR_WEB_PORT};
-    proxy_set_header Referer http://${AR_WEB_HOST}:${AR_WEB_PORT}/;
+    proxy_set_header Origin \$http_origin;
+    proxy_set_header Referer \$http_referer;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Host \$host;
     proxy_set_header X-Forwarded-Proto \$scheme;

@@ -46,7 +46,7 @@
     "bench:context-archive-real": "node benchmarks/run-context-archive-real-agent-benchmark.mjs",
     "bench:claude-compact-real": "node benchmarks/claude-code-real-compact.mjs",
     "docker:build": "docker build -t agentrouter:local .",
-    "docker:run": "docker run --rm -p 3458:8080 -v ar-data:/data agentrouter:local",
+    "docker:run": "docker run --rm -p 127.0.0.1:3458:8080 -v ar-data:/data agentrouter:local",
     "test": "npm run test:packages && npm run test:architecture && npm run test:gateway-stream",
     "test:packages": "npm run test --workspaces --if-present",
     "test:core": "npm test -w @agentrouter/core",
