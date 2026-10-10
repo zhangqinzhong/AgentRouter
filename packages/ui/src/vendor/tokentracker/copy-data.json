@@ -383,7 +383,8 @@
     "dashboard.projects.detail.comp_cached": "Cache read",
     "dashboard.projects.detail.comp_cache_write": "Cache write",
     "dashboard.projects.detail.comp_output": "Output",
-    "dashboard.projects.detail.comp_reasoning": "Reasoning output"
+    "dashboard.projects.detail.comp_reasoning": "Reasoning output",
+    "sessions.resume.unmatched_hint": "No launch profile matched. Copy the command to resume in the original client."
   },
   "zh": {
     "share.button.label": "分享",
@@ -770,6 +771,7 @@
     "dashboard.projects.detail.comp_cached": "缓存读取",
     "dashboard.projects.detail.comp_cache_write": "缓存写入",
     "dashboard.projects.detail.comp_output": "输出",
-    "dashboard.projects.detail.comp_reasoning": "推理输出"
+    "dashboard.projects.detail.comp_reasoning": "推理输出",
+    "sessions.resume.unmatched_hint": "未匹配到启动配置，可复制指令在原客户端继续。"
   }
 }

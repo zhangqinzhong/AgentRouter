@@ -103,7 +103,7 @@ export function resumeExtraArgs(source, sessionId) {
   return [];
 }
 
-function ResumeHoverButton({ ariaLabel, profileName, surfaces = ["cli"], onOpen, onCopy, children }) {
+export function ResumeHoverButton({ ariaLabel, profileName, surfaces = ["cli"], onOpen, onCopy, copyOnly = false, copyAvailable = true, children }) {
   const triggerRef = useRef(null);
   const hideRef = useRef(null);
   const [open, setOpen] = useState(false);
@@ -126,9 +126,9 @@ function ResumeHoverButton({ ariaLabel, profileName, surfaces = ["cli"], onOpen,
   };
   useEffect(() => () => { if (hideRef.current) clearTimeout(hideRef.current); }, []);
   const title = copy("sessions.resume.tooltip_open");
-  const hint = copy("sessions.resume.tooltip_open_hint", { profile: profileName });
-  const showCli = surfaces.includes("cli");
-  const showApp = surfaces.includes("app");
+  const hint = copy(copyOnly ? "sessions.resume.unmatched_hint" : "sessions.resume.tooltip_open_hint", { profile: profileName });
+  const showCli = !copyOnly && surfaces.includes("cli");
+  const showApp = !copyOnly && surfaces.includes("app");
   return (
     <>
       <button
@@ -195,14 +195,15 @@ function ResumeHoverButton({ ariaLabel, profileName, surfaces = ["cli"], onOpen,
                   {copy("sessions.resume.open_app")}
                 </button>
               ) : null}
-              {showCli ? (
+              {showCli || copyOnly ? (
                 <button
                   type="button"
+                  disabled={!copyAvailable}
                   onClick={onCopy}
                   className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-oai-gray-200 bg-white text-[12px] font-medium text-oai-gray-800 hover:bg-oai-gray-50 dark:border-oai-gray-700 dark:bg-oai-gray-900 dark:text-oai-gray-100 dark:hover:bg-oai-gray-800"
                 >
                   <Copy className="h-3.5 w-3.5" aria-hidden />
-                  {copy("sessions.resume.copy")}
+                  {copy(copyAvailable ? "sessions.resume.copy" : "sessions.resume.unavailable")}
                 </button>
               ) : null}
             </div>
@@ -618,22 +619,15 @@ const SessionRow = React.memo(function SessionRow({
             })}
           </div>
         ) : (
-          <button
-            type="button"
-            onClick={() => handleCopy()}
-            disabled={!command}
-            title={command || copy("sessions.resume.unavailable")}
-            aria-label={command ? copy("sessions.resume.copy_aria", { command }) : copy("sessions.resume.unavailable")}
-            className={cn(
-              "-mt-0.5 inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500",
-              command
-                ? "text-oai-gray-500 hover:bg-oai-gray-100 hover:text-oai-black dark:text-oai-gray-400 dark:hover:bg-oai-gray-800 dark:hover:text-white"
-                : "cursor-not-allowed text-oai-gray-300 dark:text-oai-gray-600",
-            )}
+          <ResumeHoverButton
+            ariaLabel={copy("sessions.resume.tooltip_open")}
+            profileName={provider}
+            copyOnly
+            copyAvailable={Boolean(command)}
+            onCopy={() => handleCopy()}
           >
             <Terminal className="h-3.5 w-3.5" aria-hidden />
-            <span className="hidden sm:inline">{copy("sessions.resume.copy")}</span>
-          </button>
+          </ResumeHoverButton>
         )}
       </div>
     </li>
