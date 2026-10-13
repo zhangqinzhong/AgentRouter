@@ -31,7 +31,7 @@ test("sidebar navigation groups pages and hides networking from the sidebar", ()
     ["logs"],
     ["virtual-models", "models", "api-keys", "extensions"]
   ]);
-  assert.equal(viewUsesInternalScroll("sessions"), false);
+  assert.equal(viewUsesInternalScroll("sessions"), true);
   assert.equal(viewUsesInternalScroll("heatmap"), true);
   assert.equal(viewUsesInternalScroll("trend"), false);
   assert.equal(viewUsesInternalScroll("usage"), false);

@@ -1407,3 +1407,34 @@ html[data-window-active="false"] .status-heartbeat {
   --network-row-selected: color-mix(in srgb, #10b981 10%, transparent);
   --network-accent: var(--oai-brand);
 }
+
+/* Session reader: scoped typography, independent from the management tables. */
+.session-markdown > :first-child { margin-top: 0; }
+.session-markdown > :last-child { margin-bottom: 0; }
+.session-markdown p { margin: 0.65em 0; white-space: pre-wrap; }
+.session-markdown h1, .session-markdown h2, .session-markdown h3,
+.session-markdown h4 { margin: 1.4em 0 0.6em; font-weight: 650; line-height: 1.5; }
+.session-markdown h1 { font-size: 1.4em; }
+.session-markdown h2 { font-size: 1.2em; }
+.session-markdown h3 { font-size: 1.08em; }
+.session-markdown ul, .session-markdown ol { margin: 0.75em 0; padding-left: 1.6em; }
+.session-markdown ul { list-style: disc; }
+.session-markdown ol { list-style: decimal; }
+.session-markdown li { margin: 0.3em 0; }
+.session-markdown a { color: var(--primary); text-decoration: underline; text-underline-offset: 3px; }
+.session-markdown code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: var(--muted); border-radius: 4px; padding: 0.12em 0.35em; }
+.session-markdown pre { overflow-x: auto; padding: 16px 18px; margin: 1em 0; border: 1px solid var(--border); border-radius: 10px; background: var(--muted); line-height: 1.7; }
+.session-markdown pre code { padding: 0; background: transparent; white-space: pre; }
+.session-markdown blockquote { margin: 1em 0; padding-left: 1em; border-left: 3px solid var(--border); color: var(--muted-foreground); }
+.session-markdown table { border-collapse: collapse; margin: 1em 0; width: 100%; font-size: 0.92em; }
+.session-markdown th, .session-markdown td { padding: 8px 12px; border: 1px solid var(--border); text-align: left; }
+.session-markdown th { background: var(--muted); font-weight: 600; }
+.session-markdown hr { border-color: var(--border); margin: 1.5em 0; }
+
+.session-markdown .hljs-keyword, .session-markdown .hljs-selector-tag { color: #a855f7; }
+.session-markdown .hljs-string, .session-markdown .hljs-regexp { color: #059669; }
+.session-markdown .hljs-number, .session-markdown .hljs-literal { color: #d97706; }
+.session-markdown .hljs-title, .session-markdown .hljs-attr { color: #2563eb; }
+.session-markdown .hljs-comment { color: #737373; }
+.dark .session-markdown .hljs-string { color: #6ee7b7; }
+.dark .session-markdown .hljs-title, .dark .session-markdown .hljs-attr { color: #93c5fd; }

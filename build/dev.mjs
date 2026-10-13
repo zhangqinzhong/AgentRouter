@@ -1,3 +1,4 @@
+import {buildSessionRuntime} from "./session-runtime.mjs";
 import {buildMacOSAppLauncher} from "./macos-app-launcher.mjs";
 import electron from "electron";
 import { bundleMemoryRuntime } from "./ai-memory-runtime.mjs";
@@ -403,6 +404,7 @@ async function stopElectron(child) {
 
 logDev(`starting dev build target=${devTarget} ui=${enabled.ui ? "on" : "off"} cli=${enabled.cli ? "on" : "off"} electron=${enabled.electron ? "on" : "off"}`);
 cleanDist();
+buildSessionRuntime(["cli", "core", "electron"].map(name => path.join(projectRoot, "packages", name, "dist", "main")));
 buildMacOSAppLauncher();
 await bundleMemoryRuntime();
 if (enabled.electron) {

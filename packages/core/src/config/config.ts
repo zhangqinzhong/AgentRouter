@@ -1,3 +1,4 @@
+import { normalizeProfileProviderName } from "@agentrouter/core/profiles/provider-display-name";
 import { CONFIGDIR, LEGACY_CONFIGDIR, PROVIDER_ICON_CACHE_DIR } from "@agentrouter/core/config/constants";
 import { normalizePageDefaultRanges } from "@agentrouter/core/config/page-default-ranges";
 import { validateProfileAliasFiles } from "@agentrouter/core/profiles/aliases";
@@ -3448,7 +3449,7 @@ function parseProfile(value: unknown): LoadedProfileConfig | undefined {
     }
     const providerName = readString(codex.providerName) || readString(codex.name);
     if (providerName) {
-      profile.codex.providerName = providerName;
+      profile.codex.providerName = normalizeProfileProviderName(providerName);
     }
     const showAllSessions = typeof codex.showAllSessions === "boolean"
       ? codex.showAllSessions
@@ -3621,7 +3622,7 @@ function parseProfiles(value: unknown): ProfileConfig[] | undefined {
         model,
         name,
         providerId: readString(item.providerId) || readString(item.provider) || "claude-code-router",
-        providerName: readString(item.providerName) || "AgentRouter",
+        providerName: normalizeProfileProviderName(readString(item.providerName)),
         remoteFrontendMode: parseCodexRemoteFrontendMode(readString(item.remoteFrontendMode) || readString(item.frontendMode) || readString(item.coreMode)) || "app",
         ...(routing ? { routing } : {}),
         scope: parseProfileScope(readString(item.scope) || readString(item.applyScope) || readString(item.effectScope)) || "global",

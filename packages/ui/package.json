@@ -1,6 +1,6 @@
 {
   "name": "@agentrouter/ui",
-  "version": "1.9.11",
+  "version": "1.10.0",
   "private": true,
   "description": "AgentRouter web management UI.",
   "scripts": {
@@ -20,12 +20,15 @@
     "baseui": "^16.1.1",
     "clsx": "^2.1.1",
     "date-fns": "^4.4.0",
+    "lowlight": "^3.3.0",
     "lucide-react": "^1.17.0",
     "motion": "^12.40.0",
     "react": "^18.3.1",
     "react-day-picker": "^10.0.1",
     "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
     "recharts": "^3.8.1",
+    "remark-gfm": "^4.0.1",
     "styletron-engine-atomic": "^1.6.2",
     "styletron-react": "^6.1.1",
     "tailwind-merge": "^3.6.0"

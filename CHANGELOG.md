@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.10.0 - 2026-10-13
+
+### Features
+- Add an integrated session workspace with local search, transcripts, branches, favorites, exports, client resume, activity statistics, memory-file browsing, cleanup and SSH sources.
+- Bundle an independently maintained session engine, CLI and optional MCP/client plugins derived from Wake (by @iAmCorey), with MiMo support and isolated AgentRouter profile discovery.
+
+### Fixes
+- Hide injected session metadata before pagination and correct branch navigation, favorite search limits, stale memory-file responses and database-backed session hiding.
+- Migrate legacy Codex provider display names to AgentRouter without changing provider IDs or custom names.
+- Stop Docker redirects from disclosing management tokens (upstream by @mertkayacs), and accept tokens beginning with a hyphen.
+
 ## 1.9.11 - 2026-10-09
 
 ### Features

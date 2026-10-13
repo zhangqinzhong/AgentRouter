@@ -132,6 +132,8 @@ declare global {
       getLocalUsagePage: (range: import("@agentrouter/core/collector/usage-page").LocalUsageRange) => Promise<import("@agentrouter/core/collector/usage-page").LocalUsagePageData>;
       getLocalUsageTrend: (query: import("@agentrouter/core/collector/usage-page").LocalUsageTrendQuery) => Promise<Record<string,unknown>>;
       getLocalUsageHeatmap: (query?: import("@agentrouter/core/collector/usage-page").LocalUsageHeatmapQuery) => Promise<Record<string,unknown>>;
+      sessionWorkspace: (query: Record<string, unknown>) => Promise<Record<string, any>>;
+      getLocalSessionTranscript: (query: {sessionHash:string;offset?:number}) => Promise<Record<string,unknown>>;
       getLocalUsageSessions: (query?: import("@agentrouter/core/collector/usage-page").LocalUsageSessionsQuery) => Promise<Record<string,unknown>>;
       getLocalUsageCategories: (range: import("@agentrouter/core/collector/usage-page").LocalUsageCategoryRange) => Promise<Record<string,unknown>>;
       getUsageStats: (range?: UsageStatsRange, filter?: UsageStatsFilter, customRange?: UsageDateRange) => Promise<UsageStatsSnapshot>;

@@ -1,7 +1,12 @@
 ARG NODE_IMAGE=node:22-bookworm
 ARG RUNTIME_NODE_IMAGE=node:22-bookworm-slim
 
+FROM rust:1.93-bookworm AS rust-toolchain
+
 FROM ${NODE_IMAGE} AS build
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:$PATH
 WORKDIR /app
 
 COPY package.json package-lock.json ./

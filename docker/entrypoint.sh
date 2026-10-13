@@ -13,10 +13,12 @@ AR_PUBLIC_PORT="${AR_PUBLIC_PORT:-3458}"
 AR_PUBLIC_BASE_URL="${AR_PUBLIC_BASE_URL:-http://${AR_PUBLIC_HOST}:${AR_PUBLIC_PORT}}"
 AR_NO_GATEWAY="${AR_NO_GATEWAY:-0}"
 
+AR_WEB_AUTH_TOKEN_GENERATED=0
 if [ -z "${AR_WEB_AUTH_TOKEN:-}" ]; then
   AR_WEB_AUTH_TOKEN="$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))")"
+  AR_WEB_AUTH_TOKEN_GENERATED=1
 fi
-AR_WEB_AUTH_TOKEN_QUERY="$(node -e "process.stdout.write(encodeURIComponent(process.argv[1] || ''))" "${AR_WEB_AUTH_TOKEN}")"
+AR_WEB_AUTH_TOKEN_QUERY="$(node -e "process.stdout.write(encodeURIComponent(process.argv[1] || ''))" -- "${AR_WEB_AUTH_TOKEN}")"
 
 export HOME="${AR_DATA_DIR}"
 export AR_DATA_DIR
@@ -145,14 +147,13 @@ server {
 
   client_max_body_size 8m;
 
+  # The management token is never put in a response. A token the user supplies
+  # in the query string is passed on to the page, which reads it from the URL.
   location = / {
-    return 302 /pages/home/index.html?ar_web_token=${AR_WEB_AUTH_TOKEN_QUERY};
+    return 302 /pages/home/index.html\$is_args\$args;
   }
 
   location = /pages/home/index.html {
-    if (\$arg_ar_web_token = "") {
-      return 302 /pages/home/index.html?ar_web_token=${AR_WEB_AUTH_TOKEN_QUERY};
-    }
     try_files /pages/home/index.html =404;
   }
 
@@ -195,6 +196,11 @@ server {
   }
 }
 EOF
+
+# A generated token is only reachable through the container logs.
+if [ "${AR_WEB_AUTH_TOKEN_GENERATED}" = "1" ]; then
+  echo "AR management UI: ${AR_PUBLIC_BASE_URL%/}/?ar_web_token=${AR_WEB_AUTH_TOKEN_QUERY}"
+fi
 
 if [ "$#" -gt 0 ]; then
   exec "$@"

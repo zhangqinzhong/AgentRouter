@@ -1,3 +1,4 @@
+import { normalizeProfileProviderName } from "@agentrouter/core/profiles/provider-display-name";
 import { isValidLaunchAlias } from "@agentrouter/core/profiles/alias-validation";
 import claudeCodeLogoUrl from "@/assets/agent-logos/claude-code.png";
 import codexLogoUrl from "@/assets/agent-logos/codex.png";
@@ -673,7 +674,7 @@ export function createProfileDraftFromProfile(profile: ProfileConfig, botConfigs
     managedCompact: Boolean(profile.managedCompact),
     model: profile.model,
     providerId: profile.providerId ?? "claude-code-router",
-    providerName: profile.providerName ?? "AgentRouter",
+    providerName: normalizeProfileProviderName(profile.providerName),
     scope: normalizeProfileFormScope(profile.scope),
     showAllSessions: profile.agent === "zcode" || profile.agent === "opencode" || profile.agent === "kilo" || profile.agent === "workbuddy" ? false : Boolean(profile.showAllSessions),
     surface
@@ -778,7 +779,7 @@ export function profileConfigFromDraft(
     name: draft.name,
     opusModel: draft.opusModel,
     providerId: draft.providerId.trim() || "claude-code-router",
-    providerName: draft.providerName.trim() || "AgentRouter",
+    providerName: normalizeProfileProviderName(draft.providerName),
     ...(routing ? { routing } : {}),
     scope: draft.scope,
     settingsFile: draft.settingsFile,
@@ -1537,7 +1538,7 @@ export function normalizeProfileItem(profile: ProfileConfig, index: number): Pro
     model,
     name,
     providerId: profile.providerId?.trim() || "claude-code-router",
-    providerName: profile.providerName?.trim() || "AgentRouter",
+    providerName: normalizeProfileProviderName(profile.providerName),
     ...(routing ? { routing } : {}),
     scope,
     showAllSessions: agent === "zcode" || agent === "opencode" || agent === "kilo" || agent === "workbuddy" ? false : Boolean(profile.showAllSessions),

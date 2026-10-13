@@ -15,3 +15,6 @@ blob-report
 docs/node_modules
 docs/dist
 docs/.astro
+
+native/session-core/target
+native/session-reader/target

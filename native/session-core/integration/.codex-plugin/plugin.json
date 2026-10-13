@@ -1,0 +1,1 @@
+{"name":"agentrouter-sessions","version":"0.1.0","description":"Search local session history and restore project context.","mcpServers":{"agentrouter-sessions":{"command":"sh","args":["./scripts/session-tools","agentrouter-session-mcp"],"cwd":".","env_vars":["AR_SESSION_BIN_DIR","AR_SESSION_ON_REQUEST","AR_SESSION_INDEX"]}}}

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in agentrouter-session-cli|agentrouter-session-mcp) binary="$1"; shift ;; *) exit 64 ;; esac
+if [ -n "${AR_SESSION_BIN_DIR:-}" ]; then exec "$AR_SESSION_BIN_DIR/$binary" "$@"; fi
+for dir in "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)" "$(CDPATH= cd -- "$(dirname -- "$0")/../../../.." && pwd)" "/Applications/AgentRouter.app/Contents/Resources/app.asar.unpacked/dist/main" "$HOME/Applications/AgentRouter.app/Contents/Resources/app.asar.unpacked/dist/main"; do
+  if [ -x "$dir/$binary" ]; then exec "$dir/$binary" "$@"; fi
+done
+if command -v "$binary" >/dev/null 2>&1; then exec "$binary" "$@"; fi
+printf '%s\n' 'AgentRouter session tools are not installed. Set AR_SESSION_BIN_DIR to the bundled runtime directory.' >&2
+exit 127

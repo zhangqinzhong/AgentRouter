@@ -144,6 +144,8 @@ contextBridge.exposeInMainWorld("agentrouter", {
   getLocalUsagePage: (range: import("@agentrouter/core/collector/usage-page").LocalUsageRange) => invoke(IPC_CHANNELS.appGetLocalUsagePage, range) as Promise<import("@agentrouter/core/collector/usage-page").LocalUsagePageData>,
   getLocalUsageTrend: (query: import("@agentrouter/core/collector/usage-page").LocalUsageTrendQuery) => invoke(IPC_CHANNELS.appGetLocalUsageTrend, query) as Promise<Record<string,unknown>>,
   getLocalUsageHeatmap: (query?: import("@agentrouter/core/collector/usage-page").LocalUsageHeatmapQuery) => invoke(IPC_CHANNELS.appGetLocalUsageHeatmap, query) as Promise<Record<string,unknown>>,
+  sessionWorkspace: (query: Record<string, unknown>) => invoke(IPC_CHANNELS.appSessionWorkspace, query) as Promise<Record<string, any>>,
+  getLocalSessionTranscript: (query: {sessionHash:string;offset?:number}) => invoke(IPC_CHANNELS.appGetLocalSessionTranscript, query) as Promise<Record<string,unknown>>,
   getLocalUsageSessions: (query?: import("@agentrouter/core/collector/usage-page").LocalUsageSessionsQuery) => invoke(IPC_CHANNELS.appGetLocalUsageSessions, query) as Promise<Record<string,unknown>>,
   getLocalUsageCategories: (range: import("@agentrouter/core/collector/usage-page").LocalUsageCategoryRange) => invoke(IPC_CHANNELS.appGetLocalUsageCategories, range) as Promise<Record<string,unknown>>,
   getUsageStats: (range?: UsageStatsRange, filter?: UsageStatsFilter, customRange?: UsageDateRange) => invoke(IPC_CHANNELS.appGetUsageStats, range, filter, customRange) as Promise<UsageStatsSnapshot>,

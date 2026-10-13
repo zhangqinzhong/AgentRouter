@@ -4,7 +4,12 @@
   "asar": true,
   "asarUnpack": [
     "**/*.node",
-    "dist/bundled-plugins/**"
+    "dist/bundled-plugins/**",
+    "**/agentrouter-session-*",
+    "**/session-plugin/**",
+    "**/session-runtime.json",
+    "**/session-core-LICENSE",
+    "**/session-marketplace/**"
   ],
   "electronLanguages": [
     "en-US",

@@ -1,0 +1,4 @@
+#!/bin/sh
+cd "${CLAUDE_PROJECT_DIR:-.}" 2>/dev/null || exit 0
+sh "$(dirname "$0")/session-tools" agentrouter-session-cli context 2>/dev/null
+exit 0

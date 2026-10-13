@@ -1,0 +1,2911 @@
+//! 扫描终态契约(CLAUDE.md 不变量 6):run_scan 无论正常结束、Err 提前返回
+//! 还是 adapter 出错,都必须发出一次 scanning=false 的终态进度事件——
+//! UI 的模态刷新弹窗只认这个事件收场,收不到就永久锁死。
+
+mod common;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{bail, Result};
+use serde_json::json;
+use agentrouter_session_core::adapters::claude::ClaudeAdapter;
+use agentrouter_session_core::adapters::codex::CodexAdapter;
+use agentrouter_session_core::adapters::AgentAdapter;
+use agentrouter_session_core::db::Store;
+use agentrouter_session_core::mcp::tools::{self, TranscriptCache};
+use agentrouter_session_core::models::*;
+use agentrouter_session_core::scanner::{refresh_parent_links, run_scan, scan_files, ScanEvents, ScanProgress};
+
+/// 收集全部进度事件与变更通知计数,供断言终态/刷新契约
+struct Recorder(Mutex<Vec<ScanProgress>>, Mutex<usize>);
+
+impl Recorder {
+    fn new() -> Self {
+        Recorder(Mutex::new(Vec::new()), Mutex::new(0))
+    }
+    fn changed(&self) -> usize {
+        *self.1.lock().unwrap()
+    }
+}
+
+impl ScanEvents for Recorder {
+    fn on_progress(&self, p: &ScanProgress) {
+        self.0.lock().unwrap().push(p.clone());
+    }
+    fn on_sessions_changed(&self) {
+        *self.1.lock().unwrap() += 1;
+    }
+}
+
+/// 枚举文件即失败的 adapter,模拟数据源不可读
+struct FailingAdapter;
+
+impl AgentAdapter for FailingAdapter {
+    fn agent(&self) -> AgentId {
+        AgentId::ClaudeCode
+    }
+    fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
+        bail!("simulated data source failure")
+    }
+    fn parse_session(&self, _: &SessionFileRef) -> Result<ParsedSession> {
+        bail!("unreachable")
+    }
+    fn parse_transcript(&self, _: &SessionFileRef) -> Result<ParsedTranscript> {
+        bail!("unreachable")
+    }
+    fn data_roots(&self) -> Vec<std::path::PathBuf> {
+        vec![std::path::PathBuf::from("/nonexistent/test-adapter")]
+    }
+    fn with_custom_root(&self, _: std::path::PathBuf) -> Box<dyn AgentAdapter> {
+        Box::new(FailingAdapter)
+    }
+}
+
+fn assert_terminal_event(events: &[ScanProgress], ctx: &str) {
+    let last = events
+        .last()
+        .unwrap_or_else(|| panic!("{ctx}: 无任何进度事件"));
+    assert!(
+        !last.scanning,
+        "{ctx}: 最后一个事件 scanning 仍为 true,UI 刷新弹窗将永久锁死"
+    );
+}
+
+fn temp_store(dir: &Path) -> Arc<Store> {
+    Arc::new(Store::open(&dir.join("scan.db")).expect("open store"))
+}
+
+/// `spawn_agent` 子代理端到端:进索引、不出现在顶层列表、parent_key 指向
+/// 父线程,父行的子会话计数认得它(issue #42)
+/// Codex 的登记表是 home 的一张总表,不像 grok 的边车长在 parent 自己的
+/// location 里:用户给某个更深的目录单独加了 location 之后,两个文件都归那个
+/// 实例,而边只有 home 实例报得出来。"报边者必须拥有 parent"那条按 grok 写的
+/// 规矩会把这种边整条丢掉,子会话于是静默变回顶层
+#[test]
+fn codex_spawn_links_survive_a_deeper_custom_location() {
+    let home = tempfile::tempdir().unwrap();
+    let (parent_id, child_id, _) = common::stage_codex_spawn_pair(home.path());
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    // 默认实例(有 state DB、报得出边)在前,更深的自定义 location 在后——
+    // 后者按最长根拥有这两个 rollout
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        CodexAdapter::new().with_custom_root(home.path().to_path_buf()),
+        CodexAdapter::new().with_custom_root(home.path().join("sessions/2026/09/16")),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    assert_eq!(
+        store
+            .parent_key_of(&format!("codex:{child_id}"))
+            .unwrap()
+            .as_deref(),
+        Some(format!("codex:{parent_id}").as_str())
+    );
+}
+
+#[test]
+fn codex_spawned_subagents_nest_under_their_parent() {
+    let home = tempfile::tempdir().unwrap();
+    let (parent_id, child_id, _) = common::stage_codex_spawn_pair(home.path());
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![CodexAdapter::new().with_custom_root(home.path().to_path_buf())];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let parent_key = format!("codex:{parent_id}");
+    let child_key = format!("codex:{child_id}");
+    let child = store.get_session(&child_key).unwrap().expect("子代理入库");
+    assert_eq!(child.title, "review_issue17");
+    assert_eq!(
+        store.parent_key_of(&child_key).unwrap().as_deref(),
+        Some(parent_key.as_str())
+    );
+
+    let filter = SessionFilter {
+        roots_only: true,
+        limit: 10,
+        ..Default::default()
+    };
+    let (roots, total) = store.list_sessions(&filter).unwrap();
+    assert_eq!(total, 1, "子代理不进顶层列表");
+    assert_eq!(roots[0].key, parent_key);
+    assert_eq!(
+        store
+            .child_counts(&filter)
+            .unwrap()
+            .get(&parent_key)
+            .copied(),
+        Some(1)
+    );
+}
+
+/// Claude Code 的子代理端到端:原件与分支各自派了子代理(一份 Task 派的、一份 Workflow 跑的)。
+/// 扫描后原件的子代理挂在原件下,分支的挂在分支下——子代理停在转录所在的那个会话上,它的文件在
+/// 分支的会话目录里,挂到原件上删除与清理都会把它弄丢。Insights 只算原件与分支两条会话;清理时
+/// 原件那棵树带走原件的子代理,分支自成一棵、带着分支的子代理,谁也不越界
+#[test]
+fn claude_subagents_nest_under_the_session_that_spawned_them() {
+    let home = tempfile::tempdir().unwrap();
+    // 清理要真实路径(macOS 的临时目录在 /var 这个别名后面)
+    let projects = home.path().canonicalize().unwrap().join("projects");
+    let (project, a, b) = common::stage_claude_branch(&projects);
+    let (a_task, a_step) = common::stage_claude_subagents(&project, &a, "o", "toolu_o");
+    let (b_task, b_step) = common::stage_claude_subagents(&project, &b, "b", "toolu_b");
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![ClaudeAdapter::new().with_custom_root(projects)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let key = |id: &str| format!("claude-code:{id}");
+    let parent = |id: &str| store.parent_key_of(&key(id)).unwrap();
+    assert_eq!(parent(&b), Some(key(&a)), "分支挂在原件下");
+    for child in [&a_task, &a_step] {
+        assert_eq!(parent(child), Some(key(&a)), "{child}");
+    }
+    for child in [&b_task, &b_step] {
+        assert_eq!(parent(child), Some(key(&b)), "{child} 挂在派它的分支下");
+    }
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+    assert_eq!(store.insights(today).unwrap().sessions, 2, "子代理不算会话");
+
+    let inventory = agentrouter_session_core::cleanup::inventory(&store, &adapters).unwrap();
+    let tree = |root: &str| -> std::collections::BTreeSet<String> {
+        inventory
+            .candidates
+            .iter()
+            .find(|c| c.root.key == key(root))
+            .unwrap_or_else(|| {
+                let why: Vec<(&str, &str)> = inventory
+                    .unavailable
+                    .iter()
+                    .map(|u| (u.session.key.as_str(), u.reason.as_str()))
+                    .collect();
+                panic!("{root} 没有自己的清理树: {why:?}")
+            })
+            .sessions
+            .iter()
+            .map(|s| s.key.clone())
+            .collect()
+    };
+    assert_eq!(tree(&a), [key(&a), key(&a_task), key(&a_step)].into());
+    assert_eq!(tree(&b), [key(&b), key(&b_task), key(&b_step)].into());
+}
+
+/// 旧版监听把 Claude Code Workflow 的子代理转录当顶层会话收进来过(sidechain 行被滤掉、零消息)。
+/// 文件没变、引用也没变,升级后的增量扫描本会跳过它——FTS_FORMAT "16" 那一轮重解析把它写对:
+/// 正文搜得到、挂到派它的会话下
+#[test]
+fn stale_workflow_rows_from_old_versions_are_reparsed() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+    let (project, a, _) = common::stage_claude_branch(&projects);
+    let (_, step) = common::stage_claude_subagents(&project, &a, "o", "toolu_o");
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![ClaudeAdapter::new().with_custom_root(projects)];
+    let r = adapters[0]
+        .list_session_files()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.native_id == step)
+        .unwrap();
+    let key = format!("claude-code:{step}");
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("wake.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        let stale = SessionMeta {
+            message_count: 0,
+            size_bytes: r.size,
+            file_path: r.file_path.clone(),
+            ..common::meta(&key, "Workflow step: run the tests")
+        };
+        store.write_meta_only(&[(stale, r.mtime_ms)]).unwrap();
+    }
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE schema_meta SET value = '15' WHERE key = 'fts_format'",
+            [],
+        )
+        .unwrap();
+
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(store.get_session(&key).unwrap().unwrap().message_count, 2);
+    assert_eq!(
+        store.parent_key_of(&key).unwrap(),
+        Some(format!("claude-code:{a}"))
+    );
+    let (hits, _) = store.search("All tests pass", &[], None, 10).unwrap();
+    assert!(hits.iter().any(|h| h.session.key == key), "正文搜得到");
+}
+
+/// Claude Code 分支端到端:全量扫描后分支挂在原件下、顶层只列原件;两份共有的那一轮只在
+/// 原件里搜得到,分支自己的话在分支里;原件删掉后分支变回顶层、拿回完整历史
+#[test]
+fn claude_branches_nest_under_their_original_and_outlive_it() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+    let (project, a, b) = common::stage_claude_branch(&projects);
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![ClaudeAdapter::new().with_custom_root(projects)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let (key_a, key_b) = (format!("claude-code:{a}"), format!("claude-code:{b}"));
+    assert_eq!(
+        store.parent_key_of(&key_b).unwrap().as_deref(),
+        Some(key_a.as_str())
+    );
+    let filter = SessionFilter {
+        roots_only: true,
+        limit: 10,
+        ..Default::default()
+    };
+    let (roots, total) = store.list_sessions(&filter).unwrap();
+    assert_eq!(total, 1, "分支不进顶层列表");
+    assert_eq!(roots[0].key, key_a);
+
+    let keys = |q: &str| -> std::collections::BTreeSet<String> {
+        let (hits, _) = store.search(q, &[], None, 10).unwrap();
+        hits.into_iter().map(|h| h.session.key).collect()
+    };
+    assert_eq!(
+        keys("连接池耗尽"),
+        [key_a.clone()].into(),
+        "共有的一轮只命中一次"
+    );
+    assert_eq!(keys("前端轮询结果"), [key_b.clone()].into());
+    // 长驻的 wake-mcp 一直拿着同一份转录缓存:分支文件没动,原件一没就得换成完整历史
+    let cache = TranscriptCache::default();
+    let read_b = || {
+        tools::invoke(
+            store.as_ref(),
+            &adapters,
+            &cache,
+            tools::GET_SESSION,
+            &json!({ "key": key_b }),
+        )
+        .unwrap()
+    };
+    assert!(
+        !read_b().contains("连接池耗尽"),
+        "原件在时复制来的那一轮折叠掉"
+    );
+
+    // 在 Wake 里删掉原件(文件移走 + 墓碑),分支不跟着删:增量扫描后它变回顶层会话,
+    // 复制来的那一轮也回到它自己名下
+    std::fs::remove_file(project.join(format!("{a}.jsonl"))).unwrap();
+    store
+        .remove_trashed_sessions(&[key_a], &HashMap::new())
+        .unwrap();
+    assert!(
+        read_b().contains("连接池耗尽"),
+        "转录缓存还在交折叠过的旧版本"
+    );
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(store.parent_key_of(&key_b).unwrap(), None);
+    let (roots, total) = store.list_sessions(&filter).unwrap();
+    assert_eq!((total, roots[0].key.as_str()), (1, key_b.as_str()));
+    assert_eq!(keys("连接池耗尽"), [key_b.clone()].into());
+}
+
+#[test]
+fn finale_fires_on_empty_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = Vec::new();
+    let rec = Recorder::new();
+
+    let _ = run_scan(&adapters, &store, &rec, false);
+    assert_terminal_event(&rec.0.lock().unwrap(), "空 adapter 列表");
+}
+
+/// 库里有、roster 里已经没有的记忆分组(删掉的远程 host、停用的 agent)在下一轮
+/// 扫描收尾整组清掉——否则会话与缓存都没了之后记忆还能被列出、搜到
+#[test]
+fn memories_of_sources_gone_from_the_roster_are_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let doc = MemoryDoc {
+        key: "codex:devbox:/home/me/.codex/memories/prefs.md".to_string(),
+        agent: AgentId::Codex,
+        host: "devbox".to_string(),
+        scope: MemoryScope::User,
+        project_path: String::new(),
+        project_name: String::new(),
+        session_key: String::new(),
+        path: "/home/me/.codex/memories/prefs.md".to_string(),
+        title: "prefs".to_string(),
+        updated_at: 1,
+        size_bytes: 4,
+        source: String::new(),
+        body: "body".to_string(),
+    };
+    store
+        .replace_memories(AgentId::Codex, "devbox", &[doc], &[])
+        .unwrap();
+    assert_eq!(
+        store.list_memories(&MemoryFilter::default()).unwrap().len(),
+        1
+    );
+
+    // roster 里没有 devbox 这台 host(已被删除)
+    let adapters: Vec<Box<dyn AgentAdapter>> = Vec::new();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert!(
+        store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .is_empty(),
+        "不再配置的来源的记忆必须随扫描出库"
+    );
+}
+
+#[test]
+fn finale_fires_when_adapter_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(FailingAdapter)];
+    let rec = Recorder::new();
+
+    // list_session_files 报错的路径:无论 run_scan 返回 Ok/Err,终态事件必须送达
+    let _ = run_scan(&adapters, &store, &rec, false);
+    assert_terminal_event(&rec.0.lock().unwrap(), "adapter 枚举失败");
+}
+
+/// 一家枚举失败(库在却读不出)只冻结这一家:它在库里的行原样留着,别家照常入库、照常
+/// 删除检测,整轮跑完;失败记进进度的 error,界面照常提示
+#[test]
+fn one_failing_adapter_freezes_only_its_own_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        Box::new(seed(
+            AgentId::Grok,
+            "/tmp/freeze-a",
+            "/tmp/freeze-a/a.jsonl",
+            "a",
+            10,
+        )),
+        Box::new(seed(
+            AgentId::Devin,
+            "/tmp/freeze-b",
+            "/tmp/freeze-b/b.jsonl",
+            "b",
+            10,
+        )),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert!(store.get_session("devin:b").unwrap().is_some());
+
+    let mut unreadable = seed(
+        AgentId::Devin,
+        "/tmp/freeze-b",
+        "/tmp/freeze-b/b.jsonl",
+        "b",
+        10,
+    );
+    unreadable.fail_list = true;
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        Box::new(seed(
+            AgentId::Grok,
+            "/tmp/freeze-a",
+            "/tmp/freeze-a/a2.jsonl",
+            "a2",
+            20,
+        )),
+        Box::new(unreadable),
+    ];
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, false).expect("一家读不出不截断整轮");
+    assert!(
+        store.get_session("devin:b").unwrap().is_some(),
+        "读不出的那家行原样留着"
+    );
+    assert!(
+        store.get_session("grok:a2").unwrap().is_some(),
+        "别家照常入库"
+    );
+    assert!(
+        store.get_session("grok:a").unwrap().is_none(),
+        "别家的删除检测照常"
+    );
+    let events = rec.0.lock().unwrap();
+    assert_terminal_event(&events, "一家枚举失败");
+    assert!(events
+        .last()
+        .and_then(|p| p.error.as_deref())
+        .is_some_and(|e| e.contains("simulated unreadable index")));
+}
+
+#[test]
+fn parent_links_from_multiple_locations_are_merged_by_winning_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut child = seed(
+        AgentId::Grok,
+        "/tmp/grok-child-location",
+        "/tmp/grok-child-location/group/child/updates.jsonl",
+        "child",
+        20,
+    );
+    child.meta.project_path = "/tmp/wt-plan-pr-1".into();
+    child.meta.project_name = "wt-plan-pr-1".into();
+    child.manages_links = true;
+
+    let mut parent = seed(
+        AgentId::Grok,
+        "/tmp/grok-parent-location",
+        "/tmp/grok-parent-location/group/parent/updates.jsonl",
+        "parent",
+        10,
+    );
+    parent.meta.project_path = "/Users/tester/Github/source".into();
+    parent.meta.project_name = "source".into();
+    // Grok 的 subagents/meta.json 在 parent 会话目录，所以关系快照属于
+    // parent location；child 的胜出 updates.jsonl 则来自另一 location。
+    parent.manages_links = true;
+    parent.parent_links = vec![("grok:child".into(), "grok:parent".into())];
+    // 登记只在 parent 那边:child 自己的实例看不见,解析时标不出是派出去的,关系同步来标
+    child.links_spawn = true;
+    parent.links_spawn = true;
+
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(child), Box::new(parent)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    assert_eq!(
+        store.parent_key_of("grok:child").unwrap(),
+        Some("grok:parent".into())
+    );
+    assert_eq!(
+        store
+            .get_session("grok:child")
+            .unwrap()
+            .unwrap()
+            .project_path,
+        "/Users/tester/Github/source"
+    );
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 13).unwrap();
+    assert_eq!(
+        store.insights(today).unwrap().sessions,
+        1,
+        "子会话是派出去的,Insights 只算 parent"
+    );
+}
+
+#[test]
+fn nested_parent_chain_flattens_across_three_locations() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut leaf = seed(
+        AgentId::Grok,
+        "/tmp/grok-leaf-location",
+        "/tmp/grok-leaf-location/group/leaf/updates.jsonl",
+        "leaf",
+        30,
+    );
+    leaf.manages_links = true;
+    let mut middle = seed(
+        AgentId::Grok,
+        "/tmp/grok-middle-location",
+        "/tmp/grok-middle-location/group/middle/updates.jsonl",
+        "middle",
+        20,
+    );
+    middle.manages_links = true;
+    middle.parent_links = vec![("grok:leaf".into(), "grok:middle".into())];
+    let mut root = seed(
+        AgentId::Grok,
+        "/tmp/grok-root-location",
+        "/tmp/grok-root-location/group/root/updates.jsonl",
+        "root",
+        10,
+    );
+    root.meta.project_path = "/Users/tester/Github/source".into();
+    root.meta.project_name = "source".into();
+    root.manages_links = true;
+    root.parent_links = vec![("grok:middle".into(), "grok:root".into())];
+
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![Box::new(leaf), Box::new(middle), Box::new(root)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    assert_eq!(
+        store.parent_key_of("grok:middle").unwrap(),
+        Some("grok:root".into())
+    );
+    assert_eq!(
+        store.parent_key_of("grok:leaf").unwrap(),
+        Some("grok:root".into())
+    );
+    assert_eq!(
+        store
+            .get_session("grok:leaf")
+            .unwrap()
+            .unwrap()
+            .project_path,
+        "/Users/tester/Github/source"
+    );
+}
+
+#[test]
+fn removing_parent_link_restores_child_project_on_sidecar_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut child = seed(
+        AgentId::Grok,
+        "/tmp/grok-child-location",
+        "/tmp/grok-child-location/group/child/updates.jsonl",
+        "child",
+        20,
+    );
+    child.meta.project_path = "/tmp/wt-plan-pr-1".into();
+    child.meta.project_name = "wt-plan-pr-1".into();
+    child.manages_links = true;
+    let mut parent = seed(
+        AgentId::Grok,
+        "/tmp/grok-parent-location",
+        "/tmp/grok-parent-location/group/parent/updates.jsonl",
+        "parent",
+        10,
+    );
+    parent.meta.project_path = "/Users/tester/Github/source".into();
+    parent.meta.project_name = "source".into();
+    parent.manages_links = true;
+    parent.parent_links = vec![("grok:child".into(), "grok:parent".into())];
+
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(child), Box::new(parent)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store
+            .get_session("grok:child")
+            .unwrap()
+            .unwrap()
+            .project_path,
+        "/Users/tester/Github/source"
+    );
+
+    let mut child = seed(
+        AgentId::Grok,
+        "/tmp/grok-child-location",
+        "/tmp/grok-child-location/group/child/updates.jsonl",
+        "child",
+        20,
+    );
+    child.meta.project_path = "/tmp/wt-plan-pr-1".into();
+    child.meta.project_name = "wt-plan-pr-1".into();
+    child.manages_links = true;
+    let mut parent = seed(
+        AgentId::Grok,
+        "/tmp/grok-parent-location",
+        "/tmp/grok-parent-location/group/parent/updates.jsonl",
+        "parent",
+        10,
+    );
+    parent.meta.project_path = "/Users/tester/Github/source".into();
+    parent.meta.project_name = "source".into();
+    parent.manages_links = true;
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(child), Box::new(parent)];
+
+    refresh_parent_links(&adapters, &store, &Recorder::new(), &[AgentId::Grok]);
+
+    let child = store.get_session("grok:child").unwrap().unwrap();
+    assert_eq!(store.parent_key_of(&child.key).unwrap(), None);
+    assert_eq!(child.project_path, "/tmp/wt-plan-pr-1");
+    assert_eq!(child.project_name, "wt-plan-pr-1");
+}
+
+#[test]
+fn migration_backfill_reparses_unchanged_grok_rows_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("scan.db");
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    let mut adapter = seed(
+        AgentId::Grok,
+        "/tmp/grok-backfill",
+        "/tmp/grok-backfill/group/session/updates.jsonl",
+        "session",
+        42,
+    );
+    adapter.meta.project_path = "/Users/tester/Github/source".into();
+    adapter.meta.project_name = "source".into();
+    let mut stale = adapter.meta.clone();
+    stale.project_path = "/tmp/wt-plan-pr-1".into();
+    stale.project_name = "wt-plan-pr-1".into();
+    store.write_meta_only(&[(stale, 42)]).unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('grok_parent_backfill', '1')",
+            [],
+        )
+        .unwrap();
+
+    run_scan(
+        &[Box::new(adapter) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        store
+            .get_session("grok:session")
+            .unwrap()
+            .unwrap()
+            .project_path,
+        "/Users/tester/Github/source"
+    );
+    assert!(!store.needs_grok_parent_backfill());
+}
+
+/// FTS 派生规则换代(db::FTS_FORMAT):旧库首开挂 fts_reindex 旗子,下一轮增量扫描
+/// 把 mtime/size 都没变的行也重处理一遍,然后清旗子;新库不挂
+#[test]
+fn fts_reindex_flag_reprocesses_unchanged_rows_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reindex.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        assert!(!store.needs_fts_reindex(), "新库不该挂旗子");
+    }
+    // 模拟升级前的库:有 sessions 表,但没记过 fts_format
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute("DELETE FROM schema_meta WHERE key = 'fts_format'", [])
+        .unwrap();
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    assert!(store.needs_fts_reindex(), "旧库首开要挂旗子");
+
+    let path = "/tmp/reindex/p/s.jsonl";
+    let mut before = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    before.meta.title = "before".into();
+    // 库里已有同 mtime/size 的行,增量扫描本会跳过
+    store.write_meta_only(&[(before.meta.clone(), 42)]).unwrap();
+    let mut after = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    after.meta.title = "after".into();
+    run_scan(
+        &[Box::new(after) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+    let title = |store: &Store| store.get_session("claude-code:s").unwrap().unwrap().title;
+    assert_eq!(title(&store), "after", "旗子在时未变的文件也要重处理");
+    assert!(!store.needs_fts_reindex(), "跑完一轮就清");
+
+    // 没旗子、文件没变:增量扫描照常跳过
+    let mut third = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    third.meta.title = "third".into();
+    run_scan(
+        &[Box::new(third) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(title(&store), "after");
+}
+
+#[test]
+fn format_two_backfills_pi_tokens_without_source_changes() {
+    use agentrouter_session_core::adapters::pi::PiAdapter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("tokens.db");
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![PiAdapter::new().with_custom_root(common::fixture("pi/agent/sessions"))];
+    let r = adapters[0].list_session_files().unwrap().remove(0);
+    let mut old = adapters[0].parse_session(&r).unwrap();
+    old.meta.tokens_used = Some(4300); // Last call, as stored by format 2.
+    {
+        let store = Store::open(&db_path).unwrap();
+        store
+            .write_session(&old.meta, r.mtime_ms, &old.units)
+            .unwrap();
+    }
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE schema_meta SET value = '2' WHERE key = 'fts_format'",
+            [],
+        )
+        .unwrap();
+
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    assert!(store.needs_fts_reindex());
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let updated = store.get_session(&old.meta.key).unwrap().unwrap();
+    assert_eq!(updated.tokens_used, Some(4242 + 4300));
+    assert_eq!(updated.message_count, old.meta.message_count);
+    assert!(!store.needs_fts_reindex());
+    drop(store);
+
+    // The version is persisted: neither reopening nor a second scan repeats it.
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    assert!(!store.needs_fts_reindex());
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, false).unwrap();
+    assert_eq!(rec.changed(), 0);
+}
+
+#[test]
+fn migration_backfill_retries_after_parse_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("retry.db");
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    let mut broken = seed(
+        AgentId::Grok,
+        "/tmp/grok-backfill-retry",
+        "/tmp/grok-backfill-retry/group/session/updates.jsonl",
+        "session",
+        42,
+    );
+    broken.meta.project_path = "/tmp/wt-plan-pr-1".into();
+    broken.meta.project_name = "wt-plan-pr-1".into();
+    broken.fail_parse = true;
+    store
+        .write_meta_only(&[(broken.meta.clone(), broken.r.mtime_ms)])
+        .unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('grok_parent_backfill', '1')",
+            [],
+        )
+        .unwrap();
+
+    run_scan(
+        &[Box::new(broken) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        store.needs_grok_parent_backfill(),
+        "failed forced rows must remain retryable"
+    );
+
+    let mut repaired = seed(
+        AgentId::Grok,
+        "/tmp/grok-backfill-retry",
+        "/tmp/grok-backfill-retry/group/session/updates.jsonl",
+        "session",
+        42,
+    );
+    repaired.meta.project_path = "/Users/tester/Github/source".into();
+    repaired.meta.project_name = "source".into();
+    run_scan(
+        &[Box::new(repaired) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        store
+            .get_session("grok:session")
+            .unwrap()
+            .unwrap()
+            .project_path,
+        "/Users/tester/Github/source"
+    );
+    assert!(!store.needs_grok_parent_backfill());
+}
+
+/// 固定提供一个会话(含 quickMeta 快路径)的 adapter。agent/root 可参数化:
+/// 防复活、跨根去重、重叠根归属三组测试共用
+struct SeedAdapter {
+    agent: AgentId,
+    root: std::path::PathBuf,
+    r: SessionFileRef,
+    meta: SessionMeta,
+    /// 模拟截断/损坏副本:解析一律报错(副本回退测试用)
+    fail_parse: bool,
+    /// 模拟库在却读不出:枚举报错
+    fail_list: bool,
+    /// 模拟 codex 的 state 改名:quick 给出的 key 与文件 native key 不同,
+    /// merge 时 quick key 压过 parsed(codex 同款优先级)
+    quick_key: Option<String>,
+    manages_links: bool,
+    parent_links: Vec<(String, String)>,
+    /// 模拟"这一刻读不出关系"(state DB 打不开):parent_links 交 None
+    links_unknown: bool,
+    /// 关系只记派出去的子会话(Grok 的登记表)
+    links_spawn: bool,
+    rank: u8,
+}
+
+impl AgentAdapter for SeedAdapter {
+    fn agent(&self) -> AgentId {
+        self.agent
+    }
+    fn dedup_rank(&self, _path: &str) -> u8 {
+        self.rank
+    }
+    fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
+        if self.fail_list {
+            bail!("simulated unreadable index")
+        }
+        Ok(vec![self.r.clone()])
+    }
+    fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
+        (path.to_string_lossy() == self.r.file_path).then(|| self.r.clone())
+    }
+    fn quick_meta(
+        &self,
+        _refs: &[SessionFileRef],
+    ) -> Option<std::collections::HashMap<String, SessionMeta>> {
+        let mut meta = self.meta.clone();
+        if let Some(k) = &self.quick_key {
+            meta.key = k.clone();
+        }
+        let mut m = std::collections::HashMap::new();
+        m.insert(self.r.file_path.clone(), meta);
+        Some(m)
+    }
+    fn merge_quick_meta(&self, mut parsed: SessionMeta, quick: &SessionMeta) -> SessionMeta {
+        if self.quick_key.is_some() {
+            parsed.key = quick.key.clone();
+        }
+        parsed
+    }
+    fn manages_parent_links(&self) -> bool {
+        self.manages_links
+    }
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        (!self.links_unknown).then(|| self.parent_links.clone())
+    }
+    fn linked_children_are_spawned(&self) -> bool {
+        self.links_spawn
+    }
+    fn parse_session(&self, _: &SessionFileRef) -> Result<ParsedSession> {
+        if self.fail_parse {
+            bail!("simulated corrupt copy")
+        }
+        Ok(ParsedSession {
+            meta: self.meta.clone(),
+            units: Vec::new(),
+            unknown_line_count: 0,
+            wake_lookups: Vec::new(),
+        })
+    }
+    fn parse_transcript(&self, _: &SessionFileRef) -> Result<ParsedTranscript> {
+        bail!("transcript not needed in scan")
+    }
+    fn data_roots(&self) -> Vec<std::path::PathBuf> {
+        vec![self.root.clone()]
+    }
+    fn with_custom_root(&self, _: std::path::PathBuf) -> Box<dyn AgentAdapter> {
+        Box::new(SeedAdapter {
+            agent: self.agent,
+            root: self.root.clone(),
+            r: self.r.clone(),
+            meta: self.meta.clone(),
+            fail_parse: self.fail_parse,
+            fail_list: self.fail_list,
+            quick_key: self.quick_key.clone(),
+            manages_links: self.manages_links,
+            parent_links: self.parent_links.clone(),
+            links_unknown: self.links_unknown,
+            links_spawn: self.links_spawn,
+            rank: self.rank,
+        })
+    }
+}
+
+/// 只提供记忆的 adapter:同 (agent, host) 多实例、一个坏一个好的对账测试用
+struct MemoryStub {
+    root: std::path::PathBuf,
+    docs: Vec<MemoryDoc>,
+    fail: bool,
+}
+
+impl AgentAdapter for MemoryStub {
+    fn agent(&self) -> AgentId {
+        AgentId::ClaudeCode
+    }
+    fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
+        Ok(Vec::new())
+    }
+    fn parse_session(&self, _: &SessionFileRef) -> Result<ParsedSession> {
+        bail!("unreachable")
+    }
+    fn parse_transcript(&self, _: &SessionFileRef) -> Result<ParsedTranscript> {
+        bail!("unreachable")
+    }
+    fn data_roots(&self) -> Vec<std::path::PathBuf> {
+        vec![self.root.clone()]
+    }
+    fn with_custom_root(&self, _: std::path::PathBuf) -> Box<dyn AgentAdapter> {
+        unreachable!("not used in scans")
+    }
+    fn memory_sources(&self) -> Vec<MemorySource> {
+        // 来源 id 要与 mem_doc 从 "/roots/x/memory/y.md" 取的父目录逐字节相同:桩的根是
+        // 字面 POSIX 串,Windows 上 `Path::join` 会接成 "/roots/x\memory",按串拼才一致
+        vec![MemorySource {
+            agent: AgentId::ClaudeCode,
+            kind: MemorySourceKind::Dir { ext: "md" },
+            path: std::path::PathBuf::from(format!("{}/memory", self.root.display())),
+        }]
+    }
+    fn list_memories(
+        &self,
+        _sources: &[MemorySource],
+        _projects: &[std::path::PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        if self.fail {
+            bail!("simulated unreadable memory directory")
+        }
+        Ok(self.docs.clone())
+    }
+}
+
+/// 来源 id = 文件所在目录(与 MemoryStub::memory_sources 报的 `<root>/memory` 一致)
+fn mem_doc(path: &str, title: &str) -> MemoryDoc {
+    let source = std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    MemoryDoc {
+        key: format!("claude-code:{path}"),
+        agent: AgentId::ClaudeCode,
+        host: String::new(),
+        scope: MemoryScope::Project,
+        project_path: String::new(),
+        project_name: String::new(),
+        session_key: String::new(),
+        path: path.to_string(),
+        title: title.to_string(),
+        updated_at: 1,
+        size_bytes: 4,
+        source,
+        body: "body".to_string(),
+    }
+}
+
+fn memory_stub(root: &str, docs: Vec<MemoryDoc>, fail: bool) -> Box<dyn AgentAdapter> {
+    Box::new(MemoryStub {
+        root: std::path::PathBuf::from(root),
+        docs,
+        fail,
+    })
+}
+
+/// 同 (agent, host) 的两个实例,一个读得出、一个读不出:好的那个照常对账(新增入库、
+/// 消失出库),坏的那个根下的行原样冻结;全部实例都失败才整组不动——原先一个实例失败
+/// 整组不写,默认根的记忆会一直停在上次(2026-09-21 review)
+#[test]
+fn memories_of_a_failing_instance_stay_frozen_while_the_others_reconcile() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let titles = |store: &Store| -> Vec<String> {
+        store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .iter()
+            .map(|d| d.title.clone())
+            .collect()
+    };
+    // 上一轮两边都好:a1 与 b1 入库
+    let adapters = vec![
+        memory_stub(
+            "/roots/a",
+            vec![mem_doc("/roots/a/memory/a1.md", "a1")],
+            false,
+        ),
+        memory_stub(
+            "/roots/b",
+            vec![mem_doc("/roots/b/memory/b1.md", "b1")],
+            false,
+        ),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["a1", "b1"]);
+    // 这一轮 a 换了文件、b 读不出
+    let adapters = vec![
+        memory_stub(
+            "/roots/a",
+            vec![mem_doc("/roots/a/memory/a2.md", "a2")],
+            false,
+        ),
+        memory_stub("/roots/b", Vec::new(), true),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["a2", "b1"], "a 对账了,b 冻结");
+    // 全部实例都失败:整组不动
+    let adapters = vec![memory_stub("/roots/a", Vec::new(), true)];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["a2", "b1"]);
+    // b 恢复后按它现在的内容对账
+    let adapters = vec![
+        memory_stub(
+            "/roots/a",
+            vec![mem_doc("/roots/a/memory/a2.md", "a2")],
+            false,
+        ),
+        memory_stub("/roots/b", Vec::new(), false),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["a2"]);
+}
+
+/// Settings → Memory locations 的两种偏离:停用一个默认来源(它的行随下一轮出库),
+/// 添加一个自定义目录(它的 *.md 以 agent 记的、用户级列进来);Restore defaults 后
+/// 两边都回来 / 走掉
+#[test]
+fn memory_source_overrides_drive_what_gets_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let claude_home = home.path().join(".claude");
+    let memory = claude_home.join("projects/-Users-tester-Github-wakefx/memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(memory.join("MEMORY.md"), "- notes\n").unwrap();
+    std::fs::write(claude_home.join("CLAUDE.md"), "# global\n").unwrap();
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("team.md"), "# team conventions\n").unwrap();
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        CodexAdapter::new().with_custom_root(home.path().join(".nope")),
+        agentrouter_session_core::adapters::claude::ClaudeAdapter::new().with_custom_root(claude_home.clone()),
+    ];
+    let titles = |store: &Store| -> Vec<String> {
+        store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .iter()
+            .map(|d| d.title.clone())
+            .collect()
+    };
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["MEMORY.md", "CLAUDE.md"]);
+
+    // 停用全局 CLAUDE.md 这个来源
+    let claude_md = claude_home.join("CLAUDE.md").to_string_lossy().to_string();
+    store
+        .set_memory_source_enabled("claude-code", &claude_md, false)
+        .unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["MEMORY.md"]);
+
+    // 加一个自定义目录
+    store
+        .add_memory_source("claude-code", &notes.to_string_lossy())
+        .unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let docs = store.list_memories(&MemoryFilter::default()).unwrap();
+    let custom = docs
+        .iter()
+        .find(|d| d.title == "team.md")
+        .expect("自定义目录的文件");
+    assert_eq!(
+        (custom.scope, custom.source.as_str()),
+        (MemoryScope::User, notes.to_string_lossy().as_ref())
+    );
+    let counts = store.memory_source_counts().unwrap();
+    assert_eq!(
+        counts.get(&(
+            "claude-code".to_string(),
+            notes.to_string_lossy().to_string()
+        )),
+        Some(&1)
+    );
+
+    // Restore defaults:自定义走掉、停用的回来
+    store.clear_memory_source_overrides().unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["MEMORY.md", "CLAUDE.md"]);
+}
+
+/// 会话 location 全停用(roster 里没有这一家的实例)之后,agent 级的记忆来源——用户加的
+/// 自定义目录、项目根下的指令文件——照读:它们不在被停用的 location 里,不该随它消失;
+/// 停掉的只是从那个根派生的默认来源(记忆树、全局 CLAUDE.md)。原先这一家直接从计划里
+/// 消失,scanner 把它整组删光、Settings 里连自定义行都看不见(2026-09-22 review)
+#[test]
+fn agent_level_memory_sources_outlive_a_disabled_session_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let claude_home = home.path().join(".claude");
+    let memory = claude_home.join("projects/-Users-tester-Github-wakefx/memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(memory.join("MEMORY.md"), "- notes\n").unwrap();
+    std::fs::write(claude_home.join("CLAUDE.md"), "# global\n").unwrap();
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("team.md"), "# team conventions\n").unwrap();
+    store
+        .add_memory_source("claude-code", &notes.to_string_lossy())
+        .unwrap();
+    let titles = |store: &Store| -> Vec<String> {
+        let mut v: Vec<String> = store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .iter()
+            .map(|d| d.title.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    let with_claude: Vec<Box<dyn AgentAdapter>> = vec![
+        CodexAdapter::new().with_custom_root(home.path().join(".nope")),
+        agentrouter_session_core::adapters::claude::ClaudeAdapter::new().with_custom_root(claude_home.clone()),
+    ];
+    run_scan(&with_claude, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["CLAUDE.md", "MEMORY.md", "team.md"]);
+
+    // Claude 的会话 location 停用 = roster 里没有它的实例
+    let without_claude: Vec<Box<dyn AgentAdapter>> =
+        vec![CodexAdapter::new().with_custom_root(home.path().join(".nope"))];
+    run_scan(&without_claude, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(
+        titles(&store),
+        ["team.md"],
+        "默认来源随根消失,自定义目录留下"
+    );
+    let custom = &store.list_memories(&MemoryFilter::default()).unwrap()[0];
+    assert_eq!(custom.agent, AgentId::ClaudeCode);
+
+    // 删掉自定义来源才真的走掉
+    store
+        .remove_memory_source("claude-code", &notes.to_string_lossy())
+        .unwrap();
+    run_scan(&without_claude, &store, &Recorder::new(), false).unwrap();
+    assert!(titles(&store).is_empty());
+}
+
+/// 关系这一刻读不出(state DB 打不开)= None:这一家整段跳过,库里的关系原样保留,
+/// 而不是拿空快照当"全部解除"整家清空(2026-09-21 review)
+#[test]
+fn unreadable_parent_links_keep_the_indexed_relationships() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let pair = |unknown: bool| -> Vec<Box<dyn AgentAdapter>> {
+        let mut child = seed(
+            AgentId::Grok,
+            "/tmp/grok-child-location",
+            "/tmp/grok-child-location/group/child/updates.jsonl",
+            "child",
+            20,
+        );
+        child.manages_links = true;
+        child.links_unknown = unknown;
+        let mut parent = seed(
+            AgentId::Grok,
+            "/tmp/grok-parent-location",
+            "/tmp/grok-parent-location/group/parent/updates.jsonl",
+            "parent",
+            10,
+        );
+        parent.manages_links = true;
+        parent.parent_links = vec![("grok:child".into(), "grok:parent".into())];
+        parent.links_unknown = unknown;
+        vec![Box::new(child), Box::new(parent)]
+    };
+    run_scan(&pair(false), &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("grok:child").unwrap(),
+        Some("grok:parent".into())
+    );
+    run_scan(&pair(true), &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("grok:child").unwrap(),
+        Some("grok:parent".into()),
+        "读不出不等于解除"
+    );
+}
+
+/// 两层链:先只有 leaf 与 middle 入库(leaf→middle),root 后来才被索引——这一轮算得出
+/// leaf→root 就以它为准;原先 asserted 守卫会把先入库的直接边 leaf→middle 保留回去,
+/// 链永远钉在中间层(2026-09-21 review)
+#[test]
+fn nested_chain_reflattens_once_the_root_is_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let leaf = || {
+        let mut leaf = seed(
+            AgentId::Grok,
+            "/tmp/grok-leaf-location",
+            "/tmp/grok-leaf-location/group/leaf/updates.jsonl",
+            "leaf",
+            30,
+        );
+        leaf.manages_links = true;
+        leaf
+    };
+    let middle = || {
+        let mut middle = seed(
+            AgentId::Grok,
+            "/tmp/grok-middle-location",
+            "/tmp/grok-middle-location/group/middle/updates.jsonl",
+            "middle",
+            20,
+        );
+        middle.manages_links = true;
+        middle.parent_links = vec![("grok:leaf".into(), "grok:middle".into())];
+        middle
+    };
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(leaf()), Box::new(middle())];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("grok:leaf").unwrap(),
+        Some("grok:middle".into())
+    );
+
+    let mut root = seed(
+        AgentId::Grok,
+        "/tmp/grok-root-location",
+        "/tmp/grok-root-location/group/root/updates.jsonl",
+        "root",
+        10,
+    );
+    root.manages_links = true;
+    root.parent_links = vec![("grok:middle".into(), "grok:root".into())];
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![Box::new(leaf()), Box::new(middle()), Box::new(root)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("grok:middle").unwrap(),
+        Some("grok:root".into())
+    );
+    assert_eq!(
+        store.parent_key_of("grok:leaf").unwrap(),
+        Some("grok:root".into()),
+        "root 入库后 leaf 要重新扁平到 root,而不是钉在 middle"
+    );
+}
+
+/// SeedAdapter 三件套:根/路径/mtime 齐配的最小会话
+fn seed(agent: AgentId, root: &str, path: &str, native_id: &str, mtime: i64) -> SeedAdapter {
+    SeedAdapter {
+        agent,
+        root: std::path::PathBuf::from(root),
+        r: SessionFileRef {
+            agent,
+            native_id: native_id.into(),
+            file_path: path.into(),
+            mtime_ms: mtime,
+            size: 1,
+        },
+        meta: SessionMeta {
+            id: native_id.into(),
+            agent,
+            project_path: "/tmp/p".into(),
+            project_name: "p".into(),
+            file_path: path.into(),
+            created_at: 1,
+            updated_at: mtime,
+            message_count: 0,
+            size_bytes: 1,
+            ..common::meta(&format!("{}:{native_id}", agent.as_str()), "seed")
+        },
+        fail_parse: false,
+        fail_list: false,
+        quick_key: None,
+        manages_links: false,
+        parent_links: Vec::new(),
+        links_unknown: false,
+        links_spawn: false,
+        rank: 0,
+    }
+}
+
+/// 不变量 3 端到端:删除(trash+tombstone)后,数据源仍枚举同一文件的
+/// 下一次全量扫描不得让会话复活
+#[test]
+fn tombstoned_session_does_not_resurrect_on_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let meta = SessionMeta {
+        agent: AgentId::Codex,
+        project_path: "/tmp/p".into(),
+        project_name: "p".into(),
+        file_path: "/tmp/fixtures/ghost.jsonl".into(),
+        created_at: 1,
+        updated_at: 2,
+        message_count: 0,
+        size_bytes: 1,
+        ..common::meta("codex:ghost", "残留会话")
+    };
+    let r = SessionFileRef {
+        agent: AgentId::Codex,
+        native_id: "ghost".into(),
+        file_path: meta.file_path.clone(),
+        mtime_ms: 2,
+        size: 1,
+    };
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(SeedAdapter {
+        agent: AgentId::Codex,
+        root: std::path::PathBuf::from("/tmp/fixtures"),
+        r,
+        meta: meta.clone(),
+        fail_parse: false,
+        fail_list: false,
+        quick_key: None,
+        manages_links: false,
+        parent_links: Vec::new(),
+        links_unknown: false,
+        links_spawn: false,
+        rank: 0,
+    })];
+    let rec = Recorder::new();
+
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert!(
+        store.get_session("codex:ghost").unwrap().is_some(),
+        "首扫应写入"
+    );
+
+    store
+        .remove_trashed_sessions(&["codex:ghost".to_string()], &HashMap::new())
+        .unwrap();
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert!(
+        store.get_session("codex:ghost").unwrap().is_none(),
+        "tombstoned 会话重扫后复活 = 不变量 3 破坏"
+    );
+}
+
+/// 单条删除把文件移进废纸篓后:文件不在、或同一路径冒出另一份内容(agent 重新写出)→
+/// 照旧压着;用户原样放回(文件本身的大小与修改时间对得上,`put_back_fingerprint`)→
+/// 全量与增量两条路都撤掉墓碑、会话回来——确认框说"放回原处就会重新出现"靠的就是这个。
+/// 只在 Wake 里隐藏的库存型会话(没记指纹)永远不会被当成放回。比的是文件本身而不是
+/// 索引里的变更戳:seed 的引用戳与磁盘上的文件毫无关系,照样认得出
+#[test]
+fn put_back_from_trash_brings_a_deleted_session_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let rec = Recorder::new();
+    let file = dir.path().join("a.jsonl");
+    let trash = dir.path().join("trashed-a.jsonl");
+    std::fs::write(&file, "{\"the original\": 1}\n").unwrap();
+    let path = file.to_string_lossy().to_string();
+    let roster = || -> Vec<Box<dyn AgentAdapter>> {
+        vec![Box::new(seed(
+            AgentId::Codex,
+            &dir.path().to_string_lossy(),
+            &path,
+            "a",
+            10,
+        ))]
+    };
+    let present = |store: &Store| store.get_session("codex:a").unwrap().is_some();
+    // 删除:先记指纹,再"移进废纸篓"(改名走开,与真废纸篓一样保留修改时间)
+    let delete = |store: &Store| {
+        let print = agentrouter_session_core::db::put_back_fingerprint(&file).expect("fingerprint");
+        std::fs::rename(&file, &trash).unwrap();
+        store
+            .remove_trashed_sessions(
+                &["codex:a".to_string()],
+                &HashMap::from([(path.clone(), print)]),
+            )
+            .unwrap();
+    };
+    let put_back = || std::fs::rename(&trash, &file).unwrap();
+
+    run_scan(&roster(), &store, &rec, true).unwrap();
+    assert!(present(&store));
+
+    // 全量路径
+    delete(&store);
+    run_scan(&roster(), &store, &rec, true).unwrap();
+    assert!(!present(&store), "文件还在废纸篓里");
+    std::fs::write(&file, "{\"rewritten by the agent\": 2}\n").unwrap();
+    run_scan(&roster(), &store, &rec, true).unwrap();
+    assert!(!present(&store), "同一路径的另一份文件不得解开删除");
+    std::fs::remove_file(&file).unwrap();
+    put_back();
+    run_scan(&roster(), &store, &rec, true).unwrap();
+    assert!(present(&store), "原样放回的文件要重新入库");
+
+    // 增量路径(watcher 收到放回事件)
+    delete(&store);
+    put_back();
+    scan_files(&roster(), &store, &rec, vec![roster_ref(&roster())]);
+    assert!(present(&store), "watcher 收到放回事件也要认出来");
+
+    // 只隐藏:没记指纹,文件原样在也不放行
+    store
+        .remove_trashed_sessions(&["codex:a".to_string()], &HashMap::new())
+        .unwrap();
+    run_scan(&roster(), &store, &rec, true).unwrap();
+    scan_files(&roster(), &store, &rec, vec![roster_ref(&roster())]);
+    assert!(!present(&store), "只在 Wake 里隐藏的会话不得自己回来");
+}
+
+/// 单实例 seed roster 枚举出的那条引用(watcher 增量直接拿它喂 scan_files)
+fn roster_ref(roster: &[Box<dyn AgentAdapter>]) -> SessionFileRef {
+    roster[0].list_session_files().unwrap().remove(0)
+}
+
+/// 同 agent 双根下的同 ID 会话:mtime 新者胜且跨轮稳定。旧行为是"后写者胜",
+/// 两个副本每轮轮流改写同一行、file_path 随扫描摇摆(2026-08-24 Codex review)
+/// ——故意把旧副本排在 roster 后面,旧代码在此必败
+#[test]
+fn duplicate_session_across_roots_resolves_to_newest() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        Box::new(seed(AgentId::Codex, "/live", "/live/dup.jsonl", "dup", 9)),
+        Box::new(seed(
+            AgentId::Codex,
+            "/backup",
+            "/backup/dup.jsonl",
+            "dup",
+            5,
+        )),
+    ];
+    let rec = Recorder::new();
+    for round in 0..2 {
+        run_scan(&adapters, &store, &rec, true).unwrap();
+        let s = store.get_session("codex:dup").unwrap().expect("会话应在库");
+        assert_eq!(
+            s.file_path, "/live/dup.jsonl",
+            "第 {round} 轮后 file_path 未稳定在 mtime 新者上"
+        );
+    }
+}
+
+/// 副本裁决先看实例的 dedup_rank、同级才比 mtime:一家的多个数据源可以固定
+/// 偏好某一源,而不随两边写盘先后翻转;败方仍是解析失败的回退顺位
+#[test]
+fn lower_dedup_rank_beats_newer_mtime_and_still_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut secondary = seed(AgentId::Cursor, "/ide", "/ide/db#dup", "dup", 9);
+    secondary.rank = 1;
+    let primary = seed(AgentId::Cursor, "/cli", "/cli/dup.jsonl", "dup", 5);
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(secondary), Box::new(primary)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store
+        .get_session("cursor:dup")
+        .unwrap()
+        .expect("会话应在库");
+    assert_eq!(
+        s.file_path, "/cli/dup.jsonl",
+        "rank 小者胜出,即使 mtime 更旧、roster 里排在后面"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut secondary = seed(AgentId::Cursor, "/ide", "/ide/db#dup", "dup", 9);
+    secondary.rank = 1;
+    let mut broken_primary = seed(AgentId::Cursor, "/cli", "/cli/dup.jsonl", "dup", 5);
+    broken_primary.fail_parse = true;
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(broken_primary), Box::new(secondary)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store
+        .get_session("cursor:dup")
+        .unwrap()
+        .expect("胜者损坏后会话不该消失");
+    assert_eq!(s.file_path, "/ide/db#dup", "rank 靠后的副本仍是回退顺位");
+
+    // 增量路径同一把尺子:库里已是 rank 靠后的较新副本(转录曾缺失或只剩空壳,
+    // IDE 副本胜出过),rank 靠前的较旧副本经 scan_files(watcher 路径)到来
+    // 仍要接管,不被 write_session_guarded 的 mtime 比较挡住(2026-09-15 Codex review)
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut ide_only = seed(AgentId::Cursor, "/ide", "/ide/db#dup", "dup", 9);
+    ide_only.rank = 1;
+    let only_ide: Vec<Box<dyn AgentAdapter>> = vec![Box::new(ide_only)];
+    run_scan(&only_ide, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.get_session("cursor:dup").unwrap().unwrap().file_path,
+        "/ide/db#dup"
+    );
+    let mut secondary = seed(AgentId::Cursor, "/ide", "/ide/db#dup", "dup", 9);
+    secondary.rank = 1;
+    let primary = seed(AgentId::Cursor, "/cli", "/cli/dup.jsonl", "dup", 5);
+    let incoming = primary.r.clone();
+    let both: Vec<Box<dyn AgentAdapter>> = vec![Box::new(secondary), Box::new(primary)];
+    scan_files(&both, &store, &Recorder::new(), vec![incoming]);
+    assert_eq!(
+        store.get_session("cursor:dup").unwrap().unwrap().file_path,
+        "/cli/dup.jsonl",
+        "增量写入也按 rank 接管,不被库里较新的 IDE 副本挡住"
+    );
+}
+
+/// dsh 迁移后旧代原样留着(issue #45):库里已经记着旧代时(0.8.2 及以前的 Wake 只认
+/// v0 的文件名),新代经 watcher(scan_files)到来必须接替——哪怕它的 mtime 反而更旧
+/// (同步、拷贝来的)。写事务内的副本裁决先比 dedup_rank,dsh 按代给位次
+#[test]
+fn dsh_newer_generation_takes_over_an_indexed_older_one() {
+    use agentrouter_session_core::adapters::dsh::DshAdapter;
+    const KEY: &str = "dsh:dsh-v4-0003";
+    let root = tempfile::tempdir().unwrap();
+    let session = root
+        .path()
+        .join("--Users-tester-Github-wakefx--")
+        .join("dsh-v4-0003");
+    std::fs::create_dir_all(&session).unwrap();
+    let v0 = session.join("session.jsonl.zstd");
+    std::fs::write(
+        &v0,
+        common::dsh_zstd(concat!(
+            r#"{"type":"session","version":0,"id":"dsh-v4-0003","createdAt":1788000000000,"cwd":"/Users/tester/Github/wakefx","delegationDepth":0}"#,
+            "\n",
+            r#"{"type":"user/message","seq":0,"time":1788000001000,"data":{"id":"m-u","role":"user","content":[{"type":"text","text":"old generation question"}],"source":{"kind":"user"}}}"#,
+            "\n",
+            r#"{"type":"session/title","seq":1,"time":1788000002000,"data":{"title":"Old generation title"}}"#,
+            "\n",
+        )),
+    )
+    .unwrap();
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![DshAdapter::new().with_custom_root(root.path().to_path_buf())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store.get_session(KEY).unwrap().expect("旧代入库");
+    assert_eq!(s.file_path, v0.to_string_lossy());
+    assert_eq!(s.title, "Old generation title");
+
+    // dsh 迁移出 v4,mtime 却比 v0 旧一小时
+    let v4 = session.join("session.v4.jsonl.zstd");
+    let plain = std::fs::read_to_string(common::fixture("dsh/session.v4.jsonl")).unwrap();
+    std::fs::write(&v4, common::dsh_zstd(&plain)).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&v4)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    let incoming = adapters[0].file_ref(&v4).expect("v4 是这个会话的日志");
+    scan_files(&adapters, &store, &Recorder::new(), vec![incoming]);
+    let s = store.get_session(KEY).unwrap().expect("会话仍在库");
+    assert_eq!(
+        s.file_path,
+        v4.to_string_lossy(),
+        "新代经增量写入接替,不被旧代较新的 mtime 挡住"
+    );
+    assert_eq!(s.title, "README 安装命令改 npx");
+
+    // 旧代上的事件不是这个会话的日志;下一轮全量扫描也稳定在新代上
+    assert!(adapters[0].file_ref(&v0).is_none());
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(
+        store.get_session(KEY).unwrap().unwrap().file_path,
+        v4.to_string_lossy()
+    );
+}
+
+/// dsh 委派出去的子代理(issue #63):照常收录,经首行的 parentSession 挂到派它的会话下面,
+/// 不进顶层列表;它自己的 token 计在它名下
+#[test]
+fn dsh_subagents_nest_under_the_session_that_started_them() {
+    use agentrouter_session_core::adapters::dsh::DshAdapter;
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("--Users-tester-Github-wakefx--");
+    for (dir, fixture, log) in [
+        ("dsh-e2e4-0001", "dsh/session.jsonl", "session.jsonl.zstd"),
+        (
+            "dsh-sub-0002",
+            "dsh/subagent.v4.jsonl",
+            "session.v4.jsonl.zstd",
+        ),
+    ] {
+        let session = project.join(dir);
+        std::fs::create_dir_all(&session).unwrap();
+        let plain = std::fs::read_to_string(common::fixture(fixture)).unwrap();
+        std::fs::write(session.join(log), common::dsh_zstd(&plain)).unwrap();
+    }
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![DshAdapter::new().with_custom_root(root.path().to_path_buf())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let (parent, child) = ("dsh:dsh-e2e4-0001", "dsh:dsh-sub-0002");
+    assert_eq!(store.parent_key_of(child).unwrap().as_deref(), Some(parent));
+    let sub = store.get_session(child).unwrap().expect("子代理入库");
+    assert_eq!(sub.title, "Audit the scanner effects");
+    assert_eq!(sub.tokens_used, Some(1820));
+    let filter = SessionFilter {
+        roots_only: true,
+        limit: 10,
+        ..Default::default()
+    };
+    let (roots, total) = store.list_sessions(&filter).unwrap();
+    assert_eq!(total, 1, "子代理不进顶层列表");
+    assert_eq!(roots[0].key, parent);
+    assert_eq!(store.child_counts(&filter).unwrap().get(parent), Some(&1));
+}
+
+/// Kimi 分叉:关系写在子会话自己的 state.json(`forkedFrom`),全量扫描后子会话挂在父会话
+/// 下面;state.json 的 archived 照搬进索引
+#[test]
+fn kimi_forks_nest_under_their_parent() {
+    use agentrouter_session_core::adapters::kimi::KimiAdapter;
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![KimiAdapter::new().with_custom_root(common::fixture("kimi-cli"))];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let parent = "kimi:session_c1111111-aaaa-bbbb-cccc-000000000001";
+    let child = "kimi:session_c2222222-aaaa-bbbb-cccc-000000000002";
+    assert_eq!(store.parent_key_of(child).unwrap().as_deref(), Some(parent));
+    assert!(store.get_session(child).unwrap().unwrap().archived);
+    assert!(!store.get_session(parent).unwrap().unwrap().archived);
+}
+
+/// Kimi 的分叉 B 派了子代理 C:C 的转录在 B 的会话目录里,挂在 B 下、不往上压到原件——删 B 时
+/// 目录连同 C 一起进废纸篓,C 得在删除计划里(要记墓碑),否则另一个 location 里的副本会再冒
+/// 出来。C 跟着 B 归档:B 在 Kimi 里归档了,C 不能变成顶层会话(Codex review 2026-10-12)
+#[test]
+fn kimi_fork_subagents_stay_under_the_fork() {
+    use agentrouter_session_core::adapters::kimi::KimiAdapter;
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    common::copy_tree(&common::fixture("kimi-cli"), &home);
+    let fork_id = "session_c2222222-aaaa-bbbb-cccc-000000000002";
+    let mut fork_dir = home.clone();
+    fork_dir.extend(["sessions", "wd_wakefx_cli1", fork_id]);
+    let sub_dir = fork_dir.join("agents").join("agent-1");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    std::fs::write(
+        sub_dir.join("wire.jsonl"),
+        [
+            json!({ "type": "turn.prompt", "time": 1791417603000i64,
+                "input": [{ "type": "text", "text": "Look at src/parser.rs" }],
+                "origin": { "kind": "system_trigger", "name": "subagent" } }),
+            json!({ "type": "context.append_loop_event", "time": 1791417605000i64,
+                "event": { "type": "content.part", "part": { "type": "text", "text": "Two problems." } } }),
+        ]
+        .map(|row| format!("{row}\n"))
+        .concat(),
+    )
+    .unwrap();
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![KimiAdapter::new().with_custom_root(home.clone())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let original = "kimi:session_c1111111-aaaa-bbbb-cccc-000000000001";
+    let fork = format!("kimi:{fork_id}");
+    let sub = format!("kimi:{fork_id}/agent-1");
+    assert_eq!(
+        store.parent_key_of(&fork).unwrap().as_deref(),
+        Some(original)
+    );
+    assert_eq!(
+        store.parent_key_of(&sub).unwrap(),
+        Some(fork.clone()),
+        "子代理停在它所在的分叉上"
+    );
+    assert!(store.get_session(&sub).unwrap().unwrap().archived);
+    let active = SessionFilter {
+        roots_only: true,
+        limit: 10,
+        ..Default::default()
+    };
+    let (roots, _) = store.list_sessions(&active).unwrap();
+    assert!(
+        roots.iter().all(|s| s.key != sub),
+        "分叉归档了,子代理不冒成顶层会话"
+    );
+
+    let fork_meta = store.get_session(&fork).unwrap().unwrap();
+    let plan = agentrouter_session_core::cleanup::delete_plan(&store, &adapters, &fork_meta).unwrap();
+    let doomed: Vec<&str> = plan.sessions.iter().map(|s| s.key.as_str()).collect();
+    assert_eq!(doomed, [fork.as_str(), sub.as_str()]);
+    assert_eq!(plan.targets, [fork_dir.to_string_lossy().into_owned()]);
+}
+
+/// Kimi 的归档、改名只写 state.json:增量扫描按引用判脏,state.json 的 mtime / size 并在
+/// 引用里,才会重新解析(转录没变、旧引用照旧的话,归档标记永远停在上次)
+#[test]
+fn kimi_state_only_changes_reach_the_index() {
+    use agentrouter_session_core::adapters::kimi::KimiAdapter;
+    let home = tempfile::tempdir().unwrap();
+    common::copy_tree(&common::fixture("kimi-cli"), home.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![KimiAdapter::new().with_custom_root(home.path().to_path_buf())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let key = "kimi:session_c1111111-aaaa-bbbb-cccc-000000000001";
+    assert!(!store.get_session(key).unwrap().unwrap().archived);
+
+    let mut state = home.path().to_path_buf();
+    state.extend([
+        "sessions",
+        "wd_wakefx_cli1",
+        "session_c1111111-aaaa-bbbb-cccc-000000000001",
+        "state.json",
+    ]);
+    std::fs::write(
+        &state,
+        r#"{"title":"修 QrScanner 泄漏","archived":true,"createdAt":"2026-10-08T00:00:00.000Z"}"#,
+    )
+    .unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert!(store.get_session(key).unwrap().unwrap().archived);
+}
+
+/// Antigravity:索引里先只有卡片,明文转录后来才写出来——同一个 key 由转录接替
+/// (`dedup_rank`,转录的 mtime 与卡片的时间毫不相干),增量与全量两条写路径都是;
+/// 转录目录没了、索引还在,卡片回来。库里始终只有一行
+#[test]
+fn antigravity_transcript_takes_over_its_index_card() {
+    use agentrouter_session_core::adapters::antigravity::AntigravityAdapter;
+    const KEY: &str = "antigravity:ag-1";
+    let home = tempfile::tempdir().unwrap();
+    let gemini = home.path().join(".gemini");
+    common::build_antigravity_index(
+        &gemini,
+        &[common::AgIndexRow {
+            id: "ag-1",
+            preview: "Dashboard buttons",
+            workspace: "/Users/tester/Github/dashboard",
+            app: "antigravity-ide",
+            ..Default::default()
+        }],
+    );
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![AntigravityAdapter::new().with_custom_root(gemini.clone())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let rows = || {
+        store
+            .list_sessions(&SessionFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .1
+    };
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store.get_session(KEY).unwrap().expect("卡片入库");
+    assert!(s.file_path.ends_with("#ag-1"));
+    assert_eq!(s.title, "Dashboard buttons");
+
+    let brain = gemini.join("antigravity-ide").join("brain");
+    let transcript = common::stage_antigravity_transcript(&brain, "ag-1", &[]);
+    // 转录写坏了(一条消息都读不出):卡片接着顶着,不被空会话顶掉
+    let good = std::fs::read(&transcript).unwrap();
+    std::fs::write(&transcript, "{\"type\":\"USER_INPUT\",\"content\":\"trunc").unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let s = store.get_session(KEY).unwrap().expect("会话仍在库");
+    assert!(s.file_path.ends_with("#ag-1"), "坏转录退回卡片");
+    assert_eq!(rows(), 1);
+
+    std::fs::write(&transcript, good).unwrap();
+    let incoming = adapters[0].file_ref(&transcript).expect("转录是这个会话的");
+    scan_files(&adapters, &store, &Recorder::new(), vec![incoming]);
+    let s = store.get_session(KEY).unwrap().expect("会话仍在库");
+    assert_eq!(
+        s.file_path,
+        transcript.to_string_lossy(),
+        "增量写入由转录接替"
+    );
+    assert_eq!(s.title, "Fix the button layout on the dashboard");
+    assert_eq!(s.source.as_deref(), Some("IDE"));
+    assert_eq!(rows(), 1);
+
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let s = store.get_session(KEY).unwrap().unwrap();
+    assert_eq!(s.file_path, transcript.to_string_lossy());
+    assert_eq!(rows(), 1);
+
+    std::fs::remove_dir_all(brain.join("ag-1")).unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let s = store.get_session(KEY).unwrap().expect("索引还在,卡片回来");
+    assert!(s.file_path.ends_with("#ag-1"));
+    assert_eq!(rows(), 1);
+}
+
+/// Antigravity 的父子关系记在整个 `.gemini` 共用的索引里,转录却可能归另一个只选了 brain
+/// 的 location:父子两条会话的转录都在那边时,报边的默认实例两头都不拥有,关系照样挂上
+///(`parent_links_global`,Codex 那张总表的同一条兜底)
+#[test]
+fn antigravity_child_nests_when_its_transcripts_live_elsewhere() {
+    use common::AgIndexRow;
+    use agentrouter_session_core::adapters::antigravity::AntigravityAdapter;
+    let home = tempfile::tempdir().unwrap();
+    let gemini = home.path().join(".gemini");
+    common::build_antigravity_index(
+        &gemini,
+        &[
+            AgIndexRow {
+                id: "ag-1",
+                preview: "Dashboard buttons",
+                workspace: "/Users/tester/Github/dashboard",
+                app: "antigravity",
+                ..Default::default()
+            },
+            AgIndexRow {
+                id: "ag-2",
+                preview: "Spawned helper",
+                workspace: "/Users/tester/Github/dashboard",
+                parent: "ag-1",
+                app: "antigravity",
+            },
+        ],
+    );
+    let elsewhere = home.path().join("backup").join("brain");
+    common::stage_antigravity_transcript(&elsewhere, "ag-1", &[]);
+    let child = common::stage_antigravity_transcript(&elsewhere, "ag-2", &[]);
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        AntigravityAdapter::new().with_custom_root(gemini.clone()),
+        AntigravityAdapter::new().with_custom_root(elsewhere.clone()),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store
+        .get_session("antigravity:ag-2")
+        .unwrap()
+        .expect("子会话入库");
+    assert_eq!(s.file_path, child.to_string_lossy(), "转录压过索引里的卡片");
+    assert_eq!(
+        store.parent_key_of("antigravity:ag-2").unwrap().as_deref(),
+        Some("antigravity:ag-1")
+    );
+}
+
+/// 数据库型会话(虚拟路径 `<库>#<id>`)换了父会话:scanner 解挂前要从子会话自己的文件重解析,
+/// `file_ref` 认不出虚拟路径,得从这一家的会话列表里找回引用——找不回来时,旧父会话还在就
+/// 一直留着旧关系
+#[test]
+fn database_session_moves_to_its_new_parent() {
+    use agentrouter_session_core::adapters::zcode::ZcodeAdapter;
+    let home = tempfile::tempdir().unwrap();
+    let zcode = home.path().join(".zcode");
+    let db = zcode.join("cli/db/db.sqlite");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    common::build_zcode_db(&db);
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![ZcodeAdapter::new().with_custom_root(zcode.clone())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("zcode:zc-0005").unwrap().as_deref(),
+        Some("zcode:zc-0001")
+    );
+
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("UPDATE session SET parent_id = 'zc-0011' WHERE id = 'zc-0005'")
+        .unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(
+        store.parent_key_of("zcode:zc-0005").unwrap().as_deref(),
+        Some("zcode:zc-0011")
+    );
+}
+
+/// Grok Bot:副本是 app 的滚动缓存——对话被清出缓存时卡片接替(同一个 key,库里始终一行),
+/// 缓存回来时副本接回;侧栏里改名时副本文件没动,全量扫描靠引用里并进的指纹认出来;删除只是
+/// 隐藏:缓存文件原样留在原处,下一轮扫描也不会把它当成"从废纸篓放回来了"而撤掉墓碑
+#[test]
+fn grok_bot_card_stands_in_when_the_cache_drops_a_conversation() {
+    use agentrouter_session_core::adapters::grok_bot::GrokBotAdapter;
+    const ID: &str = "b0000001-aaaa-bbbb-cccc-000000000001";
+    let key = format!("grok-bot:{ID}");
+    let home = tempfile::tempdir().unwrap();
+    let cache = common::stage_grok_bot(home.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![GrokBotAdapter::new().with_custom_root(cache.clone())];
+    let replica = common::grok_bot_replica_path(&cache, ID);
+    let roster = common::grok_bot_roster_path(&cache);
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let rows = || {
+        store
+            .list_sessions(&SessionFilter {
+                include_archived: true,
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap()
+            .1
+    };
+
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store.get_session(&key).unwrap().expect("副本入库");
+    assert_eq!(s.file_path, replica.to_string_lossy());
+    assert_eq!(s.title, "Ada");
+    // 四个有副本的对话 + 只剩卡片的 Scout
+    assert_eq!(rows(), 5);
+
+    // app 把这个对话清出了缓存:卡片接替
+    let kept = std::fs::read(&replica).unwrap();
+    std::fs::remove_file(&replica).unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let s = store.get_session(&key).unwrap().expect("卡片接替");
+    assert!(s.file_path.ends_with(&format!("#{ID}")), "{}", s.file_path);
+    assert_eq!(s.title, "Ada");
+    assert_eq!(rows(), 5);
+
+    // 用户又打开了这个对话,缓存回来:增量写入由副本接回
+    std::fs::write(&replica, &kept).unwrap();
+    let incoming = adapters[0].file_ref(&replica).expect("副本是这个对话的");
+    scan_files(&adapters, &store, &Recorder::new(), vec![incoming]);
+    let s = store.get_session(&key).unwrap().unwrap();
+    assert_eq!(s.file_path, replica.to_string_lossy());
+
+    // 侧栏里改了名:副本没动,全量扫描照样认出来
+    let renamed = std::fs::read_to_string(&roster)
+        .unwrap()
+        .replace(r#""name":"Ada""#, r#""name":"Ada Lovelace""#);
+    std::fs::write(&roster, renamed).unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(
+        store.get_session(&key).unwrap().unwrap().title,
+        "Ada Lovelace"
+    );
+
+    // 删除 = 隐藏:不动缓存文件,也不被"放回即恢复"撤掉
+    let targets = adapters[0].session_paths(&s);
+    assert!(targets.is_empty());
+    let hidden = agentrouter_session_core::cleanup::trash_sessions(&store, &[s], &targets).unwrap();
+    assert!(hidden, "一个文件都没移");
+    assert!(replica.exists());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert!(
+        store.get_session(&key).unwrap().is_none(),
+        "缓存文件还在原处,隐藏照样生效(副本与卡片同一个 key)"
+    );
+    assert_eq!(rows(), 4);
+}
+
+/// Cursor 两源端到端:转录带正文的会话固定由 CLI 源胜出(它有 slug 可反推
+/// 项目),哪怕 IDE 库里那份 lastUpdatedAt 更新、roster 里 IDE 实例排在前面;
+/// 转录只剩 turn_ended 空壳的会话由 IDE 库副本胜出。按 mtime 裁决的话胜负随
+/// 两边写盘先后翻转,IDE 副本没有工作区路径,一翻就从项目里掉进 Unknown project
+/// (2026-09-15 实测,Cursor 3.18)
+#[test]
+fn cursor_transcript_outranks_ide_copy() {
+    use agentrouter_session_core::adapters::cursor::CursorAdapter;
+    use agentrouter_session_core::adapters::cursor_ide::CursorIdeAdapter;
+    const WITH_BODY: &str = "cursor:33333333-aaaa-bbbb-cccc-000000000003";
+    const STUB_ONLY: &str = "cursor:44444444-aaaa-bbbb-cccc-000000000004";
+    const CORRUPT: &str = "cursor:55555555-aaaa-bbbb-cccc-000000000005";
+
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    common::copy_tree(&common::fixture("cursor/projects"), &projects);
+    let ide_db = dir.path().join("state.vscdb");
+    common::build_cursor_ide_db(&ide_db);
+    // 转录的 mtime 压到 IDE 库里 lastUpdatedAt(1786340100000)之前,
+    // 让 mtime 裁决与 rank 裁决给出相反答案
+    let transcript = projects.join(
+        "wakefx-cursor-proj/agent-transcripts/33333333-aaaa-bbbb-cccc-000000000003/33333333-aaaa-bbbb-cccc-000000000003.jsonl",
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1786000000000))
+        .unwrap();
+    // 截断成 `{"role":` 的坏转录:过得了空壳判定、解不出一条消息——不能靠
+    // rank 压过完整的 IDE 副本,要按解析失败回退过去(2026-09-15 Codex review)
+    let corrupt_dir =
+        projects.join("wakefx-cursor-proj/agent-transcripts/55555555-aaaa-bbbb-cccc-000000000005");
+    std::fs::create_dir_all(&corrupt_dir).unwrap();
+    std::fs::write(
+        corrupt_dir.join("55555555-aaaa-bbbb-cccc-000000000005.jsonl"),
+        "{\"role\":\n",
+    )
+    .unwrap();
+
+    for ide_first in [true, false] {
+        let cli: Box<dyn AgentAdapter> = CursorAdapter::new().with_custom_root(projects.clone());
+        let ide: Box<dyn AgentAdapter> = CursorIdeAdapter::new().with_custom_root(ide_db.clone());
+        let adapters: Vec<Box<dyn AgentAdapter>> = if ide_first {
+            vec![ide, cli]
+        } else {
+            vec![cli, ide]
+        };
+        let store = temp_store(&dir.path().join(format!("store-{ide_first}")));
+        run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+        let body = store
+            .get_session(WITH_BODY)
+            .unwrap()
+            .expect("带正文的会话在库");
+        // 按 Path 比较:Windows 上 read_dir 给的是反斜杠,join 里的字面量是正斜杠,
+        // 按字符串比在 windows-2022 job 上必红(2026-09-15 CI)
+        assert_eq!(
+            Path::new(&body.file_path),
+            transcript.as_path(),
+            "ide_first={ide_first}:转录带正文时 CLI 那份胜出,不看 mtime 与 roster 顺序"
+        );
+        assert_eq!(
+            body.project_path, "/wakefx/cursor/proj",
+            "项目来自转录的 slug"
+        );
+        let stub = store
+            .get_session(STUB_ONLY)
+            .unwrap()
+            .expect("空壳转录的会话在库");
+        assert!(
+            stub.file_path.contains("state.vscdb#"),
+            "ide_first={ide_first}:转录只剩空壳时由 IDE 库副本胜出"
+        );
+        let corrupt = store
+            .get_session(CORRUPT)
+            .unwrap()
+            .expect("坏转录的会话不该消失");
+        assert!(
+            corrupt.file_path.contains("state.vscdb#"),
+            "ide_first={ide_first}:坏转录按解析失败回退到 IDE 库副本"
+        );
+        assert_eq!(corrupt.title, "Corrupt twin");
+    }
+
+    // 早先正常入库的转录后来损坏:胜者行已在库里、mtime 也不是占位,位次不能
+    // 让它挡住回退——回退分支先清掉失效行,IDE 副本接管(Codex review 第二轮)
+    std::fs::write(&transcript, "{\"role\":\n").unwrap();
+    let cli: Box<dyn AgentAdapter> = CursorAdapter::new().with_custom_root(projects.clone());
+    let ide: Box<dyn AgentAdapter> = CursorIdeAdapter::new().with_custom_root(ide_db.clone());
+    let store = temp_store(&dir.path().join("store-false"));
+    run_scan(&vec![cli, ide], &store, &Recorder::new(), true).unwrap();
+    let taken_over = store
+        .get_session(WITH_BODY)
+        .unwrap()
+        .expect("转录损坏后会话不该消失");
+    assert!(
+        taken_over.file_path.contains("state.vscdb#"),
+        "已入库的转录损坏后由 IDE 副本接管"
+    );
+    assert_eq!(taken_over.title, "CLI twin");
+}
+
+/// Kilo Code 新版扩展把旧任务导进 kilo.db 时,会话 id 是 sha1(任务 id) 派生的
+/// `ses_migrated_…`;旧任务在 Wake 里用的就是这个 id,两份同 key,kilo.db 那份胜出
+/// (不看 mtime 与 roster 顺序),旧任务文件留作回退:kilo.db 里那份没了,它顶上来,
+/// key 不变。没导过的旧任务照常列出,子任务挂回父任务
+#[test]
+fn kilo_migrated_task_prefers_the_database_copy() {
+    use agentrouter_session_core::adapters::kilo::{legacy_task_key, migrated_session_id, KiloLegacyAdapter};
+    use agentrouter_session_core::adapters::opencode::OpencodeAdapter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ext = dir.path().join("globalStorage").join("kilocode.kilo-code");
+    let tasks = ext.join("tasks");
+    common::copy_tree(&common::fixture("kilo-legacy/Code/tasks"), &tasks);
+    let db = dir.path().join("kilo").join("kilo.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    common::build_kilo_db(&db);
+    let migrated_id = migrated_session_id("migrated-task-0004");
+    let migrated = legacy_task_key("migrated-task-0004");
+    let legacy_copy = tasks
+        .join("migrated-task-0004")
+        .join("api_conversation_history.json");
+
+    for legacy_first in [true, false] {
+        let from_db: Box<dyn AgentAdapter> = OpencodeAdapter::kilo().with_custom_root(db.clone());
+        let from_tasks: Box<dyn AgentAdapter> =
+            KiloLegacyAdapter::new().with_custom_root(tasks.clone());
+        let adapters: Vec<Box<dyn AgentAdapter>> = if legacy_first {
+            vec![from_tasks, from_db]
+        } else {
+            vec![from_db, from_tasks]
+        };
+        let store = temp_store(&dir.path().join(format!("store-{legacy_first}")));
+        run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+        let row = store
+            .get_session(&migrated)
+            .unwrap()
+            .expect("导入过的旧任务在库");
+        assert!(
+            row.file_path.contains("kilo.db#"),
+            "legacy_first={legacy_first}:kilo.db 里那份胜出,得到 {}",
+            row.file_path
+        );
+        let legacy_only = store
+            .get_session(&legacy_task_key("1736400000000"))
+            .unwrap()
+            .expect("没导过的旧任务照常列出");
+        assert_eq!(legacy_only.title, "修复二维码扫描的内存泄漏");
+        let child = store
+            .get_session(&legacy_task_key("01944f78-bba0-7abc-8def-0123456789ac"))
+            .unwrap()
+            .expect("子任务在库");
+        assert_eq!(
+            store.parent_key_of(&child.key).unwrap().as_deref(),
+            Some(legacy_task_key("01944f77-3500-7abc-8def-0123456789ab").as_str()),
+            "legacy_first={legacy_first}:子任务挂回父任务"
+        );
+        assert_eq!(
+            store
+                .parent_key_of("kilo:ses_kilo_0003")
+                .unwrap()
+                .as_deref(),
+            Some("kilo:ses_kilo_0001"),
+            "legacy_first={legacy_first}:新版的子代理会话挂在派它的会话下面"
+        );
+    }
+
+    // kilo.db 里那份没了(用户在 Kilo 里删了它):旧任务文件顶上来,key 不变
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM session WHERE id = ?1", [&migrated_id])
+        .unwrap();
+    drop(conn);
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        OpencodeAdapter::kilo().with_custom_root(db.clone()),
+        KiloLegacyAdapter::new().with_custom_root(tasks.clone()),
+    ];
+    let store = temp_store(&dir.path().join("store-false"));
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let row = store
+        .get_session(&migrated)
+        .unwrap()
+        .expect("库里那份没了,旧任务还在");
+    assert_eq!(Path::new(&row.file_path), legacy_copy.as_path());
+}
+
+/// 跨 agent 重叠根:文件只归**最长根**的实例(与 watcher 分派同一语义)。
+/// 旧行为两家轮流认领——先写的一家留下错误归属,后写的撞 file_path UNIQUE
+#[test]
+fn overlapping_roots_assign_file_to_deepest_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        Box::new(seed(AgentId::ClaudeCode, "/x", "/x/inner/f.jsonl", "f", 7)),
+        Box::new(seed(AgentId::Codex, "/x/inner", "/x/inner/f.jsonl", "f", 7)),
+    ];
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert!(
+        store.get_session("codex:f").unwrap().is_some(),
+        "最长根(/x/inner)的实例应拥有该文件"
+    );
+    assert!(
+        store.get_session("claude-code:f").unwrap().is_none(),
+        "外层根实例不得认领别家树内的文件"
+    );
+}
+
+/// watcher 增量同样受副本裁决约束:败方副本(旧 mtime)的文件事件不得覆盖
+/// 已选中的胜者行——rsync 刷新备份目录会带旧 mtime 触发一串事件
+/// (2026-08-24 Codex review P1)
+#[test]
+fn incremental_write_respects_duplicate_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let live = seed(AgentId::Codex, "/live", "/live/dup.jsonl", "dup", 9);
+    let backup = seed(AgentId::Codex, "/backup", "/backup/dup.jsonl", "dup", 5);
+    let backup_ref = backup.r.clone();
+    let newer_ref = SessionFileRef {
+        mtime_ms: 12,
+        ..backup.r.clone()
+    };
+    let mut newer_backup = seed(AgentId::Codex, "/backup", "/backup/dup.jsonl", "dup", 12);
+    newer_backup.r = newer_ref.clone();
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(live), Box::new(backup)];
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert_eq!(
+        store.get_session("codex:dup").unwrap().unwrap().file_path,
+        "/live/dup.jsonl"
+    );
+
+    // 旧副本来了个文件事件:必须被裁决挡下
+    agentrouter_session_core::scanner::scan_files(&adapters, &store, &rec, vec![backup_ref]);
+    assert_eq!(
+        store.get_session("codex:dup").unwrap().unwrap().file_path,
+        "/live/dup.jsonl",
+        "败方副本的增量事件覆盖了胜者行"
+    );
+
+    // 备份真被更新(mtime 反超):按同款规则易主
+    let adapters2: Vec<Box<dyn AgentAdapter>> = vec![Box::new(newer_backup)];
+    agentrouter_session_core::scanner::scan_files(&adapters2, &store, &rec, vec![newer_ref]);
+    assert_eq!(
+        store.get_session("codex:dup").unwrap().unwrap().file_path,
+        "/backup/dup.jsonl",
+        "mtime 反超的副本应按规则接管"
+    );
+}
+
+/// 纯删除轮也要发变更通知:location 移除后的补扫常常解析队列为空,只有
+/// 删除检测在干活——不通知,列表会一直挂着已删会话(2026-08-24 Codex review P1)
+#[test]
+fn pure_deletion_scan_notifies_sessions_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(seed(
+        AgentId::Codex,
+        "/live",
+        "/live/one.jsonl",
+        "one",
+        5,
+    ))];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert!(store.get_session("codex:one").unwrap().is_some());
+
+    // roster 里这家没了(location 被移除)→ 补扫是纯删除轮
+    let rec = Recorder::new();
+    let empty: Vec<Box<dyn AgentAdapter>> = Vec::new();
+    run_scan(&empty, &store, &rec, false).unwrap();
+    assert!(
+        store.get_session("codex:one").unwrap().is_none(),
+        "行应被出清"
+    );
+    assert!(
+        rec.changed() > 0,
+        "纯删除轮未发 on_sessions_changed,UI 不会刷新"
+    );
+}
+
+/// v0.6.4 已把 guardian reviewer 当根会话写进库的升级场景：原始 rollout 仍在
+/// 磁盘，但新 adapter 不再枚举它，常规扫描应同时清掉 session 与 FTS；MCP 的
+/// 搜索、列表、详情和项目计数都必须随同一份索引恢复，不能另加展示层补丁。
+#[test]
+fn codex_guardian_rescan_prunes_stale_index_and_all_mcp_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let codex_home = dir.path().join("codex-home");
+    let day = codex_home.join("sessions/2026/09/14");
+    std::fs::create_dir_all(&day).unwrap();
+
+    let guardian_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let guardian_key = format!("codex:{guardian_id}");
+    let guardian_path = day.join(format!("rollout-2026-09-14T01-00-00-{guardian_id}.jsonl"));
+    std::fs::write(
+        &guardian_path,
+        format!(
+            "{}\n{}\n",
+            json!({
+                "timestamp": "2026-09-14T01:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": guardian_id,
+                    "parent_thread_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                    "thread_source": "subagent",
+                    "source": { "subagent": { "other": "guardian" } },
+                    "cwd": "/work/wake",
+                    "originator": "codex_work_desktop"
+                }
+            }),
+            json!({
+                "timestamp": "2026-09-14T01:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "guardianartifact7429" }]
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let normal_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let normal_key = format!("codex:{normal_id}");
+    let normal_path = day.join(format!("rollout-2026-09-14T02-00-00-{normal_id}.jsonl"));
+    std::fs::write(
+        &normal_path,
+        format!(
+            "{}\n{}\n",
+            json!({
+                "timestamp": "2026-09-14T02:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": normal_id,
+                    "thread_source": "cli",
+                    "source": "cli",
+                    "cwd": "/work/wake",
+                    "originator": "codex_cli_rs"
+                }
+            }),
+            json!({
+                "timestamp": "2026-09-14T02:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "keep the normal session" }]
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![CodexAdapter::new().with_custom_root(codex_home.clone())];
+
+    // 绕过新枚举边界手工种一条旧版索引，模拟用户从 v0.6.4 升级。
+    let stale_ref = SessionFileRef {
+        agent: AgentId::Codex,
+        native_id: guardian_id.to_string(),
+        file_path: guardian_path.to_string_lossy().to_string(),
+        mtime_ms: 1,
+        size: std::fs::metadata(&guardian_path).unwrap().len() as i64,
+    };
+    let stale = adapters[0].parse_session(&stale_ref).unwrap();
+    store
+        .write_session(&stale.meta, stale_ref.mtime_ms, &stale.units)
+        .unwrap();
+    assert!(store.get_session(&guardian_key).unwrap().is_some());
+    let before = tools::invoke(
+        store.as_ref(),
+        &adapters,
+        &TranscriptCache::default(),
+        tools::SEARCH,
+        &json!({ "query": "guardianartifact7429", "agents": ["codex"] }),
+    )
+    .unwrap();
+    assert!(
+        before.contains(&guardian_key),
+        "stale fixture was not indexed"
+    );
+
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    assert!(guardian_path.exists(), "扫描不得删除 Codex 原始 rollout");
+    assert!(store.get_session(&guardian_key).unwrap().is_none());
+    assert!(store.get_session(&normal_key).unwrap().is_some());
+
+    let cache = TranscriptCache::default();
+    let searched = tools::invoke(
+        store.as_ref(),
+        &adapters,
+        &cache,
+        tools::SEARCH,
+        &json!({ "query": "guardianartifact7429", "agents": ["codex"] }),
+    )
+    .unwrap();
+    assert!(searched.contains("No session matches"), "{searched}");
+
+    let listed = tools::invoke(
+        store.as_ref(),
+        &adapters,
+        &cache,
+        tools::LIST_SESSIONS,
+        &json!({ "project": "/work/wake", "agents": ["codex"] }),
+    )
+    .unwrap();
+    assert!(listed.contains(&normal_key), "{listed}");
+    assert!(!listed.contains(&guardian_key), "{listed}");
+    assert!(
+        tools::invoke(
+            store.as_ref(),
+            &adapters,
+            &cache,
+            tools::GET_SESSION,
+            &json!({ "key": guardian_key })
+        )
+        .is_err(),
+        "已清理的 reviewer key 不应继续可读"
+    );
+
+    let projects = tools::invoke(
+        store.as_ref(),
+        &adapters,
+        &cache,
+        tools::LIST_PROJECTS,
+        &json!({}),
+    )
+    .unwrap();
+    let wake = projects
+        .lines()
+        .find(|line| line.contains("/work/wake"))
+        .unwrap_or_else(|| panic!("Wake project missing:\n{projects}"));
+    assert!(wake.contains("· 1 session ·"), "{wake}");
+}
+
+/// 胜者副本损坏时按裁决顺位回退:会话不得从索引消失(2026-08-24 Codex review P2)
+#[test]
+fn corrupt_winner_falls_back_to_valid_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut broken_live = seed(AgentId::Codex, "/live", "/live/dup.jsonl", "dup", 9);
+    broken_live.fail_parse = true;
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        Box::new(broken_live),
+        Box::new(seed(
+            AgentId::Codex,
+            "/backup",
+            "/backup/dup.jsonl",
+            "dup",
+            5,
+        )),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store
+        .get_session("codex:dup")
+        .unwrap()
+        .expect("胜者损坏后会话不该消失");
+    assert_eq!(s.file_path, "/backup/dup.jsonl", "应回退到有效副本");
+}
+
+/// 胜者文件被删后,幸存副本经 promote_survivors 上位,不必等下一次全量扫描
+/// (2026-08-24 Codex review P2)
+#[test]
+fn survivor_copy_promoted_after_winner_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        Box::new(seed(AgentId::Codex, "/live", "/live/dup.jsonl", "dup", 9)),
+        Box::new(seed(
+            AgentId::Codex,
+            "/backup",
+            "/backup/dup.jsonl",
+            "dup",
+            5,
+        )),
+    ];
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert_eq!(
+        store.get_session("codex:dup").unwrap().unwrap().file_path,
+        "/live/dup.jsonl"
+    );
+
+    let key = store
+        .remove_by_path("/live/dup.jsonl")
+        .unwrap()
+        .expect("应返回被删 key");
+    assert!(store.get_session("codex:dup").unwrap().is_none());
+    // 真实世界里被删文件不会再被枚举;SeedAdapter 是静态的,用"删除后"的
+    // roster(只剩 backup 实例)喂给上位逻辑
+    let after: Vec<Box<dyn AgentAdapter>> = vec![Box::new(seed(
+        AgentId::Codex,
+        "/backup",
+        "/backup/dup.jsonl",
+        "dup",
+        5,
+    ))];
+    agentrouter_session_core::watcher::promote_survivors(&after, &store, &rec, &[key]);
+    assert_eq!(
+        store
+            .get_session("codex:dup")
+            .unwrap()
+            .expect("幸存副本应上位")
+            .file_path,
+        "/backup/dup.jsonl"
+    );
+}
+
+/// location 易主(如把同一目录从 Pi 改成 Omp):文件 mtime/size 未变也要
+/// 重新入库,旧 agent 行先删——否则旧行永留、新 key 撞 file_path UNIQUE,
+/// 连全量刷新都救不回(2026-08-24 Codex review P1)
+#[test]
+fn owner_change_migrates_existing_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let as_pi: Vec<Box<dyn AgentAdapter>> =
+        vec![Box::new(seed(AgentId::Pi, "/d", "/d/s.jsonl", "s", 7))];
+    run_scan(&as_pi, &store, &Recorder::new(), true).unwrap();
+    assert!(store.get_session("pi:s").unwrap().is_some());
+
+    // 同一文件、同 mtime/size,agent 换成 Omp;增量(full=false)也必须迁移
+    let as_omp: Vec<Box<dyn AgentAdapter>> =
+        vec![Box::new(seed(AgentId::Omp, "/d", "/d/s.jsonl", "s", 7))];
+    run_scan(&as_omp, &store, &Recorder::new(), false).unwrap();
+    assert!(
+        store.get_session("pi:s").unwrap().is_none(),
+        "旧 agent 行应被清理"
+    );
+    assert!(
+        store.get_session("omp:s").unwrap().is_some(),
+        "新 agent 行应入库"
+    );
+}
+
+/// 墓碑双轨(不变量 3 的多副本延伸):删除只 trash 了胜者文件,另一 location
+/// 的副本不得让会话复活——全量与 watcher 增量都要挡(2026-08-24 Codex review P1)
+#[test]
+fn tombstone_blocks_all_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let backup_ref = SessionFileRef {
+        agent: AgentId::Codex,
+        native_id: "dup".into(),
+        file_path: "/backup/dup.jsonl".into(),
+        mtime_ms: 5,
+        size: 1,
+    };
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        Box::new(seed(AgentId::Codex, "/live", "/live/dup.jsonl", "dup", 9)),
+        Box::new(seed(
+            AgentId::Codex,
+            "/backup",
+            "/backup/dup.jsonl",
+            "dup",
+            5,
+        )),
+    ];
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert!(store.get_session("codex:dup").unwrap().is_some());
+
+    // UI 删除:trash 胜者文件 + 墓碑(key 一并入墓)
+    store
+        .remove_trashed_sessions(&["codex:dup".to_string()], &HashMap::new())
+        .unwrap();
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert!(
+        store.get_session("codex:dup").unwrap().is_none(),
+        "备份副本在全量扫描中复活了已删会话"
+    );
+    agentrouter_session_core::scanner::scan_files(&adapters, &store, &rec, vec![backup_ref]);
+    assert!(
+        store.get_session("codex:dup").unwrap().is_none(),
+        "备份副本在增量事件中复活了已删会话"
+    );
+}
+
+/// 第三条写库路径(quick 的 write_meta_only)同样受 key 墓碑约束:codex 式
+/// 改名 key 已入墓时,别的副本不得经 quick 快路径以空正文卡片复活已删会话
+/// (2026-08-24 Codex review P1)
+#[test]
+fn quick_meta_respects_key_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut a = seed(AgentId::Codex, "/live", "/live/dup.jsonl", "dup", 9);
+    a.quick_key = Some("codex:thread-1".to_string());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(a)];
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert!(
+        store.get_session("codex:thread-1").unwrap().is_some(),
+        "quick 改名 key 应入库"
+    );
+
+    store
+        .remove_trashed_sessions(&["codex:thread-1".to_string()], &HashMap::new())
+        .unwrap();
+    run_scan(&adapters, &store, &rec, true).unwrap();
+    assert!(
+        store.get_session("codex:thread-1").unwrap().is_none(),
+        "quick 快路径复活了已删会话"
+    );
+    assert!(
+        store.get_session("codex:dup").unwrap().is_none(),
+        "native key 也不得复活"
+    );
+}
+
+/// key 后缀是内容 id 的家(gemini/pi/dsh):上位反查文件名对不上时,
+/// 解析比对回退仍能找到幸存副本(2026-08-24 Codex review P2)
+#[test]
+fn survivor_promotion_matches_content_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    // meta.key 的后缀(LOGICAL)与文件名 native_id(session-123)不同
+    let mut backup = seed(
+        AgentId::Gemini,
+        "/backup",
+        "/backup/session-123.jsonl",
+        "session-123",
+        5,
+    );
+    backup.meta.key = "gemini:LOGICAL".to_string();
+    backup.meta.id = "LOGICAL".to_string();
+    let after: Vec<Box<dyn AgentAdapter>> = vec![Box::new(backup)];
+    let rec = Recorder::new();
+    agentrouter_session_core::watcher::promote_survivors(&after, &store, &rec, &["gemini:LOGICAL".to_string()]);
+    assert!(
+        store.get_session("gemini:LOGICAL").unwrap().is_some(),
+        "内容 key 的幸存副本未被上位"
+    );
+}
+
+/// 跨 host 去重分域(不变量 8⑦ 的远程扩展):同 native_id 的会话在本地与
+/// 远程各有一份(rsync 过项目后各自续跑是真实场景),按 mtime 的全局去重
+/// 会吞掉一台的——去重域必须含实例 host,两行(本地 key / host key)并存。
+#[test]
+fn local_and_remote_copies_of_same_native_id_both_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+
+    // 同一份 Claude fixture 摆进"本地自定义根"与"远程缓存"两棵树
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude/projects/-Users-tester-Github-wakefx/11111111-aaaa-bbbb-cccc-000000000001.jsonl");
+    let native = "11111111-aaaa-bbbb-cccc-000000000001";
+    let local_root = dir.path().join("local-claude");
+    let remote_cache = dir.path().join("remotes/devbox");
+    for tree in [&local_root, &remote_cache] {
+        let proj = if tree == &local_root {
+            tree.join("projects/-Users-tester-Github-wakefx")
+        } else {
+            tree.join(".claude/projects/-Users-tester-Github-wakefx")
+        };
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::copy(&fixture, proj.join(format!("{native}.jsonl"))).unwrap();
+    }
+
+    let base = agentrouter_session_core::adapters::create_adapters();
+    let claude_template = base
+        .iter()
+        .find(|a| a.agent() == AgentId::ClaudeCode)
+        .unwrap();
+    let local = claude_template.with_custom_root(local_root);
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![local]
+        .into_iter()
+        .chain(agentrouter_session_core::adapters::remote::create_remote_adapters(
+            &base,
+            "devbox",
+            &remote_cache,
+        ))
+        .collect();
+
+    let events = Recorder::new();
+    run_scan(&adapters, &store, &events, true).expect("scan ok");
+
+    let local_key = format!("claude-code:{native}");
+    let remote_key = format!("claude-code:devbox:{native}");
+    let local_row = store.get_session(&local_key).unwrap();
+    let remote_row = store.get_session(&remote_key).unwrap();
+    assert!(local_row.is_some(), "本地副本被跨 host 去重吞掉");
+    assert!(remote_row.is_some(), "远程副本被跨 host 去重吞掉");
+    let remote_row = remote_row.unwrap();
+    assert_eq!(remote_row.host, "devbox");
+    assert_eq!(remote_row.id, native, "native id 保持纯净");
+    assert!(local_row.unwrap().host.is_empty());
+
+    // 再跑一轮(模拟下一次刷新):两行都不摇摆、不互删
+    let events = Recorder::new();
+    run_scan(&adapters, &store, &events, false).expect("rescan ok");
+    assert!(store.get_session(&local_key).unwrap().is_some());
+    assert!(store.get_session(&remote_key).unwrap().is_some());
+}
+
+/// Craft fixture 认领的几份引擎转录:A 首行里的当前 SDK 会话、A 锚点边车里更早的一份、
+/// 子任务 E 的
+const CRAFT_CLAIMED: [&str; 3] = [
+    "c1a0de00-aaaa-4bbb-8ccc-000000000001",
+    "c1a0de00-aaaa-4bbb-8ccc-00000000000a",
+    "c1a0de00-aaaa-4bbb-8ccc-000000000005",
+];
+/// 谁都不认领的普通 Claude Code 会话(对照组)
+const UNCLAIMED: &str = "11111111-aaaa-bbbb-cccc-000000000001";
+
+/// Claude projects 树里摆出这几个 id 的转录(内容借 fixture 的一份,key 取文件名)
+fn stage_claude_transcripts(projects: &Path, ids: &[&str]) {
+    let proj = projects.join("-Users-tester-Github-wakefx");
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = common::fixture(&format!(
+        "claude/projects/-Users-tester-Github-wakefx/{UNCLAIMED}.jsonl"
+    ));
+    for id in ids {
+        std::fs::copy(&transcript, proj.join(format!("{id}.jsonl"))).unwrap();
+    }
+}
+
+/// Craft Agents 的 Claude 后端跑的是 Claude Agent SDK,引擎在 `~/.claude/projects` 里另落
+/// 一份转录:同一段对话会以 Claude Code 身份再列一次。Craft 会话认领它(首行的
+/// sdkSessionId + 回合锚点边车里出现过的 id,隐藏的 mini 会话也认领),替身不入库、
+/// 已入库的出库;原件没了(会话被删、Craft 的 location 整个移除)认领撤销,替身回来
+#[test]
+fn craft_claims_hide_claude_engine_copies_until_the_original_goes() {
+    use agentrouter_session_core::adapters::claude::ClaudeAdapter;
+    use agentrouter_session_core::adapters::craft::CraftAdapter;
+
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("claude-projects");
+    let claimed = CRAFT_CLAIMED;
+    stage_claude_transcripts(&projects, &[&claimed[..], &[UNCLAIMED]].concat());
+    let craft_root = home.path().join("workspaces");
+    common::copy_tree(&common::fixture("craft-agents/workspaces"), &craft_root);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let claude = || ClaudeAdapter::new().with_custom_root(projects.clone());
+    let craft = || CraftAdapter::new().with_custom_root(craft_root.clone());
+    let claude_key = |id: &str| format!("claude-code:{id}");
+    let indexed = |key: &str| store.get_session(key).unwrap().is_some();
+
+    // 装 Craft 之前:引擎那几份就是普通的 Claude Code 会话
+    run_scan(&[claude()], &store, &Recorder::new(), true).unwrap();
+    assert!(claimed.iter().all(|id| indexed(&claude_key(id))));
+
+    // 加上 Craft:替身出库,Craft 会话进库,对照组不受影响
+    let events = Recorder::new();
+    run_scan(&[claude(), craft()], &store, &events, false).unwrap();
+    for id in claimed {
+        assert!(!indexed(&claude_key(id)), "{id} 的引擎副本还挂着");
+    }
+    assert!(indexed(&claude_key(UNCLAIMED)));
+    assert!(indexed("craft-agents:ws_f1x7e5a0/260801-brave-otter"));
+    assert!(events.changed() > 0, "替身出库要通知列表刷新");
+    let keys = store.claimed_keys().unwrap();
+    for id in [
+        "c1a0de00-aaaa-4bbb-8ccc-000000000003", // 分支
+        "c1a0de00-aaaa-4bbb-8ccc-000000000004", // 隐藏的 mini 会话:不进列表但照样认领
+    ] {
+        assert!(keys.contains(&claude_key(id)), "{id} 没被认领");
+    }
+    assert!(
+        !keys.iter().any(|k| k.contains("01a0d3b2")),
+        "Pi 后端的会话不该认领 Claude 的 key: {keys:?}"
+    );
+    // 子任务与分支挂在原会话下
+    for child in ["260805-calm-reed", "260803-bold-pine"] {
+        assert_eq!(
+            store
+                .parent_key_of(&format!("craft-agents:ws_f1x7e5a0/{child}"))
+                .unwrap()
+                .as_deref(),
+            Some("craft-agents:ws_f1x7e5a0/260801-brave-otter"),
+            "{child}"
+        );
+    }
+
+    // 引擎那份还在长(Craft 里继续聊):watcher 的增量也不许把它写回来
+    let engine = projects
+        .join("-Users-tester-Github-wakefx")
+        .join(format!("{}.jsonl", claimed[0]));
+    let r = claude().file_ref(&engine).expect("engine transcript ref");
+    scan_files(&[claude(), craft()], &store, &Recorder::new(), vec![r]);
+    assert!(!indexed(&claude_key(claimed[0])));
+
+    // 在 Craft 里删掉原会话:认领撤销,它的两份引擎副本在这一轮扫描就回来
+    std::fs::remove_dir_all(craft_root.join("wakefx-ws/sessions/260801-brave-otter")).unwrap();
+    run_scan(&[claude(), craft()], &store, &Recorder::new(), false).unwrap();
+    assert!(indexed(&claude_key(claimed[0])));
+    assert!(indexed(&claude_key(claimed[1])));
+    assert!(
+        !indexed(&claude_key(claimed[2])),
+        "子任务还在,它的副本仍被认领"
+    );
+
+    // Craft 整个不在 roster 里了(location 移除):认领方消失,剩下的替身全部放回
+    run_scan(&[claude()], &store, &Recorder::new(), false).unwrap();
+    assert!(indexed(&claude_key(claimed[2])));
+    assert!(store.claimed_keys().unwrap().is_empty());
+}
+
+/// 远程镜像:认领的 key 按**报认领的实例**的 host 拼(`claude-code:devbox:<id>`),只藏
+/// 同一台机器上的替身;本机同 id 的 Claude 会话(不同 host 是另一条会话)不受影响
+#[test]
+fn craft_claims_on_a_remote_host_carry_that_host() {
+    use agentrouter_session_core::adapters::claude::ClaudeAdapter;
+    use agentrouter_session_core::adapters::craft::CraftAdapter;
+    use agentrouter_session_core::adapters::remote::RemoteAdapter;
+
+    let home = tempfile::tempdir().unwrap();
+    let local = home.path().join("local-claude");
+    let mirror = home.path().join("devbox-claude");
+    stage_claude_transcripts(&local, &CRAFT_CLAIMED);
+    stage_claude_transcripts(&mirror, &CRAFT_CLAIMED);
+    let craft_mirror = home.path().join("devbox-workspaces");
+    common::copy_tree(&common::fixture("craft-agents/workspaces"), &craft_mirror);
+    let mirror_prefix = craft_mirror.to_string_lossy().to_string();
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        ClaudeAdapter::new().with_custom_root(local),
+        Box::new(RemoteAdapter::new(
+            ClaudeAdapter::new().with_custom_root(mirror),
+            "devbox",
+        )),
+        Box::new(RemoteAdapter::new(
+            CraftAdapter::new().with_custom_root(craft_mirror),
+            "devbox",
+        )),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let indexed = |key: &str| store.get_session(key).unwrap().is_some();
+    for id in CRAFT_CLAIMED {
+        assert!(
+            !indexed(&format!("claude-code:devbox:{id}")),
+            "devbox 上的替身没藏"
+        );
+        assert!(indexed(&format!("claude-code:{id}")), "本机那份被误藏");
+    }
+    assert!(indexed(
+        "craft-agents:devbox:ws_f1x7e5a0/260801-brave-otter"
+    ));
+    assert!(store
+        .claimed_keys()
+        .unwrap()
+        .contains(&format!("claude-code:devbox:{}", CRAFT_CLAIMED[0])));
+    // 没设工作目录的会话归到工作区:取首行记的工作区路径,不是文件此刻所在的本机缓存目录
+    //(拿缓存目录当项目,按远端的工作区路径就筛不到它)
+    let lake = store
+        .get_session("craft-agents:devbox:ws_f1x7e5a0/260802-quiet-lake")
+        .unwrap()
+        .expect("lake indexed");
+    assert!(
+        !lake.project_path.starts_with(&mirror_prefix),
+        "{}",
+        lake.project_path
+    );
+    assert_eq!(lake.project_name, "wakefx-ws");
+}
+
+/// 合成一条 craft 会话(首行 + 一句用户消息),返回它的 session.jsonl
+fn craft_session(workspace: &Path, session: &str, parent: Option<&str>) -> std::path::PathBuf {
+    let dir = workspace.join("sessions").join(session);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut header = serde_json::json!({ "id": session, "createdAt": 1786200000000i64 });
+    if let Some(parent) = parent {
+        header["parentSessionId"] = serde_json::json!(parent);
+    }
+    let line = serde_json::json!({
+        "id": "m1", "type": "user", "content": format!("hello from {session}"),
+        "timestamp": 1786200000000i64
+    });
+    let path = dir.join("session.jsonl");
+    std::fs::write(&path, format!("{header}\n{line}\n")).unwrap();
+    path
+}
+
+/// Craft 的父子关系写在子会话自己的首行里:多 location 下按**子会话的胜出文件**认边。
+/// Grok 那条"报边者必须拥有 parent"(边车长在 parent 的 location 里)套在这里两头都错:
+/// 父会话胜出文件在 A、子会话只在 B,边会被丢掉;A 里还躺着子会话一份更旧的备份、写着
+/// 早已不成立的关系,A 拥有 parent,旧关系反被采纳
+#[test]
+fn craft_parent_links_follow_the_childs_winning_copy() {
+    use agentrouter_session_core::adapters::craft::CraftAdapter;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (tmp.path().join("a/notes"), tmp.path().join("b/notes"));
+    for ws in [&a, &b] {
+        std::fs::create_dir_all(ws).unwrap();
+        // 同一个工作区的两份(一份是备份):工作区 id 相同,会话 key 也就相同
+        std::fs::write(ws.join("config.json"), r#"{"id":"ws_same0000"}"#).unwrap();
+    }
+    craft_session(&a, "260901-parent", None);
+    craft_session(&b, "260902-child", Some("260901-parent"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        CraftAdapter::new().with_custom_root(a.clone()),
+        CraftAdapter::new().with_custom_root(b.clone()),
+    ];
+    let child = "craft-agents:ws_same0000/260902-child";
+    let parent_of = || store.parent_key_of(child).unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        parent_of().as_deref(),
+        Some("craft-agents:ws_same0000/260901-parent"),
+        "父会话在另一个 location 也要挂上"
+    );
+
+    // B 里那份改写成没有父会话;A 里多出一份更旧的、还写着旧关系的副本
+    let stale = craft_session(&a, "260902-child", Some("260901-parent"));
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        })
+        .unwrap();
+    craft_session(&b, "260902-child", None);
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(parent_of(), None, "落选副本里的旧关系不该被采纳");
+}

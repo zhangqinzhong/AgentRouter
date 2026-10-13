@@ -1,0 +1,20 @@
+{
+  "name": "agentrouter-local",
+  "interface": {
+    "displayName": "AgentRouter"
+  },
+  "plugins": [
+    {
+      "name": "agentrouter-sessions",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agentrouter-sessions"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..", "..");
 const imageName = process.env.AR_DOCKER_TEST_IMAGE || "claude-code-router:local";
-const token = process.env.AR_DOCKER_TEST_WEB_AUTH_TOKEN || "token+/&=#?";
+const token = process.env.AR_DOCKER_TEST_WEB_AUTH_TOKEN || "-token+/&=#?";
 const testId = randomUUID().slice(0, 8);
 const containerName = `ar-docker-smoke-${testId}`;
 const volumeName = `ar-docker-smoke-${testId}`;
@@ -59,13 +59,19 @@ try {
   const redirect = await fetch(baseUrl, { redirect: "manual" });
   assert.equal(redirect.status, 302);
   const redirectLocation = redirect.headers.get("location");
-  assert.equal(redirectLocation, `/pages/home/index.html?ar_web_token=${encodeURIComponent(token)}`);
+  assert.equal(redirectLocation, "/pages/home/index.html", "An unauthenticated request must not be handed the management token");
 
-  const page = await fetch(`${baseUrl}${redirectLocation}`);
+  const page = await fetch(`${baseUrl}${redirectLocation}`, { redirect: "manual" });
   assert.equal(page.status, 200);
   const pageHtml = await page.text();
   assert.match(pageHtml, /AgentRouter/);
   assert.match(pageHtml, /web-client-bridge\.js/);
+
+  const suppliedToken = `/pages/home/index.html?ar_web_token=${encodeURIComponent(token)}`;
+  const tokenRedirect = await fetch(`${baseUrl}/?ar_web_token=${encodeURIComponent(token)}`, { redirect: "manual" });
+  assert.equal(tokenRedirect.status, 302);
+  assert.equal(tokenRedirect.headers.get("location"), suppliedToken, "A token supplied by the user must survive the root redirect");
+  assert.equal((await fetch(`${baseUrl}${suppliedToken}`, { redirect: "manual" })).status, 200);
 
   const bridge = await fetch(`${baseUrl}/assets/web-client-bridge.js`);
   assert.equal(bridge.status, 200);

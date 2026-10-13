@@ -164,3 +164,8 @@ export async function getLocalUsageCategories(range:LocalUsageCategoryRange):Pro
  if(range.tz)new Intl.DateTimeFormat('en',{timeZone:range.tz});
  return queryLocalCollector('/functions/tokentracker-usage-category-breakdown',{from:range.from,to:range.to,source:range.source,tz:range.tz||Intl.DateTimeFormat().resolvedOptions().timeZone}) as Promise<Record<string,unknown>>;
 }
+
+export async function getLocalSessionTranscript(query: { sessionHash: string; offset?: number }) {
+  if (!query || typeof query.sessionHash !== 'string' || !/^[a-f0-9]{16,64}$/.test(query.sessionHash) || (query.offset !== undefined && (!Number.isInteger(query.offset) || query.offset < 0 || query.offset > 100000))) throw new Error('Invalid session transcript request');
+  return queryLocalCollector('/functions/session-transcript', {sessionHash: query.sessionHash, offset: String(query.offset || 0)});
+}

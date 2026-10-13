@@ -1,0 +1,11 @@
+pub mod adapters;
+pub mod cleanup;
+pub mod cli;
+pub mod db;
+pub mod mcp;
+pub mod models;
+pub mod remote;
+pub mod scanner;
+pub mod services;
+pub mod text;
+pub mod watcher;

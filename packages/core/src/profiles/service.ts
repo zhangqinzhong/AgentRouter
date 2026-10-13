@@ -1,3 +1,4 @@
+import { normalizeProfileProviderName } from "@agentrouter/core/profiles/provider-display-name";
 import { syncProfileAliases } from "@agentrouter/core/profiles/aliases";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readlinkSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -587,7 +588,7 @@ function applyCodexProfile(config: AppConfig, profile: ProfileConfig, token: str
   try {
     const endpoint = `${gatewayEndpoint(config).replace(/\/+$/g, "")}/v1`;
     const providerId = sanitizeCodexProviderId(profile.providerId || "") || "claude-code-router";
-    const providerName = profile.providerName?.trim() || "AgentRouter";
+    const providerName = normalizeProfileProviderName(profile.providerName);
     const model = normalizeClientModel(profile.model) || defaultClientModel(config);
     const source = existsSync(configFile) ? readFileSync(configFile, "utf8") : "";
     const configFormat = normalizeCodexConfigFormat(profile.configFormat);

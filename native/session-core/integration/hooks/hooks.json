@@ -1,0 +1,1 @@
+{"hooks":{"SessionStart":[{"matcher":"startup|clear","hooks":[{"type":"command","command":"sh \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start\"","timeout":30}]}]}}
