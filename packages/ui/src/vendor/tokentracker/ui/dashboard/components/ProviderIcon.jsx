@@ -520,7 +520,8 @@ function PlaceholderIcon({ size = 16, className = "" }) {
  * /brand-logos/ when available, otherwise falls back to a mono SVG (currentColor).
  */
 export function ProviderIcon({ provider, size = 16, color, className = "" }) {
-  const normalized = provider?.toUpperCase?.() || "";
+  const raw = provider?.toUpperCase?.() || "";
+  const normalized = ({"CLAUDE-CODE":"CLAUDE","CRAFT-AGENTS":"CRAFT","KILO":"KILOCODE","GROK-BOT":"GROK BOT"})[raw] || raw;
   const logoKey = piAwareLogoKey(normalized);
   const logoSrc = PROVIDER_LOGO_MAP[logoKey];
 

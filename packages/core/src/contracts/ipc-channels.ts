@@ -29,6 +29,8 @@ export const IPC_CHANNELS = {
   appGetLocalUsagePage: "ar:app:get-local-usage-page",
   appGetLocalUsageTrend: "ar:app:get-local-usage-trend",
   appGetLocalUsageHeatmap: "ar:app:get-local-usage-heatmap",
+  appSessionWorkspace: "ar:app:session-workspace",
+  appGetLocalSessionTranscript: "ar:app:get-local-session-transcript",
   appGetLocalUsageSessions: "ar:app:get-local-usage-sessions",
   appGetLocalUsageCategories: "ar:app:get-local-usage-categories",
   appGetUsageStats: "ar:app:get-usage-stats",

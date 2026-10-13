@@ -1,0 +1,13 @@
+{
+  "name": "agentrouter-local",
+  "owner": {
+    "name": "AgentRouter"
+  },
+  "plugins": [
+    {
+      "name": "agentrouter-sessions",
+      "source": "./plugins/agentrouter-sessions",
+      "description": "Local session search and project context."
+    }
+  ]
+}

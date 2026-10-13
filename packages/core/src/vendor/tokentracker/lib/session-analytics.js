@@ -2262,7 +2262,20 @@ function sessionsToCsv(rows) {
   return [columns.join(","), ...(rows || []).map((row) => columns.map((key) => escape(valueFor(row, key))).join(","))].join("\n") + "\n";
 }
 
+async function getSessionTranscript({ home = os.homedir(), sessionHash: hash, offset = 0 } = {}) {
+  if (typeof hash !== "string" || !/^[a-f0-9]{16,64}$/.test(hash) || !Number.isInteger(offset) || offset < 0 || offset > 100000) throw new Error("Invalid session transcript request");
+  const rows = await buildSessionAnalytics({ home });
+  const row = rows.find(item => item.session_hash === hash);
+  if (!row) throw new Error("Session not found");
+  if (!["claude", "codex", "grok"].includes(row.source)) return { available: false, messages: [], nextOffset: null };
+  const discovered = await discoverSessionFiles(home);
+  const entry = discovered[row.source].find(files => sessionFileCacheKey(row.source, files) === row._cache_key);
+  if (!entry) throw new Error("Session file no longer available");
+  return require("./session-transcript").readTranscript(Array.isArray(entry) ? entry : [entry], row.source, offset);
+}
+
 module.exports = {
+  getSessionTranscript,
   resolveSessionSidecarPath,
   sessionHash,
   scanClaudeSession,

@@ -1,0 +1,5 @@
+{"schemaVersion":1,"value":{"entries":[
+{"kind":"message","id":"g1","seq":1,"timestampMs":1786100000000,"clientNonce":"gn1","requestId":"gr1","role":"user","content":"What should we post today?","isStreaming":false},
+{"kind":"send-message","id":"g2","seq":2,"timestampMs":1786100010000,"requestId":"gr1","author":{"id":"b0000001-aaaa-bbbb-cccc-000000000001","name":"Ada"},"message":{"type":"text","content":"A thread about the launch"}},
+{"kind":"send-message","id":"g3","seq":3,"timestampMs":1786100020000,"requestId":"gr1","author":{"id":"b0000003-aaaa-bbbb-cccc-000000000003","name":"Scout"},"message":{"type":"text","content":"Competitors are quiet today"}}
+],"epochHint":null,"acceptedSequenceHint":null,"persistedAt":1786100020000,"cloudAgentPeerIds":[]}}

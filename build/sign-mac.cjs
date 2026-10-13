@@ -22,12 +22,23 @@ module.exports = async function sign(options) {
   manifest.releaseBinarySha256 = manifest.binarySha256;
   manifest.binarySha256 = crypto.createHash('sha256').update(fs.readFileSync(memory)).digest('hex');
   fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2));
+  const sessionDir = path.join(options.app, 'Contents/Resources/app.asar.unpacked/dist/main');
+  const sessionManifestFile = path.join(sessionDir, 'session-runtime.json');
+  const sessionManifest = JSON.parse(fs.readFileSync(sessionManifestFile, 'utf8'));
+  const sessionBinaries = ['agentrouter-session-reader', 'agentrouter-session-cli', 'agentrouter-session-mcp'].map(name => path.join(sessionDir, name));
+  sessionManifest.unsignedBinaries = {...sessionManifest.binaries};
+  for (const binary of sessionBinaries) {
+    execFileSync('/usr/bin/codesign', ['--force', '--sign', options.identity || '-', '--options', 'runtime',
+      '--entitlements', path.join(__dirname, 'entitlements.mac.inherit.plist'), binary]);
+    sessionManifest.binaries[path.basename(binary)] = crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex');
+  }
+  fs.writeFileSync(sessionManifestFile, JSON.stringify(sessionManifest, null, 2));
   const isWidget = file => file === widget || file.startsWith(widget + path.sep);
   await signAsync({
     ...options,
     // osx-sign discovers executables but does not seal .appex bundles itself.
     binaries: [...(options.binaries || []), launcher, widget],
-    ignore: file => file === memory ? true : isWidget(file) ? false : typeof originalIgnore === 'function' ? originalIgnore(file) : false,
+    ignore: file => (file === memory || sessionBinaries.includes(file)) ? true : isWidget(file) ? false : typeof originalIgnore === 'function' ? originalIgnore(file) : false,
     optionsForFile: file => ({
       ...(originalOptions ? originalOptions(file) : {}),
       ...(isWidget(file) ? {entitlements:path.join(__dirname,'../native/AgentRouterWidget/Widget.entitlements')} : {})

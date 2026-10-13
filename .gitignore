@@ -33,3 +33,8 @@ native/**/.build/
 # Generated WidgetKit Xcode project
 native/AgentRouterWidget/.generated/
 native/AgentRouterWidget/*.xcodeproj/
+
+# Rust session reader build products
+native/session-reader/target/
+
+native/session-core/target/

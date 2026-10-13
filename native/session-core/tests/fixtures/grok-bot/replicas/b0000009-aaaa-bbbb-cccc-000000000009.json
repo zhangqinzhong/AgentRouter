@@ -1,0 +1,4 @@
+{"schemaVersion":1,"value":{"entries":[
+{"kind":"message","id":"o1","seq":1,"timestampMs":1785800000000,"clientNonce":"on1","requestId":"or1","role":"user","content":"Summarize yesterday's notes","isStreaming":false},
+{"kind":"send-message","id":"o2","seq":2,"timestampMs":1785800030000,"requestId":"or1","message":{"type":"text","content":"Three things happened yesterday."}}
+],"epochHint":null,"acceptedSequenceHint":null,"persistedAt":1785800030000}}

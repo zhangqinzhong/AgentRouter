@@ -1,0 +1,4 @@
+{"schemaVersion":1,"value":{"entries":[
+{"kind":"message","id":"h1","seq":1,"timestampMs":1785900000000,"clientNonce":"hn1","requestId":"hr1","role":"user","content":"Clean up the old notes","isStreaming":false},
+{"kind":"send-message","id":"h2","seq":2,"timestampMs":1785900060000,"requestId":"hr1","message":{"type":"text","content":"Done"}}
+],"epochHint":null,"acceptedSequenceHint":2,"persistedAt":1785900060000}}

@@ -88,6 +88,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
       try { const raw=JSON.parse(await fs.readFile(originalFile,'utf8')); inherited=Array.isArray(raw.items)?raw.items:[]; } catch(e) { if(e.code!=='ENOENT' && !(e instanceof SyntaxError))throw e; }
       return {subscriptions:[...new Map([...inherited,...own].map(row=>[row.id,row])).values()]};
     }
+    if(endpoint.endsWith('session-transcript')) return require('./lib/session-analytics').getSessionTranscript({home,sessionHash:query.sessionHash,offset:Number(query.offset || 0)});
     if(endpoint.endsWith('local-sync')) { await sync(query.auto!=='true'); if(query.auto!=='true')resetUsageLimitsCache();return {ok:true,code:0}; }
     // Overview reads the persisted snapshot first; optional network sources and
     // price refresh must never hold its initial response hostage.

@@ -1,3 +1,4 @@
+import {buildSessionRuntime} from "./session-runtime.mjs";
 import {
   buildBrowserRenderer,
   buildCoreServer,
@@ -17,6 +18,7 @@ import {
 const mode = process.argv.includes("--dev") ? "development" : "production";
 
 cleanDist();
+buildSessionRuntime([new URL("../packages/core/dist/main",import.meta.url).pathname]);
 copyModelCatalog();
 copyBrowserRendererHtml();
 copyRendererHtml();

@@ -1,0 +1,15 @@
+{"schemaVersion":1,"value":{"entries":[
+{"kind":"user-attachment","id":"e41","seq":41,"timestampMs":1786000100000,"clientNonce":"n41","batchId":"n41","file_path":"/home/box/agent-data/uploads/launch-plan.png","file_name":"launch-plan.png","width":1200,"height":800,"byteSize":204800},
+{"kind":"message","id":"e42","seq":42,"timestampMs":1786000100000,"clientNonce":"n41","batchId":"n41","requestId":"r42","role":"user","content":"Turn this launch plan into a checklist","isStreaming":false},
+{"kind":"send-message","id":"e43","seq":43,"timestampMs":1786000110000,"requestId":"r42","message":{"type":"text","content":"Here is the checklist:\n\n1. Freeze the release branch\n2. Write the changelog","images":[{"url":"https://example.invalid/chart.png","alt":"timeline chart","width":640,"height":320}]}},
+{"kind":"tool-call","id":"e44","seq":44,"timestampMs":1786000111000,"name":"web_search","status":"completed","summary":"wake launch checklist"},
+{"kind":"send-message","id":"e45","seq":45,"timestampMs":1786000120000,"requestId":"r42","respondedValue":"tue","message":{"type":"widget","widget":{"prompt":"Which day should it ship?","allowCustom":true,"options":[{"label":"Tuesday","value":"tue"},{"label":"Thursday","value":"thu","description":"after the freeze"}]}}},
+{"kind":"event","id":"e46","seq":46,"timestampMs":1786000130000,"event":{"type":"automation-changed","action":"created","automationId":"au1","automationName":"Daily launch digest"}},
+{"kind":"send-message","id":"e47","seq":47,"timestampMs":1786000140000,"requestId":"r47","message":{"type":"connector","connector":"Gmail","serverId":"100001","variant":"connect"}},
+{"kind":"send-message","id":"e48","seq":48,"timestampMs":1786000150000,"requestId":"r47","secretProvided":true,"message":{"type":"secret-request","secretRequest":{"label":"Release token","description":"Needed to publish the release","target":{"kind":"box-env","name":"RELEASE_TOKEN","field":"value","platform":"github"}}}},
+{"kind":"send-message","id":"e49","seq":49,"timestampMs":1786000160000,"requestId":"r47","draftSendState":"sent","message":{"type":"email-draft","draft":{"from":"me@example.invalid","to":["team@example.invalid"],"subject":"Launch checklist","body":"The checklist is attached."}}},
+{"kind":"message","id":"e50","seq":50,"timestampMs":1786000170000,"requestId":"r50","role":"assistant","toAgent":{"id":"b0000003-aaaa-bbbb-cccc-000000000003","kind":"agent","name":"Scout"},"content":"Watch for competitor launches on Tuesday","isStreaming":false},
+{"kind":"message","id":"e51","seq":51,"timestampMs":1786000180000,"role":"user","fromAgent":{"id":"b0000003-aaaa-bbbb-cccc-000000000003","name":"Scout"},"content":"Will do","isStreaming":false},
+{"kind":"notice","id":"e52","seq":52,"timestampMs":1786000190000,"text":"Ada was updated"},
+{"kind":"send-message","id":"e53","seq":53,"timestampMs":1786000200000,"requestId":"r53","streaming":true,"message":{"type":"text","content":""}}
+],"epochHint":"ep-fixture","acceptedSequenceHint":53,"persistedAt":1786000200000,"precedingTimestampMs":1786000050000}}

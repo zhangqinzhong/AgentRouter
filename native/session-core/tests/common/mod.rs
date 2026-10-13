@@ -1,0 +1,1658 @@
+//! 集成测试共用的 fixture 搭建:合成 fixtures → 一个像真机 home 的目录树。
+//! adapter_contracts 用它建假 HOME,remote_sync 用它建"远端 home"——同一份
+//! 侧档/SQLite 库/dsh zstd 压制,两边不会各自漂移。fixture 全合成,绝不放
+//! 真实会话数据。
+#![allow(dead_code)] // 每个测试二进制只用到其中一部分
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use agentrouter_session_core::db::{IndexLock, Ownership};
+use agentrouter_session_core::models::{AgentId, IndexUnit, Role, SessionMeta};
+
+/// 一条最小的会话元数据(Claude Code、无模型无 token);测试按需用 `..meta(..)` 改字段。
+/// SessionMeta 没有 Default,新字段只补这一处
+pub fn meta(key: &str, title: &str) -> SessionMeta {
+    SessionMeta {
+        host: String::new(),
+        key: key.to_string(),
+        id: key.split(':').nth(1).unwrap_or(key).to_string(),
+        agent: AgentId::ClaudeCode,
+        title: title.to_string(),
+        project_path: "/tmp/proj".into(),
+        project_name: "proj".into(),
+        file_path: format!("/tmp/fixtures/{key}.jsonl"),
+        created_at: 1_700_000_000_000,
+        updated_at: 1_700_000_100_000,
+        message_count: 2,
+        size_bytes: 128,
+        git_branch: None,
+        model: None,
+        tokens_used: None,
+        archived: false,
+        source: None,
+        spawned: false,
+        favorite: false,
+        pinned: false,
+    }
+}
+
+/// 目录的真实路径,与子进程看到的工作目录同一种写法:macOS 的临时目录在符号链接后面
+/// (/var → /private/var),子进程的 cwd 是解开后的;Windows 的 canonicalize 会加 `\\?\`
+/// 前缀,子进程的 cwd 没有它——直接拿 canonicalize 的结果去比,Windows 上一条都对不上
+pub fn real_dir(path: &Path) -> PathBuf {
+    let real = fs::canonicalize(path).unwrap();
+    match real.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) => PathBuf::from(rest),
+        None => real,
+    }
+}
+
+/// 一个索引单元(主线、时间戳随 seq 递增);IndexUnit 同样没有 Default
+pub fn unit(seq: i64, role: Role, text: &str) -> IndexUnit {
+    IndexUnit {
+        seq,
+        sidechain_id: None,
+        role,
+        timestamp: Some(1_700_000_000_000 + seq),
+        text: text.to_string(),
+    }
+}
+
+/// dsh 默认落盘的 zstd 多帧日志:首帧 header 行、次帧事件批,帧直接连接(写端每次 append
+/// 一帧,解码器解到 EOF)
+pub fn dsh_zstd(plain: &str) -> Vec<u8> {
+    let (header, body) = plain.split_once('\n').unwrap_or((plain, ""));
+    let mut frames =
+        zstd::encode_all(format!("{header}\n").as_bytes(), 3).expect("zstd header frame");
+    frames.extend(zstd::encode_all(body.as_bytes(), 3).expect("zstd event frame"));
+    frames
+}
+
+pub fn fixture(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(rel)
+}
+
+/// 一个最小的 Codex home:state DB + 一条用户线程 + 一条 `spawn_agent` 子线程。
+/// 子线程的前半段是 `fork_turns` 复制进来的父线程历史,分界点由首行的
+/// `subagent_history_start_ordinal` 指定(真机形态,实测 0.151 会写);那一段里
+/// 还夹着一封发给**别的**子代理的派活信封,用来卡住"认收件人而不是认第一条
+/// 信封"这条兜底判据。fork 段**以助手消息收尾**、子线程自己**从工具调用开头**
+/// ——这正是折叠会把子线程自己的工具调用一起 splice 掉的形状。父子关系登记在
+/// state DB 的 thread_spawn_edges 里。adapter_contracts 与 scanner_finale 共用
+/// 一份,免得两边各写一套慢慢漂开。返回 (父线程 id, 子线程 id, 子线程文件路径)
+pub fn stage_codex_spawn_pair(home: &Path) -> (String, String, PathBuf) {
+    let parent_id = "11111111-aaaa-4bbb-8ccc-000000000001".to_string();
+    let child_id = "22222222-aaaa-4bbb-8ccc-000000000002".to_string();
+    let day = home.join("sessions/2026/09/16");
+    fs::create_dir_all(&day).unwrap();
+
+    // Codex 给每行编 ordinal(= 行号);子线程首行的
+    // subagent_history_start_ordinal 就是按它指的
+    let write_jsonl = |path: &Path, lines: &[serde_json::Value]| {
+        let text: String = lines
+            .iter()
+            .enumerate()
+            .map(|(ordinal, line)| {
+                let mut line = line.clone();
+                line["ordinal"] = serde_json::json!(ordinal);
+                format!("{line}\n")
+            })
+            .collect();
+        fs::write(path, text).unwrap();
+    };
+    let session_meta = |id: &str, extra: serde_json::Value| {
+        let mut payload = serde_json::json!({
+            "id": id,
+            "timestamp": "2026-09-16T09:00:00.000Z",
+            "cwd": "/work/wake",
+            "originator": "codex_cli_rs"
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::json!({
+            "timestamp": "2026-09-16T09:00:00.000Z",
+            "type": "session_meta",
+            "payload": payload
+        })
+    };
+    let message = |role: &str, text: &str| {
+        serde_json::json!({
+            "timestamp": "2026-09-16T09:05:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text", "text": text}]
+            }
+        })
+    };
+    // 派活信封:抬头明文、Payload 加密,与实测形态一致
+    let dispatch = |to: &str| {
+        serde_json::json!({
+            "timestamp": "2026-09-16T09:30:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": to,
+                "content": [
+                    {"type": "input_text", "text": format!("Message Type: NEW_TASK\nTask name: {to}\nSender: /root\nPayload:\n")},
+                    {"type": "encrypted_content", "encrypted_content": "gAAAAAB-opaque"}
+                ]
+            }
+        })
+    };
+
+    let parent_head = session_meta(
+        &parent_id,
+        serde_json::json!({"source": "cli", "thread_source": "user"}),
+    );
+    write_jsonl(
+        &day.join(format!("rollout-2026-09-16T09-00-00-{parent_id}.jsonl")),
+        &[
+            parent_head.clone(),
+            message("user", "inherited parent turn about the qr login bug"),
+            message("assistant", "inherited parent answer"),
+            // 派活:输出是子线程的 agent_path,详情页按它跳到子线程
+            serde_json::json!({
+                "timestamp": "2026-09-16T09:29:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "call_id": "call_spawn_1",
+                    "arguments": "{\"task_name\":\"review_issue17\",\"message\":\"Review issue 17\"}"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-09-16T09:29:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_spawn_1",
+                    "output": "{\"task_name\":\"/root/review_issue17\"}"
+                }
+            }),
+        ],
+    );
+
+    let child_head = session_meta(
+        &child_id,
+        serde_json::json!({
+            "source": {"subagent": {"thread_spawn": {
+                "parent_thread_id": parent_id,
+                "depth": 1,
+                "agent_path": "/root/review_issue17",
+                "agent_nickname": "Wegener",
+                "agent_role": null
+            }}},
+            "thread_source": "subagent",
+            "agent_path": "/root/review_issue17",
+            "subagent_history_start_ordinal": 7
+        }),
+    );
+    let child_path = day.join(format!("rollout-2026-09-16T09-30-00-{child_id}.jsonl"));
+    write_jsonl(
+        &child_path,
+        &[
+            child_head,
+            // spawn 时原样复制进来的父线程首行,saw_session_meta 必须挡住它
+            parent_head,
+            message("user", "inherited parent turn about the qr login bug"),
+            message("assistant", "inherited parent answer"),
+            dispatch("/root/other_task"),
+            message("user", "inherited follow-up turn"),
+            message("assistant", "inherited parent tail"),
+            dispatch("/root/review_issue17"),
+            serde_json::json!({
+                "timestamp": "2026-09-16T09:31:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "call_id": "call_child_1",
+                    "arguments": "{\"command\":\"rg useEffect\"}"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-09-16T09:31:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_child_1",
+                    "output": "CHILD_TOOL_OUTPUT"
+                }
+            }),
+            message("assistant", "child found the missing dependency array"),
+        ],
+    );
+
+    // state DB:threads 两行(子线程的 title/name 与真机一样是空的,标题只能
+    // 由解析侧的任务名给)+ 父子关系登记表
+    let conn = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT, name TEXT,
+         tokens_used INTEGER, archived INTEGER, git_branch TEXT, model TEXT, source TEXT,
+         created_at_ms INTEGER, updated_at_ms INTEGER, agent_path TEXT);
+         CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL,
+         child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL);",
+    )
+    .unwrap();
+    for (id, file, source, agent_path) in [
+        (
+            &parent_id,
+            format!("rollout-2026-09-16T09-00-00-{parent_id}.jsonl"),
+            "cli",
+            None,
+        ),
+        (
+            &child_id,
+            format!("rollout-2026-09-16T09-30-00-{child_id}.jsonl"),
+            // 真机把整个结构化来源原样存进 source 列
+            "{\"subagent\":{\"thread_spawn\":{}}}",
+            Some("/root/review_issue17"),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, ?2, '/work/wake', '', NULL, 0, 0,
+             NULL, NULL, ?3, 1789000000000, 1789000000000, ?4)",
+            rusqlite::params![id, day.join(file).to_string_lossy(), source, agent_path],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO thread_spawn_edges VALUES (?1, ?2, 'open')",
+        rusqlite::params![parent_id, child_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    (parent_id, child_id, child_path)
+}
+
+pub fn copy_tree(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
+/// 目录型 fixtures 摆进 home:fixture 目录名即各家 home 下的尾段(pi 的树
+/// 同时复制成 omp——omp fork 自 pi,布局同构)
+pub fn stage_dir_fixtures(home: &Path) {
+    for (src, dst) in [
+        ("claude", ".claude"),
+        ("codex", ".codex"),
+        ("cursor", ".cursor"),
+        ("gemini", ".gemini"),
+        ("grok", ".grok"),
+        ("kimi", ".kimi-code"),
+        ("kiro", ".kiro"),
+        ("pi", ".pi"),
+        ("pi", ".omp"),
+        ("qoder", ".qoder"),
+        ("codebuddy", ".codebuddy"),
+        ("codebuddy", ".workbuddy"),
+        ("craft-agents", ".craft-agent"),
+    ] {
+        copy_tree(&fixture(src), &home.join(dst));
+    }
+}
+
+/// stage_sidecars 建出的库/日志路径(契约测试按路径直开)
+pub struct Sidecars {
+    pub copilot_db: PathBuf,
+    pub opencode_db: PathBuf,
+    pub opencode_next_db: PathBuf,
+    pub antigravity_db: PathBuf,
+    pub dsh_log: PathBuf,
+    /// fork 后端派出的子代理会话(开头带着从父会话复制来的一段),挂在 dsh_log 那个会话下
+    pub dsh_sub_log: PathBuf,
+    pub hermes_db: PathBuf,
+    pub openclaw_db: PathBuf,
+    pub cursor_ide_db: PathBuf,
+    pub zcode_db: PathBuf,
+    pub devin_db: PathBuf,
+    /// Kilo Code 新版的库
+    pub kilo_db: PathBuf,
+    /// Kilo Code 旧版扩展装在 VS Code / Cursor 里各自的任务目录
+    pub kilo_tasks: PathBuf,
+    pub kilo_cursor_tasks: PathBuf,
+}
+
+/// 侧档与 SQLite 型 fixture 库:copilot/opencode(两代)/antigravity 现建库,
+/// gemini 的 projects.json、kimi 的 session_index.jsonl,dsh 的 zstd 日志与
+/// 一个子代理会话(验证 file_ref 过滤)。
+pub fn stage_sidecars(home: &Path) -> Sidecars {
+    let copilot_dir = home.join(".copilot");
+    fs::create_dir_all(&copilot_dir).expect("mkdir .copilot");
+    let copilot_db = copilot_dir.join("session-store.db");
+    build_copilot_db(&copilot_db);
+
+    let oc_dir = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&oc_dir).expect("mkdir opencode dir");
+    let opencode_db = oc_dir.join("opencode.db");
+    build_opencode_db(&opencode_db);
+    let opencode_next_db = oc_dir.join("opencode-next.db");
+    build_opencode_next_db(&opencode_next_db);
+
+    let gem_dir = home.join(".gemini");
+    fs::create_dir_all(&gem_dir).expect("mkdir .gemini");
+    fs::write(
+        gem_dir.join("projects.json"),
+        r#"{"projects":{"/Users/tester/Github/wakefx":"wakefx-gem"}}"#,
+    )
+    .expect("write projects.json");
+
+    let ag_dir = gem_dir.join("antigravity-cli");
+    fs::create_dir_all(&ag_dir).expect("mkdir antigravity-cli");
+    let antigravity_db = ag_dir.join("conversation_summaries.db");
+    build_antigravity_db(&antigravity_db);
+
+    let kimi_dir = home.join(".kimi-code");
+    fs::create_dir_all(&kimi_dir).expect("mkdir .kimi-code");
+    fs::write(
+        kimi_dir.join("session_index.jsonl"),
+        concat!(
+            r#"{"sessionId":"session_88888888-aaaa-bbbb-cccc-000000000008","sessionDir":"/x","workDir":"/Users/tester/Github/wakefx"}"#,
+            "\n",
+            r#"{"sessionId":"session_99999999-aaaa-bbbb-cccc-000000000009","sessionDir":"/x","workDir":"/Users/tester/Github/wakefx"}"#,
+            "\n",
+        ),
+    )
+    .expect("write kimi session_index");
+
+    // dsh:检入的明文 fixture 压成真实写端布局的 zstd 多帧文件(首帧 header
+    // 行、次帧事件批,帧直接连接),另放一个 fork 后端派出的子代理会话(issue #63)
+    let dsh_project = home
+        .join(".dsh")
+        .join("sessions")
+        .join("--Users-tester-Github-wakefx--");
+    let dsh_sess = dsh_project.join("dsh-e2e4-0001");
+    fs::create_dir_all(&dsh_sess).expect("mkdir dsh session dir");
+    let plain = fs::read_to_string(fixture("dsh/session.jsonl")).expect("read dsh fixture");
+    let dsh_log = dsh_sess.join("session.jsonl.zstd");
+    fs::write(&dsh_log, dsh_zstd(&plain)).expect("write dsh zstd log");
+    let dsh_sub = dsh_project.join("dsh-sub-0002");
+    fs::create_dir_all(&dsh_sub).expect("mkdir dsh subagent dir");
+    let plain = fs::read_to_string(fixture("dsh/subagent.v4.jsonl")).expect("read dsh subagent");
+    let dsh_sub_log = dsh_sub.join("session.v4.jsonl.zstd");
+    fs::write(&dsh_sub_log, dsh_zstd(&plain)).expect("write dsh subagent log");
+
+    let hermes_dir = home.join(".hermes");
+    fs::create_dir_all(&hermes_dir).expect("mkdir .hermes");
+    let hermes_db = hermes_dir.join("state.db");
+    build_hermes_db(&hermes_db);
+
+    // openclaw:现版库与旧版 jsonl(检入 fixture)同在一个 agent 目录——两代
+    // 存储并存是真机形态(doctor --fix 迁库后旧转录仍留在 sessions/)
+    let claw_agent = home.join(".openclaw").join("agents").join("main");
+    copy_tree(
+        &fixture("openclaw/agents/main/sessions"),
+        &claw_agent.join("sessions"),
+    );
+    let claw_dir = claw_agent.join("agent");
+    fs::create_dir_all(&claw_dir).expect("mkdir openclaw agent dir");
+    let openclaw_db = claw_dir.join("openclaw-agent.sqlite");
+    build_openclaw_db(&openclaw_db);
+
+    // Cursor IDE:VS Code 系的用户数据根三平台不同,与 adapter 的 storage_dir
+    // 同一推导(AR_SESSION_HOME 下派生,不走 dirs::config_dir)
+    let cursor_ide_dir = cursor_ide_storage_dir(home);
+    fs::create_dir_all(&cursor_ide_dir).expect("mkdir cursor globalStorage");
+    let cursor_ide_db = cursor_ide_dir.join("state.vscdb");
+    build_cursor_ide_db(&cursor_ide_db);
+
+    let zcode_db = home.join(".zcode/cli/db/db.sqlite");
+    fs::create_dir_all(zcode_db.parent().unwrap()).expect("mkdir .zcode/cli/db");
+    build_zcode_db(&zcode_db);
+    let zcode_tasks_db = home.join(".zcode/v2/tasks-index.sqlite");
+    fs::create_dir_all(zcode_tasks_db.parent().unwrap()).expect("mkdir .zcode/v2");
+    build_zcode_tasks_db(&zcode_tasks_db);
+
+    let devin_db = home
+        .join(".local")
+        .join("share")
+        .join("devin")
+        .join("cli")
+        .join("sessions.db");
+    fs::create_dir_all(devin_db.parent().unwrap()).expect("mkdir devin cli dir");
+    build_devin_db(&devin_db);
+
+    let kilo_dir = home.join(".local").join("share").join("kilo");
+    fs::create_dir_all(&kilo_dir).expect("mkdir kilo data dir");
+    let kilo_db = kilo_dir.join("kilo.db");
+    build_kilo_db(&kilo_db);
+    // 旧版扩展:VS Code 里一份(带 globalState 的 taskHistory),Cursor 里一份
+    let code_storage = vscode_global_storage(home, "Code");
+    let kilo_tasks = code_storage.join("kilocode.kilo-code").join("tasks");
+    copy_tree(&fixture("kilo-legacy/Code/tasks"), &kilo_tasks);
+    build_kilo_global_state(
+        &code_storage.join("state.vscdb"),
+        r#"{"taskHistory":[{"id":"1736400000000","ts":1736400006000,"task":"旧标题(globalState)","workspace":"/Users/tester/Github/stale","tokensIn":10,"tokensOut":20}],"kilo-code.welcomed":true}"#,
+    );
+    let kilo_cursor_tasks = cursor_ide_dir.join("kilocode.kilo-code").join("tasks");
+    copy_tree(&fixture("kilo-legacy/Cursor/tasks"), &kilo_cursor_tasks);
+
+    Sidecars {
+        copilot_db,
+        opencode_db,
+        opencode_next_db,
+        antigravity_db,
+        dsh_log,
+        dsh_sub_log,
+        hermes_db,
+        openclaw_db,
+        cursor_ide_db,
+        zcode_db,
+        devin_db,
+        kilo_db,
+        kilo_tasks,
+        kilo_cursor_tasks,
+    }
+}
+
+/// `<home>/…/<app 名>`:Electron app 的 userData,与 adapters::electron_user_data 的平台分支
+/// 逐条对应(改一处必须改另一处,契约测试会因路径不符而空列)
+pub fn electron_user_data(home: &Path, app: &str) -> PathBuf {
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else if cfg!(target_os = "windows") {
+        home.join("AppData").join("Roaming")
+    } else {
+        home.join(".config")
+    };
+    base.join(app)
+}
+
+/// `<home>/…/<编辑器>/User/globalStorage`:VS Code 系编辑器的 globalStorage
+pub fn vscode_global_storage(home: &Path, editor: &str) -> PathBuf {
+    electron_user_data(home, editor)
+        .join("User")
+        .join("globalStorage")
+}
+
+/// Grok Bot fixture 的账号段(app 存的是 URI 编码过的账号)
+pub const GROK_BOT_ACCOUNT: &str = "google-oauth2%7Cuser_fixture01";
+
+/// Grok Bot 的一份存储文件:键直接编码进文件名。用 adapter 自己的编码器——它对不对由 adapter 的
+/// 单测拿本机真实文件名卡着
+pub fn grok_bot_store_file(store: &Path, key: &str) -> PathBuf {
+    store.join(agentrouter_session_core::adapters::grok_bot::store_file_name(key).expect("短键直接编码进文件名"))
+}
+
+/// fixture 账号的侧栏列表
+pub fn grok_bot_roster_path(store: &Path) -> PathBuf {
+    grok_bot_store_file(store, &grok_bot_roster_key(GROK_BOT_ACCOUNT))
+}
+
+/// fixture 账号的一个对话副本
+pub fn grok_bot_replica_path(store: &Path, conversation: &str) -> PathBuf {
+    grok_bot_store_file(store, &grok_bot_replica_key(GROK_BOT_ACCOUNT, conversation))
+}
+
+pub fn grok_bot_replica_key(account: &str, conversation: &str) -> String {
+    format!("sand.client.slice.account.{account}.transcript.replicas.{conversation}")
+}
+
+pub fn grok_bot_roster_key(account: &str) -> String {
+    format!("sand.client.slice.account.{account}.roster.last-roster")
+}
+
+/// Grok Bot 的缓存目录(`<userData>/sand-client-persistence`):检入的明文 fixture——侧栏列表与
+/// 各对话的副本——按 app 的写法落成 base32 文件名;另放一个不相干的切片与一份写到一半的 `.tmp`,
+/// 都不是会话。返回缓存目录
+pub fn stage_grok_bot(home: &Path) -> PathBuf {
+    let store = electron_user_data(home, "Grok Bot").join("sand-client-persistence");
+    fs::create_dir_all(&store).expect("mkdir grok bot store");
+    fs::copy(
+        fixture("grok-bot/roster.json"),
+        grok_bot_roster_path(&store),
+    )
+    .expect("stage grok bot roster");
+    for entry in fs::read_dir(fixture("grok-bot/replicas")).expect("grok bot replicas") {
+        let path = entry.unwrap().path();
+        let id = path.file_stem().unwrap().to_string_lossy().to_string();
+        fs::copy(&path, grok_bot_replica_path(&store, &id)).expect("stage grok bot replica");
+    }
+    fs::write(
+        grok_bot_store_file(&store, "sand.client.slice.ui-layout"),
+        r#"{"schemaVersion":1,"value":{"sidebarWidth":210}}"#,
+    )
+    .unwrap();
+    let in_flight = grok_bot_replica_path(&store, "b0000001-aaaa-bbbb-cccc-000000000001");
+    fs::write(
+        in_flight.with_extension("blob.tmp"),
+        "{\"schemaVersion\":1,",
+    )
+    .unwrap();
+    store
+}
+
+/// `<home>/…/Cursor/User/globalStorage`
+pub fn cursor_ide_storage_dir(home: &Path) -> PathBuf {
+    vscode_global_storage(home, "Cursor")
+}
+
+/// 编辑器的 `globalStorage/state.vscdb`:扩展的 globalState 整份 JSON 存在 ItemTable 里、以
+/// 扩展 id 为 key(另放一条别家扩展的行和一条 secret 行陪着)
+fn build_kilo_global_state(path: &Path, global_state: &str) {
+    let conn = rusqlite::Connection::open(path).expect("create state.vscdb fixture");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+        INSERT INTO ItemTable VALUES ('GitHub.copilot', '{"seen":true}');
+        INSERT INTO ItemTable VALUES ('secret://{"extensionId":"kilocode.kilo-code","key":"apiKey"}', X'00FF');
+        "#,
+    )
+    .expect("populate state.vscdb fixture");
+    conn.execute(
+        "INSERT INTO ItemTable VALUES ('kilocode.kilo-code', ?1)",
+        [global_state],
+    )
+    .expect("insert kilo globalState");
+}
+
+/// Kilo Code 新版的 `kilo.db`(OpenCode 分支,表与 OpenCode 同形,列按 Kilo 7.x 的真实
+/// schema 取子集):
+/// - `ses_kilo_0001`:正常会话,v1 两表;另有一条实验开关下双写的 session_message
+///   shell 记录——必须照旧读 message + part(OpenCode 的判据会只剩那一条);part 里带
+///   agent / retry 两种已知但不渲染的类型
+/// - `ses_kilo_0002`:用户敲 `/review` 派子代理(消息里只有 subtask 块)、一条 compaction
+///   标记、压缩出的摘要
+/// - `ses_kilo_0003`:子代理会话(parent_id),挂在 `ses_kilo_0001` 下
+/// - `ses_kilo_0004`:已归档
+/// - `ses_kilo_0005`:只有 session_message 的会话(v2 路径)
+/// - `ses_kilo_0006`:没有正文,不列
+/// - 旧任务 `migrated-task-0004` 导进来的那份(`ses_migrated_…`),与旧版任务目录里的
+///   原件同 key,scanner 让这份胜出
+///
+/// 另有 credential 表与一行假凭证:真库就长这样,adapter 绝不读它
+pub fn build_kilo_db(path: &Path) {
+    let migrated = agentrouter_session_core::adapters::kilo::migrated_session_id("migrated-task-0004");
+    let conn = rusqlite::Connection::open(path).expect("create kilo fixture db");
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workspace_id TEXT, parent_id TEXT,
+            slug TEXT NOT NULL, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL,
+            version TEXT NOT NULL, share_url TEXT, metadata TEXT,
+            cost REAL NOT NULL DEFAULT 0,
+            tokens_input INTEGER NOT NULL DEFAULT 0, tokens_output INTEGER NOT NULL DEFAULT 0,
+            tokens_reasoning INTEGER NOT NULL DEFAULT 0, tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_write INTEGER NOT NULL DEFAULT 0, agent TEXT, model TEXT,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            time_compacting INTEGER, time_archived INTEGER
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE credential (
+            id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL, value TEXT NOT NULL,
+            connector_id TEXT, method_id TEXT, active INTEGER,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+        );
+        INSERT INTO credential VALUES
+            ('cred-1', 'kilo', 'default', '{{"type":"api","key":"NOT-A-REAL-SECRET"}}', NULL, NULL, 1, 0, 0);
+
+        INSERT INTO session (id, project_id, parent_id, slug, directory, title, version,
+                             tokens_input, tokens_output, tokens_reasoning, agent, model,
+                             time_created, time_updated, time_archived) VALUES
+            ('ses_kilo_0001', 'prj1', NULL, 'brave-otter', '/Users/tester/Github/wakefx',
+             'Kilo 二维码泄漏排查', '7.8.8', 100, 40, 10, 'code',
+             '{{"id":"kilo-auto/free","providerID":"kilo"}}', 1786300000000, 1786300600000, NULL),
+            ('ses_kilo_0002', 'prj1', NULL, 'calm-pine', '/Users/tester/Github/wakefx',
+             'Review the QR changes', '7.8.8', 0, 0, 0, 'code', NULL,
+             1786301000000, 1786301600000, NULL),
+            ('ses_kilo_0003', 'prj1', 'ses_kilo_0001', 'sub-agent', '/Users/tester/Github/wakefx',
+             'Subagent: grep the scanner', '7.8.8', 0, 0, 0, 'explore', NULL,
+             1786300200000, 1786300300000, NULL),
+            ('ses_kilo_0004', 'prj1', NULL, 'old-lake', '/Users/tester/Github/wakefx',
+             'Archived Kilo session', '7.8.8', 0, 0, 0, 'code', NULL,
+             1786200000000, 1786200100000, 1786400000000),
+            ('ses_kilo_0005', 'prj1', NULL, 'next-wave', '/Users/tester/Github/wakefx',
+             'Kilo v2 会话', '7.9.0', 0, 0, 0, 'code', NULL,
+             1786500000000, 1786500100000, NULL),
+            ('ses_kilo_0006', 'prj1', NULL, 'empty-sky', '/Users/tester/Github/wakefx',
+             'New session', '7.8.8', 0, 0, 0, 'code', NULL,
+             1786600000000, 1786600000000, NULL),
+            ('{migrated}', 'prj1', NULL, 'migrated-task-0004', '/Users/tester/Github/wakefx',
+             '迁移过的旧任务', 'v2', 0, 0, 0, NULL, NULL,
+             1736600001000, 1736600002000, NULL);
+
+        INSERT INTO message VALUES
+            ('msg_k1_a', 'ses_kilo_0001', 1786300050000, 1786300050000,
+             '{{"role":"user","time":{{"created":1786300050000}},"agent":"code"}}'),
+            ('msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"role":"assistant","time":{{"created":1786300100000}},"modelID":"kilo-auto/free","providerID":"kilo"}}'),
+            ('msg_k2_a', 'ses_kilo_0002', 1786301050000, 1786301050000,
+             '{{"role":"user","time":{{"created":1786301050000}}}}'),
+            ('msg_k2_b', 'ses_kilo_0002', 1786301100000, 1786301100000,
+             '{{"role":"assistant","time":{{"created":1786301100000}}}}'),
+            ('msg_k2_c', 'ses_kilo_0002', 1786301200000, 1786301200000,
+             '{{"role":"user","time":{{"created":1786301200000}}}}'),
+            ('msg_k2_d', 'ses_kilo_0002', 1786301300000, 1786301300000,
+             '{{"role":"assistant","summary":true,"time":{{"created":1786301300000}}}}'),
+            ('msg_k3_a', 'ses_kilo_0003', 1786300250000, 1786300250000,
+             '{{"role":"user","time":{{"created":1786300250000}}}}'),
+            ('msg_k4_a', 'ses_kilo_0004', 1786200050000, 1786200050000,
+             '{{"role":"user","time":{{"created":1786200050000}}}}'),
+            ('msg_m4_a', '{migrated}', 1736600001000, 1736600001000,
+             '{{"role":"user","time":{{"created":1736600001000}}}}'),
+            ('msg_m4_b', '{migrated}', 1736600002000, 1736600002000,
+             '{{"role":"assistant","time":{{"created":1736600002000}}}}');
+
+        INSERT INTO part VALUES
+            ('prt_k1_a1', 'msg_k1_a', 'ses_kilo_0001', 1786300050000, 1786300050000,
+             '{{"type":"text","text":"Kilo 修一下二维码扫描的 useEffect() 泄漏 @build"}}'),
+            ('prt_k1_a2', 'msg_k1_a', 'ses_kilo_0001', 1786300050000, 1786300050000,
+             '{{"type":"agent","name":"build"}}'),
+            ('prt_k1_b1', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"step-start"}}'),
+            ('prt_k1_b2', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"reasoning","text":"先看清理函数"}}'),
+            ('prt_k1_b3', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"retry","attempt":1,"error":{{"name":"APIError","data":{{"message":"overloaded"}}}},"time":{{"created":1786300100500}}}}'),
+            ('prt_k1_b4', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"tool","callID":"call_1","tool":"grep","state":{{"status":"completed","input":{{"pattern":"useEffect"}},"output":"src/QrScanner.tsx:42"}}}}'),
+            ('prt_k1_b5', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"text","text":"找到了:卸载时没有停止扫描。"}}'),
+            ('prt_k1_b6', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"step-finish","tokens":{{"input":100,"output":40}}}}'),
+            ('prt_k2_a1', 'msg_k2_a', 'ses_kilo_0002', 1786301050000, 1786301050000,
+             '{{"type":"subtask","command":"review","description":"Review the QR changes","agent":"reviewer","prompt":"Review the following changes carefully"}}'),
+            ('prt_k2_b1', 'msg_k2_b', 'ses_kilo_0002', 1786301100000, 1786301100000,
+             '{{"type":"text","text":"Review done: no leaks left."}}'),
+            ('prt_k2_c1', 'msg_k2_c', 'ses_kilo_0002', 1786301200000, 1786301200000,
+             '{{"type":"compaction","auto":true}}'),
+            ('prt_k2_d1', 'msg_k2_d', 'ses_kilo_0002', 1786301300000, 1786301300000,
+             '{{"type":"text","text":"Summary of the QR work so far."}}'),
+            ('prt_k3_a1', 'msg_k3_a', 'ses_kilo_0003', 1786300250000, 1786300250000,
+             '{{"type":"text","text":"grep the scanner"}}'),
+            ('prt_k4_a1', 'msg_k4_a', 'ses_kilo_0004', 1786200050000, 1786200050000,
+             '{{"type":"text","text":"an archived question"}}'),
+            ('prt_m4_a1', 'msg_m4_a', '{migrated}', 1736600001000, 1736600001000,
+             '{{"type":"text","text":"迁移过的旧任务"}}'),
+            ('prt_m4_b1', 'msg_m4_b', '{migrated}', 1736600002000, 1736600002000,
+             '{{"type":"text","text":"旧任务的回答(导入后)"}}');
+
+        INSERT INTO session_message VALUES
+            ('sm_k1_0', 'ses_kilo_0001', 'shell', 0, 1786300400000, 1786300400000,
+             '{{"callID":"sh-1","command":"pnpm test","output":"ok","time":{{"created":1786300400000}}}}'),
+            ('sm_k5_0', 'ses_kilo_0005', 'user', 0, 1786500000000, 1786500000000,
+             '{{"text":"Kilo v2 会话问一句","time":{{"created":1786500000000}}}}'),
+            ('sm_k5_1', 'ses_kilo_0005', 'assistant', 1, 1786500050000, 1786500050000,
+             '{{"model":{{"id":"kilo-auto/free","providerID":"kilo"}},"time":{{"created":1786500050000}},"content":[{{"type":"text","text":"v2 回答"}}]}}');
+        "#
+    ))
+    .expect("populate kilo fixture db");
+}
+
+/// Hermes `state.db` 最小同构库:sessions + messages(时间戳 unix 秒 REAL)。
+/// hs-0001 有用户标题、OpenAI 形状的 tool_calls 与 reasoning;hs-0002 无标题
+///(回退首条用户消息)、telegram 启动面、精简形状 tool_calls(无 id,按顺位回填)、
+/// 多模态 content 是 JSON 块数组;hs-0003 是 session_search 工具内部会话
+///(source=tool,不列);hs-0004 零消息(不列);hs-0005 是 hs-0001 的 /branch 分支
+///(parent_session_id,照常列出、挂父子关系)。
+pub fn build_hermes_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create hermes fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT NOT NULL, user_id TEXT, model TEXT,
+            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
+            message_count INTEGER DEFAULT 0, tool_call_count INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
+            reasoning_tokens INTEGER DEFAULT 0, title TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+            role TEXT NOT NULL, content TEXT, tool_call_id TEXT, tool_calls TEXT,
+            tool_name TEXT, timestamp REAL NOT NULL, token_count INTEGER,
+            finish_reason TEXT, reasoning TEXT, reasoning_details TEXT,
+            codex_reasoning_items TEXT
+        );
+        INSERT INTO sessions (id, source, model, started_at, ended_at, message_count,
+                              input_tokens, output_tokens, cache_read_tokens, title) VALUES
+            ('hs-0001', 'cli', 'gpt-5.4', 1786172400.0, 1786172520.0, 4, 300, 50, 100, 'Hermes QR fix'),
+            ('hs-0002', 'telegram', 'claude-opus-5', 1786176000.0, NULL, 3, 0, 0, 0, NULL),
+            ('hs-0003', 'tool', 'gpt-5.4', 1786176100.0, 1786176101.0, 2, 0, 0, 0, NULL),
+            ('hs-0004', 'cli', 'gpt-5.4', 1786176200.0, 1786176201.0, 0, 0, 0, 0, NULL);
+        INSERT INTO sessions (id, source, model, started_at, ended_at, message_count, parent_session_id, title) VALUES
+            ('hs-0005', 'cli', 'gpt-5.4', 1786176300.0, 1786176301.0, 1, 'hs-0001', 'Hermes QR fix #2');
+        INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp, reasoning) VALUES
+            ('hs-0001', 'user', 'Hermes 看看二维码扫描为何闪退,是不是 useEffect() 的问题', NULL, NULL, NULL, 1786172405.0, NULL),
+            ('hs-0001', 'assistant', NULL, NULL,
+             '[{"id":"call_h1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/QrScanner.tsx\"}"}}]',
+             NULL, 1786172408.0, '先读一下组件源码'),
+            ('hs-0001', 'tool', 'useEffect(() => watch())', 'call_h1', NULL, 'read_file', 1786172409.0, NULL),
+            ('hs-0001', 'assistant', '是依赖数组问题,我给出了修复补丁。', NULL, NULL, NULL, 1786172412.0, NULL),
+            ('hs-0001', 'user', '谢谢,合并了', NULL, NULL, NULL, 1786172520.0, NULL),
+            ('hs-0002', 'user', '[{"type":"text","text":"无标题会话的兜底标题应取这句"},{"type":"image_url","image_url":{"url":"file:///tmp/a.png"}}]', NULL, NULL, NULL, 1786176005.0, NULL),
+            ('hs-0002', 'assistant', NULL, NULL, '[{"name":"terminal","arguments":"{\"command\":\"ls\"}"}]', NULL, 1786176006.0, NULL),
+            ('hs-0002', 'tool', 'README.md', NULL, NULL, 'terminal', 1786176007.0, NULL),
+            ('hs-0002', 'assistant', '好的。', NULL, NULL, NULL, 1786176008.0, NULL),
+            ('hs-0003', 'user', 'internal search', NULL, NULL, NULL, 1786176100.5, NULL),
+            ('hs-0005', 'user', 'branched from hs-0001', NULL, NULL, NULL, 1786176300.5, NULL),
+            ('hs-0003', 'assistant', 'nothing', NULL, NULL, NULL, 1786176101.0, NULL);
+        "#,
+    )
+    .expect("populate hermes fixture db");
+}
+
+/// OpenClaw `openclaw-agent.sqlite` 最小同构库:session_nodes + session_windows +
+/// transcript_events + session_transcript_active_events(列集只取 Wake 读的)。
+/// claw-0001 是活跃窗口:事件树里塞了一条被回滚的死分支(a2-dead),
+/// active_events 只列可见分支;claw-0002 是被 spawn 的子代理窗口,只记了父会话的键
+///(挂在 claw-0001 下);claw-0004 也是子代理,条目里记了确切的父会话 claw-0003;claw-0005
+/// 是同一个子代理键(sub2)复用之前的旧窗口,条目不归它,按它自己那一行的键挂到 claw-0001;
+/// claw-0003 是 reset 前的旧窗口,node 指向 claw-0001,无 active_events
+///(退回树回溯),entry_json 的 totalTokens 不归它。
+pub fn build_openclaw_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create openclaw fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session_nodes (
+            session_key TEXT NOT NULL PRIMARY KEY, current_session_id TEXT NOT NULL,
+            entry_json TEXT NOT NULL, updated_at INTEGER NOT NULL, label TEXT,
+            display_name TEXT, spawned_by TEXT, parent_session_key TEXT, archived_at INTEGER
+        );
+        CREATE TABLE session_windows (
+            session_id TEXT NOT NULL PRIMARY KEY, session_key TEXT NOT NULL,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            transcript_updated_at INTEGER, started_at INTEGER, model TEXT,
+            model_provider TEXT, channel TEXT, chat_type TEXT, spawned_by TEXT,
+            parent_session_key TEXT, display_name TEXT
+        );
+        CREATE TABLE transcript_events (
+            session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq)
+        );
+        CREATE TABLE session_transcript_active_events (
+            session_id TEXT NOT NULL, active_position INTEGER NOT NULL,
+            event_seq INTEGER NOT NULL, message_position INTEGER,
+            PRIMARY KEY (session_id, active_position)
+        );
+        INSERT INTO session_nodes VALUES
+            ('agent:main:main', 'claw-0001',
+             '{"sessionId":"claw-0001","updatedAt":1786266030000,"model":"claude-opus-5","totalTokens":7300,"label":"Node label"}',
+             1786266030000, 'Node label', NULL, NULL, NULL, NULL),
+            ('agent:main:subagent:sub1', 'claw-0002',
+             '{"sessionId":"claw-0002","updatedAt":1786266100000,"spawnedBy":"agent:main:main"}',
+             1786266100000, NULL, NULL, 'agent:main:main', 'agent:main:main', NULL),
+            ('agent:main:subagent:sub2', 'claw-0004',
+             '{"sessionId":"claw-0004","updatedAt":1786266200000,"spawnedBy":"agent:main:main","parentSessionId":"claw-0003"}',
+             1786266200000, NULL, NULL, 'agent:main:main', 'agent:main:main', NULL);
+        INSERT INTO session_windows VALUES
+            ('claw-0001', 'agent:main:main', 1786266000000, 1786266030000, 1786266030000, 1786266000000,
+             'claude-opus-5', 'anthropic', 'telegram', 'direct', NULL, NULL, NULL),
+            ('claw-0002', 'agent:main:subagent:sub1', 1786266100000, 1786266100000, 1786266100000, 1786266100000,
+             'claude-opus-5', 'anthropic', NULL, NULL, 'agent:main:main', 'agent:main:main', NULL),
+            ('claw-0003', 'agent:main:main', 1786176000000, 1786176030000, 1786176030000, 1786176000000,
+             'gpt-5.5', 'openai', 'cli', 'direct', NULL, NULL, NULL),
+            ('claw-0004', 'agent:main:subagent:sub2', 1786266200000, 1786266200000, 1786266200000, 1786266200000,
+             'claude-opus-5', 'anthropic', NULL, NULL, 'agent:main:main', 'agent:main:main', NULL),
+            ('claw-0005', 'agent:main:subagent:sub2', 1786266150000, 1786266160000, 1786266160000, 1786266150000,
+             'claude-opus-5', 'anthropic', NULL, NULL, 'agent:main:main', 'agent:main:main', NULL);
+        INSERT INTO transcript_events VALUES
+            ('claw-0001', 0, '{"type":"session","version":3,"id":"claw-0001","timestamp":"2026-08-08T09:00:00.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786266000000),
+            ('claw-0001', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:00:05.000Z","message":{"role":"user","content":"OpenClaw 库里的会话:查二维码组件 useEffect() 清理","timestamp":1786266005000}}', 1786266005000),
+            ('claw-0001', 2, '{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-08-08T09:00:08.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_db_1","name":"exec","arguments":{"command":"rg useEffect src/"}}],"api":"anthropic-messages","provider":"anthropic","model":"claude-opus-5","usage":{"input":100,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":7100},"timestamp":1786266008000}}', 1786266008000),
+            ('claw-0001', 3, '{"type":"message","id":"r1","parentId":"a1","timestamp":"2026-08-08T09:00:09.000Z","message":{"role":"toolResult","toolCallId":"call_db_1","toolName":"exec","content":[{"type":"text","text":"src/QrScanner.tsx: useEffect(() => watch())"}],"isError":true,"timestamp":1786266009000}}', 1786266009000),
+            ('claw-0001', 4, '{"type":"message","id":"a2-dead","parentId":"r1","timestamp":"2026-08-08T09:00:11.000Z","message":{"role":"assistant","content":[{"type":"text","text":"死分支,不该出现"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-opus-5","timestamp":1786266011000}}', 1786266011000),
+            ('claw-0001', 5, '{"type":"message","id":"a2","parentId":"r1","timestamp":"2026-08-08T09:00:12.000Z","message":{"role":"assistant","content":[{"type":"text","text":"找到泄漏点,已补清理回调。"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-opus-5","usage":{"input":200,"output":30,"cacheRead":0,"cacheWrite":0,"totalTokens":7300},"timestamp":1786266012000}}', 1786266012000),
+            ('claw-0001', 6, '{"type":"message","id":"u2","parentId":"a2","timestamp":"2026-08-08T09:00:30.000Z","message":{"role":"user","content":"谢谢,合并了","timestamp":1786266030000}}', 1786266030000),
+            ('claw-0002', 0, '{"type":"session","version":3,"id":"claw-0002","timestamp":"2026-08-08T09:01:40.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786266100000),
+            ('claw-0002', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:01:41.000Z","message":{"role":"user","content":"child task","timestamp":1786266101000}}', 1786266101000),
+            ('claw-0003', 0, '{"type":"session","version":3,"id":"claw-0003","timestamp":"2026-08-07T08:00:00.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786176000000),
+            ('claw-0003', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-07T08:00:05.000Z","message":{"role":"user","content":"reset 之前的老窗口","timestamp":1786176005000}}', 1786176005000),
+            ('claw-0003', 2, '{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-08-07T08:00:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"收到。"}],"api":"openai-responses","provider":"openai","model":"gpt-5.5","timestamp":1786176030000}}', 1786176030000),
+            ('claw-0004', 0, '{"type":"session","version":3,"id":"claw-0004","timestamp":"2026-08-08T09:03:20.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786266200000),
+            ('claw-0004', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:03:21.000Z","message":{"role":"user","content":"exact parent","timestamp":1786266201000}}', 1786266201000),
+            ('claw-0005', 0, '{"type":"session","version":3,"id":"claw-0005","timestamp":"2026-08-08T09:02:30.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786266150000),
+            ('claw-0005', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:02:31.000Z","message":{"role":"user","content":"earlier spawn under the same key","timestamp":1786266151000}}', 1786266151000);
+        INSERT INTO session_transcript_active_events VALUES
+            ('claw-0001', 0, 1, 0), ('claw-0001', 1, 2, 1), ('claw-0001', 2, 3, 2),
+            ('claw-0001', 3, 5, 3), ('claw-0001', 4, 6, 4);
+        "#,
+    )
+    .expect("populate openclaw fixture db");
+}
+
+/// Copilot `session-store.db` 最小同构库:sessions + turns。
+/// cop-0002 的 summary 为空,验证标题回退首条用户消息。
+pub fn build_copilot_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create copilot fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, cwd TEXT, branch TEXT, summary TEXT,
+            created_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE turns (
+            id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER,
+            user_message TEXT, assistant_response TEXT, timestamp TEXT
+        );
+        INSERT INTO sessions VALUES
+            ('cop-0001','/Users/tester/Github/wakefx','main','Copilot QR fix','2026-08-05 09:00:00','2026-08-05 09:30:00'),
+            ('cop-0002','/Users/tester/Github/wakefx','','','2026-08-05 10:00:00','2026-08-05 10:05:00');
+        INSERT INTO turns VALUES
+            (1,'cop-0001',0,'Copilot 看看二维码扫描为何闪退,是不是 useEffect() 的问题','是依赖数组问题,我给出了修复补丁。','2026-08-05 09:05:00'),
+            (2,'cop-0001',1,'谢谢,合并了',NULL,'2026-08-05 09:30:00'),
+            (3,'cop-0002',0,'空 summary 会话的兜底标题应取这句','好的。','2026-08-05 10:05:00');
+        "#,
+    )
+    .expect("populate copilot fixture db");
+}
+
+/// OpenCode `opencode.db` 最小同构库,v1 与 v2 两代表并存(v2 迁移后形态):
+/// v1:session + message + part,msg-a 只有 synthetic part(应归 Meta),
+/// msg-c 带 reasoning/tool/unknown part;oc-0001 只存在于 v1 表(模拟迁移后
+/// 又用 v1 CLI 跑的会话),必须被 UNION 回捞。
+/// v2:session_v2 + session_message,ocv2-0001 是 opencode2 beta 会话。
+pub fn build_opencode_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create opencode fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+            time_created INTEGER, time_updated INTEGER, model TEXT,
+            tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+            time_archived INTEGER, version TEXT
+        );
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+        CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, data TEXT);
+        INSERT INTO session VALUES
+            ('oc-0001', NULL, '/Users/tester/Github/wakefx', 'OpenCode 二维码排查',
+             1786000000000, 1786000600000, '{"providerID":"anthropic","id":"claude-sonnet-4-5"}',
+             100, 50, 25, NULL, '1.14.50');
+        INSERT INTO message VALUES
+            ('msg-a','oc-0001','{"id":"msg-a","role":"user","time":{"created":1786000050000}}',1786000050000),
+            ('msg-b','oc-0001','{"id":"msg-b","role":"user","time":{"created":1786000100000}}',1786000100000),
+            ('msg-c','oc-0001','{"id":"msg-c","role":"assistant","time":{"created":1786000200000}}',1786000200000);
+        INSERT INTO part VALUES
+            ('prt-a-01','oc-0001','msg-a','{"type":"text","text":"editor context: QrScanner.tsx is open","synthetic":true}'),
+            ('prt-b-01','oc-0001','msg-b','{"type":"text","text":"OpenCode 查一下二维码组件的 useEffect() 泄漏"}'),
+            ('prt-c-01','oc-0001','msg-c','{"type":"step-start"}'),
+            ('prt-c-02','oc-0001','msg-c','{"type":"reasoning","text":"先查 effect 依赖和清理函数"}'),
+            ('prt-c-03','oc-0001','msg-c','{"type":"tool","callID":"oc_call_1","tool":"grep","state":{"status":"completed","input":{"pattern":"useEffect"},"output":"src/QrScanner.tsx: useEffect(() => watch())"}}'),
+            ('prt-c-04','oc-0001','msg-c','{"type":"text","text":"找到泄漏点,已在清理回调里停止扫描。"}'),
+            ('prt-c-05','oc-0001','msg-c','{"type":"wibble-part"}');
+        CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+            time_created INTEGER, time_updated INTEGER, model TEXT,
+            tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+            time_archived INTEGER, version TEXT
+        );
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+            time_created INTEGER, time_updated INTEGER, data TEXT
+        );
+        INSERT INTO session_v2 VALUES
+            ('ocv2-0001', NULL, '/Users/tester/Github/wakefx', 'OpenCode v2 greeting',
+             1786100000000, 1786100300000, '{"id":"nemotron-3.5-lightning-free","providerID":"opencode"}',
+             10, 5, 2, NULL, '0.0.0-beta-17639');
+        INSERT INTO session_message VALUES
+            ('m2-0','ocv2-0001','user',0,1786100000000,1786100000000,
+             '{"text":"OpenCode v2 看看二维码组件","time":{"created":1786100000000},"files":[],"agents":[]}'),
+            ('m2-1','ocv2-0001','synthetic',1,1786100001000,1786100001000,
+             '{"text":"<system-reminder>Note: the user opened QrScanner.tsx</system-reminder>","time":{"created":1786100001000}}'),
+            ('m2-2','ocv2-0001','assistant',2,1786100002000,1786100002000,
+             '{"agent":"build","model":{"id":"nemotron-3.5-lightning-free","providerID":"opencode","variant":"default"},"time":{"created":1786100002000},"content":[{"type":"reasoning","text":"用户要看扫描组件"},{"type":"text","text":"看完了,组件没有泄漏。"},{"type":"wibble-block"}]}'),
+            ('m2-3','ocv2-0001','wibble-row',3,1786100003000,1786100003000,'{}');
+        "#,
+    )
+    .expect("populate opencode fixture db");
+}
+
+/// `opencode-ai@next`/binary `opencode2` 的真实同构布局(GitHub #2):数据库名
+/// `opencode-next.db`,会话元数据仍在 session,新正文才在 session_message。
+/// message/part 两张 v1 表仍随 migration 存在但本会话没有对应行——只检查
+/// session_v2 或只对 part 求长度都会把它静默过滤。
+pub fn build_opencode_next_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create opencode next fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+            time_created INTEGER, time_updated INTEGER, model TEXT,
+            tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+            time_archived INTEGER, version TEXT
+        );
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+        CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, data TEXT);
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+            time_created INTEGER, time_updated INTEGER, data TEXT
+        );
+        INSERT INTO session VALUES
+            ('ocnext-0001', NULL, '/Users/tester/Github/wakefx', 'OpenCode next real schema',
+             1786200000000, 1786200300000,
+             '{"id":"gpt-5.6","providerID":"openai","variant":"default"}',
+             20, 8, 4, NULL, '0.0.0-next-202606270058');
+        INSERT INTO session_message VALUES
+            ('next-m0','ocnext-0001','user',0,1786200000000,1786200000000,
+             '{"text":"OpenCode next 检查二维码组件","time":{"created":1786200000000},"files":[],"agents":[]}'),
+            ('next-m1','ocnext-0001','synthetic',1,1786200001000,1786200001000,
+             '{"sessionID":"ocnext-0001","text":"editor context: QrScanner.tsx","time":{"created":1786200001000}}'),
+            ('next-m2','ocnext-0001','assistant',2,1786200002000,1786200002000,
+             '{"agent":"build","model":{"id":"gpt-5.6","providerID":"openai","variant":"default"},"time":{"created":1786200002000},"content":[{"type":"reasoning","id":"rsn-1","text":"检查 effect 清理"},{"type":"tool","id":"tool-1","name":"grep","state":{"status":"completed","input":{"pattern":"useEffect"},"structured":{},"content":[{"type":"text","text":"src/QrScanner.tsx:42"}],"result":{"matches":1}},"time":{"created":1786200002100,"completed":1786200002200}},{"type":"text","id":"txt-1","text":"next schema 解析成功。"}]}'),
+            ('next-m3','ocnext-0001','system',3,1786200003000,1786200003000,
+             '{"text":"system notice","time":{"created":1786200003000}}'),
+            ('next-m4','ocnext-0001','shell',4,1786200004000,1786200004000,
+             '{"callID":"shell-1","command":"cargo test","output":"ok","time":{"created":1786200004000,"completed":1786200004100}}'),
+            ('next-m5','ocnext-0001','compaction',5,1786200005000,1786200005000,
+             '{"reason":"auto","summary":"保留二维码排查上下文","recent":"","time":{"created":1786200005000}}'),
+            ('next-m6','ocnext-0001','agent-switched',6,1786200006000,1786200006000,
+             '{"agent":"build","time":{"created":1786200006000}}'),
+            ('next-m7','ocnext-0001','wibble-next',7,1786200007000,1786200007000,'{}');
+        "#,
+    )
+    .expect("populate opencode next fixture db");
+}
+
+/// Antigravity 会话索引表,老库形态(新版多一列 `app_data_dir`,见 `build_antigravity_index`)
+const ANTIGRAVITY_INDEX_TABLE: &str = r#"
+    CREATE TABLE conversation_summaries (
+        conversation_id text, title text NOT NULL DEFAULT "",
+        preview text NOT NULL DEFAULT "", step_count integer NOT NULL DEFAULT 0,
+        last_modified_time datetime NOT NULL, workspace_uris text NOT NULL,
+        parent_conversation_id text NOT NULL DEFAULT "",
+        nesting_depth integer NOT NULL DEFAULT 0,
+        last_user_input_time datetime NOT NULL,
+        PRIMARY KEY (conversation_id)
+    );
+"#;
+
+/// Antigravity `conversation_summaries.db` 最小同构库(老库,没有 `app_data_dir`):标题在
+/// preview 列(title 列常空);ag-0002 是挂在 ag-0001 下的子会话;ag-0003 的 nesting_depth
+/// 大于 0 却没记父会话,挂不上、不列。
+pub fn build_antigravity_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create antigravity fixture db");
+    conn.execute_batch(ANTIGRAVITY_INDEX_TABLE)
+        .expect("create antigravity fixture table");
+    conn.execute_batch(
+        r#"
+        INSERT INTO conversation_summaries
+            (conversation_id, title, preview, step_count, last_modified_time,
+             workspace_uris, parent_conversation_id, nesting_depth, last_user_input_time)
+        VALUES
+            ('ag-0001', '', 'QR overlay polish', 12, '2026-08-06 13:00:00.000000+00:00',
+             '["file:///Users/tester/Github/wakefx"]', '', 0, '2026-08-06 13:00:00.000000+00:00'),
+            ('ag-0002', '', 'Child convo', 3, '2026-08-06 13:05:00.000000+00:00',
+             '["file:///Users/tester/Github/wakefx"]', 'ag-0001', 1, '0001-01-01 00:00:00+00:00'),
+            ('ag-0003', '', 'Nested without a parent', 2, '2026-08-06 13:06:00.000000+00:00',
+             '["file:///Users/tester/Github/wakefx"]', '', 1, '0001-01-01 00:00:00+00:00');
+        "#,
+    )
+    .expect("populate antigravity fixture db");
+}
+
+/// 新版 Antigravity 会话索引里的一行(`build_antigravity_index` 用)
+#[derive(Clone, Copy, Default)]
+pub struct AgIndexRow {
+    pub id: &'static str,
+    pub preview: &'static str,
+    pub workspace: &'static str,
+    /// 父会话 id;非空 = 子会话,同时记 nesting_depth = 1
+    pub parent: &'static str,
+    /// 会话所在的 app 数据目录名(`antigravity` / `antigravity-ide`)
+    pub app: &'static str,
+}
+
+/// 新版的会话索引(多一列 `app_data_dir`)建在 `<gemini>/antigravity-cli/` 下,返回库路径
+pub fn build_antigravity_index(gemini: &Path, rows: &[AgIndexRow]) -> PathBuf {
+    let dir = gemini.join("antigravity-cli");
+    fs::create_dir_all(&dir).expect("mkdir antigravity-cli");
+    let path = dir.join("conversation_summaries.db");
+    let conn = rusqlite::Connection::open(&path).expect("create antigravity index");
+    conn.execute_batch(ANTIGRAVITY_INDEX_TABLE)
+        .expect("create antigravity index table");
+    conn.execute_batch(
+        r#"ALTER TABLE conversation_summaries ADD COLUMN app_data_dir text NOT NULL DEFAULT """#,
+    )
+    .expect("add app_data_dir");
+    for row in rows {
+        conn.execute(
+            "INSERT INTO conversation_summaries (conversation_id, preview, step_count,
+                 last_modified_time, workspace_uris, parent_conversation_id, nesting_depth,
+                 last_user_input_time, app_data_dir)
+             VALUES (?1, ?2, 4, '2026-08-30 02:12:05.000000+00:00', ?3, ?4, ?5,
+                     '2026-08-30 02:12:00.000000+00:00', ?6)",
+            rusqlite::params![
+                row.id,
+                row.preview,
+                format!("[\"file://{}\"]", row.workspace),
+                row.parent,
+                i64::from(!row.parent.is_empty()),
+                row.app
+            ],
+        )
+        .expect("insert antigravity index row");
+    }
+    path
+}
+
+/// 一条 Antigravity brain 转录(合成 fixture,格式见 PR #52)+ 若干用户贴图
+/// (`.user_uploaded/media_<毫秒>.png`),返回转录路径
+pub fn stage_antigravity_transcript(brain: &Path, id: &str, uploads: &[i64]) -> PathBuf {
+    let session = brain.join(id);
+    let logs = session.join(".system_generated").join("logs");
+    fs::create_dir_all(&logs).expect("mkdir antigravity transcript dir");
+    let transcript = logs.join("transcript.jsonl");
+    fs::copy(fixture("antigravity/transcript.jsonl"), &transcript).expect("copy transcript");
+    if !uploads.is_empty() {
+        let dir = session.join(".user_uploaded");
+        fs::create_dir_all(&dir).expect("mkdir .user_uploaded");
+        for ms in uploads {
+            fs::write(
+                dir.join(format!("media_{ms}.png")),
+                b"\x89PNG\r\n\x1a\nfixture",
+            )
+            .expect("write upload");
+        }
+    }
+    transcript
+}
+
+/// Cursor IDE `state.vscdb` 最小同构库:VS Code 的两张 KV 表 + 2026 新增的
+/// composerHeaders 索引表。
+/// - `cide-0001`:正常会话。气泡顺序只在 `fullConversationHeadersOnly` 里,
+///   KV 的 key 序(随机 UUID)与它**故意不一致**——照 key 序读会打乱对话,
+///   这条是防回归的主要断言。含 thinking 气泡、工具气泡(rawArgs 形态)、
+///   **只有 params 没有 rawArgs 的终端气泡**(实测占工具调用的 11%,且
+///   结果是 `{"output":…}` 对象而非字符串)、空壳流式气泡
+///   (Cursor 每个分片都落一条,绝大多数没有 text),一条顺序表里有、
+///   KV 里已被清理的气泡,以及一条 KV 里 value 为 NULL 的气泡行(Cursor 清理
+///   过的会话常见,真实库里一条就曾让整个会话解析失败)。
+/// - `cide-0002`:`name` 为空且无 lastUpdatedAt,验证标题回退首条用户消息、
+///   updated_at 回退末条气泡的 ISO createdAt。
+/// - `cide-0003`:零气泡的草稿 composer,不进列表。
+/// - `cide-0004`:子代理会话,composerHeaders 给出 parentComposerId(composerData 里也带同一份
+///   subagentInfo,与真机一致)。
+/// - `33333333-…-03`:与 CLI 转录 fixture 同 id 的 IDE 副本——转录带正文,
+///   scanner 按 dedup_rank 让 CLI 那份胜出(scanner_finale 有端到端)。
+/// - `44444444-…-04`:转录只剩 turn_ended 空壳(fixtures/cursor 下同名文件),
+///   CLI 源丢弃、IDE 副本胜出。
+/// - `55555555-…-05`:scanner_finale 在测试里给它写一份截断成 `{"role":` 的
+///   坏转录——过得了空壳判定、解不出消息,必须按解析失败回退到这份 IDE 副本。
+pub fn build_cursor_ide_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create cursor ide fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+        CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+        CREATE TABLE composerHeaders (
+            composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+            lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+            recency INTEGER, checkpointAt INTEGER, value TEXT, subagentTypeName TEXT
+        );
+
+        INSERT INTO cursorDiskKV (key, value) VALUES
+          ('composerData:cide-0001',
+           '{"_v":18,"composerId":"cide-0001","name":"Cursor IDE QR fix",
+             "createdAt":1786300000000,"lastUpdatedAt":1786300600000,
+             "workspaceIdentifier":{"id":"ws1","uri":{"fsPath":"/Users/tester/Github/wakefx","path":"/Users/tester/Github/wakefx","scheme":"file"}},
+             "trackedGitRepos":[],
+             "modelConfig":{"modelName":"claude-4.5-opus-high","maxMode":false},
+             "usageData":{"claude-4.5-opus-high":{"costInCents":12,"amount":3}},
+             "fullConversationHeadersOnly":[
+               {"bubbleId":"zz-user-1","type":1,"createdAt":"2026-08-09T10:00:05.000Z"},
+               {"bubbleId":"aa-think-1","type":2,"createdAt":"2026-08-09T10:00:08.000Z"},
+               {"bubbleId":"mm-tool-1","type":2,"createdAt":"2026-08-09T10:00:09.000Z"},
+               {"bubbleId":"nn-term-1","type":2,"createdAt":"2026-08-09T10:00:09.500Z"},
+               {"bubbleId":"bb-empty-1","type":2,"createdAt":"2026-08-09T10:00:10.000Z"},
+               {"bubbleId":"cc-gone-1","type":2,"createdAt":"2026-08-09T10:00:11.000Z"},
+               {"bubbleId":"dd-null-1","type":2,"createdAt":"2026-08-09T10:00:11.500Z"},
+               {"bubbleId":"kk-final-1","type":2,"createdAt":"2026-08-09T10:00:12.000Z"}]}'),
+          ('bubbleId:cide-0001:zz-user-1',
+           '{"_v":3,"type":1,"bubbleId":"zz-user-1","createdAt":"2026-08-09T10:00:05.000Z",
+             "modelInfo":{"modelName":"claude-4.5-sonnet"},"tokenCount":{"inputTokens":0,"outputTokens":0},
+             "text":"Cursor IDE 看看二维码扫描为何闪退,是不是 useEffect() 的问题"}'),
+          ('bubbleId:cide-0001:aa-think-1',
+           '{"_v":3,"type":2,"bubbleId":"aa-think-1","createdAt":"2026-08-09T10:00:08.000Z",
+             "text":"","thinking":{"text":"先查 effect 依赖和清理函数"},
+             "tokenCount":{"inputTokens":1200,"outputTokens":80}}'),
+          ('bubbleId:cide-0001:mm-tool-1',
+           '{"_v":3,"type":2,"bubbleId":"mm-tool-1","createdAt":"2026-08-09T10:00:09.000Z","text":"",
+             "toolFormerData":{"toolCallId":"call_ide_1","name":"grep","status":"completed",
+               "rawArgs":"{\"pattern\":\"useEffect\"}",
+               "result":"src/QrScanner.tsx: useEffect(() => watch())"}}'),
+          ('bubbleId:cide-0001:nn-term-1',
+           '{"_v":3,"type":2,"bubbleId":"nn-term-1","createdAt":"2026-08-09T10:00:09.500Z","text":"",
+             "toolFormerData":{"toolCallId":"call_ide_2","name":"run_terminal_command_v2","status":"completed",
+               "rawArgs":"",
+               "params":{"command":"cargo test -p wakefx","cwd":""},
+               "result":{"output":"test result: ok. 3 passed","rejected":false}}}'),
+          ('bubbleId:cide-0001:bb-empty-1',
+           '{"_v":3,"type":2,"bubbleId":"bb-empty-1","createdAt":"2026-08-09T10:00:10.000Z","text":""}'),
+          ('bubbleId:cide-0001:dd-null-1', NULL),
+          ('bubbleId:cide-0001:kk-final-1',
+           '{"_v":3,"type":2,"bubbleId":"kk-final-1","createdAt":"2026-08-09T10:00:12.000Z",
+             "text":"找到泄漏点,已在清理回调里停止扫描。",
+             "tokenCount":{"inputTokens":1500,"outputTokens":120}}'),
+
+          ('composerData:cide-0002',
+           '{"_v":13,"composerId":"cide-0002","name":"",
+             "createdAt":1786310000000,
+             "modelConfig":{"modelName":"default"},
+             "usageData":{"gpt-5.2":{"costInCents":3,"amount":2},"claude-4-sonnet":{"costInCents":9,"amount":5}},
+             "fullConversationHeadersOnly":[
+               {"bubbleId":"q1","type":1},
+               {"bubbleId":"q2","type":2,"createdAt":"2026-08-09T11:00:20.000Z"}]}'),
+          ('bubbleId:cide-0002:q1',
+           '{"_v":3,"type":1,"bubbleId":"q1","createdAt":"2026-08-09T11:00:10.000Z",
+             "text":"空 name 会话的兜底标题应取这句"}'),
+          ('bubbleId:cide-0002:q2',
+           '{"_v":3,"type":2,"bubbleId":"q2","createdAt":"2026-08-09T11:00:20.000Z","text":"好的。"}'),
+
+          ('composerData:cide-0003',
+           '{"_v":18,"composerId":"cide-0003","name":"Draft never sent",
+             "createdAt":1786320000000,"fullConversationHeadersOnly":[]}'),
+
+          ('composerData:cide-0004',
+           '{"_v":18,"composerId":"cide-0004","name":"Explore subagent",
+             "subagentInfo":{"subagentType":3,"parentComposerId":"cide-0001","subagentTypeName":"explore"},
+             "createdAt":1786330000000,"lastUpdatedAt":1786330100000,
+             "workspaceIdentifier":{"id":"ws1","uri":{"fsPath":"/Users/tester/Github/wakefx","path":"/Users/tester/Github/wakefx","scheme":"file"}},
+             "fullConversationHeadersOnly":[{"bubbleId":"s1","type":1}]}'),
+          ('bubbleId:cide-0004:s1',
+           '{"_v":3,"type":1,"bubbleId":"s1","createdAt":"2026-08-09T12:00:00.000Z","text":"child task"}'),
+
+          ('composerData:33333333-aaaa-bbbb-cccc-000000000003',
+           '{"_v":18,"composerId":"33333333-aaaa-bbbb-cccc-000000000003","name":"CLI twin",
+             "createdAt":1786340000000,"lastUpdatedAt":1786340100000,
+             "modelConfig":{"modelName":"gpt-5.6-sol"},
+             "fullConversationHeadersOnly":[{"bubbleId":"t1","type":1}]}'),
+          ('bubbleId:33333333-aaaa-bbbb-cccc-000000000003:t1',
+           '{"_v":3,"type":1,"bubbleId":"t1","createdAt":"2026-08-09T13:00:00.000Z","text":"IDE 库里的同一会话",
+             "tokenCount":{"inputTokens":40,"outputTokens":2}}'),
+
+          ('composerData:44444444-aaaa-bbbb-cccc-000000000004',
+           '{"_v":18,"composerId":"44444444-aaaa-bbbb-cccc-000000000004","name":"Stub twin",
+             "createdAt":1786350000000,"lastUpdatedAt":1786350100000,
+             "fullConversationHeadersOnly":[{"bubbleId":"u1","type":1}]}'),
+          ('bubbleId:44444444-aaaa-bbbb-cccc-000000000004:u1',
+           '{"_v":3,"type":1,"bubbleId":"u1","createdAt":"2026-08-09T14:00:00.000Z","text":"只有空壳转录的会话"}'),
+
+          ('composerData:55555555-aaaa-bbbb-cccc-000000000005',
+           '{"_v":18,"composerId":"55555555-aaaa-bbbb-cccc-000000000005","name":"Corrupt twin",
+             "createdAt":1786360000000,"lastUpdatedAt":1786360100000,
+             "fullConversationHeadersOnly":[{"bubbleId":"v1","type":1}]}'),
+          ('bubbleId:55555555-aaaa-bbbb-cccc-000000000005:v1',
+           '{"_v":3,"type":1,"bubbleId":"v1","createdAt":"2026-08-09T15:00:00.000Z","text":"转录已损坏的会话"}');
+
+        INSERT INTO composerHeaders
+            (composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value, subagentTypeName)
+        VALUES
+          ('cide-0001','ws1',1786300000000,1786300600000,0,0,1786300600000,NULL,
+           '{"type":"head","composerId":"cide-0001","name":"Cursor IDE QR fix"}',NULL),
+          ('cide-0004','ws1',1786330000000,1786330100000,0,1,1786330100000,NULL,
+           '{"type":"head","composerId":"cide-0004","name":"Explore subagent","subagentInfo":{"subagentType":3,"parentComposerId":"cide-0001","subagentTypeName":"explore"}}','explore');
+        "#,
+    )
+    .expect("populate cursor ide fixture db");
+}
+
+/// 让本进程(及其子进程)的全部 adapter 只看这个假 HOME:AR_SESSION_HOME 是 adapter
+/// 侧的统一改道开关,三端一致;HOME 仍设一份供其他 POSIX 依赖(Windows 上 dirs
+/// 不看 HOME,单设它等于没设)。再清掉各家的 env 根覆盖——开发机或 CI 上设了
+/// CODEX_HOME / XDG_DATA_HOME 之类,adapter 就会绕过 fixture 去读真实库(实测
+/// opencode 的两个契约测试会因此挂掉)。新增带 env 根的 agent 只改这里
+pub fn isolate_home(home: &Path) {
+    std::env::set_var("AR_SESSION_HOME", home);
+    std::env::set_var("HOME", home);
+    clear_agent_env_overrides();
+}
+
+/// 只清 env 根覆盖、不动 HOME(live 远程用例要保留 ~/.ssh)
+pub fn clear_agent_env_overrides() {
+    for var in [
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "CODEX_HOME",
+        "QODER_CONFIG_DIR",
+        "HERMES_HOME",
+        "OPENCLAW_STATE_DIR",
+        "CODEBUDDY_CONFIG_DIR",
+        "WORKBUDDY_CONFIG_DIR",
+        "ZCODE_STORAGE_DIR",
+        "KIMI_CODE_HOME",
+        // 库路径的覆盖:指向现存文件时会被加进数据根,读到合成 HOME 之外的真实库
+        "OPENCODE_DB",
+        "KILO_DB",
+    ] {
+        std::env::remove_var(var);
+    }
+}
+
+/// ZCode `~/.zcode` 最小同构:cli/db/db.sqlite(OpenCode 形状,session 表按真机
+/// 3.14.0 / 运行时 0.16.9 的列)+ v2/tasks-index.sqlite(只有过滤要看的列)。
+/// zc-0003 桌面端软删、zc-0004 是向导从 Claude Code 导入的,都不该列;zc-0010 是
+/// 挂在被删的 zc-0003 下的子代理,跟着藏;zc-0013 的类型没见过,不列。zc-0005 子代理、
+/// zc-0009 辅助对话挂在 zc-0001 下,zc-0012 工作流子会话挂在 zc-0011(workflow_parent,
+/// 顶层)下;zc-0008 是 fork(带 parent_id 但在任务列表里,不挂),开头是从 zc-0001
+/// 复制来的两条 + fork_notice + 时间线分隔条;zc-0009 复制来的都标了隐藏(其中一条是父
+/// 任务的压缩摘要),标题是固定的 "Selection side chat";zc-0002 的标题是占位(title_source=default)且首条是注入
+/// 上下文;zc-0001 末尾有一条 compaction 摘要(user 角色、hidden);zc-0006 是没有
+/// semantics 的老写端;zc-0007 已归档
+pub fn build_zcode_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create zcode fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workspace_id TEXT, parent_id TEXT,
+            slug TEXT NOT NULL, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL,
+            version TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            time_archived INTEGER, task_type TEXT NOT NULL DEFAULT 'interactive',
+            title_source TEXT NOT NULL DEFAULT 'first_input'
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL, sequence INTEGER
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+            sequence INTEGER
+        );
+        INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, path, title,
+                             version, time_created, time_updated, time_archived, task_type, title_source) VALUES
+            ('zc-0001','proj-wakefx',NULL,NULL,'zc-0001','/Users/tester/Github/wakefx','/Users/tester/Github/wakefx','ZCode QR fix','0.16.9',1789000000000,1789000060000,NULL,'interactive','generated'),
+            ('zc-0002','proj-wakefx',NULL,NULL,'zc-0002','/Users/tester/Github/wakefx','/Users/tester/Github/wakefx','New task','0.16.9',1789000100000,1789000110000,NULL,'interactive','default'),
+            ('zc-0003','proj-wakefx',NULL,NULL,'zc-0003','/Users/tester/Github/wakefx',NULL,'deleted in desktop','0.16.9',1789000200000,1789000210000,NULL,'interactive','first_input'),
+            ('zc-0004','proj-wakefx',NULL,NULL,'zc-0004','/Users/tester/Github/wakefx',NULL,'imported from claude','0.16.9',1789000300000,1789000310000,NULL,'interactive','first_input'),
+            ('zc-0005','proj-wakefx',NULL,'zc-0001','zc-0005','/Users/tester/Github/wakefx',NULL,'child task','0.16.9',1789000400000,1789000410000,NULL,'subagent_child','first_input'),
+            ('zc-0008','proj-wakefx',NULL,'zc-0001','zc-0008','/Users/tester/Github/wakefx',NULL,'Fork of ZCode QR fix','0.16.9',1789000800000,1789000810000,NULL,'fork','generated'),
+            ('zc-0009','proj-wakefx',NULL,'zc-0001','zc-0009','/Users/tester/Github/wakefx',NULL,'Selection side chat','0.16.9',1789000900000,1789000910000,NULL,'selection_side_chat','generated'),
+            ('zc-0010','proj-wakefx',NULL,'zc-0003','zc-0010','/Users/tester/Github/wakefx',NULL,'child of a deleted task','0.16.9',1789001000000,1789001010000,NULL,'subagent_child','first_input'),
+            ('zc-0011','proj-wakefx',NULL,NULL,'zc-0011','/Users/tester/Github/wakefx',NULL,'Run the release workflow','0.16.9',1789001100000,1789001110000,NULL,'workflow_parent','first_input'),
+            ('zc-0012','proj-wakefx',NULL,'zc-0011','zc-0012','/Users/tester/Github/wakefx',NULL,'Check the changelog','0.16.9',1789001200000,1789001210000,NULL,'workflow_child','first_input'),
+            ('zc-0013','proj-wakefx',NULL,NULL,'zc-0013','/Users/tester/Github/wakefx',NULL,'a type from a future version','0.16.9',1789001300000,1789001310000,NULL,'future_kind','first_input'),
+            ('zc-0006','proj-wakefx',NULL,NULL,'zc-0006','/Users/tester/Github/wakefx',NULL,'老写端没有 semantics','0.15.2',1789000500000,1789000510000,NULL,'interactive','first_input'),
+            ('zc-0007','proj-wakefx',NULL,NULL,'zc-0007','/Users/tester/Github/wakefx',NULL,'archived one','0.16.9',1789000600000,1789000610000,1789000700000,'interactive','first_input');
+        INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES
+            ('m-0001-0','zc-0001',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000},"agent":"zcode-agent","modelSelection":{"providerId":"account:zai","modelId":"GLM-5.3"},"semantics":{"origin":"real_user","kind":"user_prompt","transcriptVisibility":"visible"}}',0),
+            ('m-0001-1','zc-0001',1789000005000,1789000012000,'{"role":"assistant","time":{"created":1789000005000,"completed":1789000012000},"parentID":"m-0001-0","modelId":"GLM-5.3","providerId":"account:zai","tokens":{"total":120,"input":100,"output":20,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"stop","semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',1),
+            ('m-0001-2','zc-0001',1789000050000,1789000050000,'{"role":"user","time":{"created":1789000050000},"modelSelection":{"providerId":"account:zai","modelId":"GLM-5.3-Flash"},"semantics":{"origin":"real_user","kind":"user_prompt"}}',2),
+            ('m-0001-3','zc-0001',1789000055000,1789000060000,'{"role":"assistant","time":{"created":1789000055000,"completed":1789000060000},"modelId":"GLM-5.3-Flash","tokens":{"total":30,"input":25,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"stop","semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',3),
+            ('m-0001-4','zc-0001',1789000058000,1789000058000,'{"role":"user","time":{"created":1789000058000},"semantics":{"origin":"agent_runtime","kind":"compact_summary","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',4),
+            ('m-0008-a','zc-0008',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000},"semantics":{"origin":"real_user","kind":"user_prompt","transcriptVisibility":"visible"}}',0),
+            ('m-0008-b','zc-0008',1789000005000,1789000012000,'{"role":"assistant","time":{"created":1789000005000},"modelId":"GLM-5.3","tokens":{"total":120},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',1),
+            ('m-0008-c','zc-0008',1789000799000,1789000799000,'{"role":"user","time":{"created":1789000799000},"synthetic":true,"source":"fork","semantics":{"origin":"system","kind":"fork_notice","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',2),
+            ('m-0008-d','zc-0008',1789000799000,1789000799000,'{"role":"assistant","time":{"created":1789000799000,"completed":1789000799000},"modelId":"GLM-5.3","tokens":{"total":0},"semantics":{"origin":"system","kind":"timeline_event","transcriptVisibility":"visible"}}',3),
+            ('m-0008-0','zc-0008',1789000800000,1789000800000,'{"role":"user","time":{"created":1789000800000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',4),
+            ('m-0008-1','zc-0008',1789000805000,1789000810000,'{"role":"assistant","time":{"created":1789000805000},"modelId":"GLM-5.3-Flash","tokens":{"total":7},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',5),
+            ('m-0009-a','zc-0009',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000},"semantics":{"origin":"real_user","kind":"user_prompt","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',0),
+            ('m-0009-b','zc-0009',1789000005000,1789000012000,'{"role":"assistant","time":{"created":1789000005000},"modelId":"GLM-5.3","tokens":{"total":120},"semantics":{"origin":"agent_runtime","kind":"assistant_response","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',1),
+            ('m-0009-s','zc-0009',1789000058000,1789000058000,'{"role":"user","time":{"created":1789000058000},"semantics":{"origin":"agent_runtime","kind":"compact_summary","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',2),
+            ('m-0009-c','zc-0009',1789000899000,1789000899000,'{"role":"user","time":{"created":1789000899000},"synthetic":true,"source":"selection_side_chat","semantics":{"origin":"system","kind":"system_reminder","source":"selection_side_chat","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',3),
+            ('m-0009-0','zc-0009',1789000900000,1789000900000,'{"role":"user","time":{"created":1789000900000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',4),
+            ('m-0009-1','zc-0009',1789000905000,1789000910000,'{"role":"assistant","time":{"created":1789000905000},"modelId":"GLM-5.3-Flash","tokens":{"total":9},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',5),
+            ('m-0010-0','zc-0010',1789001000000,1789001000000,'{"role":"user","time":{"created":1789001000000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0011-0','zc-0011',1789001100000,1789001100000,'{"role":"user","time":{"created":1789001100000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0012-0','zc-0012',1789001200000,1789001200000,'{"role":"user","time":{"created":1789001200000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0013-0','zc-0013',1789001300000,1789001300000,'{"role":"user","time":{"created":1789001300000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0002-0','zc-0002',1789000100000,1789000100000,'{"role":"user","time":{"created":1789000100000},"semantics":{"origin":"system_injected","kind":"context","transcriptVisibility":"hidden"}}',0),
+            ('m-0002-1','zc-0002',1789000101000,1789000101000,'{"role":"user","time":{"created":1789000101000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',1),
+            ('m-0002-2','zc-0002',1789000105000,1789000110000,'{"role":"assistant","time":{"created":1789000105000},"modelId":"GLM-5.3","tokens":{"total":10},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',2),
+            ('m-0003-0','zc-0003',1789000200000,1789000200000,'{"role":"user","time":{"created":1789000200000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0004-0','zc-0004',1789000300000,1789000300000,'{"role":"user","time":{"created":1789000300000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0005-0','zc-0005',1789000400000,1789000400000,'{"role":"user","time":{"created":1789000400000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0006-0','zc-0006',1789000500000,1789000500000,'{"role":"user","time":{"created":1789000500000}}',0),
+            ('m-0006-1','zc-0006',1789000505000,1789000510000,'{"role":"assistant","time":{"created":1789000505000},"modelId":"GLM-5.3","tokens":{"total":5}}',1),
+            ('m-0007-0','zc-0007',1789000600000,1789000600000,'{"role":"user","time":{"created":1789000600000},"semantics":{"origin":"real_user"}}',0);
+        INSERT INTO part (id, message_id, session_id, time_created, time_updated, data, sequence) VALUES
+            ('p-0001-0-0','m-0001-0','zc-0001',1789000000000,1789000000000,'{"type":"text","text":"ZCode 看看二维码扫描为何闪退,是不是 useEffect() 的问题","time":{"start":1789000000000,"end":1789000000000}}',0),
+            ('p-0001-1-0','m-0001-1','zc-0001',1789000005000,1789000005000,'{"type":"step-start"}',0),
+            ('p-0001-1-1','m-0001-1','zc-0001',1789000005500,1789000006000,'{"type":"reasoning","text":"先读一下组件源码","metadata":{"anthropic":{"signature":"abc"}},"time":{"start":1789000005500,"end":1789000006000}}',1),
+            ('p-0001-1-2','m-0001-1','zc-0001',1789000006000,1789000007000,'{"type":"tool","callID":"call_0001","declarationIndex":0,"tool":"Bash","state":{"status":"completed","input":{"command":"rg useEffect src/QrScanner.tsx","description":"Find the hook"},"output":"src/QrScanner.tsx:12: useEffect(() => {","title":"Bash","time":{"start":1789000006000,"end":1789000007000}}}',2),
+            ('p-0001-1-3','m-0001-1','zc-0001',1789000008000,1789000012000,'{"type":"text","text":"是依赖数组问题,我给出了修复补丁。","time":{"start":1789000008000,"end":1789000012000}}',3),
+            ('p-0001-1-4','m-0001-1','zc-0001',1789000012000,1789000012000,'{"type":"step-finish","reason":"stop","cost":0,"tokens":{"total":120,"input":100,"output":20,"reasoning":0,"cache":{"read":0,"write":0}}}',4),
+            ('p-0001-2-0','m-0001-2','zc-0001',1789000050000,1789000050000,'{"type":"text","text":"谢谢,合并了"}',0),
+            ('p-0001-3-0','m-0001-3','zc-0001',1789000055000,1789000060000,'{"type":"text","text":"不客气。"}',0),
+            ('p-0001-4-0','m-0001-4','zc-0001',1789000058000,1789000058000,'{"type":"text","text":"Summary of the conversation so far: fixed the qr login bug."}',0),
+            ('p-0008-a-0','m-0008-a','zc-0008',1789000000000,1789000000000,'{"type":"text","text":"ZCode 看看二维码扫描为何闪退,是不是 useEffect() 的问题"}',0),
+            ('p-0008-b-0','m-0008-b','zc-0008',1789000008000,1789000012000,'{"type":"text","text":"是依赖数组问题,我给出了修复补丁。"}',0),
+            ('p-0008-c-0','m-0008-c','zc-0008',1789000799000,1789000799000,'{"type":"text","text":"This conversation was forked from session zc-0001.","synthetic":true}',0),
+            ('p-0008-d-0','m-0008-d','zc-0008',1789000799000,1789000799000,'{"type":"timeline","timelineType":"session_fork","display":"separator","status":"completed","parentSessionId":"zc-0001"}',0),
+            ('p-0008-0-0','m-0008-0','zc-0008',1789000800000,1789000800000,'{"type":"text","text":"forked follow-up"}',0),
+            ('p-0008-1-0','m-0008-1','zc-0008',1789000805000,1789000810000,'{"type":"text","text":"分叉之后的回答"}',0),
+            ('p-0009-a-0','m-0009-a','zc-0009',1789000000000,1789000000000,'{"type":"text","text":"ZCode 看看二维码扫描为何闪退,是不是 useEffect() 的问题"}',0),
+            ('p-0009-b-0','m-0009-b','zc-0009',1789000008000,1789000012000,'{"type":"text","text":"是依赖数组问题,我给出了修复补丁。"}',0),
+            ('p-0009-s-0','m-0009-s','zc-0009',1789000058000,1789000058000,'{"type":"text","text":"Summary of the parent task: fixed the qr login bug."}',0),
+            ('p-0009-c-0','m-0009-c','zc-0009',1789000899000,1789000899000,'{"type":"text","text":"The preceding conversation was inherited from the parent task for reference only.","synthetic":true}',0),
+            ('p-0009-0-0','m-0009-0','zc-0009',1789000900000,1789000900000,'{"type":"text","text":"这个 hook 为什么要清理"}',0),
+            ('p-0009-1-0','m-0009-1','zc-0009',1789000905000,1789000910000,'{"type":"text","text":"扫描器要在卸载时释放摄像头。"}',0),
+            ('p-0010-0-0','m-0010-0','zc-0010',1789001000000,1789001000000,'{"type":"text","text":"child of a deleted task"}',0),
+            ('p-0011-0-0','m-0011-0','zc-0011',1789001100000,1789001100000,'{"type":"text","text":"Run the release workflow"}',0),
+            ('p-0012-0-0','m-0012-0','zc-0012',1789001200000,1789001200000,'{"type":"text","text":"Check the changelog"}',0),
+            ('p-0013-0-0','m-0013-0','zc-0013',1789001300000,1789001300000,'{"type":"text","text":"from the future"}',0),
+            ('p-0002-0-0','m-0002-0','zc-0002',1789000100000,1789000100000,'{"type":"text","text":"<workspace><root>/Users/tester/Github/wakefx</root></workspace>"}',0),
+            ('p-0002-1-0','m-0002-1','zc-0002',1789000101000,1789000101000,'{"type":"text","text":"空标题会话取这句"}',0),
+            ('p-0002-2-0','m-0002-2','zc-0002',1789000105000,1789000110000,'{"type":"text","text":"好的。"}',0),
+            ('p-0003-0-0','m-0003-0','zc-0003',1789000200000,1789000200000,'{"type":"text","text":"deleted"}',0),
+            ('p-0004-0-0','m-0004-0','zc-0004',1789000300000,1789000300000,'{"type":"text","text":"imported"}',0),
+            ('p-0005-0-0','m-0005-0','zc-0005',1789000400000,1789000400000,'{"type":"text","text":"child"}',0),
+            ('p-0006-0-0','m-0006-0','zc-0006',1789000500000,1789000500000,'{"type":"text","text":"老写端没有 semantics"}',0),
+            ('p-0006-1-0','m-0006-1','zc-0006',1789000505000,1789000510000,'{"type":"text","text":"在。"}',0),
+            ('p-0007-0-0','m-0007-0','zc-0007',1789000600000,1789000600000,'{"type":"text","text":"archived"}',0);
+        "#,
+    )
+    .expect("populate zcode fixture db");
+}
+
+/// tasks-index:只有过滤要看的列
+pub fn build_zcode_tasks_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create zcode tasks fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, migration_source TEXT,
+            deleted INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO tasks (task_id, migration_source, deleted) VALUES
+            ('zc-0001',NULL,0),
+            ('zc-0003',NULL,1),
+            ('zc-0004','claudeCode',0);
+        "#,
+    )
+    .expect("populate zcode tasks fixture db");
+}
+
+/// Devin `<root>/cli/sessions.db` 最小同构库(列集按真机写端):
+/// sessions + message_nodes(node_id/parent_node_id 森林,chat_message JSON,
+/// unix 秒时间戳)。dv-0001 是正常会话:main_chain_id 指向 n4,n5 是挂在
+/// n1 上的重试侧枝——既不该进转录,它的 metrics 也不该进 token 累计;
+/// dv-0002 标题为空(回退首条真人消息),带 system 注入、cache_keepalive
+/// 心跳、compaction 请求与 <summary> 应答;dv-0003 是 hidden 会话不列;
+/// dv-0004 零正文不列
+pub fn build_devin_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create devin fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, working_directory TEXT NOT NULL, backend_type TEXT NOT NULL,
+            model TEXT NOT NULL, agent_mode TEXT NOT NULL, created_at INTEGER NOT NULL,
+            last_activity_at INTEGER NOT NULL, title TEXT, main_chain_id INTEGER,
+            hidden INTEGER NOT NULL DEFAULT 0, metadata TEXT
+        );
+        CREATE TABLE message_nodes (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+            node_id INTEGER NOT NULL, parent_node_id INTEGER,
+            chat_message TEXT NOT NULL, created_at INTEGER NOT NULL, metadata TEXT,
+            UNIQUE(session_id, node_id)
+        );
+        INSERT INTO sessions (id, working_directory, backend_type, model, agent_mode,
+                              created_at, last_activity_at, title, main_chain_id, hidden) VALUES
+            ('dv-0001','/Users/tester/Github/wakefx','windsurf','swe-2-max','auto',1789000000,1789000060,'Devin QR fix',4,0),
+            ('dv-0002','/Users/tester/Github/wakefx','windsurf','swe-2-max','auto',1789000100,1789000110,'',6,0),
+            ('dv-0003','/Users/tester/Github/wakefx','windsurf','swe-2-max','auto',1789000200,1789000210,'hidden helper',1,1),
+            ('dv-0004','/Users/tester/Github/wakefx','windsurf','swe-2-max','auto',1789000300,1789000300,'empty',NULL,0);
+        INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at) VALUES
+            ('dv-0001',1,NULL,'{"message_id":"u1","role":"user","content":"Devin 看看二维码扫描为何闪退,是不是 useEffect() 的问题","metadata":{"is_user_input":true,"telemetry":{"source":"user"}}}',1789000005),
+            ('dv-0001',2,1,'{"message_id":"a1","role":"assistant","content":"","thinking":{"thinking":"先读一下组件源码","signature":"sealed.v1.xyz","signature_type":"sealed"},"tool_calls":[{"id":"exec_0","name":"exec","arguments":{"command":"rg useEffect src/QrScanner.tsx"},"index":0,"kind":"function"}],"metadata":{"generation_model":"swe-2-high","metrics":{"input_tokens":200,"output_tokens":20,"cache_read_tokens":800,"cache_creation_tokens":null}}}',1789000008),
+            ('dv-0001',3,2,'{"message_id":"t1","role":"tool","content":"src/QrScanner.tsx:12: useEffect(() => watch())","tool_call_id":"exec_0","metadata":{}}',1789000009),
+            ('dv-0001',4,3,'{"message_id":"a2","role":"assistant","content":"是依赖数组问题,我给出了修复补丁。","metadata":{"generation_model":"swe-2-max","metrics":{"input_tokens":300,"output_tokens":40}}}',1789000012),
+            ('dv-0001',5,1,'{"message_id":"a3-retry","role":"assistant","content":"重试侧枝的另一种回答,不该进主链","metadata":{"generation_model":"swe-2-max","metrics":{"input_tokens":500,"output_tokens":50}}}',1789000020),
+            ('dv-0002',1,NULL,'{"message_id":"s1","role":"system","content":"<system_info>\nworkspace context\n</system_info>","metadata":{"telemetry":{"source":"system"}}}',1789000101),
+            ('dv-0002',2,1,'{"message_id":"u0","role":"user","content":"continue","metadata":{"telemetry":{"source":"cache_keepalive"}}}',1789000102),
+            ('dv-0002',3,2,'{"message_id":"u1","role":"user","content":"Conversation to summarize:\n=== MESSAGE 0 - User ===\n二维码","metadata":{"is_user_input":null,"telemetry":{"source":"user"}}}',1789000103),
+            ('dv-0002',4,3,'{"message_id":"a1","role":"assistant","content":"<summary>\n## Overview\n之前聊过二维码扫描的修复。\n</summary>","metadata":{"telemetry":{"source":"assistant"}}}',1789000104),
+            ('dv-0002',5,4,'{"message_id":"u2","role":"user","content":"空标题会话取这句","metadata":{"is_user_input":true,"telemetry":{"source":"user"}}}',1789000105),
+            ('dv-0002',6,5,'{"message_id":"a2","role":"assistant","content":"好的。","metadata":{"generation_model":"swe-2-max","metrics":{"input_tokens":50,"output_tokens":10}}}',1789000110),
+            ('dv-0003',1,NULL,'{"message_id":"u1","role":"user","content":"Output a summary from the following messages","metadata":{"is_user_input":true,"telemetry":{"source":"user"}}}',1789000205);
+        "#,
+    )
+    .expect("populate devin fixture db");
+}
+
+/// 以某种身份持住索引锁,拿不到就 panic 点名——各测试文件里"扮演 GUI / 另一个
+/// wake-cli"的同一句
+pub fn lock_as(db: &Path, kind: &str) -> IndexLock {
+    // 并行的别条测试正在 fork 子进程的那几微秒里,本进程所有 fd(含刚放掉的锁)会被复制一份
+    // 直到 exec 关掉——锁因此晚放一瞬。真实使用没有这形态(GUI 持锁到退出),测试里等一下
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match IndexLock::try_acquire(db, kind).unwrap() {
+            Ownership::Ours(lock) => return lock,
+            Ownership::Held(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ownership::Held(who) => panic!("a fresh lock should not be held by {who}"),
+        }
+    }
+}
+
+/// Claude Code 的子代理:在会话目录 `<项目目录>/<parent>/subagents/` 下放一份 Task / Agent 派的
+/// 转录(边车写着任务说明与派它的 tool_use id)和一份 Workflow 跑出来的(边车只有 agentType),
+/// 外加 Workflow 的运行日志 journal.jsonl(不是转录)。`prefix` 让同一测试里的几组 id 不撞。
+/// 返回 (Task 那份的 id, Workflow 那份的 id)
+pub fn stage_claude_subagents(
+    project: &Path,
+    parent: &str,
+    prefix: &str,
+    tool_use_id: &str,
+) -> (String, String) {
+    let subagents = project.join(parent).join("subagents");
+    let run = subagents.join("workflows").join(format!("wf_{prefix}-run"));
+    fs::create_dir_all(&run).unwrap();
+    let rows = |lines: &[(&str, &str, &str)]| -> String {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(ix, (typ, ts, text))| {
+                let message = if *typ == "user" {
+                    serde_json::json!({ "role": "user", "content": text })
+                } else {
+                    serde_json::json!({
+                        "id": format!("msg_{prefix}_{ix}"),
+                        "role": "assistant",
+                        "model": "claude-opus-5-5",
+                        "content": [{ "type": "text", "text": text }],
+                        "usage": { "input_tokens": 10, "output_tokens": 5 },
+                    })
+                };
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "parentUuid": null,
+                        "isSidechain": true,
+                        "cwd": "/Users/tester/Github/subfx",
+                        "sessionId": parent,
+                        "type": typ,
+                        "message": message,
+                        "uuid": format!("{prefix}-{ix}"),
+                        "timestamp": ts,
+                    })
+                )
+            })
+            .collect()
+    };
+    let task = format!("agent-{prefix}task");
+    let step = format!("agent-{prefix}step");
+    fs::write(
+        subagents.join(format!("{task}.jsonl")),
+        rows(&[
+            (
+                "user",
+                "2026-10-01T10:00:10.000Z",
+                "Look at src/parser.rs and report problems",
+            ),
+            (
+                "assistant",
+                "2026-10-01T10:00:20.000Z",
+                "The parser handles every case.",
+            ),
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        subagents.join(format!("{task}.meta.json")),
+        serde_json::json!({
+            "agentType": "Explore",
+            "description": "Check the parser",
+            "toolUseId": tool_use_id,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        run.join(format!("{step}.jsonl")),
+        rows(&[
+            (
+                "user",
+                "2026-10-01T10:01:00.000Z",
+                "Workflow step: run the tests",
+            ),
+            ("assistant", "2026-10-01T10:01:30.000Z", "All tests pass."),
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        run.join(format!("{step}.meta.json")),
+        r#"{"agentType":"workflow-subagent","spawnDepth":1}"#,
+    )
+    .unwrap();
+    fs::write(run.join("journal.jsonl"), "{\"type\":\"workflow-start\"}\n").unwrap();
+    (task, step)
+}
+
+/// Claude Code 的分支会话:原件 A 问了两轮;B 是从 A 第一轮之后分出来的——Claude 把 A 到
+/// 分叉点为止的行**原样**复制进 B 的开头(uuid、message.id、时间戳都不变,只改 sessionId),
+/// 头几行(custom-title 照抄 A 的标题、queue-operation)是复制那一刻写的,时间晚于 A 的开头。
+/// 之后 B 问了自己的一轮。返回 (项目目录, A 的 id, B 的 id)。adapter_contracts 与
+/// scanner_finale 共用
+pub fn stage_claude_branch(projects: &Path) -> (PathBuf, String, String) {
+    let dir = projects.join("-Users-tester-Github-branchfx");
+    fs::create_dir_all(&dir).unwrap();
+    let a = "c1a0de00-0000-4000-8000-0000000000a1".to_string();
+    let b = "c1a0de00-0000-4000-8000-0000000000b2".to_string();
+    let row = |session: &str,
+               typ: &str,
+               uuid: &str,
+               parent: Option<&str>,
+               ts: &str,
+               message: serde_json::Value| {
+        serde_json::json!({
+            "parentUuid": parent,
+            "isSidechain": false,
+            "cwd": "/Users/tester/Github/branchfx",
+            "sessionId": session,
+            "type": typ,
+            "message": message,
+            "uuid": uuid,
+            "timestamp": ts,
+        })
+    };
+    let user = |text: &str| serde_json::json!({ "role": "user", "content": text });
+    let reply = |id: &str, text: &str, input: i64, output: i64| {
+        serde_json::json!({
+            "id": id,
+            "role": "assistant",
+            "model": "claude-opus-5-5",
+            "content": [{ "type": "text", "text": text }],
+            "usage": { "input_tokens": input, "output_tokens": output },
+        })
+    };
+    let header = |session: &str, ts: &str| {
+        vec![
+            serde_json::json!({ "type": "custom-title", "customTitle": "修复登录超时", "sessionId": session }),
+            serde_json::json!({ "type": "queue-operation", "operation": "enqueue", "timestamp": ts, "sessionId": session }),
+        ]
+    };
+    // 两份共有的第一轮:B 里的是原样复制(只有 sessionId 不同)
+    let shared = |session: &str| {
+        vec![
+            row(
+                session,
+                "user",
+                "c1a0de00-1111-4000-8000-000000000001",
+                None,
+                "2026-09-01T08:00:01.000Z",
+                user("登录接口偶发超时,先看看日志"),
+            ),
+            row(
+                session,
+                "assistant",
+                "c1a0de00-1111-4000-8000-000000000002",
+                Some("c1a0de00-1111-4000-8000-000000000001"),
+                "2026-09-01T08:00:05.000Z",
+                reply(
+                    "msg_shared_01",
+                    "日志里连接池耗尽了,把上限从 10 调到 50。",
+                    100,
+                    20,
+                ),
+            ),
+        ]
+    };
+    let mut lines_a = header(&a, "2026-09-01T08:00:00.000Z");
+    lines_a.extend(shared(&a));
+    lines_a.push(row(
+        &a,
+        "user",
+        "c1a0de00-1111-4000-8000-000000000003",
+        Some("c1a0de00-1111-4000-8000-000000000002"),
+        "2026-09-01T08:10:00.000Z",
+        user("调了,还是超时"),
+    ));
+    lines_a.push(row(
+        &a,
+        "assistant",
+        "c1a0de00-1111-4000-8000-000000000004",
+        Some("c1a0de00-1111-4000-8000-000000000003"),
+        "2026-09-01T08:10:05.000Z",
+        reply("msg_a_02", "那再加个指数退避的重试。", 200, 30),
+    ));
+
+    let mut lines_b = header(&b, "2026-09-02T09:00:00.000Z");
+    lines_b.extend(shared(&b));
+    lines_b.push(row(
+        &b,
+        "user",
+        "c1a0de00-2222-4000-8000-000000000003",
+        Some("c1a0de00-1111-4000-8000-000000000002"),
+        "2026-09-02T09:00:10.000Z",
+        user("换个思路:登录改成异步队列"),
+    ));
+    lines_b.push(row(
+        &b,
+        "assistant",
+        "c1a0de00-2222-4000-8000-000000000004",
+        Some("c1a0de00-2222-4000-8000-000000000003"),
+        "2026-09-02T09:00:15.000Z",
+        reply("msg_b_02", "好,登录请求进后台队列,前端轮询结果。", 300, 40),
+    ));
+
+    let write = |id: &str, lines: &[serde_json::Value]| {
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(dir.join(format!("{id}.jsonl")), text).unwrap();
+    };
+    write(&a, &lines_a);
+    write(&b, &lines_b);
+    (dir, a, b)
+}

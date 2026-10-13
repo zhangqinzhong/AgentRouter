@@ -1,3 +1,4 @@
+import {buildSessionRuntime} from "./session-runtime.mjs";
 import {gatewayResponsesErrorsPlugin} from "./patches/gateway-responses-errors.mjs";
 import esbuild from "esbuild";
 import { spawn } from "node:child_process";
@@ -531,6 +532,7 @@ export function watchPlugin(name, onEnd) {
 }
 
 export async function buildMain(options = {}) {
+  buildSessionRuntime([electronMainOutDir,coreMainOutDir,cliMainOutDir]);
   const [mainBuildResult] = await Promise.all([
     esbuild.build(createMainBuildOptions(options)),
     buildBotGatewaySdkRuntime(options),

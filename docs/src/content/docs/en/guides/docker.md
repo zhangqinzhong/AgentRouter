@@ -32,7 +32,7 @@ Nginx exposes:
 
 | Path | Purpose |
 | --- | --- |
-| `/`, `/pages/home/index.html` | Management UI. The root path redirects to a page URL containing the management token. |
+| `/`, `/pages/home/index.html` | Management UI. The root path redirects to the page and keeps a `ar_web_token` query parameter if the request has one. Nginx never adds the token. |
 | `/api/ar/rpc` | Management RPC, protected by the management token. |
 | `/health` | Model gateway health; container or UI status is not reflected here. |
 | `/v1/*`, `/v1beta/*`, `/messages`, `/chat/completions`, `/responses`, `/interactions`, `/mcp/*` | Model and MCP gateway endpoints. |
@@ -46,7 +46,7 @@ docker compose up -d --build
 docker compose logs -f agentrouter
 ```
 
-Open <http://127.0.0.1:3458>. On a fresh volume the management UI is available immediately; the model gateway only starts working after a provider and a model have been added.
+Open the management URL that the entrypoint prints in the container log, `http://127.0.0.1:3458/?ar_web_token=<token>`. It is only printed when the token was generated; if you set `AR_WEB_AUTH_TOKEN` yourself, add it to the URL. On a fresh volume the management UI is available immediately; the model gateway only starts working after a provider and a model have been added.
 
 Complete the first-time configuration in this order:
 
@@ -103,7 +103,7 @@ The repository also provides `npm run docker:build` and `npm run docker:run`. Th
 | AgentRouter client API key | Model gateway request authentication | **API Keys** page in the UI |
 | Upstream provider credential | AgentRouter calling model providers | **Providers** page in the UI |
 
-Without `AR_WEB_AUTH_TOKEN`, the entrypoint generates a new random token on every container start. Opening the root address still works because Nginx redirects to a URL containing the current token; but persistent and remote deployments should pin a sufficiently long, strong token.
+Without `AR_WEB_AUTH_TOKEN`, the entrypoint generates a new random token on every container start and prints the management URL once to the container log. Nginx never sends the token to a client: opening the root address without a token loads the page, but every management call fails with `401` until the token is supplied in the URL. The page keeps it for the browser tab session. Persistent and remote deployments should pin a sufficiently long, strong token.
 
 Do not write the token directly into shell history. Create an environment file that stays out of version control:
 
@@ -256,7 +256,7 @@ docker compose config
 
 ### The root address returns `302`
 
-This is expected behavior. Nginx is redirecting the root address to a page URL containing the URL-encoded management token.
+This is expected behavior. Nginx redirects the root address to the management page and keeps the query string, so a `ar_web_token` you supply survives. It does not add a token.
 
 ### `/health` returns `502`
 
@@ -264,7 +264,7 @@ It checks the model gateway, not Nginx or the UI. A fresh volume without a confi
 
 ### The UI returns `401` after a token change
 
-Reopen the bare root address so Nginx generates a URL containing the new token; close tabs and bookmarks that still use the old `ar_web_token`.
+Reopen `/?ar_web_token=<token>` with the current token (for a generated token, read it from `docker compose logs ccr`); close tabs and bookmarks that still use the old `ar_web_token`.
 
 ### Clients still use the old port or domain
 

@@ -2448,7 +2448,7 @@ export function providerMatchesQuery(provider: GatewayProviderConfig, query: str
 
 export function viewUsesInternalScroll(view: ViewId): boolean {
   // Monitor workspaces own their table/detail scrolling; reports and forms use the page.
-  return view === "logs" || view === "observability" || view === "networking" || view === "heatmap";
+  return view === "sessions" || view === "logs" || view === "observability" || view === "networking" || view === "heatmap";
 }
 
 export function uniqueProviderName(providers: GatewayProviderConfig[], baseName = "provider"): string {

@@ -1,4 +1,5 @@
-import {getLocalUsagePage,getLocalUsageTrend,getLocalUsageHeatmap,getLocalUsageSessions,getLocalUsageCategories} from "@agentrouter/core/collector/usage-page";
+import {sessionWorkspace} from "@agentrouter/core/sessions/workspace";
+import {getLocalSessionTranscript,getLocalUsagePage,getLocalUsageTrend,getLocalUsageHeatmap,getLocalUsageSessions,getLocalUsageCategories} from "@agentrouter/core/collector/usage-page";
 import { memoryService } from "@agentrouter/core/memory/service";
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, session, shell, WebContentsView, type OpenDialogOptions, type Rectangle, type SaveDialogOptions } from "electron";
 import { randomUUID } from "node:crypto";
@@ -132,6 +133,8 @@ ipcMain.handle(IPC_CHANNELS.appGetLocalUsagePage, (_event, range) => getLocalUsa
 ipcMain.handle(IPC_CHANNELS.appMemory, (_event, request) => memoryService.request(request));
 ipcMain.handle(IPC_CHANNELS.appGetLocalUsageTrend, (_event, query) => getLocalUsageTrend(query));
 ipcMain.handle(IPC_CHANNELS.appGetLocalUsageHeatmap, (_event, query) => getLocalUsageHeatmap(query));
+ipcMain.handle(IPC_CHANNELS.appSessionWorkspace, (_event, query) => sessionWorkspace(query));
+ipcMain.handle(IPC_CHANNELS.appGetLocalSessionTranscript, (_event, query) => getLocalSessionTranscript(query));
 ipcMain.handle(IPC_CHANNELS.appGetLocalUsageSessions, (_event, query) => getLocalUsageSessions(query));
 ipcMain.handle(IPC_CHANNELS.appGetLocalUsageCategories, (_event, range) => getLocalUsageCategories(range));
 ipcMain.handle(IPC_CHANNELS.appGetUsageStats, (_event, range?: UsageStatsRange, filter?: UsageStatsFilter, customRange?: UsageDateRange) => getUsageStats(range, filter, customRange));

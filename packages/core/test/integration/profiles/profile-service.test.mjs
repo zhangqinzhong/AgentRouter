@@ -1076,7 +1076,7 @@ test("profile service injects ToolHub MCP into Codex config", { skip: !process.e
       model: "Provider/model",
       name: "Codex ToolHub Test",
       providerId: "claude-code-router",
-      providerName: "AgentRouter",
+      providerName: "Claude Code Router",
       scope: "agentrouter",
       showAllSessions: false,
       surface: "auto"
@@ -1090,6 +1090,8 @@ test("profile service injects ToolHub MCP into Codex config", { skip: !process.e
   assert.equal(applied.length, 1);
   assert.equal(applied[0].ok, true);
   const content = readFileSync(configFile, "utf8");
+  assert.match(content, /name = "AgentRouter"/);
+  assert.match(content, /model_provider = "claude-code-router"/);
   assert.match(content, /# BEGIN AgentRouter managed ToolHub MCP/);
   assert.match(content, /# AgentRouter configured model = "Provider\/model"/);
   assert.match(content, /\[mcp_servers\.ar-toolhub\]/);

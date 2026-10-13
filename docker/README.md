@@ -22,7 +22,7 @@ Nginx routes:
 
 | Public route | Purpose |
 | --- | --- |
-| `/` and `/pages/home/index.html` | Browser management UI. `/` redirects to a URL containing the management token. |
+| `/` and `/pages/home/index.html` | Browser management UI. `/` redirects to the page and keeps a `ar_web_token` query parameter if the request has one. The token is never added by Nginx. |
 | `/api/ar/rpc` | Authenticated management RPC. |
 | `/health` | Gateway health, not container/UI health. It can return `502` until a provider and model are configured and the gateway starts. |
 | `/v1/*`, `/v1beta/*`, `/messages`, `/chat/completions`, `/responses`, `/interactions`, `/mcp/*` | Supported model and MCP gateway requests. |
@@ -36,7 +36,7 @@ docker compose up -d --build
 docker compose logs -f agentrouter
 ```
 
-Open <http://127.0.0.1:3458>. On a new volume, the management UI is immediately available. Add a provider and model, create a AgentRouter client key under **API Keys**, and start the gateway from **Server**.
+Open `http://127.0.0.1:3458/?ar_web_token=<token>` using the generated URL from the container logs, or the token you configured. On a new volume, the management UI is immediately available. Add a provider and model, create a AgentRouter client key under **API Keys**, and start the gateway from **Server**.
 
 The repository Compose file publishes `3458:8080`, stores data in the `ar-data` named volume, and restarts the service unless explicitly stopped. A mapping without a host IP binds on every host interface. For local-only access, change it to:
 
@@ -82,10 +82,10 @@ npm run docker:run
 
 There are two independent authentication layers:
 
-1. `AR_WEB_AUTH_TOKEN` protects management RPC. Nginx puts it into the management-page URL, and the browser sends it to RPC as `x-ar-web-auth`.
+1. `AR_WEB_AUTH_TOKEN` protects management RPC. Supply it in the management URL (`/?ar_web_token=<token>`); the browser sends it to RPC as `x-ar-web-auth`. Nginx never supplies a token to an unauthenticated visitor.
 2. AgentRouter client API keys created in the **API Keys** page protect model gateway requests. These are separate from upstream provider credentials.
 
-If `AR_WEB_AUTH_TOKEN` is unset, the entrypoint generates a new random token on each container start. Opening `/` still works because Nginx redirects to a tokenized URL, but a stable token is recommended for persistent or remote deployments.
+If `AR_WEB_AUTH_TOKEN` is unset, the entrypoint generates a new random token on each container start and prints the management URL once to the container log. Opening `/` without a token loads the page, but every management call fails with `401` until the token is supplied. The page keeps the token for the browser tab session. A stable token is recommended for persistent or remote deployments.
 
 Avoid putting the token directly in shell history. Create a protected environment file instead:
 
@@ -236,7 +236,7 @@ docker compose config
 
 ### `/` returns `302`
 
-This is expected. Nginx redirects the root URL to the management page and URL-encodes the management token.
+This is expected. Nginx redirects the root URL to the management page and keeps the query string, so a `ar_web_token` you supply survives. It does not add a token.
 
 ### `/health` returns `502`
 
@@ -244,7 +244,7 @@ This is expected. Nginx redirects the root URL to the management page and URL-en
 
 ### The UI returns `401` after a token change
 
-Open the bare root URL again so Nginx creates a URL with the current token. Close stale tabs and avoid bookmarks that contain an old `ar_web_token`.
+Open `/?ar_web_token=<token>` again with the current token (for a generated token, read it from `docker compose logs agentrouter`). Close stale tabs and avoid bookmarks that contain an old `ar_web_token`.
 
 ### Clients still use the old port or hostname
 
@@ -277,7 +277,7 @@ docker compose up -d --build
 docker compose logs -f agentrouter
 ```
 
-打开 <http://127.0.0.1:3458>。首次启动时管理 UI 可以立即访问；添加供应商和模型、在 **API 密钥** 页面创建 AgentRouter 客户端 Key，然后从 **服务** 页面启动网关。
+打开 `http://127.0.0.1:3458/?ar_web_token=<token>`，使用容器日志中生成的 Token，或自行配置的 Token。首次启动时管理 UI 可以立即访问；添加供应商和模型、在 **API 密钥** 页面创建 AgentRouter 客户端 Key，然后从 **服务** 页面启动网关。
 
 仓库默认映射是 `3458:8080`，会监听宿主机所有网卡。如果只允许本机访问，请改为：
 
@@ -292,7 +292,7 @@ ports:
 - **API 密钥** 页面创建的 AgentRouter 客户端 Key 用于模型网关请求。
 - 上游供应商凭据是第三类凭据，不应拿来代替 AgentRouter 客户端 Key。
 
-根路径会重定向到包含 `ar_web_token` 的管理 URL。请把该 URL 当作密码。远程部署至少应使用固定强 Token、TLS、主机防火墙或私网，并让反向代理把全部路径转发到 Nginx。流式响应和 SSE 不应被代理缓冲。
+Nginx 不会向客户端返回 Token：根路径只会跳转到管理页，并保留请求中已有的 `ar_web_token` 参数。自动生成的 Token 会在容器日志中打印一次，请把含 Token 的 URL 当作密码。远程部署至少应使用固定强 Token、TLS、主机防火墙或私网，并让反向代理把全部路径转发到 Nginx。流式响应和 SSE 不应被代理缓冲。
 
 外部端口、域名或协议变化时，必须同步设置公开地址：
 
@@ -328,9 +328,9 @@ docker compose logs --tail=200 agentrouter
 
 ### 常见排查
 
-- `/` 返回 `302`：正常，Nginx 正在跳转到带管理 Token 的页面。
+- `/` 返回 `302`：正常，Nginx 正在跳转到管理页，并保留请求里的查询参数。
 - `/health` 返回 `502`：它检查的是模型网关；首次启动尚未配置模型时属于预期行为。
-- 修改 Token 后 UI 返回 `401`：重新打开不带参数的根地址，关闭仍使用旧 Token 的标签页。
+- 修改 Token 后 UI 返回 `401`：用当前 Token 重新打开 `/?ar_web_token=<token>`，关闭仍使用旧 Token 的标签页。
 - 重建后配置消失：检查是否仍挂载同一个 `/data` 卷；`docker compose down --volumes` 会删除数据卷。
 - 容器健康但模型请求失败：继续检查服务状态、供应商连通性、AgentRouter 客户端 Key、路由和请求日志；容器健康只表示 Nginx / UI 可访问。
 

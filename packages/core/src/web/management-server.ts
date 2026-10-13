@@ -1,4 +1,5 @@
-import {getLocalUsagePage, getLocalUsageTrend, getLocalUsageHeatmap, getLocalUsageSessions, getLocalUsageCategories, type LocalUsageCategoryRange, type LocalUsageHeatmapQuery, type LocalUsageRange, type LocalUsageSessionsQuery, type LocalUsageTrendQuery} from "@agentrouter/core/collector/usage-page";
+import {sessionWorkspace} from "@agentrouter/core/sessions/workspace";
+import {getLocalSessionTranscript,getLocalUsagePage, getLocalUsageTrend, getLocalUsageHeatmap, getLocalUsageSessions, getLocalUsageCategories, type LocalUsageCategoryRange, type LocalUsageHeatmapQuery, type LocalUsageRange, type LocalUsageSessionsQuery, type LocalUsageTrendQuery} from "@agentrouter/core/collector/usage-page";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -395,6 +396,8 @@ const rpcHandlers: Record<string, RpcHandler> = {
   getLocalUsagePage: (range) => getLocalUsagePage(range as LocalUsageRange),
   getLocalUsageTrend: (query) => getLocalUsageTrend(query as LocalUsageTrendQuery),
   getLocalUsageHeatmap: (query) => getLocalUsageHeatmap(query as LocalUsageHeatmapQuery | undefined),
+  sessionWorkspace: (query) => sessionWorkspace(query),
+  getLocalSessionTranscript: (query) => getLocalSessionTranscript(query as {sessionHash:string;offset?:number}),
   getLocalUsageSessions: (query) => getLocalUsageSessions(query as LocalUsageSessionsQuery | undefined),
   getLocalUsageCategories: (range) => getLocalUsageCategories(range as LocalUsageCategoryRange),
   getUsageStats: (range, filter, customRange) => getUsageStats(

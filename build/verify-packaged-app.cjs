@@ -8,9 +8,13 @@ const betterSqliteNativeRelativePath = path.join(
   "better-sqlite3",
   "build",
   "Release",
-  "better_sqlite3.node"
+  "better_sqlite3.node",
 );
-const betterSqlitePackageRelativePath = path.join("app.asar.unpacked", "node_modules", "better-sqlite3");
+const betterSqlitePackageRelativePath = path.join(
+  "app.asar.unpacked",
+  "node_modules",
+  "better-sqlite3",
+);
 const betterSqlitePrunablePaths = [
   "deps",
   "src",
@@ -21,7 +25,7 @@ const betterSqlitePrunablePaths = [
   "benchmarks",
   "test",
   path.join("build", "Release", "obj"),
-  path.join("build", "Release", "obj.target")
+  path.join("build", "Release", "obj.target"),
 ];
 
 module.exports = async function verifyPackagedApp(context) {
@@ -30,7 +34,9 @@ module.exports = async function verifyPackagedApp(context) {
   const appOutDir = context?.appOutDir;
 
   if (!platform || !appOutDir) {
-    throw new Error("Packaged app verification did not receive electron-builder platform context.");
+    throw new Error(
+      "Packaged app verification did not receive electron-builder platform context.",
+    );
   }
 
   const resourcesDir = findResourcesDir(appOutDir, platform);
@@ -41,32 +47,105 @@ module.exports = async function verifyPackagedApp(context) {
     if (fs.existsSync(assetsCar)) {
       assertFile(assetsCar, "Native Icon Composer asset catalog");
     } else {
-      console.warn("Assets.car is missing; continuing with the icns icon fallback.");
+      console.warn(
+        "Assets.car is missing; continuing with the icns icon fallback.",
+      );
     }
-    assertFile(path.join(resourcesDir, "AgentRouter.icns"), "Native app icon fallback");
-    assertFile(path.join(resourcesDir, "native", "AgentRouterTray"), "Native menu bar executable");
-    const launcher = path.join(resourcesDir, "app-launcher", "AgentRouterAppLauncher");
+    assertFile(
+      path.join(resourcesDir, "AgentRouter.icns"),
+      "Native app icon fallback",
+    );
+    assertFile(
+      path.join(resourcesDir, "native", "AgentRouterTray"),
+      "Native menu bar executable",
+    );
+    const launcher = path.join(
+      resourcesDir,
+      "app-launcher",
+      "AgentRouterAppLauncher",
+    );
     assertFile(launcher, "LaunchServices application launcher");
     if (arch && !nativeArchMatches(inspectNativeModule(launcher), arch)) {
-      throw new Error("Application launcher architecture does not match the app");
+      throw new Error(
+        "Application launcher architecture does not match the app",
+      );
     }
-    const widget = path.join(resourcesDir, "..", "PlugIns", "AgentRouterWidget.appex");
+    const widget = path.join(
+      resourcesDir,
+      "..",
+      "PlugIns",
+      "AgentRouterWidget.appex",
+    );
     const widgetInfo = path.join(widget, "Contents", "Info.plist");
     assertFile(widgetInfo, "WidgetKit extension metadata");
     const binary = path.join(widget, "Contents", "MacOS", "AgentRouterWidget");
     assertFile(binary, "WidgetKit extension executable");
     if (arch && !nativeArchMatches(inspectNativeModule(binary), arch)) {
-      throw new Error("WidgetKit extension architecture does not match the app");
+      throw new Error(
+        "WidgetKit extension architecture does not match the app",
+      );
     }
   }
 
+  const sessionDir = path.join(
+    resourcesDir,
+    "app.asar.unpacked",
+    "dist",
+    "main",
+  );
+  const sessionManifest = JSON.parse(
+    fs.readFileSync(path.join(sessionDir, "session-runtime.json"), "utf8"),
+  );
+  if (
+    sessionManifest.platform !== platform ||
+    (arch && sessionManifest.arch !== arch)
+  )
+    throw new Error("Session runtime target mismatch");
+  for (const stem of [
+    "agentrouter-session-reader",
+    "agentrouter-session-cli",
+    "agentrouter-session-mcp",
+  ]) {
+    const name = stem + (platform === "win32" ? ".exe" : "");
+    const file = path.join(sessionDir, name);
+    assertFile(file, "Session runtime");
+    if (
+      crypto
+        .createHash("sha256")
+        .update(fs.readFileSync(file))
+        .digest("hex") !== sessionManifest.binaries[name]
+    )
+      throw new Error("Session runtime checksum mismatch");
+    if (arch && !nativeArchMatches(inspectNativeModule(file), arch))
+      throw new Error("Session runtime architecture mismatch");
+  }
+  assertFile(
+    path.join(sessionDir, "session-core-LICENSE"),
+    "Session core license",
+  );
+  assertFile(
+    path.join(sessionDir, "session-plugin", ".codex-plugin", "plugin.json"),
+    "Session plugin",
+  );
   const nativeModule = path.join(resourcesDir, betterSqliteNativeRelativePath);
   const memoryDir = path.join(resourcesDir, "ai-memory");
-  const memoryManifest = JSON.parse(fs.readFileSync(path.join(memoryDir, "manifest.json"), "utf8"));
-  const memoryBinary = path.join(memoryDir, platform === "win32" ? "ai-memory.exe" : "ai-memory");
+  const memoryManifest = JSON.parse(
+    fs.readFileSync(path.join(memoryDir, "manifest.json"), "utf8"),
+  );
+  const memoryBinary = path.join(
+    memoryDir,
+    platform === "win32" ? "ai-memory.exe" : "ai-memory",
+  );
   assertFile(memoryBinary, "Memory runtime");
-  const memoryDigest = crypto.createHash("sha256").update(fs.readFileSync(memoryBinary)).digest("hex");
-  if (memoryManifest.platform !== platform || (arch && memoryManifest.arch !== arch) || memoryDigest !== memoryManifest.binarySha256) {
+  const memoryDigest = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(memoryBinary))
+    .digest("hex");
+  if (
+    memoryManifest.platform !== platform ||
+    (arch && memoryManifest.arch !== arch) ||
+    memoryDigest !== memoryManifest.binarySha256
+  ) {
     throw new Error("Packaged memory runtime platform or checksum mismatch");
   }
   assertFile(nativeModule, "better-sqlite3 native module");
@@ -75,14 +154,14 @@ module.exports = async function verifyPackagedApp(context) {
   if (nativeInfo.platform !== platform) {
     throw new Error(
       `Packaged better-sqlite3 native module targets ${formatNativeInfo(nativeInfo)}, ` +
-        `but electron-builder is packaging ${platform}/${arch}. Rebuild native dependencies for the target platform before packaging.`
+        `but electron-builder is packaging ${platform}/${arch}. Rebuild native dependencies for the target platform before packaging.`,
     );
   }
 
   if (arch && !nativeArchMatches(nativeInfo, arch)) {
     throw new Error(
       `Packaged better-sqlite3 native module targets ${formatNativeInfo(nativeInfo)}, ` +
-        `but electron-builder is packaging ${platform}/${arch}. Run npm run rebuild:sqlite3 on the target platform before packaging.`
+        `but electron-builder is packaging ${platform}/${arch}. Run npm run rebuild:sqlite3 on the target platform before packaging.`,
     );
   }
 };
@@ -90,7 +169,10 @@ module.exports = async function verifyPackagedApp(context) {
 function cleanupBetterSqlitePackage(resourcesDir) {
   const packageDir = path.join(resourcesDir, betterSqlitePackageRelativePath);
   for (const relativePath of betterSqlitePrunablePaths) {
-    fs.rmSync(path.join(packageDir, relativePath), { force: true, recursive: true });
+    fs.rmSync(path.join(packageDir, relativePath), {
+      force: true,
+      recursive: true,
+    });
   }
 }
 
@@ -99,8 +181,13 @@ function findResourcesDir(appOutDir, platform) {
     return path.join(appOutDir, "resources");
   }
 
-  const appBundle = fs.readdirSync(appOutDir)
-    .find((entry) => entry.endsWith(".app") && fs.statSync(path.join(appOutDir, entry)).isDirectory());
+  const appBundle = fs
+    .readdirSync(appOutDir)
+    .find(
+      (entry) =>
+        entry.endsWith(".app") &&
+        fs.statSync(path.join(appOutDir, entry)).isDirectory(),
+    );
   if (!appBundle) {
     throw new Error(`Could not find a .app bundle in ${appOutDir}`);
   }
@@ -129,13 +216,23 @@ function inspectNativeModule(file) {
   if (buffer[0] === 0x4d && buffer[1] === 0x5a) {
     return inspectPe(buffer, file);
   }
-  if (buffer[0] === 0x7f && buffer[1] === 0x45 && buffer[2] === 0x4c && buffer[3] === 0x46) {
+  if (
+    buffer[0] === 0x7f &&
+    buffer[1] === 0x45 &&
+    buffer[2] === 0x4c &&
+    buffer[3] === 0x46
+  ) {
     return inspectElf(buffer);
   }
 
   const magicLe = buffer.readUInt32LE(0);
   const magicBe = buffer.readUInt32BE(0);
-  if (magicLe === 0xfeedface || magicLe === 0xfeedfacf || magicLe === 0xcefaedfe || magicLe === 0xcffaedfe) {
+  if (
+    magicLe === 0xfeedface ||
+    magicLe === 0xfeedfacf ||
+    magicLe === 0xcefaedfe ||
+    magicLe === 0xcffaedfe
+  ) {
     return inspectMachO(buffer, magicLe);
   }
   if (magicBe === 0xcafebabe || magicBe === 0xcafebabf) {
@@ -147,13 +244,16 @@ function inspectNativeModule(file) {
 
 function inspectPe(buffer, file) {
   const peOffset = buffer.readUInt32LE(0x3c);
-  if (peOffset + 6 >= buffer.length || buffer.toString("ascii", peOffset, peOffset + 4) !== "PE\0\0") {
+  if (
+    peOffset + 6 >= buffer.length ||
+    buffer.toString("ascii", peOffset, peOffset + 4) !== "PE\0\0"
+  ) {
     throw new Error(`Native module has an invalid PE header: ${file}`);
   }
   const machine = buffer.readUInt16LE(peOffset + 4);
   return {
     arch: peMachineArch(machine),
-    platform: "win32"
+    platform: "win32",
   };
 }
 
@@ -161,7 +261,7 @@ function inspectElf(buffer) {
   const machine = buffer.readUInt16LE(18);
   return {
     arch: elfMachineArch(machine),
-    platform: "linux"
+    platform: "linux",
   };
 }
 
@@ -170,7 +270,7 @@ function inspectMachO(buffer, magicLe) {
   const cpuType = bigEndian ? buffer.readUInt32BE(4) : buffer.readUInt32LE(4);
   return {
     arch: machCpuArch(cpuType),
-    platform: "darwin"
+    platform: "darwin",
   };
 }
 
@@ -188,7 +288,7 @@ function inspectFatMachO(buffer, magicBe) {
   return {
     arch: "universal",
     archs,
-    platform: "darwin"
+    platform: "darwin",
   };
 }
 
@@ -243,7 +343,7 @@ function normalizeArch(arch) {
     [1, "x64"],
     [2, "armv7l"],
     [3, "arm64"],
-    [4, "universal"]
+    [4, "universal"],
   ]);
   return electronBuilderArchNames.get(arch);
 }

@@ -25,6 +25,10 @@ jobs:
       - run: npm ci
       - run: node build/verify-release-version.mjs
       - run: npm run typecheck
+      - run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
+      - run: cargo test --locked --manifest-path native/session-core/Cargo.toml
+      - run: cargo build --release --locked --manifest-path native/session-reader/Cargo.toml
+      - run: cargo build --release --locked --manifest-path native/session-core/Cargo.toml --bins
       - run: npm run test:collector
       - run: npm run build:memory
       - run: npm run test:core

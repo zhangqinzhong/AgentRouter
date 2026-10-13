@@ -80,3 +80,22 @@ Three actual local Codex logs parsed successfully with timing/model metadata,
 including a partially priced multi-model session. Headless installed Chrome
 verified opening details from the existing list, closing via Escape/button,
 focus restoration, and no page errors (isolated fixture UI, no running-app restart).
+
+
+## October 13 Docker authentication backport
+
+Imported upstream `ec0cb4fe` / PR #1871: anonymous Nginx redirects no longer
+supply the management token. Existing query parameters are preserved. Generated
+tokens are printed only to the container log; explicitly configured tokens are
+not printed. Updated Docker documentation and smoke assertions.
+
+The entrypoint token encoder now separates Node arguments with `--`; a generated
+base64url token starting with a hyphen otherwise causes startup to fail. The smoke
+test token covers a leading hyphen and URL-special characters.
+
+Validation: actual entrypoint execution in Node Alpine containers passed for
+configured, leading-hyphen, and generated tokens; generated Nginx configuration
+contains no management token. Shell/JavaScript syntax and diff checks pass.
+Nginx HTTP/full application smoke remains unverified: the isolated test container
+could not fetch Alpine dependencies due to networking/DNS failure. No release or
+running AgentRouter replacement was performed.

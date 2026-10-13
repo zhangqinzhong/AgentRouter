@@ -57,7 +57,7 @@ const DATE_RANGES = [
 ];
 
 // Filter by local calendar boundaries; the server receives a coarse UTC window.
-function rangeStartMs(rangeId, now = new Date()) {
+export function rangeStartMs(rangeId, now = new Date()) {
   const days = DATE_RANGES.find((range) => range.id === rangeId)?.days || 0;
   if (!days) return 0;
   const start = new Date(now);
@@ -81,7 +81,7 @@ export function sessionQueryRange(rangeId, now = new Date()) {
 // A session counts as inside the window when it *overlaps* it: one that started
 // earlier but ran into the window is still relevant, and it is also the row
 // sorted to the top (the list is ordered by ended_at).
-function overlapsRange(session, startMs) {
+export function overlapsRange(session, startMs) {
   if (!startMs) return true;
   const ended = Date.parse(session.ended_at || session.started_at || "");
   return Number.isFinite(ended) ? ended >= startMs : true;
@@ -103,7 +103,7 @@ export function resumeExtraArgs(source, sessionId) {
   return [];
 }
 
-export function ResumeHoverButton({ ariaLabel, profileName, surfaces = ["cli"], onOpen, onCopy, copyOnly = false, copyAvailable = true, children }) {
+export function ResumeHoverButton({ ariaLabel, profileName, surfaces = ["cli"], onOpen, onCopy, copyOnly = false, copyAvailable = true, triggerClassName, children }) {
   const triggerRef = useRef(null);
   const hideRef = useRef(null);
   const [open, setOpen] = useState(false);
@@ -143,7 +143,7 @@ export function ResumeHoverButton({ ariaLabel, profileName, surfaces = ["cli"], 
         onMouseLeave={hide}
         onFocus={show}
         onBlur={hide}
-        className="-mt-0.5 inline-flex h-8 w-8 items-center justify-center rounded-md text-oai-gray-500 transition-transform duration-150 ease-out hover:z-10 hover:scale-125 hover:bg-oai-gray-100 hover:text-oai-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 dark:text-oai-gray-400 dark:hover:bg-oai-gray-800 dark:hover:text-white"
+        className={triggerClassName || "-mt-0.5 inline-flex h-8 w-8 items-center justify-center rounded-md text-oai-gray-500 transition-transform duration-150 ease-out hover:z-10 hover:scale-125 hover:bg-oai-gray-100 hover:text-oai-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 dark:text-oai-gray-400 dark:hover:bg-oai-gray-800 dark:hover:text-white"}
       >
         {children}
       </button>
