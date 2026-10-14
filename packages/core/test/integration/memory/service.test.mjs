@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import { spawn } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
@@ -94,6 +95,34 @@ test("memory refuses a foreign listener and never adopts or stops it", async () 
     assert.equal(foreign.listening, true);
     assert.equal(existsSync(path.join(root, "config.toml")), false);
   } finally { await new Promise((resolve) => foreign.close(resolve)); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("preview can adopt an existing authenticated memory service without stopping it", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "ar-memory-adopt-"));
+  const token = "a".repeat(64);
+  writeFileSync(path.join(root, "agentrouter.token"), token, { mode: 0o600 });
+  const foreign = http.createServer((request, response) => {
+    if (request.url !== "/api/v1/projects" || request.headers.authorization !== `Bearer ${token}`) {
+      response.writeHead(401);
+      response.end();
+      return;
+    }
+    response.setHeader("content-type", "application/json");
+    response.end("[]");
+  });
+  await new Promise((resolve) => foreign.listen(0, "127.0.0.1", resolve));
+  const service = new MemoryService({ dataDir: root, home: root, runtimeDir, port: foreign.address().port });
+  service.setExternalReuse(true);
+  try {
+    const status = await service.request({ action: "start" });
+    assert.equal(status.state, "running");
+    assert.equal(status.pid, undefined);
+    await service.shutdown();
+    assert.equal(foreign.listening, true);
+  } finally {
+    await new Promise((resolve) => foreign.close(resolve));
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("bundled real memory: start, auth, wiki CRUD path, isolated client install/remove, backup, restart, stop", { skip: !available, timeout: 120_000 }, async () => {
@@ -245,7 +274,13 @@ test("memory model credentials are explicit, private, destination-bound and usab
     assert.ok(received.body.messages.some((message) => typeof message.content === "string" && message.content.includes('{"answer":"OK"}')), "compat fallback must explicitly request JSON, even if response_format is ignored");
     assert.ok(received.body.response_format);
     await service.request({ action: "start" });
-    await assert.rejects(service.request({ action: "saveModelConfig", settings, confirmed: true }), /Stop memory/);
+    const runningPid = service.status().pid;
+    const updated = await service.request({ action: "saveModelConfig", settings: { ...settings, enabled: false }, confirmed: true });
+    assert.equal(updated.enabled, false);
+    assert.equal(updated.hasApiKey, true);
+    assert.equal(service.status().state, "running", "saving must not interrupt capture");
+    assert.equal(service.status().pid, runningPid, "saving must not restart the service");
+    assert.equal((await service.request({ action: "modelConfig" })).enabled, false);
     await service.shutdown();
     const changed = await service.request({ action: "saveModelConfig", settings: { ...settings, baseUrl: "http://127.0.0.1:1/v1" }, confirmed: true });
     assert.equal(changed.hasApiKey, false, "old key must not follow a new API destination");

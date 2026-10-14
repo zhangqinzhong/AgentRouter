@@ -13,12 +13,13 @@ test("memory is bundled for desktop, CLI, and Docker instead of downloaded at ru
   assert.doesNotMatch(read("packages/core/src/memory/service.ts"), /releases\/download|github\.com/);
 });
 
-test("memory keeps upstream provenance and has no iframe or profile integration", () => {
+test("memory keeps upstream provenance and exposes profile-scoped client integration", () => {
   assert.match(read("vendor/ai-memory.UPSTREAM.md"), /7580b74d0fb9d14a6d949dc92f5ea8bb7feb3c83/);
   assert.match(read("vendor/ai-memory/LICENSE"), /MIT License/);
   const ui = read("packages/ui/src/pages/home/components/memory.tsx");
   assert.doesNotMatch(ui, /<iframe|<webview|dangerouslySetInnerHTML/);
-  assert.doesNotMatch(read("packages/core/src/memory/clients.ts"), /profiles\/service|applyProfile/);
+  assert.match(read("packages/core/src/memory/clients.ts"), /arManagedProfileDir|resolveCodexConfigFile/);
+  assert.match(read("packages/core/src/contracts/memory.ts"), /MemoryClientTarget/);
 });
 
 test("memory has both desktop and authenticated web bridges and shutdown hooks", () => {

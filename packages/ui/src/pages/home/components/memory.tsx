@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BrainCircuit, ChevronLeft, FileText, LoaderCircle, Play, Plus, RefreshCw, Search, Square, Terminal } from "lucide-react";
 import { MemoryModelSettingsPanel } from "./memory-model-settings";
 import { MemoryProjectSetupPanel } from "./memory-project-setup";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import type { MemoryClient, MemoryPage, MemoryPageSummary, MemoryProject, MemoryRequest, MemoryScope, MemoryStatus, MemoryTool } from "@agentrouter/core/contracts/memory";
+import type { MemoryClient, MemoryClientTarget, MemoryPage, MemoryPageSummary, MemoryProject, MemoryRequest, MemoryScope, MemoryStatus, MemoryTool } from "@agentrouter/core/contracts/memory";
 import { localAccountIcons } from "../shared/local-account-icons";
 import piIcon from "@/assets/agent-logos/pi.svg";
 import mimoIcon from "@/assets/provider-icons/xiaomi-mimo.png";
@@ -25,6 +25,18 @@ function MemoryClientIcon({ id }: { id: string }) {
   return <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border/60 bg-muted/30">
     {icon ? <img src={icon.url} alt="" className={`h-6 w-6 object-contain${icon.monochrome ? " dark:invert" : ""}`} /> : <Terminal aria-hidden="true" className="h-5 w-5 text-muted-foreground" />}
   </span>;
+}
+function memoryClientGroup(client: MemoryClient): { id: string; label: string; clients: MemoryClient[] } {
+  if (client.id === "opencode" || client.id === "opencode2") return { id: "opencode", label: "OpenCode", clients: [] };
+  if (client.id === "kiro-cli" || client.id === "kiro-cli-v3") return { id: "kiro-cli", label: "Kiro CLI", clients: [] };
+  return { id: client.id, label: client.label, clients: [] };
+}
+function memoryClientVariantLabel(client: MemoryClient, kind: "mcp" | "hooks"): string {
+  if (client.id === "opencode") return kind === "mcp" ? "OpenCode MCP" : "OpenCode plugin";
+  if (client.id === "opencode2") return "OpenCode 2 plugin";
+  if (client.id === "kiro-cli") return "Kiro MCP";
+  if (client.id === "kiro-cli-v3") return "Kiro Hooks v3";
+  return kind === "mcp" ? "MCP" : "Hook";
 }
 const control = "h-9 rounded-md border border-border bg-background px-3 text-[13px] outline-none focus:ring-2 focus:ring-emerald-500/25";
 const textArea = "min-h-28 w-full rounded-md border border-border bg-background p-3 text-[13px] leading-6 outline-none focus:ring-2 focus:ring-emerald-500/25";
@@ -68,6 +80,16 @@ export function MemoryView() {
   const generation = useRef(0);
   const initialScopeLoaded = useRef(false);
   const [refreshRevision, setRefreshRevision] = useState(0);
+  const clientGroups = useMemo(() => {
+    const groups = new Map<string, { id: string; label: string; clients: MemoryClient[] }>();
+    for (const client of clients) {
+      const descriptor = memoryClientGroup(client);
+      const group = groups.get(descriptor.id) || { ...descriptor, clients: [] };
+      group.clients.push(client);
+      groups.set(descriptor.id, group);
+    }
+    return [...groups.values()];
+  }, [clients]);
   const running = status?.state === "running";
   const inProject = ["library", "search", "sessions", "handoffs"].includes(tab);
   const section = inProject ? "library" : tab === "maintenance" ? "settings" : tab;
@@ -139,11 +161,11 @@ export function MemoryView() {
     setEditor({ workspace: current?.workspace || scope?.workspace || "", project: current?.project || scope?.project || "",
       path: current?.path || "", body: current?.body_markdown || "# ", pinned: current?.pinned || false });
   }
-  async function clientAction(client: MemoryClient, kind: "mcp" | "hooks", operation: "preview" | "install" | "remove") {
-    const path = kind === "mcp" ? client.mcpPath : client.hookPath;
+  async function clientAction(client: MemoryClient, target: MemoryClientTarget, kind: "mcp" | "hooks", operation: "preview" | "install" | "remove") {
+    const path = kind === "mcp" ? target.mcpPath : target.hookPath;
     if (operation !== "preview" && !window.confirm(`${t(operation === "install" ? "Apply client configuration?" : "Remove client integration?")}\n${client.label} · ${kind}\n${path}\n${t("Other client settings and memory data are preserved.")}`)) return;
-    await perform(client.id + kind, async () => {
-      const response = await call<{ output: string; path: string }>({ action: "client", client: client.id, kind, operation, confirmed: operation !== "preview" });
+    await perform(client.id + target.id + kind, async () => {
+      const response = await call<{ output: string; path: string }>({ action: "client", client: client.id, target: target.id, kind, operation, confirmed: operation !== "preview" });
       setPreview(`${response.path}\n\n${response.output}`);
       setClients(await call<MemoryClient[]>({ action: "clients" }));
       if (operation === "install") setNotice(t("Configuration saved. Reload the client, then verify capture with a real session."));
@@ -235,20 +257,26 @@ export function MemoryView() {
       <MemoryProjectSetupPanel />
       <h2 className="mb-2 text-sm font-semibold">{t("Client connection")}</h2>
       <p className="mb-5 text-[13px] text-muted-foreground">{t("Connect your coding clients to project memory.")}</p>
-      <div className="grid grid-cols-1 gap-4">{clients.map((client) => <section key={client.id} className="min-w-0 rounded-xl border border-border/70 bg-background p-4">
-        <div className="mb-4 flex items-center gap-3"><MemoryClientIcon id={client.id} /><h3 className="text-sm font-semibold">{client.label}</h3></div>
-        {client.id === "xiaomi-mimo" && <p className="mb-3 text-xs text-muted-foreground">{t("MiMo automatically captures completed turns and recalls them in new conversations.")}</p>}
-        {["zcode", "grok", "zero"].includes(client.id) && <p className="mb-3 text-xs text-muted-foreground">{t(client.id === "zcode" ? "ZCode has no session-end event. Finish the session from Project memory > Sessions after your work is complete." : "This client retrieves handoffs through MCP; startup hook output is not injected.")}</p>}
-        <div className="divide-y divide-border/50">{(["mcp", "hooks"] as const).filter((kind) => client[kind]).map((kind) => {
-          const configured = kind === "mcp" ? client.mcpConfigured : client.hooksConfigured;
-          return <div key={kind} className="flex flex-wrap items-center gap-2 py-3">
-            <div className="min-w-0 flex-1"><div className="text-[13px] font-medium">{t(kind === "mcp" ? "Read and write memory" : "Capture sessions")} <span className="ml-1 text-[10px] font-normal text-muted-foreground">{kind === "mcp" ? "MCP" : "Hook"}</span></div>
-              <div className={`mt-1 text-[11px] ${configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>{t(configured ? "Configured · reload client" : "Not configured or changed")}</div></div>
-            <Button size="sm" variant="ghost" disabled={!!busy} onClick={() => void clientAction(client, kind, "preview")}>{t("Preview")}</Button>
-            <Button size="sm" variant="outline" disabled={!!busy} onClick={() => void clientAction(client, kind, configured ? "remove" : "install")}>{t(configured ? "Disconnect" : "Connect")}</Button>
-          </div>;
-        })}</div>
-        <details className="mt-2 border-t border-border/50 pt-3 text-xs text-muted-foreground"><summary className="cursor-pointer hover:text-foreground">{t("Configuration files")}</summary><div className="mt-2 space-y-2">{(["mcp", "hooks"] as const).filter((kind) => client[kind]).map((kind) => <div key={kind}><span>{kind === "mcp" ? "MCP" : "Hook"}</span><code className="mt-1 block break-all text-[11px]">{kind === "mcp" ? client.mcpPath : client.hookPath}</code></div>)}</div></details>
+      <div className="grid grid-cols-1 gap-4">{clientGroups.map((group) => <section key={group.id} className="min-w-0 rounded-xl border border-border/70 bg-background p-4">
+        <div className="mb-4 flex items-center gap-3"><MemoryClientIcon id={group.clients[0].id} /><h3 className="text-sm font-semibold">{group.label}</h3></div>
+        {group.clients.map((client) => <div key={client.id} className="mb-4 last:mb-0">
+          {client.id !== group.id && <h4 className="mb-2 text-xs font-medium text-muted-foreground">{client.label}</h4>}
+          {client.id === "xiaomi-mimo" && <p className="mb-3 text-xs text-muted-foreground">{t("MiMo automatically captures completed turns and recalls them in new conversations.")}</p>}
+          {["zcode", "grok", "zero"].includes(client.id) && <p className="mb-3 text-xs text-muted-foreground">{t(client.id === "zcode" ? "ZCode has no session-end event. Finish the session from Project memory > Sessions after your work is complete." : "This client retrieves handoffs through MCP; startup hook output is not injected.")}</p>}
+          <div className="space-y-3">{client.targets.map((target) => <section key={target.id} className="rounded-lg border border-border/60 p-3">
+            <div className="mb-2 flex items-start justify-between gap-3"><div><h5 className="text-[13px] font-medium">{target.label}</h5><div className="mt-1 text-[11px] text-muted-foreground">{target.scope === "global" ? t("Global client configuration") : t("AgentRouter profile")}</div></div><span className="text-[10px] text-muted-foreground">{target.profileId || "global"}</span></div>
+            <div className="divide-y divide-border/50">{(["mcp", "hooks"] as const).filter((kind) => kind === "mcp" ? target.mcpSupported : target.hooksSupported).map((kind) => {
+              const configured = kind === "mcp" ? target.mcpConfigured : target.hooksConfigured;
+              const file = kind === "mcp" ? target.mcpPath : target.hookPath;
+              return <div key={kind} className="flex flex-wrap items-center gap-2 py-3">
+                <div className="min-w-0 flex-1"><div className="text-[13px] font-medium">{t(memoryClientVariantLabel(client, kind))} <span className="ml-1 text-[10px] font-normal text-muted-foreground">{t(kind === "mcp" ? "Read and write memory" : "Capture sessions")}</span></div>
+                  <div className={`mt-1 text-[11px] ${configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>{t(configured ? "Configured · reload client" : "Not configured or changed")}</div><code className="mt-1 block break-all text-[10px] text-muted-foreground">{file}</code></div>
+                <Button size="sm" variant="ghost" disabled={!!busy} onClick={() => void clientAction(client, target, kind, "preview")}>{t("Preview")}</Button>
+                <Button size="sm" variant="outline" disabled={!!busy} onClick={() => void clientAction(client, target, kind, configured ? "remove" : "install")}>{t(configured ? "Disconnect" : "Connect")}</Button>
+              </div>;
+            })}</div>
+          </section>)}</div>
+        </div>)}
       </section>)}</div>
       {preview && <pre className="mt-4 max-h-96 overflow-auto rounded-md border border-border p-4 text-[11px]">{preview}</pre>}
       <details className="mt-5 text-[13px] text-muted-foreground"><summary className="cursor-pointer hover:text-foreground">{t("Enable capture for a project")}</summary><p className="mt-2 leading-6">{t("Session capture requires a .ai-memory.toml file in the project root with its workspace and project names. Reload the client after connecting.")}</p></details>

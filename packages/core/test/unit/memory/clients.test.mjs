@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -34,6 +34,36 @@ test("client removal restores only an unchanged owned postimage and never delete
     assert.equal(readFileSync(path.join(data, "kept.txt"), "utf8"), "memory");
     await assert.rejects(clients.change("../../bad", "mcp", "install"), /Unsupported/);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("AgentRouter profiles have independent Codex targets and receipts", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "ar-memory-profile-target-"));
+  const configDir = path.join(root, "agentrouter");
+  const home = path.join(root, "home");
+  const profiles = [{ id: "codexcompany", name: "CodexCompany", agent: "codex", enabled: true, scope: "agentrouter", model: "" }];
+  const calls = [];
+  const clients = new MemoryClients(home, path.join(root, "data"), "http://127.0.0.1:49374", async args => {
+    calls.push(args);
+    if (args.includes("--apply")) {
+      const file = args[args.indexOf("--config-file") + 1];
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, 'user_setting = true\n[mcp_servers.ai-memory]\nurl = "http://127.0.0.1:49374/mcp"\n');
+    }
+    return "installed";
+  }, process.env, () => "token", () => { throw new Error("not needed"); }, configDir);
+  try {
+    const codex = clients.list(profiles).find((item) => item.id === "codex");
+    assert.deepEqual(codex.targets.map((target) => target.id), ["global", "codexcompany"]);
+    assert.equal(codex.targets[1].label, "CodexCompany");
+    assert.equal(codex.targets[1].mcpPath, path.join(configDir, "profiles/codexcompany/codex/config.toml"));
+    await clients.change("codex", "codexcompany", "mcp", "install", profiles);
+    const profileTarget = clients.list(profiles).find((item) => item.id === "codex").targets.find((target) => target.id === "codexcompany");
+    assert.equal(profileTarget.mcpConfigured, true);
+    assert.equal(clients.list(profiles).find((item) => item.id === "codex").mcpConfigured, false);
+    await clients.change("codex", "codexcompany", "mcp", "remove", profiles);
+    assert.equal(existsSync(path.join(configDir, "profiles/codexcompany/codex/config.toml")), false);
+    assert.ok(calls.some((args) => args.includes(path.join(configDir, "profiles/codexcompany/codex/config.toml"))));
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("shared client configuration tracks both integrations and restores them in reverse order", async () => {
