@@ -54,7 +54,7 @@ const MAX_ENCODED_NAME: usize = 240;
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// app 只认这一版副本;别的版本照样按形状读,记一笔未知,格式漂移看得出来
 const REPLICA_SCHEMA: i64 = 1;
-const NOT_CACHED: &str = "Grok Bot no longer caches this conversation on this computer — only its last message is available in Wake.";
+const NOT_CACHED: &str = "Grok Bot no longer caches this conversation on this computer — only its last message is available in AgentRouter.";
 const EARLIER_ONLY_IN_APP: &str =
     "── Earlier messages of this conversation are only in Grok Bot ──";
 

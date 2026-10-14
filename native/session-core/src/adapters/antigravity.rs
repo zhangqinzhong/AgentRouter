@@ -38,7 +38,7 @@ const APP_DIRS: [&str; 2] = ["antigravity", "antigravity-ide"];
 /// 会话目录里转录的相对路径
 const TRANSCRIPT: [&str; 3] = [".system_generated", "logs", "transcript.jsonl"];
 const ENCRYPTED_NOTE: &str =
-    "Antigravity stores this conversation encrypted — only its summary is available in Wake.";
+    "Antigravity stores this conversation encrypted — only its summary is available in AgentRouter.";
 
 /// 会话 id → 索引里那一行
 type Index = HashMap<String, AgRow>;

@@ -7483,7 +7483,7 @@ fn grok_bot_parse_contract() {
         vec![(
             Role::System,
             Text,
-            "Watches competitor launches\n\nLast message: Nothing new from the usual suspects\n\nGrok Bot no longer caches this conversation on this computer — only its last message is available in Wake."
+            "Watches competitor launches\n\nLast message: Nothing new from the usual suspects\n\nGrok Bot no longer caches this conversation on this computer — only its last message is available in AgentRouter."
         )]
     );
 

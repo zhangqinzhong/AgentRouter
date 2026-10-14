@@ -162,7 +162,7 @@ const F_FROM: FlagSpec = FlagSpec::new(
     "from_seq",
     Arity::Value,
     "SEQ",
-    "start at this message seq (a wake://…#N reference sets it too)",
+    "start at this message seq (an agentrouter://…#N reference sets it too)",
 );
 const F_MESSAGES: FlagSpec = FlagSpec::new(
     "--messages",
@@ -642,15 +642,16 @@ KEYS AND REFERENCES:
   from a remote host. `sessions` and `search` print the key of every session
   they list; `search` also prints a reference under each snippet:
 
-      ref: wake://session/claude-code:1b2c…#42
+      ref: agentrouter://session/claude-code:1b2c…#42
 
-  Pass a reference to `show` and the page starts at that message.
+  Pass a reference to `show` and the page starts at that message. A historical
+  wake:// reference still opens.
 
 EXAMPLES:
   agentrouter-session-cli sessions --project \"$PWD\" --limit 5
   agentrouter-session-cli search \"useEffect(\" --project \"$PWD\" --since 7d
   agentrouter-session-cli search \"rate limiter\" --agent codex --agent claude-code
-  agentrouter-session-cli show 'wake://session/claude-code:1b2c…#42' --tools
+  agentrouter-session-cli show 'agentrouter://session/claude-code:1b2c…#42' --tools
   agentrouter-session-cli search -- --dry-run          # a query that starts with a dash
 
 EXIT CODES:
@@ -782,9 +783,9 @@ whether an error has been seen before — git history does not hold that.
     agentrouter-session-cli show <key>
     agentrouter-session-cli memories --project \"$PWD\"
 
-`sessions` and `search` print a key for every session; `search` also prints a
-`wake://session/<key>#<seq>` reference that `show` accepts. `memories` lists the
-notes agents keep for themselves about the project, each with a `wake://memory/…`
+`sessions` and `search` print a key for every session; `search` also prints an
+`agentrouter://session/<key>#<seq>` reference that `show` accepts. `memories` lists the
+notes agents keep for themselves about the project, each with an `agentrouter://memory/…`
 reference `show` accepts. Always pass --project \"$PWD\" — without it every
 project on the machine is in scope. Everything is read-only.";
 
@@ -866,7 +867,7 @@ pub fn handoff_text(key: &str, title: &str, cli_bin: Option<&Path>) -> String {
     };
     format!(
         "{opener}\nSession key: {key}\n\
-         Read it with the wake_get_session MCP tool (key above), or from a shell:\n\
+         Read it with the ar_session_read MCP tool (key above), or from a shell:\n\
          {cli} show {shell_key}\n"
     )
 }
@@ -975,7 +976,7 @@ mod tests {
     #[test]
     fn agent_memo_mentions_memories() {
         assert!(AGENT_MEMO.contains("agentrouter-session-cli memories --project"));
-        assert!(AGENT_MEMO.contains("wake://memory/"));
+        assert!(AGENT_MEMO.contains("agentrouter://memory/"));
     }
 
     fn p(a: &[&str]) -> Result<Invocation, CliError> {
@@ -1011,7 +1012,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\nSession key: claude-code:abc\n"));
-        assert!(text.contains("wake_get_session"));
+        assert!(text.contains("ar_session_read"));
         assert!(
             text.ends_with(
                 "'/Applications/AgentRouter Dev.app/Contents/MacOS/agentrouter-session-cli' show claude-code:abc\n"
@@ -1291,7 +1292,7 @@ mod tests {
         for a in AgentId::ALL {
             assert!(h.contains(a.as_str()), "help 缺 agent {}", a.as_str());
         }
-        assert!(h.contains("wake://session/"));
+        assert!(h.contains("agentrouter://session/"));
         assert!(h.contains("EXIT CODES:"));
         // 默认值与取值区间现渲染,不是手写进散文里的
         assert!(

@@ -102,12 +102,12 @@ own to recall context.";
 pub(crate) const TOOL_ON_REQUEST: &str = "Call it only when the user explicitly asks you to \
 look something up in AgentRouter or in their past sessions; don't call it on your own to recall \
 context.";
-const INSTRUCTIONS_HOW: &str = "Start with wake_list_sessions (pass the current working \
-directory as `project`) or wake_search, then read the relevant transcript with \
-wake_get_session; wake_list_projects shows which projects have history. wake_list_memories \
+const INSTRUCTIONS_HOW: &str = "Start with ar_session_list (pass the current working \
+directory as `project`) or ar_session_search, then read the relevant transcript with \
+ar_session_read; ar_session_projects shows which projects have history. ar_session_memories \
 lists the notes agents keep for themselves about a project (Claude Code and ZCode \
-auto-memory, Codex memories); read one by passing its wake://memory/… reference to \
-wake_get_session. Nothing here can modify a session or a memory file.";
+auto-memory, Codex memories); read one by passing its agentrouter://memory/… reference to \
+ar_session_read. Nothing here can modify a session or a memory file.";
 
 pub fn instructions(usage: Usage) -> String {
     usage.compose(

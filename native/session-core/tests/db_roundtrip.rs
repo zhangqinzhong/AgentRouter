@@ -472,6 +472,16 @@ fn nested_sessions_are_aggregated_but_starred_stays_flat() {
         Some(parent.key.clone())
     );
     assert_eq!(store.agent_counts().unwrap()["grok"], 2);
+    assert_eq!(store.agent_counts_since(Some(450)).unwrap()["grok"], 1);
+    assert!(store.agent_counts_since(Some(600)).unwrap().get("grok").is_none());
+    let recent = SessionFilter {
+        roots_only: true,
+        updated_since: Some(450),
+        limit: 20,
+        ..Default::default()
+    };
+    assert_eq!(store.list_sessions(&recent).unwrap().1, 1);
+    assert_eq!(store.list_projects_since(false, Some(450)).unwrap().len(), 1);
     assert_eq!(
         store
             .list_projects(false)

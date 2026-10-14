@@ -48,17 +48,19 @@ fn reader<'a>(
     adapters::adapter_for(adapters, meta.agent, &meta.file_path)
         .context("Client location unavailable")
 }
+const TRANSCRIPT_PAGE: usize = 60;
+
 fn rows(messages: Vec<TranscriptMessage>, offset: usize) -> Value {
     let total = messages.len();
     let mut image_budget = 4 * 1024 * 1024usize;
-    let rows:Vec<Value>=messages.into_iter().skip(offset).take(60).map(|m|{
+    let rows:Vec<Value>=messages.into_iter().skip(offset).take(TRANSCRIPT_PAGE).map(|m|{
   let images:Vec<Value>=m.images.iter().filter_map(|im|{
    if !matches!(im.media_type.as_str(),"image/png"|"image/jpeg"|"image/gif"|"image/webp")||im.bytes.len()>image_budget{return None}
    image_budget-=im.bytes.len();Some(json!({"url":format!("data:{};base64,{}",im.media_type,base64::engine::general_purpose::STANDARD.encode(&im.bytes)),"offset":im.text_offset}))
   }).collect();
   json!({"id":m.seq,"seq":m.seq,"role":m.role,"kind":m.kind,"text":m.text,"thinking":m.thinking,"tools":m.tool_calls,"images":images,"timestamp":m.timestamp,"truncated":m.truncated})
  }).collect();
-    json!({"messages":rows,"total":total,"nextOffset":if offset+60<total{Some(offset+60)}else{None}})
+    json!({"messages":rows,"total":total,"nextOffset":if offset+TRANSCRIPT_PAGE<total{Some(offset+TRANSCRIPT_PAGE)}else{None}})
 }
 pub fn run(q: Value) -> Result<Value> {
     let op = str_arg(&q, "op")?;
@@ -133,9 +135,26 @@ pub fn run(q: Value) -> Result<Value> {
                 json!({"asOf":v.as_of,"sessions":v.sessions,"prompts":v.prompts,"projectsCount":v.project_count,"currentStreak":v.current_streak,"longestStreak":v.longest_streak,"daily":v.daily,"agents":rank(v.agents),"projects":rank(v.projects),"models":rank(v.models),"thisWeek":{"sessions":current.sessions,"prompts":current.prompts},"lastWeek":{"sessions":previous.sessions,"prompts":previous.prompts},"weekly":v.trend_agents.into_iter().map(|r|json!({"name":r.name,"weekly":r.weekly})).collect::<Vec<_>>()}),
             )
         }
-        "projects" => Ok(
-            json!({"projects":store.list_projects(false)?.into_iter().map(|p|json!({"path":p.path,"name":p.name,"count":p.session_count})).collect::<Vec<_>>(),"agents":AgentId::ALL.iter().map(|a|json!({"id":a.as_str(),"name":a.display_name()})).collect::<Vec<_>>()}),
-        ),
+        "projects" => {
+            // 侧栏数字和会话列表共用 since：不传是全部，传了就按同一棵树的活动时间收窄。
+            let since = q["since"].as_i64().filter(|t| *t > 0);
+            let counts = store.agent_counts_since(since)?;
+            let agents = AgentId::ALL
+                .iter()
+                .filter_map(|agent| {
+                    let count = *counts.get(agent.as_str())?;
+                    (count > 0).then(|| {
+                        json!({"id": agent.as_str(), "name": agent.display_name(), "count": count})
+                    })
+                })
+                .collect::<Vec<_>>();
+            let projects = store
+                .list_projects_since(false, since)?
+                .into_iter()
+                .map(|p| json!({"path": p.path, "name": p.name, "count": p.session_count}))
+                .collect::<Vec<_>>();
+            Ok(json!({"projects": projects, "agents": agents}))
+        }
         "children" => Ok(
             json!({"sessions":store.list_children(&session(&store,&q)?.key,&SessionFilter{roots_only:false,..filter})?}),
         ),
@@ -186,8 +205,12 @@ pub fn run(q: Value) -> Result<Value> {
                             || message.kind == MessageKind::CompactSummary)
                 })
                 .collect();
+            // A search seq starts the window at that message. Otherwise `tail`
+            // opens on the latest page; the first page is the oldest messages.
             let offset = if let Some(seq) = q["seq"].as_i64() {
                 messages.iter().position(|m| m.seq >= seq).unwrap_or(0)
+            } else if q["tail"].as_bool().unwrap_or(false) {
+                messages.len().saturating_sub(TRANSCRIPT_PAGE)
             } else {
                 number(&q, "offset", 0, 1000000)? as usize
             };

@@ -83,6 +83,8 @@ test('reader hides injected metadata before pagination and retains original sear
   const first=await request(env,{op:'transcript',key:row.key});assert.equal(first.messages.length,60);assert.equal(first.total,65);assert.ok(first.messages.every(m=>m.kind!=='meta'&&!m.text.includes('injected metadata')));
   const second=await request(env,{op:'transcript',key:row.key,offset:60});assert.equal(second.messages.length,5);assert.match(second.messages[0].text,/visible question 60/);assert.ok(second.messages[0].seq>60);
   const hit=(await request(env,{op:'search',query:'anchorfixture'})).hits.find(h=>h.session.key===row.key);assert.ok(hit);const jump=await request(env,{op:'transcript',key:row.key,seq:hit.seq});assert.equal(jump.offset,63);assert.equal(jump.messages[0].seq,hit.seq);assert.match(jump.messages[0].text,/anchorfixture/);
+  const tail=await request(env,{op:'transcript',key:row.key,tail:true});assert.equal(tail.total,65);assert.equal(tail.offset,5);assert.equal(tail.messages.length,60);assert.equal(tail.nextOffset,null);assert.match(tail.messages.at(-1).text,/visible question 64/);
+  const jumpWins=await request(env,{op:'transcript',key:row.key,tail:true,seq:hit.seq});assert.equal(jumpWins.messages[0].seq,hit.seq);
  }finally{await fs.rm(home,{recursive:true,force:true})}
 });
 

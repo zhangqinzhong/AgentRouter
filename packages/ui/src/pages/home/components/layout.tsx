@@ -3,9 +3,10 @@ import { AppSettingsPage } from "./settings";
 import { MemoryView } from "./memory";
 import {RoutingActivationBrand} from "@/vendor/cc-switch/RoutingActivationBrand";
 import {initializeWindowActivity} from "@/vendor/cc-switch/windowActivity";
-import {useEffect, useRef} from "react";
+import {Fragment, useEffect, useRef} from "react";
 import {LocalHeatmapView} from "./local-heatmap";
 import {LocalSessionsView} from "./local-sessions";
+import {SessionScopeNav, useSessionCatalog} from "./session-scope";
 import {LocalTrendView} from "./local-trend";
 import {LocalUsageView} from "./local-usage";
 import type { ComponentProps } from "react";
@@ -13,7 +14,7 @@ import { MorphIcon } from "@/vendor/lucide-morph";
 import { collapseSidebarToExpandInspectorMorph } from "@/lib/morph-icon";
 import {
   AnimatePresence, AppConfig, AppCopy, Button, Check, CircleAlert, cn, EndpointTitleBar,
-  AppUpdateStatus, GatewayStatus, listSpringTransition, LucideIcon, motion, motionEase,
+  AppUpdateStatus, GatewayStatus, LucideIcon, motion, motionEase,
   LoaderCircle, NavigationId, RefreshCw,
   reducedMotionTransition, Settings, ViewId,
   useAppText, ViewMotionShell, viewUsesInternalScroll
@@ -163,6 +164,8 @@ export function MainLayout({
     ? (isMac ? 188 : 124)
     : (isMac ? 152 : 88);
   const navigationGroups = groupSidebarNavigation(visibleNavigation);
+  const sessionsVisible = activeView === "sessions";
+  const sessionScope = useSessionCatalog(() => onSelectNavigationItem("sessions"), sessionsVisible);
 
   return (
     <>
@@ -245,14 +248,32 @@ export function MainLayout({
                   </div> : null}
                   <div className="grid min-w-0 gap-1 max-[720px]:contents">
                     {group.items.map((item) => (
-                      <SidebarNavigationButton
-                        active={activeView === item.id}
-                        item={item}
-                        key={item.id}
-                        label={copy.navigation[item.id]}
-                        onClick={() => onSelectNavigationItem(item.id)}
-                        shouldReduceMotion={shouldReduceMotion}
-                      />
+                      <Fragment key={item.id}>
+                        <SidebarNavigationButton
+                          active={item.id === "sessions" ? sessionsVisible && sessionScope.agent === "all" && sessionScope.project === "all" : activeView === item.id}
+                          item={item}
+                          label={copy.navigation[item.id]}
+                          onClick={() => {
+                            if (item.id === "sessions") sessionScope.clear();
+                            onSelectNavigationItem(item.id);
+                          }}
+                        />
+                        {item.id === "sessions" ? (
+                          <SessionScopeNav
+                            agent={sessionScope.agent}
+                            agents={sessionScope.agents}
+                            agentsOpen={sessionScope.agentsOpen}
+                            onSelectAgent={sessionScope.selectAgent}
+                            onSelectProject={sessionScope.selectProject}
+                            onToggleAgents={sessionScope.toggleAgents}
+                            onToggleProjects={sessionScope.toggleProjects}
+                            project={sessionScope.project}
+                            projects={sessionScope.projects}
+                            projectsOpen={sessionScope.projectsOpen}
+                            sessionsVisible={sessionsVisible}
+                          />
+                        ) : null}
+                      </Fragment>
                     ))}
                   </div>
                 </div>
@@ -299,6 +320,10 @@ export function MainLayout({
             activeView={activeView}
             agentAnalysisEnabled={agentAnalysisEnabled}
             networkCaptureEnabled={networkCaptureEnabled}
+            onSessionCatalogRefresh={sessionScope.reload}
+            sessionAgent={sessionScope.agent}
+            sessionProject={sessionScope.project}
+            sessionScopeNonce={sessionScope.scopeNonce}
             viewProps={viewProps}
           />
         </div>
@@ -311,19 +336,17 @@ function SidebarNavigationButton({
   active,
   item,
   label,
-  onClick,
-  shouldReduceMotion
+  onClick
 }: {
   active: boolean;
   item: MainNavigationItem;
   label: string;
   onClick: () => void;
-  shouldReduceMotion: boolean | null;
 }) {
   return (
     <Button
       className={cn(
-        "flex h-9 min-w-0 items-center gap-2 rounded-md px-2 text-left text-[13px] font-medium text-muted-foreground transition-all duration-150 max-[720px]:min-w-[118px]",
+        "flex h-9 min-w-0 items-center gap-2 rounded-md px-2 text-left text-[13px] font-medium text-muted-foreground transition-colors duration-150 max-[720px]:min-w-[118px]",
         active
           ? "bg-card text-foreground shadow-[0_1px_3px_rgba(0,0,0,0.06)]"
           : "hover:bg-muted/80 hover:text-foreground"
@@ -333,16 +356,15 @@ function SidebarNavigationButton({
       type="button"
       unstyled
     >
-      <motion.span
+      {/* Icon stays in flow with its label. A layout animation springs it up on its own when the session tree under 会话 collapses. */}
+      <span
         className={cn(
           "flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors",
           active && "bg-primary/10 text-primary"
         )}
-        layout="position"
-        transition={shouldReduceMotion ? reducedMotionTransition : listSpringTransition}
       >
         <item.icon className="h-3.5 w-3.5" />
-      </motion.span>
+      </span>
       <span className="min-w-0 flex-1 truncate">{label}</span>
     </Button>
   );
@@ -448,11 +470,19 @@ function MainViewSwitch({
   activeView,
   agentAnalysisEnabled,
   networkCaptureEnabled,
+  onSessionCatalogRefresh,
+  sessionAgent,
+  sessionProject,
+  sessionScopeNonce,
   viewProps
 }: {
   activeView: ViewId;
   agentAnalysisEnabled: boolean;
   networkCaptureEnabled: boolean;
+  onSessionCatalogRefresh: (since?: number) => void;
+  sessionAgent: string;
+  sessionProject: string;
+  sessionScopeNonce: number;
   viewProps: MainViewProps;
   configLoaded: boolean;
 }) {
@@ -462,7 +492,7 @@ function MainViewSwitch({
       <ViewMotionShell key={activeView} view={activeView}>
         {activeView === "settings" || activeView === "server" ? <AppSettingsPage {...viewProps.settings} initialPage={activeView === "server" ? "general" : viewProps.settings.initialPage} /> : null}
         {activeView === "usage" && configLoaded ? <LocalUsageView defaultRange={defaults.usage} /> : null}
-        {activeView === "sessions" && configLoaded ? <LocalSessionsView defaultRange={defaults.sessions} /> : null}
+        {activeView === "sessions" && configLoaded ? <LocalSessionsView agent={sessionAgent} onCatalogRefresh={onSessionCatalogRefresh} project={sessionProject} scopeNonce={sessionScopeNonce} /> : null}
         {activeView === "trend" && configLoaded ? <LocalTrendView defaultRange={defaults.trend} /> : null}
         {activeView === "heatmap" && configLoaded ? <LocalHeatmapView /> : null}
         {activeView === "memory" ? <MemoryView /> : null}

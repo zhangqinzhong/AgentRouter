@@ -21,6 +21,93 @@ export function groupTranscript(messages: Message[]): Message[][] {
   }, []);
 }
 
+type MemoryEntry = {
+  path: string;
+  start?: string;
+  end?: string;
+  note: string;
+};
+type MemoryCitation = { entries: MemoryEntry[]; rolloutIds: string[] };
+
+// Codex appends one memory citation to a final answer. The outer tag is HTML,
+// so skipHtml removes it; citation_entries and rollout_ids contain underscores
+// and stay on screen as literal tags. Parse the block before Markdown.
+function parseMemoryCitation(entriesText: string, rolloutText: string): MemoryCitation {
+  const entries = entriesText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = /^(.+):(\d+)-(\d+)\|note=\[(.*)\]$/.exec(line);
+      if (!match) return { path: line, note: "" };
+      return { path: match[1], start: match[2], end: match[3], note: match[4] };
+    });
+  return {
+    entries,
+    rolloutIds: rolloutText
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean),
+  };
+}
+
+function splitMemoryCitations(text: string): { body: string; citations: MemoryCitation[] } {
+  const fences: string[] = [];
+  const masked = text.replace(/```[\s\S]*?```/g, (fence) => {
+    const token = `\u0000${fences.length}\u0000`;
+    fences.push(fence);
+    return token;
+  });
+  const citations: MemoryCitation[] = [];
+  const stripped = masked.replace(
+    /<oai-mem-citation>\s*<citation_entries>([\s\S]*?)<\/citation_entries>\s*<rollout_ids>([\s\S]*?)<\/rollout_ids>\s*<\/oai-mem-citation>/g,
+    (_match, entries, rollouts) => {
+      const citation = parseMemoryCitation(entries, rollouts);
+      if (citation.entries.length === 0 && citation.rolloutIds.length === 0) return "";
+      citations.push(citation);
+      return "";
+    },
+  );
+  return {
+    citations,
+    body: stripped
+      .replace(/\u0000(\d+)\u0000/g, (_match, index) => fences[Number(index)] ?? "")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/^\n+|\n+$/g, ""),
+  };
+}
+
+function MemoryCitations({ citations, zh }: { citations: MemoryCitation[]; zh: boolean }) {
+  if (citations.length === 0) return null;
+  return (
+    <div className="mt-3 border-t border-border/40 pt-3 text-xs leading-6 text-muted-foreground">
+      <div>{zh ? "记忆引用" : "Memory citation"}</div>
+      {citations.map((citation, index) => (
+        <div key={index}>
+          {citation.entries.map((entry, entryIndex) => (
+            <div key={entryIndex} className="mt-1">
+              {entry.note ? <div className="break-words">{entry.note}</div> : null}
+              <div className="font-mono break-words">
+                {entry.start ? `${entry.path}:${entry.start}-${entry.end}` : entry.path}
+              </div>
+            </div>
+          ))}
+          {citation.rolloutIds.length > 0 && (
+            <div className="mt-1">
+              <div>{zh ? "来源会话" : "Source session"}</div>
+              {citation.rolloutIds.map((id) => (
+                <div key={id} className="font-mono break-words">
+                  {id}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 const syntax = createLowlight(common);
 function syntaxNodes(nodes: any[]): ReactNode[] {
   return nodes.map((node, i) =>
@@ -77,6 +164,7 @@ export function TranscriptMessage({
   );
   const folded =
     context || externalTool || m.role === "tool" || m.role === "thinking";
+  const cited = useMemo(() => splitMemoryCitations(m.text), [m.text]);
   const match = highlight
     ? m.text.toLowerCase().indexOf(highlight.toLowerCase())
     : -1;
@@ -100,34 +188,39 @@ export function TranscriptMessage({
         </pre>
       ) : (
         <div className="session-markdown text-[14px] leading-7 [overflow-wrap:anywhere]">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            components={{
-              code: TranscriptCode,
-              img: ({ alt }) => (
-                <span className="text-muted-foreground">
-                  [{zh ? "图片" : "Image"}
-                  {alt ? `: ${alt}` : ""}]
-                </span>
-              ),
-              a: ({ href, children }) => (
-                <a
-                  href={href && /^https?:\/\//i.test(href) ? href : undefined}
-                  target="_blank"
-                  rel="noreferrer noopener"
-                >
-                  {children}
-                </a>
-              ),
-              table: ({ children }) => (
-                <div className="overflow-x-auto">
-                  <table>{children}</table>
-                </div>
-              ),
-            }}
-          >
-            {m.text}
-          </ReactMarkdown>
+          {/* Claude 把 /effort 这类命令包在 command-name 等标签里。react-markdown 会把标签本身印成文字；跳过原始 HTML 后只留下标签里的内容。 */}
+          {cited.body ? (
+            <ReactMarkdown
+              skipHtml
+              remarkPlugins={[remarkGfm]}
+              components={{
+                code: TranscriptCode,
+                img: ({ alt }) => (
+                  <span className="text-muted-foreground">
+                    [{zh ? "图片" : "Image"}
+                    {alt ? `: ${alt}` : ""}]
+                  </span>
+                ),
+                a: ({ href, children }) => (
+                  <a
+                    href={href && /^https?:\/\//i.test(href) ? href : undefined}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                  >
+                    {children}
+                  </a>
+                ),
+                table: ({ children }) => (
+                  <div className="overflow-x-auto">
+                    <table>{children}</table>
+                  </div>
+                ),
+              }}
+            >
+              {cited.body}
+            </ReactMarkdown>
+          ) : null}
+          <MemoryCitations citations={cited.citations} zh={zh} />
         </div>
       )}
       {m.truncated && (

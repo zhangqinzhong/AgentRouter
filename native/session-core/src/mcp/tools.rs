@@ -101,13 +101,12 @@ impl From<anyhow::Error> for ToolError {
 
 type ToolResult = Result<String, ToolError>;
 
-pub const SEARCH: &str = "wake_search";
-pub const LIST_SESSIONS: &str = "wake_list_sessions";
-pub const GET_SESSION: &str = "wake_get_session";
-pub const LIST_PROJECTS: &str = "wake_list_projects";
-pub const LIST_MEMORIES: &str = "wake_list_memories";
-/// 工具名的清单:自指回声过滤与 wake_lookups 记账(`adapters::wake_lookup_kind`)与
-/// definitions 的稳定性测试都读它,加一家改这里与 `definitions()` 两处即可
+pub const SEARCH: &str = "ar_session_search";
+pub const LIST_SESSIONS: &str = "ar_session_list";
+pub const GET_SESSION: &str = "ar_session_read";
+pub const LIST_PROJECTS: &str = "ar_session_projects";
+pub const LIST_MEMORIES: &str = "ar_session_memories";
+/// 当前工具名。`definitions()` 与 CLI 命令表都读它。
 pub const NAMES: [&str; 5] = [
     SEARCH,
     LIST_SESSIONS,
@@ -115,11 +114,19 @@ pub const NAMES: [&str; 5] = [
     LIST_PROJECTS,
     LIST_MEMORIES,
 ];
+/// 历史 Wake 工具名。回声过滤仍认它们,避免旧转录被重新索引。
+pub const LEGACY_NAMES: [&str; 5] = [
+    "wake_search",
+    "wake_list_sessions",
+    "wake_get_session",
+    "wake_list_projects",
+    "wake_list_memories",
+];
 
 const MAX_SEARCH_SESSIONS: i64 = 30;
 const MAX_LIST_SESSIONS: i64 = 100;
 const MAX_LIST_MEMORIES: i64 = 100;
-/// wake_search 末尾附带的记忆命中数
+/// ar_session_search 末尾附带的记忆命中数
 const MEMORY_HITS_IN_SEARCH: i64 = 5;
 const MAX_LIST_PROJECTS: i64 = 200;
 const SNIPPETS_PER_SESSION: usize = 3;
@@ -172,7 +179,7 @@ pub fn definitions_for(usage: Usage) -> Vec<Value> {
             "description": describe(
                 "Full-text search across every indexed coding-agent session on this machine (session titles, user prompts, assistant replies, tool names and inputs).",
                 Some("Use it when the user asks whether something was discussed, tried or solved before, or wants the conversation about a topic, an error message, a file or a decision — git history does not hold that."),
-                "Terms are ANDed; CJK text and code substrings like `useEffect(` work. Returns matching sessions with up to three snippets each, plus a `wake://session/<key>#<seq>` reference per snippet that you can read with wake_get_session.",
+                "Terms are ANDed; CJK text and code substrings like `useEffect(` work. Returns matching sessions with up to three snippets each, plus an `agentrouter://session/<key>#<seq>` reference per snippet that you can read with ar_session_read.",
             ),
             "inputSchema": {
                 "type": "object",
@@ -193,7 +200,7 @@ pub fn definitions_for(usage: Usage) -> Vec<Value> {
             "description": describe(
                 "Most recently updated coding-agent sessions, optionally scoped to a project, to some agents, to a time window, or to starred sessions.",
                 Some("Use it when the user asks what they or an agent worked on recently, wants to resume or continue earlier work, or refers to \"yesterday's session\", \"last time\", \"what Codex did here\"."),
-                "Pass the current working directory as `project`. It returns the session keys wake_get_session needs. Subagent sessions are folded into their parents; archived sessions are excluded.",
+                "Pass the current working directory as `project`. It returns the session keys ar_session_read needs. Subagent sessions are folded into their parents; archived sessions are excluded.",
             ),
             "inputSchema": {
                 "type": "object",
@@ -214,12 +221,12 @@ pub fn definitions_for(usage: Usage) -> Vec<Value> {
             "description": describe(
                 "Read one session's transcript, parsed live from the agent's own files, as compact Markdown: user and assistant messages with `[seq N]` markers, tool calls folded to one line each, injected context omitted.",
                 None,
-                "Use it after wake_search or wake_list_sessions to see what actually happened — the reasoning, the decisions and the exact steps of an earlier session. Paginated: when the reply ends with a `from_seq` hint, call again with it to continue. Accepts a session key or a `wake://session/<key>#<seq>` reference (the seq becomes the starting point). Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript; pass one's id as `subagent` to read it. Also reads memory files: pass a `wake://memory/<key>` reference from wake_list_memories or wake_search to get that file.",
+                "Use it after ar_session_search or ar_session_list to see what actually happened — the reasoning, the decisions and the exact steps of an earlier session. Paginated: when the reply ends with a `from_seq` hint, call again with it to continue. Accepts a session key or an `agentrouter://session/<key>#<seq>` reference (the seq becomes the starting point). Historical `wake://` references still open. Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript; pass one's id as `subagent` to read it. Also reads memory files: pass an `agentrouter://memory/<key>` reference from ar_session_memories or ar_session_search to get that file.",
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "Session key such as `claude-code:1b2c…`, a wake://session/… reference, or a wake://memory/… reference to read a memory file." },
+                    "key": { "type": "string", "description": "Session key such as `claude-code:1b2c…`, an agentrouter://session/… reference, or an agentrouter://memory/… reference to read a memory file. Historical wake:// references still open." },
                     "from_seq": { "type": "integer", "minimum": 0, "description": "Start at this message seq (inclusive). Default: the beginning." },
                     "max_messages": { "type": "integer", "minimum": 1, "maximum": 200, "default": 60, "description": "Messages per page." },
                     "max_chars": { "type": "integer", "minimum": 200, "maximum": 100000, "default": 20000, "description": "Character budget per page." },
@@ -255,7 +262,7 @@ pub fn definitions_for(usage: Usage) -> Vec<Value> {
             "description": describe(
                 "The memory files coding agents keep for themselves on this machine — Claude Code's and ZCode's per-project auto-memory (MEMORY.md and its topic files), Codex's memories — plus the instruction files the user keeps for them (CLAUDE.md, AGENTS.md, GEMINI.md, .cursor/rules, .kiro/steering, copilot-instructions.md), read-only, grouped by project, user memory (the notes that apply to every project) last.",
                 Some("Use it when the user asks what an agent already knows or remembers about a project, or to reuse another agent's notes: decisions, conventions, gotchas."),
-                "Each entry ends with a `wake://memory/<key>` reference; read one with wake_get_session.",
+                "Each entry ends with an `agentrouter://memory/<key>` reference; read one with ar_session_read.",
             ),
             "inputSchema": {
                 "type": "object",
@@ -314,7 +321,7 @@ const CONTEXT_REPLY_CHARS: usize = 120;
 /// 时间挑,用得最多的那一家会把别家整个挤出去,而交接要的恰恰是别家做到哪了;一句用户提问
 /// 都没有的会话(别的 agent 代跑的、刚开还没说话的)不列。认不出项目、这段时间没有会话时给
 /// None——钩子的输出原样进 agent 的上下文,"没有结果"的提示与已知项目清单在这里只是噪音。
-/// 筛选与 wake_list_sessions 同一份(`recent_roots`)。不是 MCP 工具、没有要逐字节对齐的另一面,
+/// 筛选与 ar_session_list 同一份(`recent_roots`)。不是 MCP 工具、没有要逐字节对齐的另一面,
 /// 只读索引(会话行与消息单元)、不读会话文件,所以不经 ToolContext、不要 roster
 pub fn session_start_context(
     store: &Store,
@@ -385,7 +392,7 @@ pub fn session_start_context(
             out.push_str(&format!("  last reply: \"{reply}\"\n"));
         }
     }
-    out.push_str("\nRead one with the wake_get_session tool, or run `agentrouter-session-cli show <key>`.\n");
+    out.push_str("\nRead one with the ar_session_read tool, or run `agentrouter-session-cli show <key>`.\n");
     Ok(Some(out))
 }
 
@@ -721,15 +728,15 @@ fn clean_snippet(s: &str) -> String {
 }
 
 fn session_ref(key: &str, seq: i64) -> String {
-    format!("wake://session/{key}#{seq}")
+    format!("agentrouter://session/{key}#{seq}")
 }
 
 fn memory_ref(key: &str) -> String {
-    format!("wake://memory/{key}")
+    format!("agentrouter://memory/{key}")
 }
 
-/// `wake_get_session` 的 `key` 参数认的三种形态:裸会话 key、`wake://session/<key>#<seq>`
-/// (seq 成为默认起点)、`wake://memory/<key>`(记忆文件,另一条读法)。写引用的
+/// `ar_session_read` 的 `key` 参数认的三种形态:裸会话 key、`agentrouter://session/<key>#<seq>`
+/// (seq 成为默认起点)、`agentrouter://memory/<key>`(记忆文件,另一条读法)。写引用的
 /// `session_ref` / `memory_ref` 与读引用的 `parse` 放在一起,两边一起改。记忆 key
 /// 自身可含 `#`(SQLite 型虚拟路径 `<db>#<id>`),所以先认 scheme 再拆 seq
 #[derive(Debug, PartialEq, Eq)]
@@ -741,12 +748,17 @@ enum WakeRef {
 impl WakeRef {
     fn parse(raw: &str) -> Self {
         let s = raw.trim();
-        if let Some(key) = s.strip_prefix("wake://memory/") {
-            return Self::Memory {
-                key: key.trim().to_string(),
-            };
+        for prefix in ["agentrouter://memory/", "wake://memory/"] {
+            if let Some(key) = s.strip_prefix(prefix) {
+                return Self::Memory {
+                    key: key.trim().to_string(),
+                };
+            }
         }
-        let s = s.strip_prefix("wake://session/").unwrap_or(s);
+        let s = ["agentrouter://session/", "wake://session/"]
+            .iter()
+            .find_map(|prefix| s.strip_prefix(prefix))
+            .unwrap_or(s);
         match s.rsplit_once('#') {
             Some((key, seq)) if seq.parse::<i64>().is_ok() => Self::Session {
                 key: key.to_string(),
@@ -813,7 +825,7 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
             out.push_str("Note: terms shorter than 3 characters use a substring scan; try a longer or more specific term.\n");
         }
         if memory.is_empty() {
-            out.push_str("Try fewer or different terms, drop the project/agent/since filters, or list sessions with wake_list_sessions.\n\n");
+            out.push_str("Try fewer or different terms, drop the project/agent/since filters, or list sessions with ar_session_list.\n\n");
         }
         out.push_str(&memory);
         out.push_str(&index_note(ctx.store));
@@ -864,15 +876,15 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
         out.push('\n');
     }
     out.push_str(
-        "Read a session with wake_get_session (pass the key, or a ref to start at that message).\n",
+        "Read a session with ar_session_read (pass the key, or a ref to start at that message).\n",
     );
     out.push_str(&memory);
     out.push_str(&index_note(ctx.store));
     Ok(out)
 }
 
-/// wake_search 末尾附带的记忆命中:agent 自己写的记忆里提到这个词的几份,带
-/// `wake://memory/…` 引用。整段前后各一个空行,调用方直接拼、不用管分隔;没有就是空串
+/// ar_session_search 末尾附带的记忆命中:agent 自己写的记忆里提到这个词的几份,带
+/// `agentrouter://memory/…` 引用。整段前后各一个空行,调用方直接拼、不用管分隔;没有就是空串
 fn memory_hits_section(
     ctx: &ToolContext,
     query: &str,
@@ -991,22 +1003,22 @@ fn list_memories(ctx: &ToolContext, args: &Value) -> ToolResult {
             memory_ref(&d.key)
         ));
     }
-    out.push_str("\nRead one with wake_get_session using its wake://memory/… reference.\n");
+    out.push_str("\nRead one with ar_session_read using its agentrouter://memory/… reference.\n");
     out.push_str(&index_note(ctx.store));
     Ok(out)
 }
 
-/// `wake_get_session` 收到 `wake://memory/<key>` 引用时的读法:标题行 + 归属 + 来源
+/// `ar_session_read` 收到 `agentrouter://memory/<key>` 引用时的读法:标题行 + 归属 + 来源
 /// 路径,然后是正文。文件型现场读磁盘(agent 刚改过也能看到),读不到退库里那份;
 /// SQLite 型只有库里那份。同一个 `max_chars` 预算,超了截断并说明
-/// `wake_get_session` 读记忆时一页的字符上限(与会话页同数);`int_arg` 静默封顶
+/// `ar_session_read` 读记忆时一页的字符上限(与会话页同数);`int_arg` 静默封顶
 const MAX_GET_CHARS: usize = 100_000;
 
 fn get_memory(ctx: &ToolContext, key: &str, args: &Value) -> ToolResult {
     let max_chars = int_arg(args, "max_chars", 20_000, 200, MAX_GET_CHARS as i64)? as usize;
     let Some(doc) = ctx.store.get_memory(key)? else {
         return Err(ToolError::Failed(format!(
-            "No memory file with key `{key}`; get a wake://memory/… reference from wake_list_memories or wake_search."
+            "No memory file with key `{key}`; get an agentrouter://memory/… reference from ar_session_memories or ar_session_search."
         )));
     };
     let body = crate::adapters::memory_body(&doc);
@@ -1053,7 +1065,7 @@ fn get_memory(ctx: &ToolContext, key: &str, args: &Value) -> ToolResult {
     Ok(out)
 }
 
-/// 最近的根会话:wake_list_sessions 与新会话开场的上下文共用这一份筛选——不含归档、按
+/// 最近的根会话:ar_session_list 与新会话开场的上下文共用这一份筛选——不含归档、按
 /// 更新时间、置顶不优先。字段全列、不带 ..Default:新增筛选字段时这里必须表态(与
 /// workbench current_filter 同一约定)
 fn recent_roots(
@@ -1111,7 +1123,7 @@ fn list_sessions(ctx: &ToolContext, args: &Value) -> ToolResult {
         out.push_str("- ");
         out.push_str(&session_line(s));
     }
-    out.push_str("\nRead one with wake_get_session using its key.\n");
+    out.push_str("\nRead one with ar_session_read using its key.\n");
     out.push_str(&index_note(ctx.store));
     Ok(out)
 }
@@ -1159,7 +1171,7 @@ fn list_projects(ctx: &ToolContext, args: &Value) -> ToolResult {
             fmt_time(Some(p.last_active))
         ));
     }
-    out.push_str("\nUse a path as `project` in wake_list_sessions or wake_search.\n");
+    out.push_str("\nUse a path as `project` in ar_session_list or ar_session_search.\n");
     out.push_str(&index_note(ctx.store));
     Ok(out)
 }
@@ -1173,7 +1185,7 @@ fn find_session(store: &Store, key: &str) -> Result<Result<SessionMeta, String>,
     Ok(match candidates.as_slice() {
         [one] => Ok(one.clone()),
         [] => Err(format!(
-            "No session with key `{key}`. Keys look like `claude-code:<id>` (or `<agent>:<host>:<id>` for remote hosts); get one from wake_search or wake_list_sessions."
+            "No session with key `{key}`. Keys look like `claude-code:<id>` (or `<agent>:<host>:<id>` for remote hosts); get one from ar_session_search or ar_session_list."
         )),
         many => Err(format!(
             "`{key}` is ambiguous — {} sessions share that id:\n{}",
@@ -1193,7 +1205,7 @@ const MAX_SUBAGENTS_LISTED: usize = 30;
 const MAX_CHILDREN_LISTED: usize = 30;
 
 /// 挂在这条会话下面的子会话。它们是完整会话(各有 key、各自可分页读),
-/// 但 `wake_list_sessions` 只给根(roots_only),所以父会话是唯一的发现
+/// 但 `ar_session_list` 只给根(roots_only),所以父会话是唯一的发现
 /// 入口——Codex 的 `spawn_agent` 子代理、Grok 的子会话都走这里。
 /// 与侧边的 subagent 转录不是一回事:那些没有自己的 key,按 id 读
 fn child_sessions(ctx: &ToolContext, parent_key: &str) -> Vec<SessionMeta> {
@@ -1392,7 +1404,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     if !meta.host.is_empty() {
         facts.push(format!("host: @{}", meta.host));
     }
-    // 子会话给出回父会话的路:它自己不在 wake_list_sessions 的结果里,
+    // 子会话给出回父会话的路:它自己不在 ar_session_list 的结果里,
     // 读者多半是顺着搜索命中落进来的,得知道上下文挂在哪
     if let Ok(Some(parent)) = ctx.store.parent_key_of(&meta.key) {
         facts.push(format!("parent: `{parent}`"));
@@ -1439,7 +1451,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     out.push_str(&facts.join(" · "));
     out.push_str("\n\n");
 
-    // 子会话页脚在空页上也得给:`wake_list_sessions` 只回根会话,父会话是
+    // 子会话页脚在空页上也得给:`ar_session_list` 只回根会话,父会话是
     // 它们唯一的发现入口,而"这一页什么都没渲染"(整条都是 Meta、from_seq
     // 翻过了尾)与"没有子会话"是两回事
     let children = if sub_id.is_none() {
@@ -1587,6 +1599,16 @@ mod tests {
         let memory_key = "codex:/home/me/.codex/memories_1.sqlite#t-0001";
         assert_eq!(
             WakeRef::parse(&memory_ref(memory_key)),
+            WakeRef::Memory {
+                key: memory_key.to_string()
+            }
+        );
+        assert_eq!(
+            WakeRef::parse("wake://session/claude-code:abc#12"),
+            session("claude-code:abc", Some(12))
+        );
+        assert_eq!(
+            WakeRef::parse(&format!("wake://memory/{memory_key}")),
             WakeRef::Memory {
                 key: memory_key.to_string()
             }

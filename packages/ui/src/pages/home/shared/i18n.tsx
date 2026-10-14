@@ -973,6 +973,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       "7d": "7 天",
       "30d": "30 天",
       "Agent": "Agent",
+      "Projects": "项目",
       "A provider is required before profiles can route traffic.": "需要先配置供应商，配置档案才能路由请求。",
       "A real model request succeeded with the selected provider settings.": "已使用当前供应商设置成功完成一次真实模型请求。",
       "Add or verify a model provider.": "添加或确认模型供应商。",

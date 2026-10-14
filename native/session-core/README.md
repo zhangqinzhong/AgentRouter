@@ -26,10 +26,16 @@ The read-only query commands share the same index and parser with the UI:
 - agentrouter-session-cli refresh
 
 Index/refresh update only AgentRouter's index. Queries do not modify agent data.
-agentrouter-session-mcp serves the same query tools over stdio. The bundled
-integration plugin supplies MCP and an optional SessionStart hook; installing it
-is explicit, not a side effect of opening the session view. AR_SESSION_ON_REQUEST=1
-suppresses automatic history context. AR_SESSION_BIN_DIR selects the runtime.
+agentrouter-session-mcp serves the same query tools over stdio:
+ar_session_search, ar_session_list, ar_session_read, ar_session_projects, and
+ar_session_memories. New references use agentrouter://session/<key>#<seq> and
+agentrouter://memory/<key>. Historical wake_* tool names stay out of the full-text
+index, and historical wake:// references still open. The session page is search
+and reading. SSH, cleanup, activity, and the memory-file browser stay out of that
+page; the native implementations remain. The bundled integration plugin supplies
+MCP and an optional SessionStart hook; installing it is explicit, not a side
+effect of opening the session view. AR_SESSION_ON_REQUEST=1 suppresses automatic
+history context. AR_SESSION_BIN_DIR selects the runtime.
 
 ## Verification
 
