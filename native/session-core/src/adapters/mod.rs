@@ -1315,7 +1315,7 @@ const WAKE_BINARIES: [&str; 4] = ["agentrouter-session-cli", "agentrouter-sessio
 
 /// 这次工具调用是不是 agent 在查 Wake,是的话走的哪条接入、用的哪个工具(MCP 给契约
 /// 工具名,命令行给二进制名;None = 不是)。FTS 过滤只看 is_some,wake_lookups 表记账
-/// 要细分。MCP 工具按 `mcp::tools::NAMES` 认(加第五家自动覆盖),客户端会给名字加
+/// 要细分。MCP 工具按当前名 `mcp::tools::NAMES` 和历史名 `LEGACY_NAMES` 认,客户端会给名字加
 /// 自己的前缀(Claude Code / Codex 是 `mcp__wake__wake_search`,别家形态不一),所以
 /// 只看结尾、并要求前一个字符不是字母数字(`awake_search` 不算);命令行则要求
 /// wake-cli / wake-mcp 以整词出现在 shell 工具的 **command 字段**里——Grep 的 pattern、
@@ -1323,6 +1323,7 @@ const WAKE_BINARIES: [&str; 4] = ["agentrouter-session-cli", "agentrouter-sessio
 fn wake_lookup_kind(tc: &ToolCallView) -> Option<(LookupChannel, &'static str)> {
     if let Some(tool) = crate::mcp::tools::NAMES
         .iter()
+        .chain(crate::mcp::tools::LEGACY_NAMES.iter())
         .find(|t| ends_with_word(&tc.name, t))
     {
         return Some((LookupChannel::Mcp, *tool));
@@ -1519,6 +1520,8 @@ mod tests {
         };
         assert!(lookup("mcp__wake__wake_list_projects", "", None));
         assert!(lookup("wake_search", "x", None));
+        assert!(lookup("mcp__agentrouter__ar_session_search", "", None));
+        assert!(lookup("ar_session_read", "claude-code:abc", None));
         assert!(
             lookup("mcp_wake_wake_get_session", "", None),
             "别家客户端的前缀形态"

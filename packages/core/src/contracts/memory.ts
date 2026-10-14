@@ -15,11 +15,26 @@ export type MemoryProject = { workspace_name: string; project_name: string; page
 export type MemoryPageSummary = { path: string; title: string; kind: string; tier?: string; pinned?: boolean; updated_at: string };
 export type MemoryPage = MemoryPageSummary & MemoryScope & { body_markdown: string; frontmatter: Record<string, unknown>; links?: unknown[]; backlinks?: unknown[] };
 export type MemoryTool = { name: string; description?: string; inputSchema: Record<string, unknown>; annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean } };
+export type MemoryClientTarget = {
+  id: string;
+  label: string;
+  scope: "global" | "agentrouter" | "custom";
+  profileId?: string;
+  agent: string;
+  mcpPath?: string;
+  hookPath?: string;
+  mcpSupported: boolean;
+  hooksSupported: boolean;
+  mcpConfigured: boolean;
+  hooksConfigured: boolean;
+  lastAppliedAt?: string;
+};
 export type MemoryClient = {
   id: string; label: string; mcp: boolean; hooks: boolean;
   mcpPath?: string; hookPath?: string;
   mcpConfigured: boolean; hooksConfigured: boolean;
   lastAppliedAt?: string;
+  targets: MemoryClientTarget[];
 };
 export type MemoryReadRequest = {
   resource: "projects" | "workspaces" | "pages" | "page" | "search" | "sessions" | "observations" | "handoffs" | "briefing" | "overview" | "graph";
@@ -37,7 +52,7 @@ export type MemoryRequest =
   | { action: "saveConfig"; content: string }
   | { action: "read"; request: MemoryReadRequest }
   | { action: "tool"; name: string; arguments: Record<string, unknown>; confirmed?: boolean }
-  | { action: "client"; client: string; kind: "mcp" | "hooks"; operation: "preview" | "install" | "remove"; confirmed?: boolean };
+  | { action: "client"; client: string; target?: string; kind: "mcp" | "hooks"; operation: "preview" | "install" | "remove"; confirmed?: boolean };
 
 export type MemoryProjectSetup = { directory: string; workspace: string; project: string; family: "agents" | "claude-code" | "grok" | "devin" };
 export type MemoryProjectPlan = MemoryProjectSetup & { id: string; files: Array<{ path: string; content: string; changed: boolean }> };

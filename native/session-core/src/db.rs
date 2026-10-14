@@ -2014,6 +2014,16 @@ impl Store {
     /// false 只算未归档;wake-mcp 解析 `project` 参数时传 true——搜索本身覆盖
     /// 归档会话,只剩归档会话的项目不能在解析这一步就被挡掉
     pub fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectInfo>> {
+        self.list_projects_since(include_archived, None)
+    }
+
+    /// 与 `list_projects` 相同，但 `updated_since` 用根会话的树活动时间，和列表的 since 同一口径。
+    pub fn list_projects_since(
+        &self,
+        include_archived: bool,
+        updated_since: Option<i64>,
+    ) -> Result<Vec<ProjectInfo>> {
+        let since = updated_since.filter(|t| *t > 0).unwrap_or(0);
         let (root_updated, root_cond, archived) = if include_archived {
             (TREE_UPDATED_ALL, ROOT_IGNORING_ARCHIVED, "")
         } else {
@@ -2027,10 +2037,10 @@ impl Store {
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT s.project_path, s.project_name, COUNT(*), MAX({root_updated}) AS activity
              FROM sessions s
-             WHERE {archived}{root_cond}
+             WHERE {archived}{root_cond} AND (?1 <= 0 OR ({root_updated}) >= ?1)
              GROUP BY s.project_path ORDER BY activity DESC"
         ))?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![since], |r| {
             Ok(ProjectInfo {
                 path: r.get(0)?,
                 name: r.get(1)?,
@@ -2474,15 +2484,24 @@ impl Store {
     }
 
     pub fn agent_counts(&self) -> Result<HashMap<String, i64>> {
+        self.agent_counts_since(None)
+    }
+
+    /// 与 `agent_counts` 相同，但 `updated_since` 用根会话的树活动时间，和列表的 since 同一口径。
+    pub fn agent_counts_since(&self, updated_since: Option<i64>) -> Result<HashMap<String, i64>> {
+        let since = updated_since.filter(|t| *t > 0).unwrap_or(0);
         let conn = self.read.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT s.agent_id, COUNT(*) FROM sessions s
              WHERE s.archived = 0 AND (s.parent_key = '' OR NOT EXISTS (
                SELECT 1 FROM sessions p WHERE p.key = s.parent_key AND p.archived = 0
              ))
+             AND (?1 <= 0 OR ({TREE_UPDATED_ACTIVE}) >= ?1)
              GROUP BY s.agent_id",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        ))?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
         let mut map = HashMap::new();
         for r in rows {
             let (k, v) = r?;

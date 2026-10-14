@@ -496,6 +496,7 @@ async function runWebServer(options: WebCliOptions): Promise<void> {
     host: options.host,
     open: options.open,
     port: options.port,
+    reuseExternalMemory: options.startGateway === false,
     startGateway: options.startGateway
   });
   if (options.daemonChild) {

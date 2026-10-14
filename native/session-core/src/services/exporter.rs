@@ -259,7 +259,7 @@ const MAX_TOOL_LINES: usize = 40;
 /// 输入输出共用一份——分页对本页首条消息不查总量(保证前进),单条消息自身
 /// 必须有界,否则一轮上百次工具调用能撑爆对方上下文
 /// 与 `to_markdown`(全量导出)并存,seq 编号同源(`TranscriptMessage::seq`),
-/// 搜索命中的 `wake://session/<key>#<seq>` 引用直接对得上这里的 `[seq N]`
+/// 搜索命中的 `agentrouter://session/<key>#<seq>` 引用直接对得上这里的 `[seq N]`
 pub fn render_compact(messages: &[TranscriptMessage], o: &CompactOptions) -> CompactPage {
     let mut text = String::new();
     let mut rendered = 0usize;

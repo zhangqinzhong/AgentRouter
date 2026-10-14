@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.10.1 - 2026-10-14
+
+### Fixes
+- Keep the session page to search and reading. Agents and projects filter the list from the primary sidebar, a session opens on its latest messages, and Codex memory citations show the note, file range and source session.
+- Apply memory MCP and hook installation to AgentRouter-managed Claude and Codex profiles. A management server started without a gateway reuses the memory service that is already running.
+
 ## 1.10.0 - 2026-10-13
 
 ### Features

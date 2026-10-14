@@ -201,7 +201,7 @@ fn stdio_contract_end_to_end() {
     assert!(init["result"]["instructions"]
         .as_str()
         .unwrap()
-        .contains("wake_search"));
+        .contains("ar_session_search"));
     c.notify("notifications/initialized");
     assert_eq!(c.request("ping", json!({}))["result"], json!({}));
 
@@ -215,11 +215,11 @@ fn stdio_contract_end_to_end() {
     assert_eq!(
         names,
         [
-            "wake_search",
-            "wake_list_sessions",
-            "wake_get_session",
-            "wake_list_projects",
-            "wake_list_memories"
+            "ar_session_search",
+            "ar_session_list",
+            "ar_session_read",
+            "ar_session_projects",
+            "ar_session_memories"
         ]
     );
 
@@ -232,13 +232,13 @@ fn stdio_contract_end_to_end() {
     assert_eq!(bad_tool["error"]["code"], -32602);
     let bad_since = c.request(
         "tools/call",
-        json!({ "name": "wake_list_sessions", "arguments": { "since": "yesterday" } }),
+        json!({ "name": "ar_session_list", "arguments": { "since": "yesterday" } }),
     );
     assert_eq!(bad_since["error"]["code"], -32602, "参数形状错是协议错误");
     // 非 ASCII 收尾的 since 曾让 split_at 在字符中间 panic、整个 server 退出
     let cjk_since = c.request(
         "tools/call",
-        json!({ "name": "wake_list_sessions", "arguments": { "since": "7天" } }),
+        json!({ "name": "ar_session_list", "arguments": { "since": "7天" } }),
     );
     assert_eq!(cjk_since["error"]["code"], -32602, "{cjk_since}");
     c.send_raw("{not json");
@@ -248,19 +248,19 @@ fn stdio_contract_end_to_end() {
 
     // 3. search 命中的 seq 与 parse_transcript 的序号一致(seq 契约)。fixture
     // home 里十几家都有 "二维码" 提示词,按 agent 收窄让断言不依赖 bm25 排位
-    let (everywhere, is_err) = c.call("wake_search", json!({ "query": "二维码", "limit": 30 }));
+    let (everywhere, is_err) = c.call("ar_session_search", json!({ "query": "二维码", "limit": 30 }));
     assert!(!is_err, "{everywhere}");
     assert!(
         everywhere.contains("sessions match `二维码`"),
         "{everywhere}"
     );
     let (text, is_err) = c.call(
-        "wake_search",
+        "ar_session_search",
         json!({ "query": "二维码", "agents": ["claude"], "project": CLAUDE_PROJECT }),
     );
     assert!(!is_err, "{text}");
     assert!(text.contains(CLAUDE_KEY), "{text}");
-    let expected_ref = format!("ref: wake://session/{CLAUDE_KEY}#{qr_seq}");
+    let expected_ref = format!("ref: agentrouter://session/{CLAUDE_KEY}#{qr_seq}");
     assert!(
         text.contains(&expected_ref),
         "search hit must cite seq {qr_seq}:\n{text}"
@@ -269,8 +269,8 @@ fn stdio_contract_end_to_end() {
 
     // 4. get_session:引用形态起点、分页衔接、覆盖全部非 Meta 消息
     let (page, is_err) = c.call(
-        "wake_get_session",
-        json!({ "key": format!("wake://session/{CLAUDE_KEY}#{qr_seq}"), "max_messages": 1 }),
+        "ar_session_read",
+        json!({ "key": format!("agentrouter://session/{CLAUDE_KEY}#{qr_seq}"), "max_messages": 1 }),
     );
     assert!(!is_err, "{page}");
     assert_eq!(seqs_in(&page), vec![qr_seq]);
@@ -281,7 +281,7 @@ fn stdio_contract_end_to_end() {
     let mut from = 0;
     for _ in 0..50 {
         let (page, is_err) = c.call(
-            "wake_get_session",
+            "ar_session_read",
             json!({ "key": CLAUDE_KEY, "from_seq": from, "max_messages": 2 }),
         );
         assert!(!is_err, "{page}");
@@ -309,14 +309,14 @@ fn stdio_contract_end_to_end() {
     );
 
     let (tools_page, _) = c.call(
-        "wake_get_session",
+        "ar_session_read",
         json!({ "key": CLAUDE_KEY, "include_tools": true }),
     );
     assert!(
         tools_page.contains("output:"),
         "include_tools should add tool output:\n{tools_page}"
     );
-    let (plain_page, _) = c.call("wake_get_session", json!({ "key": CLAUDE_KEY }));
+    let (plain_page, _) = c.call("ar_session_read", json!({ "key": CLAUDE_KEY }));
     assert!(!plain_page.contains("output:"));
     assert!(
         plain_page.contains("🔧"),
@@ -328,13 +328,13 @@ fn stdio_contract_end_to_end() {
     // 同一套分页;未知 id 是给 LLM 看的失败结果并附上有哪些
     assert!(
         plain_page.contains(
-            "1 child session (read one with wake_get_session using its key):\n- `claude-code:agent-fixture01` — \"find the QR scanner code\" · 3 messages\n"
+            "1 child session (read one with ar_session_read using its key):\n- `claude-code:agent-fixture01` — \"find the QR scanner code\" · 3 messages\n"
         ),
         "{plain_page}"
     );
     assert!(!plain_page.contains("subagent transcript"), "{plain_page}");
     let (child, is_err) = c.call(
-        "wake_get_session",
+        "ar_session_read",
         json!({ "key": "claude-code:agent-fixture01" }),
     );
     assert!(!is_err, "{child}");
@@ -344,7 +344,7 @@ fn stdio_contract_end_to_end() {
     );
     assert!(child.contains("QR scanner is wired up"), "{child}");
     let (sub, is_err) = c.call(
-        "wake_get_session",
+        "ar_session_read",
         json!({ "key": CLAUDE_KEY, "subagent": "agent-fixture01", "max_messages": 1 }),
     );
     assert!(!is_err, "{sub}");
@@ -360,20 +360,20 @@ fn stdio_contract_end_to_end() {
         "{sub}"
     );
     let (rest, _) = c.call(
-        "wake_get_session",
+        "ar_session_read",
         json!({ "key": CLAUDE_KEY, "subagent": "agent-fixture01", "from_seq": next }),
     );
     assert!(rest.ends_with("End of subagent transcript.\n"), "{rest}");
     assert!(rest.contains("src/qr/scanner.ts"), "{rest}");
     let (bad, is_err) = c.call(
-        "wake_get_session",
+        "ar_session_read",
         json!({ "key": CLAUDE_KEY, "subagent": "agent-nope" }),
     );
     assert!(is_err);
     assert!(bad.contains("- agent-fixture01"), "{bad}");
     // `*` 只列清单不读转录(主线页脚封顶 30 条,这里不封顶)
     let (all, is_err) = c.call(
-        "wake_get_session",
+        "ar_session_read",
         json!({ "key": CLAUDE_KEY, "subagent": "*" }),
     );
     assert!(!is_err, "{all}");
@@ -385,20 +385,20 @@ fn stdio_contract_end_to_end() {
     // id 是路径形态:参数形状错,协议级 -32602,不去碰文件系统
     let reply = c.request(
         "tools/call",
-        json!({ "name": "wake_get_session",
+        json!({ "name": "ar_session_read",
                 "arguments": { "key": CLAUDE_KEY, "subagent": "../../etc/passwd" } }),
     );
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
 
     // 5. 项目匹配:cwd 在项目子目录里、没匹配上、项目清单
     let (listed, is_err) = c.call(
-        "wake_list_sessions",
+        "ar_session_list",
         json!({ "project": format!("{CLAUDE_PROJECT}/src/deep"), "agents": ["claude"] }),
     );
     assert!(!is_err);
     assert!(listed.contains(CLAUDE_KEY), "{listed}");
     let (nowhere, is_err) = c.call(
-        "wake_list_sessions",
+        "ar_session_list",
         json!({ "project": "/nowhere/at/all" }),
     );
     assert!(!is_err, "没匹配上项目不是错误");
@@ -407,12 +407,12 @@ fn stdio_contract_end_to_end() {
         nowhere.contains(CLAUDE_PROJECT),
         "should list known projects:\n{nowhere}"
     );
-    let (projects, _) = c.call("wake_list_projects", json!({}));
+    let (projects, _) = c.call("ar_session_projects", json!({}));
     assert!(projects.contains(CLAUDE_PROJECT));
 
     // 5b. 记忆:Claude 的 auto-memory 按项目列出,Codex 的用户级不受项目筛选影响;
-    // wake://memory 引用交给 wake_get_session 读;wake_search 末尾附带记忆命中
-    let (memories, _) = c.call("wake_list_memories", json!({ "project": CLAUDE_PROJECT }));
+    // agentrouter://memory 引用交给 ar_session_read 读;ar_session_search 末尾附带记忆命中
+    let (memories, _) = c.call("ar_session_memories", json!({ "project": CLAUDE_PROJECT }));
     assert!(
         memories.contains("Wake testing conventions for this repo"),
         "{memories}"
@@ -424,20 +424,20 @@ fn stdio_contract_end_to_end() {
     let mem_ref = memories
         .lines()
         .find_map(|l| l.trim().strip_prefix("ref: "))
-        .expect("a wake://memory ref")
+        .expect("an agentrouter://memory ref")
         .to_string();
-    assert!(mem_ref.starts_with("wake://memory/"), "{mem_ref}");
-    let (memory, is_err) = c.call("wake_get_session", json!({ "key": mem_ref }));
+    assert!(mem_ref.starts_with("agentrouter://memory/"), "{mem_ref}");
+    let (memory, is_err) = c.call("ar_session_read", json!({ "key": mem_ref }));
     assert!(!is_err, "{memory}");
     assert!(
         memory.starts_with("# ") && memory.contains("source: "),
         "{memory}"
     );
-    let (found, _) = c.call("wake_search", json!({ "query": "synthetic" }));
+    let (found, _) = c.call("ar_session_search", json!({ "query": "synthetic" }));
     assert!(found.contains("Memory files that mention"), "{found}");
     // 项目没匹配上:会话一条都没有,但用户级记忆对每个项目都成立,照样查
     let (unmatched, is_err) = c.call(
-        "wake_search",
+        "ar_session_search",
         json!({ "query": "concise", "project": "/nope/nope" }),
     );
     assert!(!is_err);
@@ -450,11 +450,11 @@ fn stdio_contract_end_to_end() {
     // 用不可能到达的绝对日期,不用 "1m":fixture 的 updated_at 有的取自文件 mtime,
     // Linux 的 fs::copy 不保留 mtime(macOS 走 APFS clone 会保留),staged 的
     // fixture 在 Linux 上就是"刚刚"——2026-09-08 CI 只红 ubuntu 那路
-    let (since_none, _) = c.call("wake_list_sessions", json!({ "since": "2999-01-01" }));
+    let (since_none, _) = c.call("ar_session_list", json!({ "since": "2999-01-01" }));
     assert!(since_none.starts_with("No sessions"), "{since_none}");
 
     // 6. 坏 key 是给 LLM 看的失败结果,不是协议错误、更不是崩溃
-    let (missing, is_err) = c.call("wake_get_session", json!({ "key": "claude-code:nope" }));
+    let (missing, is_err) = c.call("ar_session_read", json!({ "key": "claude-code:nope" }));
     assert!(is_err);
     assert!(missing.contains("No session with key"), "{missing}");
 

@@ -57,6 +57,16 @@ class DeepLinkService {
       void app.whenReady().then(() => windowsManager.showMainWindow());
       return;
     }
+    // Session references share the app scheme. They are text for the session
+    // tools, not provider or plugin links.
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      if (host === "session" || host === "memory") {
+        return;
+      }
+    } catch {
+      // Invalid URLs continue into the existing parser and its error path.
+    }
     let pluginRequest: PluginDeepLinkRequest | undefined;
     try {
       pluginRequest = parsePluginDeepLinkRequest(url);

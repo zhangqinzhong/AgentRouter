@@ -5,7 +5,9 @@ import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
 import { CONFIGDIR } from "@agentrouter/core/config/constants";
+import { loadAppConfig } from "@agentrouter/core/config/config";
 import { resolveRuntimeAppPath } from "@agentrouter/core/runtime/app-paths";
+import type { ProfileConfig } from "@agentrouter/core/contracts/app";
 import type { MemoryModelSettings, MemoryModelStatus, MemoryRequest, MemorySettings, MemoryStatus, MemoryTool } from "@agentrouter/core/contracts/memory";
 import { MemoryProjects } from "./projects";
 import { MemoryClients } from "./clients";
@@ -24,9 +26,10 @@ function waitForExit(child: ChildProcess, timeout: number): Promise<void> {
   });
 }
 
-export type MemoryServiceOptions = { dataDir: string; home?: string; runtimeDir?: string; port?: number; readyTimeoutMs?: number };
+export type MemoryServiceOptions = { dataDir: string; home?: string; configDir?: string; profiles?: () => Promise<ProfileConfig[]>; runtimeDir?: string; port?: number; readyTimeoutMs?: number };
 export class MemoryService {
   private child?: ChildProcess;
+  private external = false;
   private queue: Promise<unknown> = Promise.resolve();
   private state: MemoryStatus["state"] = "stopped";
   private lastError?: string;
@@ -45,7 +48,7 @@ export class MemoryService {
     this.home = options.home ?? resolveRuntimeAppPath("home");
     this.transport = new MemoryTransport(this.endpoint, () => this.token);
     this.projects = new MemoryProjects(options.dataDir, (args) => this.command(args));
-    this.clients = new MemoryClients(this.home, options.dataDir, this.endpoint, (args) => this.command(args), process.env, () => this.token, () => this.executable());
+    this.clients = new MemoryClients(this.home, options.dataDir, this.endpoint, (args) => this.command(args), process.env, () => this.token, () => this.executable(), options.configDir ?? CONFIGDIR);
   }
 
   status(): MemoryStatus {
@@ -61,6 +64,7 @@ export class MemoryService {
   }
   async autoStart() { if (this.settings().autoStart) await this.request({ action: "start" }); }
   async shutdown() { await this.request({ action: "stop" }); }
+  setExternalReuse(enabled: boolean) { this.externalReuse = enabled; }
 
   request(input: unknown): Promise<any> {
     if (!input || typeof input !== "object" || Array.isArray(input)) return Promise.reject(new Error("Invalid memory request."));
@@ -86,7 +90,7 @@ export class MemoryService {
       }
       case "modelConfig": return this.modelConfig();
       case "saveModelConfig": {
-        if (this.child) throw new Error("Stop memory before changing its model.");
+        // Persist for the next start; the running child retains its existing environment.
         if (request.confirmed !== true) throw new Error("Confirm the memory model configuration.");
         const s = request.settings;
         if (!s || [s.enabled, s.autoReview, s.requireApproval, s.consolidateOnEnd].some((v) => typeof v !== "boolean") || typeof s.model !== "string" || s.model.length > 200 || typeof s.baseUrl !== "string" || s.baseUrl.length > 4096) throw new Error("Invalid memory model settings.");
@@ -108,7 +112,10 @@ export class MemoryService {
         if (!model?.enabled) throw new Error("Configure a memory model first.");
         return { output: await this.command(["llm-test", "--provider", "openai-compat", "--model", model.model, "--base-url", model.baseUrl, "--prompt", 'Return only the JSON object {"answer":"OK"}. Do not include any other text.', "--structured"]) };
       }
-      case "clients": return this.clients.list();
+      case "clients": {
+        const profiles = this.options.profiles ? await this.options.profiles() : [];
+        return this.clients.list(profiles);
+      }
       case "projectList": return this.projects.list();
       case "projectPreview": this.requireRunning(); return this.projects.preview(request.setup);
       case "projectApply": {
@@ -159,9 +166,10 @@ export class MemoryService {
       }
       case "client": {
         this.requireRunning();
-        if (typeof request.client !== "string" || !["mcp", "hooks"].includes(request.kind) || !["preview", "install", "remove"].includes(request.operation)) throw new Error("Invalid client integration.");
+        if (typeof request.client !== "string" || (request.target !== undefined && typeof request.target !== "string") || !["mcp", "hooks"].includes(request.kind) || !["preview", "install", "remove"].includes(request.operation)) throw new Error("Invalid client integration.");
         if (request.operation !== "preview" && request.confirmed !== true) throw new Error("Confirm the client configuration change.");
-        return this.clients.change(request.client, request.kind, request.operation);
+        const profiles = this.options.profiles ? await this.options.profiles() : [];
+        return this.clients.change(request.client, request.target || "global", request.kind, request.operation, profiles);
       }
       case "backup": {
         this.requireRunning();
@@ -176,15 +184,21 @@ export class MemoryService {
   private tools(): Promise<MemoryTool[]> {
     return this.toolCatalog ? Promise.resolve(this.toolCatalog) : this.transport.tools().then((tools) => this.toolCatalog = tools);
   }
-  private requireRunning() { if (this.state !== "running" || !this.child) throw new Error("Start memory first."); }
+  private requireRunning() { if (this.state !== "running" || (!this.child && !this.external)) throw new Error("Start memory first."); }
 
   private async start(): Promise<MemoryStatus> {
-    if (this.child && this.state === "running") return this.status();
+    if ((this.child || this.external) && this.state === "running") return this.status();
     this.state = "starting"; this.lastError = undefined;
     try {
+      this.token = this.accessToken();
+      if (this.externalReuse && await this.adoptExisting()) {
+        this.external = true;
+        this.state = "running";
+        this.startedAt = new Date().toISOString();
+        return this.status();
+      }
       await this.assertPortFree();
       const executable = this.prepareRuntime();
-      this.token = this.accessToken();
       if (!existsSync(path.join(this.options.dataDir, "config.toml"))) await this.command(["init"]);
       const child = spawn(executable, ["--data-dir", this.options.dataDir, "serve", "--transport", "http", "--bind", this.endpoint.replace("http://", ""), "--enable-web"], {
         cwd: this.options.dataDir, env: this.environment(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true
@@ -223,6 +237,13 @@ export class MemoryService {
   }
 
   private async stop(): Promise<MemoryStatus> {
+    if (this.external) {
+      this.external = false;
+      this.toolCatalog = undefined;
+      this.startedAt = undefined;
+      this.state = "stopped";
+      return this.status();
+    }
     const child = this.child;
     if (child) {
       this.state = "stopping";
@@ -339,6 +360,22 @@ export class MemoryService {
       server.listen(port, "127.0.0.1", () => server.close(() => resolve()));
     });
   }
+
+  private externalReuse = false;
+  private async adoptExisting(): Promise<boolean> {
+    try {
+      const response = await fetch(`${this.endpoint}/api/v1/projects`, {
+        headers: { authorization: `Bearer ${this.token}` },
+        redirect: "error",
+        signal: AbortSignal.timeout(800)
+      });
+      if (!response.ok) return false;
+      const projects = await response.json();
+      return Array.isArray(projects);
+    } catch {
+      return false;
+    }
+  }
 }
 
-export const memoryService = new MemoryService({ dataDir: path.join(CONFIGDIR, "ai-memory") });
+export const memoryService = new MemoryService({ dataDir: path.join(CONFIGDIR, "ai-memory"), profiles: async () => (await loadAppConfig()).profile.profiles });

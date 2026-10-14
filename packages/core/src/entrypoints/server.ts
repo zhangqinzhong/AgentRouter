@@ -23,6 +23,7 @@ export async function runCoreServer(args = process.argv.slice(2)): Promise<void>
     host: options.host,
     open: options.open,
     port: options.port,
+    reuseExternalMemory: options.startGateway === false,
     startGateway: options.startGateway
   });
   process.stdout.write(`AgentRouter core server is running at ${runtime.url}\n`);

@@ -141,6 +141,7 @@ export type WebManagementServerOptions = {
   host?: string;
   open?: boolean;
   port?: number;
+  reuseExternalMemory?: boolean;
   startGateway?: boolean;
 };
 
@@ -197,6 +198,7 @@ export async function startWebManagementServer(options: WebManagementServerOptio
   const url = urlWithWebAuthToken(baseUrl, authToken);
   security = createWebManagementSecurityContext(host, port, authToken);
 
+  memoryService.setExternalReuse(options.reuseExternalMemory === true);
   void memoryService.autoStart().catch((error) => console.error(`[memory] ${formatError(error)}`));
   if (options.startGateway !== false) {
     await startConfiguredServices("web startup");
