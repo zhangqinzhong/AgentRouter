@@ -1,6 +1,7 @@
 import { PageHeader, SectionHeading, tablePageClassName } from "./page-primitives";
 import { outputRateForRequestLog } from "@/lib/token-rate";
 import { memo, useId } from "react";
+import { createPortal } from "react-dom";
 import { Maximize2, Route, X } from "lucide-react";
 import type { RequestRouteTrace, RequestRouteTraceChange, RequestRouteTraceHop } from "@agentrouter/core/contracts/app";
 import {
@@ -2305,6 +2306,26 @@ function LogBodyChunkContent({
   );
 }
 
+let jsonFullscreenScrollLocks = 0;
+let jsonFullscreenPreviousBodyOverflow = "";
+
+function lockDocumentScrollForJsonFullscreen(): () => void {
+  if (typeof document === "undefined") {
+    return () => undefined;
+  }
+  if (jsonFullscreenScrollLocks === 0) {
+    jsonFullscreenPreviousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  jsonFullscreenScrollLocks += 1;
+  return () => {
+    jsonFullscreenScrollLocks = Math.max(0, jsonFullscreenScrollLocks - 1);
+    if (jsonFullscreenScrollLocks === 0) {
+      document.body.style.overflow = jsonFullscreenPreviousBodyOverflow;
+    }
+  };
+}
+
 function LogJsonFullscreenViewer({
   body,
   bodyView,
@@ -2350,14 +2371,16 @@ function LogJsonFullscreenViewer({
 }) {
   const t = useAppText();
 
-  return (
+  useEffect(() => lockDocumentScrollForJsonFullscreen(), []);
+
+  const dialog = (
     <div
       aria-label={`${title} ${t("Fullscreen JSON viewer")}`}
       aria-modal="true"
-      className="network-json-fullscreen fixed inset-0 z-[100] flex min-h-0"
+      className="network-json-fullscreen fixed inset-0 z-[200] flex min-h-0 flex-col"
       role="dialog"
     >
-      <div className="network-json-fullscreen-panel flex min-h-0 flex-1 flex-col overflow-hidden border">
+      <div className="network-json-fullscreen-panel flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <div className="network-json-fullscreen-header flex h-12 min-w-0 shrink-0 items-center gap-3 border-b px-4">
           <span className="network-pane-title min-w-0 truncate text-[15px] font-bold">{title}</span>
           {subtitle ? <span className="network-muted shrink-0 text-[12px] font-semibold">{subtitle}</span> : null}
@@ -2380,7 +2403,7 @@ function LogJsonFullscreenViewer({
           query={query}
           title={title}
         />
-        <div className="network-json-fullscreen-body flex min-h-0 flex-1">
+        <div className="network-json-fullscreen-body flex min-h-0 min-w-0 flex-1 flex-col">
           <LogBodyViewer copyLabel={copyLabel} copyText={copyText}>
             {chunkView ? (
               <LogBodyChunkContent chunkView={chunkView} onLoadChunk={onLoadChunk} query={query} visible={visible} />
@@ -2400,6 +2423,11 @@ function LogJsonFullscreenViewer({
       </div>
     </div>
   );
+
+  if (typeof document === "undefined") {
+    return dialog;
+  }
+  return createPortal(dialog, document.body);
 }
 
 function logBodyCacheKey(body: RequestLogBody | undefined): string {

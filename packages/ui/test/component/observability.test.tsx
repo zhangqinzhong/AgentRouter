@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -150,6 +151,24 @@ test("LogsView explains filtered empty results and translates page sizes", () =>
   assert.match(html, /Clear filters/);
   assert.match(html, /25 \/ page/);
   assert.doesNotMatch(html, /\/ 页/);
+});
+
+test("request log JSON fullscreen stays closed until the viewer is opened", () => {
+  const html = renderToStaticMarkup(
+    <AppI18nContext.Provider value={appCopy.zh}>
+      <LogExpandedDetails entry={sampleRequestLogEntry} />
+    </AppI18nContext.Provider>
+  );
+  assert.match(html, /全屏查看 JSON/);
+  assert.doesNotMatch(html, /network-json-fullscreen|role="dialog"/);
+});
+
+test("request log JSON fullscreen uses the page surface instead of a black scrim", () => {
+  const css = readFileSync("packages/ui/src/styles/globals.css", "utf8");
+  assert.doesNotMatch(css, /rgba\(0,\s*0,\s*0,\s*\.82\)/);
+  assert.doesNotMatch(css, /max-width:\s*1760px/);
+  assert.match(css, /\.network-json-fullscreen,\n\.network-json-fullscreen-panel,\n\.network-json-fullscreen-body,\n\.network-json-fullscreen-header \{\n {2}background: #fff;/);
+  assert.match(css, /\.dark \.network-json-fullscreen,\n[\s\S]*background: #141414;/);
 });
 
 test("LogsView keeps Chinese token column copy as Token", () => {
