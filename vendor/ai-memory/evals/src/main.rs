@@ -1,15 +1,21 @@
 //! `ai-memory-eval` — offline evaluation harnesses for ai-memory.
 //!
-//! Two subcommands:
+//! Three subcommands:
 //!
 //! - `ab` — live A/B comparison of two LLM providers on the production
-//!   consolidation prompt (see [`ab`] and `evals/README.md`).
+//!   consolidation prompt, with literal-fidelity scoring (see [`ab`],
+//!   [`fidelity`] and `evals/README.md`).
+//! - `projection` — the zero-LLM half of that scoring: which fixture facts
+//!   and literal tokens the observation projection lets into the prompt.
 //! - `retrieval` — LongMemEval retrieval benchmark driven end-to-end
 //!   through a real `ai-memory serve` subprocess: hook-shaped ingestion,
 //!   real search stack, R@k / hit@k per question category (see
 //!   [`retrieval`] and `docs/benchmarks/`).
 
 mod ab;
+mod fidelity;
+mod generate;
+mod projection;
 mod retrieval;
 
 use anyhow::Result;
@@ -30,6 +36,9 @@ enum Command {
     /// Live A/B harness comparing two LLM providers on the ai-memory
     /// consolidation prompt.
     Ab(Box<ab::AbArgs>),
+    /// Zero-LLM: which facts the consolidation prompt's observation
+    /// projection keeps, per fixture.
+    Projection(projection::ProjectionArgs),
     /// LongMemEval retrieval benchmark through the real server stack.
     Retrieval(Box<retrieval::RetrievalArgs>),
 }
@@ -45,6 +54,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Ab(args) => ab::run(*args).await,
+        Command::Projection(args) => projection::run(args),
         Command::Retrieval(args) => retrieval::run(*args).await,
     }
 }

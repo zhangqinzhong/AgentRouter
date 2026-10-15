@@ -651,6 +651,7 @@ mod tests {
                 is_root: false,
                 is_creator: false,
                 grant: Some(level),
+                reserved_global: false,
             };
             assert!(
                 crate::authorize_project(&ctx, crate::ProjectAccess::Read).is_ok(),

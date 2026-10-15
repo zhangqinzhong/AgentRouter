@@ -1,6 +1,8 @@
 //! Wire envelope received on `POST /hook`.
 
-use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, truncate_utf8_bytes};
+use ai_memory_core::{
+    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, truncate_utf8_bytes,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
@@ -17,7 +19,32 @@ pub const POST_COMPACTION_EXCERPT_MAX_BYTES: usize = OBSERVATION_BODY_MAX_BYTES;
 /// Durable excerpt ceiling for notifications.
 pub const NOTIFICATION_EXCERPT_MAX_BYTES: usize = 2_000;
 
-const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
+/// Durable excerpt ceiling for tool I/O summaries and short excerpts
+/// (tool results, extension bodies, Stop assistant excerpts).
+pub const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
+
+/// Durable body ceiling the ingest funnel applies to an event's excerpt
+/// **after** the sanitizer has scrubbed the full text.
+///
+/// The cap used to run inside excerpt extraction, before the sanitizer ever
+/// saw the text, so a secret straddling the cutoff was cut in half and the
+/// surviving prefix too short to match a pattern — stored unredacted (#1114),
+/// the body-side twin of the #980 title-hint leak. Extraction now returns the
+/// uncapped text and the router applies this cap to the scrubbed output,
+/// mirroring `ai_memory_core::sanitize::Sanitized::new`.
+#[must_use]
+pub fn durable_body_cap(event: HookEvent) -> usize {
+    match event {
+        HookEvent::UserPrompt => USER_PROMPT_EXCERPT_MAX_BYTES,
+        HookEvent::PostCompaction => POST_COMPACTION_EXCERPT_MAX_BYTES,
+        HookEvent::Notification
+        | HookEvent::PreToolUse
+        | HookEvent::PostToolUse
+        | HookEvent::Stop
+        | HookEvent::Other => TOOL_EXCERPT_MAX_BYTES,
+        _ => OBSERVATION_BODY_MAX_BYTES,
+    }
+}
 
 /// Query-string parameters on `POST /hook`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -97,6 +124,13 @@ pub struct HookQuery {
     /// Which rung produced `identity`: `explicit` or `git_remote`. Anything
     /// else, or a malformed identity, is ignored and the event routes by name.
     pub identity_src: Option<String>,
+    /// An explicit marker `identity_style` (#1033). `path` names a
+    /// remote-backed project from its repository path without the host;
+    /// `host_path` preserves legacy naming. Omission uses the server default.
+    pub identity_style: Option<String>,
+    /// Compact JSON array of validated former project names from the local
+    /// marker. Accepted only with a full git-remote identity.
+    pub aliases: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -129,6 +163,13 @@ pub struct HookEnvelope {
     /// [`ai_memory_core::repository_identity::accept_wire_identity`]. `None`
     /// routes by project name, as every event did before identities existed.
     pub identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
+    /// How a project this event creates is named; see
+    /// [`ai_memory_core::repository_identity::IdentityStyle`].
+    pub identity_style: ai_memory_core::repository_identity::IdentityStyle,
+    /// Validated, normalized former project names supplied by the local marker.
+    pub aliases: ai_memory_core::repository_identity::MarkerAliases,
+    /// Whether an alias query was malformed or lacked a git-remote identity.
+    pub aliases_invalid: bool,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -183,6 +224,8 @@ impl std::fmt::Debug for HookEnvelope {
             .field("project_override", &self.project_override)
             .field("project_strategy", &self.project_strategy)
             .field("identity", &self.identity)
+            .field("alias_count", &self.aliases.as_slice().len())
+            .field("aliases_invalid", &self.aliases_invalid)
             .field("drop_subagent_requested", &self.drop_subagent_requested)
             .field(
                 "recall_default_global_requested",
@@ -221,11 +264,12 @@ impl std::fmt::Debug for HookEnvelope {
 
 /// Keys by which agent harnesses tag a hook event as belonging to a SUBAGENT
 /// (a nested/spawned agent session) rather than the top-level session. Grok
-/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_type`
-/// and `agent_id` (on its `SubagentStart`/`SubagentStop` and subagent tool
-/// events). The set is a union so one check covers every harness that signals
-/// subagent-ness; a harness that does not signal it simply never matches.
-const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_type", "agent_id"];
+/// sets `subagentType` (on its tool-use events); Claude Code sets `agent_id`
+/// on subagent events. `agent_type` alone is not a subagent marker: Claude
+/// Code also sets it on top-level sessions launched with `--agent`. The set
+/// is a union so one check covers every harness that signals subagent-ness;
+/// a harness that does not signal it simply never matches.
+const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_id"];
 
 /// True when the raw hook payload carries a non-empty subagent marker — i.e.
 /// the event originates from a spawned subagent session. The ingest router
@@ -247,6 +291,38 @@ pub(crate) fn query_flag_truthy(value: Option<&str>) -> bool {
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
+}
+
+/// Whether a forwarded flag was explicitly turned off (`0` / `false` / `no` /
+/// `off`, any case). An absent flag is not falsy: settings that default on,
+/// like `[profile] contribute`, stay on unless a marker says otherwise.
+pub(crate) fn query_flag_falsy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+pub(crate) fn marker_aliases_from_wire(
+    project: Option<&str>,
+    project_source: ProjectSource,
+    identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
+    raw: Option<&str>,
+) -> Result<
+    ai_memory_core::repository_identity::MarkerAliases,
+    ai_memory_core::repository_identity::MarkerAliasError,
+> {
+    let aliases = ai_memory_core::repository_identity::accept_wire_aliases(raw)?;
+    if raw.is_some()
+        && (project.is_none_or(|project| project.trim().is_empty())
+            || project_source != ProjectSource::Marker
+            || !identity.is_some_and(|identity| {
+                identity.source == ai_memory_core::repository_identity::IdentitySource::GitRemote
+            }))
+    {
+        return Err(ai_memory_core::repository_identity::MarkerAliasError::InvalidWire);
+    }
+    Ok(aliases)
 }
 
 /// How the hook router derives a project name when no explicit
@@ -451,6 +527,62 @@ pub fn agent_from_payload(raw: &serde_json::Value) -> Option<AgentKind> {
     extract_string(raw, &["cursor_version"]).map(|_| AgentKind::Cursor)
 }
 
+/// Session and checkout fields extracted from the canonical hook payload shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookPayloadContext {
+    /// Harness-native session identity.
+    pub session_id: Option<String>,
+    /// Current checkout directory.
+    pub cwd: Option<String>,
+}
+
+/// Extract the session and checkout exactly as [`HookEnvelope`] does.
+#[must_use]
+pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
+    let session_id = extract_string(
+        raw,
+        &[
+            "session_id",
+            "sessionId",
+            "sessionID",
+            "session",
+            "conversationId",
+        ],
+    )
+    .or_else(|| {
+        extract_string_path(
+            raw,
+            &[
+                &["info", "id"],
+                &["properties", "sessionID"],
+                &["properties", "info", "id"],
+                &["event", "properties", "sessionID"],
+                &["event", "properties", "info", "id"],
+                &["payload", "info", "id"],
+                &["payload", "properties", "sessionID"],
+                &["payload", "properties", "info", "id"],
+            ],
+        )
+    });
+    let cwd = extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"])
+        .or_else(|| extract_first_string_array_item(raw, &["workspacePaths", "workspace_roots"]))
+        .or_else(|| {
+            extract_string_path(
+                raw,
+                &[
+                    &["path", "cwd"],
+                    &["info", "directory"],
+                    &["properties", "info", "directory"],
+                    &["event", "properties", "info", "directory"],
+                    &["payload", "path", "cwd"],
+                    &["payload", "info", "directory"],
+                    &["payload", "properties", "info", "directory"],
+                ],
+            )
+        });
+    HookPayloadContext { session_id, cwd }
+}
+
 impl HookEnvelope {
     /// Build an envelope from the parsed query + the body JSON. Performs
     /// best-effort extraction of `session_id` / `cwd` / a body excerpt
@@ -461,66 +593,14 @@ impl HookEnvelope {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
-        // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
-        // tool.execute.*/session.* events; Claude Code and native Codex use
-        // `session_id`, older Codex bridges `sessionId`, and Antigravity CLI
-        // uses `conversationId`.
-        // JSON keys are case-sensitive, so all spellings must be listed
-        // or tool events fail the router's "missing session_id" check.
-        let body_session_id = extract_string(
-            &raw,
-            &[
-                "session_id",
-                "sessionId",
-                "sessionID",
-                "session",
-                "conversationId",
-            ],
-        )
-        .or_else(|| {
-            extract_string_path(
-                &raw,
-                &[
-                    &["info", "id"],
-                    &["properties", "sessionID"],
-                    &["properties", "info", "id"],
-                    &["event", "properties", "sessionID"],
-                    &["event", "properties", "info", "id"],
-                    &["payload", "info", "id"],
-                    &["payload", "properties", "sessionID"],
-                    &["payload", "properties", "info", "id"],
-                ],
-            )
-        });
-        let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
-        // Cursor spells the workspace directory `workspace_roots` (an array,
-        // normally one entry; multi-root workspaces carry several) and never
-        // sends a usable top-level `cwd`: its `sessionStart` / `sessionEnd`
-        // payloads omit `cwd` entirely, and its tool events send `cwd: ""`.
-        // Without this spelling every Cursor session resolved to no cwd at all
-        // and landed in the server-default `default/scratch` bucket.
-        let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
-            .or_else(|| {
-                extract_first_string_array_item(&raw, &["workspacePaths", "workspace_roots"])
-            })
-            .or_else(|| {
-                extract_string_path(
-                    &raw,
-                    &[
-                        &["path", "cwd"],
-                        &["info", "directory"],
-                        &["properties", "info", "directory"],
-                        &["event", "properties", "info", "directory"],
-                        &["payload", "path", "cwd"],
-                        &["payload", "info", "directory"],
-                        &["payload", "properties", "info", "directory"],
-                    ],
-                )
-            });
+        let context = hook_payload_context(&raw);
+        let session_id = context
+            .session_id
+            .or_else(|| query.session_id.filter(|s| !s.is_empty()));
         // Body cwd wins over the query-string fallback: the body is
         // what agent CLIs natively send, so any query-string `cwd` is
         // a bridge / test override that should defer to live data.
-        let cwd = body_cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
+        let cwd = context.cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
         let workspace_override = query.workspace.filter(|s| !s.is_empty());
         let project_override = query.project.filter(|s| !s.is_empty());
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
@@ -537,6 +617,23 @@ impl HookEnvelope {
                 ai_memory_core::repository_identity::accept_wire_identity(identity, source)
             }
             _ => None,
+        };
+        let identity_style = query
+            .identity_style
+            .as_deref()
+            .and_then(ai_memory_core::repository_identity::IdentityStyle::from_str_opt)
+            .unwrap_or_default();
+        let aliases = marker_aliases_from_wire(
+            project_override.as_deref(),
+            project_source,
+            identity.as_ref(),
+            query.aliases.as_deref(),
+        );
+        let aliases_invalid = aliases.is_err();
+        let aliases = if aliases_invalid {
+            ai_memory_core::repository_identity::MarkerAliases::default()
+        } else {
+            aliases.unwrap_or_default()
         };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
@@ -622,6 +719,9 @@ impl HookEnvelope {
             project_strategy,
             project_source,
             identity,
+            identity_style,
+            aliases,
+            aliases_invalid,
             drop_subagent_requested,
             recall_default_global_requested,
             all_owners_requested,
@@ -708,7 +808,7 @@ fn legacy_tool_body(event: HookEvent, agent: AgentKind, raw: &serde_json::Value)
         &["tool_response", "tool_output", "output", "result"],
     )
     .or_else(|| extract_content(payload, &["error"]))?;
-    Some(truncate_excerpt(&format!("tool: {tool}\n---\n{result}")))
+    Some(format!("tool: {tool}\n---\n{result}"))
 }
 
 const fn closed_tool_agent(agent: AgentKind) -> bool {
@@ -717,14 +817,22 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
         AgentKind::ClaudeCode
             | AgentKind::CommandCode
             | AgentKind::Codex
+            // Cursor's own hooks and its copies of the Claude Code hooks carry
+            // Claude's snake_case tool aliases.
+            | AgentKind::Cursor
             | AgentKind::OpenCode
             | AgentKind::Pi
             | AgentKind::Omp
             | AgentKind::AntigravityCli
             | AgentKind::Grok
             | AgentKind::Hermes
+            | AgentKind::KiroCli
             | AgentKind::Pool
             | AgentKind::Zcode
+            | AgentKind::CopilotCli
+            | AgentKind::Grizzybot
+            | AgentKind::Droid
+            | AgentKind::Muse
     )
 }
 
@@ -799,6 +907,25 @@ fn safe_tool_body(
                 // Codex's native schema has one top-level JSON response.
                 // Do not promote unrelated aliases or nested payloads to output.
                 raw.get("tool_response").and_then(value_to_text)
+            } else if agent == AgentKind::CopilotCli {
+                // Copilot CLI's VS-Code-compatible `PostToolUse` nests the
+                // model-facing text at `tool_result.text_result_for_llm`
+                // (#1040); read only that documented field so `result_type`
+                // never leaks in through an object-stringify fallback.
+                raw.pointer("/tool_result/text_result_for_llm")
+                    .and_then(value_to_text)
+                    .or_else(|| extract_content(raw, &["error"]))
+            } else if agent == AgentKind::Hermes {
+                // Hermes 3.x nests the tool result inside `extra.result`
+                // (`agent/shell_hooks.py::_payload_fields` keeps everything
+                // not in the top-level key set inside `extra`). Read only
+                // that documented field plus `error_message` so unrelated
+                // `extra` telemetry (task_id, middleware_trace, …) never
+                // leaks in through an object-stringify fallback.
+                raw.pointer("/extra/result")
+                    .and_then(value_to_text)
+                    .or_else(|| raw.pointer("/extra/error_message").and_then(value_to_text))
+                    .or_else(|| extract_content(raw, &["error"]))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -807,7 +934,7 @@ fn safe_tool_body(
             .unwrap_or_else(|| "(no output captured)".into());
             summary.push_str("\n---\n");
             summary.push_str(&result);
-            Some(truncate_excerpt(&summary))
+            Some(summary)
         }
         _ => None,
     }
@@ -830,6 +957,16 @@ fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option
         args,
         &["ReplacementContent", "CodeContent", "ReplacementChunks"],
     )
+}
+
+/// The tool a tool event names, under the keys the observation title uses.
+pub(crate) fn event_tool_name(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, &["tool", "tool_name", "name"])
+}
+
+/// The tool-use id a tool event carries (Claude-family payloads).
+pub(crate) fn event_tool_use_id(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, &["tool_use_id"])
 }
 
 fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -934,12 +1071,12 @@ fn push_candidates<'a>(out: &mut Vec<&'a serde_json::Value>, value: &'a serde_js
 
 fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::SessionStart => extract_string(raw, &["model", "title"]),
+        HookEvent::SessionStart => extract_string(raw, &["model", "title"]).and_then(first_line),
         HookEvent::UserPrompt => {
             // Kimi Code sends `prompt` as content blocks
             // (`[{"type":"text","text":...}]`); `extract_content` flattens
             // them and returns identical values for plain-string agents.
-            extract_content(raw, &["prompt", "message", "text"]).map(|s| first_line(&s))
+            extract_content(raw, &["prompt", "message", "text"]).and_then(first_line)
         }
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             extract_string(raw, &["tool", "tool_name", "name"])
@@ -948,15 +1085,15 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
                     extract_scalar_string(raw, &["stepIdx"]).map(|step| format!("step {step}"))
                 })
         }
-        HookEvent::Notification => extract_string(raw, &["message", "text"]),
-        HookEvent::PostCompaction => extract_string(raw, &["summary"]),
+        HookEvent::Notification => extract_string(raw, &["message", "text"]).and_then(first_line),
+        HookEvent::PostCompaction => extract_string(raw, &["summary"]).and_then(first_line),
         _ => None,
     }
 }
 
 fn extension_title_hint(raw: &serde_json::Value, source_event: &str) -> String {
     extract_string(raw, &["title", "summary", "subject", "name"])
-        .map(|s| first_line(&s))
+        .and_then(first_line)
         .unwrap_or_else(|| source_event.to_string())
 }
 
@@ -972,7 +1109,6 @@ fn extension_body_excerpt(raw: &serde_json::Value) -> Option<String> {
             "details",
         ],
     )
-    .map(|s| truncate_excerpt(&s))
 }
 
 /// Extract human-readable text content for an observation body, accepting the
@@ -1027,8 +1163,7 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
 
 fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"])
-            .map(|body| truncate_utf8_bytes(&body, USER_PROMPT_EXCERPT_MAX_BYTES)),
+        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -1039,18 +1174,25 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
                     .unwrap_or_else(|| "(no output captured)".into());
-            Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
+            Some(format!("tool: {tool}\n---\n{result}"))
         }
-        HookEvent::Notification => extract_content(raw, &["message", "text"])
-            .map(|body| truncate_utf8_bytes(&body, NOTIFICATION_EXCERPT_MAX_BYTES)),
-        HookEvent::PostCompaction => extract_content(raw, &["summary"])
-            .map(|body| truncate_utf8_bytes(&body, POST_COMPACTION_EXCERPT_MAX_BYTES)),
+        HookEvent::Notification => extract_content(raw, &["message", "text"]),
+        HookEvent::PostCompaction => extract_content(raw, &["summary"]),
+        // Why the session ended (#1225): a string only, first line only, so
+        // consolidation and the zero-LLM page can tell a normal quit from
+        // anything else.
+        HookEvent::SessionEnd => extract_string(raw, &["reason"])
+            .and_then(first_line)
+            .map(|reason| format!("reason: {reason}")),
         _ => None,
     }
 }
 
-/// Reduce a hook-supplied string to its first line, discarding everything
-/// after the first `\n`.
+/// Reduce a hook-supplied string to its first line.
+///
+/// Terminators are LF, CRLF, and a lone CR (`str::lines`). An empty first
+/// line (a payload that starts with a newline) yields `None` so the caller
+/// can fall back instead of storing `""`.
 ///
 /// This is the only shaping `title_hint` gets before it reaches the
 /// sanitizer: the 80-char display cap used to happen here too, but that ran
@@ -1059,12 +1201,13 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
 /// clear text (#980). The length cap now lives in
 /// `ai_memory_core::sanitize::truncate_for_title`, applied by
 /// `Sanitized::new` *after* `Sanitizer::scrub`.
-fn first_line(s: &str) -> String {
-    s.chars().take_while(|c| *c != '\n').collect()
-}
-
-fn truncate_excerpt(s: &str) -> String {
-    truncate_utf8_bytes(s, TOOL_EXCERPT_MAX_BYTES)
+fn first_line(s: String) -> Option<String> {
+    // `str::lines` treats `\n`, `\r\n`, and a lone `\r` as terminators and
+    // does not keep them. Stopping only at `\n` left a trailing CR on
+    // Windows prompts, which the sanitizer preserves and `truncate_for_title`
+    // does not strip, so the CR was stored in the observation title.
+    let line = s.lines().next().unwrap_or("").to_string();
+    (!line.is_empty()).then_some(line)
 }
 
 /// Cap core lifecycle body fields before the native hook writes its local
@@ -1125,7 +1268,15 @@ fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: us
             continue;
         };
         if text.len() > max_bytes {
-            *field = serde_json::Value::String(truncate_utf8_bytes(&text, max_bytes));
+            // Scrub the full text before capping it. The client cannot see
+            // the server's `[sanitize]` extras, but the built-in patterns
+            // cover the credential classes and the server re-scrubs the
+            // capped field with its configured sanitizer; truncating first
+            // would cut a straddling secret in half and persist an
+            // unmatchable prefix (#1114), the class #980 / #1109 fixed.
+            // Same order as `assistant_capture::transform_for_client`.
+            let scrubbed = Sanitizer::builtin().scrub(&text);
+            *field = serde_json::Value::String(truncate_utf8_bytes(&scrubbed, max_bytes));
             changed = true;
         }
     }
@@ -1244,6 +1395,36 @@ mod tests {
         assert!(ProjectSource::RepoRoot.yields_to_session());
         assert!(!ProjectSource::Marker.yields_to_session());
         assert!(!ProjectSource::Unspecified.yields_to_session());
+    }
+
+    #[test]
+    fn omitted_style_stays_legacy_host_path_while_new_clients_send_path() {
+        let envelope = |identity_style: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    identity_style: identity_style.map(str::to_owned),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": "s" }),
+            )
+        };
+        assert_eq!(
+            envelope(None).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
+        assert_eq!(
+            envelope(Some("path")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::Path
+        );
+        assert_eq!(
+            envelope(Some("host_path")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
+        assert_eq!(
+            envelope(Some("unknown")).identity_style,
+            ai_memory_core::repository_identity::IdentityStyle::HostPath
+        );
     }
 
     #[test]
@@ -1368,13 +1549,33 @@ mod tests {
         assert!(body_is_subagent(
             &serde_json::json!({ "sessionId": "s", "subagentType": "general-purpose" })
         ));
-        // Claude Code tags its subagent events with `agent_type` / `agent_id`.
+        // Claude Code identifies spawned agents with `agent_id`.
         assert!(body_is_subagent(
-            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent" })
+            &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent", "agent_id": "agent-abc123" })
         ));
         assert!(body_is_subagent(
             &serde_json::json!({ "agent_id": "agent-abc123" })
         ));
+    }
+
+    #[test]
+    fn body_is_subagent_keeps_top_level_claude_agent_sessions() {
+        // `claude --agent <name>` also sets agent_type on the main session.
+        let mut raw = serde_json::json!({
+            "session_id": "main-session",
+            "agent_type": "regulus:regulus",
+        });
+        assert!(!body_is_subagent(&raw), "agent_id absent");
+        for agent_id in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!(42),
+            serde_json::json!(false),
+        ] {
+            raw["agent_id"] = agent_id;
+            assert!(!body_is_subagent(&raw), "{raw}");
+        }
     }
 
     #[test]
@@ -1917,7 +2118,10 @@ mod tests {
             q,
             serde_json::json!({"payload":{"tool":"bash","output":"é".repeat(2_000)}}),
         );
-        assert!(long.body_excerpt.unwrap().len() <= 2_000);
+        let body = long.body_excerpt.unwrap();
+        assert!(body.len() > 2_000);
+        let capped = truncate_utf8_bytes(&body, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.len() <= 2_000);
     }
 
     /// OpenCode's plugin `event` hook receives bus events shaped like
@@ -2037,6 +2241,151 @@ mod tests {
         assert!(unknown.title_hint.is_none());
     }
 
+    /// Hermes 3.x puts the tool result inside `extra.result` and mirrors the
+    /// call status in `extra.status` (`ok` | `error`). The extractor must read
+    /// both from the documented `extra` object: output lands in the body
+    /// instead of "(no output captured)", and a proven status maps to a real
+    /// outcome instead of permanent `unknown`. Live-captured 2026-10-07 from
+    /// `agent/shell_hooks.py::_payload_fields` +
+    /// `model_tools.py::_emit_post_tool_call_hook` (Hermes main).
+    #[test]
+    fn hermes_output_and_outcome_come_from_the_extra_object() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "execute_code",
+            "tool_input": {"code": "print(1)"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {
+                "tool_call_id": "call-43",
+                "status": "ok",
+                "result": {"output": "1", "exit_code": 0}
+            }
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.contains("tool_family: non-file"), "body: {body}");
+        assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
+        assert!(
+            body.contains("outcome: success"),
+            "status ok must map to success — body: {body}"
+        );
+        assert!(
+            body.contains("\"output\": \"1\"") || body.contains("exit_code"),
+            "extra.result content must appear in the body — body: {body}"
+        );
+    }
+
+    #[test]
+    fn hermes_error_status_maps_to_error_outcome() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "terminal",
+            "tool_input": {"command": "false"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {
+                "tool_call_id": "call-44",
+                "status": "error",
+                "error_message": "command failed with exit code 1",
+                "result": "command failed"
+            }
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.contains("outcome: error"), "body: {body}");
+    }
+
+    /// A truly unknown tool name keeps the upstream privacy invariant: the
+    /// family gates output capture, so `unknown` still omits the body. Real
+    /// Hermes tools that execute code or reach the web are named in
+    /// `family()` and classify as `non-file` (see
+    /// `hermes_documented_tool_names_map_to_canonical_families`); a brand-new
+    /// Hermes tool degrades to metadata-only until its name is upstreamed —
+    /// capture fidelity is preserved by extending the list, not by relaxing
+    /// the unknown-family gate.
+    #[test]
+    fn hermes_unknown_family_keeps_metadata_only_invariant() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "brand_new_tool",
+            "tool_input": {"query": "x"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {
+                "tool_call_id": "call-45",
+                "status": "ok",
+                "result": "search hit count: 3"
+            }
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.contains("tool_family: unknown"), "body: {body}");
+        assert!(body.contains("outcome: success"), "body: {body}");
+        assert!(
+            !body.contains("search hit count: 3"),
+            "unknown family must not leak output — body: {body}"
+        );
+    }
+
+    /// Real Hermes execution-surface tools classify as non-file so their
+    /// bodies carry the `extra.result` output (live names, 2026-10-07).
+    #[test]
+    fn hermes_execution_tools_classify_non_file_and_capture_output() {
+        for tool in ["execute_code", "browser_exec", "web_extract"] {
+            let raw = serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": tool,
+                "tool_input": {"query": "x"},
+                "session_id": "hermes-session",
+                "cwd": "/repo",
+                "extra": {
+                    "tool_call_id": "call-46",
+                    "status": "ok",
+                    "result": "CAPTURE-ME-42"
+                }
+            });
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("hermes".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            let body = env.body_excerpt.unwrap_or_default();
+            assert!(
+                body.contains("tool_family: non-file"),
+                "{tool} should be non-file — body: {body}"
+            );
+            assert!(
+                body.contains("CAPTURE-ME-42"),
+                "{tool} output must be captured — body: {body}"
+            );
+        }
+    }
+
     #[test]
     fn pool_tool_title_uses_the_documented_snake_case_shape() {
         let raw = serde_json::json!({
@@ -2090,6 +2439,110 @@ mod tests {
         assert_eq!(env.session_id.as_deref(), Some("sess_4fc06da3"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/zcode-capture"));
         assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
+    }
+
+    #[test]
+    fn grizzybot_tool_title_is_a_closed_family() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write_file",
+            "tool_input": {"path": "notes.md", "content": "untrusted"},
+            "tool_response": "ok",
+            "session_id": "gb-session",
+            "cwd": "/bot/home"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("grizzybot".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Grizzybot);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("gb-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
+    }
+
+    /// Factory Droid's PostToolUse is Claude-shaped with no tool-call id
+    /// (0.240.0 tool schemas, #1240): a `Create` is a closed `file` family and
+    /// its `tool_response` is the captured output.
+    #[test]
+    fn droid_create_post_tool_use_is_a_closed_file_family_without_call_id() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "permission_mode": "auto-low",
+            "tool_name": "Create",
+            "tool_input": {"file_path": "/repo/notes.md", "content": "hello"},
+            "tool_response": {"filePath": "/repo/notes.md", "success": true},
+            "session_id": "droid-session",
+            "transcript_path": "/home/u/.factory/sessions/x.jsonl",
+            "cwd": "/repo"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("droid".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Droid);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("droid-session"));
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(!body.contains("tool_call_id"), "{body}");
+        assert!(body.contains("/repo/notes.md"), "{body}");
+    }
+
+    /// Meta Muse Code's PostToolUse and PostToolUseFailure, as captured
+    /// offline from Muse Code 1.4.7 (paths rewritten): a `write_file` is a
+    /// closed `file` family that keeps its `tool_use_id`, the session id is
+    /// the payload's UUIDv7, and a failure aliases to `post-tool-use`.
+    #[test]
+    fn muse_post_tool_use_is_a_closed_file_family_with_call_id() {
+        let raw = serde_json::json!({
+            "cwd": "/repo",
+            "hook_event_name": "PostToolUse",
+            "model": "muse-wonder-1.0",
+            "model_provider": "meta",
+            "permission_mode": "bypassPermissions",
+            "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+            "tool_input": {"content": "alpha\n", "path": "notes.txt"},
+            "tool_name": "write_file",
+            "tool_response": {
+                "filePath": "/repo/notes.txt",
+                "structuredPatch": [{"lines": ["+alpha"], "newLines": 1, "newStart": 1, "oldLines": 0, "oldStart": 1}]
+            },
+            "tool_use_id": "call_30a33793ad9c",
+            "transcript_path": null,
+            "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("muse".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Muse);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("01a13669-dc61-7a72-b5ec-ad2f300ffd26")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("call_30a33793ad9c"), "{body}");
+
+        assert_eq!(
+            HookEvent::parse("PostToolUseFailure"),
+            HookEvent::PostToolUse
+        );
     }
 
     /// Body is well-formed JSON but the expected `session_id` /
@@ -2148,6 +2601,31 @@ mod tests {
         assert_eq!(env.agent, AgentKind::Other);
     }
 
+    /// #1225: a SessionEnd's `reason` becomes the observation body (first
+    /// line, string only), so why a session ended survives capture. An
+    /// absent, empty or non-string reason leaves the body empty as before.
+    #[test]
+    fn session_end_reason_becomes_the_observation_body() {
+        let q = HookQuery {
+            event: "session-end".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let body = |raw| HookEnvelope::from_query_and_body(q.clone(), raw).body_excerpt;
+        assert_eq!(
+            body(serde_json::json!({ "reason": "prompt_input_exit" })).as_deref(),
+            Some("reason: prompt_input_exit")
+        );
+        assert_eq!(
+            body(serde_json::json!({ "reason": "logout\ninjected second line" })).as_deref(),
+            Some("reason: logout")
+        );
+        assert_eq!(body(serde_json::json!({})), None);
+        assert_eq!(body(serde_json::json!({ "reason": "" })), None);
+        assert_eq!(body(serde_json::json!({ "reason": 7 })), None);
+        assert_eq!(body(serde_json::json!({ "reason": { "kind": "x" } })), None);
+    }
+
     /// Title-hint extraction must truncate at the first newline (the
     /// "first line" rule used everywhere in the wiki log + handoff
     /// surfaces), but must NOT cap length here any more: the 80-char display
@@ -2169,6 +2647,26 @@ mod tests {
         );
         assert_eq!(env.title_hint.as_deref(), Some("first line"));
 
+        let env = HookEnvelope::from_query_and_body(
+            q.clone(),
+            serde_json::json!({ "prompt": "first line\r\nsecond line should be lost" }),
+        );
+        assert_eq!(
+            env.title_hint.as_deref(),
+            Some("first line"),
+            "CRLF must not leave a trailing CR on the title"
+        );
+
+        let env = HookEnvelope::from_query_and_body(
+            q.clone(),
+            serde_json::json!({ "prompt": "\r\nhello" }),
+        );
+        assert!(
+            env.title_hint.is_none(),
+            "empty first line after leading CRLF must not become a CR or empty title, got {:?}",
+            env.title_hint
+        );
+
         // Very long single line → title_hint keeps every character; the
         // 80-char cap now happens later, after sanitization.
         let long = "x".repeat(200);
@@ -2176,6 +2674,42 @@ mod tests {
         let title = env.title_hint.unwrap();
         assert_eq!(title.chars().count(), 200);
         assert!(!title.contains('…'));
+    }
+
+    #[test]
+    fn notification_and_compaction_titles_are_the_first_line() {
+        let start = HookQuery {
+            event: "session-start".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            start,
+            serde_json::json!({ "title": "first\r\nsecond" }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("first"));
+
+        let notify = HookQuery {
+            event: "notification".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            notify,
+            serde_json::json!({ "message": "first\r\nsecond" }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("first"));
+
+        let compact = HookQuery {
+            event: "post-compaction".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            compact,
+            serde_json::json!({ "summary": "kept\nlost" }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("kept"));
     }
 
     #[test]
@@ -2198,11 +2732,19 @@ mod tests {
                 },
                 serde_json::json!({(field): body}),
             );
-            let excerpt = env.body_excerpt.expect("bounded body excerpt");
-            assert!(excerpt.len() <= cap, "{event} exceeded {cap} bytes");
-            assert!(excerpt.ends_with('…'), "{event} omitted truncation marker");
+            // Extraction no longer caps (#1114): the sanitizer at the ingest
+            // funnel must see the full text before any byte limit runs. The
+            // scrub-then-cap order itself is asserted by the router's
+            // `issue_1114_*` tests.
+            let excerpt = env.body_excerpt.expect("body excerpt");
+            assert_eq!(excerpt, body, "{event} excerpt was capped at extraction");
+            let hook_event = HookEvent::parse(event);
+            assert_eq!(durable_body_cap(hook_event), cap);
+            let capped = truncate_utf8_bytes(&excerpt, durable_body_cap(hook_event));
+            assert!(capped.len() <= cap, "{event} exceeded {cap} bytes");
+            assert!(capped.ends_with('…'), "{event} omitted truncation marker");
             assert!(
-                !excerpt.contains("TAIL_SENTINEL"),
+                !capped.contains("TAIL_SENTINEL"),
                 "{event} retained content after the cap"
             );
         }
@@ -2248,6 +2790,35 @@ mod tests {
         ));
     }
 
+    /// Regression for #1114 (client side): an oversized lifecycle body is
+    /// scrubbed with the built-in sanitizer **before** the spool cap runs, so
+    /// a secret straddling the cutoff is redacted whole instead of being cut
+    /// into an unmatchable prefix that the spool — and later the server —
+    /// persists in clear text. Mirrors `transform_for_client` (#196) and the
+    /// #980 / #1109 scrub-before-cap fixes.
+    #[test]
+    fn client_body_cap_scrubs_before_truncating() {
+        // AWS access key id shape: a built-in pattern.
+        let secret = format!("AKIA{}", "A".repeat(16));
+        let mut raw = serde_json::json!({
+            "prompt": format!("{} {secret}", "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES - 14)),
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        let capped = raw["prompt"].as_str().expect("oversized prompt capped");
+        assert!(
+            !capped.contains("AKIA"),
+            "unredacted secret fragment survived the cap: {capped:?}"
+        );
+        assert!(
+            capped.contains("[REDACTED:"),
+            "capped prompt carries no redaction marker: {capped:?}"
+        );
+        assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+    }
+
     /// Kimi Code's content-block `prompt` must flatten into the title
     /// exactly like the body excerpt does.
     #[test]
@@ -2287,8 +2858,9 @@ mod tests {
             }),
         );
         let excerpt = env.body_excerpt.unwrap();
-        assert!(excerpt.ends_with('…'));
         assert!(excerpt.starts_with("tool_family: non-file\noutcome: unknown\n---\n"));
+        let capped = truncate_utf8_bytes(&excerpt, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.ends_with('…'));
     }
 
     /// Regression: the native-binary hook command sends the script stem
@@ -2361,6 +2933,163 @@ mod tests {
         );
     }
 
+    /// Cursor runs the Claude Code hooks too, sending its own payload with
+    /// Claude's `tool_name`/`tool_input` aliases and the result as a JSON
+    /// string in `tool_output`. The payload marks the event as Cursor's, and
+    /// Cursor was absent from `closed_tool_agent`, so its tool observations
+    /// were stored with no title or body (captured live from Cursor 3.24.9).
+    #[test]
+    fn cursor_tool_events_keep_their_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversation_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "session_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "hook_event_name": "postToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "ls", "cwd": "", "timeout": 30000},
+                "tool_output": "{\"output\":\"MARKER_CURSOR_OUTPUT\",\"exitCode\":0}",
+                "tool_use_id": "9fc522a1-2a0e-4847-9ffc-24256e023574",
+                "cwd": "",
+                "workspace_roots": [],
+            }),
+        );
+        assert_eq!(post.agent, AgentKind::Cursor);
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("cursor post-tool body");
+        assert!(body.contains("MARKER_CURSOR_OUTPUT"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "hook_event_name": "preToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "ls", "cwd": "", "timeout": 30000},
+                "tool_use_id": "9fc522a1-2a0e-4847-9ffc-24256e023574",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool non-file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+    }
+
+    /// Kiro CLI's tool hooks carry `tool_name` and `tool_input`, and its
+    /// `PostToolUse` adds `tool_response`: a plain string on the v3 engine
+    /// (live capture, Kiro CLI 2.16.2) and an object with a `success` flag on
+    /// v2. The capture policy already read this shape, but Kiro was absent from
+    /// `closed_tool_agent`, so its tool observations were stored with no title
+    /// or body, the failure mode Grok had in #931.
+    #[test]
+    fn kiro_cli_tool_events_keep_their_family_title_and_output() {
+        let v3 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kiro-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "kiro-v3-session",
+                "cwd": "/workspace/project",
+                "tool_name": "read_file",
+                "tool_input": {"path": "/workspace/project/sample.txt"},
+                "tool_response": "MARKER_KIRO_V3_OUTPUT",
+            }),
+        );
+        assert_eq!(v3.agent, AgentKind::KiroCli);
+        assert_eq!(v3.title_hint.as_deref(), Some("tool file"));
+        let body = v3.body_excerpt.expect("kiro v3 post-tool body");
+        assert!(body.contains("MARKER_KIRO_V3_OUTPUT"), "{body:?}");
+
+        let v2 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kiro-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "kiro-v2-session",
+                "cwd": "/workspace/project",
+                "tool_name": "fs_read",
+                "tool_input": {"operations": [{"mode": "Line", "path": "src/lib.rs"}]},
+                "tool_response": {"success": true, "result": ["MARKER_KIRO_V2_OUTPUT"]},
+            }),
+        );
+        assert_eq!(v2.title_hint.as_deref(), Some("tool file"));
+        let body = v2.body_excerpt.expect("kiro v2 post-tool body");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(body.contains("MARKER_KIRO_V2_OUTPUT"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("kiro-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "kiro-v3-session",
+                "cwd": "/workspace/project",
+                "tool_name": "read_file",
+                "tool_input": {"path": "/workspace/project/sample.txt"},
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+    }
+
+    /// Claude Code's Windows `PowerShell` tool shares Bash's payload shape but
+    /// fell through to the unknown family, so its output was never stored
+    /// (#1186). The PreToolUse body still never carries the command.
+    #[test]
+    fn claude_code_powershell_tool_keeps_its_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "PowerShell",
+                "tool_input": {"command": "Get-ChildItem SENTINEL_COMMAND", "description": "list"},
+                "tool_response": {"stdout": "MARKER_POWERSHELL_1186", "stderr": ""},
+                "tool_use_id": "toolu_1186",
+            }),
+        );
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("powershell post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("MARKER_POWERSHELL_1186"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "PowerShell",
+                "tool_input": {"command": "Get-ChildItem SENTINEL_COMMAND"},
+                "tool_use_id": "toolu_1186",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool non-file"));
+        let body = pre.body_excerpt.expect("powershell pre-tool body");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
+    }
+
     /// Grok Build CLI posts a `PostToolUse` with Claude Code's snake_case
     /// aliases (`tool_name` / `tool_input` / `tool_use_id`). It was absent from
     /// both `closed_tool_agent` and the `tool_observation_metadata` match, so
@@ -2388,6 +3117,40 @@ mod tests {
             body.contains("MARKER_GROK_931"),
             "grok tool_response should be serialized into the body: {body:?}"
         );
+    }
+
+    /// Copilot CLI's VS-Code-compatible `PostToolUse` nests the output at
+    /// `tool_result.text_result_for_llm` (#1040). Without Copilot in
+    /// `closed_tool_agent` the observation would be stored with an empty body,
+    /// the #931 failure mode Grok had; without the dedicated path the
+    /// `result_type` envelope would leak into the excerpt.
+    #[test]
+    fn copilot_cli_post_tool_excerpt_reads_text_result_for_llm() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("copilot-cli".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "copilot-session",
+                "cwd": "/repo",
+                "tool_name": "bash",
+                "tool_input": {"command": "ls"},
+                "tool_result": {
+                    "result_type": "success",
+                    "text_result_for_llm": "MARKER_COPILOT_1040",
+                },
+            }),
+        );
+        let body = env
+            .body_excerpt
+            .expect("copilot-cli post-tool body should not be empty");
+        assert!(body.contains("MARKER_COPILOT_1040"), "{body:?}");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(!body.contains("result_type"), "{body:?}");
     }
 
     /// End-to-end: a native-hook user prompt (`event=user-prompt-submit`,
@@ -2481,9 +3244,12 @@ mod tests {
             },
             serde_json::json!({"tool_name": "Bash", "tool_use_id": "call-long", "tool_response": {"content": [{"type": "text", "text": "é".repeat(2_000)}]}}),
         );
+        // Extraction no longer caps: the sanitizer must see the full text
+        // before any byte limit runs (#1114). The cap itself is asserted at
+        // the ingest funnel, where it is applied to the scrubbed body.
         let body = env.body_excerpt.unwrap();
         assert!(body.contains('é'));
-        assert!(body.len() <= TOOL_EXCERPT_MAX_BYTES);
+        assert!(body.len() > TOOL_EXCERPT_MAX_BYTES);
     }
 
     #[test]
@@ -2609,7 +3375,10 @@ mod tests {
             },
             serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":"utf8-1","output": "é".repeat(2_000)}),
         );
-        assert!(long.body_excerpt.unwrap().len() <= 2_000);
+        let body = long.body_excerpt.unwrap();
+        assert!(body.len() > 2_000);
+        let capped = truncate_utf8_bytes(&body, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.len() <= 2_000);
     }
 
     #[test]

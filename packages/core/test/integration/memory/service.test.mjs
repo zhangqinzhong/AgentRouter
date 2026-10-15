@@ -117,6 +117,11 @@ test("preview can adopt an existing authenticated memory service without stoppin
     const status = await service.request({ action: "start" });
     assert.equal(status.state, "running");
     assert.equal(status.pid, undefined);
+    if (available) {
+      const preview = await service.request({ action: "client", client: "codex", kind: "mcp", operation: "preview" });
+      assert.ok(preview.output.length > 0);
+      assert.equal(existsSync(preview.path), false);
+    }
     await service.shutdown();
     assert.equal(foreign.listening, true);
   } finally {

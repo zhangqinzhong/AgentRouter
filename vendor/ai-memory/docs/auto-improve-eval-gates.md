@@ -60,6 +60,40 @@ Command errors, timeouts, invalid JSON, missing `passed`, `passed = false`, and
 insufficient score delta all fail closed for the targeted proposal. Other
 proposals in the same run can still proceed.
 
+## Recorded results
+
+The review report includes optional `eval_results`, one record for each targeted
+proposal evaluated by the existing gate. The server generates each `eval_id` as a
+UUID v7 for that scorer attempt, independently of the review run ID. Its status is
+`success` when the response passes the existing criteria, `rejected` when a valid
+response has `passed = false` or insufficient score delta, `failure` for command,
+I/O, or response parsing errors, and `timeout` when the deadline expires.
+Non-targeted proposals and disabled evals produce no records.
+
+Each record contains the target path, `checker_name` (the program's basename),
+`checker_invocation_digest` (SHA-256 of the configured command string), and
+`proposal_sha256` (SHA-256 of the serialized JSON request sent on stdin).
+`before_body_sha256` and `after_body_sha256` hash the exact UTF-8 bodies in that
+request. Optional `materialized_base_body_sha256` identifies the server-resolved
+base used to materialize a patch, which can differ from the current `before_body`
+if the page changed before eval. These records do not certify a later page version.
+The invocation digest does not hash executable or script contents and cannot
+prove which checker code ran. No executable is read to produce these records.
+
+Scores and `passed` come only from the scorer response. Reasons are scrubbed with
+the built-in sanitizer before being capped at 2,048 characters. They remain
+untrusted, attributed data. Extra scorer/model fields cannot supply eval IDs,
+digests, or independent results; ordinary evidence quotes remain ordinary quotes.
+
+Staging stores all results in the existing run config JSON. For an accepted
+proposal, its eval result is also attached to the `auto_improve_eval` evidence
+entry in the pending sidecar. The sidecar remains a snapshot at staging time,
+without a new approval or execution step. Reports without `eval_results` and
+older evidence entries without `eval_result` remain readable.
+Deserializing a review report always discards `eval_results`, including forged
+or malformed values. Only results held by the live server review can be attached
+to pending evidence; reading a report cannot restore independent observations.
+
 ## Scorer design rules
 
 - Keep scorers deterministic, fast, and side-effect-free.
@@ -74,10 +108,10 @@ proposals in the same run can still proceed.
 
 This repository includes two dependency-free templates:
 
-- [`docs/examples/auto-improve-eval/score_proposal.py`](examples/auto-improve-eval/score_proposal.py)
-  — Python scorer that checks basic structure and placeholders.
-- [`docs/examples/auto-improve-eval/score_proposal.sh`](examples/auto-improve-eval/score_proposal.sh)
-  — POSIX shell wrapper around an embedded Python scorer for hosts that prefer a
+- [`docs/examples/auto-improve-eval/score_proposal.py`](examples/auto-improve-eval/score_proposal.py):
+  Python scorer that checks basic structure and placeholders.
+- [`docs/examples/auto-improve-eval/score_proposal.sh`](examples/auto-improve-eval/score_proposal.sh):
+  POSIX shell wrapper around an embedded Python scorer for hosts that prefer a
   script entrypoint.
 
 Try them with the sample payload:

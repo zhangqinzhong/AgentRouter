@@ -295,6 +295,9 @@ mod web_base_tests {
 /// [`split_web_routers`] below clippy's `too_many_arguments` threshold
 /// without hiding the call shape.
 pub struct WebMountSpec<'a> {
+    /// Mount `/api/v1` even when the browser UI is disabled. The browser UI
+    /// always implies the API for backward compatibility.
+    pub enable_api: bool,
     /// Operator-supplied custom SPA directory (`--web-ui-dir`). `None`
     /// mounts the built-in server-rendered wiki browser instead.
     pub web_ui_dir: Option<&'a Path>,
@@ -311,6 +314,11 @@ pub struct WebMountSpec<'a> {
     /// A trusted identity proxy is configured; the root-only pending-writes
     /// page needs it to decide whether operators are told apart.
     pub trusted_proxy_identity: bool,
+    /// The server's configured embedder and reranker, so project search in
+    /// `/web` and `/api/v1` ranks like `memory_query`.
+    pub recall: crate::Recall,
+    /// Process-side sources for the root-only health page.
+    pub health: Option<Arc<crate::health::HealthSources>>,
 }
 
 /// Public SPA vs dual-auth wiki/API split.
@@ -327,7 +335,24 @@ pub struct SplitWebRouters {
     pub html_auth: Option<Arc<crate::HtmlAuthRedirectConfig>>,
 }
 
+/// Refuse to be framed by any page. With auth off, a page inside an iframe
+/// makes same-origin requests the cross-origin guard rightly allows, so a
+/// foreign site could frame `/web/pending` and trick a click on Approve or
+/// Reject. Set only when a handler has not chosen its own value.
+async fn deny_framing(mut response: axum::response::Response) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let headers = response.headers_mut();
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static("frame-ancestors 'none'"));
+    response
+}
+
 /// Split the web surfaces so the host can attach different auth layers.
+/// Every web surface refuses framing (see [`deny_framing`]).
 ///
 /// # Errors
 /// Custom SPA `index.html` cannot be read.
@@ -337,15 +362,43 @@ pub fn split_web_routers(
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<SplitWebRouters> {
-    if !enable_web {
+    let split = split_web_routers_unframed(enable_web, reader, wiki, spec)?;
+    let layer = || axum::middleware::map_response(deny_framing);
+    Ok(SplitWebRouters {
+        public: split.public.layer(layer()),
+        protected: split.protected.layer(layer()),
+        html_auth: split.html_auth,
+    })
+}
+
+fn split_web_routers_unframed(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
+    if !enable_web && !spec.enable_api {
         return Ok(SplitWebRouters {
             public: axum::Router::new(),
             protected: axum::Router::new(),
             html_auth: None,
         });
     }
-    let api = build_api_router(&reader, &wiki, spec.cors_origins);
+    let mut state = crate::WebState::new(reader, wiki)
+        .with_trusted_proxy_identity(spec.trusted_proxy_identity)
+        .with_recall(spec.recall);
+    if let Some(health) = spec.health {
+        state = state.with_health(health);
+    }
+    let api = build_api_router(state.clone(), spec.cors_origins);
     let protected_api = axum::Router::new().nest("/api/v1", api);
+    if !enable_web {
+        return Ok(SplitWebRouters {
+            public: axum::Router::new(),
+            protected: protected_api,
+            html_auth: None,
+        });
+    }
     let slug = normalize_prefix(spec.web_slug);
     let mount = if slug.is_empty() { "/" } else { slug.as_str() };
     if let Some(dir) = spec.web_ui_dir {
@@ -380,14 +433,7 @@ pub fn split_web_routers(
             spec.base_path,
             mount,
         ),
-        protected: mount_builtin_browser(
-            protected_api,
-            crate::WebState::new(reader, wiki)
-                .with_trusted_proxy_identity(spec.trusted_proxy_identity),
-            &slug,
-            mount,
-            browser_inject,
-        ),
+        protected: mount_builtin_browser(protected_api, state, &slug, mount, browser_inject),
         html_auth: Some(auth_cfg),
     })
 }
@@ -411,8 +457,8 @@ fn mount_web_router(
 /// the operator configured any. The layer is scoped to this router only
 /// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
 /// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -> axum::Router {
-    let api = crate::api_router(reader.clone(), wiki.clone());
+fn build_api_router(state: crate::WebState, cors_origins: &[String]) -> axum::Router {
+    let api = crate::routes::build_api(Arc::new(state));
     if cors_origins.is_empty() {
         return api;
     }
@@ -673,12 +719,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &[],
                 web_slug,
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1074,12 +1123,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1151,12 +1203,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1173,6 +1228,114 @@ mod tests {
             html.contains(r#"<base href="/web/"><title>spa</title>"#),
             "the base href belongs in the head: {html}"
         );
+    }
+
+    /// Every web surface refuses framing: the built-in pages (the pending
+    /// writes page among them), the login page, and the API. A foreign site
+    /// that frames `/web/pending` on an auth-off server could otherwise trick
+    /// a click on Approve or Reject (GHSA-6mc4-46pr-w82w).
+    #[tokio::test]
+    async fn web_surfaces_refuse_to_be_framed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        // A page version and a session, so the history and timeline routes
+        // answer 200 rather than an error page.
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: ai_memory_core::PagePath::new("notes/a.md").unwrap(),
+                title: "A".into(),
+                body: "a".into(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let session = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let base_href = web_base_href("", "/web");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: true,
+                web_ui_dir: None,
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: &base_href,
+                base_path: "",
+                trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
+            },
+        )
+        .unwrap();
+        let session_uri = format!("/web/w/default/scratch/s/{session}");
+        for uri in [
+            "/web",
+            "/web/pending",
+            "/web/login",
+            "/api/v1/projects",
+            "/web/w/default/scratch/h/notes/a.md",
+            session_uri.as_str(),
+            "/api/v1/workspaces/default/projects/scratch/history/notes/a.md",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            if uri.contains("/h/") || uri.contains("/s/") || uri.contains("/history/") {
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+            let headers = resp.headers();
+            assert_eq!(
+                headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
+                Some("DENY"),
+                "{uri} ({})",
+                resp.status()
+            );
+            assert_eq!(
+                headers
+                    .get("content-security-policy")
+                    .map(|v| v.to_str().unwrap()),
+                Some("frame-ancestors 'none'"),
+                "{uri}"
+            );
+        }
     }
 
     /// Regression for the prod 404: with `base_path=""` (host root) the custom
@@ -1200,12 +1363,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1259,12 +1425,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/",
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1347,12 +1516,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1403,12 +1575,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1448,12 +1623,15 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();

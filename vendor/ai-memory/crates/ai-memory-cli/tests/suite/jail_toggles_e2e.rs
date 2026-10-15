@@ -103,10 +103,16 @@ impl Fixture {
         fs::write(&help_file, help).unwrap();
         let jail_argv = root.join("ai-jail-argv.txt");
         let claude_ran = root.join("claude-ran.txt");
+        // `--help` feeds toggle support; `--dry-run` is the usable-ai-jail
+        // preflight (`usable_ai_jail_here`). Neither is a real re-exec, so
+        // neither may touch `jail_argv` — tests assert its absence when the
+        // wrapper stays unjailed or rejects before exec.
         write_script(
             &bin.join("ai-jail"),
             &format!(
-                "if [ \"$1\" = --help ]; then cat '{}'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                "if [ \"$1\" = --help ]; then cat '{}'; exit 0; fi\n\
+                 if [ \"$1\" = --dry-run ]; then exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > '{}'\n",
                 help_file.display(),
                 jail_argv.display()
             ),
@@ -177,7 +183,18 @@ async fn mock_server() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHan
         let observed = observed.clone();
         async move {
             observed.lock().unwrap().push(uri.path().to_owned());
-            if uri.path() == "/workstream/runs" {
+            if uri.path() == "/workstream/recent" {
+                (
+                    StatusCode::OK,
+                    Json(json!([{
+                        "workstream_id": "12345678-1234-4234-9234-123456789abd",
+                        "name": "fixture", "current": true,
+                        "created_at": "2026-09-01T00:00:00Z",
+                        "last_active_at": "2026-09-01T00:00:00Z",
+                        "linked_harnesses": ["claude-code"]
+                    }])),
+                )
+            } else if uri.path() == "/workstream/runs" {
                 (
                     StatusCode::OK,
                     Json(json!({
@@ -691,11 +708,143 @@ async fn yolo_offer_skips_the_checklist_for_a_project_ai_jail() {
     handle.abort();
 }
 
+#[tokio::test]
+async fn bare_nonterminal_command_help_version_and_typos_do_not_launch_a_picker() {
+    let fixture = Fixture::new(HELP_2_4_1, true, None);
+    let (server, requests, handle) = mock_server().await;
+    for (args, succeeds) in [
+        (vec![], false),
+        (vec!["--help"], true),
+        (vec!["--version"], true),
+        (vec!["resumee"], false),
+    ] {
+        let output = run(&fixture, &server, &args).await;
+        assert_eq!(output.status.success(), succeeds, "{}", stderr(&output));
+        assert!(
+            !fixture.home.join("data").exists(),
+            "parsing must not load config"
+        );
+    }
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(fixture.jail_argv().is_none());
+    assert!(!fixture.claude_ran.exists());
+    handle.abort();
+}
+
+/// Run an installed ai-jail's actual PTY proxy without nesting a kernel sandbox.
+/// The backend stub only executes the command after bwrap's separator.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set AI_MEMORY_TEST_REAL_AI_JAIL to an ai-jail binary accepting a fixture BWRAP_BIN"]
+async fn installed_ai_jail_proxy_displays_resume_yolo() {
+    let jail = std::env::var_os("AI_MEMORY_TEST_REAL_AI_JAIL")
+        .expect("AI_MEMORY_TEST_REAL_AI_JAIL points to the binary being tested");
+    let fixture = Fixture::new(HELP_2_4_1, true, None);
+    std::os::unix::fs::symlink(BIN, fixture.bin.join("ai-memory")).unwrap();
+    write_script(
+        &fixture.bin.join("bwrap"),
+        "if [ \"$1\" = --version ]; then echo 'bubblewrap 0.11.0'; exit 0; fi\nwhile [ $# -gt 0 ]; do\nif [ \"$1\" = -- ]; then shift; exec \"$@\"; fi\nshift\ndone\nexit 1\n",
+    );
+    let (server, requests, handle) = mock_server().await;
+    let launch = inside_ai_jail_here();
+    let output = terminal_run_program(
+        &fixture,
+        &server,
+        Path::new(&jail),
+        "--no-landlock --no-seccomp --no-rlimits --no-mise --no-save-config --no-gpu --no-docker --no-display ai-memory resume --yolo",
+        if launch { "\x1b[C\r" } else { "\x1b" },
+        Some("Resume workstream"),
+    )
+    .await;
+    assert!(output.contains("Resume workstream"), "{output}");
+    if launch {
+        let native_args = fs::read_to_string(&fixture.claude_ran).unwrap();
+        assert!(
+            native_args.contains("--dangerously-skip-permissions"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("Re-run this session inside it?"),
+            "{output}"
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/finish"))
+        );
+    } else {
+        assert_eq!(requests.lock().unwrap().as_slice(), ["/workstream/recent"]);
+        assert!(!fixture.claude_ran.exists());
+    }
+    handle.abort();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_yolo_displays_picker_without_scanning_git_status() {
+    let fixture = Fixture::new(HELP_2_4_1, true, None);
+    std::os::unix::fs::symlink(BIN, fixture.bin.join("ai-memory")).unwrap();
+    write_script(
+        &fixture.bin.join("ai-jail"),
+        &format!(
+            "printf '%s\\n' \"$@\" > '{}'\nexec \"$@\"\n",
+            fixture.jail_argv.display(),
+        ),
+    );
+    let git_binary = host_tool("git");
+    let status_called = fixture.home.join("git-status-called");
+    fs::remove_file(fixture.bin.join("git")).unwrap();
+    write_script(
+        &fixture.bin.join("git"),
+        &format!(
+            "for arg in \"$@\"; do\nif [ \"$arg\" = status ]; then\nprintf scanned > '{}'\nfi\ndone\nexec '{}' \"$@\"\n",
+            status_called.display(),
+            git_binary.display(),
+        ),
+    );
+    let (server, requests, handle) = mock_server().await;
+    let output = terminal_run_program(
+        &fixture,
+        &server,
+        &fixture.bin.join("ai-jail"),
+        "ai-memory resume --yolo",
+        "\x1b",
+        Some("Resume workstream"),
+    )
+    .await;
+    assert!(output.contains("Resume workstream"), "{output}");
+    assert!(
+        !status_called.exists(),
+        "listing must not scan the working tree before drawing the picker"
+    );
+    assert_eq!(requests.lock().unwrap().as_slice(), ["/workstream/recent"]);
+    assert_eq!(
+        fixture.jail_argv().unwrap(),
+        ["ai-memory", "resume", "--yolo"]
+    );
+    assert!(!fixture.claude_ran.exists());
+    handle.abort();
+}
+
 /// Run `ai-memory <args>` under `script` so stdin and stderr are a real
 /// terminal, feed `input`, and return everything the terminal showed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn terminal_run(fixture: &Fixture, server: &str, args: &str, input: &str) -> String {
-    use tokio::io::AsyncWriteExt as _;
+    terminal_run_program(fixture, server, Path::new(BIN), args, input, None).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn terminal_run_program(
+    fixture: &Fixture,
+    server: &str,
+    program: &Path,
+    args: &str,
+    input: &str,
+    ready: Option<&str>,
+) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let runner = fixture.home.join("runner.sh");
     fs::write(&runner, format!("exec \"$JAIL_E2E_BINARY\" {args}\n")).unwrap();
     let mut command = command(fixture, server, &[]);
@@ -721,14 +870,36 @@ async fn terminal_run(fixture: &Fixture, server: &str, args: &str, input: &str) 
     }
     terminal
         .env("HOME", &fixture.home)
-        .env("JAIL_E2E_BINARY", BIN)
+        .env("JAIL_E2E_BINARY", program)
+        .env("AI_MEMORY_NATIVE_BIN", BIN)
+        .env("AI_MEMORY_RUN_AUTOWIRE", "false")
+        .env("BWRAP_BIN", fixture.bin.join("bwrap"))
         .current_dir(&fixture.repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = tokio::process::Command::from(terminal)
+        .kill_on_drop(true)
         .spawn()
         .expect("script provides a pseudo-terminal");
+    let mut prefix = Vec::new();
+    if let Some(ready) = ready {
+        let stdout = child.stdout.as_mut().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut chunk = [0u8; 4096];
+            while !String::from_utf8_lossy(&prefix).contains(ready) {
+                let count = stdout.read(&mut chunk).await.unwrap();
+                assert!(
+                    count > 0,
+                    "terminal exited before picker: {}",
+                    String::from_utf8_lossy(&prefix)
+                );
+                prefix.extend_from_slice(&chunk[..count]);
+            }
+        })
+        .await
+        .expect("picker appeared");
+    }
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(input.as_bytes()).await.unwrap();
     stdin.flush().await.unwrap();
@@ -739,8 +910,18 @@ async fn terminal_run(fixture: &Fixture, server: &str, args: &str, input: &str) 
         .await
         .expect("terminal run finished")
         .expect("wait for script");
+    if ready.is_some() {
+        assert!(
+            output.status.success(),
+            "{}{}{}",
+            String::from_utf8_lossy(&prefix),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     format!(
-        "{}{}",
+        "{}{}{}",
+        String::from_utf8_lossy(&prefix),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )

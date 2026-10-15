@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Hook payload schemas, sanitisation, and HTTP ingress for agent lifecycle hooks."
@@ -22,6 +23,9 @@ serde_json.workspace = true
 # Parse the per-event `?event=…` query of each spooled URL in `/hook/batch`,
 # the same crate (and version) axum's `Query` extractor uses for `/hook`.
 serde_urlencoded = "0.7"
+# Unicode composition (NFC) for comparing paths on a case-folding macOS host;
+# already built into the binary through `url`/`idna`, at this version.
+icu_normalizer = "2.2"
 tokio.workspace = true
 tracing.workspace = true
 jiff.workspace = true
@@ -35,6 +39,7 @@ tempfile.workspace = true
 git2.workspace = true
 ai-memory-llm.workspace = true
 async-trait.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true

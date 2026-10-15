@@ -391,14 +391,8 @@ fn legacy_basic_password(headers: &HeaderMap) -> Option<String> {
     Some(password.to_string())
 }
 
-fn legacy_browser_credential(headers: &HeaderMap) -> Option<(String, bool)> {
-    legacy_basic_password(headers)
-        .map(|token| (token, true))
-        .or_else(|| cookie_value(headers, LEGACY_AUTH_COOKIE).map(|token| (token, false)))
-}
-
-fn legacy_cookie(token: &str, secure: bool) -> String {
-    set_cookie(LEGACY_AUTH_COOKIE, token, true, 2_592_000, secure)
+fn legacy_browser_credential(headers: &HeaderMap) -> Option<String> {
+    legacy_basic_password(headers).or_else(|| cookie_value(headers, LEGACY_AUTH_COOKIE))
 }
 
 fn unauthorized_legacy_browser() -> Response {
@@ -581,6 +575,43 @@ async fn dummy_login_failure(runtime: &HumanAuthRuntime, ip: IpAddr, password: S
     }
 }
 
+/// Whether the request declares a JSON body, by the rule axum's `Json`
+/// extractor applies: `application/json` or `application/*+json`, parameters
+/// and case ignored.
+///
+/// `/auth/login` and `/auth/recovery` read their bodies by hand so they can
+/// rate-limit first, which skipped that check. A page on another site can
+/// `POST` `text/plain` (or a form) cross-origin without a preflight, which let
+/// it sign the operator's browser into an account of its choosing or spend the
+/// login budget guessing passwords. A JSON content type needs a preflight
+/// these routes never answer. The built-in login page, the frontend API
+/// examples and the recovery `curl` all send `application/json`.
+fn declares_json_body(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || essence
+            .strip_prefix("application/")
+            .is_some_and(|subtype| subtype.len() > "+json".len() && subtype.ends_with("+json"))
+}
+
+fn unsupported_media_type() -> Response {
+    json_err(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "expected Content-Type: application/json",
+    )
+}
+
 async fn handle_login(
     State(state): State<Arc<AuthState>>,
     req: Request<axum::body::Body>,
@@ -588,6 +619,9 @@ async fn handle_login(
     let Some(runtime) = state.human.as_ref() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth required");
     };
+    if !declares_json_body(req.headers()) {
+        return unsupported_media_type();
+    }
     let headers = req.headers().clone();
     let ip = peer_ip(&headers, req.extensions(), &runtime.trusted_proxy_cidrs);
     if runtime.limiter.ip_blocked(ip) {
@@ -682,6 +716,9 @@ async fn handle_recovery(
     let Some(runtime) = state.human.as_ref() else {
         return generic();
     };
+    if !declares_json_body(req.headers()) {
+        return unsupported_media_type();
+    }
     let headers = req.headers().clone();
     let ip = peer_ip(&headers, req.extensions(), &runtime.trusted_proxy_cidrs);
     if runtime.limiter.ip_blocked(ip) {
@@ -1040,21 +1077,18 @@ pub async fn require_dual_auth(
         if req.method() != Method::GET {
             return crate::auth::unauthorized_bearer();
         }
-        let had_legacy_cookie = cookie_value(req.headers(), LEGACY_AUTH_COOKIE).is_some();
-        let Some((provided, from_basic)) = legacy_browser_credential(req.headers()) else {
+        // A Basic sign-in mints no cookie: the browser resends the cached
+        // Basic credentials on every same-origin request by itself, and a
+        // persistent cookie would park the raw root bearer on disk for 30
+        // days, sent over plain HTTP off loopback. A cookie an older build
+        // set is still accepted until human auth retires it.
+        let Some(provided) = legacy_browser_credential(req.headers()) else {
             return unauthorized_legacy_browser();
         };
         match crate::auth::authenticate_token(&state, &mut req, &provided, false).await {
             Ok(crate::auth::BearerAuth::Authenticated) => {
                 req.extensions_mut().insert(state.clone());
-                let mut response = next.run(req).await;
-                if from_basic
-                    && !had_legacy_cookie
-                    && let Ok(cookie) = legacy_cookie(&provided, state.secure_cookie()).parse()
-                {
-                    response.headers_mut().append(header::SET_COOKIE, cookie);
-                }
-                return response;
+                return next.run(req).await;
             }
             Err(response) => return response,
             Ok(crate::auth::BearerAuth::Absent | crate::auth::BearerAuth::Rejected) => {
@@ -1521,6 +1555,54 @@ mod tests {
         (tmp, state, writer)
     }
 
+    /// A fresh bearer-only server signs a browser in through Basic. That
+    /// sign-in must not park the root bearer in a cookie: none was needed
+    /// (the browser resends Basic itself), and the old 30-day cookie held the
+    /// raw token, `Secure` only when `secure_cookie` was on. Control: the
+    /// Basic GET is still served, and the bearer still authenticates.
+    #[tokio::test]
+    async fn a_basic_sign_in_mints_no_cookie_holding_the_root_bearer() {
+        let (_tmp, state, _writer) = legacy_transition_fixture().await;
+        let router = dual_router(state);
+
+        let basic = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("authorization", legacy_basic("legacy-root-token"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(basic.status(), StatusCode::OK, "Basic sign-in is served");
+        for value in basic.headers().get_all(header::SET_COOKIE) {
+            let value = value.to_str().unwrap();
+            assert!(
+                !value.contains("legacy-root-token"),
+                "no cookie may carry the root bearer: {value}"
+            );
+        }
+        assert!(set_cookie_value(basic.headers(), LEGACY_AUTH_COOKIE).is_none());
+
+        let bearer = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("authorization", "Bearer legacy-root-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bearer.status(),
+            StatusCode::OK,
+            "the bearer API still works"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_browser_credentials_stop_when_human_bootstrap_completes() {
         let (_tmp, state, writer) = legacy_transition_fixture().await;
@@ -1538,8 +1620,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(basic.status(), StatusCode::OK);
-        let legacy_cookie = set_cookie_value(basic.headers(), LEGACY_AUTH_COOKIE)
-            .expect("successful Basic auth must persist the legacy browser cookie");
+        // A cookie an older build minted still works until bootstrap.
+        let legacy_cookie = "legacy-root-token";
 
         let cookie = router
             .clone()
@@ -2086,6 +2168,118 @@ mod tests {
             .unwrap();
         assert_eq!(fresh.status(), StatusCode::OK);
         assert!(set_cookie_value(fresh.headers(), SESSION_COOKIE).is_some());
+    }
+
+    #[test]
+    fn json_body_declaration() {
+        for (value, json) in [
+            (Some("application/json"), true),
+            (Some("application/json; charset=utf-8"), true),
+            (Some("Application/JSON"), true),
+            (Some("application/vnd.api+json"), true),
+            (None, false),
+            (Some(""), false),
+            (Some("text/plain"), false),
+            (Some("text/plain;charset=UTF-8"), false),
+            (Some("application/x-www-form-urlencoded"), false),
+            (Some("multipart/form-data; boundary=x"), false),
+            (Some("application/+json"), false),
+            (Some("text/json"), false),
+            (Some("application/jsonp"), false),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(header::CONTENT_TYPE, value.parse().unwrap());
+            }
+            assert_eq!(declares_json_body(&headers), json, "{value:?}");
+        }
+    }
+
+    /// A foreign page can `POST` the three CORS-safelisted content types
+    /// without a preflight. Neither public auth route may act on one: no
+    /// session for the attacker's account (login CSRF), no password check
+    /// (guessing), no root reset.
+    #[tokio::test]
+    async fn public_auth_routes_refuse_preflight_free_browser_bodies() {
+        let recovery = "break-glass-recovery-token-32chr";
+        let (_tmp, state, password) = human_fixture(Some(recovery)).await;
+        let new_password = "brand-new-pass!!";
+        let send = |path: &'static str, content_type: Option<&'static str>, body: Vec<u8>| {
+            let state = state.clone();
+            async move {
+                let mut req = axum::http::Request::builder().method("POST").uri(path);
+                // A JSON body is what only a same-origin page or a non-browser
+                // client can send; everything else comes from the foreign page.
+                req = if content_type.is_some_and(|c| c.starts_with("application/json")) {
+                    req.header("origin", "http://127.0.0.1:49374")
+                        .header("sec-fetch-site", "same-origin")
+                } else {
+                    req.header("origin", "https://evil.example")
+                        .header("sec-fetch-site", "cross-site")
+                };
+                if let Some(content_type) = content_type {
+                    req = req.header("content-type", content_type);
+                }
+                public_auth_router(state)
+                    .oneshot(req.body(axum::body::Body::from(body)).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        let login_body = serde_json::to_vec(&serde_json::json!({
+            "username": "root",
+            "password": password,
+        }))
+        .unwrap();
+        let recovery_body = serde_json::to_vec(&serde_json::json!({
+            "recovery_token": recovery,
+            "new_password": new_password,
+            "new_password_confirmation": new_password,
+        }))
+        .unwrap();
+        // More attempts than the per-IP failure budget, so a refusal that
+        // still charged it would lock out the control login below.
+        for _ in 0..=LOGIN_IP_LIMIT {
+            for content_type in [
+                Some("text/plain;charset=UTF-8"),
+                Some("application/x-www-form-urlencoded"),
+                Some("multipart/form-data; boundary=----a0"),
+                None,
+            ] {
+                let login = send("/auth/login", content_type, login_body.clone()).await;
+                assert_eq!(
+                    login.status(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "login as {content_type:?}"
+                );
+                assert!(
+                    login.headers().get(header::SET_COOKIE).is_none(),
+                    "a refused login must not issue a session ({content_type:?})"
+                );
+                let reset = send("/auth/recovery", content_type, recovery_body.clone()).await;
+                assert_eq!(
+                    reset.status(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "recovery as {content_type:?}"
+                );
+            }
+        }
+        // Controls: the root password is unchanged and the login budget
+        // untouched, so a JSON login (what the built-in page sends) works.
+        let control = send(
+            "/auth/login",
+            Some("application/json; charset=utf-8"),
+            login_body,
+        )
+        .await;
+        assert_eq!(control.status(), StatusCode::OK);
+        assert!(set_cookie_value(control.headers(), SESSION_COOKIE).is_some());
+        let reset = send("/auth/recovery", Some("application/json"), recovery_body).await;
+        assert_eq!(
+            reset.status(),
+            StatusCode::NO_CONTENT,
+            "JSON recovery works"
+        );
     }
 
     fn introspect_state(state: Arc<AuthState>) -> Arc<AuthState> {

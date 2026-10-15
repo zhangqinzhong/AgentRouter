@@ -5,6 +5,7 @@
 //! providers extend this layer instead of teaching each provider to read env
 //! vars directly.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use secrecy::SecretString;
@@ -49,6 +50,8 @@ pub enum AuthRequirement {
     /// Provider requires an Anthropic OAuth subscription token
     /// (from `claude setup-token`).
     AnthropicOAuthToken,
+    /// Provider shells out to the logged-in Cursor Agent CLI.
+    CursorCli,
 }
 
 /// Resolved Copilot auth inputs.
@@ -73,6 +76,59 @@ pub struct CodexAuth {
     pub executable: PathBuf,
 }
 
+/// Resolved inputs for the Cursor Agent CLI provider.
+///
+/// The child process reads untrusted captured session text, so it never
+/// inherits the server's environment: [`CursorAuth::new`] keeps only the
+/// variables the CLI needs to find its login, locale and network
+/// (see [`crate::cursor_agent::cursor_child_env`]).
+#[derive(Clone, PartialEq, Eq)]
+pub struct CursorAuth {
+    /// `agent` binary, or the path in `AI_MEMORY_CURSOR_AGENT`.
+    pub executable: PathBuf,
+    /// Directory each request's private workspace is created under.
+    pub(crate) temp_root: PathBuf,
+    /// The allowlisted environment the child runs with, and nothing else.
+    pub(crate) child_env: Vec<(OsString, OsString)>,
+}
+
+impl CursorAuth {
+    /// Resolve Cursor inputs from values captured once at config load.
+    ///
+    /// `process_env` is the server's environment; only allowlisted entries
+    /// are kept. `temp_root` must be absolute; the provider refuses to run
+    /// otherwise rather than create a workspace relative to its cwd.
+    #[must_use]
+    pub fn new(
+        executable: impl Into<PathBuf>,
+        temp_root: impl Into<PathBuf>,
+        process_env: &[(OsString, OsString)],
+    ) -> Self {
+        Self {
+            executable: executable.into(),
+            temp_root: temp_root.into(),
+            child_env: crate::cursor_agent::cursor_child_env(process_env),
+        }
+    }
+
+    /// Names of the environment variables the child receives.
+    pub fn child_env_names(&self) -> impl Iterator<Item = &OsString> {
+        self.child_env.iter().map(|(name, _)| name)
+    }
+}
+
+impl std::fmt::Debug for CursorAuth {
+    // Values stay out of logs: `CURSOR_API_KEY` is allowlisted.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CursorAuth")
+            .field("executable", &self.executable)
+            .field("temp_root", &self.temp_root)
+            .field("child_env", &self.child_env_names().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// Materialized provider credential.
 #[derive(Debug, Clone)]
 pub enum Credential {
@@ -86,6 +142,8 @@ pub enum Credential {
     Copilot(CopilotAuth),
     /// Anthropic OAuth subscription token from `claude setup-token`.
     AnthropicOAuthToken(SecretString),
+    /// Cursor Agent CLI executable. Login lives in the Cursor app, not here.
+    Cursor(CursorAuth),
 }
 
 /// Resolved authentication for one provider instance.
@@ -157,6 +215,18 @@ impl ProviderAuth {
                 api_base_url,
             })),
             source: CredentialSource::TokenFile,
+        }
+    }
+
+    /// Resolve Cursor auth from the agent executable and its child inputs.
+    #[must_use]
+    pub fn cursor(auth: CursorAuth) -> Self {
+        Self {
+            requirement: AuthRequirement::CursorCli,
+            credential: Some(Credential::Cursor(auth)),
+            source: CredentialSource::Environment {
+                name: "AI_MEMORY_CURSOR_AGENT",
+            },
         }
     }
 
@@ -236,6 +306,9 @@ impl ProviderAuth {
             (_, Some(Credential::AnthropicOAuthToken(_))) => Err(LlmError::NotConfigured(
                 "API key credential expected, got anthropic-oauth token".into(),
             )),
+            (_, Some(Credential::Cursor(_))) => Err(LlmError::NotConfigured(
+                "API key credential expected, got cursor agent CLI".into(),
+            )),
             (AuthRequirement::RequiredApiKey { env_var }, None) => {
                 Err(LlmError::NotConfigured((*env_var).into()))
             }
@@ -258,6 +331,10 @@ impl ProviderAuth {
                  ANTHROPIC_OAUTH_TOKEN (or CLAUDE_CODE_OAUTH_TOKEN)"
                     .into(),
             )),
+            (AuthRequirement::CursorCli, None) => Err(LlmError::NotConfigured(
+                "cursor agent executable missing; set AI_MEMORY_CURSOR_AGENT or install `agent`"
+                    .into(),
+            )),
         }
     }
 
@@ -270,7 +347,8 @@ impl ProviderAuth {
                 Credential::OpenAiOAuthTokenFile(_)
                 | Credential::Codex(_)
                 | Credential::Copilot(_)
-                | Credential::AnthropicOAuthToken(_),
+                | Credential::AnthropicOAuthToken(_)
+                | Credential::Cursor(_),
             )
             | None => None,
         }
@@ -329,6 +407,23 @@ impl ProviderAuth {
             )),
             _ => Err(LlmError::NotConfigured(
                 "codex auth-file credential required".into(),
+            )),
+        }
+    }
+
+    /// Extract the Cursor Agent executable.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] if this is not Cursor CLI auth.
+    pub fn require_cursor_auth(&self) -> LlmResult<CursorAuth> {
+        match (&self.requirement, &self.credential) {
+            (AuthRequirement::CursorCli, Some(Credential::Cursor(auth))) => Ok(auth.clone()),
+            (AuthRequirement::CursorCli, None) => Err(LlmError::NotConfigured(
+                "cursor agent executable missing; set AI_MEMORY_CURSOR_AGENT or install `agent`"
+                    .into(),
+            )),
+            _ => Err(LlmError::NotConfigured(
+                "cursor agent credential required".into(),
             )),
         }
     }

@@ -1,10 +1,11 @@
 //! Checkout-local discovery for managed workstreams.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
 use ai_memory_core::{ListManagedWorkstreamsRequest, ManagedWorkstreamSummary};
-use ai_memory_workstream::inspect_repository;
+use ai_memory_workstream::inspect_repository_fingerprints;
 use anyhow::{Context as _, Result};
 
 use crate::cli::WorkstreamsArgs;
@@ -45,8 +46,8 @@ pub(super) async fn list_for_checkout(
     checkout: &Path,
     limit: usize,
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
-    let repository =
-        inspect_repository(checkout).context("inspecting managed workstream checkout")?;
+    let repository = inspect_repository_fingerprints(checkout)
+        .context("inspecting managed workstream checkout")?;
     post_json(
         endpoint,
         "/workstream/recent",
@@ -56,9 +57,63 @@ pub(super) async fn list_for_checkout(
             repo_fingerprint: repository.repo_fingerprint,
             worktree_fingerprint: repository.worktree_fingerprint,
             limit,
+            offset: 0,
         },
     )
     .await
+}
+
+/// Fetch every checkout-local page without changing the server's per-page cap.
+pub(super) async fn list_all_for_checkout(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    checkout: &Path,
+) -> Result<Vec<ManagedWorkstreamSummary>> {
+    let repository = inspect_repository_fingerprints(checkout)
+        .context("inspecting managed workstream checkout")?;
+    let mut request = ListManagedWorkstreamsRequest {
+        workspace: workspace.to_owned(),
+        project: project.to_owned(),
+        repo_fingerprint: repository.repo_fingerprint,
+        worktree_fingerprint: repository.worktree_fingerprint,
+        limit: 100,
+        offset: 0,
+    };
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        let page: Vec<ManagedWorkstreamSummary> =
+            post_json(endpoint, "/workstream/recent", &request).await?;
+        let count = page.len();
+        let before = summaries.len();
+        summaries.extend(
+            page.into_iter()
+                .filter(|row| seen.insert(row.workstream_id)),
+        );
+        if count < request.limit {
+            break;
+        }
+        // Older servers ignore offset and repeat their first page. Stop
+        // instead of looping, and say the list is partial rather than fail:
+        // the CLI and server may be upgraded on different machines.
+        if summaries.len() == before {
+            eprintln!(
+                "warning: the ai-memory server ignored workstream pagination; showing its first {} workstreams. Upgrade the server to list them all.",
+                summaries.len()
+            );
+            break;
+        }
+        // Pages are ordered by recency, so a workstream that becomes active
+        // between two requests can move ahead of the offset and be skipped
+        // until the next listing; `seen` keeps the reverse move from
+        // duplicating a row. A picker tolerates that.
+        request.offset = request
+            .offset
+            .checked_add(count)
+            .context("workstream pagination offset overflow")?;
+    }
+    Ok(summaries)
 }
 
 fn render_human(summaries: &[ManagedWorkstreamSummary], workspace: &str, project: &str) -> String {

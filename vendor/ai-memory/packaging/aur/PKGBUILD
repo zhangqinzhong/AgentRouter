@@ -18,7 +18,8 @@ pkgver=0.3.2
 pkgrel=1
 pkgdesc="Local-first long-term memory MCP server for AI coding agents"
 arch=('x86_64' 'aarch64')
-url="https://github.com/akitaonrails/ai-memory"
+url="https://aimemory.sh"
+_repo="https://github.com/akitaonrails/ai-memory"
 license=('MIT')
 depends=('ca-certificates' 'gcc-libs' 'glibc')
 makedepends=('cargo')
@@ -29,7 +30,7 @@ backup=('etc/ai-memory/config.toml' 'etc/ai-memory/env')
 install=ai-memory.install
 options=('!debug' '!lto')
 conflicts=('ai-memory-bin')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::$_repo/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {

@@ -18,7 +18,11 @@ struct SettingsView: View {
                     .onChange(of: serverURL) { _, _ in scheduleSave() }
                     .onSubmit { persist() }
                 SecureField(
-                    model.tokenConfigured ? "Bearer token (saved in Keychain)" : "Bearer token (optional)",
+                    model.tokenConfigured
+                        ? "Bearer token (saved in Keychain)"
+                        : model.dataDirTokenPresent
+                            ? "Bearer token (using auth-tokens/default)"
+                            : "Bearer token (optional)",
                     text: $token
                 )
                 .onChange(of: token) { _, _ in scheduleSave() }

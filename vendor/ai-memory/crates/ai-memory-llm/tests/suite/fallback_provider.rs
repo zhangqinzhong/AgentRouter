@@ -40,14 +40,12 @@ fn ok_response_body(content: &str) -> serde_json::Value {
     })
 }
 
-/// A closed loopback port refuses the connection immediately, producing a
-/// real `reqwest::Error` with `.is_connect() == true` — no wiremock or
-/// external network access needed.
+/// Port 0 can never be listened on, so connecting to it fails inside
+/// `connect()` on every platform, producing a real `reqwest::Error` with
+/// `.is_connect() == true`. A bound-then-released ephemeral port is racy:
+/// another test's mock server can claim it in between and answer.
 async fn closed_port_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener); // nothing listens on `addr` from here on
-    format!("http://{addr}/v1")
+    "http://127.0.0.1:0/v1".to_owned()
 }
 
 #[tokio::test]

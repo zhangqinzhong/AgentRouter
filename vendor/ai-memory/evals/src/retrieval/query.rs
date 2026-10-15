@@ -58,6 +58,10 @@ pub struct QueryOutcome {
     /// puts in front of the agent, so this is the context cost of the
     /// retrieval, not of the underlying full pages.
     pub context_tokens: usize,
+    /// Raw observation hits in the response. The server only falls back to
+    /// them when page search returns nothing, so a non-zero count marks a
+    /// question answered from observations.
+    pub raw_hits: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,16 +124,54 @@ pub async fn memory_query(
     arguments.insert("workspace".into(), json!(workspace));
     arguments.insert("project".into(), json!(project));
     arguments.insert("limit".into(), json!(limit));
+    let started = Instant::now();
+    let text = mcp_tool_text(
+        client,
+        base_url,
+        "memory_query",
+        serde_json::Value::Object(arguments),
+    )
+    .await?;
+    let latency = started.elapsed();
+    let parsed: QueryResponse = serde_json::from_str(&text)
+        .with_context(|| format!("parsing memory_query JSON: {text}"))?;
+    let raw_hits = parsed.raw_hits.len();
+    // A blank/whitespace `answer` is treated as absent so the QA path falls
+    // back to harness synthesis rather than grading an empty string.
+    let answer = parsed
+        .answer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let (retrieved, contexts, context_tokens) = flatten(parsed);
+    Ok(QueryOutcome {
+        retrieved,
+        contexts,
+        answer,
+        latency,
+        context_tokens,
+        raw_hits,
+    })
+}
+
+/// Call one MCP tool over Streamable HTTP and return its first text
+/// content block (every ai-memory tool answers with one JSON text block).
+pub async fn mcp_tool_text(
+    client: &reqwest::Client,
+    base_url: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> Result<String> {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "memory_query",
+            "name": tool,
             "arguments": arguments,
         }
     });
-    let started = Instant::now();
     let resp = client
         .post(format!("{base_url}/mcp"))
         .bearer_auth(EVAL_AUTH_TOKEN)
@@ -178,33 +220,16 @@ pub async fn memory_query(
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        bail!("memory_query tool error: {result}");
+        bail!("{tool} tool error: {result}");
     }
-    let text = result
+    result
         .get("content")
         .and_then(|c| c.as_array())
         .and_then(|c| c.first())
         .and_then(|c| c.get("text"))
         .and_then(|t| t.as_str())
-        .ok_or_else(|| anyhow::anyhow!("memory_query returned no text content: {result}"))?;
-    let parsed: QueryResponse =
-        serde_json::from_str(text).with_context(|| format!("parsing memory_query JSON: {text}"))?;
-    // A blank/whitespace `answer` is treated as absent so the QA path falls
-    // back to harness synthesis rather than grading an empty string.
-    let answer = parsed
-        .answer
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    let (retrieved, contexts, context_tokens) = flatten(parsed);
-    Ok(QueryOutcome {
-        retrieved,
-        contexts,
-        answer,
-        latency: started.elapsed(),
-        context_tokens,
-    })
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{tool} returned no text content: {result}"))
 }
 
 /// Flatten pages + raw hits into ranked session attributions and their

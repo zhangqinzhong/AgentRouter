@@ -41,6 +41,7 @@ async fn make_state_with_chain(
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -1182,6 +1183,7 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         .with_store_reader(store.reader.clone());
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -1287,6 +1289,7 @@ async fn purge_project_idempotent_second_call_is_404() {
     let (state_a, store) = make_state(&tmp).await;
     let state_b = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: state_a.wiki.clone(),
@@ -1798,5 +1801,365 @@ async fn purge_project_dry_run_conflicts_on_a_live_managed_run_without_force() {
         resp.status(),
         StatusCode::CONFLICT,
         "a live managed run must still 409 a preview without --force"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1208: `project_id` as an alternative to `project` / `from`
+// ---------------------------------------------------------------------------
+
+/// `purge-project` accepts `project_id` in place of `project`, so an operator
+/// can target a legacy twin row whose NAME collides with another project's
+/// `legacy_name` (the name lookup resolves to the wrong row in that case).
+#[tokio::test]
+async fn purge_project_accepts_project_id_instead_of_name() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let (ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project_id": doomed.to_string(),
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "purge by project_id must resolve the same target as purge by name"
+    );
+
+    assert!(
+        store
+            .reader
+            .find_project(ws, "doomed".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "the row named by project_id must be the one purged"
+    );
+}
+
+/// A `project_id` that is not a UUID is a client error (400), not a 404 or a
+/// 500: it can never match a row, so the request itself is malformed.
+#[tokio::test]
+async fn purge_project_rejects_a_malformed_project_id_with_400() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project_id": "not-a-uuid",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A well-formed `project_id` with no matching row in this workspace is a 404.
+/// A foreign-scope id lands here too: the row is not visible from this
+/// workspace, so it must never be purged by a stray id.
+#[tokio::test]
+async fn purge_project_unknown_project_id_is_404() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project_id": "00000000-0000-0000-0000-0000000000ff",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Sending BOTH `project` and `project_id` is ambiguous, so it is refused
+/// before any lookup runs rather than silently preferring one.
+#[tokio::test]
+async fn purge_project_refuses_both_project_and_project_id() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let (_ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project": "doomed",
+            "project_id": doomed.to_string(),
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "project and project_id are mutually exclusive"
+    );
+
+    assert!(
+        store
+            .reader
+            .find_project(_ws, "doomed".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "an ambiguous request must not purge anything"
+    );
+}
+
+/// Sending NEITHER `project` nor `project_id` is also a 400: the old CLI
+/// always sent `project`, so a request missing both is a caller bug.
+#[tokio::test]
+async fn purge_project_refuses_neither_project_nor_project_id() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// The preview path (`dry_run: true`) must resolve `project_id` identically,
+/// so `--project-id` works for the default no-confirm preview too.
+#[tokio::test]
+async fn purge_project_preview_accepts_project_id() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let (_ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project_id": doomed.to_string(),
+            "confirm": false,
+            "dry_run": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the preview branch must resolve project_id too"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1208 security boundary: a `project_id` is scoped to the named workspace
+// ---------------------------------------------------------------------------
+//
+// `docs/security-boundaries.md` row 9 (scope resolution fail-closed): an
+// operator holding an id must not be able to reach a row the workspace
+// coordinate does not name. These are the adversarial cases plus the
+// legitimate control, so a blanket deny cannot pass for a working guard.
+
+/// Seed the ambiguity this feature exists for, at the real store level: a
+/// project named `widget`, plus a second project carrying `widget` as its
+/// legacy (v2 basename) key, so a NAME lookup for `widget` answers with two
+/// holders and is refused. Returns `(the named row, the legacy twin)`.
+async fn seed_legacy_twin(store: &Store) -> (WorkspaceId, ProjectId, ProjectId) {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    // The row the NAME resolves to.
+    let named = store
+        .writer
+        .get_or_create_project(ws, "widget", None)
+        .await
+        .unwrap();
+    // A second row whose derived legacy key is also `widget`: captured from a
+    // repository whose path-style name would be `widget`, so the store records
+    // `widget` as its `legacy_name` while its current name differs.
+    let twin = store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/widget".to_owned(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::Path,
+            "acme-widget",
+            Some("/work/widget".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_ne!(named, twin, "the twin must be a distinct row");
+    (ws, named, twin)
+}
+
+/// The `project` name is not an address once two rows answer to it: the
+/// lookup refuses instead of guessing, which is the pre-existing fail-closed
+/// behaviour this feature makes escapable rather than removes. (#1208)
+#[tokio::test]
+async fn purge_project_still_refuses_an_ambiguous_name_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let (ws, named, twin) = seed_legacy_twin(&store).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "widget", "confirm": true }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an ambiguous name must stay refused, never silently resolved"
+    );
+
+    // Nothing was purged: both holders are still there.
+    assert!(
+        store
+            .reader
+            .find_project(ws, "widget".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "the named row must survive a refused ambiguous purge"
+    );
+    assert!(
+        store
+            .reader
+            .project_name_by_id(ws, twin)
+            .await
+            .unwrap()
+            .is_some(),
+        "the twin must survive a refused ambiguous purge"
+    );
+    assert!(named != twin);
+}
+
+/// The id reaches the twin the name could not, and it purges THAT row only --
+/// the name-holder is left completely intact. This is the legitimate control
+/// for the boundary: without it, a blanket deny would look like a passing
+/// guard. (#1208)
+#[tokio::test]
+async fn purge_project_by_id_reaches_the_twin_and_leaves_the_name_holder_intact() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let (ws, named, twin) = seed_legacy_twin(&store).await;
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project_id": twin.to_string(),
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the id must be able to name the row the ambiguous name could not"
+    );
+
+    assert!(
+        store
+            .reader
+            .project_name_by_id(ws, twin)
+            .await
+            .unwrap()
+            .is_none(),
+        "the row named by project_id is the one purged"
+    );
+    assert!(
+        store
+            .reader
+            .project_name_by_id(ws, named)
+            .await
+            .unwrap()
+            .is_some(),
+        "the sibling that owns the NAME must be untouched"
+    );
+    assert_eq!(
+        store
+            .reader
+            .project_name_by_id(ws, named)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("widget"),
+        "and it must still carry its own name"
+    );
+}
+
+/// An id that really exists, but in ANOTHER workspace, is a 404 -- the same
+/// answer as an id that does not exist. It must never resolve across the
+/// workspace the request named. (#1208)
+#[tokio::test]
+async fn purge_project_refuses_a_real_id_from_another_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "secret", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({
+            "workspace": "default",
+            "project_id": foreign.to_string(),
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a real id from another workspace must not resolve here"
+    );
+
+    assert!(
+        store
+            .reader
+            .project_name_by_id(other_ws, foreign)
+            .await
+            .unwrap()
+            .is_some(),
+        "the foreign row must be untouched"
     );
 }

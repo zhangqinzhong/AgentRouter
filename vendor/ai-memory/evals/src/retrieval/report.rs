@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use super::score::{QuestionScore, SliceMetrics};
+use super::ingest::{DatePrefix, IngestMode, IngestStats};
+use super::reachability::{QuestionReach, ReachSlice};
+use super::score::{QuestionScore, SliceMetrics, percentile_u128};
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -33,8 +35,114 @@ pub struct Report {
     /// graded. Names only — never keys. `None` on the default zero-LLM path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qa: Option<QaReportMeta>,
+    /// Ingest volume and timing (server engine only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<IngestSummary>,
+    /// Evidence reachability (`--reachability` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<ReachabilityReport>,
     pub slices: BTreeMap<String, SliceMetrics>,
     pub per_question: Vec<QuestionScore>,
+}
+
+/// `--reachability` results: per-slice aggregates plus every question.
+#[derive(Debug, Serialize)]
+pub struct ReachabilityReport {
+    pub slices: BTreeMap<String, ReachSlice>,
+    pub per_question: Vec<QuestionReach>,
+}
+
+/// Ingest throughput for one config run.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestSummary {
+    pub mode: &'static str,
+    pub date_prefix: &'static str,
+    /// Questions ingested concurrently.
+    pub concurrency: usize,
+    /// Hook events posted, or pages written.
+    pub items: usize,
+    /// HTTP requests (batch POSTs or page writes).
+    pub requests: usize,
+    /// Items per second within one question's sequential ingest stream.
+    pub items_per_sec_per_stream: f64,
+    pub question_ingest_p50_ms: u128,
+    pub question_ingest_p95_ms: u128,
+    pub request_p50_ms: u128,
+    pub request_p95_ms: u128,
+    /// Whole config run (ingest + query + read-back), wall clock.
+    pub run_wall_ms: u128,
+    /// Page modes: documents larger than the 16 KiB observation backstop.
+    pub docs_over_16kib: usize,
+}
+
+impl IngestSummary {
+    pub fn new(
+        mode: IngestMode,
+        prefix: DatePrefix,
+        concurrency: usize,
+        stats: &[IngestStats],
+        wall: std::time::Duration,
+    ) -> Self {
+        let items: usize = stats.iter().map(|s| s.items).sum();
+        let stream_secs: f64 = stats.iter().map(|s| s.elapsed.as_secs_f64()).sum();
+        let per_question: Vec<u128> = stats.iter().map(|s| s.elapsed.as_millis()).collect();
+        let requests: Vec<u128> = stats
+            .iter()
+            .flat_map(|s| s.request_ms.iter().copied())
+            .collect();
+        Self {
+            mode: mode.as_str(),
+            date_prefix: prefix.as_str(),
+            concurrency,
+            items,
+            requests: requests.len(),
+            items_per_sec_per_stream: if stream_secs > 0.0 {
+                items as f64 / stream_secs
+            } else {
+                0.0
+            },
+            question_ingest_p50_ms: percentile_u128(&per_question, 0.50),
+            question_ingest_p95_ms: percentile_u128(&per_question, 0.95),
+            request_p50_ms: percentile_u128(&requests, 0.50),
+            request_p95_ms: percentile_u128(&requests, 0.95),
+            run_wall_ms: wall.as_millis(),
+            docs_over_16kib: stats.iter().map(|s| s.docs_over_16kib).sum(),
+        }
+    }
+}
+
+/// Ingest and reachability sections for one config, empty when absent.
+fn extras_md(r: &Report) -> String {
+    let mut md = String::new();
+    if let Some(i) = &r.ingest {
+        md.push_str(&format!(
+            "\n### Ingest\n\n- mode: {} (date prefix: {}), concurrency {}\n\
+             - {} items in {} requests; {:.0} items/s per question stream\n\
+             - per question p50/p95: {}/{} ms; per request p50/p95: {}/{} ms\n\
+             - run wall clock: {:.1} s; documents over 16 KiB: {}\n",
+            i.mode,
+            i.date_prefix,
+            i.concurrency,
+            i.items,
+            i.requests,
+            i.items_per_sec_per_stream,
+            i.question_ingest_p50_ms,
+            i.question_ingest_p95_ms,
+            i.request_p50_ms,
+            i.request_p95_ms,
+            i.run_wall_ms as f64 / 1000.0,
+            i.docs_over_16kib,
+        ));
+        let raw = r.per_question.iter().filter(|q| q.raw_hits > 0).count();
+        md.push_str(&format!(
+            "- questions answered from the raw-observation fallback: {raw}/{}\n",
+            r.per_question.len()
+        ));
+    }
+    if let Some(reach) = &r.reachability {
+        md.push_str(&super::reachability::to_markdown(&reach.slices));
+    }
+    md
 }
 
 /// QA-accuracy provenance for a run (R2b). Provider + model names only, so a
@@ -179,6 +287,7 @@ pub fn to_markdown(r: &Report) -> String {
     md.push_str(&format!("- mode: {}\n- config: {}\n\n", r.mode, r.config));
     md.push_str(&slices_table_md(r));
     md.push_str(&qa_table_md(r));
+    md.push_str(&extras_md(r));
     md.push_str(METRIC_NOTES);
     md
 }
@@ -202,6 +311,10 @@ pub struct AbDelta {
     pub latency_p95_ms: i128,
     pub context_tokens_mean: f64,
     pub context_tokens_median: f64,
+    /// Per-question hit@k changes keyed by k: `(gained, lost)`, questions
+    /// the candidate hits and the baseline misses, and the reverse. A net
+    /// delta built from many flips both ways is noisier than its size.
+    pub hit_flips: BTreeMap<usize, (usize, usize)>,
     /// candidate − baseline QA accuracy over the `overall` slice (R2b).
     /// `None` unless both runs graded the overall slice.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,7 +348,28 @@ fn compute_delta(baseline: &Report, candidate: &Report) -> AbDelta {
         hit_at.insert(*k, c.hit_at[k] - b.hit_at[k]);
         recall_at.insert(*k, c.recall_at[k] - b.recall_at[k]);
     }
+    let base_by_id: BTreeMap<&str, &QuestionScore> = baseline
+        .per_question
+        .iter()
+        .map(|q| (q.question_id.as_str(), q))
+        .collect();
+    let mut hit_flips = BTreeMap::new();
+    for k in &candidate.ks {
+        let (mut gained, mut lost) = (0, 0);
+        for c in &candidate.per_question {
+            let Some(b) = base_by_id.get(c.question_id.as_str()) else {
+                continue;
+            };
+            match (b.hit_at.get(k) > Some(&0.0), c.hit_at.get(k) > Some(&0.0)) {
+                (false, true) => gained += 1,
+                (true, false) => lost += 1,
+                _ => {}
+            }
+        }
+        hit_flips.insert(*k, (gained, lost));
+    }
     AbDelta {
+        hit_flips,
         hit_at,
         recall_at,
         latency_p50_ms: c.latency_p50_ms as i128 - b.latency_p50_ms as i128,
@@ -268,9 +402,11 @@ pub fn ab_to_markdown(r: &AbReport) -> String {
     md.push_str("## Baseline\n\n");
     md.push_str(&slices_table_md(&r.baseline));
     md.push_str(&qa_table_md(&r.baseline));
+    md.push_str(&extras_md(&r.baseline));
     md.push_str("\n## Candidate\n\n");
     md.push_str(&slices_table_md(&r.candidate));
     md.push_str(&qa_table_md(&r.candidate));
+    md.push_str(&extras_md(&r.candidate));
 
     // Delta table over the `overall` slice.
     let b = overall(&r.baseline);
@@ -278,8 +414,9 @@ pub fn ab_to_markdown(r: &AbReport) -> String {
     md.push_str("\n## Delta (overall, candidate − baseline)\n\n");
     md.push_str("| metric | baseline | candidate | delta |\n|---|---|---|---|\n");
     for k in &r.candidate.ks {
+        let (gained, lost) = r.delta.hit_flips.get(k).copied().unwrap_or((0, 0));
         md.push_str(&format!(
-            "| hit@{k} | {:.3} | {:.3} | {:+.3} |\n",
+            "| hit@{k} | {:.3} | {:.3} | {:+.3} (+{gained}/-{lost}) |\n",
             b.hit_at[k], c.hit_at[k], r.delta.hit_at[k]
         ));
     }
@@ -347,6 +484,8 @@ mod tests {
             abstention_excluded: 1,
             ks: vec![5],
             qa: None,
+            ingest: None,
+            reachability: None,
             slices,
             per_question: vec![],
         }
@@ -378,7 +517,10 @@ mod tests {
         assert_eq!(ab.delta.context_tokens_mean, 0.0);
         let md = ab_to_markdown(&ab);
         assert!(md.contains("A/B"));
-        assert!(md.contains("| hit@5 | 0.500 | 0.500 | +0.000 |"), "{md}");
+        assert!(
+            md.contains("| hit@5 | 0.500 | 0.500 | +0.000 (+0/-0) |"),
+            "{md}"
+        );
     }
 
     #[test]
@@ -421,7 +563,77 @@ mod tests {
         let ab = AbReport::new(baseline, candidate);
         assert!((ab.delta.hit_at[&5] - 0.2).abs() < 1e-9);
         let md = ab_to_markdown(&ab);
-        assert!(md.contains("| hit@5 | 0.400 | 0.600 | +0.200 |"), "{md}");
+        assert!(md.contains("| hit@5 | 0.400 | 0.600 | +0.200"), "{md}");
         assert!(md.contains("candidate: embeddings=local"));
+    }
+
+    fn question(id: &str, hit5: f64) -> QuestionScore {
+        QuestionScore {
+            question_id: id.into(),
+            question_type: "t".into(),
+            hit_at: BTreeMap::from([(5, hit5)]),
+            recall_at: BTreeMap::from([(5, hit5)]),
+            retrieved_sessions: 1,
+            latency_ms: 0,
+            context_tokens: 0,
+            ingest_ms: 0,
+            raw_hits: 0,
+            qa: None,
+        }
+    }
+
+    #[test]
+    fn ab_delta_counts_paired_flips_both_ways() {
+        let mut baseline = report("b", 0.5, 0.5);
+        baseline.per_question = vec![
+            question("q1", 1.0),
+            question("q2", 0.0),
+            question("q3", 1.0),
+        ];
+        let mut candidate = report("c", 0.5, 0.5);
+        candidate.per_question = vec![
+            question("q1", 0.0),
+            question("q2", 1.0),
+            question("q3", 1.0),
+        ];
+        let ab = AbReport::new(baseline, candidate);
+        assert_eq!(ab.delta.hit_flips[&5], (1, 1));
+        assert!(ab_to_markdown(&ab).contains("(+1/-1)"));
+    }
+
+    #[test]
+    fn ingest_summary_aggregates_streams_and_requests() {
+        let stats = vec![
+            IngestStats {
+                items: 10,
+                elapsed: std::time::Duration::from_millis(500),
+                request_ms: vec![5, 7],
+                docs_over_16kib: 1,
+            },
+            IngestStats {
+                items: 30,
+                elapsed: std::time::Duration::from_millis(1500),
+                request_ms: vec![9],
+                docs_over_16kib: 0,
+            },
+        ];
+        let s = IngestSummary::new(
+            IngestMode::WholeSession,
+            DatePrefix::Turn,
+            8,
+            &stats,
+            std::time::Duration::from_secs(3),
+        );
+        assert_eq!(s.items, 40);
+        assert_eq!(s.requests, 3);
+        assert!((s.items_per_sec_per_stream - 20.0).abs() < 1e-9);
+        assert_eq!(s.request_p95_ms, 9);
+        assert_eq!(s.docs_over_16kib, 1);
+        assert_eq!(s.mode, "whole-session");
+        let mut r = report("c", 0.5, 0.5);
+        r.ingest = Some(s);
+        let md = to_markdown(&r);
+        assert!(md.contains("### Ingest"));
+        assert!(md.contains("\n- 40 items in 3 requests"), "{md}");
     }
 }

@@ -4,6 +4,7 @@
 //! verify it appears in `/admin/search` results. Also tests that an
 //! unknown tier returns 422.
 
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::Wiki;
@@ -15,10 +16,13 @@ use tower::ServiceExt;
 
 async fn make_state(tmp: &TempDir) -> AdminState {
     let store = Store::open(tmp.path()).unwrap();
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -64,6 +68,33 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
 }
 
+async fn seed_identity_project(
+    state: &AdminState,
+) -> (ai_memory_core::WorkspaceId, ai_memory_core::ProjectId) {
+    let workspace = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let (project, _) = state
+        .writer
+        .resolve_project_by_identity(
+            workspace,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    (workspace, project)
+}
+
 #[tokio::test]
 async fn write_page_returns_page_id_and_path() {
     let tmp = TempDir::new().unwrap();
@@ -92,6 +123,43 @@ async fn write_page_returns_page_id_and_path() {
         body["path"].as_str().unwrap(),
         "notes/test-write.md",
         "response path must match request: {body}"
+    );
+}
+
+#[tokio::test]
+async fn write_page_surfaces_manifest_failure_after_promotion() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let (workspace, project) = seed_identity_project(&state).await;
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(workspace.to_string())
+        .join(project.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post_json(
+        state,
+        "/admin/write-page",
+        json!({
+            "workspace": "default",
+            "project": "acme-api",
+            "path": "notes/promoted.md",
+            "body": "survives the manifest failure",
+            "tier": "semantic",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(
+        body["manifest_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("committed")),
+        "{body}"
     );
 }
 
@@ -319,4 +387,404 @@ async fn write_page_with_tags_and_pinned() {
 
     let body = body_json(resp).await;
     assert!(body["page_id"].is_string(), "must have page_id: {body}");
+}
+
+#[tokio::test]
+async fn write_page_metadata_roundtrip_and_total_replacement() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let ws = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = state
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let path = ai_memory_core::PagePath::new("notes/metadata.md").unwrap();
+    assert_eq!(post_json(state.clone(), "/admin/write-page", json!({
+        "workspace": "default", "project": "scratch", "path": "gotchas/build.md", "body": "Build problem."
+    })).await.status(), StatusCode::OK);
+    let mut request = json!({
+        "workspace": "default", "project": "scratch", "path": path.as_str(),
+        "body": "# Metadata\n\nFirst version.", "kind": " rule ",
+        "entities": ["SQLite", " sqlite ", "Writer\nActor"],
+        "abstract": " One-line summary. ",
+        "relations": {"fixes": ["gotchas/build"], "causes": ["other:notes/problem.md"], "contradicts": ["decisions/old.md"]}
+    });
+    let resp = post_json(state.clone(), "/admin/write-page", request.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let md = state.wiki.read_page(ws, proj, &path).unwrap();
+    assert_eq!(md.frontmatter["kind"], "rule");
+    assert_eq!(
+        md.frontmatter["entities"],
+        json!(["sqlite", "writer actor"])
+    );
+    assert_eq!(md.frontmatter["abstract"], "One-line summary.");
+    assert_eq!(md.frontmatter["relations"], request["relations"]);
+    let links = state
+        .reader
+        .page_links(ws, proj, path.as_str().into(), None)
+        .await
+        .unwrap();
+    assert_eq!(links.links.len(), 1);
+    assert_eq!(links.links[0].path, "gotchas/build.md");
+
+    for key in ["kind", "entities", "abstract", "relations"] {
+        request.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(
+        post_json(state.clone(), "/admin/write-page", request)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let md = state.wiki.read_page(ws, proj, &path).unwrap();
+    for key in ["kind", "entities", "abstract", "relations"] {
+        assert!(
+            md.frontmatter.get(key).is_none(),
+            "{key} must not survive replacement"
+        );
+    }
+    assert!(
+        state
+            .reader
+            .page_links(ws, proj, path.as_str().into(), None)
+            .await
+            .unwrap()
+            .links
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn write_page_metadata_admin_legacy_kind_matches_base() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let ws = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = state
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    // The base adapter only trimmed kind and omitted an empty result. In
+    // particular, it imposed neither a length nor a control-character check.
+    for (i, (kind, expected)) in [
+        (Some("x".repeat(65)), Some("x".repeat(65))),
+        // Wiki's existing sanitizer removes NUL after the legacy adapter.
+        (Some(" custom\0kind ".into()), Some("customkind".into())),
+        (Some("  ".into()), None),
+        (None, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = ai_memory_core::PagePath::new(format!("notes/legacy-kind-{i}.md")).unwrap();
+        let resp = post_json(
+            state.clone(),
+            "/admin/write-page",
+            json!({
+                "workspace": "default", "project": "scratch", "path": path.as_str(),
+                "body": "# Legacy kind\n\nUnchanged caller.", "kind": kind,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "base accepted {kind:?}");
+        let md = state.wiki.read_page(ws, proj, &path).unwrap();
+        assert_eq!(
+            md.frontmatter
+                .get("kind")
+                .and_then(serde_json::Value::as_str),
+            expected.as_deref()
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_page_metadata_rejects_invalid_payload_before_scope_creation() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    for metadata in [
+        json!({"entities": "sqlite"}),
+        json!({"entities": [42]}),
+        json!({"entities": ["x".repeat(65)]}),
+        json!({"entities": [format!("{}      ", "x".repeat(60))]}),
+        json!({"entities": vec!["entity"; 11]}),
+        json!({"abstract": "x".repeat(1025)}),
+        json!({"relations": {"supports": ["notes/x.md"]}}),
+        json!({"relations": {"fixes": ["../outside.md"]}}),
+        json!({"relations": {"fixes": ["other :notes/x"]}}),
+        json!({"relations": {"fixes": vec!["notes/x.md"; 33]}}),
+    ] {
+        let mut request = json!({"workspace": "invalid", "project": "invalid", "path": "notes/x.md", "body": "Refused."});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        let resp = post_json(state.clone(), "/admin/write-page", request).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{metadata}"
+        );
+        assert!(
+            state
+                .reader
+                .find_workspace("invalid".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    // A legitimate request must still pass through the same route.
+    assert_eq!(
+        post_json(
+            state,
+            "/admin/write-page",
+            json!({
+                "workspace": "default", "project": "scratch", "path": "notes/x.md",
+                "body": "Accepted.", "kind": "fact", "entities": ["sqlite"]
+            })
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn write_page_metadata_preserves_admin_auth_and_sanitization() {
+    use ai_memory_core::{ActorContext, AuthLevel, NewUser, PagePath, UserRole};
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let ws = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = state
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let user = state
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "alice".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let path = PagePath::new("notes/guard.md").unwrap();
+    let payload = json!({
+        "workspace": "default", "project": "scratch", "path": path.as_str(),
+        "body": "# Guard\n\nLegitimate content.", "kind": "fact", "entities": ["sqlite"],
+        "abstract": "token sk-1234567890abcdef", "relations": {"fixes": ["notes/target"]},
+        "author_id": user.to_string(), "last_modified_by": {"username": "alice"},
+        "frontmatter": {"workspace_id": "foreign", "author_id": user.to_string()}
+    });
+    for (level, expected) in [
+        (AuthLevel::Anonymous, StatusCode::UNAUTHORIZED),
+        (AuthLevel::User, StatusCode::FORBIDDEN),
+        (AuthLevel::Root, StatusCode::OK),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/admin/write-page")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        request.extensions_mut().insert(level);
+        request.extensions_mut().insert(ActorContext {
+            user: Some("root".into()),
+            ..Default::default()
+        });
+        let resp = admin_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), expected);
+        assert_eq!(
+            state.wiki.abs_path(ws, proj, &path).exists(),
+            level == AuthLevel::Root
+        );
+    }
+    let md = state.wiki.read_page(ws, proj, &path).unwrap();
+    assert_eq!(md.frontmatter["last_modified_by"]["username"], "root");
+    assert!(
+        !md.frontmatter["abstract"]
+            .as_str()
+            .unwrap()
+            .contains("sk-1234567890abcdef")
+    );
+    for key in ["workspace_id", "project_id", "author_id", "frontmatter"] {
+        assert!(md.frontmatter.get(key).is_none(), "{key}");
+    }
+    let meta = state
+        .reader
+        .page_meta("default", "scratch", path.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        meta.author.is_none(),
+        "root must not inherit the forged DB-user author"
+    );
+}
+
+#[tokio::test]
+async fn write_page_metadata_store_failure_rolls_back_and_recovers() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let ws = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = state
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let path = ai_memory_core::PagePath::new("notes/recovery.md").unwrap();
+    let mut request = json!({
+        "workspace": "default", "project": "scratch", "path": path.as_str(),
+        "body": "# Recovery\n\nOriginal body.", "abstract": "Original summary.",
+        "entities": ["sqlite"], "relations": {"fixes": ["notes/target"]}
+    });
+    assert_eq!(
+        post_json(state.clone(), "/admin/write-page", request.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let original = state.wiki.read_page(ws, proj, &path).unwrap();
+    let original_id = state
+        .reader
+        .latest_page_id_by_ids(ws, proj, path.as_str().into())
+        .await
+        .unwrap();
+    // Fail the SQL insert after Wiki has installed the replacement on disk.
+    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_metadata BEFORE INSERT ON pages
+        WHEN json_extract(NEW.frontmatter_json, '$.abstract') = 'Refused summary.'
+        BEGIN SELECT RAISE(ABORT, 'injected metadata store failure'); END;",
+    )
+    .unwrap();
+    request["abstract"] = json!("Refused summary.");
+    request["body"] = json!("# Recovery\n\nReplacement body.");
+    assert_eq!(
+        post_json(state.clone(), "/admin/write-page", request.clone())
+            .await
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let restored = state.wiki.read_page(ws, proj, &path).unwrap();
+    assert_eq!(restored.body, original.body);
+    assert_eq!(restored.frontmatter, original.frontmatter);
+    assert_eq!(
+        state
+            .reader
+            .latest_page_id_by_ids(ws, proj, path.as_str().into())
+            .await
+            .unwrap(),
+        original_id
+    );
+    conn.execute_batch("DROP TRIGGER refuse_metadata;").unwrap();
+    assert_eq!(
+        post_json(state.clone(), "/admin/write-page", request)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let recovered = state.wiki.read_page(ws, proj, &path).unwrap();
+    assert_eq!(recovered.frontmatter["abstract"], "Refused summary.");
+    assert!(recovered.body.contains("Replacement body."));
+    assert_ne!(
+        state
+            .reader
+            .latest_page_id_by_ids(ws, proj, path.as_str().into())
+            .await
+            .unwrap(),
+        original_id
+    );
+}
+
+/// The route `ai-memory write-page` posts to sets a profile entry's
+/// `applies_to` and `enforced_by`, refuses an unknown tag with 422, and
+/// refuses both keys on a page outside `profile/`, or on a `profile/` path in
+/// an ordinary project, before creating its scope.
+#[tokio::test]
+async fn write_page_sets_profile_fields_and_refuses_them_elsewhere() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let request = json!({
+        "workspace": "default", "project": "_global", "path": "profile/style/types.md",
+        "body": "# Types\n\nNever cast.", "applies_to": ["TypeScript"],
+        "enforced_by": "pre-push hook"
+    });
+    assert_eq!(
+        post_json(state.clone(), "/admin/write-page", request.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let ws = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let global = state
+        .writer
+        .get_or_create_project(ws, "_global", None)
+        .await
+        .unwrap();
+    let path = ai_memory_core::PagePath::new("profile/style/types.md").unwrap();
+    let md = state.wiki.read_page(ws, global, &path).unwrap();
+    assert_eq!(md.frontmatter["applies_to"], json!(["typescript"]));
+    assert_eq!(md.frontmatter["enforced_by"], "pre-push hook");
+
+    let mut unknown = request.clone();
+    unknown["applies_to"] = json!(["typscript"]);
+    let resp = post_json(state.clone(), "/admin/write-page", unknown).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("typscript")
+    );
+
+    let ws = state
+        .reader
+        .find_workspace("default".into())
+        .await
+        .unwrap()
+        .unwrap();
+    for path in ["notes/types.md", "profile/style/types.md"] {
+        let mut stray = request.clone();
+        stray["project"] = json!("fresh");
+        stray["path"] = json!(path);
+        let resp = post_json(state.clone(), "/admin/write-page", stray).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        assert!(
+            state
+                .reader
+                .find_project(ws, "fresh".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "{path}: refused before the project is created"
+        );
+    }
 }

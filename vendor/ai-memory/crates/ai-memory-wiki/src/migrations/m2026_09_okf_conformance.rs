@@ -70,6 +70,8 @@ pub fn snapshot_before_db_migration(
     data_dir: &Path,
     dest_override: Option<&Path>,
 ) -> WikiResult<Option<crate::backup::BackupReceipt>> {
+    let wiki_root = data_dir.join("wiki");
+    crate::confinement::inspect_tree(&wiki_root)?;
     if crate::backup::BackupReceipt::load(data_dir).is_some_and(|r| r.archive_present()) {
         // A prior boot in this same upgrade already captured the pre-migration
         // state; do not overwrite it with a now-partially-migrated snapshot.
@@ -102,6 +104,7 @@ impl WikiMigration for OkfConformance {
     }
 
     async fn up(&self, writer: &WriterHandle, wiki_root: &Path) -> WikiResult<()> {
+        crate::confinement::inspect_tree(wiki_root)?;
         let data_dir = wiki_root.parent().ok_or_else(|| {
             WikiError::Io(std::io::Error::other("wiki root has no parent data dir"))
         })?;
@@ -152,6 +155,7 @@ impl WikiMigration for OkfConformance {
 
         // 2. Checkpoint whatever the tree holds before touching it.
         let git = crate::git::GitAdapter::open_or_init(wiki_root)?;
+        crate::confinement::inspect_git_directory(wiki_root)?;
         git.commit_all("pre-okf-migration checkpoint")?;
 
         // 3. DB pass — in place, through the single writer.
@@ -177,6 +181,7 @@ impl WikiMigration for OkfConformance {
         ensure_bundle_indexes(&git)?;
 
         // 5. One commit for the whole rewrite.
+        crate::confinement::inspect_git_directory(wiki_root)?;
         git.commit_all("okf-migration: conform wiki to OKF v0.2")?;
         tracing::info!(
             rows = migrated.len(),

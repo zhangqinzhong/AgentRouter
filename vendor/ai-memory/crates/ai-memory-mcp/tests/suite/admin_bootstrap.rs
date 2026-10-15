@@ -6,22 +6,53 @@
 //! The LLM path is covered by the consolidate-crate unit tests.
 
 use ai_memory_consolidate::{BootstrapOutcome, BootstrapSource, SourceKind};
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+use ai_memory_llm::{ChatRequest, ChatResponse, LlmProvider};
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::Wiki;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+struct EmptyBootstrapLlm;
+
+#[async_trait::async_trait]
+impl LlmProvider for EmptyBootstrapLlm {
+    fn name(&self) -> &'static str {
+        "empty-bootstrap"
+    }
+
+    fn model(&self) -> &str {
+        "empty-bootstrap"
+    }
+
+    async fn complete(&self, _request: ChatRequest) -> ai_memory_llm::LlmResult<ChatResponse> {
+        unreachable!("bootstrap uses structured completion")
+    }
+
+    async fn complete_structured_raw(
+        &self,
+        _request: ChatRequest,
+        _schema: serde_json::Value,
+    ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+        Ok(json!({ "pages": [], "rationale": "ok" }))
+    }
+}
 
 /// Build a minimal `AdminState` backed by a real on-disk store + wiki.
 async fn make_admin_state(tmp: &TempDir) -> AdminState {
     let store = Store::open(tmp.path()).unwrap();
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -140,6 +171,63 @@ async fn dry_run_honours_sources_collected_hint() {
 
 /// When no LLM is configured and `dry_run=false`, the server returns
 /// 503 with a descriptive error body — not a panic.
+#[tokio::test]
+async fn bootstrap_surfaces_manifest_failure_after_promotion() {
+    let tmp = TempDir::new().unwrap();
+    let mut state = make_admin_state(&tmp).await;
+    state.llm = Some(Arc::new(EmptyBootstrapLlm));
+    let workspace = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let (project, _) = state
+        .writer
+        .resolve_project_by_identity(
+            workspace,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(workspace.to_string())
+        .join(project.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post_bootstrap(
+        state,
+        json!({
+            "workspace": "default", "project": "acme-api", "sources": synthetic_sources(),
+            "max_input_tokens": 50_000, "dry_run": false, "force": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let outcome: BootstrapOutcome = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        outcome
+            .manifest_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("committed"))
+    );
+}
+
 #[tokio::test]
 async fn non_dry_run_without_llm_returns_503() {
     let tmp = TempDir::new().unwrap();

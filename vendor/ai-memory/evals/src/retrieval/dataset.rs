@@ -3,6 +3,12 @@
 //! The file is NOT committed (278 MB); it lives gitignored under
 //! `evals/datasets/` and is fetched on demand from HuggingFace with a
 //! pinned sha256. Dataset: `xiaowu0162/longmemeval` (MIT license).
+//!
+//! Two pinned variants load: the original `longmemeval_s` (every published
+//! ai-memory baseline) and the later `longmemeval_s_cleaned` re-release,
+//! which keeps the same 500 questions and evidence labels but replaces
+//! distractor sessions that also held the answer. Other systems publish on
+//! the cleaned file, so a comparison has to say which one it ran.
 
 use std::path::Path;
 
@@ -19,11 +25,52 @@ pub const LONGMEMEVAL_S_URL: &str =
 pub const LONGMEMEVAL_S_SHA256: &str =
     "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894";
 
+/// One pinned dataset file the harness accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatasetVariant {
+    /// Name recorded in reports.
+    pub name: &'static str,
+    /// Default location under the repo root.
+    pub default_path: &'static str,
+    /// Download URL (revision-pinned where upstream allows it).
+    pub url: &'static str,
+    /// Expected sha256 of the file.
+    pub sha256: &'static str,
+}
+
+/// The original S file every published ai-memory baseline uses.
+pub const VARIANT_S: DatasetVariant = DatasetVariant {
+    name: "longmemeval_s",
+    default_path: "evals/datasets/longmemeval_s.json",
+    url: LONGMEMEVAL_S_URL,
+    sha256: LONGMEMEVAL_S_SHA256,
+};
+
+/// The cleaned S re-release (`xiaowu0162/longmemeval-cleaned`, revision
+/// `98d7416c`), the input agentmemory's 2026-10-09 baseline reports on.
+pub const VARIANT_S_CLEANED: DatasetVariant = DatasetVariant {
+    name: "longmemeval_s_cleaned",
+    default_path: "evals/datasets/longmemeval_s_cleaned.json",
+    url: "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json",
+    sha256: "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+};
+
 /// One chat turn inside a haystack session.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Turn {
     pub role: String,
     pub content: String,
+    /// The dataset's evidence flag: this turn carries (part of) the answer.
+    /// Absent on most turns; only the reachability report reads it.
+    #[serde(default)]
+    pub has_answer: Option<bool>,
+}
+
+impl Turn {
+    /// True when the dataset marks this turn as answer-bearing.
+    pub fn is_evidence(&self) -> bool {
+        self.has_answer == Some(true)
+    }
 }
 
 /// One benchmark question with its private haystack of chat sessions.
@@ -63,8 +110,8 @@ impl Question {
     }
 }
 
-/// Load the dataset, verifying the pinned sha256 first.
-pub fn load(path: &Path) -> Result<Vec<Question>> {
+/// Load the dataset, verifying `variant`'s pinned sha256 first.
+pub fn load(path: &Path, variant: &DatasetVariant) -> Result<Vec<Question>> {
     let bytes = std::fs::read(path).with_context(|| {
         format!(
             "reading dataset at {} (use --fetch to download)",
@@ -72,11 +119,13 @@ pub fn load(path: &Path) -> Result<Vec<Question>> {
         )
     })?;
     let digest = hex::encode(Sha256::digest(&bytes));
-    if digest != LONGMEMEVAL_S_SHA256 {
+    if digest != variant.sha256 {
         bail!(
-            "dataset sha256 mismatch at {}: got {digest}, pinned {LONGMEMEVAL_S_SHA256}. \
+            "dataset sha256 mismatch at {}: got {digest}, pinned {} for {}. \
              Refusing to benchmark against an unpinned file.",
-            path.display()
+            path.display(),
+            variant.sha256,
+            variant.name
         );
     }
     let questions: Vec<Question> =
@@ -99,24 +148,40 @@ pub fn load(path: &Path) -> Result<Vec<Question>> {
 
 /// Download the dataset to `path` (atomically: tmp + rename) and verify
 /// the pinned sha256 before the rename lands it.
-pub async fn fetch(path: &Path) -> Result<()> {
+pub async fn fetch(path: &Path, variant: &DatasetVariant) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    tracing::info!(
-        url = LONGMEMEVAL_S_URL,
-        "downloading LongMemEval-S (278 MB)"
-    );
-    let resp = reqwest::get(LONGMEMEVAL_S_URL).await?.error_for_status()?;
+    tracing::info!(url = variant.url, "downloading {} (~278 MB)", variant.name);
+    let resp = reqwest::get(variant.url).await?.error_for_status()?;
     let bytes = resp.bytes().await?;
     let digest = hex::encode(Sha256::digest(&bytes));
-    if digest != LONGMEMEVAL_S_SHA256 {
-        bail!("downloaded dataset sha256 {digest} does not match pin {LONGMEMEVAL_S_SHA256}");
+    if digest != variant.sha256 {
+        bail!(
+            "downloaded dataset sha256 {digest} does not match pin {}",
+            variant.sha256
+        );
     }
     let tmp = path.with_extension("part");
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// First `per_type` questions of each question type, types in sorted order
+/// (the same deterministic selection as agentmemory's `stratifySample`).
+/// A prefix sample (`--sample`) only covers the first type, because the file
+/// is grouped by type; this one covers every slice.
+pub fn stratify(questions: Vec<Question>, per_type: usize) -> Vec<Question> {
+    let mut buckets: std::collections::BTreeMap<String, Vec<Question>> =
+        std::collections::BTreeMap::new();
+    for q in questions {
+        let bucket = buckets.entry(q.question_type.clone()).or_default();
+        if bucket.len() < per_type {
+            bucket.push(q);
+        }
+    }
+    buckets.into_values().flatten().collect()
 }
 
 mod hex {
@@ -175,7 +240,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("longmemeval_s.json");
         std::fs::write(&p, serde_json::to_vec(&sample_json()).unwrap()).unwrap();
-        let err = load(&p).unwrap_err().to_string();
+        let err = load(&p, &VARIANT_S).unwrap_err().to_string();
         assert!(err.contains("sha256 mismatch"), "{err}");
+        let err = load(&p, &VARIANT_S_CLEANED).unwrap_err().to_string();
+        assert!(err.contains("longmemeval_s_cleaned"), "{err}");
+    }
+
+    #[test]
+    fn the_evidence_flag_is_read_and_defaults_to_absent() {
+        let qs: Vec<Question> = serde_json::from_value(sample_json()).unwrap();
+        let turns = &qs[0].haystack_sessions[0];
+        assert!(turns[0].is_evidence());
+        assert_eq!(turns[1].has_answer, None);
+        assert!(!turns[1].is_evidence());
+    }
+
+    #[test]
+    fn stratify_takes_a_prefix_of_every_type_in_sorted_order() {
+        let mut qs: Vec<Question> = Vec::new();
+        let base: Vec<Question> = serde_json::from_value(sample_json()).unwrap();
+        for (i, ty) in ["b-type", "a-type", "b-type", "b-type", "a-type"]
+            .iter()
+            .enumerate()
+        {
+            let mut q = base[0].clone();
+            q.question_id = format!("q{i}");
+            q.question_type = (*ty).into();
+            qs.push(q);
+        }
+        let picked: Vec<String> = stratify(qs, 2).into_iter().map(|q| q.question_id).collect();
+        assert_eq!(picked, ["q1", "q4", "q0", "q2"]);
     }
 }

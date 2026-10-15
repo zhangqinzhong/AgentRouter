@@ -19,6 +19,14 @@ use crate::server_profiles::{self, ProfileName};
 /// `servers.toml`, or a failed write.
 pub fn run(config: &Config, args: ServerArgs) -> Result<()> {
     let mut stdout = std::io::stdout();
+    let root_token = config.auth.token_file_path();
+    match &args.command {
+        ServerCommand::Add(ServerAddArgs { name, .. })
+        | ServerCommand::Remove(ServerRemoveArgs { name }) => {
+            refuse_the_root_token_name(&config.data_dir, name, root_token)?;
+        }
+        ServerCommand::List(_) => {}
+    }
     match args.command {
         ServerCommand::Add(args) => {
             let stdin_token = if args.auth_token_stdin {
@@ -40,6 +48,24 @@ fn parse_name(raw: &str) -> Result<ProfileName> {
              starting with a letter or digit"
         )
     })
+}
+
+/// `auth-tokens/default` holds this install's root bearer once `init` or
+/// `auth enable` provisioned it. A profile of that name would read the same
+/// file, so the hook would present the root bearer to that profile's server
+/// (and `server add --auth-token` would overwrite the root bearer, `server
+/// remove` delete it).
+fn refuse_the_root_token_name(data_dir: &Path, raw: &str, root_token: Option<&Path>) -> Result<()> {
+    let Some(name) = ProfileName::parse(raw) else {
+        return Ok(());
+    };
+    if server_profiles::profile_shares_root_token(data_dir, &name, root_token) {
+        bail!(
+            "`{name}` names this server's own root bearer token file ([auth].bearer_token_file); \
+             choose another profile name"
+        );
+    }
+    Ok(())
 }
 
 fn read_token_line(input: &mut impl std::io::BufRead) -> Result<String> {
@@ -180,6 +206,19 @@ mod tests {
     /// `server add` that must succeed; returns what it printed.
     fn add_ok(data_dir: &Path, args: ServerAddArgs, stdin_token: Option<String>) -> String {
         output(|out| add(data_dir, args, stdin_token, out))
+    }
+
+    /// A profile named after the root bearer's file is refused while that
+    /// file is the server's credential; any other name, or the same name on an
+    /// install without a root bearer file, is accepted.
+    #[test]
+    fn the_root_bearer_file_name_cannot_be_registered_or_removed() {
+        let dd = tempfile::tempdir().unwrap();
+        let root = server_profiles::root_token_path(dd.path());
+        let err = refuse_the_root_token_name(dd.path(), "default", Some(&root)).unwrap_err();
+        assert!(err.to_string().contains("root bearer"), "{err}");
+        assert!(refuse_the_root_token_name(dd.path(), "team-b", Some(&root)).is_ok());
+        assert!(refuse_the_root_token_name(dd.path(), "default", None).is_ok());
     }
 
     /// The listing reports whether a token is stored and never the token.

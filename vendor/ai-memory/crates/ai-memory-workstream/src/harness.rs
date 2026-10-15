@@ -7,6 +7,121 @@ use ai_memory_core::AgentKind;
 use anyhow::{Result, anyhow, bail};
 use uuid::Uuid;
 
+/// OpenCode's incompatible major-version contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeDialect {
+    /// OpenCode 1 plugin, MCP, and transcript contracts.
+    V1,
+    /// OpenCode 2 plugin, MCP, and transcript contracts.
+    V2,
+}
+
+impl OpenCodeDialect {
+    /// Parse an OpenCode `--version` response without guessing an unknown major.
+    pub fn parse_version_output(output: &str) -> Result<Self> {
+        let mut versions = output
+            .split_ascii_whitespace()
+            .filter_map(parse_semver_major);
+        let major = versions
+            .next()
+            .ok_or_else(|| anyhow!("OpenCode returned no strict semantic version"))?;
+        if versions.next().is_some() {
+            bail!("OpenCode returned multiple semantic versions");
+        }
+        match major {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            other => bail!(
+                "OpenCode major {other} is not supported; upgrade ai-memory before using this OpenCode version"
+            ),
+        }
+    }
+
+    /// Numeric major used in persisted compatibility keys.
+    #[must_use]
+    pub const fn major(self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    /// Managed harness carrying this dialect through launch and transcript IO.
+    #[must_use]
+    pub const fn harness(self) -> ManagedHarness {
+        match self {
+            Self::V1 => ManagedHarness::OpenCode,
+            Self::V2 => ManagedHarness::OpenCode2,
+        }
+    }
+}
+
+fn parse_semver_major(raw: &str) -> Option<u64> {
+    let trimmed =
+        raw.trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | ',' | ';'));
+    let token = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    let (without_build, build) = token
+        .split_once('+')
+        .map_or((token, None), |(core, build)| (core, Some(build)));
+    if without_build.contains('+')
+        || build.is_some_and(|value| !valid_semver_identifiers(value, false))
+    {
+        return None;
+    }
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    if prerelease.is_some_and(|value| !valid_semver_identifiers(value, true)) {
+        return None;
+    }
+    let mut parts = core.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let patch = parts.next()?;
+    if parts.next().is_some()
+        || !valid_semver_number(major)
+        || !valid_semver_number(minor)
+        || !valid_semver_number(patch)
+    {
+        return None;
+    }
+    major.parse().ok()
+}
+
+fn valid_semver_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn valid_semver_identifiers(value: &str, reject_leading_zero_numeric: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!reject_leading_zero_numeric
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || identifier.len() == 1
+                    || !identifier.starts_with('0'))
+        })
+}
+
+/// Native transcript support available to recovery and backfill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptCapability {
+    /// The native store can export a normalized visible-event transcript.
+    Export,
+    /// Recovery can only rely on lifecycle events retained in the hook spool.
+    SpoolOnly,
+}
+
 /// Harnesses with native-session and transcript adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedHarness {
@@ -38,6 +153,8 @@ pub enum ManagedHarness {
     Grok,
     /// Google Antigravity CLI (`agy`).
     Antigravity,
+    /// GitHub Copilot CLI (`copilot`).
+    Copilot,
 }
 
 impl ManagedHarness {
@@ -57,7 +174,17 @@ impl ManagedHarness {
             "kiro" | "kiro-cli" => Some(Self::Kiro),
             "grok" | "grok-build" => Some(Self::Grok),
             "antigravity" | "antigravity-cli" | "agy" => Some(Self::Antigravity),
+            "copilot" | "copilot-cli" => Some(Self::Copilot),
             _ => None,
+        }
+    }
+
+    /// Recovery capability of this harness's native session store.
+    #[must_use]
+    pub const fn transcript_capability(self) -> TranscriptCapability {
+        match self {
+            Self::Antigravity => TranscriptCapability::SpoolOnly,
+            _ => TranscriptCapability::Export,
         }
     }
 
@@ -86,6 +213,7 @@ impl ManagedHarness {
             Self::Kiro | Self::KiroV3 => AgentKind::KiroCli,
             Self::Grok => AgentKind::Grok,
             Self::Antigravity => AgentKind::AntigravityCli,
+            Self::Copilot => AgentKind::CopilotCli,
         }
     }
 
@@ -111,6 +239,7 @@ impl ManagedHarness {
             Self::Kiro | Self::KiroV3 => "kiro-cli",
             Self::Grok => "grok",
             Self::Antigravity => "agy",
+            Self::Copilot => "copilot",
         }
     }
 
@@ -131,6 +260,7 @@ impl ManagedHarness {
             Self::KiroV3 => "kiro-v3",
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
+            Self::Copilot => "copilot",
         }
     }
 }
@@ -255,8 +385,6 @@ pub fn build_launch_plan_with_env(
     env_overrides: &[(String, String)],
     roots: Option<LaunchRoots<'_>>,
 ) -> Result<LaunchPlan> {
-    let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
-    let mut args = native_args;
     let get = |name: &str| {
         env_overrides
             .iter()
@@ -264,6 +392,27 @@ pub fn build_launch_plan_with_env(
             .map(|(_, value)| OsString::from(value))
             .or_else(|| std::env::var_os(name))
     };
+    build_launch_plan_with_env_lookup(
+        harness,
+        executable,
+        native_args,
+        linked_session_id,
+        get,
+        roots,
+    )
+}
+
+/// Build a launch plan from one caller-owned environment snapshot.
+pub fn build_launch_plan_with_env_lookup(
+    harness: ManagedHarness,
+    executable: Option<OsString>,
+    native_args: Vec<OsString>,
+    linked_session_id: Option<&str>,
+    get: impl Fn(&str) -> Option<OsString> + Copy,
+    roots: Option<LaunchRoots<'_>>,
+) -> Result<LaunchPlan> {
+    let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
+    let mut args = native_args;
     let session_dir = match harness {
         ManagedHarness::Pi | ManagedHarness::Omp => flag_path(&args, &["--session-dir"]),
         ManagedHarness::Crush => flag_path(&args, &["--data-dir", "-D"]),
@@ -286,6 +435,17 @@ pub fn build_launch_plan_with_env(
         _ => None,
     });
     let mut expected = explicit_session_id(harness, &args);
+    for id in expected.as_deref().into_iter().chain(linked_session_id) {
+        ai_memory_core::NativeSessionIdentity::parse(id, &ai_memory_core::Sanitizer::builtin())?;
+    }
+    // Command Code and Copilot also resolve a session name or an id prefix;
+    // only an exact UUID identifies the session before launch.
+    if matches!(
+        harness,
+        ManagedHarness::CommandCode | ManagedHarness::Copilot
+    ) {
+        expected = expected.filter(|value| Uuid::parse_str(value).is_ok());
+    }
     let mode = launch_mode(harness, &args);
     if mode == LaunchMode::Session
         && harness == ManagedHarness::KiroV3
@@ -411,6 +571,20 @@ pub fn build_launch_plan_with_env(
                     expected = Some(id.to_string());
                 }
             }
+            ManagedHarness::Copilot => {
+                // `--session-id` officially sets the UUID of a new session.
+                // A linked id uses `--resume=<id>`: the `=` form keeps the
+                // optional-value option from consuming a following argument,
+                // and a missing session fails instead of being created anew.
+                if let Some(id) = linked_session_id {
+                    args.push(OsString::from(format!("--resume={id}")));
+                    expected = Some(id.to_string());
+                } else {
+                    let id = Uuid::new_v4().to_string();
+                    args.extend([OsString::from("--session-id"), OsString::from(&id)]);
+                    expected = Some(id);
+                }
+            }
         }
     }
 
@@ -446,6 +620,7 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         ManagedHarness::KiroV3 => None,
         ManagedHarness::Grok => Some("--yolo"),
         ManagedHarness::Antigravity => Some("--dangerously-skip-permissions"),
+        ManagedHarness::Copilot => Some("--yolo"),
     };
     if let Some(flag) = flag {
         // Kimi's `--yolo` has hidden aliases (`--yes`, `--auto-approve`) and
@@ -460,6 +635,8 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
             // never be widened by the wrapper.
             ManagedHarness::Kiro => &["--trust-all-tools", "-a", "--trust-tools"],
             ManagedHarness::Grok => &["--yolo", "--always-approve"],
+            // Copilot documents `--allow-all` as the same permission set.
+            ManagedHarness::Copilot => &["--yolo", "--allow-all"],
             _ => &[flag],
         };
         if !has_flag(args, present) {
@@ -497,6 +674,21 @@ pub fn allows_native_session_adoption(harness: ManagedHarness, native_args: &[Os
         && !noninteractive_invocation(harness, native_args)
 }
 
+/// Whether a successful managed run represents an interactive session where
+/// follow-up choices may be offered in the parent terminal.
+///
+/// Explicit native session selectors remain interactive; this differs from
+/// [`allows_native_session_adoption`], which also rejects them because that
+/// function controls a separate prompt for choosing an existing session.
+#[must_use]
+pub fn is_interactive_session_invocation(
+    harness: ManagedHarness,
+    native_args: &[OsString],
+) -> bool {
+    launch_mode(harness, native_args) == LaunchMode::Session
+        && !noninteractive_invocation(harness, native_args)
+}
+
 fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool {
     match harness {
         ManagedHarness::Claude => has_flag(args, &["--print", "-p"]),
@@ -514,6 +706,8 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
         // / `-i` is NOT: it seeds a prompt and then keeps the session open, so
         // it stays adoptable.
         ManagedHarness::Antigravity => has_flag(args, &["--print", "-p", "--prompt"]),
+        // `-i`/`--interactive` seeds a prompt and keeps the session open.
+        ManagedHarness::Copilot => has_flag(args, &["--prompt", "-p"]),
     }
 }
 
@@ -776,6 +970,27 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "update",
         ]
         .as_slice(),
+        // Every root command in Copilot CLI 1.0.92 (`copilot --help`).
+        ManagedHarness::Copilot => [
+            "app",
+            "completion",
+            "config",
+            "help",
+            "init",
+            "instruction",
+            "login",
+            "lsp",
+            "mcp",
+            "memories",
+            "plugin",
+            "sandbox",
+            "sessions",
+            "skill",
+            "update",
+            "version",
+            "workflow",
+        ]
+        .as_slice(),
     };
     let first = if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
         kiro_root_subcommand(args)
@@ -871,6 +1086,12 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
         // naming one; that is still an explicit user choice, so nothing may be
         // injected over it.
         ManagedHarness::Antigravity => has_flag(args, &["--conversation", "--continue", "-c"]),
+        // A bare `--resume` opens Copilot's session picker and `--connect`
+        // attaches to a remote session; both are explicit user choices.
+        ManagedHarness::Copilot => has_flag(
+            args,
+            &["--resume", "-r", "--continue", "--session-id", "--connect"],
+        ),
     }
 }
 
@@ -898,13 +1119,13 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // A bare `--session`/`--resume` opens the picker: `flag_value`
         // returns `None` when no value follows, as intended.
         ManagedHarness::Kimi => flag_value(args, &["--session", "-S", "--resume", "-r"]),
-        ManagedHarness::CommandCode => flag_value(args, &["--session", "--resume", "-r"])
-            .filter(|value| Uuid::parse_str(value).is_ok()),
+        ManagedHarness::CommandCode => flag_value(args, &["--session", "--resume", "-r"]),
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => flag_value(args, &["--resume-id"]),
         ManagedHarness::Grok => flag_value(args, &["--resume", "-r", "--session-id", "-s"]),
         // A bare `--continue` names no conversation: the id is only known
         // after the fact, from the conversation store.
         ManagedHarness::Antigravity => flag_value(args, &["--conversation"]),
+        ManagedHarness::Copilot => flag_value(args, &["--resume", "-r", "--session-id"]),
     }
 }
 
@@ -1054,6 +1275,7 @@ pub fn store_override_vars(harness: ManagedHarness) -> &'static [&'static str] {
         ManagedHarness::Kimi => &["KIMI_CODE_HOME"],
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => &["KIRO_HOME"],
         ManagedHarness::Grok => &["GROK_HOME"],
+        ManagedHarness::Copilot => &["COPILOT_HOME"],
         ManagedHarness::Crush | ManagedHarness::CommandCode | ManagedHarness::Antigravity => &[],
     }
 }
@@ -1537,6 +1759,8 @@ fn environment_session_dir_with(
         ManagedHarness::Grok => value("GROK_HOME").map(|dir| dir.join("sessions")),
         // `agy` exposes no environment override for its conversation store.
         ManagedHarness::Antigravity => None,
+        // Sessions live under `<COPILOT_HOME>/session-state/<id>/`.
+        ManagedHarness::Copilot => value("COPILOT_HOME").map(|dir| dir.join("session-state")),
     }
 }
 
@@ -1718,6 +1942,59 @@ mod tests {
     }
 
     #[test]
+    fn opencode_version_parser_accepts_strict_and_decorated_versions() {
+        for (output, expected) in [
+            ("1.18.34", OpenCodeDialect::V1),
+            ("v2.0.23", OpenCodeDialect::V2),
+            ("OpenCode v2.0.23 (build abc)", OpenCodeDialect::V2),
+            ("opencode 1.18.34-beta.1", OpenCodeDialect::V1),
+        ] {
+            assert_eq!(
+                OpenCodeDialect::parse_version_output(output).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_version_parser_rejects_malformed_and_unsupported_versions() {
+        for output in ["2", "2.0", "latest", "version 2.x", "1.2.3 2.0.0"] {
+            assert!(
+                OpenCodeDialect::parse_version_output(output).is_err(),
+                "{output}"
+            );
+        }
+        let error = OpenCodeDialect::parse_version_output("3.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("major 3 is not supported"), "{error}");
+    }
+
+    #[test]
+    fn post_run_prompt_is_limited_to_interactive_session_invocations() {
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &[OsString::from("resume"), OsString::from("chosen")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &[OsString::from("exec"), OsString::from("continue here")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Claude,
+            &[OsString::from("--print"), OsString::from("continue here")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Pi,
+            &[OsString::from("--no-session")]
+        ));
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Claude,
+            &[OsString::from("--model"), OsString::from("opus")]
+        ));
+    }
+
+    #[test]
     fn opencode2_shares_v1_session_contract_with_its_own_binary() {
         for name in ["opencode2", "opencode-v2", "open-code2"] {
             assert_eq!(
@@ -1862,6 +2139,7 @@ mod tests {
                 ManagedHarness::Antigravity,
                 Some("--dangerously-skip-permissions"),
             ),
+            (ManagedHarness::Copilot, Some("--yolo")),
         ] {
             let mut args = Vec::new();
             apply_yolo(harness, &mut args);
@@ -2896,6 +3174,167 @@ mod tests {
     }
 
     #[test]
+    fn copilot_generates_then_resumes_native_session_after_user_arguments() {
+        let fresh = build_launch_plan(
+            ManagedHarness::Copilot,
+            None,
+            vec![OsString::from("--model"), OsString::from("gpt-5.6")],
+            None,
+        )
+        .unwrap();
+        let id = fresh.expected_session_id.clone().unwrap();
+        assert!(Uuid::parse_str(&id).is_ok());
+        assert_eq!(
+            strings(&fresh.args),
+            ["--model", "gpt-5.6", "--session-id", id.as_str()]
+        );
+        assert_eq!(fresh.mode, LaunchMode::Session);
+
+        let resumed = build_launch_plan(
+            ManagedHarness::Copilot,
+            None,
+            vec![OsString::from("--model"), OsString::from("gpt-5.6")],
+            Some(&id),
+        )
+        .unwrap();
+        // The `=` form keeps the optional-value `--resume` from consuming a
+        // following argument.
+        let selector = format!("--resume={id}");
+        assert_eq!(
+            strings(&resumed.args),
+            ["--model", "gpt-5.6", selector.as_str()]
+        );
+        assert_eq!(resumed.expected_session_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn copilot_explicit_selector_always_wins_including_bare_picker() {
+        let exact = "0cb916db-26aa-40f2-86b5-1ba81b225fd2";
+        for (native, expected) in [
+            (
+                vec![OsString::from("--resume"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (
+                vec![OsString::from(format!("--session-id={exact}"))],
+                Some(exact),
+            ),
+            (vec![OsString::from(format!("-r={exact}"))], Some(exact)),
+            // Names and id prefixes resolve natively; they identify nothing
+            // before launch.
+            (vec![OsString::from("--resume=my feature")], None),
+            (vec![OsString::from("--resume=0cb916d")], None),
+            (vec![OsString::from("--continue")], None),
+            (vec![OsString::from("--connect")], None),
+            // A bare `--resume` opens the native picker; still an explicit
+            // choice, so nothing may be injected.
+            (vec![OsString::from("--resume")], None),
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Copilot,
+                None,
+                native.clone(),
+                Some("linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
+            assert_eq!(plan.expected_session_id.as_deref(), expected, "{native:?}");
+            assert!(!allows_native_session_adoption(
+                ManagedHarness::Copilot,
+                &native
+            ));
+        }
+    }
+
+    #[test]
+    fn copilot_utility_subcommands_are_passed_through() {
+        for utility in [
+            "login", "sessions", "mcp", "plugin", "update", "version", "help", "config", "init",
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Copilot,
+                None,
+                vec![OsString::from(utility)],
+                Some("linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{utility}");
+            assert_eq!(strings(&plan.args), [utility]);
+        }
+        for flag in ["--help", "-h", "--version", "-v"] {
+            let plan = build_launch_plan(
+                ManagedHarness::Copilot,
+                None,
+                vec![OsString::from(flag)],
+                None,
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{flag}");
+            assert_eq!(strings(&plan.args), [flag]);
+        }
+    }
+
+    #[test]
+    fn copilot_prompt_blocks_adoption_but_interactive_seed_does_not() {
+        for args in [
+            vec![OsString::from("-p"), OsString::from("summarize")],
+            vec![OsString::from("--prompt=summarize")],
+        ] {
+            assert!(!allows_native_session_adoption(
+                ManagedHarness::Copilot,
+                &args
+            ));
+            // A one-shot prompt still records a native session.
+            let plan = build_launch_plan(ManagedHarness::Copilot, None, args, None).unwrap();
+            assert_eq!(plan.mode, LaunchMode::Session);
+        }
+        assert!(allows_native_session_adoption(
+            ManagedHarness::Copilot,
+            &[OsString::from("-i"), OsString::from("summarize")]
+        ));
+    }
+
+    #[test]
+    fn copilot_yolo_respects_the_allow_all_alias() {
+        for already in ["--yolo", "--allow-all"] {
+            let mut args = vec![OsString::from(already)];
+            apply_yolo(ManagedHarness::Copilot, &mut args);
+            assert_eq!(strings(&args), [already], "{already} must not duplicate");
+        }
+        // Narrower grants are additive in Copilot; the wrapper's request
+        // still has to widen them explicitly.
+        let mut args = vec![OsString::from("--allow-all-tools")];
+        apply_yolo(ManagedHarness::Copilot, &mut args);
+        assert_eq!(strings(&args), ["--allow-all-tools", "--yolo"]);
+    }
+
+    #[test]
+    fn copilot_names_parse_to_one_variant() {
+        for name in ["copilot", "copilot-cli"] {
+            assert_eq!(
+                ManagedHarness::from_name(name),
+                Some(ManagedHarness::Copilot)
+            );
+        }
+        assert_eq!(ManagedHarness::Copilot.agent_kind(), AgentKind::CopilotCli);
+        assert_eq!(ManagedHarness::Copilot.executable(), "copilot");
+        assert!(!ManagedHarness::Copilot.lacks_session_end_hook());
+    }
+
+    #[test]
+    fn copilot_home_environment_override_points_at_session_state() {
+        let get = |name: &str| (name == "COPILOT_HOME").then(|| OsString::from("/stores/copilot"));
+        assert_eq!(
+            environment_session_dir_with(ManagedHarness::Copilot, None, None, get).as_deref(),
+            Some(std::path::Path::new("/stores/copilot/session-state"))
+        );
+        assert_eq!(
+            store_override_vars(ManagedHarness::Copilot),
+            ["COPILOT_HOME"]
+        );
+    }
+
+    #[test]
     fn kimi_home_environment_override_points_at_sessions_root() {
         let get =
             |name: &str| (name == "KIMI_CODE_HOME").then(|| OsString::from("/stores/kimi-code"));
@@ -3240,6 +3679,36 @@ mod tests {
     }
 
     #[test]
+    fn transcript_capability_marks_only_antigravity_spool_only() {
+        for harness in [
+            ManagedHarness::Claude,
+            ManagedHarness::Codex,
+            ManagedHarness::OpenCode,
+            ManagedHarness::OpenCode2,
+            ManagedHarness::Pi,
+            ManagedHarness::Crush,
+            ManagedHarness::Omp,
+            ManagedHarness::Kimi,
+            ManagedHarness::CommandCode,
+            ManagedHarness::Kiro,
+            ManagedHarness::KiroV3,
+            ManagedHarness::Grok,
+            ManagedHarness::Antigravity,
+        ] {
+            assert_eq!(
+                harness.transcript_capability(),
+                if harness == ManagedHarness::Antigravity {
+                    TranscriptCapability::SpoolOnly
+                } else {
+                    TranscriptCapability::Export
+                },
+                "{}",
+                harness.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn only_harnesses_without_a_session_end_hook_need_finalizing() {
         let hookless = [
             ManagedHarness::CommandCode,
@@ -3268,5 +3737,58 @@ mod tests {
                 harness.as_str()
             );
         }
+    }
+
+    #[test]
+    fn native_identity_selector_rejects_original_before_resume_arguments() {
+        let bad = "sk-abcdefghijklmnopqrstuvwx";
+        for (args, linked) in [
+            (vec![OsString::from("resume"), OsString::from(bad)], None),
+            (Vec::new(), Some(bad)),
+        ] {
+            let result = build_launch_plan(ManagedHarness::Codex, None, args, linked);
+            assert!(
+                result.is_err(),
+                "selector must refuse dirty original identity"
+            );
+            assert!(!format!("{:#}", result.unwrap_err()).contains(bad));
+        }
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from(bad)],
+            None,
+        );
+        assert!(
+            command_code.is_err(),
+            "Command Code must check original privacy before UUID filtering"
+        );
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from(uuid)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(command_code.expected_session_id.as_deref(), Some(uuid));
+        let command_code = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from("vendor-id")],
+            None,
+        )
+        .unwrap();
+        assert!(command_code.expected_session_id.is_none());
+        assert!(command_code.args.iter().any(|arg| arg == "vendor-id"));
+        let plan = build_launch_plan(
+            ManagedHarness::Codex,
+            None,
+            Vec::new(),
+            Some("vendor-界-01"),
+        )
+        .unwrap();
+        assert_eq!(plan.expected_session_id.as_deref(), Some("vendor-界-01"));
+        assert!(plan.args.iter().any(|arg| arg == "vendor-界-01"));
     }
 }

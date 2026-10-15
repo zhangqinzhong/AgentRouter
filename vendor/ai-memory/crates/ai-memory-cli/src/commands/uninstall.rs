@@ -8,17 +8,19 @@
 
 use crate::cli::McpClient;
 use crate::cli::UninstallArgs;
-use crate::commands::apply_shared::apply_atomic;
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
+use crate::commands::apply_shared::{PrivateBackup, apply_atomic_with_backup};
 use crate::commands::path_util::{
     agent_config_home, claude_config_dir, claude_config_paths, home_dir,
 };
-use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
+use crate::commands::user_service::{self, ServiceManager};
+use crate::commands::{agent_plugins, data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, GROK_SKILL_DIR, MANAGED_MARKER,
-    MANAGED_SKILLS, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
+    GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER, GROK_RULES_DIR, GROK_SKILL_DIR,
+    MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
 };
 use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line};
 use anyhow::{Context, Result};
@@ -74,6 +76,7 @@ enum DeleteKind {
     OpenClawEntrypoint,
     KiroCliV3Hooks,
     ManagedSkill,
+    GrokHandoffRule,
     AutowireSentinel,
 }
 
@@ -89,6 +92,7 @@ impl DeleteKind {
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
             Self::KiroCliV3Hooks => "Kiro CLI v3 hook file",
             Self::ManagedSkill => "managed Agent Skill",
+            Self::GrokHandoffRule => "managed Grok first-turn handoff rule",
             Self::AutowireSentinel => "auto-wire sentinel",
         }
     }
@@ -175,13 +179,21 @@ fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: Del
 /// Build the full removal plan by reading each existing config file and
 /// running the matching pure stripper. Missing files / no-matches
 /// produce no entry. `name`/`url` identify the MCP server.
-fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<PlannedChange>> {
+///
+/// Harness homes (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`,
+/// `GROK_HOME`, `APPDATA`) come
+/// from `env`, the environment `Config::load` captured (invariant #1).
+fn build_plan(
+    args: &UninstallArgs,
+    data_dir: &Path,
+    env: &crate::config::RuntimeEnv,
+) -> anyhow::Result<Vec<PlannedChange>> {
     let mut plan = Vec::new();
     let want = |k: crate::cli::UninstallOnly| args.only.is_none() || args.only == Some(k);
     let name = args.mcp_name.as_deref();
     let url = args.mcp_url.as_str();
     let home = home_dir();
-    let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let claude_config_dir = claude_config_dir(env.var_os("CLAUDE_CONFIG_DIR"));
     let omp_dirs = if want(crate::cli::UninstallOnly::Hooks) || want(crate::cli::UninstallOnly::Mcp)
     {
         omp_agent_dirs(home.as_deref(), args.profile.as_deref())
@@ -200,9 +212,23 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
         .into_iter()
         .map(|path| (path, HookConfigShape::NestedHooksKey))
         .collect();
+        // A `--scope project` install lives in the checkout's gitignored
+        // `.claude/settings.local.json`; sweep the one for the current
+        // directory, as the Kiro project configs below are.
+        let cwd = std::env::current_dir().context("getting CWD for hook removal")?;
+        let project_local = install_hooks::project_claude_settings_local(&cwd);
+        if !hook_files.iter().any(|(path, _)| *path == project_local) {
+            hook_files.push((project_local, HookConfigShape::NestedHooksKey));
+        }
         hook_files.extend([
+            // Copilot CLI's standalone file keeps flat entries under the usual
+            // `hooks` key next to its `version: 1`, like Cursor's.
             (
-                install_hooks::codex_hooks_path()?,
+                install_hooks::copilot_cli_hooks_path_in(env.var_os("COPILOT_HOME"))?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            (
+                install_hooks::codex_hooks_path(env)?,
                 HookConfigShape::NestedHooksKey,
             ),
             (
@@ -234,6 +260,18 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
                 install_hooks::devin_config_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
+            // Droid's hooks.json is the event map itself, like Devin's
+            // hooks.v1.json.
+            (
+                install_hooks::droid_hooks_path()?,
+                HookConfigShape::FlatHookFile,
+            ),
+            // Muse keeps its hooks under the usual `hooks` key of the
+            // settings.json its MCP servers live in, beside `schema_version`.
+            (
+                install_hooks::muse_settings_path(env)?,
+                HookConfigShape::NestedHooksKey,
+            ),
         ]);
         for (path, shape) in hook_files {
             if !path.exists() {
@@ -255,7 +293,6 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
 
         let mut kiro_configs =
             install_hooks::list_kiro_cli_agent_configs(&install_hooks::kiro_cli_agents_dir()?)?;
-        let cwd = std::env::current_dir().context("getting CWD for Kiro hook removal")?;
         kiro_configs.extend(install_hooks::list_kiro_cli_agent_configs(
             &cwd.join(".kiro/agents"),
         )?);
@@ -397,8 +434,11 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
             KimiCode,
             KiroCli,
             CommandCode,
+            CopilotCli,
+            Droid,
             Swival,
             Muse,
+            PrimeAgent,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -412,12 +452,14 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
                 // even with CODEX_HOME set, so sweep that file too.
                 claude_config_paths(
                     home.as_deref(),
-                    agent_config_home(std::env::var_os("CODEX_HOME")).as_deref(),
+                    agent_config_home(env.var_os("CODEX_HOME")).as_deref(),
                     Path::new(".codex/config.toml"),
                     Path::new("config.toml"),
                 )
             } else if matches!(client, Omp) {
                 omp_dirs.iter().map(|dir| dir.join("mcp.json")).collect()
+            } else if matches!(client, Muse) {
+                vec![install_hooks::muse_settings_path(env)?]
             } else {
                 let Ok(path) = install_mcp::mcp_config_path(client) else {
                     continue;
@@ -470,13 +512,15 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
     // ---- Managed Agent Skills (project + global roots) ----
     if want(crate::cli::UninstallOnly::Skills) {
         let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
-        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-        let grok_home = install_mcp::grok_home().ok();
+        let appdata = env.var_os("APPDATA").map(PathBuf::from);
+        let grok_home = install_mcp::grok_home_in(env.var_os("GROK_HOME")).ok();
+        let copilot_home = install_mcp::copilot_home_in(env.var_os("COPILOT_HOME")).ok();
         for root in skill_roots(
             &cwd,
             home.as_deref(),
             appdata.as_deref(),
             grok_home.as_deref(),
+            copilot_home.as_deref(),
             claude_config_dir.as_deref(),
         ) {
             for skill in MANAGED_SKILLS {
@@ -487,6 +531,21 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
                 );
             }
         }
+    }
+
+    // The Grok first-turn rule is written by both `install-hooks --agent grok`
+    // and `install-skills --scope global --agent grok`. Sweep it with either
+    // concern so uninstall of hooks or skills does not leave the always-on rule.
+    if (want(crate::cli::UninstallOnly::Skills) || want(crate::cli::UninstallOnly::Hooks))
+        && let Ok(grok_home) = install_mcp::grok_home()
+    {
+        push_generated_delete(
+            &mut plan,
+            grok_home
+                .join(GROK_RULES_DIR)
+                .join(GROK_HANDOFF_RULE_FILENAME),
+            DeleteKind::GrokHandoffRule,
+        );
     }
 
     // ---- Auto-wire sentinels (ai-memory's own state) ----
@@ -515,13 +574,15 @@ fn skill_roots(
     home: Option<&Path>,
     appdata: Option<&Path>,
     grok_home: Option<&Path>,
+    copilot_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(10);
+    let mut roots = Vec::with_capacity(12);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(GITHUB_SKILL_DIR).join(SKILLS_DIR));
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
@@ -530,6 +591,10 @@ fn skill_roots(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(GROK_SKILL_DIR));
         push_unique_skill_root(&mut roots, grok_root.join(SKILLS_DIR));
+        let copilot_root = copilot_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
+        push_unique_skill_root(&mut roots, copilot_root.join(SKILLS_DIR));
     }
     // Windows global Devin installs live under %APPDATA%\devin\skills, not
     // $HOME/.devin/skills — sweep it too or uninstall orphans those skills.
@@ -576,7 +641,12 @@ fn print_plan(plan: &[PlannedChange]) {
 /// Re-run the planned strippers inside `apply_atomic` so the actual write is
 /// atomic + backed up. Planning records exact operations per file, so shared
 /// files such as `~/.gemini/settings.json` only apply the selected concerns.
-fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow::Result<()> {
+fn apply_change(
+    change: &PlannedChange,
+    private_backup: Option<&PrivateBackup>,
+    name: Option<&str>,
+    url: &str,
+) -> anyhow::Result<()> {
     match change {
         PlannedChange::DeleteFile { path, kind } => {
             if !path.exists() {
@@ -595,9 +665,14 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
             if *kind == DeleteKind::ManagedSkill {
                 remove_empty_skill_dirs(path)?;
             }
+            if *kind == DeleteKind::GrokHandoffRule
+                && let Some(parent) = path.parent()
+            {
+                remove_dir_if_empty(parent)?;
+            }
         }
         PlannedChange::Rewrite { path, ops, .. } => {
-            let outcome = apply_atomic(path, |existing| {
+            let outcome = apply_atomic_with_backup(path, private_backup, |existing| {
                 let mut out = existing.to_string();
                 for op in ops {
                     out = match *op {
@@ -668,8 +743,37 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     let name = args.mcp_name.clone();
     let url = args.mcp_url.clone();
 
-    let plan = build_plan(&args, &config.data_dir)?;
+    let plan = build_plan(&args, &config.data_dir, &config.runtime_env)?;
     print_plan(&plan);
+    // The marketplace plugins carry hooks, MCP and skills together, so only a
+    // full uninstall removes them; the harness's own CLI does the removal.
+    let plugins = if args.only.is_none() {
+        installed_plugins(config)
+    } else {
+        Vec::new()
+    };
+    for plugin in &plugins {
+        let (program, plugin_args) = plugin.harness.uninstall_command();
+        println!("would run `{program} {}`", plugin_args.join(" "));
+    }
+    let service = if args.only.is_none() {
+        setup_service(config)
+    } else {
+        None
+    };
+    if let Some((_, removal)) = &service {
+        print_service_plan(removal);
+    }
+    let remove_service = matches!(&service, Some((_, user_service::Removal::Removed(_))));
+    let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
+    if hooks_removed {
+        // Only the current checkout's project file is reachable from here.
+        println!(
+            "note: run `ai-memory uninstall --only hooks --apply` inside every other checkout that \
+             used `install-hooks --scope project`; their .claude/settings.local.json keeps calling \
+             this binary and data dir."
+        );
+    }
     if args.purge_data {
         for path in data_purge::purge_preview(&config.data_dir) {
             println!("would purge {}", path.display());
@@ -679,19 +783,8 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         println!("(dry-run; pass --apply to remove)");
         return Ok(());
     }
-    if plan.is_empty() && !args.purge_data {
+    if plan.is_empty() && plugins.is_empty() && !args.purge_data && !remove_service {
         return Ok(());
-    }
-
-    // All-or-nothing: when we're going to purge data, refuse before touching
-    // anything if an ai-memory process is alive (matches reset's guard-at-top).
-    // Wiring-only uninstall stays unguarded — it edits agent config files the
-    // server never touches.
-    if args.purge_data {
-        let siblings = crate::process_guard::sibling_processes();
-        if !siblings.is_empty() {
-            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
-        }
     }
 
     if std::io::stdin().is_terminal() && !args.yes {
@@ -706,9 +799,31 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         }
     }
 
+    stop_service_guarding_purge(
+        service.as_ref(),
+        args.purge_data,
+        &user_service::SystemRunner,
+        crate::process_guard::sibling_processes,
+        std::time::Duration::from_secs(5),
+    )?;
+
+    // The current checkout's `.claude/settings.local.json` keeps its backup
+    // under the data dir, as `install-hooks --scope project` does: a sibling
+    // `.bak-<ts>` would sit untracked in the repository.
+    let project_local = std::env::current_dir()
+        .ok()
+        .map(|cwd| install_hooks::project_claude_settings_local(&cwd));
     for change in &plan {
-        apply_change(change, name.as_deref(), &url)?;
+        let private_backup = match change {
+            PlannedChange::Rewrite { path, .. } if project_local.as_ref() == Some(path) => Some(
+                install_hooks::project_settings_backup(&config.data_dir, path),
+            ),
+            _ => None,
+        };
+        apply_change(change, private_backup.as_ref(), name.as_deref(), &url)?;
     }
+
+    uninstall_plugins(&plugins, &user_service::SystemRunner);
 
     // Removing the hooks removes the only readers of the stored bearer, so
     // leaving it on disk would strand a live credential (#552). An uninstall
@@ -716,7 +831,6 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     // native hook, the shell hooks and the generated TypeScript integrations
     // (the Pi one also bridges MCP) all still read it. Best-effort: an
     // unremovable file must not fail a teardown that otherwise succeeded.
-    let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
     if hooks_removed && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir) {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
@@ -724,8 +838,12 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         );
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
-    // reasoning applies; the registry of URLs stays.
-    if let Err(error) = crate::server_profiles::clear_tokens(&config.data_dir) {
+    // reasoning applies; the registry of URLs stays. The root bearer the
+    // server itself reads (`[auth].bearer_token_file`) is not a hook's and
+    // stays with the server's config.
+    if let Err(error) =
+        crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
+    {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
             config.data_dir.display()
@@ -741,6 +859,180 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     print_docker_hint(args.purge_data);
 
     Ok(())
+}
+
+/// The ai-memory marketplace plugins installed for this user.
+fn installed_plugins(config: &Config) -> Vec<agent_plugins::InstalledPlugin> {
+    let Some(home) = crate::commands::run::native_home(config) else {
+        return Vec::new();
+    };
+    agent_plugins::installed(&home, &|name| {
+        config
+            .runtime_env
+            .process_env()
+            .iter()
+            .find(|(key, _)| key.as_os_str() == name)
+            .map(|(_, value)| value.clone())
+    })
+}
+
+/// Remove each plugin through its harness's CLI. A failure is reported with
+/// the command to run, and never stops the rest of the teardown.
+fn uninstall_plugins(
+    plugins: &[agent_plugins::InstalledPlugin],
+    runner: &dyn user_service::CommandRunner,
+) {
+    for plugin in plugins {
+        let (program, args) = plugin.harness.uninstall_command();
+        let shown = format!("{program} {}", args.join(" "));
+        match runner.run(program, &args) {
+            Ok(outcome) if outcome.success => println!("✓ {shown}"),
+            Ok(outcome) => eprintln!(
+                "ai-memory uninstall warning: `{shown}` failed ({}); run it yourself",
+                outcome.stderr.trim()
+            ),
+            Err(error) => eprintln!(
+                "ai-memory uninstall warning: could not run `{shown}` ({error:#}); run it yourself"
+            ),
+        }
+    }
+}
+
+/// The user service `setup` installs on this platform and what uninstall
+/// would do about it; `None` on a platform without one or with no home.
+fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Removal)> {
+    let manager = ServiceManager::current()?;
+    let home = crate::commands::run::native_home(config)?;
+    let xdg_config_home = config
+        .runtime_env
+        .process_env()
+        .iter()
+        .find(|(key, _)| key == "XDG_CONFIG_HOME")
+        .map(|(_, value)| PathBuf::from(value));
+    let path = user_service::unit_path(manager, &home, xdg_config_home.as_deref());
+    Some((manager, user_service::planned_removal(&path)))
+}
+
+/// Stop the user service `setup` installed, refusing a data purge while any
+/// other ai-memory process is alive.
+///
+/// All-or-nothing: the live-process check runs first, with the service's own
+/// process left out because this uninstall is about to stop it, so a sibling
+/// (a `run` session, a second server) refuses the purge before the service
+/// is stopped or anything else is touched (matches reset's guard-at-top).
+/// After the stop the check runs again without that exception: a service that
+/// did not exit still holds the data. Wiring-only uninstall stays unguarded;
+/// it edits agent config files the server never touches.
+fn stop_service_guarding_purge(
+    service: Option<&(ServiceManager, user_service::Removal)>,
+    purge_data: bool,
+    runner: &dyn user_service::CommandRunner,
+    siblings: impl Fn() -> Vec<sysinfo::Pid>,
+    exit_wait: std::time::Duration,
+) -> Result<()> {
+    let to_stop = match service {
+        Some((manager, user_service::Removal::Removed(path))) => Some((*manager, path)),
+        _ => None,
+    };
+    let service_pid = if purge_data {
+        to_stop.and_then(|(manager, _)| service_main_pid(manager, runner))
+    } else {
+        None
+    };
+    if purge_data {
+        let others: Vec<sysinfo::Pid> = siblings()
+            .into_iter()
+            .filter(|pid| Some(pid.as_u32()) != service_pid)
+            .collect();
+        if !others.is_empty() {
+            anyhow::bail!(crate::process_guard::busy_message("purge data", &others));
+        }
+    }
+    if let Some((manager, path)) = to_stop {
+        match user_service::remove(manager, path, runner)? {
+            user_service::Removal::Removed(path) => {
+                println!("✓ stopped and removed the user service {}", path.display());
+            }
+            other => print_service_plan(&other),
+        }
+    }
+    if purge_data && to_stop.is_some() {
+        // `launchctl bootout` can return before the process has exited, so
+        // give the service's own process a bounded moment to go before the
+        // recheck refuses on it.
+        let mut alive = siblings();
+        if let Some(service_pid) = service_pid {
+            let deadline = std::time::Instant::now() + exit_wait;
+            while alive.iter().any(|pid| pid.as_u32() == service_pid)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                alive = siblings();
+            }
+        }
+        if !alive.is_empty() {
+            anyhow::bail!(crate::process_guard::busy_message("purge data", &alive));
+        }
+    }
+    Ok(())
+}
+
+/// The running service's main process, as its manager reports it; `None`
+/// when it is not running or the manager cannot say.
+fn service_main_pid(
+    manager: ServiceManager,
+    runner: &dyn user_service::CommandRunner,
+) -> Option<u32> {
+    let pid = match manager {
+        ServiceManager::SystemdUser => {
+            let out = runner
+                .run(
+                    "systemctl",
+                    &[
+                        "--user",
+                        "show",
+                        "--property=MainPID",
+                        "--value",
+                        user_service::SYSTEMD_UNIT_NAME,
+                    ],
+                )
+                .ok()
+                .filter(|out| out.success)?;
+            out.stdout.trim().parse::<u32>().ok()?
+        }
+        ServiceManager::Launchd => {
+            // `launchctl list <label>` prints a dictionary with a
+            // `"PID" = 123;` line while the job runs.
+            let out = runner
+                .run("launchctl", &["list", user_service::LAUNCHD_LABEL])
+                .ok()
+                .filter(|out| out.success)?;
+            out.stdout.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("\"PID\" =")?
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+            })?
+        }
+    };
+    (pid != 0).then_some(pid)
+}
+
+fn print_service_plan(removal: &user_service::Removal) {
+    match removal {
+        user_service::Removal::Absent => {}
+        user_service::Removal::Removed(path) => {
+            println!("would stop and remove the user service {}", path.display());
+        }
+        user_service::Removal::NotOurs(path) => println!(
+            "leaving {}: `ai-memory setup` did not write it, or it was edited since; remove it \
+             yourself if it runs ai-memory",
+            path.display()
+        ),
+    }
 }
 
 /// Print the manual Docker teardown steps (never executed). When the
@@ -1192,6 +1484,7 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                         })
             }),
         DeleteKind::ManagedSkill => content.contains(MANAGED_MARKER),
+        DeleteKind::GrokHandoffRule => content.contains(GROK_HANDOFF_RULE_MARKER),
     }
 }
 
@@ -1208,17 +1501,20 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::CopilotCli
+        | McpClient::Droid
         | McpClient::Swival
-        | McpClient::Devin => Some(&["mcpServers"]),
+        | McpClient::Devin
+        | McpClient::PrimeAgent => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::OpenCode2 => Some(&["mcp", "servers"]),
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Zed => Some(&["context_servers"]),
-        // Muse Code spells the key snake_case; the camelCase spelling the
-        // clients above use would leave the entry behind.
-        McpClient::Muse => Some(&["mcp_servers"]),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
+        // Muse reads `mcpServers` or the legacy `mcp_servers`;
+        // `strip_mcp_json` sweeps both.
+        McpClient::Muse => Some(&["mcpServers"]),
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
     }
 }
 
@@ -1236,16 +1532,35 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
             return true;
         }
     }
+    // Our stdio bridge, in any client's shape (`command` + `args`, or
+    // OpenCode's single `command` array), aimed at this server.
+    if install_mcp::bridge_entry_url(entry) == Some(url) {
+        return true;
+    }
     if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
         let has_remote = args.iter().any(|a| a.as_str() == Some("mcp-remote"));
-        let has_session_bridge = entry.get("command").and_then(|v| v.as_str()) == Some("ai-memory")
-            && args.iter().any(|a| a.as_str() == Some("mcp-bridge"));
         let has_url = args.iter().any(|a| a.as_str() == Some(url));
-        if (has_remote || has_session_bridge) && has_url {
+        if has_remote && has_url {
             return true;
         }
     }
     false
+}
+
+/// A TOML `[mcp_servers.<name>]` table (Codex, Grok) aimed at `url`: an HTTP
+/// entry by its `url`, or our stdio bridge by `command` + `args`.
+fn toml_mcp_entry_targets(table: &dyn toml_edit::TableLike, url: &str) -> bool {
+    if table.get("url").and_then(|u| u.as_str()) == Some(url) {
+        return true;
+    }
+    let as_json = serde_json::json!({
+        "command": table.get("command").and_then(|c| c.as_str()),
+        "args": table
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+    });
+    install_mcp::bridge_entry_url(&as_json) == Some(url)
 }
 
 /// URL forms uninstall matches for `client`: the endpoint as given, plus
@@ -1340,38 +1655,57 @@ fn strip_mcp_json(
     let Some(path) = mcp_servers_path(client) else {
         return Ok((content.to_string(), Vec::new()));
     };
+    let legacy: &[&str] = &["mcp_servers"];
+    let paths: Vec<&[&str]> = if client == McpClient::Muse {
+        vec![path, legacy]
+    } else {
+        vec![path]
+    };
     let mut removed = Vec::new();
     let new_content = mutate_json(content, |root| {
-        let mut cursor: &mut serde_json::Map<String, serde_json::Value> = root;
-        for (depth, key) in path.iter().enumerate() {
-            let is_last = depth == path.len() - 1;
-            if is_last {
-                let Some(servers) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
-                    return Ok(());
-                };
-                let keys: Vec<String> = servers.keys().cloned().collect();
-                for k in keys {
-                    let ours = servers
-                        .get(&k)
-                        .is_some_and(|e| mcp_entry_is_ours(&k, e, name, url));
-                    if ours {
-                        servers.remove(&k);
-                        removed.push(k);
-                    }
-                }
-                if servers.is_empty() {
-                    cursor.remove(*key);
-                }
-            } else {
-                let Some(next) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
-                    return Ok(());
-                };
-                cursor = next;
-            }
+        for path in &paths {
+            strip_mcp_json_at(root, path, name, url, &mut removed);
         }
         Ok(())
     })?;
     Ok((new_content, removed))
+}
+
+/// [`strip_mcp_json`] for the server map at one key path.
+fn strip_mcp_json_at(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[&str],
+    name: Option<&str>,
+    url: &str,
+    removed: &mut Vec<String>,
+) {
+    let mut cursor: &mut serde_json::Map<String, serde_json::Value> = root;
+    for (depth, key) in path.iter().enumerate() {
+        let is_last = depth == path.len() - 1;
+        if is_last {
+            let Some(servers) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
+                return;
+            };
+            let keys: Vec<String> = servers.keys().cloned().collect();
+            for k in keys {
+                let ours = servers
+                    .get(&k)
+                    .is_some_and(|e| mcp_entry_is_ours(&k, e, name, url));
+                if ours {
+                    servers.remove(&k);
+                    removed.push(k);
+                }
+            }
+            if servers.is_empty() {
+                cursor.remove(*key);
+            }
+        } else {
+            let Some(next) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
+                return;
+            };
+            cursor = next;
+        }
+    }
 }
 
 /// Remove ai-memory's Codex MCP table by name or `url`. Returns new
@@ -1391,10 +1725,8 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
                 for k in keys {
                     let matches_url = servers
                         .get(&k)
-                        .and_then(|item| item.as_table())
-                        .and_then(|t| t.get("url"))
-                        .and_then(|u| u.as_str())
-                        == Some(url);
+                        .and_then(|item| item.as_table_like())
+                        .is_some_and(|t| toml_mcp_entry_targets(t, url));
                     if name.is_none_or(|name| k == name) && matches_url {
                         servers.remove(&k);
                         removed.push(k);
@@ -1407,9 +1739,7 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
                     let matches_url = servers
                         .get(&k)
                         .and_then(|value| value.as_inline_table())
-                        .and_then(|table| table.get("url"))
-                        .and_then(|value| value.as_str())
-                        == Some(url);
+                        .is_some_and(|table| toml_mcp_entry_targets(table, url));
                     if name.is_none_or(|name| k == name) && matches_url {
                         servers.remove(&k);
                         removed.push(k);
@@ -1432,6 +1762,251 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    /// Answers `systemctl`/`launchctl` from a script and records each call.
+    struct ServiceRunner {
+        calls: std::cell::RefCell<Vec<String>>,
+        main_pid: &'static str,
+    }
+
+    impl user_service::CommandRunner for ServiceRunner {
+        fn run(&self, program: &str, args: &[&str]) -> Result<user_service::CommandOutcome> {
+            let line = format!("{program} {}", args.join(" "));
+            self.calls.borrow_mut().push(line.clone());
+            let stdout = if line.contains("MainPID") {
+                self.main_pid.to_owned()
+            } else if line.starts_with("launchctl list") {
+                format!(
+                    "{{\n\t\"Label\" = \"x\";\n\t\"PID\" = {};\n}};\n",
+                    self.main_pid
+                )
+            } else {
+                String::new()
+            };
+            Ok(user_service::CommandOutcome {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// A unit `setup` rendered, written where `uninstall` finds it.
+    #[cfg(unix)]
+    fn setup_unit(root: &Path) -> (ServiceManager, user_service::Removal) {
+        let manager = ServiceManager::SystemdUser;
+        let unit = user_service::render(
+            manager,
+            &user_service::ServiceSpec {
+                exe: root.join("bin").join("ai-memory"),
+                data_dir: root.join("data"),
+                config_path: root.join("config.toml"),
+                home: root.to_path_buf(),
+                xdg_config_home: None,
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(unit.path.parent().unwrap()).unwrap();
+        std::fs::write(&unit.path, &unit.contents).unwrap();
+        (manager, user_service::planned_removal(&unit.path))
+    }
+
+    /// Adversarial: a live sibling (pid 777) refuses `--purge-data` BEFORE
+    /// the service is stopped; the old order stopped it first and only then
+    /// refused, leaving the user without a server and with nothing purged.
+    /// Controls: the service's own process is not a sibling, and a purge
+    /// with only that process alive stops the service and proceeds.
+    #[cfg(unix)]
+    #[test]
+    fn purge_guard_refuses_a_live_sibling_before_stopping_the_service() {
+        let root = tempfile::tempdir().unwrap();
+        let service = setup_unit(root.path());
+        assert!(matches!(service.1, user_service::Removal::Removed(_)));
+        let runner = ServiceRunner {
+            calls: std::cell::RefCell::default(),
+            main_pid: "4242",
+        };
+        let pids = |raw: &[u32]| {
+            raw.iter()
+                .copied()
+                .map(sysinfo::Pid::from_u32)
+                .collect::<Vec<_>>()
+        };
+
+        let error = stop_service_guarding_purge(
+            Some(&service),
+            true,
+            &runner,
+            || pids(&[4242, 777]),
+            Duration::ZERO,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("777") && !error.contains("4242"), "{error}");
+        assert!(
+            !runner.calls.borrow().iter().any(|c| c.contains("disable")),
+            "the service must still run: {:?}",
+            runner.calls.borrow()
+        );
+
+        let alive = std::cell::RefCell::new(pids(&[4242]));
+        stop_service_guarding_purge(
+            Some(&service),
+            true,
+            &runner,
+            || alive.replace(Vec::new()),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c == "systemctl --user disable --now ai-memory.service")
+        );
+    }
+
+    /// A service that did not exit after the stop still blocks the purge.
+    #[cfg(unix)]
+    #[test]
+    fn purge_guard_rechecks_after_stopping_the_service() {
+        let root = tempfile::tempdir().unwrap();
+        let service = setup_unit(root.path());
+        let runner = ServiceRunner {
+            calls: std::cell::RefCell::default(),
+            main_pid: "4242",
+        };
+        let error = stop_service_guarding_purge(
+            Some(&service),
+            true,
+            &runner,
+            || vec![sysinfo::Pid::from_u32(4242)],
+            Duration::from_millis(120),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("4242"), "{error}");
+    }
+
+    /// A service whose process takes a moment to exit after the stop (as
+    /// `launchctl bootout` allows) does not block the purge.
+    #[cfg(unix)]
+    #[test]
+    fn purge_guard_waits_for_the_stopped_service_to_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let service = setup_unit(root.path());
+        let runner = ServiceRunner {
+            calls: std::cell::RefCell::default(),
+            main_pid: "4242",
+        };
+        // Alive at the pre-check and for two polls after the stop, then gone.
+        let polls = std::cell::Cell::new(0);
+        stop_service_guarding_purge(
+            Some(&service),
+            true,
+            &runner,
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() <= 3 {
+                    vec![sysinfo::Pid::from_u32(4242)]
+                } else {
+                    Vec::new()
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(polls.get() >= 4, "the recheck must poll again");
+    }
+
+    #[test]
+    fn service_main_pid_reads_systemd_and_launchd() {
+        let runner = |main_pid| ServiceRunner {
+            calls: std::cell::RefCell::default(),
+            main_pid,
+        };
+        assert_eq!(
+            service_main_pid(ServiceManager::SystemdUser, &runner("4242\n")),
+            Some(4242)
+        );
+        assert_eq!(
+            service_main_pid(ServiceManager::SystemdUser, &runner("0\n")),
+            None,
+            "MainPID=0 means not running"
+        );
+        assert_eq!(
+            service_main_pid(ServiceManager::Launchd, &runner("515")),
+            Some(515)
+        );
+    }
+
+    /// The skill sweep finds a global Copilot CLI skill under the COPILOT_HOME
+    /// `Config::load` captured (invariant #1), not one re-read from the live
+    /// process.
+    #[test]
+    fn skill_sweep_uses_the_captured_copilot_home() {
+        let copilot_home = tempfile::tempdir().unwrap();
+        let skill = copilot_home
+            .path()
+            .join(SKILLS_DIR)
+            .join(MANAGED_SKILLS[0].relative_path);
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, MANAGED_SKILLS[0].content).unwrap();
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "COPILOT_HOME",
+            copilot_home.path().to_str().unwrap(),
+        )]);
+        let args = UninstallArgs {
+            apply: false,
+            purge_data: false,
+            only: Some(crate::cli::UninstallOnly::Skills),
+            mcp_name: None,
+            mcp_url: String::new(),
+            yes: false,
+            profile: None,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let plan = build_plan(&args, data.path(), &env).unwrap();
+        assert!(
+            plan.iter().any(|change| matches!(
+                change,
+                PlannedChange::DeleteFile { path, .. } if *path == skill
+            )),
+            "{plan:?}"
+        );
+    }
+
+    /// Each installed plugin is removed through its own harness CLI, and one
+    /// failure does not stop the next.
+    #[test]
+    fn uninstall_removes_each_plugin_through_its_harness() {
+        use crate::commands::agent_plugins::test_support::{
+            RecordingRunner, install_claude_plugin, install_codex_plugin,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let config = Config {
+            home_dir: Some(home.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        assert!(installed_plugins(&config).is_empty());
+        install_claude_plugin(home.path(), "3.0.0", false);
+        install_codex_plugin(home.path());
+        let plugins = installed_plugins(&config);
+        assert_eq!(plugins.len(), 2, "a disabled plugin is still removed");
+
+        let runner = RecordingRunner::new(Some(1));
+        uninstall_plugins(&plugins, &runner);
+        assert_eq!(
+            *runner.calls.borrow(),
+            vec![
+                "claude plugin uninstall ai-memory@ai-memory",
+                "codex plugin remove ai-memory@ai-memory"
+            ]
+        );
+    }
 
     /// The Windows global Devin skill root (`%APPDATA%\devin\skills`) is
     /// swept alongside the cwd/home roots — `install-skills --scope global`
@@ -1442,17 +2017,17 @@ mod tests {
         let home = Path::new("/home/alice");
         let appdata = Path::new("C:/Users/Alice/AppData/Roaming");
 
-        let roots = skill_roots(cwd, Some(home), Some(appdata), None, None);
+        let roots = skill_roots(cwd, Some(home), Some(appdata), None, None, None);
         assert!(
             roots.contains(&appdata.join("devin").join(SKILLS_DIR)),
             "{roots:?}"
         );
 
-        let without = skill_roots(cwd, Some(home), None, None, None);
+        let without = skill_roots(cwd, Some(home), None, None, None, None);
         assert_eq!(
             without.len(),
-            8,
-            "no phantom root when APPDATA is unset (claude/agents/devin/grok × project+global)"
+            10,
+            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot × project+global)"
         );
         assert!(
             without.contains(&cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR)),
@@ -1472,6 +2047,7 @@ mod tests {
         let roots = skill_roots(
             Path::new("/repo"),
             Some(Path::new("/home/alice")),
+            None,
             None,
             None,
             Some(Path::new("/stores/claude")),
@@ -1494,12 +2070,112 @@ mod tests {
             None,
             Some(Path::new("/custom/grok")),
             None,
+            None,
         );
         assert!(
             roots.contains(&PathBuf::from("/custom/grok/skills")),
             "{roots:?}"
         );
         assert!(!roots.contains(&PathBuf::from("/home/alice/.grok/skills")));
+    }
+
+    /// `.github/skills` is usually committed team content, so sweeping it must
+    /// only ever plan the deletion of ai-memory's own marker-bearing files.
+    #[test]
+    fn github_skill_root_sweep_spares_unmanaged_same_name_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = MANAGED_SKILLS[0];
+        let user = tmp
+            .path()
+            .join("user/.github/skills")
+            .join(skill.relative_path);
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&user, "---\nname: team-skill\n---\nteam-authored\n").unwrap();
+        let mut plan = Vec::new();
+        push_generated_delete(&mut plan, user.clone(), DeleteKind::ManagedSkill);
+        assert!(
+            plan.is_empty(),
+            "an unmanaged skill must never be planned: {plan:?}"
+        );
+
+        let managed = tmp
+            .path()
+            .join("ours/.github/skills")
+            .join(skill.relative_path);
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, skill.content).unwrap();
+        push_generated_delete(&mut plan, managed.clone(), DeleteKind::ManagedSkill);
+        assert_eq!(plan.len(), 1, "the managed control must be planned");
+    }
+
+    #[test]
+    fn grok_handoff_rule_sweep_spares_unmanaged_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp.path().join("rules").join("ai-memory-handoff.md");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&user, "# my grok rule\n").unwrap();
+        let mut plan = Vec::new();
+        push_generated_delete(&mut plan, user.clone(), DeleteKind::GrokHandoffRule);
+        assert!(
+            plan.is_empty(),
+            "an unmanaged Grok rule must never be planned: {plan:?}"
+        );
+
+        let managed = tmp
+            .path()
+            .join("ours")
+            .join("rules")
+            .join("ai-memory-handoff.md");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, GROK_HANDOFF_RULE_MARKER).unwrap();
+        push_generated_delete(&mut plan, managed.clone(), DeleteKind::GrokHandoffRule);
+        assert_eq!(plan.len(), 1, "the managed Grok rule must be planned");
+    }
+
+    #[test]
+    fn generated_grok_handoff_rule_detection_requires_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-memory-handoff.md");
+        std::fs::write(&path, "# user rule\n").unwrap();
+        assert!(!generated_file_is_ours(&path, DeleteKind::GrokHandoffRule));
+        std::fs::write(&path, format!("{GROK_HANDOFF_RULE_MARKER}\n# rule\n")).unwrap();
+        assert!(generated_file_is_ours(&path, DeleteKind::GrokHandoffRule));
+    }
+
+    /// `install-skills --agent copilot-cli` writes `.github/skills` in the
+    /// project and `$COPILOT_HOME/skills` globally; uninstall must sweep both.
+    #[test]
+    fn skill_roots_sweep_copilot_cli_project_and_relocated_home() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            Some(Path::new("/custom/copilot")),
+            None,
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/repo/.github/skills")),
+            "{roots:?}"
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/custom/copilot/skills")),
+            "{roots:?}"
+        );
+        assert!(!roots.contains(&PathBuf::from("/home/alice/.copilot/skills")));
+
+        let default_home = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            default_home.contains(&PathBuf::from("/home/alice/.copilot/skills")),
+            "{default_home:?}"
+        );
     }
 
     #[test]
@@ -2114,6 +2790,45 @@ mod tests {
         assert!(v["servers"].get("other").is_some());
     }
 
+    /// Copilot CLI keeps servers under the root `mcpServers` map; the strip
+    /// must remove only ai-memory's entry and leave e.g. a `github` server.
+    #[test]
+    fn strip_mcp_copilot_cli_root_mcp_servers() {
+        let content = r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp","tools":["*"]},"github":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::CopilotCli,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("ai-memory").is_none());
+        assert!(v["mcpServers"].get("github").is_some());
+    }
+
+    /// Prime Agent's settings.json carries every other Prime Agent setting
+    /// beside `mcpServers`; the strip removes only ai-memory's entry.
+    #[test]
+    fn strip_mcp_prime_agent_keeps_other_settings_and_servers() {
+        let content = r#"{"defaultModel":"glm","mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp","bearerTokenEnvVar":"AI_MEMORY_AUTH_TOKEN"},"search":{"type":"http","url":"https://search.example/mcp"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::PrimeAgent,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("ai-memory").is_none());
+        assert!(v["mcpServers"].get("search").is_some());
+        assert_eq!(v["defaultModel"], "glm");
+    }
+
     #[test]
     fn strip_mcp_zed_context_servers_preserves_other_settings() {
         let content = r#"{
@@ -2156,6 +2871,62 @@ mod tests {
         )
         .unwrap();
         assert!(removed.is_empty());
+    }
+
+    /// The stdio bridge entries `install-mcp` writes on a token-file install
+    /// are ours when they target this server, in every client shape, and a
+    /// bridge aimed at another server is not.
+    #[test]
+    fn bridge_entries_are_recognised_by_their_upstream_url() {
+        let url = "http://127.0.0.1:49374/mcp";
+        let bridge = |target: &str| {
+            serde_json::json!({
+                "type": "stdio",
+                "command": "ai-memory",
+                "args": ["mcp-bridge", "--no-session-id", "--server-url", target],
+            })
+        };
+        let opencode = serde_json::json!({
+            "type": "local",
+            "command": ["ai-memory", "mcp-bridge", "--no-session-id", "--server-url", url],
+            "enabled": true,
+        });
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &bridge(url),
+            Some("ai-memory"),
+            url
+        ));
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &opencode,
+            Some("ai-memory"),
+            url
+        ));
+        assert!(!mcp_entry_is_ours(
+            "ai-memory",
+            &bridge("https://team.example/mcp"),
+            Some("ai-memory"),
+            url
+        ));
+        let foreign =
+            serde_json::json!({"command": "other", "args": ["mcp-bridge", "--server-url", url]});
+        assert!(!mcp_entry_is_ours(
+            "ai-memory",
+            &foreign,
+            Some("ai-memory"),
+            url
+        ));
+
+        let toml = format!(
+            "[mcp_servers.ai-memory]\ncommand = \"ai-memory\"\nargs = [\"mcp-bridge\", \"--no-session-id\", \"--server-url\", \"{url}\"]\n\n[mcp_servers.other]\ncommand = \"other\"\n"
+        );
+        let (out, removed) = strip_mcp_toml(&toml, Some("ai-memory"), url).unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        assert!(out.contains("[mcp_servers.other]"), "{out}");
+        let (_, kept) =
+            strip_mcp_toml(&toml, Some("ai-memory"), "https://team.example/mcp").unwrap();
+        assert!(kept.is_empty());
     }
 
     #[test]
@@ -2450,6 +3221,7 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
                 removed: vec!["ai-memory".to_string()],
                 ops: vec![RewriteOp::McpJson(McpClient::KimiCode)],
             },
+            None,
             Some("ai-memory"),
             "http://127.0.0.1:49374/mcp",
         )

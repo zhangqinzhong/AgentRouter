@@ -8,6 +8,7 @@
 //! the operator made it.
 
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -20,15 +21,51 @@ pub const SIDECARS: &[&str] = &[
 /// The queue database file name.
 pub const DB_FILE: &str = "relay.sqlite";
 
+/// Retries for a queue file that answers "access denied" on Windows.
+const DELETE_PENDING_RETRIES: u32 = 5;
+const DELETE_PENDING_PAUSE: Duration = Duration::from_millis(20);
+
+/// Read a queue path's metadata, `None` when it does not exist.
+///
+/// On Windows a file another process is deleting answers "access denied"
+/// until the delete completes, and SQLite deletes its rollback journal at
+/// every commit. Two relays opening one queue would otherwise fail at random
+/// on the other's journal. The read is retried briefly (at most about 100 ms)
+/// and then reported, so a file that stays unreadable is still refused.
+fn queue_path_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    read_settled(path, cfg!(windows), || std::fs::symlink_metadata(path))
+}
+
+fn read_settled<T>(
+    path: &Path,
+    retry_denied: bool,
+    mut read: impl FnMut() -> std::io::Result<T>,
+) -> Result<Option<T>> {
+    let mut retries = 0;
+    loop {
+        match read() {
+            Ok(value) => return Ok(Some(value)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e)
+                if retry_denied
+                    && e.kind() == std::io::ErrorKind::PermissionDenied
+                    && retries < DELETE_PENDING_RETRIES =>
+            {
+                retries += 1;
+                std::thread::sleep(DELETE_PENDING_PAUSE);
+            }
+            Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+        }
+    }
+}
+
 /// Reject a path that is a symlink or a Windows reparse point.
 ///
 /// A missing path is fine: it is about to be created inside a directory that
 /// was itself checked.
 pub fn reject_symlink(path: &Path) -> Result<()> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+    let Some(meta) = queue_path_metadata(path)? else {
+        return Ok(());
     };
     if meta.file_type().is_symlink() {
         bail!(
@@ -54,10 +91,8 @@ pub fn reject_symlink(path: &Path) -> Result<()> {
 /// hardlinked elsewhere, and owner-only on Unix. A missing file passes.
 pub fn check_queue_file(path: &Path) -> Result<()> {
     reject_symlink(path)?;
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+    let Some(meta) = queue_path_metadata(path)? else {
+        return Ok(());
     };
     if !meta.is_file() {
         bail!(
@@ -216,5 +251,55 @@ pub fn create_private_file(path: &Path) -> Result<()> {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn denied() -> Error {
+        Error::from(ErrorKind::PermissionDenied)
+    }
+
+    #[test]
+    fn a_file_mid_delete_settles_after_a_brief_retry() {
+        let mut calls = 0;
+        let read = read_settled(Path::new("relay.sqlite-journal"), true, || {
+            calls += 1;
+            if calls < 3 { Err(denied()) } else { Ok(calls) }
+        });
+        assert_eq!(read.unwrap(), Some(3));
+    }
+
+    #[test]
+    fn a_file_that_stays_unreadable_is_still_refused() {
+        let mut calls = 0;
+        let read = read_settled(Path::new("relay.sqlite-journal"), true, || {
+            calls += 1;
+            Err::<(), _>(denied())
+        });
+        let message = format!("{:#}", read.unwrap_err());
+        assert!(
+            message.contains("inspect relay.sqlite-journal"),
+            "{message}"
+        );
+        assert_eq!(calls, DELETE_PENDING_RETRIES + 1);
+    }
+
+    #[test]
+    fn without_the_windows_retry_a_denied_read_fails_at_once_and_a_missing_file_is_absent() {
+        let mut calls = 0;
+        let read = read_settled(Path::new("relay.sqlite"), false, || {
+            calls += 1;
+            Err::<(), _>(denied())
+        });
+        assert!(read.is_err());
+        assert_eq!(calls, 1);
+        let missing = read_settled(Path::new("relay.sqlite"), true, || {
+            Err::<(), _>(Error::from(ErrorKind::NotFound))
+        });
+        assert_eq!(missing.unwrap(), None);
     }
 }

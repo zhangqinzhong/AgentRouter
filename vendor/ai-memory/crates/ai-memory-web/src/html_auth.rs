@@ -2,7 +2,9 @@
 //!
 //! After [`require_dual_auth`](ai_memory_mcp::require_dual_auth) returns
 //! JSON 401/403, navigational browser GETs to the wiki should land on the
-//! builtin login / change-password pages instead. `/api/v1` stays JSON.
+//! builtin login / change-password pages instead. `/api/v1` stays JSON, and
+//! a Basic challenge (a bearer-only server with no human accounts) reaches
+//! the browser unchanged.
 
 use std::sync::Arc;
 
@@ -144,6 +146,12 @@ pub async fn html_auth_redirect_mw(
         return resp;
     }
     match resp.status() {
+        // A server with a bearer token and no human accounts (every fresh
+        // install) has no login form that could succeed, so it answers with
+        // a Basic challenge instead: the browser prompts, and the token from
+        // `auth-tokens/default` signs in as the password. Redirecting that
+        // 401 to the login page would leave the browser with no way in.
+        StatusCode::UNAUTHORIZED if offers_basic_challenge(&resp) => resp,
         StatusCode::UNAUTHORIZED => {
             let next_q =
                 urlencoding_encode(&sanitize_next(Some(&full_path_and_query), &cfg.web_root));
@@ -154,6 +162,20 @@ pub async fn html_auth_redirect_mw(
         }
         _ => resp,
     }
+}
+
+fn offers_basic_challenge(resp: &Response) -> bool {
+    resp.headers()
+        .get_all(header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| {
+            v.split(',').any(|part| {
+                part.trim_start()
+                    .get(..6)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("basic "))
+            })
+        })
 }
 
 fn is_api_v1_path(path: &str) -> bool {
@@ -284,6 +306,48 @@ mod tests {
             location.starts_with("/web/login?next="),
             "expected login redirect, got {location}"
         );
+    }
+
+    #[tokio::test]
+    async fn html_nav_basic_challenge_reaches_the_browser() {
+        let cfg = Arc::new(HtmlAuthRedirectConfig::from_mount("", "/web"));
+        let router = Router::new()
+            .route(
+                "/wiki",
+                get(|| async {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        [(
+                            header::WWW_AUTHENTICATE,
+                            "Basic realm=\"ai-memory\", Bearer realm=\"ai-memory\"",
+                        )],
+                    )
+                        .into_response()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                cfg,
+                html_auth_redirect_mw,
+            ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/wiki")
+                    .header(header::ACCEPT, "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+        let challenge = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(challenge.starts_with("Basic "), "challenge: {challenge}");
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -26,8 +26,16 @@ pub const MAX_RECEIPTS: i64 = 200_000;
 /// Session-to-agent pins retained at once, enforced the same way.
 pub const MAX_SESSION_PINS: i64 = 50_000;
 
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 const IDENTITY: &str = "ai-memory-relay-queue";
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenPhase {
+    AfterPreflight,
+    BeforeJournal,
+    JournalBusy,
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta(
@@ -64,7 +72,8 @@ CREATE TABLE IF NOT EXISTS receipt(
     ingest_key       TEXT PRIMARY KEY,
     body_sha256      TEXT NOT NULL,
     first_attempt_ms INTEGER NOT NULL,
-    delivered_at_ms  INTEGER NOT NULL
+    delivered_at_ms  INTEGER NOT NULL,
+    outcome          TEXT
 );
 CREATE INDEX IF NOT EXISTS receipt_first_attempt ON receipt(first_attempt_ms);
 CREATE TABLE IF NOT EXISTS session_agent(
@@ -144,6 +153,8 @@ pub struct Stats {
     pub max_attempts: i64,
     pub receipts: i64,
     pub known_sessions: i64,
+    /// Outcomes within the retained first-attempt window, with fixed keys.
+    pub receipt_outcomes: std::collections::BTreeMap<String, i64>,
 }
 
 /// The companion's queue database.
@@ -166,6 +177,30 @@ impl Queue {
     /// metadata commit together, so an interrupted initialization can reopen
     /// the empty database left by rollback.
     pub fn open(dir: &Path) -> Result<Self> {
+        #[cfg(test)]
+        {
+            Self::open_for_test(dir, Duration::from_secs(10), &mut |_| {})
+        }
+        #[cfg(not(test))]
+        {
+            Self::open_inner(dir, Duration::from_secs(10))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(
+        dir: &Path,
+        timeout: Duration,
+        hook: &mut dyn FnMut(OpenPhase),
+    ) -> Result<Self> {
+        Self::open_inner(dir, timeout, hook)
+    }
+
+    fn open_inner(
+        dir: &Path,
+        timeout: Duration,
+        #[cfg(test)] hook: &mut dyn FnMut(OpenPhase),
+    ) -> Result<Self> {
         let path = dir.join(fsguard::DB_FILE);
         fsguard::check_queue_file(&path)?;
         for name in fsguard::SIDECARS {
@@ -180,22 +215,43 @@ impl Queue {
         }
         let mut conn = Connection::open(&path)
             .with_context(|| format!("open relay queue at {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(10))?;
-        let state = classify(&conn, &path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=FULL;\nPRAGMA foreign_keys=ON;",
-        )
-        .with_context(|| format!("configure relay queue at {}", path.display()))?;
-        if state != DbState::Ready {
+        conn.busy_timeout(timeout)?;
+        classify(&conn, &path)?;
+        #[cfg(test)]
+        hook(OpenPhase::AfterPreflight);
+        // Recheck under the write lock: another opener may have initialized or
+        // migrated since the read-only preflight.
+        {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(SCHEMA)
-                .with_context(|| format!("initialize relay queue schema at {}", path.display()))?;
-            tx.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('identity', ?1), ('schema_version', ?2)",
-                params![IDENTITY, SCHEMA_VERSION],
-            )?;
+            match classify(&tx, &path)? {
+                DbState::Fresh => {
+                    tx.execute_batch(SCHEMA)?;
+                    tx.execute(
+                        "INSERT INTO meta(key, value) VALUES('identity', ?1), ('schema_version', ?2)",
+                        params![IDENTITY, SCHEMA_VERSION],
+                    )?;
+                }
+                DbState::V1 => {
+                    tx.execute_batch("ALTER TABLE receipt ADD COLUMN outcome TEXT;")?;
+                    tx.execute(
+                        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![SCHEMA_VERSION],
+                    )?;
+                }
+                DbState::Ready => {}
+            }
             tx.commit()?;
         }
+        #[cfg(test)]
+        hook(OpenPhase::BeforeJournal);
+        configure(
+            &conn,
+            &path,
+            timeout,
+            #[cfg(test)]
+            hook,
+        )
+        .with_context(|| format!("configure relay queue at {}", path.display()))?;
         Ok(Self { conn, path })
     }
 
@@ -508,7 +564,7 @@ impl Queue {
     /// An acknowledgement means delivered *or* deliberately dropped by server
     /// policy (a capture-protocol drop, a subagent drop, a session-collision
     /// drop). It never promises an observation was written.
-    pub fn confirm(&mut self, keys: &[String], now_ms: i64) -> Result<usize> {
+    pub fn confirm(&mut self, keys: &[(String, &str)], now_ms: i64) -> Result<usize> {
         if keys.is_empty() {
             return Ok(0);
         }
@@ -516,7 +572,7 @@ impl Queue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut moved = 0;
-        for key in keys {
+        for (key, outcome) in keys {
             let row: Option<(String, Option<i64>, i64)> = tx
                 .query_row(
                     "SELECT body_sha256, first_attempt_ms, first_seen_ms
@@ -529,14 +585,16 @@ impl Queue {
                 continue;
             };
             tx.execute(
-                "INSERT INTO receipt(ingest_key, body_sha256, first_attempt_ms, delivered_at_ms)
-                 VALUES(?1, ?2, ?3, ?4)
-                 ON CONFLICT(ingest_key) DO UPDATE SET delivered_at_ms = excluded.delivered_at_ms",
+                "INSERT INTO receipt(ingest_key, body_sha256, first_attempt_ms, delivered_at_ms, outcome)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(ingest_key) DO UPDATE SET delivered_at_ms = excluded.delivered_at_ms,
+                     outcome = COALESCE(NULLIF(receipt.outcome, 'unknown'), excluded.outcome)",
                 params![
                     key,
                     body_sha256,
                     first_attempt_ms.unwrap_or(first_seen_ms),
-                    now_ms
+                    now_ms,
+                    crate::ack::outcome(outcome)
                 ],
             )?;
             tx.execute("DELETE FROM pending WHERE ingest_key = ?1", params![key])?;
@@ -612,6 +670,19 @@ impl Queue {
         let known_sessions: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM session_agent", [], |r| r.get(0))?;
+        let mut receipt_outcomes = crate::ack::outcome_counts();
+        let mut stmt = self.conn.prepare(
+            "SELECT outcome, COUNT(*) FROM receipt WHERE first_attempt_ms >= ?1 GROUP BY outcome",
+        )?;
+        for row in stmt.query_map(params![cutoff], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (value, count) = row?;
+            let key = crate::ack::outcome(value.as_deref().unwrap_or("unknown"));
+            if let Some(total) = receipt_outcomes.get_mut(key) {
+                *total += count;
+            }
+        }
         Ok(Stats {
             pending_items,
             pending_bytes,
@@ -626,6 +697,7 @@ impl Queue {
             max_attempts,
             receipts,
             known_sessions,
+            receipt_outcomes,
         })
     }
 }
@@ -659,6 +731,65 @@ enum DbState {
     Fresh,
     /// A relay queue of this exact schema version.
     Ready,
+    /// Version one is upgraded transactionally.
+    V1,
+}
+
+fn configure(
+    conn: &Connection,
+    path: &Path,
+    timeout: Duration,
+    #[cfg(test)] hook: &mut dyn FnMut(OpenPhase),
+) -> Result<()> {
+    // WAL needs an exclusive lock outside a transaction. SQLite can return
+    // BUSY without calling its busy handler when other openers hold read/write
+    // locks. Own this phase's wait budget instead of restarting a 10s wait.
+    let deadline = Instant::now() + timeout;
+    conn.busy_timeout(Duration::ZERO)?;
+    let result = loop {
+        let attempt = (|| -> Result<()> {
+            // Keep the same connection and recheck identity/version metadata
+            // before every WAL attempt, including after a lock was released.
+            if classify(conn, path)? != DbState::Ready {
+                bail!(
+                    "relay queue identity or schema version changed before journal configuration"
+                );
+            }
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=FULL;\nPRAGMA foreign_keys=ON;",
+            )?;
+            Ok(())
+        })();
+        match attempt {
+            Err(error) if is_lock_contention(&error) => {
+                #[cfg(test)]
+                hook(OpenPhase::JournalBusy);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break Err(error);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                if Instant::now() >= deadline {
+                    break Err(error);
+                }
+            }
+            other => break other,
+        }
+    };
+    conn.busy_timeout(timeout)?;
+    result.map_err(|error| {
+        if is_lock_contention(&error) {
+            error.context("relay queue busy; retry opening the same queue")
+        } else {
+            error
+        }
+    })
+}
+
+pub(crate) fn is_lock_contention(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(error, _))
+        if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
 /// Classify an existing file before touching it. Never mutates.
@@ -679,7 +810,14 @@ fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
         |r| r.get(0),
     );
     // A file that is not a SQLite database fails right here, before any write.
-    let objects = objects.map_err(|e| refuse(format!("cannot read its object list: {e}")))?;
+    let objects = objects.map_err(|e| {
+        let error = anyhow::Error::new(e);
+        if is_lock_contention(&error) {
+            error
+        } else {
+            error.context(refuse("cannot read its object list".into()))
+        }
+    })?;
     if objects == 0 {
         return Ok(DbState::Fresh);
     }
@@ -690,13 +828,21 @@ fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
         mapped.collect()
     })();
     let meta: HashMap<String, String> = rows
-        .map_err(|e| refuse(format!("it carries no readable relay metadata: {e}")))?
+        .map_err(|e| {
+            let error = anyhow::Error::new(e);
+            if is_lock_contention(&error) {
+                error
+            } else {
+                error.context(refuse("it carries no readable relay metadata".into()))
+            }
+        })?
         .into_iter()
         .collect();
     match (
         meta.get("identity").map(String::as_str),
         meta.get("schema_version").map(String::as_str),
     ) {
+        (Some(IDENTITY), Some("1")) => Ok(DbState::V1),
         (Some(IDENTITY), Some(SCHEMA_VERSION)) => Ok(DbState::Ready),
         (Some(IDENTITY), Some(other)) => Err(refuse(format!(
             "schema version {other} but this build speaks {SCHEMA_VERSION}"

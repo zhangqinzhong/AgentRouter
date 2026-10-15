@@ -14,6 +14,7 @@
 //! (sessions/observations/handoffs) are dropped by the purge.
 
 use super::common::{post, spawn_capture_hook};
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, Sanitized,
     Sanitizer, SessionId, Tier,
@@ -43,6 +44,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -76,6 +78,7 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -318,6 +321,63 @@ async fn move_project_true_move_into_fresh_dest() {
     assert!(!src_dir.exists(), "source dir must be removed after move");
 }
 
+#[tokio::test]
+async fn move_project_merge_surfaces_destination_promotion_manifest_warning() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "src",
+        "acme-api",
+        "notes/a.md",
+        "body a",
+    )
+    .await;
+    let dst_ws = store.writer.get_or_create_workspace("dst").await.unwrap();
+    let (dst_project, _) = store
+        .writer
+        .resolve_project_by_identity(
+            dst_ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(dst_ws.to_string())
+        .join(dst_project.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "acme-api", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["merged_into_existing"], true, "{body}");
+    assert!(
+        body["manifest_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("committed")),
+        "{body}"
+    );
+}
+
 /// Without `confirm: true` the server returns 400 and leaves the source intact.
 #[tokio::test]
 async fn move_project_requires_confirm() {
@@ -435,6 +495,28 @@ async fn move_project_same_workspace_rejected() {
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// A private profile (`default/_profile.<user id>`) cannot be moved out of
+/// the default workspace: its owner finds it there, so a move would orphan it.
+/// The refusal comes before any lookup, so nothing is touched.
+#[tokio::test]
+async fn move_project_refuses_a_private_profile() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project": "_profile.00000000000000000000000000000001",
+            "to_workspace": "elsewhere",
+            "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 /// The move carries the source page's existing embedding over instead of
 /// recomputing it. Proven by overwriting the source embedding with a
 /// recognisable marker vector: if the move re-embedded, the destination would
@@ -451,6 +533,7 @@ async fn move_project_carries_source_embedding() {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -746,6 +829,7 @@ async fn true_move_notifies_admission_with_destination_names() {
         .with_store_reader(store.reader.clone());
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -804,6 +888,7 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -848,12 +933,10 @@ async fn ids(
     (ws_id, proj_id)
 }
 
-/// W1: when the on-disk dir rename fails mid true-move, the SQL re-stamp is
-/// rolled back so NOTHING moves (no DB-ahead-of-disk split-brain). We force the
-/// rename to fail by planting a FILE where the destination workspace dir would
-/// be created.
+/// A non-directory namespace component is refused before the project move, so
+/// neither disk nor SQLite changes.
 #[tokio::test]
-async fn true_move_rolls_back_when_dir_rename_fails() {
+async fn true_move_refuses_an_invalid_destination_namespace_without_db_changes() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_state(&tmp).await;
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
@@ -882,7 +965,7 @@ async fn true_move_rolls_back_when_dir_rename_fails() {
         body["error"]
             .as_str()
             .unwrap_or("")
-            .contains("nothing changed"),
+            .contains("not a directory"),
         "{body}"
     );
 
@@ -1035,6 +1118,7 @@ async fn copy_purge_force_never_deletes_a_live_managed_workstream() {
 fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
     AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
@@ -1535,6 +1619,7 @@ async fn true_move_aborts_when_admission_rejects() {
         .with_store_reader(store.reader.clone());
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -1634,6 +1719,7 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         .with_store_reader(store.reader.clone());
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -1750,6 +1836,7 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         .with_store_reader(store.reader.clone());
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -2946,7 +3033,7 @@ async fn delete_workspace_reject_policy_aborts_before_db_or_disk_destruction() {
 }
 
 #[tokio::test]
-async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notification() {
+async fn delete_workspace_refuses_invalid_namespace_before_db_or_notification() {
     let (url, rx) = spawn_capture_hook().await;
 
     let tmp = TempDir::new().unwrap();
@@ -2978,28 +3065,261 @@ async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notificati
     )
     .await;
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = body_json(resp).await;
     assert!(
-        body["files_deleted"].as_array().unwrap().is_empty(),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a directory"),
         "{body}"
     );
-    assert_eq!(body["files_failed"].as_array().unwrap().len(), 1, "{body}");
     assert!(
         store
             .reader
             .find_workspace("victim".into())
             .await
             .unwrap()
-            .is_none(),
-        "DB delete should still commit and be reported as partial filesystem failure"
+            .is_some(),
+        "namespace refusal must leave DB rows intact"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx)
+            .await
+            .is_err(),
+        "a refused operation must not notify observers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1208: `project_id` as an alternative to `project`
+// ---------------------------------------------------------------------------
+
+/// `move-project` accepts `project_id` in place of `project`, targeting the
+/// exact row rather than whichever row a name lookup happens to resolve to.
+#[tokio::test]
+async fn move_project_accepts_project_id_instead_of_name() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "movable", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project_id": proj.to_string(),
+            "to_workspace": "elsewhere",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "move by project_id must resolve the same target as move by name"
     );
 
-    let payload = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+    let dst_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
         .await
-        .expect("async purge_workspace dispatch should fire")
         .unwrap();
-    assert_eq!(payload["ctx"]["op"], "purge_workspace");
-    assert_eq!(payload["ctx"]["workspace"], "victim");
-    assert_eq!(payload["ctx"]["partial_failure"], true);
+    assert!(
+        store
+            .reader
+            .find_project(dst_ws, "movable".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "the row named by project_id must land in the destination"
+    );
+}
+
+/// A malformed `project_id` is a 400, before any lookup or filesystem work.
+#[tokio::test]
+async fn move_project_rejects_a_malformed_project_id_with_400() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project_id": "not-a-uuid",
+            "to_workspace": "elsewhere",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// An unknown (or foreign-scope) `project_id` is a 404, so a stray id from
+/// another workspace can never drive a destructive move.
+#[tokio::test]
+async fn move_project_unknown_project_id_is_404() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project_id": "00000000-0000-0000-0000-0000000000ff",
+            "to_workspace": "elsewhere",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// An id that really exists, but in ANOTHER workspace, is a 404 and moves
+/// nothing. Control: the same id moves when the request names its own
+/// workspace as the source. (#1208)
+#[tokio::test]
+async fn move_project_refuses_a_real_id_from_another_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "secret", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state.clone(),
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project_id": foreign.to_string(),
+            "to_workspace": "target",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a real id from another workspace must not resolve here"
+    );
+    assert!(
+        store
+            .reader
+            .project_name_by_id(other_ws, foreign)
+            .await
+            .unwrap()
+            .is_some(),
+        "the foreign project stays where it was"
+    );
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "elsewhere",
+            "project_id": foreign.to_string(),
+            "to_workspace": "target",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "control: its own workspace");
+}
+
+/// `project` and `project_id` together are ambiguous and refused with 400.
+#[tokio::test]
+async fn move_project_refuses_both_project_and_project_id() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "movable", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project": "movable",
+            "project_id": proj.to_string(),
+            "to_workspace": "elsewhere",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    assert!(
+        store
+            .reader
+            .find_project(ws, "movable".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "an ambiguous request must not move anything"
+    );
+}
+
+/// The existing name path still works when `project_id` is absent, so the
+/// wire format stays backward compatible with older CLI builds.
+#[tokio::test]
+async fn move_project_still_accepts_a_bare_project_name() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "movable", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project": "movable",
+            "to_workspace": "elsewhere",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }

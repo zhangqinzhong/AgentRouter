@@ -25,6 +25,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -213,14 +214,63 @@ fn create_test_symlink_file(target: &std::path::Path, link: &std::path::Path) ->
     }
 }
 
+#[cfg(unix)]
+fn create_test_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+    std::os::unix::fs::symlink(target, link).unwrap();
+    true
+}
+
+#[cfg(windows)]
+fn create_test_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => true,
+        Err(e) if e.raw_os_error() == Some(1314) => {
+            eprintln!("skipping directory reparse assertion: Windows privilege unavailable");
+            false
+        }
+        Err(e) => panic!(
+            "failed to create test directory link {}: {e}",
+            link.display()
+        ),
+    }
+}
+
+#[tokio::test]
+async fn backup_refuses_redirected_git_metadata_before_returning_an_archive() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+    std::fs::write(state.wiki.root().join(".git/commondir"), "../outside\n").unwrap();
+
+    let response = admin_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/backup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+}
+
 #[cfg(any(unix, windows))]
 #[tokio::test]
-async fn backup_does_not_dereference_wiki_symlinks() {
+async fn backup_refuses_wiki_leaf_links_before_returning_an_archive() {
     let tmp = TempDir::new().unwrap();
     let (state, _store) = make_state(&tmp).await;
 
     let wiki_dir = tmp.path().join("wiki");
     std::fs::create_dir_all(&wiki_dir).unwrap();
+    let archive_marker = tmp.path().join("archive-created");
+    assert!(!archive_marker.exists());
     let secret = tmp.path().join("outside-secret.md");
     let secret_body = "outside secret must not enter backup";
     std::fs::write(&secret, secret_body).unwrap();
@@ -239,27 +289,57 @@ async fn backup_does_not_dereference_wiki_symlinks() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let decoder = GzDecoder::new(bytes.as_ref());
-    let mut archive = Archive::new(decoder);
-    for entry in archive.entries().expect("tarball must be readable") {
-        let mut entry = entry.expect("entry must be readable");
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        let mut body = Vec::new();
-        entry
-            .read_to_end(&mut body)
-            .expect("regular file entry must be readable");
-        assert!(
-            !body
-                .windows(secret_body.len())
-                .any(|window| window == secret_body.as_bytes()),
-            "backup must not include symlink target contents"
-        );
+    assert!(
+        !body
+            .windows(secret_body.len())
+            .any(|window| window == secret_body.as_bytes()),
+        "refusal must not disclose the external canary"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn backup_refuses_linked_wiki_directories_before_returning_an_archive() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_state(&tmp).await;
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let canary = outside.join("canary.md");
+    std::fs::write(&canary, "outside directory canary").unwrap();
+    if !create_test_symlink_dir(&outside, &state.wiki.root().join("linked")) {
+        return;
     }
+
+    let response = admin_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/backup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        std::fs::read_to_string(canary).unwrap(),
+        "outside directory canary"
+    );
 }

@@ -8,7 +8,10 @@
 //! a gateway key IS configured it is sent as a bearer token; (3) the
 //! embedder identifies as provider `openai-compat`, so stored
 //! `{provider, model, dim}` triples are a distinct family from plain
-//! `openai`; (4) the factory refuses to build without a base URL.
+//! `openai`; (4) the factory refuses to build without a base URL;
+//! (5) the embeddings request never carries the chat provider's
+//! `x-request-id` header — the embedder is a separate type with no
+//! operation id to send.
 
 use ai_memory_llm::{
     Embedder, EmbedderChoice, EmbedderConfig, LlmError, OpenAiCompatEmbedder, build_embedder,
@@ -74,6 +77,43 @@ async fn configured_key_is_sent_as_bearer() {
     )
     .expect("embedder builds");
     e.embed("hello").await.expect("embed succeeds");
+}
+
+#[tokio::test]
+async fn factory_built_compat_embedder_sends_no_request_id_header() {
+    // The openai-compat chat path injects `x-request-id` (the logical
+    // operation id) on every chat attempt; the embedder must never carry
+    // that header. A refactor that shares the chat header hook with the
+    // embedder breaks this assertion.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(move |req: &Request| {
+            assert!(
+                req.headers.get("x-request-id").is_none(),
+                "the compat embedder must not carry the chat provider's x-request-id header"
+            );
+            ResponseTemplate::new(200).set_body_json(embedding_body(8))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let embedder = build_embedder(EmbedderConfig {
+        provider: EmbedderChoice::OpenAiCompat,
+        model: "nomic-embed-text".into(),
+        dim: 8,
+        api_key: SecretString::from(String::new()),
+        base_url: Some(format!("{}/v1", server.uri())),
+        models_dir: None,
+        copilot_auth: None,
+        defaulted: false,
+        query_prefix: String::new(),
+        document_prefix: String::new(),
+    })
+    .expect("factory builds compat embedder");
+
+    embedder.embed("hello").await.expect("embed succeeds");
 }
 
 #[tokio::test]

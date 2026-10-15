@@ -5,8 +5,6 @@
 //! KDF — see [`crate::password`].
 
 use ai_memory_core::{NewUser, User, UserId, UserRole};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -55,19 +53,6 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-/// Generate a fresh URL-safe-base64 secret (43 characters). Prefer
-/// [`crate::api_credentials::generate_api_key`] for native keys so the
-/// `aim_` prefix is applied.
-///
-/// # Errors
-/// [`StoreError::Os`] if the OS CSPRNG fails.
-pub fn generate_token() -> StoreResult<String> {
-    let mut bytes = [0u8; TOKEN_RAW_LEN];
-    getrandom::fill(&mut bytes)
-        .map_err(|e| StoreError::Os(format!("os csprng failed during token generation: {e}")))?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
 /// Login lookup: public user plus the stored PHC (never serialised).
 #[derive(Debug, Clone)]
 pub struct LoginUser {
@@ -75,77 +60,6 @@ pub struct LoginUser {
     pub user: User,
     /// Argon2id PHC, if the human has a password.
     pub password_hash: Option<String>,
-}
-
-/// Insert a token-only compatibility identity. V53 mirrors
-/// `users.token_hash` into the reserved `legacy-user-token`
-/// `api_credentials` row in the same transaction.
-///
-/// # Errors
-/// Duplicate username/email/token or SQL.
-pub fn insert_user(
-    conn: &Connection,
-    new_user: &NewUser,
-    token_hash: &[u8; TOKEN_HASH_LEN],
-) -> StoreResult<UserId> {
-    let id = UserId::new();
-    let now = Timestamp::now().as_microsecond();
-    conn.execute(
-        "INSERT INTO users \
-         (id, username, name, email, token_hash, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            id.as_bytes(),
-            &new_user.username,
-            &new_user.name,
-            &new_user.email,
-            token_hash.as_slice(),
-            now,
-        ],
-    )
-    .map_err(map_unique_violation)?;
-    Ok(id)
-}
-
-/// Replace and reactivate the deprecated single-token credential.
-///
-/// # Errors
-/// SQL failures.
-pub fn rotate_user_token(
-    conn: &Connection,
-    id: UserId,
-    new_token_hash: &[u8; TOKEN_HASH_LEN],
-) -> StoreResult<bool> {
-    let rows = conn.execute(
-        "UPDATE users SET token_hash = ?1, token_expired_at = NULL WHERE id = ?2",
-        params![new_token_hash.as_slice(), id.as_bytes()],
-    )?;
-    Ok(rows > 0)
-}
-
-/// Idempotently revoke the deprecated single-token credential.
-///
-/// # Errors
-/// SQL failures.
-pub fn expire_user_token(conn: &Connection, id: UserId) -> StoreResult<bool> {
-    let now = Timestamp::now().as_microsecond();
-    let rows = conn.execute(
-        "UPDATE users SET token_expired_at = COALESCE(token_expired_at, ?1) WHERE id = ?2",
-        params![now, id.as_bytes()],
-    )?;
-    Ok(rows > 0)
-}
-
-/// Idempotently reactivate the deprecated single-token credential.
-///
-/// # Errors
-/// SQL failures.
-pub fn revive_user_token(conn: &Connection, id: UserId) -> StoreResult<bool> {
-    let rows = conn.execute(
-        "UPDATE users SET token_expired_at = NULL WHERE id = ?1",
-        params![id.as_bytes()],
-    )?;
-    Ok(rows > 0)
 }
 
 /// Insert a human identity. `password_hash` is already Argon2id PHC (or
@@ -499,7 +413,7 @@ pub fn touch_user_last_seen(conn: &Connection, id: UserId) -> StoreResult<bool> 
 pub fn find_user_by_username(conn: &Connection, username: &str) -> StoreResult<Option<User>> {
     conn.query_row(
         "SELECT id, username, name, email, created_at, last_seen_at, \
-                role, must_change_password, disabled_at, password_hash, token_expired_at \
+                role, must_change_password, disabled_at, password_hash \
          FROM users WHERE username = ?1",
         params![username],
         |row| row_to_user(row, 0),
@@ -515,7 +429,7 @@ pub fn find_user_by_username(conn: &Connection, username: &str) -> StoreResult<O
 pub fn find_user_by_id(conn: &Connection, id: UserId) -> StoreResult<Option<User>> {
     conn.query_row(
         "SELECT id, username, name, email, created_at, last_seen_at, \
-                role, must_change_password, disabled_at, password_hash, token_expired_at \
+                role, must_change_password, disabled_at, password_hash \
          FROM users WHERE id = ?1",
         params![id.as_bytes()],
         |row| row_to_user(row, 0),
@@ -534,7 +448,7 @@ pub fn find_login_user_by_username(
 ) -> StoreResult<Option<LoginUser>> {
     conn.query_row(
         "SELECT id, username, name, email, created_at, last_seen_at, \
-                role, must_change_password, disabled_at, password_hash, token_expired_at \
+                role, must_change_password, disabled_at, password_hash \
          FROM users WHERE username = ?1",
         params![username],
         |row| {
@@ -556,7 +470,7 @@ pub fn find_login_user_by_username(
 pub fn list_users(conn: &Connection) -> StoreResult<Vec<User>> {
     let mut stmt = conn.prepare(
         "SELECT id, username, name, email, created_at, last_seen_at, \
-                role, must_change_password, disabled_at, password_hash, token_expired_at \
+                role, must_change_password, disabled_at, password_hash \
          FROM users ORDER BY created_at ASC",
     )?;
     let rows = stmt
@@ -667,8 +581,8 @@ pub(crate) fn map_unique_violation(e: rusqlite::Error) -> StoreError {
     StoreError::from(e)
 }
 
-/// Decode a user row starting at `offset`. Relative columns 9 and 10 are
-/// `password_hash` and the deprecated `token_expired_at`.
+/// Decode a user row starting at `offset`. Relative column 9 is
+/// `password_hash`, read only to derive `has_password`.
 pub(crate) fn row_to_user(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<User> {
     let id_bytes: Vec<u8> = row.get(offset)?;
     let id = UserId::from_slice(&id_bytes).map_err(|e| {
@@ -695,7 +609,6 @@ pub(crate) fn row_to_user(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::R
         email: row.get(offset + 3)?,
         created_at: row.get(offset + 4)?,
         last_seen_at: row.get(offset + 5)?,
-        token_expired_at: row.get(offset + 10)?,
         role,
         must_change_password: must != 0,
         disabled_at: row.get(offset + 8)?,
@@ -959,7 +872,9 @@ mod tests {
         assert_eq!(role, "user");
         assert_eq!(token, hash);
         assert_eq!(bootstrap, 0);
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         crate::migrations::run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         let user = find_user_by_id(&conn, id).unwrap().unwrap();
         assert!(!user.has_password);
         assert_eq!(user.username, "alice");

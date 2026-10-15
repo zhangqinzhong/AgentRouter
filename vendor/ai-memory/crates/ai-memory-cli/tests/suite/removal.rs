@@ -135,6 +135,217 @@ fn install_then_uninstall_round_trip_claude_hooks() {
     }
 }
 
+/// `--scope project` writes the checkout's gitignored
+/// `.claude/settings.local.json` (at the git root from any subdirectory; in
+/// the launch directory on Windows) and leaves the user-level file alone, and
+/// keeps its backup out of the checkout. `uninstall` from inside the checkout
+/// sweeps exactly our entries; from anywhere else it leaves the file untouched.
+#[test]
+fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git init failed");
+    let sub = project.path().join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Claude Code reads the launch directory on Windows, the git root elsewhere.
+    let local = if cfg!(windows) {
+        sub.as_path()
+    } else {
+        project.path()
+    }
+    .join(".claude")
+    .join("settings.local.json");
+    // Pre-seed a third-party hook we must NOT touch.
+    write_file(
+        &local,
+        r#"{"hooks":{"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/n.sh"}]}]}}"#,
+    );
+    let install = |cwd: &Path| {
+        command_with_home(home.path())
+            .args([
+                "install-hooks",
+                "--agent",
+                "claude-code",
+                "--scope",
+                "project",
+                "--apply",
+            ])
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+
+    let output = install(&sub);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "install-hooks failed: {stderr}");
+    assert!(
+        stderr.contains("is not ignored by git"),
+        "no ignore rule exists yet, so the installer must warn: {stderr}"
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+    assert!(
+        after["hooks"]["Notification"].is_array(),
+        "third-party hook must survive"
+    );
+    assert!(
+        after["hooks"]["SessionStart"].is_array(),
+        "our hooks must land in the project file: {after}"
+    );
+    assert!(
+        !home.path().join(".claude").join("settings.json").exists(),
+        "project scope must not touch the user-level settings"
+    );
+    // The pre-seeded file was updated, so a backup exists, and it must sit
+    // under the data dir: Claude Code's ignore rule does not cover a sibling
+    // `.bak-<ts>`, which would carry the hook commands into `git status`.
+    let backups = home
+        .path()
+        .join(".ai-memory-data")
+        .join("backups")
+        .join("claude-settings-local");
+    let no_backup_in_checkout = |when: &str| {
+        let leaked: Vec<_> = std::fs::read_dir(local.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".bak-"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{when}: backup left in the checkout: {leaked:?}"
+        );
+    };
+    no_backup_in_checkout("install");
+    let saved: Vec<_> = std::fs::read_dir(&backups).unwrap().flatten().collect();
+    assert_eq!(saved.len(), 1, "one backup under {}", backups.display());
+    assert!(
+        std::fs::read_to_string(saved[0].path())
+            .unwrap()
+            .contains("/usr/bin/n.sh"),
+        "the backup holds the prior file"
+    );
+
+    // With an ignore rule in place the warning goes away.
+    write_file(
+        &project.path().join(".gitignore"),
+        "**/.claude/settings.local.json\n",
+    );
+    let output = install(&sub);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "re-apply failed: {stderr}");
+    assert!(!stderr.contains("is not ignored by git"), "{stderr}");
+
+    // Uninstall from an unrelated directory never reaches into this checkout.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let output = run_uninstall(
+        elsewhere.path(),
+        home.path(),
+        &["uninstall", "--apply", "--only", "hooks", "--yes"],
+    );
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let untouched: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+    assert!(
+        untouched["hooks"]["SessionStart"].is_array(),
+        "uninstall elsewhere must leave the project file alone"
+    );
+
+    // From inside the checkout (any subdirectory) it sweeps exactly our entries.
+    let output = run_uninstall(
+        &sub,
+        home.path(),
+        &["uninstall", "--apply", "--only", "hooks", "--yes"],
+    );
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    no_backup_in_checkout("uninstall");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("used `install-hooks --scope project`"),
+        "uninstall must point at the checkouts it cannot reach"
+    );
+    let swept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+    assert!(
+        swept["hooks"]["Notification"].is_array(),
+        "third-party hook must survive uninstall"
+    );
+    for ours in [
+        "SessionStart",
+        "SessionEnd",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "PreCompact",
+        "UserPromptSubmit",
+    ] {
+        assert!(
+            swept["hooks"].get(ours).is_none(),
+            "{ours} should be removed: {swept}"
+        );
+    }
+}
+
+/// A print-only preview of a project-scoped install must not hand the operator
+/// a bearer to paste into the checkout; the user-level preview still embeds it.
+#[test]
+fn project_scope_preview_withholds_the_bearer_token() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let preview = |scope: &str| {
+        let output = command_with_home(home.path())
+            .args([
+                "install-hooks",
+                "--agent",
+                "claude-code",
+                "--scope",
+                scope,
+                "--auth-token",
+                "SEKRIT-PREVIEW",
+            ])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "preview failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let project_scoped = preview("project");
+    assert!(
+        !project_scoped.contains("SEKRIT-PREVIEW"),
+        "the project preview must not embed the bearer: {project_scoped}"
+    );
+    assert!(project_scoped.contains("NOT embedded"), "{project_scoped}");
+
+    let global = preview("global");
+    assert!(
+        global.contains("SEKRIT-PREVIEW"),
+        "control: the user-level preview embeds it as before: {global}"
+    );
+    assert!(
+        !home.path().join(".claude").exists() && !project.path().join(".claude").exists(),
+        "a preview writes nothing"
+    );
+}
+
 #[test]
 fn relocated_claude_uninstall_sweeps_active_and_legacy_installs() {
     let _guard = cli_test_lock();
@@ -820,6 +1031,80 @@ fn zcode_mcp_install_and_uninstall_round_trip_preserves_siblings() {
     assert_eq!(
         removed["mcp"]["servers"]["other"]["url"], "https://other.example/mcp",
         "uninstall must preserve sibling servers"
+    );
+}
+
+/// Factory Droid (#1240): `install-mcp` and `install-hooks` merge into
+/// `~/.factory/mcp.json` and the bare `~/.factory/hooks.json` event map
+/// around the user's own entries, and `uninstall` removes only ai-memory's.
+#[test]
+fn droid_install_and_uninstall_round_trip_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let mcp = home.path().join(".factory/mcp.json");
+    let hooks = home.path().join(".factory/hooks.json");
+    write_file(
+        &mcp,
+        r#"{"mcpServers":{"other":{"type":"http","url":"https://other.example/mcp"}}}"#,
+    );
+    write_file(
+        &hooks,
+        r#"{"PreToolUse":[{"matcher":"Execute","hooks":[{"type":"command","command":"/usr/local/bin/guard.sh"}]}]}"#,
+    );
+
+    for args in [
+        &["install-mcp", "--client", "droid", "--apply"][..],
+        &["install-hooks", "--agent", "droid", "--apply"][..],
+    ] {
+        let out = command_with_home(home.path()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["ai-memory"]["type"], "http");
+    assert_eq!(
+        installed["mcpServers"]["other"]["url"],
+        "https://other.example/mcp"
+    );
+    let wired: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+    let pre = wired["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{wired}");
+    assert!(
+        pre[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--agent droid"),
+        "{wired}"
+    );
+    assert!(wired["SessionEnd"].is_array(), "{wired}");
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcpServers"].get("ai-memory").is_none());
+    assert_eq!(
+        removed["mcpServers"]["other"]["url"],
+        "https://other.example/mcp"
+    );
+    let unwired = std::fs::read_to_string(&hooks).unwrap();
+    assert!(!unwired.contains("--agent droid"), "{unwired}");
+    let unwired: serde_json::Value = serde_json::from_str(&unwired).unwrap();
+    assert_eq!(
+        unwired["PreToolUse"][0]["hooks"][0]["command"],
+        "/usr/local/bin/guard.sh"
     );
 }
 
@@ -2025,4 +2310,74 @@ fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
             path.display()
         );
     }
+}
+
+/// Meta Muse Code: `install-mcp` and `install-hooks` both merge into
+/// `$XDG_CONFIG_HOME/muse/settings.json` around the user's own server and
+/// hook, keeping `schema_version` and unknown keys, the MCP entry goes under
+/// the legacy `mcp_servers` map the file already uses (never a second map),
+/// and `uninstall` removes only ai-memory's entries.
+#[test]
+fn muse_install_and_uninstall_round_trip_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".config/muse/settings.json");
+    write_file(
+        &settings,
+        r#"{"schema_version":1,"theme":"dark","mcp_servers":{"other":{"transport":"stdio","command":"other-mcp","mode":"optional"}},"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"/usr/local/bin/guard.sh","timeout":5}]}]}}"#,
+    );
+
+    for args in [
+        &["install-mcp", "--client", "muse", "--apply"][..],
+        &["install-hooks", "--agent", "muse", "--apply"][..],
+    ] {
+        let out = command_with_home(home.path()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(installed["schema_version"], 1);
+    assert_eq!(installed["theme"], "dark");
+    assert!(installed.get("mcpServers").is_none(), "{installed}");
+    let ours = &installed["mcp_servers"]["ai-memory"];
+    assert_eq!(ours["transport"], "stdio", "{installed}");
+    assert_eq!(ours["mode"], "optional");
+    assert_eq!(ours["args"][1], "--agent");
+    assert_eq!(ours["args"][2], "muse");
+    assert_eq!(installed["mcp_servers"]["other"]["command"], "other-mcp");
+    let pre = installed["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{installed}");
+    assert!(
+        pre[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--agent muse"),
+        "{installed}"
+    );
+    assert!(installed["hooks"]["SessionEnd"].is_array(), "{installed}");
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let text = std::fs::read_to_string(&settings).unwrap();
+    assert!(!text.contains("--agent muse"), "{text}");
+    assert!(!text.contains("mcp-bridge"), "{text}");
+    let removed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(removed["schema_version"], 1);
+    assert_eq!(removed["theme"], "dark");
+    assert_eq!(removed["mcp_servers"]["other"]["command"], "other-mcp");
+    assert_eq!(
+        removed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "/usr/local/bin/guard.sh"
+    );
 }

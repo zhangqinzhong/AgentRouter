@@ -14,7 +14,7 @@ import { MemoryClients } from "./clients";
 import { memoryReadPath, MemoryTransport } from "./transport";
 
 const execute = promisify(execFile);
-export const MEMORY_VERSION = "2.5.2";
+export const MEMORY_VERSION = "3.0.0";
 const defaultSettings: MemorySettings = { autoStart: false, semanticSearch: false };
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function waitForExit(child: ChildProcess, timeout: number): Promise<void> {
@@ -192,6 +192,9 @@ export class MemoryService {
     try {
       this.token = this.accessToken();
       if (this.externalReuse && await this.adoptExisting()) {
+        // Preview and install shell out to the CLI. Attaching to the
+        // already-running server does not stage that binary.
+        if (this.findRuntime()) this.prepareRuntime();
         this.external = true;
         this.state = "running";
         this.startedAt = new Date().toISOString();

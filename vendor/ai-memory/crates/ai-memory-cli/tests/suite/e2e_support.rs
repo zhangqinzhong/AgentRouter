@@ -258,7 +258,8 @@ mod slow {
     async fn start_serve_moves_off_a_port_taken_before_the_bind() {
         use std::io::{Read as _, Write as _};
 
-        let root = tempfile::tempdir().unwrap().keep();
+        let guard = tempfile::tempdir().unwrap();
+        let root = guard.path().to_path_buf();
         let taken = TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = taken.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -285,7 +286,8 @@ mod slow {
     #[tokio::test]
     #[should_panic(expected = "serve exited")]
     async fn start_serve_reports_an_early_exit() {
-        let root = tempfile::tempdir().unwrap().keep();
+        let guard = tempfile::tempdir().unwrap();
+        let root = guard.path().to_path_buf();
         start_serve(&reqwest::Client::new(), &root.join("serve.log"), |port| {
             let mut cmd = serve(&root, port);
             cmd.arg("--no-such-flag");

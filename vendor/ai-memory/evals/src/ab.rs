@@ -15,12 +15,17 @@
 //!    flattened markdown rendering, and a `meta.json` (timing,
 //!    update count, parse status) per fixture per provider under
 //!    `evals/runs/<timestamp>/{baseline,candidate}/`.
-//! 4. Prints a side-by-side summary table to stdout.
+//! 4. Scores literal fidelity (see [`crate::fidelity`]): which of the
+//!    fixture's `must_mention` facts the projection dropped, which ones
+//!    the model dropped after seeing them, invented tokens and wikilinks,
+//!    and `must_not_mention` hits.
+//! 5. Prints a side-by-side summary table to stdout and writes
+//!    `report.json` with the provenance a published number needs.
 //!
-//! Quality judgement is left to the human reading the outputs — the
-//! harness only reports the OBJECTIVE deltas (latency, update
-//! counts, schema-parse success). Anything subtler (faithfulness,
-//! hallucination, structure) is for you to eyeball.
+//! `--runs N` repeats every side N times; the spread between a side's own
+//! runs is the noise band a delta has to clear. `--generated-seed` adds
+//! the seeded long session from [`crate::generate`]. Anything subtler than
+//! these literal checks (structure, judgement) is still for you to eyeball.
 //!
 //! ## Running it
 //!
@@ -39,6 +44,7 @@
 //!     --candidate-api-key ollama-local
 //! ```
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +58,9 @@ use serde::{Deserialize, Serialize};
 use ai_memory_consolidate::{ConsolidatedBatch, build_batch_request};
 use ai_memory_core::{Observation, ObservationKind, ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::{AuthRequirement, LlmProvider, ProviderAuth, ProviderChoice, ProviderConfig};
+
+use crate::fidelity::{PageFidelity, PromptFidelity, Scorer, request_text};
+use crate::generate;
 
 #[derive(clap::Args, Debug)]
 pub struct AbArgs {
@@ -111,28 +120,44 @@ pub struct AbArgs {
     /// Candidate auth file for `openai-oauth` or `codex`.
     #[arg(long)]
     candidate_token_file: Option<PathBuf>,
+
+    /// Repeat each side this many times; the spread between a side's own
+    /// runs is the noise band.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=20))]
+    runs: u32,
+
+    /// Also run the seeded long session (`evals/src/generate.rs`); the
+    /// published runs use 1215.
+    #[arg(long)]
+    generated_seed: Option<u64>,
 }
 
 /// JSON shape of an eval fixture file. We only care about
 /// observations the consolidation prompt actually consumes; the
 /// other Observation fields get populated with dummies at runtime.
-#[derive(Debug, Deserialize)]
-struct Fixture {
-    name: String,
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct Fixture {
+    pub(crate) name: String,
     /// Free-text describing the scenario; not consumed by the runner
     /// but useful when reading fixture files by hand.
-    #[allow(dead_code)]
     #[serde(default)]
-    description: String,
-    observations: Vec<FixtureObservation>,
+    pub(crate) description: String,
+    pub(crate) observations: Vec<FixtureObservation>,
+    /// Literal strings the pages should carry (exact substring).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) must_mention: Vec<String>,
+    /// Literal strings no page may carry: injected instructions,
+    /// credential-shaped values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) must_not_mention: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct FixtureObservation {
-    kind: String,
-    title: String,
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct FixtureObservation {
+    pub(crate) kind: String,
+    pub(crate) title: String,
     #[serde(default)]
-    body: String,
+    pub(crate) body: String,
 }
 
 /// One result of one provider on one fixture.
@@ -140,10 +165,39 @@ struct FixtureObservation {
 struct CaseRun {
     provider: String,
     fixture: String,
+    run: u32,
     elapsed_ms: u128,
     parsed_ok: bool,
     error: Option<String>,
     update_count: Option<usize>,
+    fidelity: Option<PageFidelity>,
+}
+
+/// One fixture's projection plus every run of both sides.
+#[derive(Debug, Serialize)]
+struct FixtureReport {
+    fixture: String,
+    projection: PromptFidelity,
+    baseline: Vec<CaseRun>,
+    candidate: Vec<CaseRun>,
+}
+
+#[derive(Debug, Serialize)]
+struct SideMeta {
+    provider: String,
+    model: String,
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AbReport {
+    commit: String,
+    runs: u32,
+    generated_seed: Option<u64>,
+    generated_sha256: Option<String>,
+    baseline: SideMeta,
+    candidate: SideMeta,
+    fixtures: Vec<FixtureReport>,
 }
 
 pub async fn run(args: AbArgs) -> Result<()> {
@@ -155,8 +209,17 @@ pub async fn run(args: AbArgs) -> Result<()> {
     let candidate_provider =
         make_provider(candidate.clone()).context("building candidate provider")?;
 
-    let fixtures = load_fixtures(&args.fixtures)
+    let mut fixtures = load_fixtures(&args.fixtures)
         .with_context(|| format!("loading fixtures from {}", args.fixtures.display()))?;
+    let generated = match args.generated_seed {
+        Some(seed) => {
+            let fx = generate::session(seed);
+            let (json, sha) = generate::dump(&fx)?;
+            fixtures.push((PathBuf::from(format!("{}.json", fx.name)), fx));
+            Some((json, sha))
+        }
+        None => None,
+    };
     if fixtures.is_empty() {
         bail!("no *.json fixtures found in {}", args.fixtures.display());
     }
@@ -170,6 +233,13 @@ pub async fn run(args: AbArgs) -> Result<()> {
     let run_dir = args.out.join(&stamp);
     std::fs::create_dir_all(run_dir.join("baseline"))?;
     std::fs::create_dir_all(run_dir.join("candidate"))?;
+    let generated_sha256 = match generated {
+        Some((json, sha)) => {
+            std::fs::write(run_dir.join("generated-session.json"), json)?;
+            Some(sha)
+        }
+        None => None,
+    };
 
     println!();
     println!("ai-memory eval — {stamp}");
@@ -190,54 +260,127 @@ pub async fn run(args: AbArgs) -> Result<()> {
         candidate.model,
         candidate.base_url.as_deref().unwrap_or("(default)")
     );
+    println!("  runs     : {}", args.runs);
     println!("  out      : {}", run_dir.display());
     println!();
 
-    let mut results: Vec<(CaseRun, CaseRun)> = Vec::with_capacity(fixtures.len());
+    let mut reports: Vec<FixtureReport> = Vec::with_capacity(fixtures.len());
     for (path, fx) in fixtures {
         println!("→ {} ({} observations)", fx.name, fx.observations.len());
         let observations = synthesise_observations(&fx);
         let session_id = SessionId::new();
-
-        // Run both providers concurrently per fixture so a slow one
-        // doesn't double the wall-clock.
-        let req_a = build_batch_request(session_id, &observations);
-        let req_b = build_batch_request(session_id, &observations);
-        let (a_res, b_res) = tokio::join!(
-            run_one(baseline_provider.clone(), "baseline", req_a),
-            run_one(candidate_provider.clone(), "candidate", req_b),
+        let request = build_batch_request(session_id, &observations);
+        let scorer = Scorer::new(
+            session_id,
+            &observations,
+            &request,
+            &fx.must_mention,
+            &fx.must_not_mention,
         );
+        let projection = scorer.prompt(observations.len());
+        println!("  projection: {}", describe_projection(&projection));
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&fx.name)
+            .to_string();
+        std::fs::create_dir_all(run_dir.join("requests"))?;
+        std::fs::write(
+            run_dir.join("requests").join(format!("{stem}.txt")),
+            request_text(&request),
+        )?;
 
-        let a = persist_case("baseline", &fx.name, &path, &run_dir, a_res)?;
-        let b = persist_case("candidate", &fx.name, &path, &run_dir, b_res)?;
-
-        println!(
-            "  baseline : {:>5} ms  parsed={} updates={}",
-            a.elapsed_ms,
-            a.parsed_ok,
-            a.update_count.map_or("-".into(), |n| n.to_string())
-        );
-        println!(
-            "  candidate: {:>5} ms  parsed={} updates={}",
-            b.elapsed_ms,
-            b.parsed_ok,
-            b.update_count.map_or("-".into(), |n| n.to_string())
-        );
-        // Force-flush per fixture so progress is visible when stdout
-        // is piped (e.g. via `tee` or backgrounded runs). Without
-        // this, full-buffering swallows every println! until exit.
-        std::io::stdout().flush().ok();
-        results.push((a, b));
+        let mut report = FixtureReport {
+            fixture: fx.name.clone(),
+            projection,
+            baseline: Vec::new(),
+            candidate: Vec::new(),
+        };
+        for run in 1..=args.runs {
+            // Run both providers concurrently per fixture so a slow one
+            // doesn't double the wall-clock.
+            let (a_res, b_res) = tokio::join!(
+                run_one(baseline_provider.clone(), "baseline", request.clone()),
+                run_one(candidate_provider.clone(), "candidate", request.clone()),
+            );
+            let case_stem = if args.runs > 1 {
+                format!("{stem}.r{run}")
+            } else {
+                stem.clone()
+            };
+            let a = persist_case(
+                "baseline", &fx.name, &case_stem, run, &run_dir, a_res, &scorer,
+            )?;
+            let b = persist_case(
+                "candidate",
+                &fx.name,
+                &case_stem,
+                run,
+                &run_dir,
+                b_res,
+                &scorer,
+            )?;
+            for case in [&a, &b] {
+                println!(
+                    "  {:<9} r{run}: {:>5} ms  parsed={} updates={}  {}",
+                    case.provider,
+                    case.elapsed_ms,
+                    case.parsed_ok,
+                    case.update_count.map_or("-".into(), |n| n.to_string()),
+                    case.fidelity.as_ref().map_or(String::new(), describe_page)
+                );
+            }
+            // Force-flush per run so progress is visible when stdout
+            // is piped (e.g. via `tee` or backgrounded runs). Without
+            // this, full-buffering swallows every println! until exit.
+            std::io::stdout().flush().ok();
+            report.baseline.push(a);
+            report.candidate.push(b);
+        }
+        reports.push(report);
     }
+
+    let ab_report = AbReport {
+        commit: crate::retrieval::report::commit_sha(),
+        runs: args.runs,
+        generated_seed: args.generated_seed,
+        generated_sha256,
+        baseline: SideMeta {
+            provider: baseline.provider_name().to_string(),
+            model: baseline.model.clone(),
+            base_url: baseline.base_url.clone(),
+        },
+        candidate: SideMeta {
+            provider: candidate.provider_name().to_string(),
+            model: candidate.model.clone(),
+            base_url: candidate.base_url.clone(),
+        },
+        fixtures: reports,
+    };
+    std::fs::write(
+        run_dir.join("report.json"),
+        serde_json::to_string_pretty(&ab_report)?,
+    )?;
 
     // Tail summary so the user can grok the run at a glance.
     println!();
     println!("=== summary ===");
-    let n = results.len();
-    let baseline_total: u128 = results.iter().map(|(a, _)| a.elapsed_ms).sum();
-    let candidate_total: u128 = results.iter().map(|(_, b)| b.elapsed_ms).sum();
-    let baseline_ok = results.iter().filter(|(a, _)| a.parsed_ok).count();
-    let candidate_ok = results.iter().filter(|(_, b)| b.parsed_ok).count();
+    print!("{}", fidelity_summary(&ab_report.fixtures));
+    let baseline_runs: Vec<&CaseRun> = ab_report
+        .fixtures
+        .iter()
+        .flat_map(|f| &f.baseline)
+        .collect();
+    let candidate_runs: Vec<&CaseRun> = ab_report
+        .fixtures
+        .iter()
+        .flat_map(|f| &f.candidate)
+        .collect();
+    let n = baseline_runs.len();
+    let baseline_total: u128 = baseline_runs.iter().map(|c| c.elapsed_ms).sum();
+    let candidate_total: u128 = candidate_runs.iter().map(|c| c.elapsed_ms).sum();
+    let baseline_ok = baseline_runs.iter().filter(|c| c.parsed_ok).count();
+    let candidate_ok = candidate_runs.iter().filter(|c| c.parsed_ok).count();
     println!(
         "baseline : {baseline_ok}/{n} parsed ok  total {baseline_total} ms  avg {} ms",
         baseline_total / n.max(1) as u128
@@ -328,6 +471,11 @@ fn resolve_provider(side: &str, args: &AbArgs) -> Result<ResolvedConfig> {
             base_url.clone(),
         ),
         AuthRequirement::AnthropicOAuthToken => ProviderAuth::anthropic_oauth_token(api_key),
+        AuthRequirement::CursorCli => ProviderAuth::cursor(ai_memory_llm::CursorAuth::new(
+            "agent",
+            std::env::temp_dir(),
+            &std::env::vars_os().collect::<Vec<_>>(),
+        )),
     };
 
     Ok(ResolvedConfig {
@@ -364,6 +512,9 @@ impl From<ResolvedConfig> for ProviderConfig {
             // Match the product default so provider comparisons exercise the
             // same schema-constrained path operators receive.
             compat_strict: true,
+            // Comparisons must not differ by engine-side thinking behaviour;
+            // keep the product default (off) for every candidate.
+            compat_disable_thinking: false,
             request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             // The A/B harness compares consolidation quality; reasoning
             // effort stays at each model's own default unless a future
@@ -383,7 +534,7 @@ fn make_provider(r: ResolvedConfig) -> Result<Arc<dyn LlmProvider>> {
         .context("building provider")
 }
 
-fn load_fixtures(dir: &Path) -> Result<Vec<(PathBuf, Fixture)>> {
+pub(crate) fn load_fixtures(dir: &Path) -> Result<Vec<(PathBuf, Fixture)>> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
@@ -399,7 +550,7 @@ fn load_fixtures(dir: &Path) -> Result<Vec<(PathBuf, Fixture)>> {
     Ok(out)
 }
 
-fn synthesise_observations(fx: &Fixture) -> Vec<Observation> {
+pub(crate) fn synthesise_observations(fx: &Fixture) -> Vec<Observation> {
     let workspace_id = WorkspaceId::new();
     let project_id = ProjectId::new();
     let session_id = SessionId::new();
@@ -540,14 +691,12 @@ fn extract_first_balanced_object(text: &str) -> Option<String> {
 fn persist_case(
     side: &str,
     fixture_name: &str,
-    fixture_path: &Path,
+    safe_name: &str,
+    run: u32,
     run_dir: &Path,
     res: ProviderResult,
+    scorer: &Scorer<'_>,
 ) -> Result<CaseRun> {
-    let safe_name = fixture_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(fixture_name);
     let dir = run_dir.join(side);
     std::fs::create_dir_all(&dir)?;
 
@@ -572,10 +721,12 @@ fn persist_case(
     let case = CaseRun {
         provider: side.to_string(),
         fixture: fixture_name.to_string(),
+        run,
         elapsed_ms: res.elapsed.as_millis(),
         parsed_ok: res.batch.is_some(),
         error: res.error.clone(),
         update_count: res.batch.as_ref().map(|b| b.updates.len()),
+        fidelity: res.batch.as_ref().map(|b| scorer.page(b)),
     };
     let meta_path = dir.join(format!("{safe_name}.meta.json"));
     std::fs::write(&meta_path, serde_json::to_string_pretty(&case)?)?;
@@ -618,4 +769,83 @@ fn render_markdown(side: &str, fixture_name: &str, res: &ProviderResult) -> Stri
         out.push('\n');
     }
     out
+}
+
+/// One line per fixture: what the projection kept.
+pub(crate) fn describe_projection(p: &PromptFidelity) -> String {
+    let mut out = format!(
+        "selected {}/{} truncated {}",
+        p.selected, p.observations, p.truncated_bodies
+    );
+    if p.must_mention_total > 0 {
+        let _ = write!(
+            out,
+            "  facts lost {}/{}",
+            p.lost_in_projection.len(),
+            p.must_mention_total
+        );
+        if !p.lost_in_projection.is_empty() {
+            let _ = write!(out, " {:?}", p.lost_in_projection);
+        }
+    }
+    if let Some(r) = p.recall_prompt {
+        let _ = write!(out, "  recall_prompt {r:.3}");
+    }
+    out
+}
+
+fn describe_page(f: &PageFidelity) -> String {
+    let mut out = String::new();
+    if let Some(loss) = f.llm_loss {
+        let _ = write!(out, "llm_loss {loss:.2} ");
+    }
+    if let Some(r) = f.recall_page {
+        let _ = write!(out, "recall_page {r:.3} ");
+    }
+    let _ = write!(
+        out,
+        "invented tokens {} links {} forbidden {}",
+        f.hallucinated_tokens.len(),
+        f.invented_wikilinks.len(),
+        f.must_not_mention_hits.len()
+    );
+    out
+}
+
+/// Per fixture and side: mean and min-max of `llm_loss` and invented
+/// tokens over the runs. A delta inside a side's own spread is noise.
+fn fidelity_summary(fixtures: &[FixtureReport]) -> String {
+    let mut out = String::new();
+    for f in fixtures {
+        for (side, cases) in [("baseline", &f.baseline), ("candidate", &f.candidate)] {
+            let scored: Vec<&PageFidelity> =
+                cases.iter().filter_map(|c| c.fidelity.as_ref()).collect();
+            let losses: Vec<f64> = scored.iter().filter_map(|s| s.llm_loss).collect();
+            let invented: Vec<f64> = scored
+                .iter()
+                .map(|s| s.hallucinated_tokens.len() as f64)
+                .collect();
+            let _ = writeln!(
+                out,
+                "{:<28} {:<9} parsed {}/{}  llm_loss {}  invented tokens {}",
+                f.fixture,
+                side,
+                scored.len(),
+                cases.len(),
+                spread(&losses),
+                spread(&invented)
+            );
+        }
+    }
+    out
+}
+
+fn spread(values: &[f64]) -> String {
+    if values.is_empty() {
+        return "-".into();
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    format!("{mean:.2} ({min:.2}-{max:.2})")
 }

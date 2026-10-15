@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared by every client that normalises a git remote into a repository identity: the Rust core, hooks/_lib.sh, hooks/lib/ai-memory-hook.ps1 and the generated TypeScript plugins. A case added here is checked against all four, so they cannot drift apart. `identity: null` means the remote must yield no identity.",
+  "_comment": "Shared by every client that normalises a git remote and parses local marker aliases: the Rust core/native client, hooks/_lib.sh, hooks/lib/ai-memory-hook.ps1 and generated TypeScript plugins. Alias cases define the deliberately limited portable grammar: one root-level, one-line JSON-compatible string array; no escapes, duplicate declarations, table placement, multiline arrays, trailing commas, comments, or trailing junk. A case added here is checked against all four, so they cannot drift apart. (#1033)",
   "normalize": [
     { "url": "git@github.com:Acme/API.git", "identity": "github.com/acme/api" },
     { "url": "git@github.com:acme/api", "identity": "github.com/acme/api" },
@@ -41,5 +41,40 @@
     { "identity": "github.com/acme/api.git", "name": "acme-api.git" },
     { "identity": "acme platform", "name": "acme-platform" },
     { "identity": "ana/personal notes", "name": "ana-personal-notes" }
+  ],
+  "styled_key": [
+    { "identity": "github.com/akitaonrails/ai-memory", "source": "git_remote", "path": "akitaonrails/ai-memory", "host_path": "github.com/akitaonrails/ai-memory", "path_name": "akitaonrails-ai-memory" },
+    { "identity": "gitlab.com/acme/group/api", "source": "git_remote", "path": "acme/group/api", "host_path": "gitlab.com/acme/group/api", "path_name": "acme-group-api" },
+    { "identity": "ssh.dev.azure.com/v3/acme/proj/api", "source": "git_remote", "path": "v3/acme/proj/api", "host_path": "ssh.dev.azure.com/v3/acme/proj/api", "path_name": "v3-acme-proj-api" },
+    { "identity": "github.com/acme/my api", "source": "git_remote", "path": "acme/my api", "host_path": "github.com/acme/my api", "path_name": "acme-my-api" },
+    { "identity": "acme/platform", "source": "explicit", "path": "acme/platform", "host_path": "acme/platform", "path_name": null },
+    { "identity": "api", "source": "folder_name", "path": "api", "host_path": "api", "path_name": null }
+  ],
+  "identity_style": [
+    { "value": "path", "style": "path" },
+    { "value": "host_path", "style": "host_path" },
+    { "value": "  path  ", "style": "path" },
+    { "value": "Path", "style": null },
+    { "value": "host-path", "style": null },
+    { "value": "", "style": null }
+  ],
+  "marker_aliases": [
+    { "toml": "aliases = [\" former-name \", \"legacy_name\", \"former-name\", \"V2.name\"]", "status": "valid", "aliases": ["former-name", "legacy_name", "V2.name"] },
+    { "toml": "aliases = []", "status": "valid", "aliases": [] },
+    { "toml": "aliases = [ ]", "status": "valid", "aliases": [] },
+    { "toml": "workspace = \"acme\"", "status": "absent" },
+    { "toml": "aliases = [\"-leading\"]", "status": "invalid" },
+    { "toml": "aliases = [\"../foreign\"]", "status": "invalid" },
+    { "toml": "aliases = [\"nested/project\"]", "status": "invalid" },
+    { "toml": "aliases = [\"escaped\\nname\"]", "status": "invalid" },
+    { "toml": "aliases = [\"one\",]", "status": "invalid" },
+    { "toml": "aliases = [\"one\"] # comment", "status": "invalid" },
+    { "toml": "aliases = [\"one\"] junk", "status": "invalid" },
+    { "toml": "aliases = [\n  \"one\"\n]", "status": "invalid" },
+    { "toml": "aliases = [\"one\"]\naliases = [\"two\"]", "status": "invalid" },
+    { "toml": "[capture]\naliases = [\"one\"]", "status": "invalid" },
+    { "toml": "aliases = [\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]", "status": "valid", "aliases": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] },
+    { "toml": "aliases = [\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]", "status": "invalid" },
+    { "toml": "aliases = [\"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\", \"same\"]", "status": "invalid" }
   ]
 }

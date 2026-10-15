@@ -1,9 +1,8 @@
 //! JSON routes for third-party read-only frontends.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use ai_memory_core::{ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId};
+use ai_memory_core::{ObservationKind, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_store::{
     BriefingSnapshot, HealthPage, ObservationOrder, ObservationPage, ObservationRecord, PageHit,
     RelatedPage, ScopeName, ScopeResolutionError, SessionSummary, lookup_existing_scope_guarded,
@@ -13,6 +12,7 @@ use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -41,6 +41,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route(
             "/search",
             axum::routing::get(search_handler).post(search_post_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/history/{*path}",
+            axum::routing::get(history_handler),
         )
         .route(
             "/workspaces/{workspace}/projects/{project}/recent",
@@ -215,6 +219,7 @@ async fn page_handler(
         .map_err(internal_error)?;
 
     let page = ApiPage {
+        id: meta.id.to_string(),
         backlinks: links.backlinks,
         body_markdown: markdown.body,
         created_at: meta.created_at,
@@ -281,39 +286,97 @@ async fn page_handler(
     Ok(resp)
 }
 
+/// A page's stored versions, newest first, and a unified diff between two of
+/// them (default: the newest against the version it replaced). See
+/// `routes/history.rs`; the HTML view renders the same data.
+async fn history_handler(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    Path((workspace, project, path)): Path<(String, String, String)>,
+    Query(query): Query<super::history::HistoryQuery>,
+) -> Result<Response, Response> {
+    use super::history::HistoryError;
+    let history = super::history::load(
+        &state,
+        viewer_of(viewer),
+        &workspace,
+        &project,
+        &path,
+        &query,
+    )
+    .await
+    .map_err(|err| match err {
+        HistoryError::Scope(ScopeResolutionError::ProjectNotFoundInWorkspace {
+            project, ..
+        }) => not_found(format!("project '{project}' not found")),
+        HistoryError::Scope(other) => scope_error_response(other),
+        HistoryError::BadRequest(message) => json_error(StatusCode::BAD_REQUEST, message),
+        HistoryError::NotFound(message) => not_found(message),
+        HistoryError::Internal(error) => internal_error(error),
+    })?;
+    let side = |side: &super::history::DiffSide| ApiHistorySide {
+        id: side.id.to_string(),
+        title: side.title.clone(),
+        created_at: side.created_at.clone(),
+    };
+    let (status, reason, truncated, hunks) = match history.diff {
+        crate::diff::Diff::Same => ("same", None, false, Vec::new()),
+        crate::diff::Diff::TooLarge(why) => ("too_large", Some(why), false, Vec::new()),
+        crate::diff::Diff::Changed { hunks, truncated } => ("changed", None, truncated, hunks),
+    };
+    Ok(with_no_store(
+        Json(ApiHistory {
+            workspace,
+            project,
+            path,
+            total: history.total,
+            offset: history.offset,
+            limit: history.limit,
+            diff: ApiHistoryDiff {
+                from: history.from.as_ref().map(side),
+                to: side(&history.to),
+                status,
+                reason,
+                truncated,
+                hunks,
+            },
+            versions: history.versions,
+        })
+        .into_response(),
+    ))
+}
+
 async fn search_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, Response> {
     let query = SearchQuery::from_raw(raw_query.as_deref()).map_err(ApiFailure::into_response)?;
     let request = query
         .try_into_request()
         .map_err(ApiFailure::into_response)?;
-    search_with_request(&state, request, viewer_of(viewer)).await
+    search_with_request(&state, request, viewer_of(viewer), &owner_filter_for(actor)).await
 }
 
 async fn search_post_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Response, Response> {
-    search_with_request(&state, request, viewer_of(viewer)).await
+    search_with_request(&state, request, viewer_of(viewer), &owner_filter_for(actor)).await
 }
 
-// NOTE (deferred): vector/semantic search. `ReaderPool::hybrid_search` already
-// RRF-fuses FTS5 + entity matching + cosine over stored embeddings + link-graph
-// expansion, but it needs a query embedding — and `WebState` is read-only
-// (reader + wiki), with no embedder. Wiring true semantic search means injecting
-// an embedding client into `WebState` (touching `lib.rs`/`serve.rs`/`Cargo.toml`)
-// and confirming the embedding provider (Ollama) is reachable from the
-// deployment. Until then this handler stays FTS5-only. Link-graph "related
-// pages" already ship via the page-view `links`/`backlinks`
-// (`ReaderPool::page_links`).
+// A global search is FTS5 over every readable repository, as
+// `memory_query(global=true)` is. A scoped one (one project or `scopes`)
+// runs the hybrid ranker `memory_query` runs, with the server's embedder
+// and reranker (`crate::recall`), so the two surfaces agree on order.
 async fn search_with_request(
     state: &WebState,
     request: SearchRequest,
     viewer: Option<ai_memory_core::UserId>,
+    owner: &ai_memory_core::OwnerFilter,
 ) -> Result<Response, Response> {
     let term = request.q.trim().to_owned();
     if term.is_empty() {
@@ -338,7 +401,15 @@ async fn search_with_request(
     }
     let hits = match scoped_search_mode(state, &request, viewer).await? {
         SearchMode::Global => state.reader.search_pages(term, limit, viewer).await,
-        SearchMode::Scoped(scopes) => search_scopes(state, scopes, term, limit).await,
+        SearchMode::Scoped(scopes) => {
+            let scopes: Vec<(WorkspaceId, ProjectId)> = scopes
+                .iter()
+                .map(|scope| (scope.workspace_id, scope.project_id))
+                .collect();
+            crate::recall::search_scopes(state, &scopes, &term, limit, false, owner)
+                .await
+                .map(|result| result.hits.into_iter().map(|(hit, _)| hit).collect())
+        }
     }
     .map_err(internal_error)?;
 
@@ -413,60 +484,181 @@ async fn resolve_scopes(
     .map_err(scope_error_response)
 }
 
-async fn search_scopes(
-    state: &WebState,
-    scopes: Vec<ResolvedSearchScope>,
-    term: String,
+#[derive(Deserialize)]
+struct RecentQuery {
+    #[serde(default = "default_limit")]
     limit: usize,
-) -> ai_memory_store::StoreResult<Vec<PageHit>> {
-    let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
-    for scope in scopes {
-        let hits = state
-            .reader
-            .search_pages_for_project(
-                scope.workspace_id,
-                scope.project_id,
-                term.clone(),
-                limit,
-                None,
-            )
-            .await?;
-        for hit in hits {
-            hits_by_id
-                .entry(hit.id)
-                .and_modify(|existing| {
-                    if hit.rank < existing.rank {
-                        *existing = hit.clone();
-                    }
-                })
-                .or_insert(hit);
+    updated_since: Option<String>,
+    cursor: Option<String>,
+}
+
+// Versioned URL-safe base64 JSON is opaque to callers and bounded before decoding.
+// Scope ids are checked after normal authorization, never used to resolve scope.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecentCursor {
+    v: u8,
+    workspace: WorkspaceId,
+    project: ProjectId,
+    since: String,
+    updated_at: String,
+    path: String,
+}
+
+fn recent_instant(value: &str) -> ApiParseResult<jiff::Timestamp> {
+    let bytes = value.as_bytes();
+    let invalid = || ApiFailure::bad_request("invalid RFC3339 timestamp");
+    if bytes.len() < 20
+        || bytes.len() > 64
+        || !value.is_ascii()
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || ![0..4, 5..7, 8..10, 11..13, 14..16, 17..19]
+            .into_iter()
+            .all(|range| bytes[range].iter().all(u8::is_ascii_digit))
+    {
+        return Err(invalid());
+    }
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || digits > 9 {
+            return Err(invalid());
+        }
+        rest = &fraction[digits..];
+    }
+    if rest != "Z" && rest != "z" {
+        let zone = rest.as_bytes();
+        if zone.len() != 6
+            || !matches!(zone[0], b'+' | b'-')
+            || zone[3] != b':'
+            || !zone[1..3].iter().chain(&zone[4..6]).all(u8::is_ascii_digit)
+        {
+            return Err(invalid());
         }
     }
-    let mut hits: Vec<PageHit> = hits_by_id.into_values().collect();
-    hits.sort_by(|a, b| {
-        a.rank
-            .partial_cmp(&b.rank)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    hits.truncate(limit);
-    Ok(hits)
+    value.parse::<jiff::Timestamp>().map_err(|_| invalid())
+}
+
+fn encode_recent_cursor(cursor: &RecentCursor) -> ApiParseResult<String> {
+    let bytes = serde_json::to_vec(cursor).map_err(|_| ApiFailure {
+        message: "internal server error".into(),
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    decode_recent_cursor(&raw)?;
+    Ok(raw)
+}
+
+fn decode_recent_cursor(raw: &str) -> ApiParseResult<RecentCursor> {
+    if raw.len() > 8192 || raw.is_empty() {
+        return Err(ApiFailure::bad_request("invalid recent cursor"));
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| ApiFailure::bad_request("invalid recent cursor"))?;
+    if bytes.len() > 6144 {
+        return Err(ApiFailure::bad_request("invalid recent cursor"));
+    }
+    let cursor: RecentCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiFailure::bad_request("invalid recent cursor"))?;
+    if cursor.v != 1 || cursor.path.len() > 2048 || PagePath::new(&cursor.path).is_err() {
+        return Err(ApiFailure::bad_request("invalid recent cursor"));
+    }
+    Ok(cursor)
 }
 
 async fn recent_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
-    Query(query): Query<LimitQuery>,
+    Query(query): Query<RecentQuery>,
 ) -> Result<Response, Response> {
-    let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
+    let limit = query.limit.clamp(1, 100);
+    if query.updated_since.is_none() && query.cursor.is_none() {
+        let mut pages = state
+            .reader
+            .list_pages(&workspace, &project)
+            .await
+            .map_err(internal_error)?;
+        pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        pages.truncate(limit);
+        return Ok(with_cache(Json(pages).into_response(), LIST_CACHE_MAX_AGE));
+    }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_recent_cursor)
+        .transpose()
+        .map_err(ApiFailure::into_response)?;
+    let (since, after) = if let Some(cursor) = cursor {
+        if cursor.workspace != workspace_id || cursor.project != project_id {
+            return Err(
+                ApiFailure::bad_request("recent cursor does not match scope").into_response(),
+            );
+        }
+        let since = recent_instant(&cursor.since).map_err(ApiFailure::into_response)?;
+        let after = recent_instant(&cursor.updated_at).map_err(ApiFailure::into_response)?;
+        if after <= since
+            || query
+                .updated_since
+                .as_deref()
+                .map(recent_instant)
+                .transpose()
+                .map_err(ApiFailure::into_response)?
+                .is_some_and(|bound| bound != since)
+        {
+            return Err(ApiFailure::bad_request("conflicting recent cursor bounds").into_response());
+        }
+        (since, Some((after.as_microsecond(), cursor.path)))
+    } else {
+        (
+            recent_instant(query.updated_since.as_deref().unwrap_or_default())
+                .map_err(ApiFailure::into_response)?,
+            None,
+        )
+    };
+    // SQL timestamps have microsecond precision. Flooring a submicrosecond
+    // cutoff retains exactly the rows strictly later than the supplied instant.
     let mut pages = state
         .reader
-        .list_pages(&workspace, &project)
+        .incremental_pages(
+            workspace_id,
+            project_id,
+            i64::try_from(since.as_nanosecond().div_euclid(1000)).map_err(internal_error)?,
+            after,
+            limit,
+        )
         .await
         .map_err(internal_error)?;
-    pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    pages.truncate(query.limit.clamp(1, 100));
-    Ok(with_cache(Json(pages).into_response(), LIST_CACHE_MAX_AGE))
+    let has_more = pages.len() > limit;
+    pages.truncate(limit);
+    let next_cursor = if has_more {
+        pages
+            .last()
+            .map(|page| {
+                encode_recent_cursor(&RecentCursor {
+                    v: 1,
+                    workspace: workspace_id,
+                    project: project_id,
+                    since: since.to_string(),
+                    updated_at: page.updated_at.clone(),
+                    path: page.path.clone(),
+                })
+            })
+            .transpose()
+            .map_err(ApiFailure::into_response)?
+    } else {
+        None
+    };
+    Ok(with_no_store(
+        Json(serde_json::json!({ "pages": pages, "next_cursor": next_cursor })).into_response(),
+    ))
 }
 
 async fn briefing_handler(
@@ -616,7 +808,7 @@ async fn overview_handler(
 /// may leave `user` empty, and reading `user` here would file that operator as
 /// unattributed while the auth layer calls them a user — hiding their own
 /// handoffs, and the bodies of the shared ones, from them in their own UI.
-fn owner_filter_for(
+pub(crate) fn owner_filter_for(
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
 ) -> ai_memory_core::OwnerFilter {
     ai_memory_core::OwnerFilter::for_actor_context(
@@ -904,8 +1096,8 @@ async fn project_overview_handler(
 /// `memory_read_session_observations` tool so a frontend and an agent see
 /// the same page sizes and body caps.
 const SESSION_LIST_MAX_LIMIT: usize = 100;
-const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
-const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
+pub(crate) const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
+pub(crate) const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
 const SESSION_OBSERVATIONS_MIN_BODY_CHARS: usize = 200;
 const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 
@@ -1046,7 +1238,7 @@ async fn session_observations_handler(
 /// `ai_memory_consolidate::projection::cap_text_with_marker`, which the MCP
 /// tool uses; duplicated here because the web crate does not depend on the
 /// consolidation pipeline.
-fn cap_body(body: &str, max_chars: usize) -> String {
+pub(crate) fn cap_body(body: &str, max_chars: usize) -> String {
     let total = body.chars().count();
     if total <= max_chars {
         return body.to_owned();
@@ -1303,6 +1495,40 @@ struct SessionObservationsQuery {
 }
 
 #[derive(Debug, Serialize)]
+struct ApiHistory {
+    workspace: String,
+    project: String,
+    path: String,
+    total: u64,
+    offset: usize,
+    limit: usize,
+    versions: Vec<ai_memory_store::PageVersion>,
+    diff: ApiHistoryDiff,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiHistoryDiff {
+    /// `None` when `to` replaced nothing at this path.
+    from: Option<ApiHistorySide>,
+    to: ApiHistorySide,
+    /// `same`, `changed` or `too_large`.
+    status: &'static str,
+    /// Why a `too_large` diff was refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// The output line cap cut `hunks` short.
+    truncated: bool,
+    hunks: Vec<crate::diff::Hunk>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiHistorySide {
+    id: String,
+    title: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ApiSessionList {
     sessions: Vec<SessionSummary>,
 }
@@ -1321,6 +1547,9 @@ struct ApiSessionObservations {
 
 #[derive(Debug, Serialize)]
 struct ApiPage {
+    /// Id of the latest version, the token a conditional MCP write or delete
+    /// passes back. It changes with every new version, so the ETag does too.
+    id: String,
     workspace: String,
     project: String,
     path: String,
@@ -1477,6 +1706,47 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recent_cursor_validates_rfc3339_and_bounded_payload() {
+        for value in [
+            "2026-09-30T10:00:00Z",
+            "2026-09-30T10:00:00.123456789-03:00",
+            "1969-12-31T23:59:59.999999999Z",
+        ] {
+            assert!(super::recent_instant(value).is_ok(), "{value}");
+        }
+        for value in [
+            "2026-09-30",
+            "2026-09-30 10:00:00Z",
+            "2026-09-30T10:00:00",
+            "2026-09-30T10:00:00Z[UTC]",
+            "2026-09-30T10:00:00+0300",
+            "2026-09-30T10:00:00.1234567890Z",
+        ] {
+            assert!(super::recent_instant(value).is_err(), "{value}");
+        }
+        let cursor = super::RecentCursor {
+            v: 1,
+            workspace: super::WorkspaceId::new(),
+            project: super::ProjectId::new(),
+            since: "2000-01-01T00:00:00Z".into(),
+            updated_at: "2026-09-30T10:00:00Z".into(),
+            path: "page.md".into(),
+        };
+        let raw = super::encode_recent_cursor(&cursor).unwrap();
+        assert_eq!(super::decode_recent_cursor(&raw).unwrap().path, "page.md");
+        let invalid = super::RecentCursor {
+            path: "../page.md".into(),
+            ..cursor
+        };
+        assert!(super::encode_recent_cursor(&invalid).is_err());
+        assert!(super::decode_recent_cursor(&"a".repeat(8194)).is_err());
+        assert!(super::decode_recent_cursor("e30").is_err());
+        for invalid in [format!("{raw}="), "+w".into(), "/w".into()] {
+            assert!(super::decode_recent_cursor(&invalid).is_err());
+        }
+    }
+
     use super::{internal_error, serves_handoff_body};
     use ai_memory_core::{AuthLevel, OwnerFilter};
     use axum::{Extension, body::to_bytes};

@@ -11,11 +11,11 @@ delayed post-tool, stop, or session-end tail from an older process must not
 redirect a newer session's unscoped reads.
 
 Since v1.39 that pointer is **keyed by the caller's own coordinate** by
-default (`per_actor`), so two harnesses in one project — or two operators on
-one server — cannot overwrite each other's notion of "current project".
+default (`per_actor`), so two harnesses in one project, or two operators on
+one server, cannot overwrite each other's notion of "current project".
 
-Before v1.39 the default was a single process-wide slot (`single`). That is
-right for exactly one harness at a time and collapses as soon as there are
+Before v1.39 the default was a single process-wide slot (`single`). That
+works for exactly one harness at a time and breaks as soon as there are
 two: a hook firing from `~/repo-A` overwrites the slot that a concurrent
 `memory_query` (with no explicit project) in `~/repo-B` was about to read.
 Because unscoped **writes** resolve through the same pointer, that could also
@@ -32,9 +32,10 @@ The `[auto_scope]` config block still selects the mode explicitly, including
 | `per_session` | `session_id`           | Session-aware clients/bridges that forward the hook session id on every MCP request. |
 | `per_actor`   | `(qualified identity, session_id)`, with an identity-only no-session slot | **Default.** Isolates parallel harnesses and separate operators. Falls back to the shared slot for a caller with no coordinate, and for an install where nothing has ever been keyed (no lifecycle hooks); fails closed on a genuine session mismatch. |
 
-Both opt-in modes still publish foreground activity to the single slot in
-parallel, so a caller with no actor identity (anonymous probe, legacy code
-path) sees the most recently active project rather than an empty pointer.
+The `per_actor` and `per_session` isolation modes still publish foreground
+activity to the single slot in parallel, so a caller with no actor identity
+(anonymous probe, legacy code path) sees the most recently active project
+rather than an empty pointer.
 Non-foreground events refresh only their exact keyed entry when one exists.
 That preserves legacy behavior without letting a delayed tail take over, but
 it is not per-session isolation; use explicit `workspace` + `project`
@@ -53,8 +54,18 @@ Scope resolution is centralized in `ai_memory_store::ScopeResolver` and its
 explicit helpers:
 
 - `lookup_existing_scope` for read, search, maintenance, retention, embed, and
-  destructive paths. It never creates workspaces or projects.
-- `create_explicit_scope` for explicit write/create paths only.
+  destructive paths. It never creates workspaces, projects, or renames. Within
+  the named workspace it accepts an exact project name, the canonical
+  path-style name derived from a stored hostful git identity, or the v2
+  basename only when that compatibility key identifies one UUID.
+- `create_explicit_scope` for explicit write/create paths only. Existing
+  identity-backed rows are authorized and may be promoted to the canonical
+  name inside one writer transaction; unrelated or ambiguous candidates are
+  never merged. The promoting APIs return `ResolvedWriteScope` metadata rather
+  than silently discarding it; runtime callers ask Wiki to refresh/checkpoint
+  that scope's `_meta.md` after the SQL commit, and disclose failures for
+  startup manifest repair. Reserved profile/global helpers use a no-promotion
+  resolver because those names cannot be repository compatibility keys.
 - `resolve_many_existing_scopes` for multi-project search scopes, with
   deduplication and max-scope validation.
 - `ScopeResolver::resolve_read_args` and `resolve_write_args` for MCP tools
@@ -115,14 +126,20 @@ pointers. The durable `SessionId` stored for hook observations remains global:
 if another owner reuses an already-owned id, ai-memory drops that hook before it
 can append observations or publish a pointer for the foreign actor.
 
+Pointers hold project ids, not names, so the default repository-path project
+name ([`identity_style`](marker-file.md#naming-projects-by-repository-path-identity_style),
+#1033) is published and resolved exactly like any other. Static clients derive
+that name from normalized `upstream`, then `origin`; only a checkout without a
+valid remote uses its folder basename.
+
 Owner and agent are what identify a session; scope is not. The same operator's
 session legitimately produces events in another project when its cwd moves, so
-a differing `(workspace, project)` is recorded rather than rejected — see
+a differing `(workspace, project)` is recorded rather than rejected. See
 [`[routing] mid_session`](marker-file.md#mid-session-navigation-routing-mid_session)
 for how those events are attributed. The one exception is a terminal event: a
 `SessionEnd` naming a different scope than its session is not that session's
-end, so it is dropped rather than ending someone else's session — unless it
-comes from the session's own cwd. Then the scope drifted under the same
+end, so it is dropped rather than ending someone else's session, unless it
+comes from the session's own cwd. In that case the scope drifted under the same
 directory (a `.ai-memory.toml` appeared mid-session), and the end closes the
 session in the scope it was recorded in.
 
@@ -169,6 +186,19 @@ subprocess the startup id rather than the resumed id. Restart Claude Code after
 when no `CLAUDE_CODE_SESSION_ID` is available instead of silently degrading to
 the shared single slot.
 
+Meta Muse Code's entry is the same bridge with `--agent muse`: Muse gives its
+stdio MCP servers `MUSE_SESSION_ID`, the session id its hooks report, and the
+bridge forwards that one. Each mode reads only its own variable, so a Claude
+Code started from a Muse shell (or the reverse) never forwards the outer
+harness's id, and the Muse bridge also fails closed without `MUSE_SESSION_ID`.
+
+The same binary also runs session-less, as `ai-memory mcp-bridge
+--no-session-id`: the stdio entry `install-mcp` writes for every other client
+when the server's token lives in `[auth].bearer_token_file`. It forwards no
+session id, not even an inherited `CLAUDE_CODE_SESSION_ID`, so those clients
+stay static MCP clients and pass `workspace` + `project`; they never touch a
+per-session pointer.
+
 Use `per_session` only when your client or bridge can send the same
 opaque session id from the hook payload on each MCP request as
 `X-Memory-Actor-Session-Id`, native MCP metadata as above, or `Mcp-Session-Id`. Otherwise
@@ -198,7 +228,7 @@ For built-in installs that use static MCP config, prefer:
 ## Pairing with multi-user mode
 
 `per_actor` is most useful when the engine is in multi-user mode (see
-[`docs/users.md`](users.md)) — each native API credential resolves through
+[`docs/users.md`](users.md)): each native API credential resolves through
 `api_credentials` to its owning `users` row, so the auth middleware tags
 every request with the right `user`. With `[auto_scope] mode = "per_actor"`, two
 authenticated users running concurrent agent sessions through the same
@@ -213,9 +243,9 @@ configs, use explicit `workspace` + `project` arguments for concurrent windows.
 
 ## Surviving a restart
 
-The pointer is process memory: restarting the daemon — which is exactly what
-the packages tell you to do after an upgrade — empties it, including for
-sessions that are still open. Until the next foreground hook event lands, every
+The pointer is process memory. Restarting the daemon, which the packages tell
+you to do after an upgrade, empties it, including for sessions that are still
+open. Until the next foreground hook event lands, every
 keyed read misses, and an unscoped read used to resolve through the baked
 default scope and report an empty project through the success path. Nothing in
 the answer or the log said "scope unresolved", so an agent asking "what do we
@@ -223,12 +253,12 @@ have here?" was told "nothing" while thousands of observations sat in the DB.
 
 `serve` therefore seeds a **read-side fallback slot** at startup from the most
 recently active project already recorded in SQLite, so a keyed miss right after
-a restart degrades to real data instead of an empty default. Four bounds keep
-that narrow:
+a restart degrades to real data instead of an empty default. Four bounds limit
+it:
 
 - **Reads only.** The seed is a reconstruction, not an observed publish, so it
   lives in its own slot. An unscoped **write** still resolves as if nothing
-  were published — it fails closed on a genuine mismatch and otherwise uses the
+  were published: it fails closed on a genuine mismatch and otherwise uses the
   configured default, exactly as before. Nothing in a restart should retarget
   where a page lands.
 - **Keyed entries are never reconstructed**, so a keyed hit still wins and
@@ -265,16 +295,16 @@ observable changes:
 
 | your setup | before | after |
 |---|---|---|
-| one harness, hooks installed | shared slot | keyed slot for that session — same project |
-| static MCP client (bearer, no session id) | shared slot | that operator's identity-only slot — same project |
+| one harness, hooks installed | shared slot | keyed slot for that session, same project |
+| static MCP client (bearer, no session id) | shared slot | that operator's identity-only slot, same project |
 | client that forwards no identity at all | shared slot | shared slot, unchanged |
-| **MCP-only install, no lifecycle hooks** | shared slot | shared slot — nothing is ever keyed, so the fallback applies |
+| **MCP-only install, no lifecycle hooks** | shared slot | shared slot; nothing is ever keyed, so the fallback applies |
 | two harnesses / two operators | one slot, last write wins | one slot each |
 
-The single behavioural change is deliberate: a client that forwards a session
+The one behavioural change is deliberate: a client that forwards a session
 id which does **not** match any published hook activity no longer inherits the
-shared slot. Answering it from there is what routed a request into whichever
-project published last — on a shared server, potentially another operator's.
+shared slot. Answering it from there routed a request into whichever
+project published last, which on a shared server could be another operator's.
 Such a caller now resolves to the server's configured default instead.
 
 To restore the old behaviour exactly:

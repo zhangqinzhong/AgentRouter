@@ -52,9 +52,26 @@ pub fn looks_like_scaffolding(candidate: &str) -> bool {
         return true;
     }
 
-    // A markup/context block: `<ide_opened_file>…`, `<system-reminder>…`,
-    // `<user_info>…`. Requires a closing bracket so a bare comparison like
-    // "< 5ms is fine" stays prose.
+    if looks_like_markup_block(trimmed) {
+        return true;
+    }
+
+    // A decorated shell prompt echoed into the paste.
+    if trimmed.starts_with(PROMPT_DECORATION) {
+        return true;
+    }
+
+    false
+}
+
+/// `true` when `candidate` opens with a markup/context block:
+/// `<ide_opened_file>…`, `<system-reminder>…`, `<user_info>…`,
+/// `<task-notification>…`. Requires a closing bracket so a bare comparison
+/// like "< 5ms is fine" stays prose, and a bare tag name so an opening tag
+/// with attributes (`<pasted_content id="87e5">`, a user paste) stays prose.
+#[must_use]
+pub fn looks_like_markup_block(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
     if let Some(rest) = trimmed.strip_prefix('<')
         && let Some(tag) = rest.split('>').next()
         && !tag.is_empty()
@@ -66,13 +83,22 @@ pub fn looks_like_scaffolding(candidate: &str) -> bool {
     {
         return true;
     }
-
-    // A decorated shell prompt echoed into the paste.
-    if trimmed.starts_with(PROMPT_DECORATION) {
-        return true;
-    }
-
     false
+}
+
+/// `true` when `candidate` opens with the instruction files Codex injects as a
+/// user message: `# AGENTS.md instructions for <cwd>` when a project
+/// `AGENTS.md` contributes, a bare `# AGENTS.md instructions` when only the
+/// global `~/.codex/AGENTS.md` does. The text is the user's or the
+/// repository's standing rules, not something the user typed in the session.
+#[must_use]
+pub fn looks_like_codex_instructions(candidate: &str) -> bool {
+    candidate
+        .trim_start()
+        .strip_prefix("# AGENTS.md instructions")
+        .is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with(" for ") || rest.starts_with(['\n', '\r'])
+        })
 }
 
 #[cfg(test)]
@@ -146,6 +172,22 @@ mod tests {
     fn a_hyphenated_word_alone_is_not_an_identifier() {
         // No digits and no brackets, so it stays prose even without a space.
         assert!(!looks_like_scaffolding("well-done"));
+    }
+
+    #[test]
+    fn both_codex_instruction_headers_are_recognized() {
+        assert!(looks_like_codex_instructions(
+            "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>rules</INSTRUCTIONS>"
+        ));
+        assert!(looks_like_codex_instructions(
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>rules</INSTRUCTIONS>"
+        ));
+        assert!(!looks_like_codex_instructions(
+            "# AGENTS.md instructionsets are confusing"
+        ));
+        assert!(!looks_like_codex_instructions(
+            "update the AGENTS.md instructions for the release flow"
+        ));
     }
 
     #[test]

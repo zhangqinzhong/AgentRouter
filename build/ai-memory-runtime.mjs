@@ -5,15 +5,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const memoryVersion = "2.5.2";
+export const memoryVersion = "3.0.0";
 // Release assets are pinned independently of the release API. Downloading a
 // replacement under the same tag cannot silently replace the bundled runtime.
 const assets = {
-  "darwin-arm64": ["ai-memory-macos-aarch64.tar.gz", "160881fab2be3d2e9cf64f656da517c961c1e14ff4987d75a70ee1c71e17e9ef"],
-  "darwin-x64": ["ai-memory-macos-x86_64.tar.gz", "35fe9b036707c587cfe75e21bbe4a49b00eac2018a047352970fd53d787e9c4a"],
-  "linux-arm64": ["ai-memory-linux-aarch64.tar.gz", "813e962b10b51877948805a3dc73bcbae512c143e18772e8ca170f1f83fd2ce7"],
-  "linux-x64": ["ai-memory-linux-x86_64.tar.gz", "acbf6ee84e744a9ab0a8e133a3eefbbb77811d6b4d0ca9a281e664358c1a1fc8"],
-  "win32-x64": ["ai-memory-windows-x86_64.zip", "7bc4dab235feb7a26496338feb756515bf6e47ef5f0eaa4fe0e5dcaabead32d3"]
+  "darwin-arm64": ["ai-memory-macos-aarch64.tar.gz", "2b7142add73ce69efe7f36627efaff3d17b9bcce7c46c92e2732bb7f6286b5af"],
+  "darwin-x64": ["ai-memory-macos-x86_64.tar.gz", "05afc07505284e0c01104fd5b9ad6c705f11271eff54279fdbda11abcb121722"],
+  "linux-arm64": ["ai-memory-linux-aarch64.tar.gz", "1f96cae23f91c0671a482aec34f1aaa779fca33a19fdd9fd4e9299502dbec40f"],
+  "linux-x64": ["ai-memory-linux-x86_64.tar.gz", "649aff2858e3a8fb4209ffbf11d5f5552594a2371dbb0dd9b0eac3a50f5d45cb"],
+  "win32-x64": ["ai-memory-windows-x86_64.zip", "95b7b1b35f8c84fd98bead0705e05751c279ee98902feda75902bcf341dfa85d"]
 };
 
 export async function prepareMemoryRuntime({ platform = process.platform, arch = process.arch, fromSource = process.env.AR_MEMORY_BUILD_FROM_SOURCE === "1" } = {}) {
@@ -55,7 +55,7 @@ export async function prepareMemoryRuntime({ platform = process.platform, arch =
       cpSync(path.join(root, "vendor", "ai-memory", "LICENSE"), path.join(stage, "LICENSE"));
       if (platform !== "win32") chmodSync(path.join(stage, executable), 0o755);
       const binarySha256 = createHash("sha256").update(readFileSync(path.join(stage, executable))).digest("hex");
-      writeFileSync(path.join(stage, "manifest.json"), JSON.stringify({ version: memoryVersion, platform, arch, binarySha256, sourceCommit: "7580b74d0fb9d14a6d949dc92f5ea8bb7feb3c83", archiveSha256: fromSource ? null : asset[1] }, null, 2));
+      writeFileSync(path.join(stage, "manifest.json"), JSON.stringify({ version: memoryVersion, platform, arch, binarySha256, sourceCommit: "dbe928e3b64414c619435df887ed344ff83887a5", archiveSha256: fromSource ? null : asset[1] }, null, 2));
       renameSync(stage, destination);
     } finally {
       rmSync(stage, { recursive: true, force: true });

@@ -1,17 +1,21 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::Duration;
 
+use ai_memory_client::sanitize_external_text;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use regex::Regex;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 use walkdir::WalkDir;
+
+mod agentmemory;
+mod mcp;
+#[cfg(test)]
+mod test_http;
 
 const IMPORT_VERSION: &str = "omc-wiki-v1";
 const CONVERSATION_IMPORT_VERSION: &str = "external-conversation-v1";
@@ -37,6 +41,10 @@ enum Commands {
     OmcWiki(OmcArgs),
     /// Replay a generic external conversation through ai-memory's hook API.
     ExternalConversation(ConversationArgs),
+    /// Import the Obsidian vault agentmemory's `obsidian-export` writes.
+    AgentmemoryVault(agentmemory::vault::VaultArgs),
+    /// Import an agentmemory `ExportData` JSON file.
+    AgentmemoryExport(agentmemory::export::ExportArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -298,6 +306,8 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Commands::OmcWiki(args) => run_omc(args).await,
         Commands::ExternalConversation(args) => run_conversation(args).await,
+        Commands::AgentmemoryVault(args) => agentmemory::vault::run(args).await,
+        Commands::AgentmemoryExport(args) => agentmemory::export::run(args).await,
     }
 }
 
@@ -527,6 +537,11 @@ fn plan_external_conversation(
     server_url: &str,
 ) -> Result<ConversationPlan> {
     validate_label(workspace, "workspace", 128)?;
+    ai_memory_client::reject_sensitive(&serde_json::json!([
+        workspace,
+        server_url,
+        file.to_string_lossy().as_ref()
+    ]))?;
     let metadata = fs::metadata(file)
         .with_context(|| format!("read conversation source {}", file.display()))?;
     if !metadata.is_file() {
@@ -540,12 +555,18 @@ fn plan_external_conversation(
     }
     let bytes = fs::read(file).with_context(|| format!("read {}", file.display()))?;
     let source_sha256 = sha256_hex(&bytes);
-    let mut envelope: ConversationEnvelope =
-        serde_json::from_slice(&bytes).context("parse generic conversation JSON")?;
+    let mut envelope: ConversationEnvelope = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow!("parse generic conversation JSON: invalid schema"))?;
 
+    ai_memory_client::reject_sensitive(&serde_json::json!({
+        "project": envelope.project, "source": envelope.source, "session_id": envelope.session_id,
+    }))?;
     envelope.project = validate_label(&envelope.project, "project", 128)?.to_owned();
     envelope.source = validate_source_name(&envelope.source)?.to_owned();
-    envelope.session_id = validate_label(&envelope.session_id, "session_id", 256)?.to_owned();
+    if envelope.session_id.len() > 256 || envelope.session_id.chars().any(char::is_control) {
+        bail!("session_id must be bounded and free of control characters");
+    }
+    validate_label(&envelope.session_id, "session_id", 256)?;
     if envelope.messages.is_empty() {
         bail!("conversation must contain at least one message");
     }
@@ -704,8 +725,16 @@ fn planned_hook_event(
     event: &str,
     role: Option<ConversationRole>,
     source_event: Option<&str>,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
 ) -> Result<PlannedHookEvent> {
+    ai_memory_client::reject_sensitive(
+        &serde_json::json!({"session_id": stable_session_id, "event": event, "source_event": source_event}),
+    )?;
+    if let Some(id) = body.get("session_id") {
+        ai_memory_client::reject_sensitive(id)?;
+    }
+    ai_memory_client::sanitize_external_value(&mut body)?;
+    ai_memory_client::check_body(&body)?;
     let body_bytes = serde_json::to_vec(&body)?;
     let ingest_key = event_ingest_key(stable_session_id, index, event, &body_bytes);
     let url = build_hook_url(
@@ -717,6 +746,7 @@ fn planned_hook_event(
         &ingest_key,
         source_event,
     )?;
+    ai_memory_client::reject_sensitive(&serde_json::json!(url))?;
     Ok(PlannedHookEvent {
         index,
         event: event.to_owned(),
@@ -864,63 +894,13 @@ fn truncate_utf8(input: &str, max_bytes: usize) -> String {
     while end > 0 && !input.is_char_boundary(end) {
         end -= 1;
     }
+    if let Some(start) = input[..end].rfind('[')
+        && input[start..].starts_with("[REDACTED")
+        && !input[start..end].contains(']')
+    {
+        end = start;
+    }
     input[..end].to_owned()
-}
-
-fn sanitize_external_text(input: &str) -> String {
-    let controls_removed: String = input
-        .chars()
-        .map(|ch| {
-            if ch == '\n' || ch == '\r' || ch == '\t' || !ch.is_control() {
-                ch
-            } else {
-                '\u{fffd}'
-            }
-        })
-        .collect();
-    secret_patterns()
-        .iter()
-        .fold(controls_removed, |text, rule| {
-            rule.regex.replace_all(&text, rule.replacement).into_owned()
-        })
-}
-
-struct RedactionRule {
-    regex: Regex,
-    replacement: &'static str,
-}
-
-fn secret_patterns() -> &'static [RedactionRule] {
-    static RULES: OnceLock<Vec<RedactionRule>> = OnceLock::new();
-    RULES.get_or_init(|| {
-        vec![
-            RedactionRule {
-                regex: Regex::new(
-                    r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-                )
-                .unwrap(),
-                replacement: "[REDACTED PRIVATE KEY]",
-            },
-            RedactionRule {
-                regex: Regex::new(
-                    r"\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16})\b",
-                )
-                .unwrap(),
-                replacement: "[REDACTED CREDENTIAL]",
-            },
-            RedactionRule {
-                regex: Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}").unwrap(),
-                replacement: "$1[REDACTED]",
-            },
-            RedactionRule {
-                regex: Regex::new(
-                    r#"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)\b(\s*[:=]\s*)(?:\"[^\"\r\n]{6,}\"|'[^'\r\n]{6,}'|[^\s,;]{6,})"#,
-                )
-                .unwrap(),
-                replacement: "$1$2[REDACTED]",
-            },
-        ]
-    })
 }
 
 fn conversation_manifest(plan: &ConversationPlan) -> ConversationManifest {
@@ -1089,39 +1069,17 @@ struct ParsedMarkdown {
     pinned: bool,
 }
 
-/// Split an OMC page into frontmatter fields and body. The fence is found
-/// the way `ai_memory_wiki::markdown::parse` finds it: past a leading UTF-8
-/// BOM, and with either LF or CRLF fence lines, since a wiki checked out on
-/// Windows with `core.autocrlf=true` has CRLF throughout. Missing it dropped
-/// kind, tier, tags and pin, and imported the YAML block as body text.
+/// Split an OMC page into frontmatter fields and body.
 fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
     let mut out = ParsedMarkdown::default();
-    let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
-    let (rest, newline) = if let Some(rest) = input.strip_prefix("---\r\n") {
-        (Some(rest), "\r\n")
-    } else {
-        (input.strip_prefix("---\n"), "\n")
-    };
-    let close = format!("\n---{newline}");
-    let body = if let Some(rest) = rest {
-        if let Some(end) = rest.find(&close) {
-            let yaml = rest[..end].trim_end_matches('\r');
-            let value: serde_yaml::Value =
-                serde_yaml::from_str(yaml).context("parse YAML frontmatter")?;
-            if let Some(map) = value.as_mapping() {
-                out.title = yaml_string(map, "title");
-                out.kind = yaml_string(map, "kind");
-                out.tier = yaml_string(map, "tier");
-                out.pinned = yaml_bool(map, "pinned").unwrap_or(false);
-                out.tags = yaml_tags(map);
-            }
-            rest[end + close.len()..].to_owned()
-        } else {
-            input.to_owned()
-        }
-    } else {
-        input.to_owned()
-    };
+    let (frontmatter, body) = split_frontmatter(input)?;
+    if let Some(map) = frontmatter.as_ref() {
+        out.title = yaml_string(map, "title");
+        out.kind = yaml_string(map, "kind");
+        out.tier = yaml_string(map, "tier");
+        out.pinned = yaml_bool(map, "pinned").unwrap_or(false);
+        out.tags = yaml_tags(map);
+    }
     if out.title.is_none() {
         out.title = first_h1(&body);
     }
@@ -1129,21 +1087,66 @@ fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
     Ok(out)
 }
 
-fn yaml_key(key: &str) -> serde_yaml::Value {
-    serde_yaml::Value::String(key.into())
+/// Split a Markdown page into its YAML frontmatter mapping (when the block
+/// is a mapping) and its body. The fence is found the way
+/// `ai_memory_wiki::markdown::parse` finds it: past a leading UTF-8 BOM, and
+/// with either LF or CRLF fence lines, since a wiki checked out on Windows
+/// with `core.autocrlf=true` has CRLF throughout. Missing it dropped kind,
+/// tier, tags and pin, and imported the YAML block as body text.
+fn split_frontmatter(input: &str) -> Result<(Option<YamlMap>, String)> {
+    let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+    let (rest, newline) = if let Some(rest) = input.strip_prefix("---\r\n") {
+        (Some(rest), "\r\n")
+    } else {
+        (input.strip_prefix("---\n"), "\n")
+    };
+    let close = format!("\n---{newline}");
+    let Some(rest) = rest else {
+        return Ok((None, input.to_owned()));
+    };
+    let Some(end) = rest.find(&close) else {
+        return Ok((None, input.to_owned()));
+    };
+    let yaml = rest[..end].trim_end_matches('\r');
+    let value: serde_json::Value =
+        serde_saphyr::from_str_with_options(yaml, frontmatter_parse_options())
+            .context("parse YAML frontmatter")?;
+    let map = match value {
+        serde_json::Value::Object(map) => Some(map),
+        _ => None,
+    };
+    Ok((map, rest[end + close.len()..].to_owned()))
 }
-fn yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(yaml_key(key))
+
+/// Read frontmatter the way `serde_yaml` 0.9 did, matching the server's
+/// parser: YAML 1.2 booleans (`pinned: yes` stays a string, so not pinned),
+/// `<<` as an ordinary key, and `.inf`/`.nan` kept as text instead of
+/// failing the page.
+fn frontmatter_parse_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+        ignore_binary_tag_for_string: true,
+        reject_non_finite_typeless_float: false,
+        with_snippet: false,
+        budget: serde_saphyr::budget! { max_depth: 128 },
+    }
+}
+
+type YamlMap = serde_json::Map<String, serde_json::Value>;
+
+fn yaml_string(map: &YamlMap, key: &str) -> Option<String> {
+    map.get(key)
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .filter(|s| !s.trim().is_empty())
 }
-fn yaml_bool(map: &serde_yaml::Mapping, key: &str) -> Option<bool> {
-    map.get(yaml_key(key)).and_then(|v| v.as_bool())
+fn yaml_bool(map: &YamlMap, key: &str) -> Option<bool> {
+    map.get(key).and_then(|v| v.as_bool())
 }
-fn yaml_tags(map: &serde_yaml::Mapping) -> Vec<String> {
-    match map.get(yaml_key("tags")) {
-        Some(serde_yaml::Value::Sequence(seq)) => seq
+fn yaml_tags(map: &YamlMap) -> Vec<String> {
+    match map.get("tags") {
+        Some(serde_json::Value::Array(seq)) => seq
             .iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect(),
@@ -1355,6 +1358,10 @@ impl ImportClient {
     }
 
     async fn post_hook_batch(&self, events: &[PlannedHookEvent]) -> Result<HookBatchDelivery> {
+        for event in events {
+            ai_memory_client::check_body(&event.body)?;
+            ai_memory_client::reject_sensitive(&serde_json::json!(event.url))?;
+        }
         let items: Vec<_> = events
             .iter()
             .map(|event| HookBatchItem {
@@ -1386,8 +1393,8 @@ fn enc_path(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use crate::test_http::{read_http_request, respond_json};
+    use std::net::TcpListener;
     use std::thread;
     use tempfile::tempdir;
 
@@ -1414,47 +1421,6 @@ mod tests {
         })
     }
 
-    fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 4096];
-        let header_end = loop {
-            let read = stream.read(&mut buf).unwrap();
-            assert!(read > 0, "client closed before sending complete headers");
-            bytes.extend_from_slice(&buf[..read]);
-            if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            })
-            .unwrap_or(0);
-        while bytes.len() - header_end < content_length {
-            let read = stream.read(&mut buf).unwrap();
-            assert!(read > 0, "client closed before sending complete body");
-            bytes.extend_from_slice(&buf[..read]);
-        }
-        (
-            headers,
-            bytes[header_end..header_end + content_length].to_vec(),
-        )
-    }
-
-    fn respond_json(stream: &mut TcpStream, status: &str, body: &str) {
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        stream.flush().unwrap();
-    }
-
     #[test]
     fn parses_omc_frontmatter() {
         let parsed = parse_markdown("---\ntitle: T\nkind: rule\ntier: procedural\ntags: [a, b]\npinned: true\nextra: ignored\n---\n# Body\ntext").unwrap();
@@ -1464,6 +1430,18 @@ mod tests {
         assert_eq!(parsed.tags, vec!["a", "b"]);
         assert!(parsed.pinned);
         assert_eq!(parsed.body, "# Body\ntext");
+    }
+
+    /// `serde_yaml` 0.9 read YAML 1.1 words as text, so `pinned: yes` never
+    /// pinned a page and a bare `tags:` word stayed a one-item list.
+    #[test]
+    fn omc_frontmatter_keeps_yaml_1_1_words_as_text() {
+        let parsed = parse_markdown("---\ntitle: yes\npinned: yes\ntags: on\n---\nbody").unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("yes"));
+        assert!(!parsed.pinned);
+        assert_eq!(parsed.tags, vec!["on"]);
+
+        assert!(parse_markdown("---\ntitle: a\ntitle: b\n---\nbody").is_err());
     }
 
     /// A wiki checked out on Windows with `core.autocrlf=true`, or saved
@@ -1883,5 +1861,305 @@ mod tests {
             }
             .accepted_every_event(3)
         );
+    }
+    #[tokio::test]
+    async fn shared_key_sanitation_precedes_plan_manifest_transport_and_exact_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut raw = serde_json::json!({"session_id":"native", "cwd":"/work/app", "output":"\u{1b}[32mresult\u{1b}[0m\u{202e} token=getToken() Bearer abcdefghijklmnop", "nested":[{"accessToken":"fixture-value", "refreshToken":"fixture-value", "clientSecret":"fixture-value", "privateKey":"fixture-value", "x-api-key":"fixture-value", "OPENAI_API_KEY":"fixture-value", "cookie":"fixture-value", "credentials":"fixture-value"}], "metrics":{"max_tokens":12,"input_tokens":34,"token_count":0,"token_usage":1.25}});
+        raw["metrics"] = serde_json::json!({"max_tokens":12,"input_tokens":34,"token_count":0,"token_usage":1.25,"output_tokens":9007199254740993_u64,"total_tokens":89,"totalTokens":89,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"prompt_tokens":5,"completion_tokens":7,"reasoning_tokens":11});
+        raw["key_forms"] = serde_json::json!([{"auth":"fixture-value","jwt":"fixture-value","pwd":"fixture-value","bearer":"fixture-value","session_key":"fixture-value","signature":"fixture-value"}]);
+        raw["plural_forms"] = serde_json::json!([{
+            "api_keys":"fixture-value", "access_keys":"fixture-value", "private_keys":"fixture-value", "session_keys":"fixture-value",
+            "apiKeys":["fixture-value"], "accessKeys":["fixture-value"], "privateKeys":["fixture-value"], "sessionKeys":["fixture-value"]
+        }]);
+        raw["controls"] = serde_json::json!({"author":"fixture-value","authority":"fixture-value","key":"fixture-value","keys":["fixture-value"]});
+        raw["numeric_cases"] = serde_json::json!({"token":123456,"access_tokens":123456,"private_token_count":123456,"auth_token_usage":123456,"token_usage":{"input_tokens":12}});
+        let planned = || {
+            planned_hook_event(
+                &base,
+                "w",
+                "p",
+                "native",
+                0,
+                "post-tool-use",
+                None,
+                None,
+                raw.clone(),
+            )
+            .unwrap()
+        };
+        let event = planned();
+        assert_eq!(event.body["session_id"], raw["session_id"]);
+        assert_eq!(event.body["cwd"], raw["cwd"]);
+        assert_eq!(
+            event.body["output"],
+            sanitize_external_text(raw["output"].as_str().unwrap())
+        );
+        assert_eq!(event.body["metrics"], raw["metrics"]);
+        assert!(
+            event.body["nested"][0]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| value == "[REDACTED]")
+        );
+        assert_eq!(
+            event.ingest_key,
+            event_ingest_key(
+                "native",
+                0,
+                "post-tool-use",
+                &serde_json::to_vec(&event.body).unwrap()
+            )
+        );
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(
+            event.body["key_forms"][0]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| value == "[REDACTED]")
+        );
+        assert!(
+            event.body["plural_forms"][0]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| value == "[REDACTED]")
+        );
+        assert!(
+            event.body["numeric_cases"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| value == "[REDACTED]")
+        );
+        assert!(event.body["controls"] == raw["controls"]);
+        assert!(
+            serde_json::to_vec(&event.body["metrics"]).unwrap()
+                == serde_json::to_vec(&raw["metrics"]).unwrap()
+        );
+        assert!(!serialized.contains("abcdefghijklmnop"));
+        ai_memory_client::check_body(&event.body).unwrap();
+        let expected = event.body.clone();
+        let server = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let bytes = read_http_request(&mut socket).1;
+                let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(wire[0]["body"], expected);
+                bodies.push(bytes);
+                if attempt == 1 {
+                    respond_json(&mut socket, "200 OK", r#"{"accepted":1}"#);
+                }
+            }
+            assert_eq!(bodies[0], bodies[1]);
+        });
+        let client = ImportClient::new(&base).unwrap();
+        assert!(client.post_hook_batch(&[event]).await.is_err());
+        let retry = planned();
+        assert_eq!(serde_json::to_string(&retry).unwrap(), serialized);
+        assert_eq!(
+            client.post_hook_batch(&[retry]).await.unwrap().ack.accepted,
+            1
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sanitized_redaction_markers_survive_utf8_byte_caps_in_bodies_and_titles() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        for (role, cap) in [
+            ("user", MAX_USER_MESSAGE_BYTES),
+            ("assistant", MAX_EXTENSION_MESSAGE_BYTES),
+        ] {
+            let prefix = format!("{}{} token=", "界", "x".repeat(cap - 16));
+            let source = serde_json::json!({"project":"p","source":"chatgpt","session_id":"native", "messages":[
+                {"role":"user", "content":"clean control"},
+                {"role":role, "content":format!("{prefix}abcdefghijklmnop\u{1b}[0m\u{202e}")},
+                {"role":"assistant", "content":format!("{} token=abcdefghijklmnop", "x".repeat(145))}
+            ]});
+            let file = write_conversation(root, source);
+            let plan = plan_external_conversation(&file, "w", DEFAULT_SERVER_URL).unwrap();
+            for event in &plan.events {
+                ai_memory_client::check_body(&event.body).unwrap();
+                for field in ["prompt", "message", "title"] {
+                    if let Some(text) = event.body[field].as_str() {
+                        assert!(!text.contains("abcdefghijklmnop"));
+                        assert!(!text.contains(['\u{1b}', '\u{202e}']));
+                        if let Some(at) = text.rfind('[') {
+                            assert!(
+                                text[at..].contains(']'),
+                                "redaction marker must remain whole"
+                            );
+                        }
+                    }
+                }
+            }
+            let body = &plan.events[2].body;
+            let text = body[if role == "user" { "prompt" } else { "message" }]
+                .as_str()
+                .unwrap();
+            assert!(text.len() <= cap);
+            assert!(plan.events[3].body["title"].as_str().unwrap().len() <= 160);
+            let again = plan_external_conversation(&file, "w", DEFAULT_SERVER_URL).unwrap();
+            assert_eq!(plan.transcript_sha256, again.transcript_sha256);
+            assert_eq!(plan.events[2].ingest_key, again.events[2].ingest_key);
+        }
+    }
+
+    #[tokio::test]
+    async fn sensitive_native_identity_is_refused_before_manifest_and_http_with_unicode_control() {
+        let root = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut control = sample_conversation();
+        control["session_id"] = " sessão-界-opaque ".into();
+        let file = write_conversation(root.path(), control.clone());
+        let plan = plan_external_conversation(&file, "w", &base).unwrap();
+        assert_eq!(plan.external_session_id, " sessão-界-opaque ");
+        assert_eq!(
+            plan.events[0].body["external_session_id"],
+            control["session_id"]
+        );
+        assert_eq!(
+            plan.stable_session_id,
+            stable_external_session_id("w", "memory-lab", "chatgpt", " sessão-界-opaque ")
+        );
+        for (field, value) in [
+            ("project", "sk-1234567890abcdefghijklmnop"),
+            ("source", "sk-1234567890abcdefghijklmnop"),
+            ("session_id", "sk-1234567890abcdefghijklmnop"),
+            ("session_id", "\tnative"),
+            ("session_id", "native\n"),
+            ("session_id", "\rnative"),
+        ] {
+            let mut source = control.clone();
+            source[field] = value.into();
+            let file = write_conversation(root.path(), source);
+            assert!(
+                plan_external_conversation(&file, "w", &base).is_err(),
+                "sensitive native identity must be refused before planning"
+            );
+            let manifest = root.path().join(format!("{field}-manifest.json"));
+            let error = run_conversation(ConversationArgs {
+                file,
+                workspace: Some("w".into()),
+                server_url: base.clone(),
+                apply: true,
+                manifest_out: Some(manifest.clone()),
+                create_destination: false,
+                show_body: true,
+            })
+            .await;
+            assert!(error.is_err(), "sensitive source identity must be refused");
+            assert!(!error.unwrap_err().to_string().contains("abcdefghijklmnop"));
+            assert!(
+                !manifest.exists(),
+                "refused identity cannot create a manifest"
+            );
+            assert!(
+                listener.accept().is_err(),
+                "refused identity cannot reach HTTP"
+            );
+        }
+        let mut oversized = control.clone();
+        oversized["session_id"] = format!("native{}", " ".repeat(256)).into();
+        let oversized_file = write_conversation(root.path(), oversized);
+        assert!(
+            plan_external_conversation(&oversized_file, "w", &base).is_err(),
+            "native ID bounds apply before trimming"
+        );
+        let file = write_conversation(root.path(), control);
+        let manifest = root.path().join("control-manifest.json");
+        run_conversation(ConversationArgs {
+            file,
+            workspace: Some("w".into()),
+            server_url: base,
+            apply: false,
+            manifest_out: Some(manifest.clone()),
+            create_destination: false,
+            show_body: true,
+        })
+        .await
+        .unwrap();
+        assert!(manifest.exists());
+        assert!(listener.accept().is_err());
+    }
+
+    #[tokio::test]
+    async fn preview_and_manifest_use_scrubbed_bodies_and_digest() {
+        let root = tempdir().unwrap();
+        let mut source = sample_conversation();
+        source["messages"][1]["content"] =
+            "界 token=abcdefghijklmnop[REDACTED] literal [REDACTED PRIVATE KEY]".into();
+        let file = write_conversation(root.path(), source.clone());
+        let plan = plan_external_conversation(&file, "w", DEFAULT_SERVER_URL).unwrap();
+        let preview = serde_json::to_string(&plan.events).unwrap();
+        assert!(!preview.contains("abcdefghijklmnop"));
+        assert!(preview.contains("literal [REDACTED PRIVATE KEY]"));
+        source["messages"][1]["content"] =
+            sanitize_external_text(source["messages"][1]["content"].as_str().unwrap()).into();
+        let safe_file = root.path().join("safe-conversation.json");
+        fs::write(&safe_file, serde_json::to_vec(&source).unwrap()).unwrap();
+        let safe = plan_external_conversation(&safe_file, "w", DEFAULT_SERVER_URL).unwrap();
+        assert_eq!(plan.transcript_sha256, safe.transcript_sha256);
+        assert_eq!(plan.events[2].ingest_key, safe.events[2].ingest_key);
+        let manifest = root.path().join("manifest.json");
+        run_conversation(ConversationArgs {
+            file,
+            workspace: Some("w".into()),
+            server_url: DEFAULT_SERVER_URL.into(),
+            apply: false,
+            manifest_out: Some(manifest.clone()),
+            create_destination: false,
+            show_body: true,
+        })
+        .await
+        .unwrap();
+        let stored = fs::read_to_string(manifest).unwrap();
+        assert!(!stored.contains("abcdefghijklmnop"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).unwrap()["transcript_sha256"],
+            plan.transcript_sha256
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_body_authority_is_refused_before_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let clean = planned_hook_event(
+            &base,
+            "w",
+            "p",
+            "sessão-界",
+            0,
+            "session-start",
+            None,
+            None,
+            serde_json::json!({"session_id":"sessão-界"}),
+        )
+        .unwrap();
+        let mut client = ImportClient::new(&base).unwrap();
+        client.client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        for field in ["workspace", "project", "actor", "author_id", "headers"] {
+            let mut attack = clean.clone();
+            attack.body[field] = "forged".into();
+            assert!(client.post_hook_batch(&[attack]).await.is_err());
+            assert!(
+                listener.accept().is_err(),
+                "forged body authority must be refused before POST"
+            );
+        }
+        ai_memory_client::check_body(&clean.body).unwrap();
     }
 }

@@ -119,7 +119,7 @@ export class MemoryClients {
     });
   }
 
-  async change(id: string, targetOrKind: string, kindOrOperation: "mcp" | "hooks" | "preview" | "install" | "remove", operationOrProfiles?: "preview" | "install" | "remove" | ProfileConfig[], profiles: ProfileConfig[] = []): Promise<{ output: string; path: string }> {
+  async change(id: string, targetOrKind: string, kindOrOperation: "mcp" | "hooks" | "preview" | "install" | "remove", operationOrProfiles?: "preview" | "install" | "remove" | ProfileConfig[], profiles: ProfileConfig[] = []): Promise<{ output: string; path: string; before?: string }> {
     const legacy = targetOrKind === "mcp" || targetOrKind === "hooks";
     const targetId = legacy ? "global" : targetOrKind;
     const kind = (legacy ? targetOrKind : kindOrOperation) as "mcp" | "hooks";
@@ -155,7 +155,7 @@ export class MemoryClients {
       if (before && !previous) throw new Error("An unmanaged MiMo memory plugin already exists.");
       if (previous && (!before || digest(before) !== previous.afterSha256)) throw new Error("MiMo memory plugin changed after installation.");
       const content = renderMimoPlugin(this.runtimeExecutable(), this.dataDir, this.endpoint);
-      if (operation === "preview") return { output: content, path: file };
+      if (operation === "preview") return { output: content, path: file, before: this.shownBefore(before) };
       this.atomicWrite(file, Buffer.from(content));
       this.recordIfChanged(id, targetId, kind, file, before, previous);
       return { output: "MiMo session capture installed. Reload MiMo to load the plugin.", path: file };
@@ -170,7 +170,7 @@ export class MemoryClients {
       if (errors.length || !object(value) || (value.mcp !== undefined && !object(value.mcp))) throw new Error("MiMo configuration must be a JSONC object with an MCP object.");
       if (value.mcp?.["ai-memory"] !== undefined && !previous) throw new Error("An unmanaged ai-memory MCP entry already exists. Review it before replacing it.");
       if (previous && (!before || !matchingMcpEntry(before, previous))) throw new Error("Client configuration changed. Review and reconcile the previous integration before reinstalling.");
-      if (operation === "preview") return { output: `Configure ai-memory MCP at ${file}\nServer: ${this.endpoint}/mcp\nAuthentication: local memory token\nSession capture: connect the MiMo plugin separately`, path: file };
+      if (operation === "preview") return { output: `Server: ${this.endpoint}/mcp\nAuthentication: local memory token\nSession capture: connect the MiMo plugin separately`, path: file, before: this.shownBefore(before) };
       const token = this.authToken();
       if (!token) throw new Error("Start memory before connecting MiMo.");
       const content = applyEdits(source, modify(source, ["mcp", "ai-memory"], { type: "remote", url: `${this.endpoint}/mcp`, enabled: true, headers: { Authorization: `Bearer ${token}` } }, { formattingOptions: { insertSpaces: true, tabSize: 2 } }));
@@ -196,7 +196,13 @@ export class MemoryClients {
       throw error;
     }
     if (operation === "install") this.recordIfChanged(id, targetId, kind, file, before, previous);
-    return { output, path: file };
+    return operation === "preview" ? { output, path: file, before: this.shownBefore(before) } : { output, path: file };
+  }
+
+  private shownBefore(before: Buffer | null): string {
+    const token = this.authToken();
+    const text = before?.toString("utf8") ?? "";
+    return token ? text.split(token).join("[redacted]") : text;
   }
 
   private recordIfChanged(id: string, target: string, kind: string, file: string, before: Buffer | null, previous?: Receipt) {

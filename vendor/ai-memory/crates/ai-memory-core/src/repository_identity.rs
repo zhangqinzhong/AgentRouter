@@ -78,6 +78,150 @@ pub const MARKER_FILENAMES: &[&str] = &[MARKER_FILENAME];
 /// bound exists so a client cannot park an arbitrary blob in a unique index.
 pub const MAX_IDENTITY_LEN: usize = 512;
 
+/// Maximum former project names accepted from one local marker.
+pub const MAX_MARKER_ALIASES: usize = 16;
+
+/// Maximum UTF-8 byte length of one marker alias.
+pub const MAX_MARKER_ALIAS_LEN: usize = 128;
+
+/// Why a marker alias list was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerAliasError {
+    /// More aliases were supplied than the bounded routing request permits.
+    TooMany,
+    /// One alias was empty, oversized, escaped, or not a plain project token.
+    Invalid,
+    /// The marker or wire value did not use the portable array grammar.
+    InvalidWire,
+}
+
+impl std::fmt::Display for MarkerAliasError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TooMany => "too many marker aliases",
+            Self::Invalid => "invalid marker alias",
+            Self::InvalidWire => "invalid marker aliases wire value",
+        })
+    }
+}
+
+impl std::error::Error for MarkerAliasError {}
+
+/// A validated, bounded marker alias list.
+///
+/// Construction is limited to the parsers below, so store and router APIs
+/// cannot accidentally iterate an unbounded caller-supplied vector.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct MarkerAliases(Vec<String>);
+
+impl MarkerAliases {
+    /// Validate, trim, and first-occurrence-deduplicate aliases.
+    pub fn new<I, S>(aliases: I) -> Result<Self, MarkerAliasError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut normalized = Vec::new();
+        let mut count = 0_usize;
+        for alias in aliases {
+            count += 1;
+            if count > MAX_MARKER_ALIASES {
+                return Err(MarkerAliasError::TooMany);
+            }
+            let alias = alias.as_ref().trim();
+            let mut chars = alias.chars();
+            let first_valid = chars.next().is_some_and(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_uppercase() || c.is_ascii_digit()
+            });
+            if !first_valid
+                || alias.len() > MAX_MARKER_ALIAS_LEN
+                || !chars.all(|c| {
+                    c.is_ascii_lowercase()
+                        || c.is_ascii_uppercase()
+                        || c.is_ascii_digit()
+                        || matches!(c, '.' | '_' | '-')
+                })
+            {
+                return Err(MarkerAliasError::Invalid);
+            }
+            if !normalized.iter().any(|seen| seen == alias) {
+                normalized.push(alias.to_owned());
+            }
+        }
+        Ok(Self(normalized))
+    }
+
+    /// Borrow the bounded names in deterministic marker order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether the marker supplied no effective aliases.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Stable cache-key representation; aliases cannot contain this separator.
+    #[must_use]
+    pub fn cache_key(&self) -> String {
+        self.0.join("\u{1f}")
+    }
+}
+
+/// Decode the compact JSON-array query value used by hook and handoff clients.
+pub fn accept_wire_aliases(raw: Option<&str>) -> Result<MarkerAliases, MarkerAliasError> {
+    let Some(raw) = raw else {
+        return Ok(MarkerAliases::default());
+    };
+    if raw.len() > (MAX_MARKER_ALIAS_LEN + 6) * MAX_MARKER_ALIASES + 2 {
+        return Err(MarkerAliasError::TooMany);
+    }
+    if raw.contains('\\') {
+        return Err(MarkerAliasError::Invalid);
+    }
+    let aliases: Vec<String> =
+        serde_json::from_str(raw).map_err(|_| MarkerAliasError::InvalidWire)?;
+    MarkerAliases::new(aliases)
+}
+
+/// Parse the portable local-marker alias grammar.
+///
+/// The only accepted declaration is one root-level, one-line
+/// `aliases = ["name", "other"]`. Strings may contain only the alias token
+/// characters accepted by [`MarkerAliases::new`]; escapes, trailing commas,
+/// comments/trailing junk, duplicate declarations, multiline arrays, and an
+/// `aliases` key inside any table are rejected.
+pub fn parse_marker_aliases(text: &str) -> Result<Option<MarkerAliases>, MarkerAliasError> {
+    let mut found = None;
+    let mut in_table = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_table = true;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "aliases" {
+            continue;
+        }
+        if in_table || found.is_some() {
+            return Err(MarkerAliasError::InvalidWire);
+        }
+        let value = value.trim();
+        if value.contains('\\') {
+            return Err(MarkerAliasError::Invalid);
+        }
+        let aliases: Vec<String> =
+            serde_json::from_str(value).map_err(|_| MarkerAliasError::InvalidWire)?;
+        found = Some(MarkerAliases::new(aliases)?);
+    }
+    Ok(found)
+}
+
 /// Which rung of the chain produced an identity.
 ///
 /// Stored alongside the identity so an operator can tell a globally unique
@@ -154,6 +298,87 @@ pub struct RepositoryIdentity {
     pub identity: String,
     /// Which rung produced it.
     pub source: IdentitySource,
+}
+
+/// Backward-compatible project scope metadata stored in `_meta.md`.
+///
+/// Identity and source are optional together for manifests created before
+/// identity-aware reindex. Canonical and legacy names are persisted as
+/// consistency assertions and recomputed from the accepted identity on import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectManifest {
+    /// Human-readable project name.
+    pub project: String,
+    /// Optional checkout path used for local routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    /// Full repository identity, including the host for a remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Source of the stored repository identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_source: Option<IdentitySource>,
+    /// Optional consistency assertion, never an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_name: Option<String>,
+    /// Optional consistency assertion, never an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_name: Option<String>,
+}
+
+/// Operator-visible warning for a committed project-name promotion whose
+/// derived wiki manifest still needs repair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ManifestWarning(String);
+
+impl ManifestWarning {
+    /// Build the warning emitted when the SQL promotion committed but the
+    /// `_meta.md` refresh/checkpoint failed.
+    pub fn promotion_refresh_failed(error: impl std::fmt::Display) -> Self {
+        Self(format!(
+            "project name promotion committed, but _meta.md refresh/checkpoint failed and needs startup repair: {error}"
+        ))
+    }
+
+    /// Build the warning emitted when no wiki handle is available to refresh
+    /// the promoted scope.
+    #[must_use]
+    pub fn wiki_unavailable() -> Self {
+        Self(
+            "project name promotion committed; wiki handle unavailable, so _meta.md needs startup repair"
+                .to_owned(),
+        )
+    }
+
+    /// Borrow the stable wire message.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ManifestWarning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for ManifestWarning {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+/// Stable transport context for an operation that may follow a committed
+/// project-name promotion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestWarningContext {
+    /// Repair warning when promotion committed before the operation failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<ManifestWarning>,
 }
 
 /// Everything the chain needs, gathered by the caller.
@@ -273,8 +498,46 @@ pub fn split_name_base(identity: &str) -> String {
     } else {
         segments.join("-")
     };
-    let mut out = String::with_capacity(tail.len());
-    for c in tail.chars() {
+    project_name_from(&tail)
+}
+
+/// The project name a `path`-style repository takes (#1033): the git remote's
+/// whole repository path without its host, spelled the way
+/// [`split_name_base`] spells names (`github.com/acme/group/api` →
+/// `acme-group-api`). `None` for any identity that is not a git remote — a
+/// declared identity or name keeps the name it already has.
+#[must_use]
+pub fn path_style_name(identity: &RepositoryIdentity) -> Option<String> {
+    if identity.source != IdentitySource::GitRemote {
+        return None;
+    }
+    let key = styled_key(identity, IdentityStyle::Path);
+    let joined: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
+    Some(project_name_from(&joined.join("-")))
+}
+
+/// The v2 basename key for a stored git-remote identity.
+///
+/// Before path-style naming, a checkout commonly created its project from the
+/// repository folder (`github.com/acme/api` → `api`). Dual-key lookup keeps
+/// that key readable after an in-place promotion to [`path_style_name`].
+#[must_use]
+pub fn legacy_basename_name(identity: &RepositoryIdentity) -> Option<String> {
+    if identity.source != IdentitySource::GitRemote {
+        return None;
+    }
+    identity
+        .identity
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .map(project_name_from)
+}
+
+/// Characters a project name cannot carry become `-`, runs collapse, and the
+/// ends are trimmed; an empty result is `repository`.
+fn project_name_from(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
         let keep = c.is_alphanumeric() || matches!(c, '-' | '_' | '.');
         let c = if keep { c } else { '-' };
         if !(c == '-' && out.ends_with('-')) {
@@ -286,6 +549,65 @@ pub fn split_name_base(identity: &str) -> String {
         "repository".to_owned()
     } else {
         out
+    }
+}
+
+/// How a remote-derived key spells a repository (#1033).
+///
+/// Chosen by `identity_style` in `.ai-memory.toml`. Either way captures route
+/// by the full #708 identity; the style only decides the canonical name of a
+/// remote-backed project. Phase-5 clients explicitly send `Path` and name it
+/// from the whole repository path without the host ([`path_style_name`]), so
+/// worktrees and clones agree on a short name. The Rust/wire default remains
+/// `HostPath` because pre-Phase-5 clients omitted their implicit host-path
+/// style; preserving omission is the version-skew boundary. Two forges hosting the same path must never
+/// share a project, so the store falls back to the hostful/legacy-safe name when
+/// the path name is already claimed by another full identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityStyle {
+    /// `acme/api` — the repository path without its host.
+    Path,
+    /// `github.com/acme/api` — the full #708 identity and legacy wire default.
+    #[default]
+    HostPath,
+}
+
+impl IdentityStyle {
+    /// The marker spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::HostPath => "host_path",
+        }
+    }
+
+    /// Parse the marker spelling. Unknown values are `None`, so a typo is
+    /// reported instead of silently picking a style.
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim() {
+            "path" => Some(Self::Path),
+            "host_path" => Some(Self::HostPath),
+            _ => None,
+        }
+    }
+}
+
+/// The key `identity` takes under `style`.
+///
+/// Only a git-remote identity has a host to drop. A declared identity, a
+/// manifest name or a folder name is already the key a person chose (or the
+/// only one there is), so every style returns it unchanged.
+#[must_use]
+pub fn styled_key(identity: &RepositoryIdentity, style: IdentityStyle) -> String {
+    if style == IdentityStyle::HostPath || identity.source != IdentitySource::GitRemote {
+        return identity.identity.clone();
+    }
+    match identity.identity.split_once('/') {
+        Some((_host, path)) if !path.is_empty() => path.to_owned(),
+        _ => identity.identity.clone(),
     }
 }
 
@@ -732,6 +1054,153 @@ mod tests {
     }
 
     const CASES: &str = include_str!("../fixtures/remote_identity_cases.json");
+
+    /// #1033: `path` drops only a git remote's host, `host_path` is the #708
+    /// identity unchanged, and declared or folder keys never change.
+    #[test]
+    fn styled_keys_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        for case in cases["styled_key"].as_array().unwrap() {
+            let identity = RepositoryIdentity {
+                identity: case["identity"].as_str().unwrap().to_owned(),
+                source: IdentitySource::from_str_opt(case["source"].as_str().unwrap()).unwrap(),
+            };
+            for (style, field) in [
+                (IdentityStyle::Path, "path"),
+                (IdentityStyle::HostPath, "host_path"),
+            ] {
+                assert_eq!(
+                    styled_key(&identity, style),
+                    case[field].as_str().unwrap(),
+                    "{} as {field}",
+                    identity.identity
+                );
+            }
+            assert_eq!(
+                path_style_name(&identity).as_deref(),
+                case["path_name"].as_str(),
+                "{} path name",
+                identity.identity
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_basename_is_derived_only_from_remote_identities() {
+        let remote = RepositoryIdentity {
+            identity: "github.com/acme/group/api".into(),
+            source: IdentitySource::GitRemote,
+        };
+        assert_eq!(legacy_basename_name(&remote).as_deref(), Some("api"));
+        assert_eq!(
+            legacy_basename_name(&RepositoryIdentity {
+                identity: "acme/platform".into(),
+                source: IdentitySource::Explicit,
+            }),
+            None
+        );
+    }
+
+    /// The explicit marker spellings every client forwards. Omission is not a
+    /// third spelling; each server applies its own versioned default.
+    #[test]
+    fn identity_style_values_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        for case in cases["identity_style"].as_array().unwrap() {
+            let value = case["value"].as_str().unwrap();
+            assert_eq!(
+                IdentityStyle::from_str_opt(value).map(IdentityStyle::as_str),
+                case["style"].as_str(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_aliases_are_bounded_trimmed_deduplicated_and_reject_paths() {
+        assert_eq!(
+            MarkerAliases::new([" former-name ", "legacy_name", "former-name"])
+                .unwrap()
+                .as_slice(),
+            ["former-name", "legacy_name"]
+        );
+        for invalid in [
+            "",
+            "-leading",
+            "../foreign",
+            "nested/project",
+            "bad\u{7}name",
+        ] {
+            assert_eq!(
+                MarkerAliases::new([invalid]),
+                Err(MarkerAliasError::Invalid),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(
+            MarkerAliases::new((0..=MAX_MARKER_ALIASES).map(|index| format!("a{index}"))),
+            Err(MarkerAliasError::TooMany)
+        );
+        assert_eq!(
+            MarkerAliases::new([format!("a{}", "x".repeat(MAX_MARKER_ALIAS_LEN))]),
+            Err(MarkerAliasError::Invalid)
+        );
+    }
+
+    #[test]
+    fn marker_alias_values_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        for case in cases["marker_aliases"].as_array().unwrap() {
+            let toml = case["toml"].as_str().unwrap();
+            let parsed = parse_marker_aliases(toml);
+            match case["status"].as_str().unwrap() {
+                "valid" => {
+                    let got = parsed.unwrap().unwrap().as_slice().to_vec();
+                    let expected = case["aliases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>();
+                    assert_eq!(got, expected, "{toml}");
+                }
+                "absent" => assert_eq!(parsed.unwrap(), None, "{toml}"),
+                "invalid" => assert!(parsed.is_err(), "{toml}"),
+                status => panic!("unknown fixture status {status}"),
+            }
+        }
+    }
+
+    /// The same path on two forges keeps two `host_path` keys but shares one
+    /// `path` key — the collision adoption must detect, never merge.
+    #[test]
+    fn the_path_style_alone_cannot_tell_two_forges_apart() {
+        let remote = |identity: &str| RepositoryIdentity {
+            identity: identity.to_owned(),
+            source: IdentitySource::GitRemote,
+        };
+        let github = remote("github.com/acme/api");
+        let gitlab = remote("gitlab.com/acme/api");
+        assert_eq!(
+            styled_key(&github, IdentityStyle::Path),
+            styled_key(&gitlab, IdentityStyle::Path)
+        );
+        assert_ne!(
+            styled_key(&github, IdentityStyle::HostPath),
+            styled_key(&gitlab, IdentityStyle::HostPath)
+        );
+    }
+
+    #[test]
+    fn identity_style_parses_only_its_marker_spellings() {
+        assert_eq!(IdentityStyle::default(), IdentityStyle::HostPath);
+        for style in [IdentityStyle::Path, IdentityStyle::HostPath] {
+            assert_eq!(IdentityStyle::from_str_opt(style.as_str()), Some(style));
+        }
+        for bad in ["", "Path", "host-path", "hostpath", "owner_repo"] {
+            assert_eq!(IdentityStyle::from_str_opt(bad), None, "{bad}");
+        }
+    }
 
     /// The fixture every client normaliser is checked against. The Rust core
     /// is the reference: a case that fails here is a wrong fixture, a case

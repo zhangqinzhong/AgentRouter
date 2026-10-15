@@ -1,8 +1,8 @@
 //! Envelope validation and the stable retry identity.
 //!
 //! Validate input before enqueueing so malformed events cannot block a batch.
-//! Body values, including `_ai_memory_capture`, are preserved for the server.
-//! These checks do not sanitize locally queued content.
+//! New body values are sanitized before hashing and persistence. Native identities
+//! are validated first; stored retry bytes are never rewritten.
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -40,7 +40,7 @@ pub const TERMINAL_EVENTS: &[&str] = &["session-end"];
 ///
 /// `deny_unknown_fields` applies to the envelope only. `body` is an opaque
 /// object: unknown keys inside it (a harness payload field, the
-/// `_ai_memory_capture` protocol block) are preserved untouched.
+/// `_ai_memory_capture` protocol block) remain untrusted and are sanitized.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputEvent {
@@ -50,7 +50,7 @@ pub struct InputEvent {
     pub agent: String,
     /// Canonical lifecycle event name, used for both `event` and `source_event`.
     pub event: String,
-    /// Harness payload, delivered verbatim.
+    /// Harness payload, sanitized at new-event ingress.
     pub body: serde_json::Value,
 }
 
@@ -62,8 +62,7 @@ pub struct ValidEvent {
     pub event: String,
     pub session_id: String,
     pub cwd: String,
-    /// Canonical JSON of the body exactly as supplied (sorted keys, no reformatting
-    /// of values). The bytes delivered later are these bytes.
+    /// Canonical JSON after ingress sanitation. Retries use these exact bytes.
     pub body_json: String,
     pub body_sha256: String,
     pub ingest_key: String,
@@ -110,6 +109,8 @@ pub fn check_actor(actor: &str) -> Result<(), String> {
 
 /// Validate a workspace or project name.
 pub fn check_scope(label: &str, value: &str) -> Result<(), String> {
+    ai_memory_client::reject_sensitive(&serde_json::json!(value))
+        .map_err(|_| format!("unsafe --{label} rejected"))?;
     is_plain(value, MAX_SCOPE_LEN)
         .then_some(())
         .ok_or_else(|| format!("--{label} must be 1..={MAX_SCOPE_LEN} printable characters"))
@@ -152,11 +153,34 @@ pub fn ingest_key(
 /// quote body content: an invalid payload must not become a log line.
 pub fn validate(
     index: usize,
-    input: InputEvent,
+    mut input: InputEvent,
     producer: &str,
     actor: &str,
 ) -> Result<ValidEvent, String> {
     let at = |detail: &str| format!("item {index}: {detail}");
+    ai_memory_client::reject_sensitive(&serde_json::json!({
+        "event_id": input.event_id, "agent": input.agent, "event": input.event,
+        "producer": producer, "actor": actor,
+    }))
+    .map_err(|_| at("sensitive envelope rejected"))?;
+    let identities: Vec<_> = [
+        "session_id",
+        "cwd",
+        "producer",
+        "actor",
+        "event_id",
+        "agent",
+        "event",
+        "ingest_key",
+    ]
+    .iter()
+    .filter_map(|key| input.body.get(key))
+    .collect();
+    ai_memory_client::reject_sensitive(&serde_json::json!(identities))
+        .map_err(|_| at("unsafe body identity rejected"))?;
+    ai_memory_client::sanitize_external_value(&mut input.body)
+        .map_err(|_| at("unsafe hook body rejected"))?;
+    ai_memory_client::check_body(&input.body).map_err(|_| at("unsafe hook body rejected"))?;
     if !is_plain(&input.event_id, MAX_EVENT_ID_LEN) {
         return Err(at(&format!(
             "event_id must be 1..={MAX_EVENT_ID_LEN} printable characters"

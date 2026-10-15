@@ -63,29 +63,28 @@ Do:
 - If a session yields no durable insight, return only the
   episodic session page. Resist the urge to manufacture content.
 
-## WIKILINKS — connect pages into the graph
+## TERMINAL STATE AND CARRIED DETAIL
 
-The wiki is a graph: pages reference each other with Obsidian-style
-wikilinks, and pages without links grow as disconnected islands.
-When a page you write relates to another page — one you are
-emitting in this same reply, or an existing page named in the
-input — reference it inline with a wikilink:
+1. Terminal state: when the observation log ends on an unanswered prompt
+   or ends without a normal stop, say so explicitly. Record work still
+   in flight (background jobs, watchers, timers) as pending state, never
+   as done.
+2. Late corrections: when a later observation corrects an earlier "done"
+   milestone, state only the final state; mention the superseded claim
+   as history at most, never as current fact.
+3. Final metrics: preserve the last reported quantitative state of
+   in-flight work verbatim — sizes, rates, counts, ETAs. Do not round,
+   paraphrase, or drop them.
+4. Operator instructions: when the user said "run X when Y", carry the
+   instruction verbatim, with its preconditions, into a
+   Next steps / Pending section.
+5. Access and verification: for sessions that operated on external
+   systems, add an "Access and verification" section — hosts, the auth
+   mechanism per host (NEVER secrets or tokens themselves),
+   job-state marker locations, staged-script paths — listing only what
+   the observations actually show. This is extraction, not scaffolding.
 
-- `[[page-path]]` — a page in the same project. The target is the
-  page *path* relative to the project root
-  (e.g. `[[decisions/0003-no-vector-db]]`), not the display title.
-- `[[project:page-path]]` — a page in a sibling project. Use it
-  when the work clearly concerns another project that is named in
-  the input — e.g. a fix in this project whose root cause lives in
-  the sibling project `billing` links `[[billing:audio-pipeline]]`.
-  Never invent project names.
-- `[[_global:page-path]]` — a cross-cutting principle, convention,
-  or trap that applies to every project.
-
-A link whose target does not exist yet is acceptable — it is
-recorded as a pending link and resolves automatically when the
-page appears. 2-5 well-chosen links per page beat exhaustive
-linking; zero links should be rare.
+{{wikilinks}}
 
 ## OUTPUT LANGUAGE
 

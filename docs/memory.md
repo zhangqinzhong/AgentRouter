@@ -1,6 +1,6 @@
 # Integrated project memory
 
-AgentRouter embeds the ai-memory 2.5.2 runtime and presents its knowledge,
+AgentRouter embeds the ai-memory 3.0.0 runtime and presents its knowledge,
 search, sessions, handoffs, client integration, and maintenance tools through
 native React pages. It does not embed the upstream web UI. Upstream source,
 license, and provenance are in `vendor/ai-memory` and `vendor/ai-memory.UPSTREAM.md`.
@@ -184,10 +184,10 @@ or finalizing A, and A accepted another message afterwards. Both persisted
 sessions remained open. The native-runtime regression also checks that prompts
 after the last completion boundary are excluded from recall.
 
-## Runtime upgrade to 2.5.2
+## Runtime upgrade to 3.0.0
 
-The bundled source and all five platform archive checksums are pinned to v2.5.2
-(commit `7580b74d0fb9d14a6d949dc92f5ea8bb7feb3c83`). Integration tests run the
+The bundled source and all five platform archive checksums are pinned to v3.0.0
+(commit `dbe928e3b64414c619435df887ed344ff83887a5`). Integration tests run the
 actual macOS binary with isolated data and client homes, including Codex hook
 capture, ZCode lifecycle behavior, MiMo idle capture/recall, and client installers.
 This does not certify a new live conversation in every desktop client. Back up

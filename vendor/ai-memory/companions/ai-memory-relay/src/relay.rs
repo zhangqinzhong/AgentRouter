@@ -96,6 +96,9 @@ pub fn init(
     identity::check_actor(actor).map_err(anyhow::Error::msg)?;
     identity::check_scope("workspace", workspace).map_err(anyhow::Error::msg)?;
     identity::check_scope("project", project).map_err(anyhow::Error::msg)?;
+    ai_memory_client::reject_sensitive(&serde_json::json!({
+        "producer": producer, "actor": actor, "server_url": server_url,
+    }))?;
     let binding = Binding {
         server_url: http::normalize_server_url(server_url)?,
         producer: producer.to_owned(),
@@ -228,6 +231,7 @@ pub fn status(dir: &Path) -> Result<Report> {
         "max_attempts": stats.max_attempts,
         "receipts": stats.receipts,
         "known_sessions": stats.known_sessions,
+        "receipt_outcomes": stats.receipt_outcomes,
         "limits": {
             "pending_items": queue::MAX_PENDING_ITEMS,
             "pending_bytes": queue::MAX_PENDING_BYTES,
@@ -273,6 +277,8 @@ pub fn flush(dir: &Path, options: &FlushOptions) -> Result<Report> {
 fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
     let mut queue = Queue::open(dir)?;
     let binding = queue.binding()?;
+    identity::check_scope("workspace", &binding.workspace).map_err(anyhow::Error::msg)?;
+    identity::check_scope("project", &binding.project).map_err(anyhow::Error::msg)?;
     queue.prune(crate::now_ms())?;
     let token = Token::from_env()?;
     let authenticated = token.is_some();
@@ -281,8 +287,10 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
     let started = Instant::now();
     let mut deferred: HashSet<(String, String)> = HashSet::new();
     let mut delivered = 0usize;
+    let mut outcomes = ack::outcome_counts();
     let mut batches = 0usize;
     let mut blocked_sessions = 0usize;
+    let mut dropped_unsafe = 0usize;
     let mut failure: Option<String> = None;
     let mut backed_off = false;
 
@@ -295,7 +303,7 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         let now = crate::now_ms();
         let base = binding.server_url.clone();
         let for_cost = binding.clone();
-        let batch: Batch =
+        let mut batch: Batch =
             queue.select_batch(MAX_BATCH_ITEMS, MAX_BATCH_BYTES, now, &deferred, |item| {
                 item_cost(&base, &for_cost, item)
             })?;
@@ -303,22 +311,46 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         if batch.items.is_empty() {
             break;
         }
+        let mut items = Vec::new();
+        let mut unsafe_keys: Vec<(String, &str)> = Vec::new();
+        for item in &batch.items {
+            let wire = serde_json::from_str(&item.body_json).ok().and_then(|body| {
+                ai_memory_client::reject_sensitive(&serde_json::json!([
+                    item.event_id,
+                    item.agent,
+                    item.event,
+                    item.session_id,
+                ]))
+                .ok()?;
+                ai_memory_client::check_body(&body).ok()?;
+                let url = http::item_url(&binding.server_url, &binding, item);
+                ai_memory_client::reject_sensitive(&serde_json::json!(url)).ok()?;
+                Some(BatchItem { url, body })
+            });
+            if let Some(wire) = wire {
+                items.push(wire);
+            } else {
+                // Only an item queued before local sanitation can fail here. It
+                // is never sent, and retaining it would hold its session's later
+                // events on every flush, so it leaves the queue as a local
+                // policy drop; the receipt keeps its key replay-protected.
+                unsafe_keys.push((item.ingest_key.clone(), "dropped_policy"));
+            }
+        }
+        if !unsafe_keys.is_empty() {
+            dropped_unsafe += queue.confirm(&unsafe_keys, now)?;
+            batch
+                .items
+                .retain(|item| !unsafe_keys.iter().any(|(key, _)| *key == item.ingest_key));
+        }
+        if items.is_empty() {
+            continue;
+        }
         batches += 1;
         let keys: Vec<String> = batch.items.iter().map(|i| i.ingest_key.clone()).collect();
         // Durable, and before the request: a lost ack must not restart the
-        // 30-day clock on the next run.
+        // 30-day clock on the next run. Unsafe items were already excluded.
         queue.stamp_attempt(&keys, now)?;
-        let items: Vec<BatchItem> = batch
-            .items
-            .iter()
-            .map(|item| {
-                Ok(BatchItem {
-                    url: http::item_url(&binding.server_url, &binding, item),
-                    body: serde_json::from_str(&item.body_json)
-                        .context("stored body is no longer valid JSON")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         // Selection checked the retry window once; a retry inside this batch can
         // still cross it. Carry the batch's tightest expiry into the sender so
         // every attempt is re-checked against it.
@@ -411,12 +443,23 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
 
         // Only now, after the whole response was validated, does anything leave
         // the queue.
-        let confirmed: Vec<String> = accepted
+        let confirmed: Vec<(String, &str)> = accepted
             .iter()
-            .filter_map(|idx| batch.items.get(*idx))
-            .map(|item| item.ingest_key.clone())
+            .filter_map(|idx| {
+                batch.items.get(*idx).map(|item| {
+                    (
+                        item.ingest_key.clone(),
+                        ack::acknowledged_outcome(&parsed, *idx),
+                    )
+                })
+            })
             .collect();
         delivered += queue.confirm(&confirmed, crate::now_ms())?;
+        for (_, outcome) in &confirmed {
+            if let Some(count) = outcomes.get_mut(*outcome) {
+                *count += 1;
+            }
+        }
 
         if let Some(failed_index) = parsed.failed_index
             && let Some(item) = batch.items.get(failed_index)
@@ -447,12 +490,22 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         "acknowledged {delivered} event(s) in {batches} batch(es); {} still pending across {} session(s)",
         stats.pending_items, stats.pending_sessions
     )];
+    summary.push(format!(
+        "acknowledged_outcomes: {}",
+        serde_json::to_string(&outcomes)?
+    ));
     if backed_off {
         summary.push(
             "server answered 429: the acknowledged items were applied and the flush stopped. \
              Back off before the next run"
                 .to_owned(),
         );
+    }
+    if dropped_unsafe > 0 {
+        summary.push(format!(
+            "{dropped_unsafe} event(s) queued before local sanitation failed privacy/validation \
+             and were dropped locally, never sent; their sessions continued"
+        ));
     }
     if !deferred.is_empty() {
         summary.push(format!(

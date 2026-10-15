@@ -19,10 +19,10 @@
 //! with `run --no-autowire` or `AI_MEMORY_RUN_AUTOWIRE=false`.
 
 use std::cell::Cell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
-use ai_memory_workstream::ManagedHarness;
+use ai_memory_workstream::{ManagedHarness, OpenCodeDialect};
 use sha2::{Digest as _, Sha256};
 
 use crate::cli::{AgentChoice, InstallHooksArgs, InstallMcpArgs, McpClient};
@@ -47,6 +47,7 @@ pub(crate) fn agent_choice_for_harness(harness: ManagedHarness) -> Option<AgentC
         ManagedHarness::KiroV3 => AgentChoice::KiroCliV3,
         ManagedHarness::Grok => AgentChoice::Grok,
         ManagedHarness::Antigravity => AgentChoice::AntigravityCli,
+        ManagedHarness::Copilot => AgentChoice::CopilotCli,
         // No AgentChoice / installer support.
         ManagedHarness::Crush => return None,
     })
@@ -134,30 +135,34 @@ fn resolve_through_links(path: &Path) -> Option<PathBuf> {
 /// transcript import agree on one config home. It also records whether any
 /// value it handed out came from `--env`.
 struct LaunchEnv<'a> {
+    effective: &'a super::run::EffectiveChildEnv,
     run_env: &'a [(String, String)],
     from_run_env: Cell<bool>,
 }
 
 impl<'a> LaunchEnv<'a> {
-    fn new(run_env: &'a [(String, String)]) -> Self {
+    fn new(effective: &'a super::run::EffectiveChildEnv, run_env: &'a [(String, String)]) -> Self {
         Self {
+            effective,
             run_env,
             from_run_env: Cell::new(false),
         }
     }
 
     fn var_os(&self, name: &str) -> Option<OsString> {
-        if let Some((_, value)) = self.run_env.iter().find(|(key, _)| key == name) {
+        if self.run_env.iter().any(|(key, _)| {
+            super::run::environment_keys_equal(OsStr::new(key), OsStr::new(name), cfg!(windows))
+        }) {
             self.from_run_env.set(true);
-            return Some(OsString::from(value));
         }
-        std::env::var_os(name)
+        self.effective.get(name).map(OsStr::to_os_string)
     }
 }
 
 /// Where this launch's auto-wire installs, resolved without touching the disk.
 struct WireTargets {
     agent: AgentChoice,
+    opencode_dialect: Option<OpenCodeDialect>,
     sentinel: PathBuf,
     hook_target: anyhow::Result<PathBuf>,
     /// Whether any relocation variable behind the hook target came from `--env`.
@@ -169,33 +174,71 @@ struct WireTargets {
     /// the installer's own check (which reads ai-memory's environment) would
     /// miss it.
     shared_extensions_dir: Option<PathBuf>,
+    /// A `--scope project` Claude Code install covering the launch directory;
+    /// hooks are not wired user-level on top of it.
+    project_hooks: Option<PathBuf>,
 }
 
+#[cfg(test)]
 fn wire_targets(
     config: &Config,
     harness: ManagedHarness,
     overrides: &WireOverrides,
     run_env: &[(String, String)],
+    launch_cwd: &Path,
+) -> Option<WireTargets> {
+    let effective_env = super::run::EffectiveChildEnv::with_overrides(&config.runtime_env, run_env);
+    wire_targets_with_env(
+        config,
+        harness,
+        overrides,
+        run_env,
+        &effective_env,
+        launch_cwd,
+    )
+}
+
+fn wire_targets_with_env(
+    config: &Config,
+    harness: ManagedHarness,
+    overrides: &WireOverrides,
+    run_env: &[(String, String)],
+    effective_env: &super::run::EffectiveChildEnv,
+    launch_cwd: &Path,
 ) -> Option<WireTargets> {
     let agent = agent_choice_for_harness(harness)?;
-    let hook_env = LaunchEnv::new(run_env);
+    let opencode_dialect = match harness {
+        ManagedHarness::OpenCode => Some(OpenCodeDialect::V1),
+        ManagedHarness::OpenCode2 => Some(OpenCodeDialect::V2),
+        _ => None,
+    };
+    let project_hooks = project_scoped_claude_hooks(agent, launch_cwd);
+    let hook_env = LaunchEnv::new(effective_env, run_env);
     let hook_target = install_hooks::hook_config_target_with(agent, &|name| hook_env.var_os(name));
     let mcp_client = install_hooks::mcp_client_for_agent(agent);
-    let mcp_env = LaunchEnv::new(run_env);
+    let mcp_env = LaunchEnv::new(effective_env, run_env);
     let mcp_target = mcp_client
         .map(|client| install_mcp::mcp_config_path_with(client, &|name| mcp_env.var_os(name)));
     let sentinel = sentinel_path(
         &config.data_dir,
         agent,
         &[
+            opencode_dialect.map_or_else(
+                || "dialect:default".to_string(),
+                |dialect| format!("opencode-major:{}", dialect.major()),
+            ),
             target_key(overrides.hooks_config_file.as_deref(), Some(&hook_target)),
             target_key(overrides.mcp_config_file.as_deref(), mcp_target.as_ref()),
+            project_hooks
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |path| path.display().to_string()),
         ],
     );
     let shared_extensions_dir = match (&overrides.hooks_config_file, &hook_target) {
         (None, Ok(target)) => {
-            let launch = LaunchEnv::new(run_env);
-            let process = LaunchEnv::new(&[]);
+            let launch = LaunchEnv::new(effective_env, run_env);
+            let process_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+            let process = LaunchEnv::new(&process_env, &[]);
             install_hooks::shared_extensions_dir(agent, target, &|name| launch.var_os(name)).filter(
                 |_| {
                     install_hooks::shared_extensions_dir(agent, target, &|name| {
@@ -209,6 +252,7 @@ fn wire_targets(
     };
     Some(WireTargets {
         agent,
+        opencode_dialect,
         sentinel,
         hook_target,
         hook_relocated: hook_env.from_run_env.get(),
@@ -216,6 +260,7 @@ fn wire_targets(
         mcp_target,
         mcp_relocated: mcp_env.from_run_env.get(),
         shared_extensions_dir,
+        project_hooks,
     })
 }
 
@@ -241,6 +286,7 @@ fn target_key(injected: Option<&Path>, resolved: Option<&anyhow::Result<PathBuf>
 /// otherwise a target is pinned only when `--env` moved it, so a launch without
 /// `--env` installs exactly where the installers pick on their own.
 struct WireInstalls {
+    opencode_dialect: Option<OpenCodeDialect>,
     /// One hook install, or one per agent config for a Kiro CLI v2 home that
     /// `--env` relocated.
     hooks: Vec<InstallHooksArgs>,
@@ -255,6 +301,7 @@ struct WireInstalls {
 fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverrides) -> WireInstalls {
     let WireTargets {
         agent,
+        opencode_dialect,
         hook_target,
         hook_relocated,
         mcp_client,
@@ -263,8 +310,13 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
         shared_extensions_dir,
         ..
     } = targets;
-    let server_url = Some(config.server_url.clone());
-    let auth_token = config.auth.bearer_token.clone();
+    let infer_opencode_transition = opencode_dialect.is_some() && !config.server_url_configured();
+    let server_url = (!infer_opencode_transition).then(|| config.server_url.clone());
+    // Only an inline token is handed to the installers as an explicit value.
+    // One read from `[auth].bearer_token_file` stays out of rendered configs:
+    // hook install persists it to the hook credential files, and MCP install
+    // routes it through the bridge or an env-var reference (#552).
+    let auth_token = config.auth.renderable_bearer_token().map(str::to_owned);
     let hook_install = |config_file: Option<PathBuf>| InstallHooksArgs {
         agent,
         hooks_dir: overrides.hooks_dir.clone(),
@@ -273,6 +325,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
         as_user: None,
         apply: true,
         config_file,
+        scope: crate::cli::HookInstallScope::Global,
         project_strategy: None,
         capture_assistant: false,
         capture_mode: None,
@@ -356,8 +409,12 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
             config_file: mcp_file,
             session_aware: false,
             flavor: None,
+            token_env_var: false,
+            stdio_bridge: false,
+            bridge_data_dir: None,
         });
     WireInstalls {
+        opencode_dialect,
         hooks,
         hooks_skipped,
         mcp,
@@ -375,28 +432,104 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
 /// Production launches pass [`WireOverrides::default()`] (via
 /// [`run_from`](super::run::run_from)); the overrides exist only so the seam can
 /// be exercised without writing to the developer's real `$HOME`.
+///
+/// `launch_cwd` is the directory the harness is launched in — a `resume` may
+/// launch into a checkout other than the shell's — and is where a
+/// `--scope project` Claude Code install is looked for.
+///
+/// `skip_mcp` serves degraded offline launches: the hook install is local and
+/// idempotent, so it still runs (capture must spool offline), but registering
+/// an MCP entry pointing at a server that just proved unreachable would bake a
+/// dead endpoint into the harness config. The MCP install is skipped and the
+/// sentinel is NOT written, so the next online launch completes the wiring
+/// instead of the sentinel suppressing it forever.
+#[cfg(test)]
 pub(crate) fn ensure_wired_with(
     config: &Config,
     harness: ManagedHarness,
     overrides: &WireOverrides,
     run_env: &[(String, String)],
+    launch_cwd: &Path,
 ) {
-    let Some(targets) = wire_targets(config, harness, overrides, run_env) else {
+    let effective_env = super::run::EffectiveChildEnv::with_overrides(&config.runtime_env, run_env);
+    ensure_wired_with_env(
+        config,
+        harness,
+        overrides,
+        run_env,
+        &effective_env,
+        launch_cwd,
+        false,
+    );
+}
+
+pub(crate) fn ensure_wired_with_env(
+    config: &Config,
+    harness: ManagedHarness,
+    overrides: &WireOverrides,
+    run_env: &[(String, String)],
+    effective_env: &super::run::EffectiveChildEnv,
+    launch_cwd: &Path,
+    skip_mcp: bool,
+) {
+    let Some(targets) = wire_targets_with_env(
+        config,
+        harness,
+        overrides,
+        run_env,
+        effective_env,
+        launch_cwd,
+    ) else {
         return;
     };
     if targets.sentinel.exists() {
         return;
     }
+    if let Some(harness) = plugin_harness(targets.agent)
+        && let Some(home) = super::run::native_home(config)
+        && super::agent_plugins::enabled(harness, &home, &|name| {
+            effective_env.get(name).map(OsStr::to_os_string)
+        })
+        .is_some()
+    {
+        // No sentinel: the check is two small file reads, and a later
+        // `claude plugin uninstall` must let the next launch wire again.
+        eprintln!(
+            "ai-memory: the ai-memory plugin is enabled in {}; it carries the hooks and MCP \
+             entry, so this launch wires nothing for it.",
+            harness.agent()
+        );
+        return;
+    }
     let agent = targets.agent;
     let sentinel = targets.sentinel.clone();
+    let project_hooks = targets.project_hooks.clone();
 
-    eprintln!(
-        "ai-memory: first managed launch of {} here — wiring its ai-memory hooks + MCP so \
-         capture and recall work (disable with --no-autowire or AI_MEMORY_RUN_AUTOWIRE=false).",
-        harness.as_str()
-    );
+    if skip_mcp {
+        eprintln!(
+            "ai-memory: first managed launch of {} here while the server is unreachable — \
+             wiring its ai-memory hooks (capture spools locally); the MCP registration waits \
+             for the next online launch (disable with --no-autowire or \
+             AI_MEMORY_RUN_AUTOWIRE=false).",
+            harness.as_str()
+        );
+    } else {
+        eprintln!(
+            "ai-memory: first managed launch of {} here — wiring its ai-memory hooks + MCP so \
+             capture and recall work (disable with --no-autowire or AI_MEMORY_RUN_AUTOWIRE=false).",
+            harness.as_str()
+        );
+    }
 
-    let installs = wire_installs(config, targets, overrides);
+    let mut installs = wire_installs(config, targets, overrides);
+    if let Some(project_file) = project_hooks {
+        eprintln!(
+            "ai-memory: project-scoped ai-memory hooks found at {}; not wiring the user-level \
+             Claude Code settings on top of them.",
+            project_file.display()
+        );
+        installs.hooks.clear();
+    }
     let warn_hooks = |reason: &str| {
         eprintln!(
             "ai-memory: could not auto-install {} hooks ({reason}); continuing launch. \
@@ -405,49 +538,53 @@ pub(crate) fn ensure_wired_with(
             agent.kind().as_str()
         );
     };
-    for args in installs.hooks {
-        match install_hooks::run(config, args) {
-            Ok(()) => {
-                if let Some(dir) = &installs.shared_extensions_dir {
-                    install_hooks::warn_agents_share_extensions_dir(dir);
-                }
-            }
-            Err(error) => warn_hooks(&format!("{error:#}")),
-        }
-    }
-    if let Some(reason) = &installs.hooks_skipped {
-        warn_hooks(reason);
-    }
-
+    // Install MCP first so a major-version migration has one canonical selected
+    // entry before the hook installer infers its endpoint and credential.
     // Not every hook-capable harness has an MCP client the installer can write
     // (e.g. Pi bridges MCP through its generated extension); skip those quietly.
-    let mcp_failure = match installs.mcp {
-        // The sentinel is version-keyed, so this whole step re-runs on every
-        // upgrade. install-mcp replaces the `ai-memory` entry wholesale, so a
-        // plain re-run would overwrite a session-aware Claude Code bridge the
-        // user installed with `install-mcp --session-aware` back to static HTTP,
-        // silently disabling per_session for their MCP calls. Preserve it, in
-        // the file this launch would write.
-        Some(args)
-            if install_mcp::existing_entry_is_session_aware(
-                args.client,
-                args.config_file.as_deref(),
-                &args.name,
-            ) =>
-        {
-            eprintln!(
-                "ai-memory: keeping the existing session-aware {} MCP bridge; not \
-                 overwriting it with the static HTTP registration.",
-                harness.as_str()
-            );
-            None
+    let mcp_config_path = installs
+        .mcp
+        .as_ref()
+        .and_then(|args| args.config_file.clone());
+    let mcp_failure = if skip_mcp {
+        // Degraded offline launch: a registration pointing at the unreachable
+        // server would cost the harness its recall until the config was
+        // edited by hand. Existing registrations are untouched and degrade to
+        // no-recall for this run instead; nothing is planned, so nothing can
+        // fail or escape a confinement guard.
+        installs.mcp = None;
+        None
+    } else {
+        match installs.mcp.take() {
+            // The sentinel is version-keyed, so this whole step re-runs on every
+            // upgrade. install-mcp replaces the `ai-memory` entry wholesale, so a
+            // plain re-run would overwrite a session-aware Claude Code bridge the
+            // user installed with `install-mcp --session-aware` back to static HTTP,
+            // silently disabling per_session for their MCP calls. Preserve it, in
+            // the file this launch would write.
+            Some(args)
+                if install_mcp::existing_entry_is_session_aware(
+                    args.client,
+                    args.config_file.as_deref(),
+                    &args.name,
+                ) =>
+            {
+                eprintln!(
+                    "ai-memory: keeping the existing session-aware {} MCP bridge; not \
+                     overwriting it with the static HTTP registration.",
+                    harness.as_str()
+                );
+                None
+            }
+            Some(args) => {
+                install_mcp::run_with_opencode_dialect(config, args, installs.opencode_dialect)
+                    .err()
+                    .map(|error| format!("{error:#}"))
+            }
+            None => installs.mcp_skipped,
         }
-        Some(args) => install_mcp::run(config, args)
-            .err()
-            .map(|error| format!("{error:#}")),
-        None => installs.mcp_skipped,
     };
-    if let Some(reason) = mcp_failure {
+    if let Some(reason) = &mcp_failure {
         eprintln!(
             "ai-memory: could not auto-install the {} MCP server ({reason}); continuing \
              launch. Wire it manually with `ai-memory install-mcp --client {} --apply`.",
@@ -456,12 +593,60 @@ pub(crate) fn ensure_wired_with(
         );
     }
 
+    if installs.opencode_dialect.is_some() && mcp_failure.is_some() {
+        warn_hooks("the OpenCode MCP transition failed before hook endpoint/token inference");
+    } else {
+        for args in installs.hooks {
+            match install_hooks::run_with_opencode_dialect_and_mcp_path(
+                config,
+                args,
+                installs.opencode_dialect,
+                mcp_config_path.as_deref(),
+            ) {
+                Ok(()) => {
+                    if let Some(dir) = &installs.shared_extensions_dir {
+                        install_hooks::warn_agents_share_extensions_dir(dir);
+                    }
+                }
+                Err(error) => warn_hooks(&format!("{error:#}")),
+            }
+        }
+        if let Some(reason) = &installs.hooks_skipped {
+            warn_hooks(reason);
+        }
+    }
+
     // Record the attempt even on partial failure: re-applying an idempotent
     // install on every launch would nag and churn config. A user who wants a
     // retry can re-run install-hooks manually or delete this sentinel under
     // `<data_dir>/autowire-state/`; `ai-memory uninstall` clears them all when
-    // it removes hooks or MCP.
-    write_sentinel(&sentinel);
+    // it removes hooks or MCP. A degraded offline launch (skip_mcp) is the one
+    // exception: its wiring is deliberately half-done, so the sentinel stays
+    // unwritten and the next online launch completes the MCP half.
+    if !skip_mcp {
+        write_sentinel(&sentinel);
+    }
+}
+
+/// The marketplace plugin that covers `agent`'s wiring, when one exists.
+fn plugin_harness(agent: AgentChoice) -> Option<super::agent_plugins::PluginHarness> {
+    match agent {
+        AgentChoice::ClaudeCode => Some(super::agent_plugins::PluginHarness::ClaudeCode),
+        AgentChoice::Codex => Some(super::agent_plugins::PluginHarness::Codex),
+        _ => None,
+    }
+}
+
+/// The `--scope project` Claude Code install covering `launch_cwd`, if any.
+/// The operator chose per-checkout capture there, so auto-wire must not add
+/// the same hooks to the user-level file on top of it. The path also keys the
+/// sentinel, so suppressing hooks for this checkout never gates another one.
+fn project_scoped_claude_hooks(agent: AgentChoice, launch_cwd: &Path) -> Option<PathBuf> {
+    if agent != AgentChoice::ClaudeCode {
+        return None;
+    }
+    let path = install_hooks::project_claude_settings_local(launch_cwd);
+    install_hooks::settings_file_carries_ai_memory_hooks(&path).then_some(path)
 }
 
 #[cfg(test)]
@@ -485,12 +670,133 @@ mod tests {
             ManagedHarness::KiroV3,
             ManagedHarness::Grok,
             ManagedHarness::Antigravity,
+            ManagedHarness::Copilot,
         ] {
             assert!(
                 agent_choice_for_harness(harness).is_some(),
                 "{harness:?} must map to an AgentChoice for autowire"
             );
         }
+    }
+
+    /// A `--scope project` Claude install in the launch checkout must stop the
+    /// auto-wire from adding the same hooks to the user-level file.
+    #[test]
+    fn project_scoped_claude_hooks_suppress_the_user_level_wire() {
+        let project = tempfile::TempDir::new().unwrap();
+        let local = install_hooks::project_claude_settings_local(project.path());
+        assert_eq!(
+            project_scoped_claude_hooks(AgentChoice::ClaudeCode, project.path()),
+            None,
+            "no file, nothing to honor"
+        );
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(
+            &local,
+            r#"{"hooks":{"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/n.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            project_scoped_claude_hooks(AgentChoice::ClaudeCode, project.path()),
+            None,
+            "a third-party hook is not an ai-memory install"
+        );
+        std::fs::write(
+            &local,
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /h/.local/share/ai-memory/hooks/claude-code/stop.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            project_scoped_claude_hooks(AgentChoice::ClaudeCode, project.path()),
+            Some(local)
+        );
+        assert_eq!(
+            project_scoped_claude_hooks(AgentChoice::Codex, project.path()),
+            None,
+            "only Claude Code reads that file"
+        );
+    }
+
+    /// End to end: a launch from a checkout with a `--scope project` install
+    /// wires MCP but not hooks, and its sentinel is keyed on that checkout, so
+    /// a later launch from another checkout still wires hooks there.
+    #[test]
+    fn a_project_scoped_checkout_suppresses_hooks_without_gating_other_checkouts() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let local = install_hooks::project_claude_settings_local(project.path());
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(
+            &local,
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /h/.local/share/ai-memory/hooks/claude-code/stop.sh"}]}]}}"#,
+        )
+        .unwrap();
+        let settings = data.path().join("claude-settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let mcp = data.path().join("claude.json");
+        std::fs::write(&mcp, "{}").unwrap();
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            project.path(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{}",
+            "hooks must not be wired user-level over a project-scoped install"
+        );
+        assert!(
+            std::fs::read_to_string(&mcp).unwrap().contains("ai-memory"),
+            "MCP is still wired"
+        );
+        let project_sentinel = wire_targets(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            project.path(),
+        )
+        .unwrap()
+        .sentinel;
+        assert!(project_sentinel.exists(), "the attempt is still recorded");
+
+        // Another checkout has no project install: its own sentinel, so hooks wire.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other_sentinel = wire_targets(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            elsewhere.path(),
+        )
+        .unwrap()
+        .sentinel;
+        assert_ne!(
+            project_sentinel, other_sentinel,
+            "suppression for one checkout must not gate another"
+        );
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            elsewhere.path(),
+        );
+        assert!(
+            install_hooks::settings_file_carries_ai_memory_hooks(&settings),
+            "a checkout without a project install must still get user-level hooks"
+        );
     }
 
     #[test]
@@ -510,6 +816,109 @@ mod tests {
             install_hooks::mcp_client_for_agent(agent).is_none(),
             "Pi bridges MCP through its extension, not a native mcp.json"
         );
+    }
+
+    #[test]
+    fn opencode_major_transition_changes_the_autowire_sentinel() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides::default();
+        let v1 = wire_targets(
+            &config,
+            ManagedHarness::OpenCode,
+            &overrides,
+            &[],
+            &config.data_dir,
+        )
+        .unwrap();
+        let v2 = wire_targets(
+            &config,
+            ManagedHarness::OpenCode2,
+            &overrides,
+            &[],
+            &config.data_dir,
+        )
+        .unwrap();
+        assert_ne!(v1.sentinel, v2.sentinel);
+    }
+
+    #[test]
+    fn opencode_autowire_migrates_mcp_before_hooks_infer_transition_settings() {
+        let data = tempfile::tempdir().unwrap();
+        let plugin = data.path().join("plugins/ai-memory-opencode2.ts");
+        let mcp = data.path().join("opencode.json");
+        std::fs::write(
+            &mcp,
+            r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://transition-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer transition-token"}}}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            data_dir: data.path().join("data"),
+            run_autowire: true,
+            ..Config::default()
+        };
+        let overrides = WireOverrides {
+            hooks_config_file: Some(plugin.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+
+        ensure_wired_with(
+            &config,
+            ManagedHarness::OpenCode2,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
+
+        let mcp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(mcp).unwrap()).unwrap();
+        assert!(mcp.pointer("/mcp/ai-memory").is_none());
+        assert_eq!(
+            mcp.pointer("/mcp/servers/ai-memory/url"),
+            Some(&serde_json::json!("http://transition-host:49374/mcp"))
+        );
+        assert!(
+            std::fs::read_to_string(plugin)
+                .unwrap()
+                .contains("http://transition-host:49374")
+        );
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir).as_deref(),
+            Some("transition-token")
+        );
+    }
+
+    #[test]
+    fn opencode_autowire_does_not_write_hooks_when_mcp_transition_conflicts() {
+        let data = tempfile::tempdir().unwrap();
+        let plugin = data.path().join("plugins/ai-memory-opencode2.ts");
+        let mcp = data.path().join("opencode.json");
+        let initial = r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true},"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false}}}}"#;
+        std::fs::write(&mcp, initial).unwrap();
+        let config = Config {
+            data_dir: data.path().join("data"),
+            run_autowire: true,
+            ..Config::default()
+        };
+        let overrides = WireOverrides {
+            hooks_config_file: Some(plugin.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+
+        ensure_wired_with(
+            &config,
+            ManagedHarness::OpenCode2,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
+
+        assert!(!plugin.exists());
+        assert_eq!(std::fs::read_to_string(mcp).unwrap(), initial);
+        assert!(crate::config::read_hook_auth_token(&config.data_dir).is_none());
     }
 
     #[test]
@@ -557,7 +966,7 @@ mod tests {
         run_env: &[(String, String)],
     ) -> WireInstalls {
         let overrides = WireOverrides::default();
-        let targets = wire_targets(config, harness, &overrides, run_env).unwrap();
+        let targets = wire_targets(config, harness, &overrides, run_env, &config.data_dir).unwrap();
         wire_installs(config, targets, &overrides)
     }
 
@@ -617,6 +1026,12 @@ mod tests {
                 "hooks/ai-memory.json",
                 Some("config.toml"),
             ),
+            (
+                ManagedHarness::Copilot,
+                "COPILOT_HOME",
+                "hooks/ai-memory.json",
+                Some("mcp-config.json"),
+            ),
         ] {
             let installs = planned_installs(&config, harness, &env_pair(var, &root));
             assert_eq!(installs.hooks.len(), 1, "{harness:?}");
@@ -637,12 +1052,21 @@ mod tests {
     /// masks the process one, the same layering native-session resolution uses.
     #[test]
     fn launch_env_prefers_run_env_and_records_it() {
-        let process_only = LaunchEnv::new(&[]);
-        assert_eq!(process_only.var_os("PATH"), std::env::var_os("PATH"));
+        let process = crate::commands::run::EffectiveChildEnv::for_tests([("PATH", "/process")]);
+        let process_only = LaunchEnv::new(&process, &[]);
+        assert_eq!(
+            process_only.var_os("PATH"),
+            Some(OsString::from("/process"))
+        );
         assert!(!process_only.from_run_env.get());
 
         let run_env = [("PATH".to_string(), "/from-run-env".to_string())];
-        let layered = LaunchEnv::new(&run_env);
+        let effective = crate::commands::run::EffectiveChildEnv::with_overrides_for_platform(
+            process.entries(),
+            &run_env,
+            false,
+        );
+        let layered = LaunchEnv::new(&effective, &run_env);
         assert_eq!(
             layered.var_os("PATH"),
             Some(OsString::from("/from-run-env"))
@@ -650,7 +1074,15 @@ mod tests {
         assert!(layered.from_run_env.get());
 
         let empty = [("PATH".to_string(), String::new())];
-        assert_eq!(LaunchEnv::new(&empty).var_os("PATH"), Some(OsString::new()));
+        let effective = crate::commands::run::EffectiveChildEnv::with_overrides_for_platform(
+            process.entries(),
+            &empty,
+            false,
+        );
+        assert_eq!(
+            LaunchEnv::new(&effective, &empty).var_os("PATH"),
+            Some(OsString::new())
+        );
     }
 
     /// A named OMP profile owns its agent dir and ignores
@@ -742,6 +1174,7 @@ mod tests {
             (ManagedHarness::Kimi, &["KIMI_CODE_HOME"][..]),
             (ManagedHarness::KiroV3, &["KIRO_HOME"][..]),
             (ManagedHarness::Grok, &["GROK_HOME"][..]),
+            (ManagedHarness::Copilot, &["COPILOT_HOME"][..]),
         ] {
             let run_env: Vec<_> = vars
                 .iter()
@@ -789,7 +1222,7 @@ mod tests {
         let overrides = WireOverrides::default();
         for harness in [ManagedHarness::Pi, ManagedHarness::Omp] {
             let shared = |run_env: &[(String, String)]| {
-                wire_targets(&config, harness, &overrides, run_env)
+                wire_targets(&config, harness, &overrides, run_env, &config.data_dir)
                     .unwrap()
                     .shared_extensions_dir
             };
@@ -812,7 +1245,8 @@ mod tests {
                 &config,
                 ManagedHarness::Claude,
                 &overrides,
-                &env_pair("PI_CODING_AGENT_DIR", &root)
+                &env_pair("PI_CODING_AGENT_DIR", &root),
+                &config.data_dir,
             )
             .unwrap()
             .shared_extensions_dir,
@@ -834,7 +1268,8 @@ mod tests {
             ..WireOverrides::default()
         };
         let plan = |harness: ManagedHarness, run_env: &[(String, String)]| {
-            let targets = wire_targets(&config, harness, &overrides, run_env).unwrap();
+            let targets =
+                wire_targets(&config, harness, &overrides, run_env, &config.data_dir).unwrap();
             wire_installs(&config, targets, &overrides)
         };
         let blank = [("CLAUDE_CONFIG_DIR".to_string(), "  ".to_string())];
@@ -899,8 +1334,14 @@ mod tests {
         std::os::unix::fs::symlink(&inside, &looped).unwrap();
         let plan = |dir: &Path| {
             let run_env = env_pair("CLAUDE_CONFIG_DIR", dir);
-            let targets =
-                wire_targets(&config, ManagedHarness::Claude, &overrides, &run_env).unwrap();
+            let targets = wire_targets(
+                &config,
+                ManagedHarness::Claude,
+                &overrides,
+                &run_env,
+                &config.data_dir,
+            )
+            .unwrap();
             wire_installs(&config, targets, &overrides)
         };
         let detour = data.path().join("missing").join("..").join("linked");
@@ -971,9 +1412,15 @@ mod tests {
         let overrides = WireOverrides::default();
         let sentinel = |dir: &str| {
             let run_env = env_pair("CLAUDE_CONFIG_DIR", &data.path().join(dir));
-            wire_targets(&config, ManagedHarness::Claude, &overrides, &run_env)
-                .unwrap()
-                .sentinel
+            wire_targets(
+                &config,
+                ManagedHarness::Claude,
+                &overrides,
+                &run_env,
+                &config.data_dir,
+            )
+            .unwrap()
+            .sentinel
         };
         assert_eq!(sentinel("work"), sentinel("work"));
         assert_ne!(
@@ -1004,8 +1451,20 @@ mod tests {
         };
         let work = account("work");
         let personal = account("personal");
-        ensure_wired_with(&config, ManagedHarness::Claude, &work, &[]);
-        ensure_wired_with(&config, ManagedHarness::Claude, &personal, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &work,
+            &[],
+            &config.data_dir,
+        );
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &personal,
+            &[],
+            &config.data_dir,
+        );
         for overrides in [&work, &personal] {
             let settings = overrides.hooks_config_file.as_ref().unwrap();
             let mcp = overrides.mcp_config_file.as_ref().unwrap();
@@ -1079,7 +1538,10 @@ mod tests {
                 AgentChoice::ClaudeCode,
                 install_hooks::claude_settings_path(),
             ),
-            (AgentChoice::Codex, install_hooks::codex_hooks_path()),
+            (
+                AgentChoice::Codex,
+                install_hooks::codex_hooks_path(&crate::config::RuntimeEnv::from_process()),
+            ),
             (AgentChoice::OpenCode, install_hooks::opencode_plugin_path()),
             (
                 AgentChoice::OpenCode2,
@@ -1105,6 +1567,10 @@ mod tests {
                 AgentChoice::AntigravityCli,
                 install_hooks::antigravity_hooks_path(),
             ),
+            (
+                AgentChoice::CopilotCli,
+                install_hooks::copilot_cli_hooks_path(),
+            ),
         ] {
             assert_eq!(
                 install_hooks::hook_config_target_with(agent, &process_env).ok(),
@@ -1125,6 +1591,7 @@ mod tests {
             ManagedHarness::KiroV3,
             ManagedHarness::Grok,
             ManagedHarness::Antigravity,
+            ManagedHarness::Copilot,
         ] {
             let agent = agent_choice_for_harness(harness).unwrap();
             assert!(
@@ -1156,6 +1623,143 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")
     }
 
+    /// The degraded offline wiring contract: hooks are installed (capture must
+    /// spool locally), the MCP registration is left alone (a dead endpoint
+    /// would be baked into harness config otherwise), and no sentinel is
+    /// written, so the next online launch completes the MCP half.
+    #[test]
+    fn skip_mcp_wires_hooks_only_and_writes_no_sentinel() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let settings = data.path().join("claude-settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let mcp = data.path().join("claude.json");
+        std::fs::write(&mcp, r#"{"existingMcpKey":"keep me too"}"#).unwrap();
+
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+        let effective_env =
+            super::super::run::EffectiveChildEnv::with_overrides(&config.runtime_env, &[]);
+        ensure_wired_with_env(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &effective_env,
+            &config.data_dir,
+            true,
+        );
+
+        let hooks_json = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            hooks_json.contains("ai-memory") || hooks_json.contains("ai_memory"),
+            "the ai-memory hook must be installed offline: {hooks_json}"
+        );
+        let mcp_json = std::fs::read_to_string(&mcp).unwrap();
+        assert!(
+            !mcp_json.contains("ai-memory"),
+            "no MCP registration may be written for an unreachable server: {mcp_json}"
+        );
+        assert!(
+            mcp_json.contains("existingMcpKey"),
+            "the MCP file must be untouched: {mcp_json}"
+        );
+        let sentinel = wire_targets(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        )
+        .unwrap()
+        .sentinel;
+        assert!(
+            !sentinel.exists(),
+            "an offline half-wiring must not gate the next online launch"
+        );
+
+        // The next online launch completes the wiring and records the attempt.
+        ensure_wired_with_env(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &effective_env,
+            &config.data_dir,
+            false,
+        );
+        assert!(
+            std::fs::read_to_string(&mcp).unwrap().contains("ai-memory"),
+            "the online completion installs the MCP entry"
+        );
+        assert!(sentinel.exists(), "the completed wiring is recorded");
+    }
+
+    /// An enabled ai-memory Claude Code plugin already carries the hooks and
+    /// MCP entry, so a managed launch writes neither (adversarial: the files
+    /// stay absent). Control: with the plugin disabled the same launch wires
+    /// both, so the plugin state is what decided it.
+    #[test]
+    fn an_enabled_plugin_leaves_the_harness_unwired() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        crate::commands::agent_plugins::test_support::install_claude_plugin(
+            home.path(),
+            "3.0.0",
+            true,
+        );
+        let claude = home.path().join(".claude");
+        let settings = claude.join("settings.json");
+        let mcp = claude.join(".claude.json");
+
+        let mut config = test_config(home.path(), data.path());
+        config.home_dir = Some(home.path().to_string_lossy().into_owned());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+        let run_env = env_pair("CLAUDE_CONFIG_DIR", &claude);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &run_env,
+            &config.data_dir,
+        );
+        assert!(
+            !std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("\"hooks\""),
+            "no settings hooks beside the plugin"
+        );
+        assert!(!mcp.exists(), "no MCP entry beside the plugin");
+
+        crate::commands::agent_plugins::test_support::install_claude_plugin(
+            home.path(),
+            "3.0.0",
+            false,
+        );
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &run_env,
+            &config.data_dir,
+        );
+        assert!(
+            install_hooks::settings_file_carries_ai_memory_hooks(&settings),
+            "a disabled plugin is wired around as before"
+        );
+        assert!(mcp.exists());
+    }
+
     /// The load-bearing "won't mess up any harness" guarantee: auto-wire installs
     /// the harness's hooks + MCP while preserving unrelated user config, and a
     /// second launch is a clean no-op (no duplication, no churn). Paths are
@@ -1176,7 +1780,13 @@ mod tests {
             mcp_config_file: Some(mcp.clone()),
             ..WireOverrides::default()
         };
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
 
         let hooks_json = std::fs::read_to_string(&settings).unwrap();
         assert!(
@@ -1197,17 +1807,29 @@ mod tests {
             "the ai-memory MCP server must be installed: {mcp_json}"
         );
         assert!(
-            wire_targets(&config, ManagedHarness::Claude, &overrides, &[])
-                .unwrap()
-                .sentinel
-                .exists(),
+            wire_targets(
+                &config,
+                ManagedHarness::Claude,
+                &overrides,
+                &[],
+                &config.data_dir
+            )
+            .unwrap()
+            .sentinel
+            .exists(),
             "the attempt must be recorded"
         );
 
         // Second launch: the sentinel gates it, so the files are byte-identical.
         let before_hooks = std::fs::read(&settings).unwrap();
         let before_mcp = std::fs::read(&mcp).unwrap();
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
         assert_eq!(
             std::fs::read(&settings).unwrap(),
             before_hooks,
@@ -1241,7 +1863,13 @@ mod tests {
             mcp_config_file: Some(mcp.clone()),
             ..WireOverrides::default()
         };
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
 
         let mcp_json = std::fs::read_to_string(&mcp).unwrap();
         let entry: serde_json::Value = serde_json::from_str(&mcp_json).unwrap();
@@ -1260,10 +1888,16 @@ mod tests {
         // The hooks still install, and the attempt is still recorded, so a plain
         // re-launch stays gated.
         assert!(
-            wire_targets(&config, ManagedHarness::Claude, &overrides, &[])
-                .unwrap()
-                .sentinel
-                .exists(),
+            wire_targets(
+                &config,
+                ManagedHarness::Claude,
+                &overrides,
+                &[],
+                &config.data_dir
+            )
+            .unwrap()
+            .sentinel
+            .exists(),
             "the attempt must be recorded even when the MCP bridge is preserved"
         );
     }
@@ -1291,6 +1925,7 @@ mod tests {
             ManagedHarness::Claude,
             &overrides,
             &env_pair("CLAUDE_CONFIG_DIR", &root),
+            &config.data_dir,
         );
 
         let mcp_json = std::fs::read_to_string(&mcp).unwrap();
@@ -1319,6 +1954,7 @@ mod tests {
             ManagedHarness::Crush,
             &WireOverrides::default(),
             &[],
+            &config.data_dir,
         );
         assert!(
             !autowire_state_dir(data.path()).exists(),
@@ -1343,13 +1979,25 @@ mod tests {
             mcp_config_file: Some(mcp.clone()),
             ..WireOverrides::default()
         };
-        let sentinel = wire_targets(&config, ManagedHarness::Claude, &overrides, &[])
-            .unwrap()
-            .sentinel;
+        let sentinel = wire_targets(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        )
+        .unwrap()
+        .sentinel;
         std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
         std::fs::write(&sentinel, b"").unwrap();
 
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
         assert_eq!(
             std::fs::read_to_string(&settings).unwrap(),
             r#"{"existingUserKey":1}"#,
@@ -1381,12 +2029,24 @@ mod tests {
             mcp_config_file: Some(mcp.clone()),
             ..WireOverrides::default()
         };
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
 
         // The wiring is removed by hand; the sentinel alone keeps it that way.
         std::fs::write(&settings, user_settings).unwrap();
         std::fs::write(&mcp, user_mcp).unwrap();
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
         assert_eq!(std::fs::read_to_string(&mcp).unwrap(), user_mcp);
 
         // Moving the state aside is, for the gate, the same as clearing it.
@@ -1395,7 +2055,13 @@ mod tests {
             data.path().join("cleared-autowire-state"),
         )
         .unwrap();
-        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &[],
+            &config.data_dir,
+        );
         assert!(
             std::fs::read_to_string(&settings)
                 .is_ok_and(|s| s.contains("ai-memory") || s.contains("ai_memory"))

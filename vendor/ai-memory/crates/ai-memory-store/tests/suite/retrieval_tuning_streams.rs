@@ -36,6 +36,7 @@ fn tuning(session_recall: bool, bonus: f64, abstract_vectors: bool) -> Retrieval
         session_recall_bonus: bonus,
         abstract_vectors,
         belief_authority_weight: 0.0,
+        observation_stream: false,
     }
 }
 

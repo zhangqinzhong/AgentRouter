@@ -1,4 +1,5 @@
-//! Native `aim_` API credentials. Auth lookup never reads `users.token_hash`.
+//! Native `aim_` API credentials, plus the `legacy-user-token` rows V55
+//! copied from 1.x compatibility tokens. Auth reads only this table.
 
 use ai_memory_core::{ApiCredential, ApiCredentialId, NATIVE_API_KEY_PREFIX, User, UserId};
 use base64::Engine;
@@ -135,18 +136,17 @@ pub fn find_active_user_by_token_hash(
 ) -> StoreResult<Option<AuthenticatedApiUser>> {
     conn.query_row(
         "SELECT u.id, u.username, u.name, u.email, u.created_at, u.last_seen_at, \
-                u.role, u.must_change_password, u.disabled_at, u.password_hash, \
-                u.token_expired_at, c.id \
+                u.role, u.must_change_password, u.disabled_at, u.password_hash, c.id \
          FROM api_credentials c \
          JOIN users u ON u.id = c.user_id \
          WHERE c.token_hash = ?1 AND c.revoked_at IS NULL \
            AND (c.expires_at IS NULL OR c.expires_at > ?2)",
         params![token_hash.as_slice(), now],
         |row| {
-            let cred_bytes: Vec<u8> = row.get(11)?;
+            let cred_bytes: Vec<u8> = row.get(10)?;
             let credential_id = ApiCredentialId::from_slice(&cred_bytes).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    11,
+                    10,
                     rusqlite::types::Type::Blob,
                     Box::new(std::io::Error::other(e.to_string())),
                 )
@@ -389,7 +389,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(copied, hash);
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         crate::migrations::run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         assert!(
             find_active_user_by_token_hash(&conn, &hash, 0)
                 .unwrap()
@@ -411,15 +413,193 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 70, "update the pin when adding a migration");
+        assert_eq!(version, 80, "update the pin when adding a migration");
         let cols: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'token_hash'",
+                "SELECT COUNT(*) FROM pragma_table_info('users') \
+                 WHERE name IN ('token_hash', 'token_expired_at')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(cols, 1);
+        assert_eq!(cols, 0, "V79 drops the 1.x token columns");
+    }
+
+    fn column_count(conn: &Connection, table: &str, column: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn legacy_trigger_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'trigger' AND name LIKE 'users_token_hash_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Seed a user exactly as 2.x `user add` did: the token lands in
+    /// `users.token_hash`, and V55's mirror trigger copies it into the
+    /// user's `legacy-user-token` credential.
+    fn insert_2x_token_user(conn: &Connection, username: &str, hash: &[u8; 32]) -> UserId {
+        let id = UserId::new();
+        conn.execute(
+            "INSERT INTO users (id, username, name, email, token_hash, created_at) \
+             VALUES (?1, ?2, NULL, NULL, ?3, 1)",
+            params![id.as_bytes(), username, hash.as_slice()],
+        )
+        .unwrap();
+        id
+    }
+
+    /// The 3.0 upgrade: a database in the last 2.x shape (V78) holding
+    /// tokens issued, expired and rotated by the removed `user` commands.
+    /// After V79 every token that authenticated before still does, an
+    /// expired one stays refused, `api-key list|rotate|revoke` manage them,
+    /// and the rows that point at those users survive the `users` rebuild.
+    #[test]
+    fn v79_upgrade_keeps_legacy_tokens_as_api_keys() {
+        let mut conn = open_to(78);
+        let pepper = TokenPepper::new("test-pepper-1234567890abcdef");
+        let alice_hash = hash_token("alice-1x-token", &pepper);
+        let bob_hash = hash_token("bob-1x-token", &pepper);
+        let carol_old = hash_token("carol-1x-token", &pepper);
+        let carol_new = hash_token("carol-1x-token-rotated", &pepper);
+        let alice = insert_2x_token_user(&conn, "alice", &alice_hash);
+        let bob = insert_2x_token_user(&conn, "bob", &bob_hash);
+        let carol = insert_2x_token_user(&conn, "carol", &carol_old);
+        // 2.x `user expire bob`, then `user rotate-token carol`.
+        conn.execute(
+            "UPDATE users SET token_expired_at = 77 WHERE id = ?1",
+            params![bob.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE users SET token_hash = ?1, token_expired_at = NULL WHERE id = ?2",
+            params![carol_new.as_slice(), carol.as_bytes()],
+        )
+        .unwrap();
+        let session =
+            crate::web_sessions::insert_web_session(&conn, alice, &[3; 32], &[4; 32]).unwrap();
+        assert_eq!(legacy_trigger_count(&conn), 4);
+
+        // Store::open's order: foreign keys off around the runner.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        assert_eq!(column_count(&conn, "users", "token_hash"), 0);
+        assert_eq!(column_count(&conn, "users", "token_expired_at"), 0);
+        assert_eq!(legacy_trigger_count(&conn), 0);
+
+        let found = find_active_user_by_token_hash(&conn, &alice_hash, 0)
+            .unwrap()
+            .expect("an active 2.x token still authenticates");
+        assert_eq!(found.user.id, alice);
+        assert_eq!(found.user.username, "alice");
+        assert_eq!(found.credential_id.as_bytes(), alice.as_bytes());
+        assert!(
+            find_active_user_by_token_hash(&conn, &bob_hash, 0)
+                .unwrap()
+                .is_none(),
+            "an expired 2.x token stays refused"
+        );
+        assert!(
+            find_active_user_by_token_hash(&conn, &carol_old, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            find_active_user_by_token_hash(&conn, &carol_new, 0)
+                .unwrap()
+                .unwrap()
+                .user
+                .id,
+            carol
+        );
+
+        let listed = list_api_credentials(&conn).unwrap();
+        assert_eq!(listed.len(), 3, "api-key list shows every legacy token");
+        for credential in &listed {
+            assert_eq!(credential.label, "legacy-user-token");
+            assert_eq!(credential.id.as_bytes(), credential.user_id.as_bytes());
+            assert_eq!(
+                credential.revoked_at.is_some(),
+                credential.user_id == bob,
+                "only the expired token is revoked: {credential:?}"
+            );
+        }
+
+        let alice_cred = ApiCredentialId::from_slice(alice.as_bytes()).unwrap();
+        let rotated = hash_token("aim_rotated-after-upgrade", &pepper);
+        assert!(rotate_api_credential(&conn, alice_cred, &rotated, Some("…rade")).unwrap());
+        assert!(
+            find_active_user_by_token_hash(&conn, &alice_hash, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_active_user_by_token_hash(&conn, &rotated, 0)
+                .unwrap()
+                .is_some()
+        );
+        let carol_cred = ApiCredentialId::from_slice(carol.as_bytes()).unwrap();
+        assert!(revoke_api_credential(&conn, carol_cred).unwrap());
+        assert!(
+            find_active_user_by_token_hash(&conn, &carol_new, 0)
+                .unwrap()
+                .is_none(),
+            "a revoked legacy token is refused"
+        );
+
+        let live = crate::web_sessions::find_live_session_by_hash(&conn, &[3; 32], 0)
+            .unwrap()
+            .expect("the rebuild keeps web sessions");
+        assert_eq!(live.id, session.id);
+        assert_eq!(live.user.id, alice);
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    /// Recovery: run with foreign keys on, `DROP TABLE users` would cascade
+    /// through every credential. The guard must abort V79 instead, and the
+    /// rollback must leave the 2.x database, and its tokens, as they were.
+    #[test]
+    fn v79_rolls_back_rather_than_cascade_delete_credentials() {
+        let mut conn = open_to(78);
+        let hash = [0x5Au8; 32];
+        let alice = insert_2x_token_user(&conn, "alice", &hash);
+
+        let error = crate::migrations::run_to(&mut conn, 79)
+            .expect_err("V79 must abort when the rebuild would lose a credential");
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "unexpected V79 error: {error}"
+        );
+        let version: i64 = conn
+            .query_row(
+                "SELECT MAX(version) FROM refinery_schema_history",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 78, "the failed V79 must roll back");
+        assert_eq!(column_count(&conn, "users", "token_hash"), 1);
+        assert_eq!(legacy_trigger_count(&conn), 4);
+        let found = find_active_user_by_token_hash(&conn, &hash, 0)
+            .unwrap()
+            .expect("the token survives the aborted upgrade");
+        assert_eq!(found.user.id, alice);
     }
 
     #[test]

@@ -57,6 +57,30 @@ jobs:
             echo "tag version v${tag_version} does not match Cargo.toml version ${manifest_version}" >&2
             exit 1
           fi
+          # bin/release re-renders the marketplace plugins with the bump, so
+          # the tag's catalogs point at the tag itself (#1166).
+          for manifest in plugins/claude-code/.claude-plugin/plugin.json plugins/codex/.codex-plugin/plugin.json; do
+            plugin_version="$(jq -r .version "$manifest")"
+            if [ "$plugin_version" != "$tag_version" ]; then
+              echo "$manifest has version ${plugin_version}, expected ${tag_version}; re-run render-plugins" >&2
+              exit 1
+            fi
+          done
+          for catalog in .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do
+            # A missing catalog or an empty plugin list would leave the loop
+            # below nothing to check, so refuse both before reading refs.
+            if ! jq -e '.plugins | length > 0' "$catalog" >/dev/null; then
+              echo "$catalog is missing or lists no plugins; re-run render-plugins" >&2
+              exit 1
+            fi
+            refs="$(jq -r '.plugins[].source.ref' "$catalog")"
+            for ref in $refs; do
+              if [ "$ref" != "v${tag_version}" ]; then
+                echo "$catalog points at ${ref}, expected v${tag_version}; re-run render-plugins" >&2
+                exit 1
+              fi
+            done
+          done
           echo "version=${tag_version}" >> "$GITHUB_OUTPUT"
 
   binary:
@@ -104,7 +128,7 @@ jobs:
           mkdir -p "dist/$artifact/docs"
           cp README.md LICENSE "dist/$artifact/"
           cp docs/install.md "dist/$artifact/docs/install.md"
-          tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
+          COPYFILE_DISABLE=1 tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
           sha256sum "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -163,7 +187,7 @@ jobs:
           cp README.md LICENSE "dist/$artifact/"
           cp docs/install.md "dist/$artifact/docs/install.md"
           cp docs/macos.md "dist/$artifact/docs/macos.md"
-          tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
+          COPYFILE_DISABLE=1 tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
           shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
 
       - name: Smoke test release tarball
@@ -525,6 +549,26 @@ jobs:
             sha256sum ai-memory-hooks.tar.gz > ai-memory-hooks.tar.gz.sha256
           )
 
+      # For Customize > Plugins > Upload plugin in the Claude desktop app and
+      # Cowork: the plugin directory itself, launcher mode included.
+      - name: Stage the Claude Code plugin zip
+        run: |
+          set -euo pipefail
+          (cd plugins/claude-code && zip -qrX "$GITHUB_WORKSPACE/artifacts/ai-memory-claude-plugin.zip" .)
+          (
+            cd artifacts
+            sha256sum ai-memory-claude-plugin.zip > ai-memory-claude-plugin.zip.sha256
+          )
+
+      - name: Stage checksum-verified install script
+        run: |
+          set -euo pipefail
+          install -m 0755 install.sh artifacts/install.sh
+          (
+            cd artifacts
+            sha256sum install.sh > install.sh.sha256
+          )
+
       - name: Generate release body
         run: |
           echo "## Checksums (SHA256)" > body.md
@@ -534,6 +578,10 @@ jobs:
           echo "" >> body.md
           echo "## Install" >> body.md
           echo '```bash' >> body.md
+          echo "# Linux/macOS, no root: checksum-verified release binary under ~/.local, then one-step setup" >> body.md
+          echo "curl -fsSL https://github.com/akitaonrails/ai-memory/releases/download/${GITHUB_REF_NAME}/install.sh | AI_MEMORY_VERSION=${{ needs.validate-version.outputs.version }} sh" >> body.md
+          echo "ai-memory setup" >> body.md
+          echo "" >> body.md
           echo "# Arch Linux (AUR)" >> body.md
           echo "yay -S ai-memory-bin      # prebuilt Linux x86_64/aarch64 binary" >> body.md
           echo "yay -S ai-memory          # builds from source" >> body.md

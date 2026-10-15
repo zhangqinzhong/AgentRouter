@@ -247,13 +247,16 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
             continue;
         };
         let ft = metadata.file_type();
-        if ft.is_symlink() {
+        if crate::confinement::is_link_like(&metadata) {
             continue;
         }
         if ft.is_dir() {
             let Some((ws, proj, proj_root)) = extract_project_dir_ids(wiki.root(), raw_path) else {
                 continue;
             };
+            if wiki.validate_project_root(ws, proj).is_err() {
+                continue;
+            }
             reindex_project_dir(wiki, ws, proj, proj_root).await;
             continue;
         }
@@ -269,6 +272,9 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         let Some((ws, proj, page_path)) = extract_project_ids(wiki.root(), raw_path) else {
             continue;
         };
+        if wiki.validate_page_path(ws, proj, &page_path).is_err() {
+            continue;
+        }
         if is_pending_path(&page_path) {
             continue;
         }
@@ -311,6 +317,9 @@ async fn reindex_project_dir(
     proj: ProjectId,
     proj_root: std::path::PathBuf,
 ) -> bool {
+    if wiki.validate_project_root(ws, proj).is_err() {
+        return false;
+    }
     // Same orphan guard `reconcile` applies (#613), for the other way a
     // project directory reaches the indexer. A filesystem event on a rowless
     // directory would otherwise walk it and warn once per page, which is the
@@ -740,6 +749,17 @@ async fn reconcile(
 pub(crate) fn walk_project_dirs(
     wiki_root: &Path,
 ) -> WikiResult<Vec<(WorkspaceId, ProjectId, std::path::PathBuf)>> {
+    let root_metadata = match std::fs::symlink_metadata(wiki_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if crate::confinement::is_link_like(&root_metadata) {
+        return Err(WikiError::Confinement {
+            path: wiki_root.to_path_buf(),
+            reason: "symbolic links and reparse points are not allowed in the wiki project tree",
+        });
+    }
     let mut out = Vec::new();
     let ws_read = match std::fs::read_dir(wiki_root) {
         Ok(r) => r,
@@ -748,7 +768,8 @@ pub(crate) fn walk_project_dirs(
     };
     for ws_entry in ws_read {
         let ws_entry = ws_entry?;
-        if !ws_entry.file_type()?.is_dir() {
+        let ws_metadata = std::fs::symlink_metadata(ws_entry.path())?;
+        if crate::confinement::is_link_like(&ws_metadata) || !ws_metadata.is_dir() {
             continue;
         }
         let ws_name = ws_entry.file_name();
@@ -764,7 +785,8 @@ pub(crate) fn walk_project_dirs(
         };
         for proj_entry in proj_read {
             let proj_entry = proj_entry?;
-            if !proj_entry.file_type()?.is_dir() {
+            let proj_metadata = std::fs::symlink_metadata(proj_entry.path())?;
+            if crate::confinement::is_link_like(&proj_metadata) || !proj_metadata.is_dir() {
                 continue;
             }
             let proj_name = proj_entry.file_name();
@@ -849,6 +871,17 @@ pub(crate) fn walk_markdown_partial(root: &Path) -> WikiResult<(Vec<PagePath>, b
     let mut partial = false;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                partial = true;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if crate::confinement::is_link_like(&metadata) {
+            continue;
+        }
         let read = match std::fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -860,14 +893,9 @@ pub(crate) fn walk_markdown_partial(root: &Path) -> WikiResult<(Vec<PagePath>, b
         for entry in read {
             let entry = entry?;
             let path = entry.path();
-            let ft = entry.file_type()?;
-            // Skip symlinks entirely. An attacker with write access to
-            // the wiki/ dir could otherwise plant a symlink to /etc/hosts,
-            // /home/user/.ssh/id_ed25519 etc. and have the watcher
-            // index the target's content. The sanitiser would still
-            // scrub credentials, but we'd be reading files we
-            // shouldn't be reading. (Audit critical #3.)
-            if ft.is_symlink() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            let ft = metadata.file_type();
+            if crate::confinement::is_link_like(&metadata) {
                 continue;
             }
             if ft.is_dir() {
@@ -910,7 +938,8 @@ fn is_tempfile(path: &Path) -> bool {
 }
 
 /// `_meta.md` is the per-scope manifest the engine writes (workspace/project
-/// name + repo_path) so the wiki tree is self-describing. It describes the
+/// name, repo path, and optional repository identity coordinates) so the wiki
+/// tree is self-describing. It describes the
 /// scope, it is never a wiki page.
 fn is_manifest_filename(page_path: &PagePath) -> bool {
     page_path
@@ -963,6 +992,24 @@ mod tests {
 
     #[cfg(unix)]
     fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_test_symlink_dir(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!("skipping directory reparse assertion: Windows privilege unavailable");
+                false
+            }
+            Err(e) => panic!("failed to create directory link {}: {e}", link.display()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_test_symlink_dir(target: &Path, link: &Path) -> bool {
         std::os::unix::fs::symlink(target, link).unwrap();
         true
     }
@@ -1705,9 +1752,47 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn walk_markdown_skips_linked_directories_and_their_ledgers() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(project.join("control.md"), "control\n").unwrap();
+        std::fs::write(outside.join("page.md"), "outside page\n").unwrap();
+        std::fs::write(
+            outside.join("log-2026-10.md"),
+            "## [2026-10-01T00:00:00Z] stop | outside ledger\n",
+        )
+        .unwrap();
+        if !create_test_symlink_dir(&outside, &project.join("linked")) {
+            return;
+        }
+
+        let found = walk_markdown(&project).unwrap();
+        assert_eq!(found, vec![PagePath::new("control.md").unwrap()]);
+    }
+
     /// Direct notify events must use the same symlink guard as full-tree walks;
     /// otherwise a symlinked markdown file can be opened before reconciliation
     /// gets a chance to skip it.
+    #[test]
+    fn shared_link_like_helper_accepts_regular_files_and_directories() {
+        let tmp = TempDir::new().unwrap();
+        let directory = tmp.path().join("directory");
+        let file = tmp.path().join("file.md");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, "control").unwrap();
+        assert!(!crate::confinement::is_link_like(
+            &std::fs::symlink_metadata(directory).unwrap()
+        ));
+        assert!(!crate::confinement::is_link_like(
+            &std::fs::symlink_metadata(file).unwrap()
+        ));
+    }
+
     #[cfg(any(unix, windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_file_event_skips_symlink() {

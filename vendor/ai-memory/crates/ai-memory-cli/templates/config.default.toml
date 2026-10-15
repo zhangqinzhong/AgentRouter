@@ -18,6 +18,14 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 # Default tracing filter (overridable by RUST_LOG).
 log_level = "info"
 
+# Optional env-only presets for managed harness launches. Select one with
+# `ai-memory run --profile work claude`. `--env-file` overrides the profile,
+# and repeated `--env` entries override both. Keep executable paths, native
+# argv, and permission-bypass choices on the command line.
+# [run.profiles.work.env]
+# CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+# ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+
 # Optional server-side hook ingest limiter for shared/remote installs. The rate
 # is tokens per second per actor/session source; 0 or unset disables it. Burst
 # defaults to the rate (minimum one token when enabled). Env equivalents:
@@ -34,6 +42,15 @@ log_level = "info"
 # be installed with `ai-memory install-hooks --agent claude-code
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
+
+# Server-side drop list for tool events (#1241): the server acknowledges and
+# discards a matching PreToolUse/PostToolUse event before it is sanitized or
+# stored, whatever the client sends. Applies to every project on this server.
+# At most 64 entries per list, 128 characters each. Example: Claude Code marks
+# plugin tool calls with their own tool-use id prefix.
+# [ingest]
+# drop_tool_use_id_prefixes = ["toolu_plugin_"]
+# drop_tool_names = ["mcp__noisy__poll"]
 
 # Strip root-level anyOf/oneOf/allOf from MCP tool input schemas on every
 # tools/list, even without a `?flavor=moonshot` / `?flavor=bedrock` marker.
@@ -168,7 +185,9 @@ per_user = false
 # LLM consolidation prompt limits. These are approximate because tokenizers
 # differ by provider and model. Their sum must fit the model's context window;
 # leave additional headroom for tokenizer variance. Small local models must
-# lower both values together. Startup minimums are 6000 input and 1000 output.
+# lower both values together. Startup minimums are 8350 input (at the default
+# input_token_safety_margin of 0.8; a lower margin needs proportionally more)
+# and 1000 output.
 # Consolidation turns a finished session's raw observations into wiki
 # pages. Off (zero-LLM) you still get session pages + search; with an
 # LLM you get distilled concept/gotcha/rule pages. Reach for these knobs

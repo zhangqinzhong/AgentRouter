@@ -1,11 +1,12 @@
-//! Opt-in post-fusion ranking signals for `hybrid_search`.
+//! Post-fusion ranking signals for `hybrid_search`.
 //!
-//! Two bounded, independently switchable signals, both off by default so a
-//! store that never configures them ranks exactly as before:
+//! Bounded, independently switchable signals. All but the observation stream
+//! are off by default; with every one of them off a store ranks exactly as it
+//! did before any of them existed:
 //!
 //! * **Session-recall routing** — a zero-LLM lexical check that recognises
 //!   queries phrased as "find a past session / what did we do back then"
-//!   ("上次 / 之前那次…的会话 / last time / yesterday …"). Session pages
+//!   ("上次 / 之前那次…的会话 / last time / yesterday / última sessão …"). Session pages
 //!   otherwise carry a bounded authority penalty (kind `session` −0.15,
 //!   tier `episodic` −0.08, ×0.77 combined) because they are rarely the
 //!   right answer to a fact query — but a query that is *about* a past
@@ -19,12 +20,21 @@
 //!   a precise second vote per page. Contributes nothing while the table
 //!   is empty.
 //!
-//! Both signals are reported in `SearchExplain`, so an `explain=true`
+//! * **Observation stream** — a further RRF stream over `observations_fts`.
+//!   The zero-LLM session page keeps only a short excerpt of each turn, so
+//!   the evidence a question needs often lives only in the session's
+//!   sanitized observation bodies. Each session's best-ranked matching
+//!   observation votes once for that session's latest page; a session with
+//!   no page contributes nothing (the raw fallback still covers it). On by
+//!   default since it met its measured success criteria.
+//!
+//! Every signal is reported in `SearchExplain`, so an `explain=true`
 //! query can account for the returned rank.
 
 use serde::{Deserialize, Serialize};
 
-/// Tunables for the opt-in ranking signals. `Default` disables both.
+/// Tunables for the ranking signals. `Default` enables only the observation
+/// stream.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalTuning {
@@ -49,6 +59,13 @@ pub struct RetrievalTuning {
     /// default on without a positive R2 delta (retrieval-triple / QA), not yet
     /// performed.
     pub belief_authority_weight: f64,
+    /// Add the observation-evidence stream to the RRF fusion (R1): search
+    /// `observations_fts` in the same project and let each matching
+    /// observation vote, once per session, for its session's latest
+    /// `sessions/<id>.md` page. Nothing is written. ON by default: on the
+    /// retrieval eval it lifted zero-LLM hit@5 without breaking the latency or
+    /// token budgets. `false` restores the previous ranking byte for byte.
+    pub observation_stream: bool,
 }
 
 impl Default for RetrievalTuning {
@@ -66,6 +83,7 @@ impl Default for RetrievalTuning {
             // OFF by default: folding belief confidence into ranking is
             // R2-gated (see the field doc).
             belief_authority_weight: 0.0,
+            observation_stream: true,
         }
     }
 }
@@ -117,6 +135,19 @@ const SESSION_RECALL_EN: &[&str] = &[
     "earlier we",
     "previously",
 ];
+// Require an explicit historical phrase: "sessão", "antes", or "ontem"
+// alone also occur in technical queries unrelated to recalling our work.
+const SESSION_RECALL_PT_BR: &[&str] = &[
+    "última sessão",
+    "ultima sessao",
+    "última sessao",
+    "ultima sessão",
+    "sessão anterior",
+    "sessao anterior",
+    "onde paramos ontem",
+    "decisão anterior",
+    "decisao anterior",
+];
 
 /// Route a query to session-recall retrieval by lexical markers. Deliberately
 /// zero-LLM: it gates a bounded ranking nudge, not a retrieval mode, and a
@@ -128,6 +159,7 @@ pub fn is_session_recall_query(query: &str) -> bool {
     SESSION_RECALL_ZH.iter().any(|m| lowered.contains(m))
         || SESSION_RECALL_EN
             .iter()
+            .chain(SESSION_RECALL_PT_BR.iter())
             .any(|m| padded.contains(&format!(" {m} ")))
 }
 
@@ -152,11 +184,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_tuning_is_inert() {
+    fn default_tuning_enables_only_the_observation_stream() {
         let t = RetrievalTuning::default();
         assert!(!t.session_recall_routing);
         assert!(!t.abstract_vectors);
         assert_eq!(t.belief_authority_weight, 0.0);
+        assert!(t.observation_stream);
     }
 
     #[test]
@@ -190,5 +223,53 @@ mod tests {
     fn latin_markers_respect_word_boundaries() {
         assert!(!is_session_recall_query("unknown snowfall"));
         assert!(is_session_recall_query("what did we ship yesterday"));
+    }
+
+    #[test]
+    fn detects_portuguese_session_recall_queries() {
+        for q in [
+            "o que fizemos na última sessão",
+            "o que fizemos na ultima sessao",
+            "o que fizemos na última sessao",
+            "o que fizemos na ultima sessão",
+            "onde paramos ontem",
+            "lembre a decisão anterior",
+            "lembre a decisao anterior",
+            "o que discutimos na sessão anterior",
+            "o que discutimos na sessao anterior",
+            "ONDE PARAMOS ONTEM?",
+            "lembre a (DECISÃO ANTERIOR), sobre SQLite",
+        ] {
+            assert!(is_session_recall_query(q), "{q}");
+        }
+    }
+
+    #[test]
+    fn portuguese_markers_require_history_and_word_boundaries() {
+        for q in [
+            "erro na sessão do usuário",
+            "erro na sessao do usuario",
+            "a sessão passada para o middleware é nula",
+            "sessao passada como parametro",
+            "sessão expira",
+            "sessao expira",
+            "antes de salvar",
+            "sessão",
+            "sessao",
+            "antes",
+            "ontem",
+            "decisão",
+            "anterior",
+            "o que fizemos agora",
+            "onde paramos o serviço",
+            "penúltima sessão",
+            "penultima sessao",
+            "decisão anteriormente tomada",
+            "decisao anteriormente tomada",
+            "xonde paramos ontem",
+            "onde paramos ontemx",
+        ] {
+            assert!(!is_session_recall_query(q), "{q}");
+        }
     }
 }

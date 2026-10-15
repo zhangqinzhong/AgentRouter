@@ -38,6 +38,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -416,6 +417,60 @@ async fn reorg_dry_run_returns_plan_entries() {
     // dry-run → summary counters must be zero.
     assert_eq!(body["summary"]["sessions_moved"].as_u64().unwrap(), 0);
     assert!(body["dry_run"].as_bool().unwrap());
+}
+
+/// A cwd named like a reserved scope stays where it is: the reorg neither
+/// moves sessions into `_global` / a profile project nor creates one.
+#[tokio::test]
+async fn reorg_never_targets_a_reserved_scope() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let scratch = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for dir in [
+        "/home/user/_global",
+        "/home/user/_profile",
+        "/home/user/gamma-repo",
+    ] {
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: scratch,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some(std::path::PathBuf::from(dir)),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let resp = post(state, "/admin/reorg", json!({ "dry_run": false })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["summary"]["sessions_moved"].as_u64().unwrap(),
+        1,
+        "only the ordinary cwd moves: {body}"
+    );
+    let scopes = store.reader.list_all_scopes().await.unwrap();
+    assert!(
+        scopes
+            .iter()
+            .all(|s| s.project_name != "_profile" && s.project_name != "_global"),
+        "reorg must not create a reserved project: {scopes:?}"
+    );
+    assert!(scopes.iter().any(|s| s.project_name == "gamma-repo"));
 }
 
 #[tokio::test]

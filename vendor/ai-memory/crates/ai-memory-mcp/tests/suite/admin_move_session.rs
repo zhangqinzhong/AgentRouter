@@ -7,6 +7,7 @@
 //! consolidation job) and a `sessions/<id>.md` page written through the wiki
 //! so a real file sits on disk.
 
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, ProjectId,
     Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
@@ -32,6 +33,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -383,6 +385,57 @@ async fn move_session_restamps_rows_moves_file_and_checkpoints() {
             .iter()
             .any(|c| c.summary.contains("move-session")),
         "{checkpoints:?}"
+    );
+}
+
+#[tokio::test]
+async fn move_session_create_surfaces_destination_promotion_manifest_warning() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let scopes = seed_scopes(&store).await;
+    let sid = seed_session(&store, &state.wiki, scopes.ws, scopes.src, "/repo/src").await;
+    let (destination, _) = store
+        .writer
+        .resolve_project_by_identity(
+            scopes.other_ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(scopes.other_ws.to_string())
+        .join(destination.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({
+            "session_id": sid.to_string(), "workspace": "other", "project": "acme-api",
+            "create": true, "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(
+        body["manifest_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("committed")),
+        "{body}"
     );
 }
 

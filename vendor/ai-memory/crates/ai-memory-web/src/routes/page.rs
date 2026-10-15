@@ -3,23 +3,42 @@
 use std::sync::Arc;
 
 use ai_memory_core::PagePath;
+use ai_memory_store::PageSummary;
 use askama::Template;
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 
 use crate::markdown;
 use crate::state::WebState;
 use crate::templates::{
-    NamespaceView, NotFoundView, PageRow, PageView, humanize, page_href, project_href,
+    NamespaceView, NotFoundView, OutlineItem, PageRow, PageView, RELATED_LIMIT, RelatedRow,
+    encode_segment, history_href, humanize, page_href, project_href,
 };
+
+/// Pages per namespace listing page.
+const NAMESPACE_PAGE_SIZE: usize = 25;
+
+/// Namespace listing options. Strings, so a bad value falls back to a
+/// default instead of becoming axum's 400.
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct NamespaceQuery {
+    sort: Option<String>,
+    page: Option<String>,
+}
 
 /// Handler for `GET /w/:workspace/:project/p/*path`.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
+    query: Result<Query<NamespaceQuery>, QueryRejection>,
 ) -> Response {
+    // A query string that does not parse at all (a repeated key) is ignored
+    // too: every page URL takes this extractor, not only namespaces.
+    let query = query.map(|Query(q)| q).unwrap_or_default();
+    let viewer_id = viewer.as_ref().map(|axum::Extension(v)| v.user());
     if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
         return refusal_response(&refusal);
     }
@@ -28,7 +47,9 @@ pub(crate) async fn handler(
         // Not a page — it may be a namespace (directory) link, e.g. the OKF
         // bundle index's `[_lint/](_lint/)`. Render a listing rather than a
         // bare 404 (#603).
-        Ok(None) => return namespace_or_not_found(&state, &workspace, &project, &path).await,
+        Ok(None) => {
+            return namespace_or_not_found(&state, &workspace, &project, &path, &query).await;
+        }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
@@ -48,11 +69,49 @@ pub(crate) async fn handler(
     // Drop a leading H1 that repeats the title — the template already
     // renders the title in its header, so leaving it in the body
     // duplicates it.
-    let body_html = markdown::render(
+    let rendered = markdown::render_document(
         markdown::strip_leading_h1(&markdown_doc.body, &meta.title),
         &workspace,
         &project,
     );
+
+    // The far end of each link is filtered by what the viewer may read, so a
+    // backlink from a restricted project never reaches the sidebar.
+    let links = match state
+        .reader
+        .page_links_preview(
+            meta.workspace_id,
+            meta.project_id,
+            meta.path.clone(),
+            viewer_id,
+            RELATED_LIMIT,
+        )
+        .await
+    {
+        Ok(l) => l,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let (cited_by, cited_by_more) =
+        related_rows(links.backlinks, links.backlinks_total, &workspace, &project);
+    let (cites, cites_more) = related_rows(links.links, links.links_total, &workspace, &project);
+
+    // `#id` alone would resolve against the injected `<base href>`.
+    let own_href = page_href(&workspace, &project, &meta.path);
+    let outline: Vec<OutlineItem> = rendered
+        .outline
+        .iter()
+        .filter(|h| (2..=3).contains(&h.level))
+        .map(|h| OutlineItem {
+            href: format!("{own_href}#{}", encode_segment(&h.id)),
+            text: h.text.clone(),
+            nested: h.level == 3,
+        })
+        .collect();
+    let outline = if outline.len() < 2 {
+        Vec::new()
+    } else {
+        outline
+    };
 
     let project_href = project_href(&workspace, &project);
     let supersedes_path = meta.supersedes.unwrap_or_default();
@@ -73,6 +132,7 @@ pub(crate) async fn handler(
         },
     );
 
+    let history_href = history_href(&workspace, &project, &path);
     match (PageView {
         workspace,
         project,
@@ -86,7 +146,13 @@ pub(crate) async fn handler(
         created_relative: humanize(&meta.created_at),
         supersedes_path,
         supersedes_href,
-        body_html,
+        body_html: rendered.html,
+        history_href,
+        outline,
+        cited_by,
+        cited_by_more,
+        cites,
+        cites_more,
         author_username,
         author_name,
         author_email,
@@ -98,6 +164,30 @@ pub(crate) async fn handler(
     }
 }
 
+/// Neighbours as rows, and how many of `total` were left out.
+/// A neighbour in another project carries a `workspace/project` hint.
+fn related_rows(
+    related: Vec<ai_memory_store::RelatedPage>,
+    total: usize,
+    workspace: &str,
+    project: &str,
+) -> (Vec<RelatedRow>, usize) {
+    let more = total.saturating_sub(related.len());
+    let rows = related
+        .into_iter()
+        .map(|r| RelatedRow {
+            href: page_href(&r.workspace, &r.project, &r.path),
+            scope_hint: if r.workspace == workspace && r.project == project {
+                String::new()
+            } else {
+                format!("{}/{}", r.workspace, r.project)
+            },
+            title: r.title,
+        })
+        .collect();
+    (rows, more)
+}
+
 /// When a path is not a page, list the pages under it as a namespace
 /// (directory) if any exist; otherwise 404. Powers the OKF bundle index's
 /// directory links and any relative `dir/` link (#603).
@@ -106,6 +196,7 @@ async fn namespace_or_not_found(
     workspace: &str,
     project: &str,
     path: &str,
+    query: &NamespaceQuery,
 ) -> Response {
     let namespace = path.trim_end_matches('/');
     if namespace.is_empty() {
@@ -116,9 +207,43 @@ async fn namespace_or_not_found(
         Ok(p) => p,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let pages: Vec<PageRow> = all
+    let mut under: Vec<_> = all
         .into_iter()
         .filter(|p| p.path.starts_with(&prefix))
+        .collect();
+    if under.is_empty() {
+        return not_found_response();
+    }
+    let sort_title = query.sort.as_deref() == Some("title");
+    // Titles repeat (session pages), so ties fall back to recency, then path.
+    let newest_first = |a: &PageSummary, b: &PageSummary| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.path.cmp(&b.path))
+    };
+    if sort_title {
+        under.sort_by(|a, b| {
+            a.title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then_with(|| newest_first(a, b))
+        });
+    } else {
+        under.sort_by(newest_first);
+    }
+    let total = under.len();
+    let last_page = total.div_ceil(NAMESPACE_PAGE_SIZE);
+    let page = query
+        .page
+        .as_deref()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map_or(1, |n| n.min(last_page));
+    let start = (page - 1) * NAMESPACE_PAGE_SIZE;
+    let pages: Vec<PageRow> = under
+        .into_iter()
+        .skip(start)
+        .take(NAMESPACE_PAGE_SIZE)
         .map(|p| PageRow {
             href: page_href(workspace, project, &p.path),
             path: p.path,
@@ -127,15 +252,25 @@ async fn namespace_or_not_found(
             updated_relative: humanize(&p.updated_at),
         })
         .collect();
-    if pages.is_empty() {
-        return not_found_response();
-    }
+    // Resolved against the injected `<base href>`, so a bare `?sort=`
+    // would land on the web root.
+    let href = page_href(workspace, project, &prefix);
+    let sort = if sort_title { "title" } else { "updated" };
+    let page_link = |n: usize| format!("{href}?sort={sort}&page={n}");
     match (NamespaceView {
         workspace: workspace.to_owned(),
         project: project.to_owned(),
         project_href: project_href(workspace, project),
         namespace: namespace.to_owned(),
+        first: start + 1,
+        last: start + pages.len(),
         pages,
+        total,
+        sort_updated_href: format!("{href}?sort=updated"),
+        sort_title_href: format!("{href}?sort=title"),
+        sort_title,
+        prev_href: (page > 1).then(|| page_link(page - 1)),
+        next_href: (page < last_page).then(|| page_link(page + 1)),
     }
     .render())
     {
@@ -155,12 +290,14 @@ pub(crate) fn refusal_response(refusal: &ai_memory_store::ScopeResolutionError) 
         (StatusCode::FORBIDDEN, refusal.to_string()).into_response()
     } else if refusal.is_not_found() {
         not_found_response()
+    } else if refusal.is_bad_request() {
+        (StatusCode::BAD_REQUEST, refusal.to_string()).into_response()
     } else {
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     }
 }
 
-fn not_found_response() -> Response {
+pub(crate) fn not_found_response() -> Response {
     let html = NotFoundView {}
         .render()
         .unwrap_or_else(|_| "<h1>Not found</h1>".to_owned());

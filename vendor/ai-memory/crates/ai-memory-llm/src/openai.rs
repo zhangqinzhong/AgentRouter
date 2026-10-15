@@ -30,6 +30,16 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// messages and logs — naming it makes those messages discoverable.
 pub(crate) const STRUCTURED_OUTPUT_SCHEMA_NAME: &str = "Result";
 
+/// `X-Request-Id` header the `openai-compat` provider sends on every chat
+/// attempt, carrying the [`LlmOperationId`] all attempts of one operation
+/// share (strict-to-tolerant fallbacks included). A gateway that records it
+/// (for example as `req=<id>`) can correlate every attempt of the same
+/// operation and forward it to the engine. The factory enables it only for
+/// the configured `openai-compat` provider and refuses a static
+/// `AI_MEMORY_LLM_HEADERS` entry for this name there; the official OpenAI
+/// and OpenCode providers keep their own contracts.
+pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
+
 /// Build the full URL for an OpenAI-style endpoint. Tolerates the
 /// conventions found in the wild:
 ///   * `https://api.openai.com`           (OpenAI's own docs)
@@ -101,6 +111,15 @@ pub struct OpenAiProvider {
     /// Caller-identifying defaults a provider opts into. Layered *under*
     /// `extra_headers`.
     client_headers: Option<ClientHeaders>,
+    /// OpenAI-compat only: send [`REQUEST_ID_HEADER`] with the logical
+    /// operation id on every chat attempt. Off by default; the factory
+    /// turns it on only for the configured `openai-compat` provider, so
+    /// the official OpenAI and OpenCode providers never gain the header.
+    request_id_header: bool,
+    /// OpenAI-compat only: send `chat_template_kwargs` with every chat
+    /// request (see [`Self::with_disable_thinking`]). Ignored by the
+    /// `Official` dialect, which would 400 on the unknown parameter.
+    disable_thinking: bool,
 }
 
 /// Defaults for a provider whose gateway wants the caller identified: an
@@ -130,6 +149,8 @@ impl OpenAiProvider {
             reasoning_effort: None,
             extra_headers: ExtraHeaders::default(),
             client_headers: None,
+            request_id_header: false,
+            disable_thinking: false,
         })
     }
 
@@ -198,6 +219,42 @@ impl OpenAiProvider {
         self
     }
 
+    /// Send [`REQUEST_ID_HEADER`] with the logical operation id on every
+    /// chat attempt. The id is created before the first attempt and reused
+    /// by every fallback, so all attempts of one operation carry exactly
+    /// the same value. Enabled by the factory only for the configured
+    /// `openai-compat` provider; a static `AI_MEMORY_LLM_HEADERS` entry
+    /// for this name is refused there at startup, and
+    /// [`ExtraHeaders::apply`] replaces per name either way, so one value
+    /// always reaches the wire.
+    #[must_use]
+    pub(crate) fn with_request_id_header(mut self) -> Self {
+        self.request_id_header = true;
+        self
+    }
+
+    /// Send `chat_template_kwargs: {"enable_thinking": false}` with every
+    /// chat request. Thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models) otherwise spend the output budget on a reasoning
+    /// pass before the structured payload and can truncate it. The
+    /// `Official` dialect never emits the field — api.openai.com rejects
+    /// unknown top-level parameters — so the flag only ever reaches the
+    /// wire through the openai-compat wrapper
+    /// (`AI_MEMORY_LLM_COMPAT_DISABLE_THINKING`).
+    #[must_use]
+    pub(crate) fn with_disable_thinking(mut self, enabled: bool) -> Self {
+        self.disable_thinking = enabled;
+        self
+    }
+
+    /// Test-visible state so wrapper tests (`OpenAiCompatProvider`) can
+    /// assert the thinking switch reached the inner client without
+    /// exposing the field.
+    #[cfg(test)]
+    pub(crate) fn disable_thinking(&self) -> bool {
+        self.disable_thinking
+    }
+
     /// Endpoint the client will call. Test-visible so wrappers that default
     /// the base URL and let it be overridden can assert which one is set.
     #[cfg(test)]
@@ -222,6 +279,23 @@ struct OpenAiRequest<'a> {
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<OpenAiReasoning>,
+    /// vLLM / SGLang / llama.cpp chat-template overrides. Emitted only by
+    /// the `Compat` dialect with the thinking switch on (see
+    /// [`OpenAiProvider::with_disable_thinking`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+/// Chat-template override payload for local engines.
+///
+/// Today this carries only the thinking switch: Qwen3-class thinking
+/// models on a local engine otherwise emit `reasoning_content` (or
+/// think blocks inside `content`) that consume the output budget and
+/// truncate the structured payload that follows.
+#[derive(Debug, Serialize)]
+struct ChatTemplateKwargs {
+    /// `false` turns the engine's thinking pass off.
+    enable_thinking: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -263,6 +337,11 @@ struct OpenAiResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiMessageResponse,
+    /// Why the engine stopped generating: `stop`, `length`, `tool_calls`,
+    /// `content_filter`, … Engines that predate the field omit it, so the
+    /// value is optional.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,6 +402,27 @@ impl LlmProvider for OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    /// Plain chat completion that also reports the engine's
+    /// `finish_reason` for the first choice, so the openai-compat tolerant
+    /// path can classify a `length`-truncated response before trying to
+    /// parse it. The [`LlmProvider`] [`Self::complete_with_operation_id`]
+    /// path deliberately drops the field: prose cut at the token budget is
+    /// a normal outcome there, not an error.
+    pub(crate) async fn complete_with_operation_id_and_finish_reason(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<(ChatResponse, Option<String>)> {
+        let response = self
+            .post(&self.build_request(&request, None), operation_id)
+            .await?;
+        let finish_reason = response
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.clone());
+        Ok((self.to_chat_response(response), finish_reason))
+    }
+
     async fn complete_structured(
         &self,
         request: ChatRequest,
@@ -348,11 +448,36 @@ impl OpenAiProvider {
                 operation_id,
             )
             .await?;
-        let text = response
+        // A `length` stop on a structured response means the engine hit
+        // its output budget before the JSON could finish (observed on
+        // vLLM-hosted Qwen3 with the thinking pass on). Surface a
+        // terminal, content-free error: a tolerant retry would just
+        // re-truncate and double the token spend, and a parse failure is
+        // the wrong class — nothing is wrong with the JSON, it is cut
+        // short.
+        let finish_reason = response
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.clone());
+        if is_length_truncated(finish_reason.as_deref()) {
+            return Err(LlmError::TruncatedResponse {
+                model: self.model.clone(),
+                completion_tokens: response.usage.as_ref().map(|u| u.completion_tokens),
+            });
+        }
+        // No content at all (missing, empty, or whitespace-only) is a
+        // distinct terminal failure, not a JSON parse error: there is
+        // nothing to parse and no retry can conjure output.
+        let Some(text) = response
             .choices
             .first()
             .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("");
+            .filter(|t| !t.trim().is_empty())
+        else {
+            return Err(LlmError::EmptyContent {
+                model: self.model.clone(),
+            });
+        };
         serde_json::from_str::<serde_json::Value>(text).map_err(LlmError::from)
     }
 
@@ -403,6 +528,15 @@ impl OpenAiProvider {
             }
         };
         let (reasoning_effort, reasoning) = self.chat_reasoning_fields();
+        // Only the `Compat` dialect may carry chat-template overrides —
+        // api.openai.com rejects unknown top-level parameters, so the
+        // `Official` dialect must never emit this even if the flag was
+        // set on a wrapped client.
+        let chat_template_kwargs = (self.dialect == RequestDialect::Compat
+            && self.disable_thinking)
+            .then_some(ChatTemplateKwargs {
+                enable_thinking: false,
+            });
         OpenAiRequest {
             model: &self.model,
             messages,
@@ -412,6 +546,7 @@ impl OpenAiProvider {
             response_format,
             reasoning_effort,
             reasoning,
+            chat_template_kwargs,
         }
     }
 
@@ -462,9 +597,23 @@ impl OpenAiProvider {
         // — two `user-agent` values whenever the operator configures one, and
         // a duplicate is worse than either value alone. `set_default` leaves
         // an operator entry untouched, so the layering is explicit here
-        // rather than dependent on call order.
+        // rather than dependent on call order. The dynamic `x-request-id`
+        // is the one header ai-memory *owns* on this path: `insert`
+        // (not `set_default`) plus the factory's refuse-up-front keep
+        // exactly one value on the wire, the operation's.
         let request = match self.client_headers {
-            None => self.extra_headers.apply(builder),
+            None => {
+                let mut headers = self.extra_headers.clone();
+                if self.request_id_header {
+                    // A UUID is always a valid header value; on the
+                    // impossible failure, omitting a correlation header
+                    // beats failing the consolidation pass that carries it.
+                    if let Ok(value) = HeaderValue::from_str(&operation_id.to_string()) {
+                        headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+                    }
+                }
+                headers.apply(builder)
+            }
             Some(client) => {
                 let mut headers = self.extra_headers.clone();
                 headers.set_default(
@@ -494,6 +643,14 @@ impl OpenAiProvider {
         }
         response_json_limited::<OpenAiResponse>(resp).await
     }
+}
+
+/// `true` when the engine reports the output stopped at the token budget
+/// rather than at a natural end. OpenAI and the local engines spell it
+/// `length`; engines that omit the field report `None` and are never
+/// truncated by this classifier.
+pub(crate) fn is_length_truncated(finish_reason: Option<&str>) -> bool {
+    finish_reason.is_some_and(|reason| reason.trim().eq_ignore_ascii_case("length"))
 }
 
 /// Recursively normalise a JSON schema for OpenAI Structured Outputs
@@ -675,15 +832,19 @@ fn max_output_tokens_for(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiProvider, RequestDialect, enforce_strict_object_schemas,
-        model_requires_max_completion_tokens, normalize_openai_base,
+        OpenAiJsonSchema, OpenAiProvider, OpenAiResponse, OpenAiResponseFormat, REQUEST_ID_HEADER,
+        RequestDialect, STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas,
+        is_length_truncated, model_requires_max_completion_tokens, normalize_openai_base,
     };
-    use crate::types::{ChatMessage, ChatRequest, ReasoningEffort, Role};
+    use crate::provider::LlmProvider;
+    use crate::types::{ChatMessage, ChatRequest, LlmOperationId, ReasoningEffort, Role};
     use rstest::rstest;
     use schemars::JsonSchema;
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn provider_for(model: &str) -> OpenAiProvider {
         OpenAiProvider::new(SecretString::new("test-key".into()), model).unwrap()
@@ -1201,6 +1362,102 @@ mod tests {
     }
 
     #[test]
+    fn build_request_compat_omits_chat_template_kwargs_by_default() {
+        // The thinking switch is opt-in: an unconfigured vLLM / Ollama /
+        // LM Studio setup must see a byte-identical request shape, so the
+        // key is absent entirely rather than false.
+        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "qwen3.8-27b")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat);
+        let json = serde_json::to_value(p.build_request(&chat_request(), None)).unwrap();
+        assert!(
+            json.get("chat_template_kwargs").is_none(),
+            "no chat_template_kwargs without opt-in, got {json}"
+        );
+    }
+
+    #[test]
+    fn build_request_compat_sends_enable_thinking_false_when_opted_in() {
+        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "qwen3.8-27b")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat)
+            .with_disable_thinking(true);
+        let json = serde_json::to_value(p.build_request(&chat_request(), None)).unwrap();
+        assert_eq!(
+            json["chat_template_kwargs"],
+            json!({ "enable_thinking": false }),
+            "opt-in must send the vLLM/SGLang thinking switch verbatim"
+        );
+    }
+
+    #[test]
+    fn build_request_official_never_emits_chat_template_kwargs() {
+        // api.openai.com rejects unknown top-level parameters; the dialect
+        // gate must hold even if the flag somehow reaches an official
+        // client (only the openai-compat wrapper sets it today).
+        let p = provider_for("gpt-4o-mini").with_disable_thinking(true);
+        let json = serde_json::to_value(p.build_request(&chat_request(), None)).unwrap();
+        assert!(
+            json.get("chat_template_kwargs").is_none(),
+            "the Official dialect must never send chat_template_kwargs, got {json}"
+        );
+    }
+
+    #[test]
+    fn build_request_structured_request_keeps_chat_template_kwargs() {
+        // The thinking switch is per-request-body, not per-endpoint: the
+        // structured path (response_format set) carries it too.
+        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "qwen3.8-27b")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat)
+            .with_disable_thinking(true);
+        let response_format = OpenAiResponseFormat::JsonSchema {
+            json_schema: OpenAiJsonSchema {
+                name: STRUCTURED_OUTPUT_SCHEMA_NAME.into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"]
+                }),
+                strict: true,
+            },
+        };
+        let json =
+            serde_json::to_value(p.build_request(&chat_request(), Some(response_format))).unwrap();
+        assert_eq!(
+            json["chat_template_kwargs"],
+            json!({ "enable_thinking": false }),
+            "the structured request must carry the thinking switch alongside response_format"
+        );
+        assert_eq!(json["response_format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn is_length_truncated_classifies_engine_values() {
+        assert!(is_length_truncated(Some("length")));
+        // Defensive: an engine that pads or uppercases the value must
+        // still classify, and every other stop reason must not.
+        assert!(is_length_truncated(Some(" length ")));
+        assert!(is_length_truncated(Some("LENGTH")));
+        assert!(!is_length_truncated(None));
+        assert!(!is_length_truncated(Some("stop")));
+        assert!(!is_length_truncated(Some("tool_calls")));
+        assert!(!is_length_truncated(Some("content_filter")));
+        assert!(!is_length_truncated(Some("")));
+    }
+
+    #[test]
+    fn response_without_finish_reason_or_usage_deserializes() {
+        // Engines that predate the field omit it; the shape must stay
+        // backwards compatible and classify as not truncated.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],"model":"m"}"#;
+        let resp: OpenAiResponse = serde_json::from_str(body).expect("deserialises");
+        let finish_reason = resp.choices.first().and_then(|c| c.finish_reason.clone());
+        assert_eq!(finish_reason, None);
+        assert!(!is_length_truncated(finish_reason.as_deref()));
+    }
+
+    #[test]
     fn build_request_does_not_cap_gpt5() {
         // Reasoning models have a much larger output cap (128K+); leave
         // the caller's value alone.
@@ -1355,6 +1612,36 @@ mod tests {
         assert_eq!(
             normalize_openai_base("https://api.z.ai/api/coding/paas/v4", ep),
             "https://api.z.ai/api/coding/paas/v4/embeddings"
+        );
+    }
+
+    /// Acceptance: the official OpenAI provider keeps its contract —
+    /// without the openai-compat opt-in it never sends `x-request-id`.
+    #[tokio::test]
+    async fn the_official_provider_sends_no_request_id_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-4o-mini",
+                "choices": [{ "message": { "content": "ok" } }],
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(SecretString::from("sk-test"), "gpt-4o-mini")
+            .unwrap()
+            .with_base_url(server.uri());
+        provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), LlmOperationId::new())
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get(REQUEST_ID_HEADER).is_none(),
+            "the official provider must not gain the openai-compat header"
         );
     }
 }

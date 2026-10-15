@@ -16,12 +16,13 @@
 //! Built-in patterns cover bearer tokens, vendor-prefixed API keys
 //! (Anthropic / OpenAI / OpenRouter sk-…, Stripe sk_live_/rk_live_…,
 //! all GitHub token prefixes ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained
-//! github_pat_…, Google AIza… plus OAuth refresh tokens 1//…, Meta /
+//! github_pat_…, Google AIza… and AQ.Ab… plus OAuth refresh tokens 1//…, Meta /
 //! Facebook Graph EAA…, Telegram bot tokens, GoHighLevel pit-…, Slack
 //! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
 //! keys, URL-embedded credentials (`postgres://user:pass@host`), and
-//! anything matching the generic `*_(KEY|TOKEN|SECRET|PASSWORD|
-//! CREDENTIAL)=value` shape. Operators can extend the list via
+//! dotless base64 JSON tokens (Cloudflare tunnel tokens), and anything
+//! matching the generic `*_(KEY|KEY_ID|TOKEN|SECRET|PASSWORD|CREDENTIAL|
+//! PEPPER|SALT|…)=value` shape. Operators can extend the list via
 //! `[sanitize].extra_patterns` and exempt substrings via
 //! `[sanitize].allowlist` — the allowlist is checked *per match*, so a
 //! pattern still runs but an allowlisted span survives unchanged.
@@ -91,8 +92,14 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // no error and no way to recover it. The word boundaries keep a real key
     // from being missed when it sits inside punctuation.
     (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "aws_key"),
-    // Naked Google / Gemini API keys.
+    // Naked Google / Gemini API keys (legacy standard-key shape).
     (r"AIza[A-Za-z0-9_\-]{30,}", "google_api_key"),
+    // Gemini authorization ("auth") keys. AI Studio has issued these instead
+    // of `AIza…` keys since 2026-05-28: `AQ.Ab` followed by a base64url tail
+    // (48 characters on a key issued 2026-10). The `.Ab` anchor keeps
+    // ordinary text such as "AQ.A" headings or `AQ.` abbreviations intact;
+    // the open tail floor matches the AIza rule's.
+    (r"AQ\.Ab[A-Za-z0-9_\-]{30,}", "google_api_key"),
     // Google OAuth refresh tokens. Longer-lived than the AIza keys above:
     // they mint fresh access tokens until explicitly revoked, so a leaked
     // one outlives the session it came from.
@@ -134,6 +141,13 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r"eyJ[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}",
         "jwt",
     ),
+    // A base64 JSON object with no dots: Cloudflare tunnel tokens
+    // (`cloudflared service install eyJ…` is how the dashboard hands one out)
+    // and other opaque `{"…` blobs the JWT rule's three segments miss. `eyJ` is
+    // only base64 for `{"`, so the 40-character floor is what separates a
+    // credential from a short encoded fragment; config that long is pasted as
+    // JSON, not base64.
+    (r"eyJ[A-Za-z0-9_\-+/]{40,}={0,2}", "base64_json_token"),
     // PEM private key blocks — multi-line, lazy match.
     (
         r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
@@ -177,6 +191,16 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
     (
         r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)"?\s*[=:]\s*\S+"#,
+        "env_secret",
+    ),
+    // The suffixes one step outside those: `*_KEY_ID` (the other half of an
+    // S3 pair, e.g. `LITESTREAM_ACCESS_KEY_ID`), `*_PASSPHRASE`,
+    // `*_SIGNING_KEY`, and `*_PEPPER` / `*_SALT`, which turn a stolen hash
+    // table into a usable one. Uppercase only, the environment-variable
+    // convention: as code identifiers (`api_key_id`, `password_salt`) they are
+    // ordinary column and field names, and redaction is irreversible.
+    (
+        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)"?\s*[=:]\s*\S+"#,
         "env_secret",
     ),
     // Filesystem paths that commonly contain credentials. The separator
@@ -486,6 +510,71 @@ mod tests {
     }
 
     #[test]
+    fn scrubs_the_suffixes_one_step_outside_key_and_token() {
+        // Fixtures are FAKE shapes, not real values.
+        for (input, secret) in [
+            (
+                "LITESTREAM_ACCESS_KEY_ID=fake0000fake0000fake0000fake0000",
+                "fake0000fake0000fake0000fake0000",
+            ),
+            (
+                "AI_MEMORY_AUTH_TOKEN_PEPPER=fakepepperfakepepperfakepepper00",
+                "fakepepperfakepepperfakepepper00",
+            ),
+            ("PASSWORD_SALT: fakesaltfakesalt00", "fakesaltfakesalt00"),
+            ("GPG_PASSPHRASE=correct-horse-fake", "correct-horse-fake"),
+            ("RELEASE_SIGNING_KEY=fakesigningkey000", "fakesigningkey000"),
+        ] {
+            let out = s().scrub(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+            assert!(out.contains("[REDACTED:env_secret]"), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn lowercase_identifiers_with_the_new_suffixes_survive() {
+        // Code, not environment: the new suffixes are uppercase-only.
+        for keep in [
+            "let api_key_id = row.get(0);",
+            "pub password_salt: String,",
+            "struct Row { user_key_id: u64 }",
+            "cache_key_id: abc123",
+        ] {
+            assert_eq!(s().scrub(keep), keep);
+        }
+    }
+
+    #[test]
+    fn scrubs_a_dotless_base64_json_token() {
+        // The shape of a Cloudflare tunnel token: base64 of `{"a":"…","t":"…"}`
+        // with no dots, handed out as a shell command rather than an assignment.
+        let token = "eyJhIjoiRkFLRUZBS0VGQUtFRkFLRUZBS0VGQUtFIiwidCI6IkZBS0VGQUtFIn0=";
+        let out = s().scrub(&format!("cloudflared service install {token}"));
+        assert!(!out.contains(token), "{out}");
+        assert_eq!(
+            out,
+            "cloudflared service install [REDACTED:base64_json_token]"
+        );
+    }
+
+    #[test]
+    fn ordinary_identifiers_survive_the_wider_rules() {
+        for keep in [
+            // A git SHA, a SHA-256 digest, a UUID and a version string.
+            "commit 1f0775428a9e4b1c2d3e4f5a6b7c8d9e0f1a2b3c",
+            "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "request 3b58f2d3-c1ac-81b2-b387-dd04ff9a3d11",
+            "version 2.4.2",
+            // `eyJ` is only base64 for `{"`: a short run is not a credential.
+            "payload eyJhIjoi",
+            // The suffixes are words in prose, not assignments.
+            "add a pinch of SALT and a KEY_ID column",
+        ] {
+            assert_eq!(s().scrub(keep), keep);
+        }
+    }
+
+    #[test]
     fn scrubs_bearer_token() {
         let out = s().scrub("Authorization: Bearer abcdef0123456789ABCDEF0123456789");
         assert!(out.contains("[REDACTED:"));
@@ -514,6 +603,28 @@ mod tests {
         let out = s().scrub("the key AIzaSyFAKEfake0123456789abcdefghijkl is leaked");
         assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("AIzaSy"));
+    }
+
+    #[test]
+    fn scrubs_naked_gemini_auth_key() {
+        // SHAPE only (`AQ.Ab` + base64url tail), never a live value — same
+        // rule as the AIzaSy… fixture above.
+        let out = s().scrub("export it: AQ.AbFAKEfake0123456789abcdefghijklmn-_FAKE done");
+        assert!(out.contains("[REDACTED:"), "{out}");
+        assert!(!out.contains("AQ.AbFAKE"), "{out}");
+        assert!(out.ends_with(" done"), "{out}");
+    }
+
+    #[test]
+    fn leaves_short_aq_prefixed_text_alone() {
+        // Not a key: too short, or missing the `.Ab` anchor.
+        for text in [
+            "see AQ.Ab for details",
+            "AQ.A section",
+            "AQ.Xyz0123456789abcdefghijklmnopqrstuvwxyz",
+        ] {
+            assert_eq!(s().scrub(text), text);
+        }
     }
 
     // Every fixture below is a SHAPE, never a live value — same rule as the

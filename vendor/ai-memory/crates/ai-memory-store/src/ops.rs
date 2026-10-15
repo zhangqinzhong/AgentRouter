@@ -203,6 +203,66 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
+/// What a conditional page write requires of the current latest version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagePrecondition {
+    /// No latest version exists at the path: the write creates the page.
+    Absent,
+    /// The latest version at the path is this one.
+    Latest(PageId),
+}
+
+/// The outcome of [`upsert_page_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalUpsert {
+    /// The precondition held and the page was written; the id is current.
+    Upserted(PageId),
+    /// The precondition did not hold and nothing was written.
+    Mismatch {
+        /// The latest version id at the path, `None` when there is none.
+        current: Option<PageId>,
+    },
+}
+
+/// [`upsert_page`] only when `precondition` holds, checked in the same
+/// transaction as the write so no other writer can land in between.
+pub fn upsert_page_if(
+    conn: &mut Connection,
+    page: &NewPage,
+    precondition: PagePrecondition,
+) -> StoreResult<ConditionalUpsert> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let current = latest_page_id_in_tx(&tx, page)?;
+    let holds = match precondition {
+        PagePrecondition::Absent => current.is_none(),
+        PagePrecondition::Latest(expected) => current == Some(expected),
+    };
+    if !holds {
+        return Ok(ConditionalUpsert::Mismatch { current });
+    }
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(ConditionalUpsert::Upserted(id))
+}
+
+fn latest_page_id_in_tx(tx: &Transaction<'_>, page: &NewPage) -> StoreResult<Option<PageId>> {
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|bytes| PageId::from_slice(&bytes).map_err(StoreError::from))
+        .transpose()
+}
+
 /// Resolve a workspace by name, creating it if missing. Atomic.
 pub fn get_or_create_workspace(
     conn: &mut Connection,
@@ -291,11 +351,17 @@ pub fn get_or_create_project(
 /// The access mode a newly created project starts in.
 ///
 /// `default` is the server's `[auth] new_projects_restricted` setting. The
-/// two reserved projects are always open whatever it says: `scratch` is where
-/// every cwd-less event lands, and the global preferences scope is shared by
-/// construction and unioned into everybody's reads.
+/// shared reserved projects are always open whatever it says: `scratch` is
+/// where every cwd-less event lands, and the global preferences scope and a
+/// workspace profile are shared by construction and unioned into everybody's
+/// reads. A private profile (`_profile.<user id>`) is always restricted: it
+/// exists to be readable by its creator alone.
 pub(crate) fn initial_access_mode(name: &str, default: crate::AccessMode) -> crate::AccessMode {
-    if name == ai_memory_core::DEFAULT_PROJECT_NAME || name == ai_memory_core::GLOBAL_SCOPE_PROJECT
+    if name.starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX) {
+        crate::AccessMode::Restricted
+    } else if name == ai_memory_core::DEFAULT_PROJECT_NAME
+        || name == ai_memory_core::GLOBAL_SCOPE_PROJECT
+        || name == ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT
     {
         crate::AccessMode::Open
     } else {
@@ -392,6 +458,9 @@ pub enum IdentityResolution {
     /// refuse — never split, which would let the first outsider after an
     /// upgrade take the identity away from the team whose project it is.
     Unclaimed,
+    /// An existing identity-backed project was renamed to its canonical path
+    /// name after write authorization, preserving the project UUID.
+    Promoted,
     /// No project existed under the name; one was created with the identity.
     Created,
     /// The name belonged to a project with a different identity, so a new one
@@ -405,6 +474,190 @@ impl IdentityResolution {
     pub fn created(self) -> bool {
         matches!(self, Self::Created | Self::Split)
     }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectNameWriteResolution {
+    pub project_id: ai_memory_core::ProjectId,
+    pub promoted_from: Option<String>,
+    pub authorization_error: Option<ai_memory_core::AuthzError>,
+}
+
+/// Result of resolving transient marker aliases for a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectAliasWriteResolution {
+    /// Existing project UUID.
+    pub project_id: ai_memory_core::ProjectId,
+    /// Previous name when canonical promotion committed.
+    pub promoted_from: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_project_name_for_write(
+    conn: &mut Connection,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    requested: &str,
+    principal: Option<&crate::ProjectPrincipal>,
+    distinguishes_operators: bool,
+    promote: bool,
+    new_project_mode: crate::AccessMode,
+) -> StoreResult<ProjectNameWriteResolution> {
+    let tx = conn.transaction()?;
+    let matched = crate::project_coordinates::resolve(&tx, *workspace_id, requested)?;
+    if let Some(matched) = matched {
+        if let Some(principal) = principal {
+            crate::project_authz::resolve_project_authz(
+                &tx,
+                *workspace_id,
+                matched.id,
+                principal,
+                distinguishes_operators,
+            )?
+            .authorize(crate::ProjectAccess::Write)
+            .map_err(|error| StoreError::Forbidden(error.message()))?;
+        }
+        let promote_to = promote
+            .then(|| crate::project_coordinates::promotion_target(&matched, requested))
+            .flatten()
+            .map(str::to_owned);
+        let promoted_from = if let Some(canonical) = promote_to {
+            rename_project_in_tx(
+                &tx,
+                workspace_id,
+                &matched.id,
+                Some(&matched.current_name),
+                &canonical,
+                principal.and_then(|principal| principal.user_id),
+                "promote_project_name",
+            )?;
+            Some(matched.current_name)
+        } else {
+            None
+        };
+        tx.commit()?;
+        return Ok(ProjectNameWriteResolution {
+            project_id: matched.id,
+            promoted_from,
+            authorization_error: None,
+        });
+    }
+
+    let also_in = project_name_in_other_workspaces(&tx, workspace_id, requested)?;
+    let id = insert_project_with_identityless_name(
+        &tx,
+        workspace_id,
+        requested,
+        None,
+        initial_access_mode(requested, new_project_mode),
+        principal.and_then(|principal| principal.user_id),
+        Timestamp::now().as_microsecond(),
+    )?;
+    let authorization_error = match principal {
+        Some(principal) => crate::project_authz::resolve_project_authz(
+            &tx,
+            *workspace_id,
+            id,
+            principal,
+            distinguishes_operators,
+        )?
+        .authorize(crate::ProjectAccess::Write)
+        .err(),
+        None => None,
+    };
+    tx.commit()?;
+    if scheduler_state_table_exists(conn)? {
+        crate::auto_improve::ensure_scheduler_state(conn, *workspace_id, id)?;
+    }
+    warn_project_name_in_other_workspaces(requested, &also_in);
+    Ok(ProjectNameWriteResolution {
+        project_id: id,
+        promoted_from: None,
+        authorization_error,
+    })
+}
+
+pub(crate) fn resolve_project_aliases_for_write(
+    conn: &mut Connection,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    canonical: &str,
+    aliases: &ai_memory_core::repository_identity::MarkerAliases,
+    repository: &ai_memory_core::repository_identity::RepositoryIdentity,
+    principal: Option<&crate::ProjectPrincipal>,
+    distinguishes_operators: bool,
+) -> StoreResult<Option<ProjectAliasWriteResolution>> {
+    let tx = conn.transaction()?;
+    let Some(matched) = crate::project_coordinates::resolve_aliases(
+        &tx,
+        *workspace_id,
+        canonical,
+        aliases,
+        repository,
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(principal) = principal {
+        crate::project_authz::resolve_project_authz(
+            &tx,
+            *workspace_id,
+            matched.id,
+            principal,
+            distinguishes_operators,
+        )?
+        .authorize(crate::ProjectAccess::Write)
+        .map_err(|error| StoreError::Forbidden(error.message()))?;
+    }
+    let derived_canonical = ai_memory_core::repository_identity::path_style_name(repository)
+        .as_deref()
+        == Some(canonical);
+    let promote_to = derived_canonical
+        .then(|| crate::project_coordinates::promotion_target(&matched, canonical))
+        .flatten()
+        .map(str::to_owned);
+    let promoted_from = if let Some(canonical) = promote_to {
+        rename_project_in_tx(
+            &tx,
+            workspace_id,
+            &matched.id,
+            Some(&matched.current_name),
+            &canonical,
+            principal.and_then(|principal| principal.user_id),
+            "promote_project_name",
+        )?;
+        Some(matched.current_name)
+    } else {
+        None
+    };
+    tx.commit()?;
+    Ok(Some(ProjectAliasWriteResolution {
+        project_id: matched.id,
+        promoted_from,
+    }))
+}
+
+fn insert_project_with_identityless_name(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    repo_path: Option<&str>,
+    mode: crate::AccessMode,
+    creator: Option<ai_memory_core::UserId>,
+    now: i64,
+) -> StoreResult<ai_memory_core::ProjectId> {
+    let id = ai_memory_core::ProjectId::new();
+    tx.execute(
+        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at, access_mode, created_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id.as_bytes(),
+            workspace_id.as_bytes(),
+            name,
+            repo_path,
+            now,
+            mode.as_str(),
+            creator.map(|creator| creator.as_bytes().to_vec()),
+        ],
+    )?;
+    Ok(id)
 }
 
 /// Resolve the project a repository identity routes to, creating it if
@@ -422,6 +675,16 @@ impl IdentityResolution {
 ///      the identity ([`ai_memory_core::repository_identity::split_name_base`],
 ///      then `-2`, `-3`, …).
 ///
+/// Under [`IdentityStyle::Path`](ai_memory_core::repository_identity::IdentityStyle)
+/// a project this call creates is named
+/// [`path_style_name`](ai_memory_core::repository_identity::path_style_name)
+/// instead (#1033), but only while no project in the workspace holds that
+/// name or canonical key. A holder with another full identity — typically the
+/// same path on another forge — makes the newcomer fall back to the name it
+/// would otherwise get and is never merged in. Capture resolution may claim or
+/// promote a compatible existing row only after write authorization in this
+/// transaction; read-only and non-capture callers never rename.
+///
 /// An identity already on a project is never overwritten. A created project
 /// records its creator in `created_by`, as [`get_or_create_project_as`] does. A
 /// split
@@ -436,6 +699,8 @@ pub fn resolve_project_by_identity(
     conn: &mut Connection,
     workspace_id: &ai_memory_core::WorkspaceId,
     identity: &ai_memory_core::repository_identity::RepositoryIdentity,
+    style: ai_memory_core::repository_identity::IdentityStyle,
+    promote: bool,
     name: &str,
     repo_path: Option<&str>,
     candidate: Option<ai_memory_core::ProjectId>,
@@ -445,38 +710,111 @@ pub fn resolve_project_by_identity(
     let repo_path = repo_path.map(normalize_repo_path_key);
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
+    let name_is_free = |tx: &rusqlite::Transaction<'_>, name: &str| -> StoreResult<bool> {
+        Ok(tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                params![workspace_id.as_bytes(), name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none())
+    };
+    let canonical_name_available =
+        |tx: &rusqlite::Transaction<'_>, name: &str| -> StoreResult<bool> {
+            for (column, index) in [
+                ("name", "sqlite_autoindex_projects_2"),
+                ("canonical_name", "idx_projects_canonical_name"),
+            ] {
+                let sql = format!(
+                    "SELECT 1 FROM projects INDEXED BY {index} \
+                     WHERE workspace_id = ?1 AND {column} = ?2 \
+                       AND {column} <> '' AND identity <> ?3 LIMIT 1"
+                );
+                if tx
+                    .query_row(
+                        &sql,
+                        params![workspace_id.as_bytes(), name, identity.identity],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+    let path_name = match style {
+        ai_memory_core::repository_identity::IdentityStyle::Path => {
+            ai_memory_core::repository_identity::path_style_name(identity)
+        }
+        ai_memory_core::repository_identity::IdentityStyle::HostPath => None,
+    };
+    let path_name = match path_name {
+        Some(path_name) if canonical_name_available(&tx, &path_name)? => Some(path_name),
+        _ => None,
+    };
 
-    let matched: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT id FROM projects WHERE workspace_id = ?1 AND identity = ?2",
-            params![workspace_id.as_bytes(), identity.identity],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let (id, resolution) = if let Some(bytes) = matched {
-        (
-            ai_memory_core::ProjectId::from_slice(&bytes)?,
-            IdentityResolution::Matched,
-        )
+    let matched = crate::project_coordinates::matches(&tx, *workspace_id, name, Some(identity))?
+        .into_iter()
+        .find(|candidate| candidate.provenance.identity);
+    let (id, resolution) = if let Some(matched) = matched {
+        let promote_to = (promote
+            && style == ai_memory_core::repository_identity::IdentityStyle::Path)
+            .then(|| crate::project_coordinates::promotion_target(&matched, path_name.as_deref()?))
+            .flatten()
+            .map(str::to_owned);
+        if let Some(canonical) = promote_to {
+            let may_write = match creator {
+                None => true,
+                Some(user) => crate::project_authz::resolve_project_authz(
+                    &tx,
+                    *workspace_id,
+                    matched.id,
+                    &crate::ProjectPrincipal::user(user),
+                    true,
+                )?
+                .authorize(crate::ProjectAccess::Write)
+                .is_ok(),
+            };
+            if may_write {
+                rename_project_in_tx(
+                    &tx,
+                    workspace_id,
+                    &matched.id,
+                    Some(&matched.current_name),
+                    &canonical,
+                    creator,
+                    "promote_project_name",
+                )?;
+                (matched.id, IdentityResolution::Promoted)
+            } else {
+                (matched.id, IdentityResolution::Matched)
+            }
+        } else {
+            (matched.id, IdentityResolution::Matched)
+        }
     } else {
-        let candidate_row: Option<(Vec<u8>, String)> = match candidate {
+        let candidate_row: Option<(Vec<u8>, String, String)> = match candidate {
             Some(candidate) => tx
                 .query_row(
-                    "SELECT id, identity FROM projects WHERE workspace_id = ?1 AND id = ?2",
+                    "SELECT id, identity, name FROM projects WHERE workspace_id = ?1 AND id = ?2",
                     params![workspace_id.as_bytes(), candidate.as_bytes()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?,
             None => tx
                 .query_row(
-                    "SELECT id, identity FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                    "SELECT id, identity, name FROM projects WHERE workspace_id = ?1 AND name = ?2",
                     params![workspace_id.as_bytes(), name],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?,
         };
         match candidate_row {
             None => {
+                let name = path_name.as_deref().unwrap_or(name);
                 let id = insert_project_with_identity(
                     &tx,
                     workspace_id,
@@ -489,7 +827,7 @@ pub fn resolve_project_by_identity(
                 )?;
                 (id, IdentityResolution::Created)
             }
-            Some((bytes, held)) if held.is_empty() => {
+            Some((bytes, held, current_name)) if held.is_empty() => {
                 let id = ai_memory_core::ProjectId::from_slice(&bytes)?;
                 // The same decision the choke point makes, on this
                 // transaction, so the claim cannot race a grant change.
@@ -506,31 +844,62 @@ pub fn resolve_project_by_identity(
                     .is_ok(),
                 };
                 if may_write {
+                    let canonical_name =
+                        ai_memory_core::repository_identity::path_style_name(identity)
+                            .unwrap_or_default();
+                    let legacy_name =
+                        ai_memory_core::repository_identity::legacy_basename_name(identity)
+                            .unwrap_or_default();
                     tx.execute(
-                        "UPDATE projects SET identity = ?1, identity_source = ?2 WHERE id = ?3",
-                        params![identity.identity, identity.source.as_str(), id.as_bytes()],
+                        "UPDATE projects SET identity = ?1, identity_source = ?2, \
+                         canonical_name = ?3, legacy_name = ?4 WHERE id = ?5",
+                        params![
+                            identity.identity,
+                            identity.source.as_str(),
+                            canonical_name,
+                            legacy_name,
+                            id.as_bytes()
+                        ],
                     )?;
-                    (id, IdentityResolution::Claimed)
+                    let promote_to = (promote
+                        && style == ai_memory_core::repository_identity::IdentityStyle::Path)
+                        .then_some(path_name.as_deref())
+                        .flatten()
+                        .filter(|canonical| *canonical != current_name);
+                    if let Some(canonical) = promote_to {
+                        rename_project_in_tx(
+                            &tx,
+                            workspace_id,
+                            &id,
+                            Some(&current_name),
+                            canonical,
+                            creator,
+                            "promote_project_name",
+                        )?;
+                        (id, IdentityResolution::Promoted)
+                    } else {
+                        (id, IdentityResolution::Claimed)
+                    }
                 } else {
                     (id, IdentityResolution::Unclaimed)
                 }
             }
             Some(_) => {
-                let base = ai_memory_core::repository_identity::split_name_base(&identity.identity);
-                let mut split_name = base.clone();
-                let mut n = 2_u32;
-                while tx
-                    .query_row(
-                        "SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2",
-                        params![workspace_id.as_bytes(), split_name],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some()
-                {
-                    split_name = format!("{base}-{n}");
-                    n += 1;
-                }
+                let split_name = match path_name {
+                    Some(path_name) => path_name,
+                    None => {
+                        let base = ai_memory_core::repository_identity::split_name_base(
+                            &identity.identity,
+                        );
+                        let mut split_name = base.clone();
+                        let mut n = 2_u32;
+                        while !name_is_free(&tx, &split_name)? {
+                            split_name = format!("{base}-{n}");
+                            n += 1;
+                        }
+                        split_name
+                    }
+                };
                 let id = insert_project_with_identity(
                     &tx,
                     workspace_id,
@@ -564,11 +933,15 @@ fn insert_project_with_identity(
     now: i64,
 ) -> StoreResult<ai_memory_core::ProjectId> {
     let id = ai_memory_core::ProjectId::new();
+    let canonical_name =
+        ai_memory_core::repository_identity::path_style_name(identity).unwrap_or_default();
+    let legacy_name =
+        ai_memory_core::repository_identity::legacy_basename_name(identity).unwrap_or_default();
     tx.execute(
         "INSERT INTO projects \
          (id, workspace_id, name, repo_path, created_at, identity, identity_source, access_mode, \
-          created_by) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          created_by, canonical_name, legacy_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             id.as_bytes(),
             workspace_id.as_bytes(),
@@ -579,6 +952,8 @@ fn insert_project_with_identity(
             identity.source.as_str(),
             mode.as_str(),
             creator.map(|creator| creator.as_bytes().to_vec()),
+            canonical_name,
+            legacy_name,
         ],
     )?;
     Ok(id)
@@ -593,7 +968,8 @@ fn insert_project_with_identity(
 /// which is what makes this safe to run on a schedule (the operator-driven
 /// `purge-project` covers everything that actually holds data). Reserved
 /// projects (`scratch`, the cwd-less fallback; `_global`, the preferences
-/// scope) are exempt even when empty. Returns the deleted names for logging.
+/// scope; `_profile` and `_profile.<user id>`, the profile scopes) are exempt
+/// even when empty. Returns the deleted names for logging.
 ///
 /// # Errors
 /// Propagates SQLite failures.
@@ -604,7 +980,8 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
     let names: Vec<String> = {
         let mut stmt = tx.prepare(
             "SELECT name FROM projects
-             WHERE name NOT IN ('scratch', ?1)
+             WHERE name NOT IN ('scratch', ?1, '_profile')
+               AND name NOT LIKE '\\_profile.%' ESCAPE '\\'
                AND created_at < ?2
                AND NOT EXISTS (SELECT 1 FROM pages        WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM sessions     WHERE project_id = projects.id)
@@ -624,7 +1001,8 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
     if !names.is_empty() {
         tx.execute(
             "DELETE FROM projects
-             WHERE name NOT IN ('scratch', ?1)
+             WHERE name NOT IN ('scratch', ?1, '_profile')
+               AND name NOT LIKE '\\_profile.%' ESCAPE '\\'
                AND created_at < ?2
                AND NOT EXISTS (SELECT 1 FROM pages        WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM sessions     WHERE project_id = projects.id)
@@ -765,18 +1143,32 @@ pub fn ensure_project_with_id(
     workspace_id: ai_memory_core::WorkspaceId,
     name: &str,
     repo_path: Option<&str>,
+    identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
 ) -> StoreResult<()> {
     let repo_path = repo_path.map(normalize_repo_path_key);
+    let identity_value = identity.map(|value| value.identity.as_str()).unwrap_or("");
+    let identity_source = identity.map(|value| value.source.as_str()).unwrap_or("");
+    let canonical_name = identity
+        .and_then(ai_memory_core::repository_identity::path_style_name)
+        .unwrap_or_default();
+    let legacy_name = identity
+        .and_then(ai_memory_core::repository_identity::legacy_basename_name)
+        .unwrap_or_default();
     let tx = conn.transaction()?;
     let inserted = tx.execute(
-        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING",
+        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at, \
+         identity, identity_source, canonical_name, legacy_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
         params![
             id.as_bytes(),
             workspace_id.as_bytes(),
             name,
             repo_path.as_deref(),
-            Timestamp::now().as_microsecond()
+            Timestamp::now().as_microsecond(),
+            identity_value,
+            identity_source,
+            canonical_name,
+            legacy_name
         ],
     )?;
     let also_in = if inserted > 0 {
@@ -784,28 +1176,64 @@ pub fn ensure_project_with_id(
     } else {
         Vec::new()
     };
-    type ProjectRow = (Vec<u8>, String, Option<String>);
+    type ProjectRow = (
+        Vec<u8>,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+    );
     let existing: Option<ProjectRow> = tx
         .query_row(
-            "SELECT workspace_id, name, repo_path FROM projects WHERE id = ?1",
+            "SELECT workspace_id, name, repo_path, identity, identity_source, \
+             canonical_name, legacy_name FROM projects WHERE id = ?1",
             params![id.as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
         )
         .optional()?;
     match existing {
-        Some((existing_ws, existing_name, existing_repo_path))
-            if existing_ws.as_slice() == workspace_id.as_bytes()
-                && existing_name == name
-                && existing_repo_path.as_deref() == repo_path.as_deref() =>
+        Some((
+            existing_ws,
+            existing_name,
+            existing_repo_path,
+            existing_identity,
+            existing_source,
+            existing_canonical,
+            existing_legacy,
+        )) if existing_ws.as_slice() == workspace_id.as_bytes()
+            && existing_name == name
+            && existing_repo_path.as_deref() == repo_path.as_deref()
+            && existing_identity == identity_value
+            && existing_source == identity_source
+            && existing_canonical == canonical_name
+            && existing_legacy == legacy_name =>
         {
             Ok(())
         }
-        Some((existing_ws, existing_name, existing_repo_path)) => {
-            Err(StoreError::Duplicate(format!(
-                "project id {id} already exists with workspace_id bytes length {}, name='{existing_name}', repo_path={existing_repo_path:?}; manifest has workspace={workspace_id}, name='{name}', repo_path={repo_path:?}",
-                existing_ws.len(),
-            )))
-        }
+        Some((
+            existing_ws,
+            existing_name,
+            existing_repo_path,
+            existing_identity,
+            existing_source,
+            existing_canonical,
+            existing_legacy,
+        )) => Err(StoreError::Duplicate(format!(
+            "project id {id} already exists with workspace_id bytes length {}, name='{existing_name}', repo_path={existing_repo_path:?}, identity={existing_identity:?}, identity_source={existing_source:?}, canonical_name={existing_canonical:?}, legacy_name={existing_legacy:?}; manifest has workspace={workspace_id}, name='{name}', repo_path={repo_path:?}, identity={identity_value:?}, identity_source={identity_source:?}, canonical_name={canonical_name:?}, legacy_name={legacy_name:?}",
+            existing_ws.len(),
+        ))),
         None => Err(StoreError::NotFound(format!(
             "project id {id} was not inserted"
         ))),
@@ -1660,8 +2088,9 @@ fn replace_links_in_tx(
         // The relation joins the dedupe key (and the table's PK): a
         // typed edge and a plain reference to the same target are two
         // different rows, mirroring `link_type` in the schema.
+        let to_workspace = link_workspace_name(link);
         let key = (
-            link.workspace.clone(),
+            to_workspace.map(str::to_owned),
             link.project.clone(),
             link.path.as_str().to_string(),
             link.relation,
@@ -1678,7 +2107,7 @@ fn replace_links_in_tx(
             params![
                 from_page_id.as_bytes(),
                 to_page_blob,
-                link.workspace,
+                to_workspace,
                 link.project,
                 link.path.as_str(),
                 link.relation
@@ -1711,11 +2140,24 @@ fn insert_evidence_in_tx(
     Ok(())
 }
 
+/// Workspace recorded on a scoped link. A project-only `[[_global:path]]`
+/// qualifier has no workspace in the source, but the reserved preferences
+/// project lives in [`ai_memory_core::DEFAULT_WORKSPACE_NAME`] (issue #1042).
+fn link_workspace_name(link: &LinkTarget) -> Option<&str> {
+    match (link.workspace.as_deref(), link.project.as_deref()) {
+        (None, Some(ai_memory_core::GLOBAL_SCOPE_PROJECT)) => {
+            Some(ai_memory_core::DEFAULT_WORKSPACE_NAME)
+        }
+        (name, _) => name,
+    }
+}
+
 /// Resolve a link target to the latest page id it points at, or `None` if the
 /// target workspace / project / page does not exist yet (an unresolved forward
 /// link). A bare link resolves within the source page's own project; a
 /// `[[project:path]]` / `[[workspace/project:path]]` link resolves against the
-/// named project (same workspace when only the project is given).
+/// named project (same workspace when only the project is given). A project-only
+/// `[[_global:path]]` link always resolves in the default workspace.
 fn latest_page_id_for_link(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
@@ -1727,7 +2169,7 @@ fn latest_page_id_for_link(
             page.project_id.as_bytes().to_vec(),
         ),
         Some(project_name) => {
-            let workspace_blob: Vec<u8> = match &link.workspace {
+            let workspace_blob: Vec<u8> = match link_workspace_name(link) {
                 None => page.workspace_id.as_bytes().to_vec(),
                 Some(workspace_name) => {
                     let found: Option<Vec<u8>> = tx
@@ -1836,6 +2278,25 @@ fn refresh_incoming_links_for_path(
                 page.workspace_id.as_bytes(),
             ],
         )?;
+        // Legacy rows stored `[[_global:path]]` with `to_workspace` NULL and
+        // were only refreshed when the source page lived in the default
+        // workspace. The reserved home is always `default/_global`, so a
+        // write of that page also heals NULL-workspace `_global` edges from
+        // every workspace (issue #1042).
+        if project_name == ai_memory_core::GLOBAL_SCOPE_PROJECT
+            && workspace_name == ai_memory_core::DEFAULT_WORKSPACE_NAME
+        {
+            tx.execute(
+                "UPDATE links \
+                 SET to_page_id = ?1 \
+                 WHERE to_project = ?2 AND to_path = ?3 AND to_workspace IS NULL",
+                params![
+                    latest_page_id.as_bytes(),
+                    ai_memory_core::GLOBAL_SCOPE_PROJECT,
+                    page.path.as_str(),
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -1898,8 +2359,8 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
     // be sitting undelivered in a client hook spool; without this check the
     // next drain recreates the session row and the observations land again,
     // silently undoing a deletion an application already promised its user
-    // (#387). Every ingest path funnels through here, so this is the one
-    // place the guard has to live.
+    // (#387). The other place a session row is created, hook admission in
+    // `admit_hook_session_event`, repeats the guard.
     if session_is_purged(conn, session)? {
         return Err(StoreError::SessionPurged(session.id.to_string()));
     }
@@ -2343,9 +2804,38 @@ pub fn insert_observation(
 }
 
 /// Ingest-keys older than this are swept opportunistically on every keyed
-/// insert. Keys only need to outlive the client spool (7 days + retry
-/// backoff); 30 days is a generous margin.
+/// insert. Ordinary keys only need to outlive the client spool (7 days + retry
+/// backoff); recovery keys remain tied to their stored session until it is purged.
 const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
+fn recovery_ingest_key(key: &str) -> bool {
+    key.strip_prefix("recovery_").is_some_and(|digest| {
+        digest.len() == 55 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn recovery_event_identity(obs: &NewObservation, agent: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    let session_id = obs.session_id.to_string();
+    for value in [
+        Some(session_id.as_str()),
+        agent,
+        Some(obs.kind.as_str()),
+        obs.extension.as_deref(),
+        obs.source_event.as_deref(),
+        Some(obs.title.as_str()),
+        Some(obs.body.as_str()),
+    ] {
+        if let Some(value) = value {
+            hasher.update(value.len().to_be_bytes());
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update(usize::MAX.to_be_bytes());
+        }
+    }
+    hasher.update(obs.occurred_at.unwrap_or_default().to_be_bytes());
+    format!("{digest:x}", digest = hasher.finalize())
+}
 
 /// Claim a project-scoped ingest key and append its observation atomically.
 ///
@@ -2365,18 +2855,48 @@ pub fn insert_observation_keyed(
     // Sweep before looking up the current key so an expired key can be reused
     // even when no unrelated keyed event arrived in the meantime.
     tx.execute(
-        "DELETE FROM ingest_keys WHERE seen_at < ?1",
+        "DELETE FROM ingest_keys WHERE recovery_retained = 0 AND seen_at < ?1",
         params![now - INGEST_KEY_TTL_MICROS],
     )?;
-    let existing: Option<Option<i64>> = tx
+    let recovery = recovery_ingest_key(ingest_key);
+    let session_agent = if recovery {
+        tx.query_row(
+            "SELECT agent_kind FROM sessions WHERE id = ?1",
+            params![obs.session_id.as_bytes()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let event_identity = recovery.then(|| recovery_event_identity(obs, session_agent.as_deref()));
+    type IngestKeyRow = (
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    if recovery && session_agent.is_none() {
+        return Err(StoreError::SessionCollision);
+    }
+    let existing: Option<IngestKeyRow> = tx
         .query_row(
-            "SELECT completed_at FROM ingest_keys \
+            "SELECT completed_at, session_id, agent_kind, observation_kind, event_identity FROM ingest_keys \
              WHERE project_id = ?1 AND key = ?2",
             params![obs.project_id.as_bytes(), ingest_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    if let Some(completed_at) = existing {
+    if let Some((completed_at, session_id, agent, kind, identity)) = existing {
+        if recovery
+            && (session_id.as_deref() != Some(obs.session_id.as_bytes())
+                || agent.as_deref() != session_agent.as_deref()
+                || kind.as_deref() != Some(obs.kind.as_str())
+                || identity.as_deref() != event_identity.as_deref())
+        {
+            return Err(StoreError::SessionCollision);
+        }
         tx.commit()?;
         return Ok(if completed_at.is_some() {
             IngestObservationOutcome::AlreadyComplete
@@ -2386,9 +2906,18 @@ pub fn insert_observation_keyed(
     }
 
     tx.execute(
-        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) \
-         VALUES (?1, ?2, ?3, NULL)",
-        params![obs.project_id.as_bytes(), ingest_key, now],
+        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id, agent_kind, observation_kind, event_identity, recovery_retained) \
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            obs.project_id.as_bytes(),
+            ingest_key,
+            now,
+            recovery.then_some(obs.session_id.as_bytes()),
+            session_agent,
+            recovery.then_some(obs.kind.as_str()),
+            event_identity,
+            i64::from(recovery)
+        ],
     )?;
     let id = insert_observation_row(&tx, obs)?;
     tx.commit()?;
@@ -2495,6 +3024,13 @@ pub fn admit_hook_session_event(
             if !owner_filter.admits(session.actor_user.as_deref()) {
                 return Err(StoreError::SessionCollision);
             }
+            // Hook ingest creates its session row here rather than through
+            // `begin_session_row`, so a purge must hold against it too: a
+            // late delivery for a purged session would otherwise bring the
+            // session back (#387).
+            if session_is_purged(&tx, session)? {
+                return Err(StoreError::SessionPurged(session.id.to_string()));
+            }
             // `now` is also the ingest-key TTL clock above; started_at honors
             // the caller's original event time (backfill) and only falls
             // back to it when absent (live capture).
@@ -2544,18 +3080,36 @@ pub fn admit_hook_session_event(
     }
     let ingest = if let Some(key) = ingest_key {
         tx.execute(
-            "DELETE FROM ingest_keys WHERE seen_at < ?1",
+            "DELETE FROM ingest_keys WHERE recovery_retained = 0 AND seen_at < ?1",
             params![now - INGEST_KEY_TTL_MICROS],
         )?;
-        let old: Option<Option<i64>> = tx
+        let recovery = recovery_ingest_key(key);
+        let event_identity =
+            recovery.then(|| recovery_event_identity(obs, Some(session.agent_kind.as_str())));
+        type IngestKeyRow = (
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let old: Option<IngestKeyRow> = tx
             .query_row(
-                "SELECT completed_at FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
+                "SELECT completed_at, session_id, agent_kind, observation_kind, event_identity FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
                 params![obs.project_id.as_bytes(), key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         match old {
-            Some(done) => {
+            Some((done, keyed_session, keyed_agent, keyed_kind, keyed_identity)) => {
+                if recovery
+                    && (keyed_session.as_deref() != Some(obs.session_id.as_bytes())
+                        || keyed_agent.as_deref() != Some(session.agent_kind.as_str())
+                        || keyed_kind.as_deref() != Some(obs.kind.as_str())
+                        || keyed_identity.as_deref() != event_identity.as_deref())
+                {
+                    return Err(StoreError::SessionCollision);
+                }
                 if done.is_some() {
                     IngestObservationOutcome::AlreadyComplete
                 } else {
@@ -2563,7 +3117,20 @@ pub fn admit_hook_session_event(
                 }
             }
             None => {
-                tx.execute("INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, NULL)", params![obs.project_id.as_bytes(), key, now])?;
+                tx.execute(
+                    "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id, agent_kind, observation_kind, event_identity, recovery_retained) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        obs.project_id.as_bytes(),
+                        key,
+                        now,
+                        recovery.then_some(obs.session_id.as_bytes()),
+                        recovery.then_some(session.agent_kind.as_str()),
+                        recovery.then_some(obs.kind.as_str()),
+                        event_identity,
+                        i64::from(recovery)
+                    ],
+                )?;
                 IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
             }
         }
@@ -4783,6 +5350,89 @@ pub fn reorg_sessions(
     })
 }
 
+fn validate_project_rename<'a>(current_name: &str, new_name: &'a str) -> StoreResult<&'a str> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err(StoreError::InvalidProjectName(
+            "project name must not be empty or all whitespace".into(),
+        ));
+    }
+    if trimmed.contains('/') {
+        return Err(StoreError::InvalidProjectName(
+            "project name must not contain '/' (it appears in URL paths)".into(),
+        ));
+    }
+    if ai_memory_core::profile::is_profile_project(trimmed) {
+        return Err(StoreError::InvalidProjectName(format!(
+            "{trimmed} is reserved for the cross-project profile"
+        )));
+    }
+    if ai_memory_core::profile::is_profile_project(current_name) {
+        return Err(StoreError::InvalidProjectName(
+            "a cross-project profile project cannot be renamed".into(),
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn rename_project_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    current_name: Option<&str>,
+    new_name: &str,
+    author_id: Option<ai_memory_core::UserId>,
+    audit_op: &str,
+) -> StoreResult<()> {
+    let current = match current_name {
+        Some(current) => current.to_owned(),
+        None => tx
+            .query_row(
+                "SELECT name FROM projects WHERE id = ?1 AND workspace_id = ?2",
+                params![project_id.as_bytes(), workspace_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "project id {project_id} no longer exists in workspace {workspace_id} \
+                     (race with concurrent purge or delete)"
+                ))
+            })?,
+    };
+    let trimmed = validate_project_rename(&current, new_name)?;
+    let rows = tx.execute(
+        "UPDATE projects SET name = ?1 WHERE id = ?2 AND workspace_id = ?3",
+        params![trimmed, project_id.as_bytes(), workspace_id.as_bytes()],
+    );
+    match rows {
+        Ok(0) => Err(StoreError::NotFound(format!(
+            "project id {project_id} no longer exists in workspace {workspace_id} \
+             (race with concurrent purge or delete)"
+        ))),
+        Ok(_) => {
+            let detail = serde_json::json!({ "from": current, "to": trimmed }).to_string();
+            audit_with_detail(
+                tx,
+                audit_op,
+                Some(workspace_id.as_bytes()),
+                Some(project_id.as_bytes()),
+                None,
+                author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+                Timestamp::now().as_microsecond(),
+                &detail,
+            )
+        }
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || error.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(StoreError::ProjectNameTaken(trimmed.to_owned()))
+        }
+        Err(error) => Err(StoreError::Sqlite(error)),
+    }
+}
+
 /// Rename a project within its workspace.
 ///
 /// Only the `name` column is updated — all pages, sessions, observations,
@@ -4803,60 +5453,18 @@ pub fn rename_project(
     new_name: &str,
     author_id: Option<ai_memory_core::UserId>,
 ) -> StoreResult<()> {
-    let trimmed = new_name.trim();
-    if trimmed.is_empty() {
-        return Err(StoreError::InvalidProjectName(
-            "project name must not be empty or all whitespace".into(),
-        ));
-    }
-    if trimmed.contains('/') {
-        return Err(StoreError::InvalidProjectName(
-            "project name must not contain '/' (it appears in URL paths)".into(),
-        ));
-    }
-
-    // Wrap the UPDATE + audit row in one transaction so the trail can never
-    // diverge from the rename it records (on any error the tx drops without
-    // commit, rolling both back).
     let tx = conn.transaction()?;
-    let rows = tx.execute(
-        "UPDATE projects SET name = ?1 WHERE id = ?2 AND workspace_id = ?3",
-        params![trimmed, project_id.as_bytes(), workspace_id.as_bytes()],
-    );
-
-    match rows {
-        // Zero rows affected means the project row vanished between the
-        // admin handler's `lookup_ws_proj_no_create` and this UPDATE —
-        // the classic shape is a concurrent `purge-project` racing the
-        // rename. Without this check, the rename would happily return
-        // `Ok(())` and the admin handler would respond `200 OK` for an
-        // operation that touched nothing, contradicting the purge's
-        // (also `200 OK`) destruction of the same row.
-        Ok(0) => Err(StoreError::NotFound(format!(
-            "project id {project_id} no longer exists in workspace {workspace_id} \
-             (race with concurrent purge or delete)",
-        ))),
-        Ok(_) => {
-            audit(
-                &tx,
-                "rename_project",
-                Some(workspace_id.as_bytes()),
-                Some(project_id.as_bytes()),
-                None,
-                author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
-                Timestamp::now().as_microsecond(),
-            )?;
-            tx.commit()?;
-            Ok(())
-        }
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                || err.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            Err(StoreError::ProjectNameTaken(trimmed.to_string()))
-        }
-        Err(e) => Err(StoreError::Sqlite(e)),
-    }
+    rename_project_in_tx(
+        &tx,
+        workspace_id,
+        project_id,
+        None,
+        new_name,
+        author_id,
+        "rename_project",
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Record a successfully-applied wiki-structure migration.
@@ -5580,6 +6188,19 @@ pub fn purge_session(
           WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
         rusqlite::params![&sid[..], &wid[..], &pid[..]],
     )? as u64;
+
+    // Profile evidence harvested from this session's prompts. A candidate
+    // keeps the user's own sentence (`statement`, `quote`), so one left behind
+    // would let a later convergence write that sentence into a profile page.
+    // Not scoped to this project: the harvest files a candidate under the
+    // project of the prompt it came from, and a prompt this session recorded
+    // in another project is deleted with it by the `observations` cascade
+    // (`collateral_observations_deleted`). A session id names one session, so
+    // `session:<id>` matches only this session's evidence.
+    tx.execute(
+        "DELETE FROM profile_candidates WHERE source_kind = 'prompt' AND source_ref = ?1",
+        rusqlite::params![format!("session:{session_id}")],
+    )?;
 
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
@@ -6400,6 +7021,37 @@ pub fn move_project_workspace(
         "UPDATE workstreams SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    // The remaining tables that carry the workspace beside the project id.
+    // Left behind, an entity or a feedback row stops matching reads keyed on
+    // the new workspace, and a purge tombstone stops matching the moved
+    // project's session ids, so a purged session could be recreated.
+    for table in [
+        "entities",
+        "page_feedback",
+        "purged_sessions",
+        "profile_candidates",
+        "profile_entry_ledger",
+        "profile_harvest_marks",
+    ] {
+        tx.execute(
+            &format!(
+                "UPDATE {table} SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3"
+            ),
+            params![&to[..], &pid[..], &from[..]],
+        )?;
+    }
+    // A message names the project on both ends: pending mail addressed to the
+    // moved project and mail it sent, which it can still cancel.
+    tx.execute(
+        "UPDATE agent_messages SET to_workspace_id = ?1 \
+          WHERE to_project_id = ?2 AND to_workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )?;
+    tx.execute(
+        "UPDATE agent_messages SET from_workspace_id = ?1 \
+          WHERE from_project_id = ?2 AND from_workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )?;
 
     let projects_updated = tx.execute(
         "UPDATE projects SET workspace_id = ?1 WHERE id = ?2 AND workspace_id = ?3",
@@ -7194,7 +7846,7 @@ pub(crate) mod tests {
         let id = ProjectId::new();
 
         let logs = capture_warnings(|| {
-            ensure_project_with_id(&mut conn, id, ws_b, "shared", None).unwrap();
+            ensure_project_with_id(&mut conn, id, ws_b, "shared", None, None).unwrap();
         });
         assert!(
             logs.contains("already exists in other workspace")
@@ -7204,7 +7856,7 @@ pub(crate) mod tests {
         );
 
         let logs = capture_warnings(|| {
-            ensure_project_with_id(&mut conn, id, ws_b, "shared", None).unwrap();
+            ensure_project_with_id(&mut conn, id, ws_b, "shared", None, None).unwrap();
         });
         assert!(
             !logs.contains("already exists in other workspace"),
@@ -7219,10 +7871,10 @@ pub(crate) mod tests {
         let ws_b = get_or_create_workspace(&mut conn, "beta").unwrap();
         get_or_create_project(&mut conn, &ws_a, "shared", None).unwrap();
         let id = ProjectId::new();
-        ensure_project_with_id(&mut conn, id, ws_b, "other", None).unwrap();
+        ensure_project_with_id(&mut conn, id, ws_b, "other", None, None).unwrap();
 
         let logs = capture_warnings(|| {
-            let err = ensure_project_with_id(&mut conn, id, ws_b, "shared", None)
+            let err = ensure_project_with_id(&mut conn, id, ws_b, "shared", None, None)
                 .expect_err("same id with different name must fail validation");
             assert!(
                 matches!(err, StoreError::Duplicate(_)),
@@ -8290,6 +8942,14 @@ pub(crate) mod tests {
     fn purge_session_removes_the_session_and_everything_derived_from_it() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let (sid, _page) = seed_session(&mut conn, ws, proj, "target");
+        let recovery_key = format!("recovery_{}", "a".repeat(55));
+        conn.execute(
+            "INSERT INTO ingest_keys \
+             (project_id, key, seen_at, completed_at, session_id, recovery_retained) \
+             VALUES (?1, ?2, 1, 1, ?3, 1)",
+            params![proj.as_bytes(), recovery_key, sid.as_bytes()],
+        )
+        .unwrap();
 
         let summary = purge_session(
             &mut conn,
@@ -8313,6 +8973,11 @@ pub(crate) mod tests {
             "observations=0"
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0, "pages=0");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM ingest_keys"),
+            0,
+            "session-bound recovery keys cascade with the purged session"
+        );
         assert_eq!(summary.observations_deleted, 1);
         assert_eq!(summary.pages_deleted, 1);
         assert_eq!(
@@ -9642,6 +10307,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// The cross-project profile keeps the user's own sentence from a prompt
+    /// in `profile_candidates`, keyed `session:<id>`. Purging the session must
+    /// take that evidence with it, including the candidate harvested from a
+    /// prompt the session recorded in another project: the purge deletes that
+    /// observation through the cascade, so its sentence must not outlive it.
+    /// A sibling session's candidates (in both projects) and a page candidate
+    /// are the controls.
+    #[test]
+    fn purge_session_deletes_the_profile_candidates_harvested_from_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (purged, _) = seed_session(&mut conn, ws, proj, "target");
+        let (sibling, _) = seed_session(&mut conn, ws, proj, "sibling");
+        // A prompt the purged session recorded in `other` (follow-cwd routing).
+        let mut stray = hook_observation(&hook_session(purged, ws, proj, None));
+        stray.project_id = other;
+        stray.body = "obs-in-other-project".into();
+        insert_observation(&mut conn, &stray).unwrap();
+        let candidate = |project: ProjectId, kind: &str, source_ref: String| {
+            conn.execute(
+                "INSERT INTO profile_candidates \
+                 (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+                  statement, quote, observed_at, generality) \
+                 VALUES (?1, ?2, ?3, ?4, 'topic', 'workflow', 'statement', 'quote', 1, 'general')",
+                params![ws.as_bytes(), project.as_bytes(), kind, source_ref],
+            )
+            .unwrap();
+        };
+        candidate(proj, "prompt", format!("session:{purged}"));
+        candidate(proj, "prompt", format!("session:{sibling}"));
+        candidate(proj, "page", "page:_rules/keep.md".into());
+        candidate(other, "prompt", format!("session:{purged}"));
+        candidate(other, "prompt", format!("session:{sibling}"));
+
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+        assert_eq!(summary.collateral_observations_deleted, 1);
+
+        let remaining: Vec<(Vec<u8>, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT project_id, source_ref FROM profile_candidates ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            remaining,
+            [
+                (proj.as_bytes().to_vec(), format!("session:{sibling}")),
+                (proj.as_bytes().to_vec(), "page:_rules/keep.md".to_owned()),
+                (other.as_bytes().to_vec(), format!("session:{sibling}")),
+            ]
+        );
+    }
+
     /// A purge must be terminal. The events that produced a session can sit
     /// undelivered in a client hook spool for days (#493 measured spools with
     /// thousands), so without a tombstone the next drain recreates the session
@@ -9674,6 +10404,52 @@ pub(crate) mod tests {
             "still gone"
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 0);
+    }
+
+    /// `begin_session` is not the only way a hook event creates a session:
+    /// live ingest goes through `admit_hook_session_event`, which inserts the
+    /// row itself. The purge must hold against it as well (#387). A sibling
+    /// session and the same id in another project are the controls.
+    #[test]
+    fn a_purged_session_is_not_recreated_by_hook_admission() {
+        let admit = |conn: &mut Connection, session: &NewSession| {
+            admit_hook_session_event(
+                conn,
+                session,
+                &hook_observation(session),
+                &OwnerFilter::Any,
+                None,
+                None,
+            )
+        };
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (purged, _) = seed_session(&mut conn, ws, proj, "target");
+        let (sibling, _) = seed_session(&mut conn, ws, proj, "sibling");
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        let session = hook_session(purged, ws, proj, None);
+        let err = admit(&mut conn, &session).expect_err("must stay purged");
+        assert!(matches!(err, StoreError::SessionPurged(_)), "got {err:?}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 1);
+
+        let sibling_session = hook_session(sibling, ws, proj, None);
+        let admitted = admit(&mut conn, &sibling_session).unwrap();
+        assert!(matches!(admitted, HookSessionAdmission::Observation { .. }));
+
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let elsewhere = hook_session(purged, ws, other, None);
+        let admitted = admit(&mut conn, &elsewhere).unwrap();
+        assert!(matches!(admitted, HookSessionAdmission::Observation { .. }));
     }
 
     /// The tombstone is scoped: purging a session id in one project must not
@@ -10878,6 +11654,162 @@ pub(crate) mod tests {
             Some(&target_id.as_bytes()[..]),
             "link must resolve across projects once the target lands"
         );
+    }
+
+    /// `[[_global:path]]` from a page outside the default workspace resolves
+    /// to the reserved `_global` project there, and the stored row names
+    /// that workspace (issue #1042).
+    #[test]
+    fn upsert_page_resolves_global_link_from_another_workspace() {
+        let (_tmp, mut conn, default_ws, _scratch) = fresh_db();
+        let global = get_or_create_project(
+            &mut conn,
+            &default_ws,
+            ai_memory_core::GLOBAL_SCOPE_PROJECT,
+            None,
+        )
+        .unwrap();
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj = get_or_create_project(&mut conn, &other_ws, "embodied-ai", None).unwrap();
+
+        let mut source = page(
+            other_ws,
+            other_proj,
+            "notes/here.md",
+            "see the standing rule",
+        );
+        source.links = vec![LinkTarget {
+            workspace: None,
+            project: Some(ai_memory_core::GLOBAL_SCOPE_PROJECT.into()),
+            path: PagePath::new("python-env.md").unwrap(),
+            relation: None,
+        }];
+        let source_id = upsert_page(&mut conn, &source).unwrap();
+
+        let (to_workspace, to_project, resolved): (
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+        ) = conn
+            .query_row(
+                "SELECT to_workspace, to_project, to_page_id FROM links \
+                 WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "python-env.md"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            to_workspace.as_deref(),
+            Some(ai_memory_core::DEFAULT_WORKSPACE_NAME)
+        );
+        assert_eq!(
+            to_project.as_deref(),
+            Some(ai_memory_core::GLOBAL_SCOPE_PROJECT)
+        );
+        assert!(resolved.is_none(), "forward link stays unresolved");
+
+        let target_id = upsert_page(
+            &mut conn,
+            &page(default_ws, global, "python-env.md", "use the venv"),
+        )
+        .unwrap();
+        let resolved: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT to_page_id FROM links WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "python-env.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some(&target_id.as_bytes()[..]),
+            "[[_global:path]] must resolve in default/_global, not other/_global"
+        );
+    }
+
+    /// Pre-fix rows stored `[[_global:path]]` with `to_workspace` NULL. A
+    /// later write of the reserved page must still pick them up.
+    #[test]
+    fn writing_a_global_page_heals_legacy_null_workspace_edges() {
+        let (_tmp, mut conn, default_ws, _scratch) = fresh_db();
+        let global = get_or_create_project(
+            &mut conn,
+            &default_ws,
+            ai_memory_core::GLOBAL_SCOPE_PROJECT,
+            None,
+        )
+        .unwrap();
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj = get_or_create_project(&mut conn, &other_ws, "embodied-ai", None).unwrap();
+
+        let source_id = upsert_page(
+            &mut conn,
+            &page(other_ws, other_proj, "notes/here.md", "body"),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO links \
+                 (from_page_id, to_page_id, to_workspace, to_project, to_path, link_type) \
+             VALUES (?1, NULL, NULL, ?2, 'python-env.md', 'references')",
+            params![source_id.as_bytes(), ai_memory_core::GLOBAL_SCOPE_PROJECT],
+        )
+        .unwrap();
+
+        let target_id = upsert_page(
+            &mut conn,
+            &page(default_ws, global, "python-env.md", "use the venv"),
+        )
+        .unwrap();
+        let resolved: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT to_page_id FROM links WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "python-env.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some(&target_id.as_bytes()[..]),
+            "a NULL-workspace _global edge must resolve when default/_global is written"
+        );
+    }
+
+    /// A sibling-project `[[infra:path]]` from a non-default workspace still
+    /// resolves in that workspace, not in `default`.
+    #[test]
+    fn upsert_page_project_only_non_global_stays_in_source_workspace() {
+        let (_tmp, mut conn, default_ws, _scratch) = fresh_db();
+        let _default_infra = get_or_create_project(&mut conn, &default_ws, "infra", None).unwrap();
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj = get_or_create_project(&mut conn, &other_ws, "embodied-ai", None).unwrap();
+        let other_infra = get_or_create_project(&mut conn, &other_ws, "infra", None).unwrap();
+
+        let mut source = page(other_ws, other_proj, "notes/here.md", "depends on infra");
+        source.links = vec![LinkTarget {
+            workspace: None,
+            project: Some("infra".into()),
+            path: PagePath::new("runbooks/02.md").unwrap(),
+            relation: None,
+        }];
+        let source_id = upsert_page(&mut conn, &source).unwrap();
+        let target_id = upsert_page(
+            &mut conn,
+            &page(other_ws, other_infra, "runbooks/02.md", "the runbook"),
+        )
+        .unwrap();
+        let (to_workspace, resolved): (Option<String>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT to_workspace, to_page_id FROM links \
+                 WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "runbooks/02.md"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            to_workspace, None,
+            "non-global project-only stays NULL workspace"
+        );
+        assert_eq!(resolved.as_deref(), Some(&target_id.as_bytes()[..]));
     }
 
     /// Store-boundary defense in depth: an unbounded handoff field or list
@@ -12544,6 +13476,8 @@ pub(crate) mod tests {
                 selection: crate::WorkstreamSelection::Current,
                 lease_owner: "test".into(),
             },
+            None,
+            false,
         )
         .unwrap();
 
@@ -12605,6 +13539,148 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(still_there, 1);
+    }
+
+    /// Tables that carry the workspace beside the project id must follow a
+    /// move too: pending mail on both ends, entities, page feedback, the purge
+    /// tombstone and the profile evidence. The other project's side of a
+    /// message stays where it is.
+    #[test]
+    fn move_project_workspace_restamps_the_remaining_workspace_columns() {
+        let (_tmp, mut conn, src_ws, proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "djalmajr").unwrap();
+        let other = get_or_create_project(&mut conn, &src_ws, "other", None).unwrap();
+
+        let mut with_entity = page(src_ws, proj, "notes/e.md", "body");
+        with_entity.entities = vec!["postgres".into()];
+        let page_id = upsert_page(&mut conn, &with_entity).unwrap();
+        conn.execute(
+            "INSERT INTO page_feedback \
+             (id, page_id, workspace_id, project_id, kind, salience_after, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'stale', 1.0, 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                &page_id.as_bytes()[..],
+                src_ws.as_bytes(),
+                proj.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO purged_sessions (session_id, workspace_id, project_id, purged_at) \
+             VALUES (?1, ?2, ?3, 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                src_ws.as_bytes(),
+                proj.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'page', 'page:_rules/a.md', 'topic', 'workflow', 's', 'q', 1, 'general')",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_entry_ledger (workspace_id, project_id, path, topic_key, written_at) \
+             VALUES (?1, ?2, 'profile/a.md', 'topic', 1)",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_harvest_marks (workspace_id, project_id) VALUES (?1, ?2)",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        let message = |from: ProjectId, to: ProjectId| {
+            conn.execute(
+                "INSERT INTO agent_messages \
+                 (id, from_workspace_id, from_project_id, from_agent, \
+                  to_workspace_id, to_project_id, body, created_at) \
+                 VALUES (?1, ?2, ?3, 'other', ?2, ?4, 'hello', 1)",
+                params![
+                    uuid::Uuid::new_v4().as_bytes(),
+                    src_ws.as_bytes(),
+                    from.as_bytes(),
+                    to.as_bytes(),
+                ],
+            )
+            .unwrap();
+        };
+        message(other, proj);
+        message(proj, other);
+
+        move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
+
+        let in_workspace = |table: &str, ws: &ai_memory_core::WorkspaceId| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id = ?1"),
+                params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for table in [
+            "entities",
+            "page_feedback",
+            "purged_sessions",
+            "profile_candidates",
+            "profile_entry_ledger",
+            "profile_harvest_marks",
+        ] {
+            assert_eq!(in_workspace(table, &dst_ws), 1, "{table} must follow");
+            assert_eq!(in_workspace(table, &src_ws), 0, "{table} must leave");
+        }
+        let side = |column: &str, ws: &ai_memory_core::WorkspaceId| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM agent_messages WHERE {column} = ?1"),
+                params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // One message is addressed to the moved project, the other sent by it;
+        // the `other` project's end of each stays in the source workspace.
+        assert_eq!(side("to_workspace_id", &dst_ws), 1);
+        assert_eq!(side("from_workspace_id", &dst_ws), 1);
+        assert_eq!(side("to_workspace_id", &src_ws), 1);
+        assert_eq!(side("from_workspace_id", &src_ws), 1);
+    }
+
+    /// The purge tombstone is keyed on `(session, workspace, project)`, so it
+    /// has to follow a move or a late event recreates the purged session in
+    /// the destination (#387). A session that was never purged is the control.
+    #[test]
+    fn a_purged_session_stays_purged_after_its_project_moves() {
+        let (_tmp, mut conn, src_ws, proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "destination").unwrap();
+        let (purged, _) = seed_session(&mut conn, src_ws, proj, "target");
+        purge_session(
+            &mut conn,
+            src_ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
+
+        let err = begin_session(&mut conn, &hook_session(purged, dst_ws, proj, None))
+            .expect_err("the purge must survive the move");
+        assert!(matches!(err, StoreError::SessionPurged(_)), "got {err:?}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 0);
+        begin_session(
+            &mut conn,
+            &hook_session(SessionId::new(), dst_ws, proj, None),
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
     }
 
     /// A same-named project already in the destination workspace makes the
@@ -13382,9 +14458,9 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, _proj) = fresh_db();
         let id = ProjectId::new();
 
-        ensure_project_with_id(&mut conn, id, ws, "from-manifest", Some("/repo/a")).unwrap();
-        let err =
-            ensure_project_with_id(&mut conn, id, ws, "renamed", Some("/repo/a")).unwrap_err();
+        ensure_project_with_id(&mut conn, id, ws, "from-manifest", Some("/repo/a"), None).unwrap();
+        let err = ensure_project_with_id(&mut conn, id, ws, "renamed", Some("/repo/a"), None)
+            .unwrap_err();
 
         assert!(
             matches!(err, StoreError::Duplicate(_)),
@@ -14380,6 +15456,37 @@ pub(crate) mod tests {
             .expect("rename of live project must succeed");
     }
 
+    /// A profile project is found by name and a private one's owner is in its
+    /// name: renaming a project onto a profile name, or a profile away, is
+    /// refused, and the refused rename changes nothing.
+    #[test]
+    fn rename_project_refuses_profile_names_both_ways() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for name in ["_profile", "_profile.00000000000000000000000000000001"] {
+            let err = rename_project(&mut conn, &ws, &proj, name, None)
+                .expect_err("renaming onto a profile name must be refused");
+            assert!(matches!(err, StoreError::InvalidProjectName(_)), "{err:?}");
+        }
+        let private = get_or_create_project(
+            &mut conn,
+            &ws,
+            "_profile.00000000000000000000000000000002",
+            None,
+        )
+        .unwrap();
+        let err = rename_project(&mut conn, &ws, &private, "plain", None)
+            .expect_err("renaming a profile away must be refused");
+        assert!(matches!(err, StoreError::InvalidProjectName(_)), "{err:?}");
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM projects WHERE id = ?1",
+                params![private.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "_profile.00000000000000000000000000000002");
+    }
+
     fn seed_user(conn: &Connection, username: &str) -> ai_memory_core::UserId {
         crate::users::insert_human_user(
             conn,
@@ -14455,6 +15562,8 @@ pub(crate) mod tests {
                 selection: crate::workstream::WorkstreamSelection::Current,
                 lease_owner: "test".to_string(),
             },
+            None,
+            false,
         )
         .expect("opening a managed run should succeed")
     }
