@@ -53,7 +53,7 @@ function date(value?: string) { return value ? new Date(value).toLocaleString() 
 function MemoryClientTargetRow({ client, target, kind, busy, preview, previewError, previewRef, onAction, onClose, t }: {
   client: MemoryClient; target: MemoryClientTarget; kind: "mcp" | "hooks"; busy: string;
   preview?: { row: string; before: string; text: string }; previewError?: { row: string; text: string };
-  previewRef: RefObject<HTMLDivElement | null>; onAction: (operation: "preview" | "install" | "remove") => void; onClose: () => void; t: (text: string) => string;
+  previewRef: RefObject<HTMLDivElement>; onAction: (operation: "preview" | "install" | "remove") => void; onClose: () => void; t: (text: string) => string;
 }) {
   const configured = kind === "mcp" ? target.mcpConfigured : target.hooksConfigured;
   const file = kind === "mcp" ? target.mcpPath : target.hookPath;
