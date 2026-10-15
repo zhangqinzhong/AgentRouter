@@ -39,15 +39,22 @@ const LEGACY_ORPHAN_TAIL_CRLF: &str =
 /// # Errors
 /// Returns an error if the target path can't be written or if the
 /// existing file isn't valid UTF-8.
-pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
-    run_inner(args, true)
+pub fn run(config: &Config, args: InstallInstructionsArgs) -> Result<()> {
+    run_inner(args, &config.runtime_env, true)
 }
 
-pub(super) fn run_quiet(args: InstallInstructionsArgs) -> Result<()> {
-    run_inner(args, false)
+pub(super) fn run_quiet(
+    args: InstallInstructionsArgs,
+    env: &crate::config::RuntimeEnv,
+) -> Result<()> {
+    run_inner(args, env, false)
 }
 
-fn run_inner(args: InstallInstructionsArgs, report: bool) -> Result<()> {
+fn run_inner(
+    args: InstallInstructionsArgs,
+    env: &crate::config::RuntimeEnv,
+    report: bool,
+) -> Result<()> {
     let block = if args.compact {
         compact_block()
     } else {
@@ -62,7 +69,7 @@ fn run_inner(args: InstallInstructionsArgs, report: bool) -> Result<()> {
     let prepared_skills = if !args.print {
         skill_args
             .as_ref()
-            .map(install_skills::prepare_install)
+            .map(|args| install_skills::prepare_install(args, env))
             .transpose()?
     } else {
         None

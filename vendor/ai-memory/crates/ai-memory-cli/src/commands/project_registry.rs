@@ -20,6 +20,9 @@ use crate::http_client::ServerEndpoint;
 const REGISTRY_VERSION: u32 = 1;
 const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_LINKS: usize = 10_000;
+/// Oldest records are evicted first; an evicted session only loses the
+/// mismatch check and falls back to the pre-record behavior.
+const MAX_SESSION_STORES: usize = 1_000;
 const REGISTRY_FILE: &str = "client-projects.json";
 const REGISTRY_LOCK_FILE: &str = "client-projects.lock";
 
@@ -38,10 +41,30 @@ pub(super) struct ProjectLink {
     pub(super) linked_at: String,
 }
 
+/// The native store this client launched one linked session under.
+///
+/// The server only learns the native session id, so without this record a
+/// later launch cannot tell a deleted session from one that lives under a
+/// different store override (a second `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionStore {
+    server: String,
+    harness: String,
+    native_session_id: String,
+    /// Absolute, normalized store root, so the default store and an override
+    /// spelling the same directory compare equal.
+    store: PathBuf,
+    recorded_at: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectRegistry {
     version: u32,
     links: Vec<ProjectLink>,
+    // Optional so registries written before this field still load; older
+    // binaries ignore it and simply drop it on their next write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    session_stores: Vec<SessionStore>,
 }
 
 impl Default for ProjectRegistry {
@@ -49,6 +72,7 @@ impl Default for ProjectRegistry {
         Self {
             version: REGISTRY_VERSION,
             links: Vec::new(),
+            session_stores: Vec::new(),
         }
     }
 }
@@ -133,6 +157,57 @@ pub(super) fn rekey_scope(
         }
         Ok(true)
     })
+}
+
+/// Remember the store a session was linked under, after the server accepted
+/// the link (at launch, or at finish for an id discovered after the run).
+pub(super) fn record_session_store(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    harness: &str,
+    native_session_id: &str,
+    store: &Path,
+) -> Result<()> {
+    let server = endpoint.identity();
+    update_registry(config, |registry| {
+        registry.session_stores.retain(|record| {
+            !(record.server == server
+                && record.harness == harness
+                && record.native_session_id == native_session_id)
+        });
+        registry.session_stores.push(SessionStore {
+            server,
+            harness: harness.to_owned(),
+            native_session_id: native_session_id.to_owned(),
+            store: store.to_path_buf(),
+            recorded_at: jiff::Timestamp::now().to_string(),
+        });
+        let excess = registry
+            .session_stores
+            .len()
+            .saturating_sub(MAX_SESSION_STORES);
+        registry.session_stores.drain(..excess);
+        Ok(true)
+    })
+}
+
+/// The store a session was linked under, if this client recorded one.
+pub(super) fn recorded_session_store(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    harness: &str,
+    native_session_id: &str,
+) -> Result<Option<PathBuf>> {
+    let server = endpoint.identity();
+    Ok(load_registry(&registry_path(config))?
+        .session_stores
+        .into_iter()
+        .find(|record| {
+            record.server == server
+                && record.harness == harness
+                && record.native_session_id == native_session_id
+        })
+        .map(|record| record.store))
 }
 
 fn registry_path(config: &Config) -> PathBuf {
@@ -417,5 +492,108 @@ mod tests {
         assert_eq!(links[0].workspace, "to");
         assert_eq!(links[0].project, "renamed");
         assert_eq!(links[0].linked_at, original_linked_at);
+    }
+
+    #[test]
+    fn session_stores_are_keyed_by_server_harness_and_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(&tmp.path().join("data"));
+        let first = endpoint("http://memory-one:49374");
+        let second = endpoint("http://memory-two:49374");
+        let custom = tmp.path().join("claude-glm").join("projects");
+        let default = tmp.path().join("home").join(".claude").join("projects");
+
+        record_session_store(&config, &first, "claude", "abc", &custom).unwrap();
+        record_session_store(&config, &first, "codex", "def", &default).unwrap();
+
+        assert_eq!(
+            recorded_session_store(&config, &first, "claude", "abc").unwrap(),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            recorded_session_store(&config, &first, "codex", "def").unwrap(),
+            Some(default.clone())
+        );
+        assert_eq!(
+            recorded_session_store(&config, &first, "codex", "abc").unwrap(),
+            None
+        );
+        assert_eq!(
+            recorded_session_store(&config, &second, "claude", "abc").unwrap(),
+            None
+        );
+
+        record_session_store(&config, &first, "claude", "abc", &default).unwrap();
+        assert_eq!(
+            recorded_session_store(&config, &first, "claude", "abc").unwrap(),
+            Some(default)
+        );
+    }
+
+    /// Registries written before session stores existed keep loading, and
+    /// recording one keeps their links.
+    #[test]
+    fn registries_without_session_stores_still_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir(&checkout).unwrap();
+        let config = config_at(&data);
+        let endpoint = endpoint("http://memory:49374");
+        let store = tmp.path().join("store");
+        record_prepared_checkout(&config, &endpoint, "default", "app", &checkout).unwrap();
+        let legacy = fs::read_to_string(data.join(REGISTRY_FILE)).unwrap();
+        assert!(!legacy.contains("session_stores"), "{legacy}");
+
+        assert_eq!(
+            recorded_session_store(&config, &endpoint, "claude", "abc").unwrap(),
+            None
+        );
+        record_session_store(&config, &endpoint, "claude", "abc", &store).unwrap();
+
+        assert_eq!(links_for_server(&config, &endpoint).unwrap().len(), 1);
+        assert_eq!(
+            recorded_session_store(&config, &endpoint, "claude", "abc").unwrap(),
+            Some(store)
+        );
+    }
+
+    #[test]
+    fn session_store_records_evict_the_oldest_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(&tmp.path().join("data"));
+        let endpoint = endpoint("http://memory:49374");
+        let server = endpoint.identity();
+        let store = tmp.path().join("store");
+        update_registry(&config, |registry| {
+            registry.session_stores = (0..MAX_SESSION_STORES)
+                .map(|index| SessionStore {
+                    server: server.clone(),
+                    harness: "claude".to_owned(),
+                    native_session_id: format!("session-{index}"),
+                    store: store.clone(),
+                    recorded_at: "2026-01-01T00:00:00Z".to_owned(),
+                })
+                .collect();
+            Ok(true)
+        })
+        .unwrap();
+
+        record_session_store(&config, &endpoint, "claude", "newest", &store).unwrap();
+
+        let path = registry_path(&config);
+        assert_eq!(
+            load_registry(&path).unwrap().session_stores.len(),
+            MAX_SESSION_STORES
+        );
+        assert_eq!(
+            recorded_session_store(&config, &endpoint, "claude", "session-0").unwrap(),
+            None
+        );
+        assert_eq!(
+            recorded_session_store(&config, &endpoint, "claude", "newest").unwrap(),
+            Some(store)
+        );
     }
 }

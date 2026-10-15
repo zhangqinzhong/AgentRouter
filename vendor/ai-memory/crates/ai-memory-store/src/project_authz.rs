@@ -17,6 +17,14 @@
 //!   where there is no notion of "another user" to gate against, and
 //! - any `open` project.
 //!
+//! ## The reserved shared scopes are read-open, write-gated
+//!
+//! `default/_global` and a workspace's `_profile` stay `open` because their
+//! pages are unioned into every project's reads. Writing it therefore reaches every other user's results,
+//! so on a deployment that distinguishes operators a write needs root or an
+//! explicit `write` grant on it, whatever its access mode. Creating it first
+//! grants nothing: the first writer must not become a permanent one.
+//!
 //! ## Never fail closed on a resolution gap (#678)
 //!
 //! A `restricted` project with **zero** grants still admits root and the
@@ -39,6 +47,9 @@ use crate::error::StoreResult;
 /// Denial message surfaced when a `restricted` project refuses a caller.
 pub const RESTRICTED_PROJECT_FORBIDDEN: &str =
     "project access is restricted; root, the project creator, or a matching grant is required";
+
+/// Denial message surfaced when a write to the reserved global scope is refused.
+pub const GLOBAL_SCOPE_WRITE_FORBIDDEN: &str = "the global scope is shared with every project; writing it requires root or a write grant on it";
 
 /// A project's enforcement mode, stored in `projects.access_mode` (V68).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,12 +187,17 @@ pub struct ProjectAuthz {
     pub is_creator: bool,
     /// The caller's grant on the project, if any.
     pub grant: Option<GrantLevel>,
+    /// The project is a shared reserved scope: the global preferences scope
+    /// (`default/_global`) or a workspace profile (`<workspace>/_profile`).
+    pub reserved_global: bool,
 }
 
 impl ProjectAuthz {
     /// Decide whether the caller may perform `need` in this project.
     ///
     /// - A deployment that does not distinguish operators skips the gate.
+    /// - A write to the reserved global scope needs root or a `write` grant,
+    ///   in either mode; its creator gets nothing extra.
     /// - An `open` project admits everyone (today's behaviour).
     /// - A `restricted` project admits root and the creator unconditionally;
     ///   otherwise a read needs any grant and a write needs a `write` grant.
@@ -192,6 +208,13 @@ impl ProjectAuthz {
     pub fn authorize(&self, need: ProjectAccess) -> Result<(), AuthzError> {
         if !self.distinguishes_operators {
             return Ok(());
+        }
+        if self.reserved_global && need == ProjectAccess::Write {
+            return if self.is_root || self.grant == Some(GrantLevel::Write) {
+                Ok(())
+            } else {
+                Err(AuthzError::Forbidden(GLOBAL_SCOPE_WRITE_FORBIDDEN))
+            };
         }
         match self.access_mode {
             AccessMode::Open => Ok(()),
@@ -223,33 +246,99 @@ pub fn authorize_project(ctx: &ProjectAuthz, need: ProjectAccess) -> Result<(), 
     ctx.authorize(need)
 }
 
-/// Read `projects.access_mode` and `projects.created_by`, degrading to
-/// [`AccessMode::Open`] with no creator on any read failure and for an unknown
-/// project. Never fails closed.
-fn read_project_row(conn: &Connection, project_id: ProjectId) -> (AccessMode, Option<UserId>) {
+/// The facts [`resolve_project_authz`] reads from a project's row.
+struct ProjectRow {
+    access_mode: AccessMode,
+    creator: Option<UserId>,
+    reserved_global: bool,
+}
+
+/// Read `projects.access_mode`, `projects.created_by` and whether the project
+/// is the reserved global scope, degrading to [`AccessMode::Open`] with no
+/// creator on any read failure and for an unknown project. Never fails closed.
+fn read_project_row(conn: &Connection, project_id: ProjectId) -> ProjectRow {
     match conn.query_row(
-        "SELECT access_mode, created_by FROM projects WHERE id = ?1",
+        "SELECT p.access_mode, p.created_by, p.name, w.name \
+         FROM projects p JOIN workspaces w ON w.id = p.workspace_id WHERE p.id = ?1",
         params![project_id.as_bytes()],
         |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
                 row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         },
     ) {
-        Ok((mode, creator)) => (
-            AccessMode::from_db(mode.as_deref()),
-            creator.and_then(|raw| UserId::from_slice(&raw).ok()),
-        ),
-        Err(rusqlite::Error::QueryReturnedNoRows) => (AccessMode::Open, None),
+        Ok((mode, creator, project, workspace)) => ProjectRow {
+            access_mode: AccessMode::from_db(mode.as_deref()),
+            creator: creator.and_then(|raw| UserId::from_slice(&raw).ok()),
+            reserved_global: is_reserved_global(&workspace, &project),
+        },
+        Err(rusqlite::Error::QueryReturnedNoRows) => ProjectRow {
+            access_mode: AccessMode::Open,
+            creator: None,
+            reserved_global: false,
+        },
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 "could not read projects.access_mode; degrading project authz to open",
             );
-            (AccessMode::Open, None)
+            ProjectRow {
+                access_mode: AccessMode::Open,
+                creator: None,
+                reserved_global: false,
+            }
         }
     }
+}
+
+/// [`read_project_row`] without degrading: the project must exist in the
+/// given workspace, its access mode must be a known value and its creator a
+/// well-formed id.
+fn read_project_row_strict(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> StoreResult<ProjectRow> {
+    let (mode, creator, project, workspace) = conn.query_row(
+        "SELECT p.access_mode, p.created_by, p.name, w.name FROM projects p \
+         JOIN workspaces w ON w.id = p.workspace_id \
+         WHERE p.workspace_id = ?1 AND p.id = ?2",
+        params![workspace_id.as_bytes(), project_id.as_bytes()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )?;
+    let access_mode = match mode.as_str() {
+        "open" => AccessMode::Open,
+        "restricted" => AccessMode::Restricted,
+        _ => {
+            return Err(crate::StoreError::MalformedRecord(
+                "unknown project access mode".into(),
+            ));
+        }
+    };
+    Ok(ProjectRow {
+        access_mode,
+        creator: creator.map(|raw| UserId::from_slice(&raw)).transpose()?,
+        reserved_global: is_reserved_global(&workspace, &project),
+    })
+}
+
+/// The shared reserved scopes every project's reads union in: the global
+/// preferences scope, and a workspace's `_profile`. A private profile is not
+/// one of them; it is restricted to its creator instead.
+fn is_reserved_global(workspace: &str, project: &str) -> bool {
+    (workspace == ai_memory_core::DEFAULT_WORKSPACE_NAME
+        && project == ai_memory_core::GLOBAL_SCOPE_PROJECT)
+        || project == ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT
 }
 
 /// Look up a caller's grant on a project. Returns the failure so the caller can
@@ -294,12 +383,97 @@ pub fn resolve_project_authz(
     principal: &ProjectPrincipal,
     distinguishes_operators: bool,
 ) -> StoreResult<ProjectAuthz> {
-    let (mut access_mode, creator) = read_project_row(conn, project_id);
+    resolve(
+        conn,
+        workspace_id,
+        project_id,
+        principal,
+        distinguishes_operators,
+        Resolution::DegradeToOpen,
+    )
+}
+
+/// [`resolve_project_authz`] for a managed-run write that releases or replaces
+/// another operator's state (finish, cancel, heartbeat, link, context
+/// acceptance). The decision is the same; only a resolution gap differs: an
+/// unreadable or unknown project, an unknown access mode, a deleted user or an
+/// unreadable grant is an error instead of degrading to `open`, and a server
+/// with database users distinguishes operators even when the caller's auth
+/// level does not say so.
+pub(crate) fn resolve_project_authz_strict(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    principal: &ProjectPrincipal,
+    distinguishes_operators: bool,
+) -> StoreResult<ProjectAuthz> {
+    resolve(
+        conn,
+        workspace_id,
+        project_id,
+        principal,
+        distinguishes_operators,
+        Resolution::Strict,
+    )
+}
+
+/// How [`resolve`] treats a gap in what it can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// Degrade to `open` and log (#678).
+    DegradeToOpen,
+    /// Fail the request.
+    Strict,
+}
+
+fn resolve(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    principal: &ProjectPrincipal,
+    mut distinguishes_operators: bool,
+    resolution: Resolution,
+) -> StoreResult<ProjectAuthz> {
+    let ProjectRow {
+        mut access_mode,
+        creator,
+        reserved_global,
+    } = match resolution {
+        Resolution::DegradeToOpen => read_project_row(conn, project_id),
+        Resolution::Strict => {
+            let row = read_project_row_strict(conn, workspace_id, project_id)?;
+            distinguishes_operators |= crate::users::users_exist(conn)?;
+            if let Some(user_id) = principal.user_id {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
+                    params![user_id.as_bytes()],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(crate::StoreError::Forbidden(
+                        "authenticated user no longer exists",
+                    ));
+                }
+            }
+            row
+        }
+    };
     let is_creator = principal.is_creator || (creator.is_some() && creator == principal.user_id);
-    let grant = if access_mode == AccessMode::Restricted {
+    let grant = if reserved_global || access_mode == AccessMode::Restricted {
         match principal.user_id {
             Some(user_id) => match read_grant(conn, workspace_id, project_id, user_id) {
                 Ok(grant) => grant,
+                Err(err) if resolution == Resolution::Strict => return Err(err.into()),
+                // The global scope's write gate needs the grant in either
+                // mode; an unreadable grant admits no write there, while reads
+                // stay open.
+                Err(err) if reserved_global => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not read project_grants for the global scope; refusing writes",
+                    );
+                    None
+                }
                 Err(err) => {
                     // The grants table cannot be read: degrade to open rather
                     // than lock everyone out of a restricted project (#678).
@@ -322,6 +496,7 @@ pub fn resolve_project_authz(
         is_root: principal.is_root,
         is_creator,
         grant,
+        reserved_global,
     })
 }
 
@@ -342,7 +517,105 @@ mod tests {
             is_root,
             is_creator,
             grant,
+            reserved_global: false,
         }
+    }
+
+    /// The strict resolution managed-run mutations use is the canonical
+    /// decision, not a parallel one: the reserved global scope's write gate
+    /// holds there too, and only a resolution gap is treated differently (an
+    /// unknown project fails instead of degrading to open).
+    #[tokio::test]
+    async fn strict_resolution_shares_the_global_gate_and_fails_closed_on_a_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(tmp.path()).unwrap();
+        let global = crate::create_global_scope(&store.writer).await.unwrap();
+        let user = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let principal = ProjectPrincipal::user(user);
+
+        let strict = resolve_project_authz_strict(
+            &conn,
+            global.workspace_id,
+            global.project_id,
+            &principal,
+            false,
+        )
+        .unwrap();
+        assert!(strict.reserved_global);
+        assert!(
+            strict.distinguishes_operators,
+            "a server with database users distinguishes operators"
+        );
+        assert!(strict.authorize(ProjectAccess::Write).is_err());
+        assert!(strict.authorize(ProjectAccess::Read).is_ok());
+
+        let unknown = ProjectId::new();
+        assert!(
+            resolve_project_authz_strict(&conn, global.workspace_id, unknown, &principal, true)
+                .is_err()
+        );
+        let lenient =
+            resolve_project_authz(&conn, global.workspace_id, unknown, &principal, true).unwrap();
+        assert_eq!(lenient.access_mode, AccessMode::Open);
+    }
+
+    /// GHSA-7qj3-7wqw-m5w6: writing the reserved global scope needs root or a
+    /// write grant in either mode; its creator and an open mode admit nothing
+    /// extra, reads stay open, and an install without operators is unchanged.
+    #[test]
+    fn the_global_scope_admits_writes_only_from_root_or_a_write_grant() {
+        let global = |mode, is_root, is_creator, grant| ProjectAuthz {
+            reserved_global: true,
+            ..ctx(true, mode, is_root, is_creator, grant)
+        };
+        for mode in [AccessMode::Open, AccessMode::Restricted] {
+            let refused = [
+                global(mode, false, false, None),
+                global(mode, false, true, None),
+                global(mode, false, false, Some(GrantLevel::Read)),
+            ];
+            for ctx in refused {
+                assert_eq!(
+                    ctx.authorize(ProjectAccess::Write),
+                    Err(AuthzError::Forbidden(GLOBAL_SCOPE_WRITE_FORBIDDEN)),
+                    "{ctx:?}"
+                );
+            }
+            assert!(
+                global(mode, true, false, None)
+                    .authorize(ProjectAccess::Write)
+                    .is_ok()
+            );
+            assert!(
+                global(mode, false, false, Some(GrantLevel::Write))
+                    .authorize(ProjectAccess::Write)
+                    .is_ok()
+            );
+        }
+        assert!(
+            global(AccessMode::Open, false, false, None)
+                .authorize(ProjectAccess::Read)
+                .is_ok()
+        );
+        let single_user = ProjectAuthz {
+            distinguishes_operators: false,
+            ..global(AccessMode::Open, false, false, None)
+        };
+        assert!(single_user.authorize(ProjectAccess::Write).is_ok());
     }
 
     #[test]

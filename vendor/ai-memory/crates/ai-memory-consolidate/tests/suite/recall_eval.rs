@@ -22,7 +22,7 @@ use ai_memory_core::{
     SessionId, Tier,
 };
 use ai_memory_llm::{Embedder, SyntheticEmbedder};
-use ai_memory_store::Store;
+use ai_memory_store::{RetrievalTuning, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use tempfile::TempDir;
 
@@ -105,6 +105,124 @@ const PROBES: &[(&str, &str)] = &[
 ];
 
 const RECALL_FLOOR: f64 = 0.70;
+
+#[tokio::test]
+async fn portuguese_session_recall_is_opt_in_and_preserves_fact_queries() {
+    let tmp = TempDir::new().expect("tempdir");
+    let mut store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "eval", None)
+        .await
+        .expect("proj");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+    // Identical searchable content isolates the existing session authority
+    // penalty and its opt-in cancellation from differences in FTS matches.
+    let body = "Na última sessão fizemos a busca SQLite. Ontem paramos na revisão. \
+                A decisão anterior tratou do histórico. \
+                Erro na sessão do usuário: a sessão expira antes de salvar. \
+                A sessão passada para o middleware é nula; sessao passada como parametro.";
+    for (path, tier, kind) in [
+        ("notes/recall.md", Tier::Semantic, "note"),
+        ("sessions/recall.md", Tier::Episodic, "session"),
+    ] {
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).expect("path"),
+            frontmatter: serde_json::json!({"title": "Busca e sessões", "kind": kind}),
+            body: body.into(),
+            tier,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .expect("write page");
+    }
+
+    let probes = [
+        ("o que fizemos na última sessão", true),
+        ("o que fizemos na ultima sessao", true),
+        ("o que fizemos na última sessao", true),
+        ("o que fizemos na ultima sessão", true),
+        ("ONDE PARAMOS ONTEM?", true),
+        ("lembre a decisão anterior", true),
+        ("lembre a decisao anterior", true),
+        ("erro na sessão do usuário", false),
+        ("erro na sessao do usuario", false),
+        ("a sessão passada para o middleware é nula", false),
+        ("sessao passada como parametro", false),
+        ("sessão expira", false),
+        ("sessao expira", false),
+        ("antes de salvar", false),
+        ("sessão", false),
+        ("sessao", false),
+        ("antes", false),
+        ("penúltima sessão", false),
+        ("decisão anteriormente tomada", false),
+    ];
+    for (query, historical) in probes {
+        let mut baseline = Vec::new();
+        for mode in 0..3 {
+            store.reader.set_retrieval_tuning(if mode == 0 {
+                RetrievalTuning::default()
+            } else {
+                RetrievalTuning {
+                    session_recall_routing: mode == 2,
+                    session_recall_bonus: 0.15,
+                    ..RetrievalTuning::default()
+                }
+            });
+            let hits = store
+                .reader
+                .hybrid_search_explained(
+                    ws,
+                    proj,
+                    query.into(),
+                    None,
+                    String::new(),
+                    String::new(),
+                    0,
+                    5,
+                    None,
+                    false,
+                )
+                .await
+                .expect("search");
+            assert_eq!(hits.len(), 2, "query={query:?}, mode={mode}");
+            let ranking: Vec<_> = hits.iter().map(|(hit, _)| (hit.id, hit.rank)).collect();
+            if mode == 0 {
+                baseline = ranking;
+                assert_eq!(hits[0].0.path.as_str(), "notes/recall.md", "{query}");
+            } else if mode == 1 || !historical {
+                assert_eq!(ranking, baseline, "query={query:?}, mode={mode}");
+            } else {
+                assert_eq!(hits[0].0.path.as_str(), "sessions/recall.md", "{query}");
+                assert!(hits[0].1.intent_boost.expect("recall boost") > 1.0);
+            }
+            for (_, explain) in &hits {
+                let expected = (mode == 2 && historical).then_some("session_recall");
+                assert_eq!(explain.intent, expected, "query={query:?}, mode={mode}");
+                if expected.is_none() {
+                    assert_eq!(explain.intent_boost, None, "{query}");
+                }
+            }
+        }
+    }
+    eprintln!(
+        "portuguese_session_recall: {} probes checked off/on",
+        probes.len()
+    );
+}
 
 #[tokio::test]
 async fn recall_at_5_baseline() {
@@ -399,6 +517,117 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
     assert_eq!(raw_hits.len(), 1);
     assert_eq!(raw_hits[0].session_id, session_id);
     assert!(raw_hits[0].snippet.contains("<mark>capybara</mark>"));
+}
+
+/// Cross-project profile recall (`docs/cross-project-profile.md`): a habit the
+/// user stated in two projects becomes a profile entry that a task-level
+/// query finds in the profile scope, where every other project's
+/// `memory_query` unions it. A choice only one project made stays out.
+#[tokio::test]
+async fn profile_recall_across_projects() {
+    use ai_memory_consolidate::profile::{ProfilePassConfig, run_profile_pass};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
+    for (project, prompt) in [
+        ("alpha", "I prefer tabs over spaces."),
+        // Reworded: the same text in two projects at the same moment is one
+        // message fanned out, not a habit (#1148).
+        ("beta", "I prefer tabs over spaces here too."),
+        (
+            "alpha",
+            "Use the legacy webpack builder instead of vite in this repo.",
+        ),
+    ] {
+        let proj = store
+            .writer
+            .get_or_create_project(ws, project, None)
+            .await
+            .expect("proj");
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .expect("begin session");
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: prompt.into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .expect("insert observation");
+    }
+    let config = ProfilePassConfig {
+        settings: ai_memory_core::profile::ProfileSettings::default(),
+        distinguishes_operators: false,
+    };
+    run_profile_pass(&store.reader, &store.writer, &wiki, None, &config)
+        .await
+        .expect("profile pass");
+
+    let global = ai_memory_store::lookup_global_scope(&store.reader)
+        .await
+        .expect("lookup")
+        .expect("the profile scope exists");
+    let hits = store
+        .reader
+        .search_pages_for_project(
+            global.workspace_id,
+            global.project_id,
+            "tabs spaces".into(),
+            5,
+            None,
+        )
+        .await
+        .expect("profile search");
+    assert!(
+        hits.iter().any(|h| h.path.as_str().starts_with("profile/")),
+        "the converged habit is recallable from the profile: {hits:?}"
+    );
+    let local = store
+        .reader
+        .search_pages_for_project(
+            global.workspace_id,
+            global.project_id,
+            "webpack builder".into(),
+            5,
+            None,
+        )
+        .await
+        .expect("profile search");
+    assert!(
+        local.is_empty(),
+        "a one-project exception never reaches the profile: {local:?}"
+    );
 }
 
 async fn measure_recall(

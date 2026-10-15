@@ -6,13 +6,16 @@
 //! guard read `process.env` while the rest of the codebase used
 //! `getMergedEnv()`, masking the bug for weeks).
 
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_llm::{
-    AuthRequirement, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders, FallbackLlmProvider,
-    LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice,
-    ProviderConfig, ReasoningEffort, build_provider,
+    AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, CursorAuth, EmbedderChoice, EmbedderConfig,
+    ExtraHeaders, FallbackLlmProvider, LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL,
+    ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort, build_provider,
+    cursor_executable,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -33,6 +36,9 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
 
 /// Default base URL used by thin-client CLI subcommands.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
+
+/// Default number of failed hook-spool drain passes before dropping an event.
+pub const DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS: u32 = 8;
 
 /// Placeholder credential that lets `Config::load` validate a fallback
 /// profile whose `api_key_env` is absent from this process. Never reaches a
@@ -305,6 +311,15 @@ pub struct Config {
     /// already supplies its own schema. Set
     /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
+    /// OpenAI-compat only: send
+    /// `chat_template_kwargs: {"enable_thinking": false}` with every chat
+    /// request, for thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models): the engine otherwise spends the output budget
+    /// on a reasoning pass before the structured payload and can truncate
+    /// it mid-JSON. Ignored by every other provider; off by default. Set
+    /// with `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` (or
+    /// `llm_compat_disable_thinking = true` in `config.toml`).
+    pub llm_compat_disable_thinking: bool,
     /// Per-request timeout (seconds) applied to every chat
     /// completion request and to the Copilot token exchange; the
     /// openai-oauth token refresh keeps the built-in default ceiling
@@ -406,6 +421,11 @@ pub struct Config {
     /// per harness and config home. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
+    /// Named, env-only presets for `ai-memory run --profile NAME`.
+    /// Profiles deliberately do not carry executable paths, native argv, or
+    /// permission-bypass flags. Configure them under `[run.profiles.<name>.env]`.
+    #[serde(default)]
+    pub run: RunSettings,
     /// Off by default. When true, a Claude `ai-memory run --yolo` additionally
     /// applies [`apply_claude_true_yolo`](ai_memory_workstream::apply_claude_true_yolo),
     /// injecting `--settings` that forces `bypassPermissions` over any
@@ -548,6 +568,17 @@ pub struct Config {
     /// Both approve validated proposals by default unless `require_approval` is
     /// set. The SessionEnd trigger stays off by default.
     pub auto_improve: AutoImproveSettings,
+    /// Session-start handoff delivery (design: #959). Default keeps today's
+    /// automatic-claim behavior unchanged.
+    pub handoff: HandoffSettings,
+    /// `[profile]` — the cross-project profile: how this user usually works,
+    /// delivered to every project as defaults below the repository's rules
+    /// file (`docs/design-cross-project-profile.md`,
+    /// `docs/cross-project-profile.md`). `enabled = "auto"` (the default)
+    /// turns it on for a single-operator server, shared across every
+    /// workspace, and leaves it off for a multi-user one. Settable via
+    /// `AI_MEMORY_PROFILE__<KEY>` (for example `AI_MEMORY_PROFILE__SHARE`).
+    pub profile: ai_memory_core::profile::ProfileSettings,
     /// Privacy-strip tuning. Built-in patterns always run; this section
     /// lets the operator extend or punch holes in them.
     pub sanitize: ai_memory_core::SanitizeConfig,
@@ -558,16 +589,21 @@ pub struct Config {
     /// `AI_MEMORY_AUTH_TOKEN` env var or `[auth].bearer_token` in
     /// config.toml.
     pub auth: AuthSettings,
-    /// `[auto_scope]` — opt-in isolation of the hook-published "current
-    /// project" pointer used by MCP tools that omit `workspace`/`project`.
-    /// Default `single` mode preserves the legacy global slot; `per_session`
-    /// and `per_actor` are for shared installs. See [`AutoScopeSettings`]
+    /// `[auto_scope]` — isolation of the hook-published "current project"
+    /// pointer used by MCP tools that omit `workspace`/`project`. The default
+    /// `per_actor` mode keys it by whatever coordinate the caller has;
+    /// `per_session` keys by `session_id`, and `single` keeps the pre-v1.39
+    /// global slot. See [`AutoScopeSettings`]
     /// and [`ai_memory_core::ActiveProjectMode`].
     pub auto_scope: AutoScopeSettings,
     /// `[routing]` — how mid-session events whose cwd moved are attributed.
     /// Default `follow-cwd` preserves the historical per-event resolution;
     /// `sticky` keeps the session's project. See [`RoutingSettings`].
     pub routing: RoutingSettings,
+    /// Client-side hook spool retry policy.
+    pub hook_spool: HookSpoolSettings,
+    /// `[ingest]` — server-side drop list for tool events (#1241).
+    pub ingest: IngestSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -617,6 +653,29 @@ pub struct Config {
     pub runtime_env: RuntimeEnv,
 }
 
+#[derive(Clone, Default)]
+struct CapturedProcessEnv(Vec<(OsString, OsString)>);
+
+impl std::fmt::Debug for CapturedProcessEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturedProcessEnv")
+            .field("entries", &self.0.len())
+            .finish()
+    }
+}
+
+/// Whether a captured environment key names `name`: exactly, or ignoring
+/// ASCII case where the platform's environment is case-insensitive (Windows).
+fn env_name_matches(key: &std::ffi::OsStr, name: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        key.to_str()
+            .is_some_and(|key| key.eq_ignore_ascii_case(name))
+    } else {
+        key == name
+    }
+}
+
 /// Environment-only values captured once by [`Config::load`].
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeEnv {
@@ -625,13 +684,18 @@ pub struct RuntimeEnv {
     platform_home: Option<PathBuf>,
     codex_home: Option<PathBuf>,
     codex_executable: Option<PathBuf>,
+    cursor_executable: Option<PathBuf>,
+    temp_dir: Option<PathBuf>,
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
     scope_cwd: Option<String>,
     ignore_marker: bool,
     project_strategy: Option<String>,
+    process_env: CapturedProcessEnv,
+    capture_owner_active: bool,
     claude_code_session_id: Option<String>,
+    muse_session_id: Option<String>,
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
     openai_api_key: Option<SecretString>,
@@ -645,11 +709,14 @@ pub struct RuntimeEnv {
     copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
     opencode_api_key: Option<SecretString>,
+    hook_spool_max_attempts: Option<String>,
+    run_require_server: Option<String>,
 }
 
 impl RuntimeEnv {
-    fn from_process() -> Self {
+    pub(crate) fn from_process() -> Self {
         let platform_home = dirs::home_dir();
+        let process_env = CapturedProcessEnv(std::env::vars_os().collect());
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
             home_dir: resolve_operator_home(
@@ -661,6 +728,8 @@ impl RuntimeEnv {
             platform_home,
             codex_home: env_path("CODEX_HOME"),
             codex_executable: env_path("AI_MEMORY_CODEX_EXECUTABLE"),
+            cursor_executable: env_path("AI_MEMORY_CURSOR_AGENT"),
+            temp_dir: Some(std::env::temp_dir()),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
@@ -673,10 +742,15 @@ impl RuntimeEnv {
             // --project-strategy` bakes into the generated hook commands.
             // Consulted only when a marker does not pin one.
             project_strategy: env_string("AI_MEMORY_PROJECT_STRATEGY"),
+            process_env,
+            capture_owner_active: env_string("AI_MEMORY_CAPTURE_OWNER")
+                .is_some_and(|value| !value.trim().is_empty()),
             claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
+            muse_session_id: env_string("MUSE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
-            // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
-            // ANTHROPIC_OAUTH_TOKEN is our canonical name — accept both.
+            // CLAUDE_CODE_OAUTH_TOKEN is the name Claude Code reads the
+            // `claude setup-token` token from; ANTHROPIC_OAUTH_TOKEN is our
+            // canonical name — accept both.
             anthropic_oauth_token: env_secret("ANTHROPIC_OAUTH_TOKEN")
                 .or_else(|| env_secret("CLAUDE_CODE_OAUTH_TOKEN")),
             openai_api_key: env_secret("OPENAI_API_KEY"),
@@ -697,7 +771,19 @@ impl RuntimeEnv {
             copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
             opencode_api_key: env_secret("OPENCODE_API_KEY"),
+            hook_spool_max_attempts: std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").ok(),
+            // A flat env var (not `AI_MEMORY_RUN__REQUIRE_SERVER`, which
+            // figment's `__` split would map onto `run.require_server`) so it
+            // reads the same way as `AI_MEMORY_RUN_AUTOWIRE`; applied in
+            // `load_with_runtime_env` instead of figment for that reason.
+            run_require_server: std::env::var("AI_MEMORY_RUN_REQUIRE_SERVER").ok(),
         }
+    }
+
+    /// Data directory captured from the process environment, if present.
+    #[must_use]
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
     }
 
     /// Host cwd forwarded by the docker wrapper, if present.
@@ -731,16 +817,96 @@ impl RuntimeEnv {
         self.project_strategy.as_deref()
     }
 
+    /// Complete process environment captured by the single config-read path.
+    #[must_use]
+    pub fn process_env(&self) -> &[(OsString, OsString)] {
+        &self.process_env.0
+    }
+
+    /// One variable of the captured process environment. Third-party harness
+    /// homes (`CODEX_HOME`, `COPILOT_HOME`, ...) are read through here so a
+    /// command never re-reads the live environment (invariant #1) and tests
+    /// can inject them. Names match case-insensitively on Windows, as
+    /// `std::env::var_os` does there.
+    #[must_use]
+    pub(crate) fn var_os(&self, name: &str) -> Option<OsString> {
+        self.process_env
+            .0
+            .iter()
+            .find(|(key, _)| env_name_matches(key, name, cfg!(windows)))
+            .map(|(_, value)| value.clone())
+    }
+
+    /// Whether this invocation delegates native capture to an external producer.
+    #[must_use]
+    pub fn capture_owner_active(&self) -> bool {
+        self.capture_owner_active
+    }
+
     /// Claude Code lifecycle session id inherited by an stdio MCP subprocess.
     #[must_use]
     pub fn claude_code_session_id(&self) -> Option<&str> {
         self.claude_code_session_id.as_deref()
     }
 
+    /// Meta Muse Code session id, which Muse sets for its stdio MCP servers
+    /// and hooks.
+    #[must_use]
+    pub fn muse_session_id(&self) -> Option<&str> {
+        self.muse_session_id.as_deref()
+    }
+
+    /// Hook-spool attempt override captured from the process environment.
+    #[must_use]
+    pub fn hook_spool_max_attempts(&self) -> Option<&str> {
+        self.hook_spool_max_attempts.as_deref()
+    }
+
+    /// Managed-launch fail-closed override captured from the process
+    /// environment.
+    #[must_use]
+    pub fn run_require_server(&self) -> Option<&str> {
+        self.run_require_server.as_deref()
+    }
+
     #[cfg(test)]
     pub fn with_host_cwd_for_tests(host_cwd: impl Into<String>) -> Self {
         Self {
             host_cwd: Some(host_cwd.into()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_host_cwd_and_home_for_tests(
+        host_cwd: impl Into<String>,
+        home_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            host_cwd: Some(host_cwd.into()),
+            home_dir: Some(home_dir.into()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_session_ids_for_tests(claude_code: Option<&str>, muse: Option<&str>) -> Self {
+        Self {
+            claude_code_session_id: claude_code.map(str::to_owned),
+            muse_session_id: muse.map(str::to_owned),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_process_env_for_tests(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            process_env: CapturedProcessEnv(
+                pairs
+                    .iter()
+                    .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+                    .collect(),
+            ),
             ..Self::default()
         }
     }
@@ -784,6 +950,21 @@ pub struct AuthSettings {
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
+    /// File holding the shared bearer token, one line, owner-only. A relative
+    /// path resolves against the data dir, so a container that mounts the data
+    /// dir at `/data` and a host client that sees it at its host path read the
+    /// same file. `ai-memory init` on a fresh data dir and `ai-memory auth
+    /// enable` set this to `auth-tokens/default`.
+    ///
+    /// Read once by [`Config::load`] into [`Self::bearer_token`].
+    /// `AI_MEMORY_AUTH_TOKEN` still wins over it; setting it together with
+    /// `bearer_token` is refused as ambiguous. A token read from here is never
+    /// written into a harness config (see [`Self::renderable_bearer_token`]).
+    pub bearer_token_file: Option<PathBuf>,
+    /// Where `bearer_token_file` resolved to and whether it held a token. Set
+    /// by [`Config::load`]; never read from or written to a config file.
+    #[serde(skip)]
+    pub(crate) token_file: Option<ResolvedTokenFile>,
     /// Create every new project `restricted` rather than `open` (#708).
     ///
     /// Off by default: a new project is open to every authenticated user, as
@@ -862,6 +1043,8 @@ impl std::fmt::Debug for AuthSettings {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("bearer_token_file", &self.bearer_token_file)
+            .field("token_file", &self.token_file)
             .field("secure_cookie", &self.secure_cookie)
             .field("root_username", &self.root_username)
             .field("root_issuer", &self.root_issuer)
@@ -889,10 +1072,147 @@ impl std::fmt::Debug for AuthSettings {
     }
 }
 
+/// `[auth].bearer_token_file` after [`Config::load`] resolved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedTokenFile {
+    /// Absolute path the token was read from.
+    pub(crate) path: PathBuf,
+    /// Whether the file held a non-blank token. A configured file that is
+    /// missing or blank leaves [`AuthSettings::bearer_token`] unset, and
+    /// `serve` refuses to start rather than run open.
+    pub(crate) loaded: bool,
+}
+
+impl AuthSettings {
+    /// The bearer an installer may write into a harness config or print in a
+    /// snippet: one the operator supplied inline (`[auth].bearer_token` or
+    /// `AI_MEMORY_AUTH_TOKEN`). A token read from `bearer_token_file` is
+    /// `None` here, because that file exists to keep the secret out of
+    /// harness configs (#552); those installs reach it through `ai-memory
+    /// mcp-bridge`, an env-var reference, or the hook credential files.
+    #[must_use]
+    pub fn renderable_bearer_token(&self) -> Option<&str> {
+        if self.token_file.as_ref().is_some_and(|file| file.loaded) {
+            return None;
+        }
+        self.bearer_token.as_deref()
+    }
+
+    /// The token file this install's bearer comes from, when it comes from
+    /// one (loaded or not).
+    #[must_use]
+    pub(crate) fn token_file_path(&self) -> Option<&Path> {
+        self.token_file.as_ref().map(|file| file.path.as_path())
+    }
+
+    /// The configured token file when it could not supply a token.
+    #[must_use]
+    pub(crate) fn missing_token_file(&self) -> Option<&Path> {
+        self.token_file
+            .as_ref()
+            .filter(|file| !file.loaded)
+            .map(|file| file.path.as_path())
+    }
+
+    /// Record a token read from `path`, the way [`Config::load`] would have.
+    /// For `auth enable`, which provisions the file after config was loaded and
+    /// re-renders wiring in the same process.
+    pub(crate) fn adopt_token_file(&mut self, path: PathBuf, token: String) {
+        self.bearer_token = Some(token);
+        self.token_file = Some(ResolvedTokenFile { path, loaded: true });
+    }
+}
+
+/// What [`apply_bearer_token_file`] needs to know about the load.
+struct TokenFileContext<'a> {
+    data_dir: &'a Path,
+    /// `AI_MEMORY_AUTH_TOKEN` was set (it already replaced `bearer_token`).
+    env_token: bool,
+    /// A config file exists at the path this load read.
+    config_file_exists: bool,
+    server_url: &'a str,
+}
+
+/// Resolve `[auth].bearer_token_file` against the final data dir and read it.
+///
+/// `AI_MEMORY_AUTH_TOKEN` already replaced `bearer_token` and wins here too,
+/// exactly as it wins over the inline key. Both keys set in config is
+/// refused: which one the server enforces must never be a guess.
+///
+/// With no key at all, see [`discover_root_token`].
+fn apply_bearer_token_file(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) -> Result<()> {
+    if ctx.env_token {
+        return Ok(());
+    }
+    let Some(raw) = auth
+        .bearer_token_file
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        discover_root_token(auth, ctx);
+        return Ok(());
+    };
+    if non_empty(auth.bearer_token.as_deref()).is_some() {
+        anyhow::bail!(
+            "[auth].bearer_token and [auth].bearer_token_file are both set; keep only one"
+        );
+    }
+    let path = if raw.is_absolute() {
+        raw.clone()
+    } else {
+        ctx.data_dir.join(raw)
+    };
+    let token = read_trimmed_secret(&path);
+    auth.token_file = Some(ResolvedTokenFile {
+        path,
+        loaded: token.is_some(),
+    });
+    auth.bearer_token = token;
+    Ok(())
+}
+
+/// Find this install's root bearer when the config this command loaded does
+/// not name it.
+///
+/// A packaged install keeps its config outside the data dir (`init --config
+/// ~/.config/ai-memory/config.toml`, the systemd unit passes the same path),
+/// while `install-mcp`, `status` and the bridge run without `--config` and so
+/// read no config file at all. They still need the token `init` minted at
+/// `<data_dir>/auth-tokens/default`. It is used, as a file-sourced token, only
+/// when every one of these holds:
+///
+/// - no bearer is configured any other way (env, inline key, file key);
+/// - no config file exists where this load looked, so no config chose to run
+///   without one (an existing install with a config keeps its behaviour);
+/// - the server URL is loopback, so the token can only reach this machine;
+/// - no server profile named `default` is registered, whose token file this
+///   would be (#992).
+fn discover_root_token(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) {
+    if non_empty(auth.bearer_token.as_deref()).is_some()
+        || ctx.config_file_exists
+        || !crate::commands::hook_spool::is_loopback_url(ctx.server_url)
+    {
+        return;
+    }
+    let path = crate::server_profiles::root_token_path(ctx.data_dir);
+    let Some(token) = read_trimmed_secret(&path) else {
+        return;
+    };
+    // An unreadable registry cannot prove the name is free.
+    let profile_named_default =
+        crate::server_profiles::root_token_name_is_registered(ctx.data_dir).unwrap_or(true);
+    if profile_named_default {
+        return;
+    }
+    auth.token_file = Some(ResolvedTokenFile { path, loaded: true });
+    auth.bearer_token = Some(token);
+}
+
 /// `[auto_scope]` — controls how the hook-published "currently active
-/// project" pointer is shared across concurrent callers. The legacy default
-/// is `single` (process-wide slot, last-write-wins). Opt-in modes isolate
-/// concurrent agent runs and/or operators.
+/// project" pointer is shared across concurrent callers. The default is
+/// `per_actor` (since v1.39), which keys the pointer by whatever coordinate the
+/// caller has; `per_session` keys by `session_id`, and `single` keeps the
+/// pre-v1.39 process-wide slot (last-write-wins).
 ///
 /// Set under `[auto_scope]` in `config.toml` or via the
 /// `AI_MEMORY_AUTO_SCOPE__MODE`, `AI_MEMORY_AUTO_SCOPE__SESSION_TTL_SECS`,
@@ -900,7 +1220,7 @@ impl std::fmt::Debug for AuthSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoScopeSettings {
-    /// `single` (default), `per_session`, or `per_actor`. See
+    /// `per_actor` (default), `per_session`, or `single`. See
     /// [`ai_memory_core::ActiveProjectMode`] for full semantics.
     pub mode: ai_memory_core::ActiveProjectMode,
     /// TTL (seconds) for per-key entries in `per_session`/`per_actor`
@@ -934,6 +1254,57 @@ pub struct RoutingSettings {
     pub mid_session: ai_memory_core::MidSessionRouting,
 }
 
+/// `[ingest]`: tool events the server drops whatever the client sends
+/// (#1241). Both lists are empty by default and apply to every project on the
+/// server. Validated once by [`Config::load`] into [`Self::drop_list`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IngestSettings {
+    /// Drop a tool event whose `tool_use_id` starts with one of these.
+    pub drop_tool_use_id_prefixes: Vec<String>,
+    /// Drop a tool event whose tool name equals one of these exactly.
+    pub drop_tool_names: Vec<String>,
+    /// The validated list the hook router checks. Set by [`Config::load`];
+    /// never read from or written to a config file.
+    #[serde(skip)]
+    pub drop_list: ai_memory_hooks::IngestDropList,
+}
+
+/// Client-side hook spool retry policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HookSpoolSettings {
+    /// Failed drain passes before an event is dropped; zero disables this limit.
+    #[serde(
+        default = "default_hook_spool_max_attempts",
+        deserialize_with = "deserialize_hook_spool_max_attempts"
+    )]
+    pub max_attempts: u32,
+}
+
+impl Default for HookSpoolSettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_hook_spool_max_attempts(),
+        }
+    }
+}
+
+const fn default_hook_spool_max_attempts() -> u32 {
+    DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS
+}
+
+fn deserialize_hook_spool_max_attempts<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS))
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -949,6 +1320,7 @@ impl Default for Config {
             llm_model: None,
             llm_base_url: None,
             llm_compat_strict: true,
+            llm_compat_disable_thinking: false,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
@@ -959,6 +1331,7 @@ impl Default for Config {
             capture_assistant: false,
             backfill_on_start: true,
             run_autowire: true,
+            run: RunSettings::default(),
             claude_true_yolo: false,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
@@ -979,10 +1352,14 @@ impl Default for Config {
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
+            handoff: HandoffSettings::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
             routing: RoutingSettings::default(),
+            hook_spool: HookSpoolSettings::default(),
+            ingest: IngestSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
@@ -991,6 +1368,74 @@ impl Default for Config {
             runtime_env: RuntimeEnv::default(),
         }
     }
+}
+
+/// `[run]` settings for the managed harness launcher.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunSettings {
+    /// Persisted env-only launch profiles, selected with `run --profile`.
+    pub profiles: BTreeMap<String, RunProfile>,
+    /// Fail a managed launch when the server is unreachable instead of
+    /// degrading to a serverless launch (`docs/managed-workstreams.md`).
+    /// Off by default; the `--require-server` flag and
+    /// `AI_MEMORY_RUN_REQUIRE_SERVER=true` request it per launch or per
+    /// environment.
+    pub require_server: bool,
+}
+
+/// One named managed-launch preset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfile {
+    /// Environment overrides applied before `--env-file` and `--env`.
+    pub env: BTreeMap<String, String>,
+}
+
+fn validate_run_profiles(run: &RunSettings) -> Result<()> {
+    const MAX_PROFILES: usize = 128;
+    const MAX_PROFILE_NAME: usize = 64;
+    const MAX_ENV_PER_PROFILE: usize = 128;
+    const MAX_ENV_KEY: usize = 256;
+    const MAX_ENV_VALUE: usize = 64 * 1024;
+
+    if run.profiles.len() > MAX_PROFILES {
+        anyhow::bail!("run.profiles may contain at most {MAX_PROFILES} profiles");
+    }
+    for (name, profile) in &run.profiles {
+        if name.is_empty()
+            || name.len() > MAX_PROFILE_NAME
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            anyhow::bail!(
+                "invalid run profile name {name:?}; use 1-{MAX_PROFILE_NAME} ASCII letters, digits, '.', '_' or '-'"
+            );
+        }
+        if profile.env.len() > MAX_ENV_PER_PROFILE {
+            anyhow::bail!(
+                "run profile {name:?} may contain at most {MAX_ENV_PER_PROFILE} environment entries"
+            );
+        }
+        let mut folded = HashSet::with_capacity(profile.env.len());
+        for (key, value) in &profile.env {
+            if key.is_empty() || key.len() > MAX_ENV_KEY || key.contains(['=', '\0']) {
+                anyhow::bail!("run profile {name:?} has invalid environment key {key:?}");
+            }
+            if value.len() > MAX_ENV_VALUE || value.contains('\0') {
+                anyhow::bail!(
+                    "run profile {name:?} environment value for {key:?} is invalid or exceeds {MAX_ENV_VALUE} bytes"
+                );
+            }
+            if !folded.insert(key.to_ascii_uppercase()) {
+                anyhow::bail!(
+                    "run profile {name:?} repeats environment key {key:?} with different ASCII case"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `[consolidation]` LLM consolidation prompt sizing.
@@ -1025,6 +1470,50 @@ impl Default for ConsolidationSettings {
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
                 ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        }
+    }
+}
+
+/// `[handoff]` session handoff delivery and creation settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HandoffSettings {
+    /// When `true` (default — unchanged behavior), a `SessionStart` that
+    /// finds a pending handoff claims it automatically, exactly as before
+    /// this setting existed.
+    ///
+    /// When `false`, `SessionStart` does not claim the handoff. It instead
+    /// renders a non-consuming notice naming the exact `handoff_id`, the
+    /// `from_agent`, and its age — mirroring the existing inbox notice
+    /// (`render_inbox_notice`): metadata only, never the stored summary
+    /// text, since a handoff's summary is written by whatever agent or
+    /// operator ended the prior session and a non-consuming notice cannot be
+    /// deliberately skipped the way `memory_handoff_accept` can be left
+    /// uncalled. The agent (or operator) picks it up explicitly with
+    /// `memory_handoff_accept` using that id. This fixes an unrelated next
+    /// session (or a non-interactive launch) silently consuming a baton
+    /// meant for a different session (#959).
+    ///
+    /// Server-wide: applies to every operator on this server. A per-project
+    /// override is intentionally left for a follow-up change.
+    pub claim_on_session_start: bool,
+    /// When `true` (default — unchanged behavior), ending an unmanaged session
+    /// creates an automatic open handoff for the next session.
+    ///
+    /// When `false`, `SessionEnd` writes the session summary page and
+    /// enqueues consolidation as usual, but does not create an automatic
+    /// handoff (#1043). Explicit handoffs created via `memory_handoff_begin`
+    /// and managed runs are unaffected.
+    ///
+    /// Server-wide: applies to every operator on this server.
+    pub create_on_session_end: bool,
+}
+
+impl Default for HandoffSettings {
+    fn default() -> Self {
+        Self {
+            claim_on_session_start: true,
+            create_on_session_end: true,
         }
     }
 }
@@ -1378,12 +1867,14 @@ impl DreamSettings {
     }
 }
 
-/// `[retrieval]` opt-in ranking signals layered on the RRF fusion in
-/// `memory_query`. Every default leaves ranking byte-identical to a store
+/// `[retrieval]` ranking signals layered on the RRF fusion in
+/// `memory_query`. Only `observation_stream` is on by default; with it
+/// turned off, every other default leaves ranking byte-identical to a store
 /// that never heard of this section.
 ///
 /// Env form: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
-/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`.
+/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`,
+/// `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalSettings {
@@ -1405,6 +1896,11 @@ pub struct RetrievalSettings {
     /// `confidence` into its authority factor, inside the existing bounds.
     /// OFF by default: enabling it is gated on a positive R2 delta.
     pub belief_authority_weight: f64,
+    /// Add the observation-evidence stream (R1) to the RRF fusion: matching
+    /// observation bodies vote, once per session, for that session's latest
+    /// `sessions/<id>.md` page in the same project. Read-only; the wiki is
+    /// not enlarged. ON by default; `false` restores the previous ranking.
+    pub observation_stream: bool,
 }
 
 impl Default for RetrievalSettings {
@@ -1415,6 +1911,7 @@ impl Default for RetrievalSettings {
             session_recall_bonus: base.session_recall_bonus,
             abstract_vectors: base.abstract_vectors,
             belief_authority_weight: base.belief_authority_weight,
+            observation_stream: base.observation_stream,
         }
     }
 }
@@ -1431,6 +1928,7 @@ impl RetrievalSettings {
             // supported pages; clamp it out so misconfiguration is inert, not
             // inverted.
             belief_authority_weight: self.belief_authority_weight.max(0.0),
+            observation_stream: self.observation_stream,
         }
     }
 }
@@ -1604,6 +2102,24 @@ fn apply_fts_stopwords_env(config: &mut Config, raw: Option<&str>) {
     );
 }
 
+fn apply_hook_spool_max_attempts_env(config: &mut Config, raw: Option<&str>) {
+    let Some(raw) = raw else { return };
+    config.hook_spool.max_attempts = raw
+        .trim()
+        .parse()
+        .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS);
+}
+
+/// `AI_MEMORY_RUN_REQUIRE_SERVER` only ever turns the fail-closed behavior
+/// on: an absent, blank, or non-truthy value leaves whatever `config.toml`
+/// selected, and only an explicit truthy spelling overrides it to on.
+fn apply_run_require_server_env(config: &mut Config, raw: Option<&str>) {
+    let Some(raw) = raw else { return };
+    if crate::marker::is_truthy(raw) {
+        config.run.require_server = true;
+    }
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -1611,8 +2127,14 @@ impl Config {
     /// Returns an error if the config file is malformed or any required
     /// field is missing.
     pub fn load(config_path: Option<&Path>, cli_data_dir: Option<PathBuf>) -> Result<Self> {
-        let runtime_env = RuntimeEnv::from_process();
+        Self::load_with_runtime_env(config_path, cli_data_dir, RuntimeEnv::from_process())
+    }
 
+    pub(crate) fn load_with_runtime_env(
+        config_path: Option<&Path>,
+        cli_data_dir: Option<PathBuf>,
+        runtime_env: RuntimeEnv,
+    ) -> Result<Self> {
         // Figure out where the config file *would* live so we can read it
         // before knowing the final data dir. CLI > env > default.
         let probe_data_dir = cli_data_dir
@@ -1680,6 +2202,8 @@ impl Config {
                 .ok()
                 .as_deref(),
         );
+        apply_hook_spool_max_attempts_env(&mut config, runtime_env.hook_spool_max_attempts());
+        apply_run_require_server_env(&mut config, runtime_env.run_require_server());
 
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
@@ -1698,7 +2222,18 @@ impl Config {
         }
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
+        apply_bearer_token_file(
+            &mut config.auth,
+            &TokenFileContext {
+                data_dir: &config.data_dir,
+                env_token: runtime_env.auth_token.is_some(),
+                config_file_exists: resolved_config_path.exists(),
+                server_url: &config.server_url,
+            },
+        )?;
         config.runtime_env = runtime_env;
+
+        validate_run_profiles(&config.run)?;
 
         if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
             anyhow::bail!(
@@ -1767,6 +2302,11 @@ impl Config {
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
         }
+        config.ingest.drop_list = ai_memory_hooks::IngestDropList::new(
+            config.ingest.drop_tool_use_id_prefixes.clone(),
+            config.ingest.drop_tool_names.clone(),
+        )
+        .map_err(|message| anyhow::anyhow!(message))?;
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -1778,16 +2318,58 @@ impl Config {
             anyhow::bail!("auto_improve.scheduler.experience_{message}");
         }
 
+        // The safety margin scales the input budget, so a non-positive value
+        // would starve every prompt and one above 1.0 would loosen the budget
+        // past the nominal token limit it is meant to tighten (#884). NaN also
+        // fails every comparison below, so it is rejected here too.
+        //
+        // Validated before the floor check below, which needs a trustworthy
+        // margin to compute the effective budget.
+        let safety_margin = config.consolidation.input_token_safety_margin;
+        if !(safety_margin > 0.0 && safety_margin <= 1.0) {
+            anyhow::bail!(
+                "consolidation.input_token_safety_margin must be in (0.0, 1.0] \
+                 (got {safety_margin}); it scales the approximate input-token budget"
+            );
+        }
+
         // Fail at startup rather than shipping a prompt that is all scaffolding
         // and no observations: below this floor the fixed system prompt and page
         // conventions consume the entire budget, so every consolidation would
         // either be evidence-free or rejected by the provider.
+        //
+        // The floor is a *character* budget -- what the builders actually need
+        // to hold the fixed prompts plus MIN_OBSERVATION_RESERVE_CHARS of
+        // evidence -- expressed in tokens at the default margin. Comparing the
+        // configured budget against it therefore has to put both sides on the
+        // same footing: the configured budget at ITS margin, the requirement at
+        // the DEFAULT margin.
+        //
+        // Scoring the configured side at the default margin instead would make
+        // the check a no-op, because the margin cancels out of both sides and
+        // it collapses back to `max_input_tokens < MIN_CONSOLIDATION_MAX_INPUT_TOKENS`
+        // -- the raw-count comparison this replaced. Doing it this way is what
+        // makes a lowered margin demand more tokens, which is the point: the
+        // margin exists to buy headroom on dense corpora (#884), and buying it
+        // by shrinking the budget below what the prompt needs is exactly the
+        // case that used to pass and then omit every observation (#1234).
         let min_input_tokens = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_INPUT_TOKENS;
-        if config.consolidation.max_input_tokens < min_input_tokens {
+        let required_input_chars = ai_memory_consolidate::effective_input_chars(
+            min_input_tokens,
+            ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        );
+        let effective_input_chars = ai_memory_consolidate::effective_input_chars(
+            config.consolidation.max_input_tokens,
+            safety_margin,
+        );
+        if effective_input_chars < required_input_chars {
             anyhow::bail!(
-                "consolidation.max_input_tokens must be at least {min_input_tokens} \
-                 (got {}); below that the system prompt and page conventions leave \
-                 no room for observations",
+                "consolidation.max_input_tokens must leave at least {required_input_chars} \
+                 characters for the prompt ({min_input_tokens} tokens at the default \
+                 input_token_safety_margin) (got {}, which is {effective_input_chars} at \
+                 input_token_safety_margin = {safety_margin}); below that the system \
+                 prompt and page conventions leave no room for observations. Raise \
+                 max_input_tokens, or raise input_token_safety_margin towards 1.0",
                 config.consolidation.max_input_tokens
             );
         }
@@ -1799,21 +2381,6 @@ impl Config {
                 config.consolidation.max_output_tokens
             );
         }
-        // The safety margin scales the input budget, so a non-positive value
-        // would starve every prompt and one above 1.0 would loosen the budget
-        // past the nominal token limit it is meant to tighten (#884). NaN also
-        // fails every comparison below, so it is rejected here too.
-        let safety_margin = config.consolidation.input_token_safety_margin;
-        if !(safety_margin > 0.0 && safety_margin <= 1.0) {
-            anyhow::bail!(
-                "consolidation.input_token_safety_margin must be in (0.0, 1.0] \
-                 (got {safety_margin}); it scales the approximate input-token budget"
-            );
-        }
-        // The safety margin scales the input budget, so a non-positive value
-        // would starve every prompt and one above 1.0 would loosen the budget
-        // past the nominal token limit it is meant to tighten (#884). NaN also
-        // fails every comparison below, so it is rejected here too.
         // Zero (or a sub-second remainder rounded down) would cut every
         // provider request off before it is sent.
         if config.llm_timeout_secs == 0 {
@@ -1830,7 +2397,7 @@ impl Config {
         config
             .llm_extra_headers()
             .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?;
-        validate_auth_secrets(&config.auth)?;
+        validate_auth_settings(&config.auth)?;
 
         // Validated and resolved eagerly, unlike the primary provider (which
         // stays lazily checked at `serve` startup): a fallback can otherwise
@@ -1911,7 +2478,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "AI_MEMORY_LLM_PROVIDER={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         let model = match non_empty(self.llm_model.as_deref()) {
@@ -1932,6 +2499,7 @@ impl Config {
                     ));
                 }
                 ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
+                ProviderChoice::Cursor => CURSOR_DEFAULT_MODEL.to_string(),
             },
         };
         Ok(Some(ProviderConfig {
@@ -1940,6 +2508,7 @@ impl Config {
             auth: self.provider_auth(provider, None),
             base_url: self.resolve_base_url(provider),
             compat_strict: self.llm_compat_strict,
+            compat_disable_thinking: self.llm_compat_disable_thinking,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -1971,7 +2540,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "llm_fallbacks[{index}].provider={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         let model = non_empty(Some(profile.model.as_str()))
@@ -1996,6 +2565,7 @@ impl Config {
             auth: self.fallback_provider_auth(provider, resolved_key),
             base_url: non_empty(profile.base_url.as_deref()).map(str::to_string),
             compat_strict: self.llm_compat_strict,
+            compat_disable_thinking: self.llm_compat_disable_thinking,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -2045,6 +2615,7 @@ impl Config {
             AuthRequirement::AnthropicOAuthToken => {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
+            AuthRequirement::CursorCli => ProviderAuth::cursor(self.cursor_auth()),
         }
     }
 
@@ -2293,6 +2864,7 @@ impl Config {
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
             ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
+            ProviderChoice::Cursor => None,
         }
     }
 
@@ -2317,6 +2889,20 @@ impl Config {
             .as_deref()
             .or_else(|| self.runtime_env.home_dir.as_deref().map(Path::new));
         resolve_codex_auth_file(self.runtime_env.codex_home.as_deref(), platform_home)
+    }
+
+    /// Cursor Agent CLI inputs, from values captured once by [`Config::load`].
+    ///
+    /// The child gets only the allowlisted part of the captured process
+    /// environment. Without a captured temp dir (a test-built config) the
+    /// root is empty and the provider refuses to run instead of writing the
+    /// prompt under its cwd.
+    fn cursor_auth(&self) -> CursorAuth {
+        CursorAuth::new(
+            cursor_executable(self.runtime_env.cursor_executable.as_deref()),
+            self.runtime_env.temp_dir.clone().unwrap_or_default(),
+            self.runtime_env.process_env(),
+        )
     }
 
     /// Shared Copilot auth token file path.
@@ -2384,6 +2970,7 @@ impl Config {
             AuthRequirement::AnthropicOAuthToken => {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
+            AuthRequirement::CursorCli => ProviderAuth::cursor(self.cursor_auth()),
         }
     }
 
@@ -2440,6 +3027,7 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
         "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
         "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
         "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
+        "cursor" => ProviderChoice::Cursor,
         _ => return None,
     })
 }
@@ -2549,7 +3137,13 @@ fn non_empty_secret(secret: Option<&SecretString>) -> Option<&str> {
 }
 
 /// Reject equal configured secrets without logging their values.
-fn validate_auth_secrets(auth: &AuthSettings) -> Result<()> {
+///
+/// Named without "secret": CodeQL's sensitive-name heuristic treats a call
+/// whose name matches it as a source, and taints the whole `Config` this
+/// borrows from, so every printed config field (the data dir, the server URL)
+/// was reported as cleartext logging. Real secret fields are still reported by
+/// their own names.
+fn validate_auth_settings(auth: &AuthSettings) -> Result<()> {
     let mut named: Vec<(&str, &str)> = Vec::new();
     if let Some(v) = non_empty(auth.bearer_token.as_deref()) {
         named.push(("[auth].bearer_token", v));
@@ -2726,6 +3320,39 @@ fn normalize_home_dir(home: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 
+    /// Windows environment names are case-insensitive (`std::env::var_os`
+    /// finds `Codex_Home` for `CODEX_HOME`), so the captured lookup must be
+    /// too there, and stay exact elsewhere.
+    #[test]
+    fn captured_env_names_match_case_insensitively_only_on_windows_rules() {
+        use std::ffi::OsStr;
+        assert!(super::env_name_matches(
+            OsStr::new("Codex_Home"),
+            "CODEX_HOME",
+            true
+        ));
+        assert!(super::env_name_matches(
+            OsStr::new("CODEX_HOME"),
+            "CODEX_HOME",
+            true
+        ));
+        assert!(!super::env_name_matches(
+            OsStr::new("CODEX_HOMES"),
+            "CODEX_HOME",
+            true
+        ));
+        assert!(!super::env_name_matches(
+            OsStr::new("Codex_Home"),
+            "CODEX_HOME",
+            false
+        ));
+        assert!(super::env_name_matches(
+            OsStr::new("CODEX_HOME"),
+            "CODEX_HOME",
+            false
+        ));
+    }
+
     /// #552: the bearer used to travel on every hook's command line, readable
     /// through `/proc/<pid>/cmdline` by any local user. It now lives in the
     /// data dir instead — which is only an improvement if the files are not
@@ -2759,7 +3386,7 @@ mod tests {
         }
     }
 
-    /// Re-running `install-hooks --apply` after `user rotate-token` must leave
+    /// Re-running `install-hooks --apply` after `api-key rotate` must leave
     /// the new bearer, not both.
     #[test]
     fn storing_a_second_token_replaces_the_first() {
@@ -2825,43 +3452,46 @@ mod tests {
         for rendered in [format!("{auth:?}"), format!("{config:?}")] {
             assert!(rendered.contains("root_username: Some(\"operator\")"));
             assert!(rendered.contains("<redacted>"));
-            for secret in [
+            for sentinel in [
                 "bearer-secret-sentinel",
                 "pepper-secret-sentinel",
                 "proxy-secret-sentinel",
                 "initial-password-sentinel",
                 "recovery-token-sentinel-32chars",
             ] {
-                assert!(!rendered.contains(secret), "Debug output exposed {secret}");
+                assert!(
+                    !rendered.contains(sentinel),
+                    "Debug output exposed {sentinel}"
+                );
             }
         }
     }
 
     #[test]
-    fn validate_auth_secrets_rejects_short_recovery_token() {
+    fn validate_auth_settings_rejects_short_recovery_token() {
         let auth = AuthSettings {
             recovery_token: Some(SecretString::from("too-short-recovery-token")),
             ..AuthSettings::default()
         };
-        let err = validate_auth_secrets(&auth).unwrap_err();
+        let err = validate_auth_settings(&auth).unwrap_err();
         assert!(err.to_string().contains("32"), "{err:#}");
         assert!(!err.to_string().contains("too-short-recovery-token"));
     }
 
     #[test]
-    fn validate_auth_secrets_rejects_equal_recovery_and_bearer() {
+    fn validate_auth_settings_rejects_equal_recovery_and_bearer() {
         let secret = "this-recovery-token-is-32-chars!!";
         let auth = AuthSettings {
             bearer_token: Some(secret.into()),
             recovery_token: Some(SecretString::from(secret)),
             ..AuthSettings::default()
         };
-        let err = validate_auth_secrets(&auth).unwrap_err();
+        let err = validate_auth_settings(&auth).unwrap_err();
         assert!(err.to_string().contains("must differ"), "{err:#}");
     }
 
     #[test]
-    fn validate_auth_secrets_rejects_recovery_credential_prefixes() {
+    fn validate_auth_settings_rejects_recovery_credential_prefixes() {
         for prefix in [
             ai_memory_core::SESSION_SECRET_PREFIX,
             ai_memory_core::NATIVE_API_KEY_PREFIX,
@@ -2873,7 +3503,7 @@ mod tests {
                 ))),
                 ..AuthSettings::default()
             };
-            let err = validate_auth_secrets(&auth).unwrap_err();
+            let err = validate_auth_settings(&auth).unwrap_err();
             assert!(
                 err.to_string().contains("reserved credential prefix"),
                 "{err:#}"
@@ -2888,6 +3518,7 @@ mod tests {
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert_eq!(cfg.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(
             cfg.llm_timeout_secs,
@@ -3000,6 +3631,57 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_observation_stream_defaults_on_and_loads_from_toml() {
+        assert!(Config::default().retrieval.tuning().observation_stream);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[retrieval]\nobservation_stream = false\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!config.retrieval.tuning().observation_stream);
+        // The other [retrieval] signals keep their defaults.
+        assert!(!config.retrieval.tuning().abstract_vectors);
+        // A config that never names the key gets the default.
+        std::fs::write(&config_path, "[retrieval]\nabstract_vectors = false\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.retrieval.tuning().observation_stream);
+    }
+
+    #[test]
+    fn retrieval_observation_stream_env_overrides_config() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_OBSERVATION_STREAM_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[retrieval]\nobservation_stream = true\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert!(!config.retrieval.tuning().observation_stream);
+            println!("observation-stream-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::retrieval_observation_stream_env_overrides_config")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM", "false")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("observation-stream-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
     fn load_rejects_destructive_invalid_breadth_weights() {
         for value in ["-0.1", "nan", "inf"] {
             let tmp = TempDir::new().unwrap();
@@ -3047,6 +3729,343 @@ mod tests {
     /// A configured list parses verbatim and resolves to exactly those
     /// words (lowercased), replacing the default outright rather than
     /// extending it.
+    fn load_auth(data_dir: &Path, toml: &str, env_token: Option<&str>) -> Result<Config> {
+        let config_path = data_dir.join("config.toml");
+        std::fs::write(&config_path, toml).unwrap();
+        Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(data_dir.to_path_buf()),
+            RuntimeEnv {
+                auth_token: env_token.map(str::to_owned),
+                ..RuntimeEnv::default()
+            },
+        )
+    }
+
+    /// A relative `bearer_token_file` resolves against the data dir it was
+    /// loaded with, so a container (data dir `/data`) and a host client (the
+    /// host path of the same bind mount) read one file.
+    #[test]
+    fn a_relative_bearer_token_file_resolves_against_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        for dir in ["host", "container"] {
+            let dd = tmp.path().join(dir);
+            std::fs::create_dir_all(dd.join("auth-tokens")).unwrap();
+            std::fs::write(
+                dd.join("auth-tokens").join("default"),
+                format!("tok-{dir}\n"),
+            )
+            .unwrap();
+            let config = load_auth(
+                &dd,
+                "[auth]\nbearer_token_file = \"auth-tokens/default\"\n",
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                config.auth.bearer_token.as_deref(),
+                Some(format!("tok-{dir}").as_str())
+            );
+            assert_eq!(config.auth.renderable_bearer_token(), None);
+            assert_eq!(
+                config.auth.token_file_path(),
+                Some(config.data_dir.join("auth-tokens/default").as_path())
+            );
+            assert_eq!(config.auth.missing_token_file(), None);
+        }
+    }
+
+    #[test]
+    fn an_absolute_bearer_token_file_is_read_as_is() {
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = tmp.path().join("secret");
+        std::fs::write(&elsewhere, "abs-token").unwrap();
+        let toml = format!(
+            "[auth]\nbearer_token_file = {}\n",
+            toml_edit::Value::from(elsewhere.to_string_lossy().as_ref())
+        );
+        let config = load_auth(tmp.path(), &toml, None).unwrap();
+        assert_eq!(config.auth.bearer_token.as_deref(), Some("abs-token"));
+    }
+
+    /// A configured file that is missing or blank yields no bearer, never an
+    /// empty one, and is reported so `serve` can refuse to start open.
+    #[test]
+    fn a_missing_or_blank_bearer_token_file_is_reported_not_guessed() {
+        let tmp = TempDir::new().unwrap();
+        let toml = "[auth]\nbearer_token_file = \"auth-tokens/default\"\n";
+        let missing = load_auth(tmp.path(), toml, None).unwrap();
+        assert!(missing.auth.bearer_token.is_none());
+        assert!(missing.auth.missing_token_file().is_some());
+
+        std::fs::create_dir_all(tmp.path().join("auth-tokens")).unwrap();
+        std::fs::write(tmp.path().join("auth-tokens").join("default"), " \n").unwrap();
+        let blank = load_auth(tmp.path(), toml, None).unwrap();
+        assert!(blank.auth.bearer_token.is_none());
+        assert!(blank.auth.missing_token_file().is_some());
+    }
+
+    /// `AI_MEMORY_AUTH_TOKEN` wins over the file, as it wins over the inline
+    /// key, and then counts as an inline (renderable) token as before.
+    #[test]
+    fn the_env_token_wins_over_the_bearer_token_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("auth-tokens")).unwrap();
+        std::fs::write(tmp.path().join("auth-tokens").join("default"), "file-token").unwrap();
+        let config = load_auth(
+            tmp.path(),
+            "[auth]\nbearer_token_file = \"auth-tokens/default\"\n",
+            Some("env-token"),
+        )
+        .unwrap();
+        assert_eq!(config.auth.bearer_token.as_deref(), Some("env-token"));
+        assert_eq!(config.auth.renderable_bearer_token(), Some("env-token"));
+        assert_eq!(config.auth.token_file_path(), None);
+    }
+
+    #[test]
+    fn an_inline_bearer_and_a_bearer_token_file_together_are_refused() {
+        let tmp = TempDir::new().unwrap();
+        let err = load_auth(
+            tmp.path(),
+            "[auth]\nbearer_token = \"inline\"\nbearer_token_file = \"auth-tokens/default\"\n",
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("both set"), "{err:#}");
+    }
+
+    fn plant_root_token(data_dir: &Path) {
+        std::fs::create_dir_all(data_dir.join("auth-tokens")).unwrap();
+        std::fs::write(data_dir.join("auth-tokens").join("default"), "root-token\n").unwrap();
+    }
+
+    fn load_without_config(data_dir: &Path, runtime_env: RuntimeEnv) -> Config {
+        Config::load_with_runtime_env(None, Some(data_dir.to_path_buf()), runtime_env).unwrap()
+    }
+
+    /// A packaged install's client commands read no config file (it lives
+    /// outside the data dir) and still find the token `init` minted, as a
+    /// file-sourced token.
+    #[test]
+    fn a_client_without_a_config_file_discovers_the_root_bearer() {
+        let tmp = TempDir::new().unwrap();
+        plant_root_token(tmp.path());
+        let config = load_without_config(tmp.path(), RuntimeEnv::default());
+        assert_eq!(config.auth.bearer_token.as_deref(), Some("root-token"));
+        assert_eq!(config.auth.renderable_bearer_token(), None);
+    }
+
+    /// Each guard on discovery, with the case above as the control.
+    #[test]
+    fn root_bearer_discovery_is_refused_outside_its_narrow_case() {
+        // A config file exists and names no token: that install runs open.
+        let tmp = TempDir::new().unwrap();
+        plant_root_token(tmp.path());
+        let config = load_auth(tmp.path(), "[auth]\nsecure_cookie = false\n", None).unwrap();
+        assert!(
+            config.auth.bearer_token.is_none(),
+            "existing config keeps its posture"
+        );
+
+        // A remote server must never be handed this machine's root bearer.
+        let tmp = TempDir::new().unwrap();
+        plant_root_token(tmp.path());
+        let remote = load_without_config(
+            tmp.path(),
+            RuntimeEnv {
+                server_url: Some("https://memory.example".into()),
+                ..RuntimeEnv::default()
+            },
+        );
+        assert!(remote.auth.bearer_token.is_none());
+
+        // A registered profile named `default` owns that file (#992).
+        let tmp = TempDir::new().unwrap();
+        let name = crate::server_profiles::ProfileName::parse("default").unwrap();
+        crate::server_profiles::add(tmp.path(), &name, "https://team.example", &[], Some("team"))
+            .unwrap();
+        let profiled = load_without_config(tmp.path(), RuntimeEnv::default());
+        assert!(
+            profiled.auth.bearer_token.is_none(),
+            "a profile token is not a root bearer"
+        );
+
+        // An explicit env token wins, as always.
+        let tmp = TempDir::new().unwrap();
+        plant_root_token(tmp.path());
+        let env = load_without_config(
+            tmp.path(),
+            RuntimeEnv {
+                auth_token: Some("env".into()),
+                ..RuntimeEnv::default()
+            },
+        );
+        assert_eq!(env.auth.bearer_token.as_deref(), Some("env"));
+        assert_eq!(env.auth.token_file_path(), None);
+    }
+
+    /// Control: a pre-default config (no key) loads exactly as before, inline
+    /// token renderable, no file consulted.
+    #[test]
+    fn a_config_without_a_bearer_token_file_loads_as_before() {
+        let tmp = TempDir::new().unwrap();
+        let open = load_auth(tmp.path(), "[auth]\nsecure_cookie = false\n", None).unwrap();
+        assert!(open.auth.bearer_token.is_none());
+        assert_eq!(open.auth.token_file_path(), None);
+        let inline = load_auth(tmp.path(), "[auth]\nbearer_token = \"inline\"\n", None).unwrap();
+        assert_eq!(inline.auth.renderable_bearer_token(), Some("inline"));
+    }
+
+    #[test]
+    fn hook_spool_max_attempts_config_and_runtime_override_precedence() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[hook_spool]\nmax_attempts = 3\n").unwrap();
+
+        let from_config = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(from_config.hook_spool.max_attempts, 3);
+
+        let overridden = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                hook_spool_max_attempts: Some("0".into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(overridden.hook_spool.max_attempts, 0);
+    }
+
+    #[test]
+    fn run_require_server_config_and_runtime_env() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let off = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert!(!off.run.require_server, "off by default");
+
+        std::fs::write(&config_path, "[run]\nrequire_server = true\n").unwrap();
+        let from_config = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert!(from_config.run.require_server);
+
+        // The env var only turns it on; it never turns a config-file on back
+        // off, and a non-truthy spelling is inert.
+        for raw in ["", "false", "no", "0"] {
+            let inert = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv {
+                    run_require_server: Some(raw.into()),
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap();
+            assert!(inert.run.require_server, "{raw:?} must stay inert");
+        }
+        let truthy = Config::load_with_runtime_env(
+            Some(&config_path),
+            None,
+            RuntimeEnv {
+                run_require_server: Some("true".into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert!(truthy.run.require_server);
+    }
+
+    #[test]
+    fn loader_hook_spool_runtime_env_overrides_config() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_HOOK_SPOOL_CONFIG_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[hook_spool]\nmax_attempts = 3\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert_eq!(config.hook_spool.max_attempts, 0);
+            println!("runtime-override-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::loader_hook_spool_runtime_env_overrides_config")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("runtime-override-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn invalid_hook_spool_max_attempts_values_use_default() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        for invalid in ["-1", "\"invalid\""] {
+            std::fs::write(
+                &config_path,
+                format!("[hook_spool]\nmax_attempts = {invalid}\n"),
+            )
+            .unwrap();
+            let config = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                config.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS,
+                "invalid config value {invalid} must use the default"
+            );
+        }
+
+        std::fs::remove_file(&config_path).unwrap();
+        for invalid in ["invalid", "-1", ""] {
+            let invalid_env = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(tmp.path().to_path_buf()),
+                RuntimeEnv {
+                    hook_spool_max_attempts: Some(invalid.into()),
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                invalid_env.hook_spool.max_attempts, DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS,
+                "invalid env value {invalid:?} must use the default"
+            );
+        }
+    }
+
     #[test]
     fn configured_search_fts_stopwords_list_parses_and_replaces_default() {
         let tmp = TempDir::new().unwrap();
@@ -3393,6 +4412,62 @@ mod tests {
         }
     }
 
+    /// #1234: the floor's promise is a *character* budget -- enough room for
+    /// the fixed prompts plus `MIN_OBSERVATION_RESERVE_CHARS` of evidence -- so
+    /// the check has to score the configured budget at its own margin against
+    /// that requirement at the default margin. 8,000 tokens is the case that
+    /// used to load and then send every observation to the omission marker:
+    /// it clears the requirement at margin 1.0 but not at the default 0.8.
+    #[test]
+    fn load_rejects_a_budget_whose_effective_size_is_below_the_floor() {
+        // Clears the character requirement at margin 1.0, misses it at 0.8.
+        for (tokens, margin) in [(8_000, 0.8), (8_000, 0.6), (8_000, 0.5), (9_000, 0.7)] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[consolidation]
+max_input_tokens = {tokens}
+                     input_token_safety_margin = {margin}
+"
+                ),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("a budget too small at its own margin must fail closed");
+            assert!(
+                error.to_string().contains("consolidation.max_input_tokens"),
+                "unexpected error for {tokens} tokens at margin {margin}: {error:#}"
+            );
+        }
+    }
+
+    /// Controls for the test above, so a blanket rejection cannot pass for a
+    /// working guard: the same token counts are accepted once the margin is
+    /// high enough to clear the requirement, and 8,000 at margin 1.0 -- which
+    /// the reject test deliberately excludes -- must still load.
+    #[test]
+    fn load_accepts_a_budget_whose_effective_size_clears_the_floor() {
+        for (tokens, margin) in [(8_000, 1.0), (10_000, 0.8), (10_000, 0.7)] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[consolidation]
+max_input_tokens = {tokens}
+                     input_token_safety_margin = {margin}
+"
+                ),
+            )
+            .unwrap();
+            let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect("a budget that clears the requirement must load");
+            assert_eq!(cfg.consolidation.max_input_tokens, tokens);
+        }
+    }
+
     #[test]
     fn load_rejects_a_consolidation_output_limit_too_small_for_json() {
         let min = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
@@ -3458,20 +4533,91 @@ mod tests {
         );
     }
 
-    /// A small-context provider needs both sides of the context allocation to
-    /// survive the config round-trip.
+    /// The small-context examples in `docs/install.md` and
+    /// `docs/llm-providers.md` must be configs that actually load. These are
+    /// the literal values those docs quote, copied by hand: keep them in step
+    /// when the docs change, so an example does not go stale the way
+    /// `max_input_tokens = 6500` did once the floor moved (#1234).
     #[test]
-    fn load_accepts_a_small_context_consolidation_budget() {
+    fn documented_small_context_examples_load() {
+        for (doc, tokens, output, margin) in [
+            ("docs/install.md", 10_000, 1_000, 0.8),
+            ("docs/install.md (8k window)", 6_700, 1_000, 1.0),
+            ("docs/llm-providers.md", 10_000, 1_000, 0.8),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[consolidation]
+max_input_tokens = {tokens}
+max_output_tokens = {output}
+input_token_safety_margin = {margin}
+"
+                ),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .unwrap_or_else(|error| panic!("{doc}'s example no longer loads: {error:#}"));
+        }
+    }
+
+    /// A small-context provider needs both sides of the context allocation to
+    /// survive the config round-trip. The budget is derived from the floor
+    /// rather than written out, so the test keeps meaning "the smallest
+    /// accepted budget round-trips" when the floor moves (#1234) instead of
+    /// pinning a number the floor happens to allow today.
+    /// `[ingest]` is read once into the validated drop list the hook router
+    /// checks, and an out-of-bounds entry fails startup instead of being
+    /// silently ignored (#1241).
+    #[test]
+    fn ingest_drop_lists_load_into_the_router_list_and_reject_bad_entries() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "[consolidation]\nmax_input_tokens = 7000\nmax_output_tokens = 1000\n",
+            "[ingest]\ndrop_tool_use_id_prefixes = [\"toolu_plugin_\"]\ndrop_tool_names = [\"mcp__noisy__poll\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            config.ingest.drop_list,
+            ai_memory_hooks::IngestDropList::new(
+                vec!["toolu_plugin_".into()],
+                vec!["mcp__noisy__poll".into()]
+            )
+            .unwrap()
+        );
+
+        std::fs::write(&config_path, "[ingest]\ndrop_tool_names = [\" \"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("drop_tool_names"),
+            "{error:#}"
+        );
+
+        // Default: empty, so nothing is dropped.
+        assert_eq!(
+            Config::default().ingest.drop_list,
+            ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    #[test]
+    fn load_accepts_a_small_context_consolidation_budget() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let small = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_INPUT_TOKENS;
+        let output = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
+        std::fs::write(
+            &config_path,
+            format!("[consolidation]\nmax_input_tokens = {small}\nmax_output_tokens = {output}\n"),
         )
         .unwrap();
         let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
-        assert_eq!(cfg.consolidation.max_input_tokens, 7_000);
-        assert_eq!(cfg.consolidation.max_output_tokens, 1_000);
+        assert_eq!(cfg.consolidation.max_input_tokens, small);
+        assert_eq!(cfg.consolidation.max_output_tokens, output);
     }
 
     /// `AI_MEMORY_LLM_TIMEOUT_SECS` (figment maps it to this field) exists so
@@ -3716,6 +4862,10 @@ mod tests {
             [auth]
             secure_cookie = true
 
+            [handoff]
+            claim_on_session_start = false
+            create_on_session_end = false
+
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
@@ -3770,6 +4920,8 @@ mod tests {
         assert_eq!(cfg.contradiction_band_min, 0.5);
         assert_eq!(cfg.contradiction_band_max, 0.8);
         assert!(cfg.auth.secure_cookie);
+        assert!(!cfg.handoff.claim_on_session_start);
+        assert!(!cfg.handoff.create_on_session_end);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);
@@ -3805,6 +4957,61 @@ mod tests {
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
+    }
+
+    #[test]
+    fn profile_defaults_are_auto_and_parse_from_file_and_env() {
+        use ai_memory_core::profile::{EffectiveProfileShare, ProfileEnabled, ProfileShare};
+        let defaults = Config::default().profile;
+        assert_eq!(defaults.enabled, ProfileEnabled::Auto);
+        assert_eq!(defaults.share, ProfileShare::Auto);
+        assert!(defaults.inject_on_session_start);
+        assert_eq!(
+            defaults.effective_share(false),
+            Some(EffectiveProfileShare::Global)
+        );
+        assert_eq!(defaults.effective_share(true), None);
+
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[profile]\nenabled = true\nshare = \"workspace\"\nmin_projects = 3\n\
+             inject_on_session_start = false\ndigest_max_bytes = 4000\n\
+             baseline_max_bytes = 8000\napply_max_lines = 20\nllm = false\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.profile.enabled, ProfileEnabled::On);
+        assert_eq!(cfg.profile.share, ProfileShare::Workspace);
+        assert_eq!(cfg.profile.min_projects, 3);
+        assert!(!cfg.profile.inject_on_session_start);
+        assert_eq!(cfg.profile.digest_max_bytes, 4_000);
+        assert_eq!(cfg.profile.baseline_max_bytes, 8_000);
+        assert_eq!(cfg.profile.apply_max_lines, 20);
+        assert!(!cfg.profile.llm);
+        assert_eq!(
+            cfg.profile.effective_share(true),
+            Some(EffectiveProfileShare::Workspace)
+        );
+
+        std::fs::write(
+            &cfg_path,
+            "[profile]\nenabled = \"auto\"\nshare = \"off\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.profile.effective_share(false), None);
+    }
+
+    #[test]
+    fn handoff_claim_on_session_start_defaults_to_true() {
+        assert!(Config::default().handoff.claim_on_session_start);
+    }
+
+    #[test]
+    fn handoff_create_on_session_end_defaults_to_true() {
+        assert!(Config::default().handoff.create_on_session_end);
     }
 
     #[test]
@@ -4368,6 +5575,45 @@ mod tests {
         assert!(!provider.compat_strict);
     }
 
+    /// The thinking switch is opt-in: off by default (existing vLLM /
+    /// Ollama / LM Studio setups are unchanged) and forwarded verbatim to
+    /// the provider config when the operator turns it on.
+    #[test]
+    fn openai_compat_disable_thinking_defaults_off_and_is_forwarded() {
+        let mut cfg = Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("qwen3.8-27b".into()),
+            llm_base_url: Some("http://localhost:8000/v1".into()),
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(!provider.compat_disable_thinking);
+
+        cfg.llm_compat_disable_thinking = true;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(provider.compat_disable_thinking);
+    }
+
+    /// TOML key loads and stays independent from the strict-mode default.
+    #[test]
+    fn load_accepts_llm_compat_disable_thinking_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_compat_disable_thinking = true\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(cfg.llm_compat_disable_thinking);
+        // The sibling strict knob keeps its own default — independent keys.
+        assert!(cfg.llm_compat_strict);
+    }
+
+    #[test]
+    fn load_defaults_llm_compat_disable_thinking_off() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!cfg.llm_compat_disable_thinking);
+    }
+
     #[test]
     fn openai_oauth_provider_uses_data_dir_token_file() {
         let tmp = TempDir::new().unwrap();
@@ -4565,7 +5811,8 @@ mod tests {
 
             let provider = cfg.llm_provider_config().unwrap().unwrap();
             assert_eq!(provider.provider, ProviderChoice::OpenCode, "{spelling}");
-            assert_eq!(provider.model, "claude-sonnet-4-6", "{spelling}");
+            assert_eq!(provider.model, "mimo-v2.6-flash", "{spelling}");
+            assert!(provider.base_url.is_none(), "{spelling}");
             assert_eq!(
                 provider.auth.requirement(),
                 AuthRequirement::RequiredApiKey {
@@ -4579,6 +5826,68 @@ mod tests {
                 "{spelling}"
             );
         }
+    }
+
+    #[test]
+    fn cursor_provider_resolves_choice_default_model_and_executable() {
+        let cfg = Config {
+            llm_provider: Some("cursor".into()),
+            runtime_env: RuntimeEnv {
+                cursor_executable: Some(PathBuf::from("/opt/cursor/agent")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_cursor_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Cursor);
+        assert_eq!(provider.model, CURSOR_DEFAULT_MODEL);
+        assert_eq!(auth.executable, PathBuf::from("/opt/cursor/agent"));
+        assert_eq!(provider.auth.requirement(), AuthRequirement::CursorCli);
+    }
+
+    /// The Cursor child reads untrusted session text: the provider config
+    /// hands it the captured environment's allowlisted part only, so the
+    /// server's own bearer and other providers' keys never reach it.
+    #[test]
+    fn cursor_provider_hands_the_child_only_allowlisted_env() {
+        let entries = [
+            ("HOME", "/home/op"),
+            ("PATH", "/usr/bin"),
+            ("CURSOR_API_KEY", "cursor-key"),
+            ("AI_MEMORY_AUTH_TOKEN", "root-bearer-canary"),
+            ("ANTHROPIC_API_KEY", "sk-ant-canary"),
+        ];
+        let cfg = Config {
+            llm_provider: Some("cursor".into()),
+            runtime_env: RuntimeEnv {
+                temp_dir: Some(PathBuf::from("/tmp")),
+                process_env: CapturedProcessEnv(
+                    entries
+                        .iter()
+                        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                        .collect(),
+                ),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let auth = cfg
+            .llm_provider_config()
+            .unwrap()
+            .unwrap()
+            .auth
+            .require_cursor_auth()
+            .unwrap();
+        let mut names: Vec<_> = auth
+            .child_env_names()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["CURSOR_API_KEY", "HOME", "PATH"]);
     }
 
     fn load_with_toml(toml: &str) -> anyhow::Result<Config> {
@@ -4859,6 +6168,34 @@ mod tests {
     #[test]
     fn llm_provider_chain_none_when_no_llm_is_configured() {
         assert!(Config::default().llm_provider_chain().unwrap().is_none());
+    }
+
+    #[test]
+    fn run_profiles_parse_from_config_and_reject_ambiguous_names_and_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[run.profiles.work.env]\nCLAUDE_CONFIG_DIR = '/accounts/work'\nMODEL = 'opus'\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap();
+        assert_eq!(
+            config.run.profiles["work"].env["CLAUDE_CONFIG_DIR"],
+            "/accounts/work"
+        );
+
+        std::fs::write(&config_path, "[run.profiles.'bad name'.env]\nFOO = 'bar'\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap_err();
+        assert!(error.to_string().contains("invalid run profile name"));
+
+        std::fs::write(
+            &config_path,
+            "[run.profiles.work.env]\nPATH = '/one'\nPath = '/two'\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap_err();
+        assert!(error.to_string().contains("different ASCII case"));
     }
 
     #[test]

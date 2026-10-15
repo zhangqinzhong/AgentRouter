@@ -17,16 +17,30 @@ pub(crate) fn is_scope_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|response| response.status() == reqwest::StatusCode::NOT_FOUND)
 }
 
+pub(crate) fn is_scope_ambiguous(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::http_client::ServerResponseError>()
+        .is_some_and(|response| {
+            response.status() == reqwest::StatusCode::BAD_REQUEST
+                && response.body().contains("ambiguous")
+        })
+}
+
+pub(crate) mod agent_plugins;
+pub(crate) mod agentmemory_residue;
 pub mod api_key;
 pub mod apply_shared;
 pub mod audit_contamination;
 pub mod auth;
+pub mod auth_enable;
 pub mod auto_improve;
 pub mod auto_improve_report;
 pub mod backfill;
 pub mod backup;
+pub mod backup_agents;
 pub mod bootstrap;
 pub mod checkpoints;
+pub mod codex_hook_trust;
 pub mod commit;
 pub mod compact;
 pub mod completions;
@@ -52,29 +66,37 @@ pub mod install_instructions;
 pub mod install_mcp;
 pub mod install_skills;
 pub mod lint;
+pub mod list_projects;
 pub mod llm_test;
 pub mod mcp_bridge;
 pub mod message;
 pub mod move_project;
 pub mod move_session;
 pub mod openclaw_plugin;
+pub mod opencode_dialect;
 pub mod path_util;
 pub mod pending_writes;
+pub(crate) mod plugin_origin;
+pub mod profile;
 pub mod project;
+pub mod project_init;
 pub mod project_registry;
 pub mod purge_preview;
 pub mod purge_project;
 pub mod purge_session;
 pub mod read_page;
 pub mod reclaim_ledger_versions;
+pub mod recovery;
 pub mod reindex;
 pub mod rename_project;
 pub mod rename_workstream;
+pub mod render_plugins;
 pub mod render_shared;
 pub mod reorg;
 pub mod repair_backfill_timestamps;
 pub mod reset;
 pub mod restore;
+pub mod restore_agents;
 pub mod restore_page;
 pub mod resume;
 pub mod run;
@@ -82,12 +104,15 @@ pub mod run_autowire;
 pub mod search;
 pub mod serve;
 pub mod server;
+pub mod setup;
 pub mod setup_agent;
 pub mod show;
 pub mod status;
+pub mod transcript_capture;
 pub mod uninstall;
 pub mod upgrade;
 pub mod user;
+pub mod user_service;
 pub mod workstream_search;
 pub mod workstreams;
 pub mod write_page;
@@ -97,11 +122,12 @@ pub mod write_page;
 /// Each field is resolved independently, in this order:
 ///
 /// 1. The explicit flag (`--workspace` / `--project`) when non-empty.
-/// 2. The nearest `.ai-memory.toml` marker: `workspace`, and `project` —
-///    or the hook-compatible derived project when the marker leaves it
-///    unpinned (`basename(cwd)` by default, main repo root for `repo-root`).
-/// 3. Today's fallbacks: [`crate::config::DEFAULT_WORKSPACE`] and
-///    [`resolve_project_name`]'s cwd chain.
+/// 2. The nearest `.ai-memory.toml` marker: `workspace` and an explicit
+///    `project`/`identity`; otherwise a valid remote supplies its canonical path
+///    name even when the unpinned strategy is `repo-root`.
+/// 3. Without a valid remote, an explicit marker `repo-root` strategy derives
+///    the main repo root; otherwise use [`crate::config::DEFAULT_WORKSPACE`] and
+///    [`resolve_project_name`]'s cwd-basename fallback.
 ///
 /// Rung 2 is why this function exists. Before it, only the lifecycle hooks
 /// read the marker, so a checkout declaring `workspace = "acme"` still had
@@ -144,14 +170,42 @@ pub(crate) fn resolve_scope(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String)> {
+    resolve_scope_noting_marker_project(config, explicit_ws, explicit_proj)
+        .map(|(workspace, project, _)| (workspace, project))
+}
+
+/// [`resolve_scope`], also reporting whether a marker's `project` key named
+/// the project. Hook capture routes such a project by name and never reads the
+/// remote, so a caller mirroring capture needs that fact.
+pub(crate) fn resolve_scope_noting_marker_project(
+    config: &Config,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+) -> Result<(String, String, bool)> {
     let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
     let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
-    // Both halves pinned on the command line: the marker cannot change the
-    // answer, so skip the walk and the file reads entirely.
     if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
-        return Ok((workspace.to_string(), project.to_string()));
+        return Ok((workspace.to_string(), project.to_string(), false));
     }
-    let marker = marker_scope(config);
+    let marker = marker_scope(config)?;
+    let marker_project = explicit_proj.is_none()
+        && marker
+            .as_ref()
+            .is_some_and(|(scope, _, _)| scope.project.is_some());
+    let (workspace, project) =
+        resolve_scope_with_marker(config, explicit_ws, explicit_proj, marker, true)?;
+    Ok((workspace, project, marker_project))
+}
+
+pub(crate) fn resolve_scope_with_marker(
+    config: &Config,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+    marker: Option<(crate::marker::MarkerScope, String, String)>,
+    announce: bool,
+) -> Result<(String, String)> {
+    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
+    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
 
     let mut decided: Vec<&str> = Vec::with_capacity(2);
     let workspace = match explicit_ws {
@@ -172,22 +226,26 @@ pub(crate) fn resolve_scope(
         Some(explicit) => explicit.to_string(),
         None => {
             // A marker's explicit `project` pins the name for its whole tree.
-            // Otherwise derive exactly as the hook does: basename(cwd) by
-            // default, or the main repository root for `repo-root`.
+            // Otherwise a valid remote supplies the canonical path name; only
+            // the no-valid-remote fallback consults basename/repo-root.
             let declared = marker
                 .as_ref()
                 .and_then(|(scope, identity_cwd, lookup_cwd)| {
-                    scope.project.clone().or_else(|| {
-                        if scope.is_repo_root() {
-                            crate::marker::repo_root_project(lookup_cwd)
-                        } else {
-                            ai_memory_consolidate::derive_project_name(
-                                std::path::Path::new(identity_cwd),
-                                ai_memory_consolidate::ProjectNameStrategy::Basename,
-                            )
-                            .map(|(name, _)| name)
-                        }
-                    })
+                    scope
+                        .project
+                        .clone()
+                        .or_else(|| scope.canonical_remote_project())
+                        .or_else(|| {
+                            if scope.is_repo_root() {
+                                crate::marker::repo_root_project(lookup_cwd)
+                            } else {
+                                ai_memory_consolidate::derive_project_name(
+                                    std::path::Path::new(identity_cwd),
+                                    ai_memory_consolidate::ProjectNameStrategy::Basename,
+                                )
+                                .map(|(name, _)| name)
+                            }
+                        })
                 });
             match declared {
                 Some(name) => {
@@ -199,7 +257,7 @@ pub(crate) fn resolve_scope(
         }
     };
 
-    if let Some((scope, _, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
+    if announce && let Some((scope, _, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
         // Name only the halves the marker actually decided: an explicit flag
         // that was honoured must not read as if the file overrode it.
         eprintln!(
@@ -212,46 +270,73 @@ pub(crate) fn resolve_scope(
 }
 
 /// Resolve `(workspace, project)` for an explicit local directory without
-/// changing the process working directory or consulting wrapper cwd overrides.
+/// changing the process working directory, resolving symlinks, or consulting
+/// wrapper cwd overrides.
 ///
-/// The policy matches [`resolve_scope`]: a marker may pin either half, an
-/// unpinned project under a marker follows that marker's strategy, and a tree
-/// without a scope marker falls back to the main repository root.
+/// The policy matches [`resolve_scope`]: a marker may pin either half, a valid
+/// remote's canonical path wins an unpinned marker strategy, an explicit
+/// `repo-root` strategy handles only the no-valid-remote case, and a tree
+/// without a scope marker otherwise uses the cwd basename.
 pub(crate) fn resolve_scope_for_path(
     config: &Config,
     cwd: &std::path::Path,
 ) -> Result<(String, String)> {
-    let cwd = cwd
-        .canonicalize()
-        .with_context(|| format!("canonicalizing project candidate {}", cwd.display()))?;
+    resolve_scope_for_path_with_explicit(config, cwd, None, None)
+}
+
+pub(crate) fn resolve_scope_for_path_with_explicit(
+    config: &Config,
+    cwd: &std::path::Path,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+) -> Result<(String, String)> {
+    if !cwd.exists() {
+        return Err(anyhow!(
+            "project candidate does not exist: {}",
+            cwd.display()
+        ));
+    }
+    let cwd = crate::marker::absolute_normalized(cwd);
     let identity = cwd.to_string_lossy().into_owned();
-    let marker = crate::marker::read_scope(&identity, &config.runtime_env);
-    let workspace = marker
-        .as_ref()
-        .and_then(|scope| scope.workspace.clone())
+    let marker = crate::marker::read_scope(&identity, &config.runtime_env)?;
+    let workspace = explicit_ws
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| marker.as_ref().and_then(|scope| scope.workspace.clone()))
         .unwrap_or_else(|| crate::config::DEFAULT_WORKSPACE.to_string());
-    let project = match marker.as_ref() {
-        Some(scope) => scope
-            .project
-            .clone()
-            .or_else(|| {
-                if scope.is_repo_root() {
-                    crate::marker::repo_root_project(&identity)
-                } else {
+    let project = if let Some(project) = explicit_proj.filter(|value| !value.is_empty()) {
+        project.to_owned()
+    } else {
+        match marker.as_ref() {
+            Some(scope) => scope
+                .project
+                .clone()
+                .or_else(|| scope.canonical_remote_project())
+                .or_else(|| {
+                    if scope.is_repo_root() {
+                        crate::marker::repo_root_project(&identity)
+                    } else {
+                        ai_memory_consolidate::derive_project_name(
+                            &cwd,
+                            ai_memory_consolidate::ProjectNameStrategy::Basename,
+                        )
+                        .map(|(name, _)| name)
+                    }
+                })
+                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+            None => crate::marker::discover_remote_identity(&identity)
+                .and_then(|repository| {
+                    ai_memory_core::repository_identity::path_style_name(&repository)
+                })
+                .or_else(|| {
                     ai_memory_consolidate::derive_project_name(
                         &cwd,
                         ai_memory_consolidate::ProjectNameStrategy::Basename,
                     )
                     .map(|(name, _)| name)
-                }
-            })
-            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
-        None => ai_memory_consolidate::derive_project_name(
-            &cwd,
-            ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
-        )
-        .map(|(name, _)| name)
-        .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+                })
+                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+        }
     };
     Ok((workspace, project))
 }
@@ -260,11 +345,11 @@ pub(crate) fn resolve_scope_for_path(
 /// deliberately absent (`embed --force` fans out across every project in the
 /// workspace). Resolving the pair there would make the command fail on the
 /// cwd-derived project name it is about to throw away.
-pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> String {
+pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> Result<String> {
     if let Some(explicit) = explicit_ws.filter(|s| !s.is_empty()) {
-        return explicit.to_string();
+        return Ok(explicit.to_string());
     }
-    match marker_scope(config) {
+    Ok(match marker_scope(config)? {
         Some((scope, _, _)) => match scope.workspace {
             Some(declared) => {
                 eprintln!(
@@ -276,11 +361,23 @@ pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> S
             None => crate::config::DEFAULT_WORKSPACE.to_string(),
         },
         None => crate::config::DEFAULT_WORKSPACE.to_string(),
-    }
+    })
 }
 
 /// The nearest scope-declaring marker plus the cwd the walk started from.
-fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String, String)> {
+fn marker_scope(config: &Config) -> Result<Option<(crate::marker::MarkerScope, String, String)>> {
+    let Some((identity_cwd, lookup_cwd)) = scope_directories(config) else {
+        return Ok(None);
+    };
+    let Some(scope) =
+        crate::marker::read_scope_for(&lookup_cwd, &identity_cwd, &config.runtime_env)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((scope, identity_cwd, lookup_cwd)))
+}
+
+pub(crate) fn scope_directories(config: &Config) -> Option<(String, String)> {
     let identity_cwd = scope_cwd(config)?;
     // The Docker wrapper preserves the host cwd for identity but binds the
     // checkout at /work. Check the host path when its bounded root is mounted;
@@ -295,8 +392,7 @@ fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String, 
             .ok()
             .map(|cwd| cwd.to_string_lossy().into_owned())?
     };
-    let scope = crate::marker::read_scope(&lookup_cwd, &config.runtime_env)?;
-    Some((scope, identity_cwd, lookup_cwd))
+    Some((identity_cwd, lookup_cwd))
 }
 
 /// The directory marker discovery walks up from.
@@ -321,17 +417,14 @@ fn scope_cwd(config: &Config) -> Option<String> {
 ///
 /// Precedence:
 /// 1. `explicit` (the user's `--project` flag) when non-empty.
-/// 2. `AI_MEMORY_HOST_CWD` env var. The docker wrapper sets this
-///    to the host's `$PWD` because inside the container the workdir
-///    is always `/work` (a bind mount), so the container's own
-///    `current_dir()` returns "work" for every invocation. Without
-///    this env var, every dockerised bootstrap would land in project
-///    `default/work` regardless of which host dir it was actually
-///    run from. Honoured here as a basename, same heuristic as the
-///    other fallbacks.
-/// 3. Basename of the git repo root walked up from CWD (handles
-///    running from any subdir of the project).
-/// 4. Basename of the bare CWD (covers non-git directories).
+/// 2. Canonical path-style name from the valid `upstream` remote, then
+///    `origin`, when the checkout has no marker identity/name override.
+///    `AI_MEMORY_HOST_CWD` selects the host checkout before the remote is
+///    inspected; if that path is unavailable in a container it remains the
+///    basename fallback rather than borrowing `/work`'s identity.
+/// 3. Basename of the current directory, including a git-repository
+///    subdirectory or a non-git directory. `repo-root` is used only when a
+///    marker/install strategy explicitly selects it.
 ///
 /// Mirrors the heuristic the hook router uses in
 /// `ai-memory-hooks::router::resolve_project_ids`, so commands
@@ -342,13 +435,19 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
     if let Some(p) = explicit.filter(|s| !s.is_empty()) {
         return Ok(p.to_string());
     }
-    if let Some(host_cwd) = config.runtime_env.host_cwd()
-        && let Some(name) = std::path::Path::new(host_cwd)
+    if let Some(host_cwd) = config.runtime_env.host_cwd() {
+        if let Some(repository) = crate::marker::discover_remote_identity(host_cwd)
+            && let Some(name) = ai_memory_core::repository_identity::path_style_name(&repository)
+        {
+            return Ok(name);
+        }
+        if let Some(name) = std::path::Path::new(host_cwd)
             .file_name()
             .and_then(|s| s.to_str())
             .filter(|s| !s.is_empty())
-    {
-        return Ok(name.to_string());
+        {
+            return Ok(name.to_string());
+        }
     }
 
     // Safety net: when running inside the docker wrapper, the
@@ -372,17 +471,17 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
         );
     }
 
-    // Shared with the hook router via `derive_project_name` so the CLI
-    // and hooks agree on what "the project for this cwd" means. The
-    // `MainRepoRoot` strategy walks worktrees back to the main repo
-    // — a session in `~/repo-worktrees/feature-x/` and one in the
-    // main checkout resolve to the same project name (the main repo's
-    // basename), instead of fragmenting into separate projects.
-    // Aligned change from the earlier CLI behaviour (which used the
-    // worktree-local `discover_repo_root`).
+    // Shared with the hook router via `derive_project_name`: with no valid
+    // remote and no explicit repo-root strategy, both use the current cwd's
+    // basename, including repository subdirectories.
+    if let Some(repository) = crate::marker::discover_remote_identity(&cwd.to_string_lossy())
+        && let Some(name) = ai_memory_core::repository_identity::path_style_name(&repository)
+    {
+        return Ok(name);
+    }
     if let Some((name, _)) = ai_memory_consolidate::derive_project_name(
         &cwd,
-        ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
+        ai_memory_consolidate::ProjectNameStrategy::Basename,
     ) {
         return Ok(name);
     }
@@ -429,6 +528,173 @@ mod tests {
         assert_eq!(
             resolve_project_name(&config, Some("explicit-project")).unwrap(),
             "explicit-project"
+        );
+    }
+
+    fn git(command: &[&str], cwd: &std::path::Path) -> bool {
+        std::process::Command::new("git")
+            .args(command)
+            .current_dir(cwd)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn resolve_project_name_uses_canonical_remote_path_and_upstream_priority() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        if !git(&["init", "-q"], tmp.path()) {
+            return;
+        }
+        assert!(git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://token@example.test/wrong/origin.git"
+            ],
+            tmp.path()
+        ));
+        assert!(git(
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:Acme/Group/API.git"
+            ],
+            tmp.path()
+        ));
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(tmp.path().to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_project_name(&config, None).unwrap(),
+            "acme-group-api"
+        );
+    }
+
+    #[test]
+    fn static_scope_uses_path_default_and_respects_marker_opt_out_and_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("checkout");
+        std::fs::create_dir(&repo).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return;
+        }
+        assert!(git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:Acme/Group/API.git"
+            ],
+            &repo
+        ));
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(repo.to_str().unwrap()),
+            ..Config::default()
+        };
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("default".into(), "acme-group-api".into())
+        );
+
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"oss\"\nidentity_style = \"host_path\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("oss".into(), "checkout".into())
+        );
+
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"oss\"\nproject = \"pinned\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("oss".into(), "pinned".into())
+        );
+    }
+
+    #[test]
+    fn remote_path_wins_explicit_repo_root_strategy_without_project_or_identity_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("checkout");
+        let subdir = repo.join("crates/cli");
+        std::fs::create_dir_all(&subdir).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return;
+        }
+        assert!(git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:Acme/Group/API.git"
+            ],
+            &repo
+        ));
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"oss\"\nproject_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(subdir.to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("oss".into(), "acme-group-api".into())
+        );
+        assert_eq!(
+            resolve_scope_for_path(&Config::default(), &subdir).unwrap(),
+            ("oss".into(), "acme-group-api".into())
+        );
+    }
+
+    #[test]
+    fn remote_less_git_subdirectory_uses_basename_unless_repo_root_is_explicit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("checkout");
+        let subdir = repo.join("crates/cli");
+        std::fs::create_dir_all(&subdir).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return;
+        }
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(subdir.to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(resolve_project_name(&config, None).unwrap(), "cli");
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("default".into(), "cli".into())
+        );
+        assert_eq!(
+            resolve_scope_for_path(&Config::default(), &subdir).unwrap(),
+            ("default".into(), "cli".into())
+        );
+
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "project_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("default".into(), "checkout".into())
+        );
+        assert_eq!(
+            resolve_scope_for_path(&Config::default(), &subdir).unwrap(),
+            ("default".into(), "checkout".into())
         );
     }
 
@@ -480,6 +746,72 @@ mod tests {
     /// the lifecycle hooks — the only marker reader at the time — sent that
     /// same checkout's captures to the declared workspace.
     #[test]
+    fn explicit_scope_wins_over_home_route_and_home_route_beats_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("outside/repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            format!(
+                "[routes.path.\"{}\"]\nroute_workspace=\"oss\"\nroute_project=\"acme-api\"\n",
+                repo.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_and_home_for_tests(
+                repo.to_string_lossy(),
+                home.to_string_lossy(),
+            ),
+            ..Config::default()
+        };
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("oss".into(), "acme-api".into())
+        );
+        assert_eq!(
+            resolve_scope(&config, Some("cli"), Some("explicit")).unwrap(),
+            ("cli".into(), "explicit".into())
+        );
+    }
+
+    #[test]
+    fn invalid_home_routes_refuse_unscoped_and_partial_cli_but_explicit_pair_bypasses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("outside/repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            home.join(".ai-memory.toml"),
+            "workspace=\"wrong\"\nproject=\"wrong\"\n[routes.path.\"relative\"]\nroute_workspace=\"route\"\nroute_project=\"route\"\n",
+        )
+        .unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_and_home_for_tests(
+                repo.to_string_lossy(),
+                home.to_string_lossy(),
+            ),
+            ..Config::default()
+        };
+        assert!(resolve_scope(&config, None, None).is_err());
+        assert!(resolve_scope(&config, Some("explicit"), None).is_err());
+        assert!(resolve_scope(&config, None, Some("explicit")).is_err());
+        assert_eq!(
+            resolve_scope(&config, Some("cli"), Some("explicit")).unwrap(),
+            ("cli".into(), "explicit".into())
+        );
+        std::fs::write(home.join(".ai-memory.toml"), "x".repeat(65_537)).unwrap();
+        assert!(resolve_scope(&config, None, None).is_err());
+        assert_eq!(
+            resolve_scope(&config, Some("cli"), Some("explicit")).unwrap(),
+            ("cli".into(), "explicit".into())
+        );
+    }
+
+    #[test]
     fn resolve_scope_takes_the_workspace_from_the_marker() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_at(tmp.path(), Some("workspace = \"acme\"\n"));
@@ -495,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_only_marker_uses_hook_basename_from_a_subdirectory() {
+    fn workspace_only_marker_without_remote_uses_hook_basename_from_a_subdirectory() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".ai-memory.toml"), "workspace = \"acme\"\n").unwrap();
         let subdir = tmp.path().join("crates").join("cli");
@@ -561,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_only_marker_uses_linked_worktree_directory_name() {
+    fn remote_less_workspace_marker_uses_linked_worktree_directory_name() {
         let tmp = tempfile::TempDir::new().unwrap();
         let worktree = tmp.path().join("feature-worktree");
         std::fs::create_dir_all(&worktree).unwrap();

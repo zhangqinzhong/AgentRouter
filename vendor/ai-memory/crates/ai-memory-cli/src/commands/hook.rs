@@ -7,7 +7,8 @@
 //! cleanup pass before fetching handoff context. `session-end` returns quickly:
 //! after enqueue it spawns a detached `hook-drain` process, whose stdout/stderr
 //! are redirected away from the agent, and that process drains under an
-//! exclusive spool lock with a longer bounded budget.
+//! exclusive spool lock with a longer bounded budget. Zero, whose hook sandbox
+//! kills detached children, drains in-process within a short fixed budget.
 //!
 //! See `docs/windows.md#native-hook-command-claude-code-on-windows`.
 
@@ -19,19 +20,22 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDisposition, CaptureMode, HookEvent, PolicyState, repository_admits_capture,
+    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, GlobStep,
+    GlobWalk, HookEvent, PolicyState, absolute_tool_location_paths, capture_lookup_locations,
+    glob_segment_matches, glob_walk, repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
+use crate::config::{Config, RuntimeEnv};
 use crate::server_profiles::{self, ProfileName, Rejection, ResolvedServer};
 
 use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
-    build_client, canonical_context, capture_policy, extract_cwd, get_handoff, marker_query_suffix,
-    marker_query_suffix_without_briefing, marker_requests_briefing, resolve_cwd_with_fallbacks,
-    url_encode,
+    HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
+    hook_scope, marker_capture_policy, marker_query_suffix, marker_query_suffix_without_briefing,
+    marker_requests_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -64,6 +68,18 @@ const MAX_BRIEFED_MARKERS: usize = 512;
 /// well under a second so a `post-tool-use` hook never stalls a tool call (one
 /// in-flight POST against a slow server is bounded by this too).
 const INCREMENTAL_DRAIN_BUDGET: Duration = Duration::from_millis(250);
+/// Total budget, lock wait included, for a `session-end` drained in-process
+/// ([`session_end_drains_in_process`]). Fixed rather than env-overridable:
+/// together with [`IN_PROCESS_SESSION_END_DEADLINE`] it has to stay inside
+/// Zero's 30-second hook timeout.
+const IN_PROCESS_SESSION_END_DRAIN_BUDGET: Duration = Duration::from_secs(10);
+/// Hard stop for that drain, the request in flight at the budget included.
+const IN_PROCESS_SESSION_END_DEADLINE: Duration = Duration::from_secs(20);
+// Zero kills a hook after 30 seconds; the hard stop must land first.
+const _: () = assert!(
+    IN_PROCESS_SESSION_END_DRAIN_BUDGET.as_secs() < IN_PROCESS_SESSION_END_DEADLINE.as_secs()
+        && IN_PROCESS_SESSION_END_DEADLINE.as_secs() < 30
+);
 
 /// Per-event POST timeout during a drain. Env: `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES`.
 fn drain_event_timeout() -> Duration {
@@ -134,6 +150,34 @@ fn should_spawn_background_drainer(event: &str) -> bool {
     matches!(event, "session-end" | "stop" | "pre-compact")
 }
 
+/// Zero runs hooks in a sandbox started with `--die-with-parent`, which kills
+/// a detached drainer the moment the hook exits, so its `session-end` drains
+/// in-process within [`IN_PROCESS_SESSION_END_DRAIN_BUDGET`] instead (#1172).
+fn session_end_drains_in_process(agent: AgentKind, event: &str) -> bool {
+    agent == AgentKind::Zero && event == "session-end"
+}
+
+/// Drain the spool from the hook process itself, for a harness that kills the
+/// detached drainer. Undelivered events stay spooled for the next boundary.
+async fn drain_session_end_in_process(
+    spool: &Path,
+    data_dir: &Path,
+    max_attempts: hook_spool::MaxAttempts,
+) {
+    let drain = hook_spool::drain_exclusive_within_budget(
+        spool,
+        data_dir,
+        IN_PROCESS_SESSION_END_DRAIN_BUDGET,
+        drain_event_timeout().min(IN_PROCESS_SESSION_END_DRAIN_BUDGET),
+        max_attempts,
+    );
+    // The budget stops new requests; this also stops one already in flight
+    // (an old server's per-event fallback, a token refresh). Cancelling only
+    // at an await point leaves every spool file whole: at worst an accepted
+    // event is re-sent and the server's ingest key skips it.
+    let _ = tokio::time::timeout(IN_PROCESS_SESSION_END_DEADLINE, drain).await;
+}
+
 fn session_id_state_path(data_dir: &Path, agent: AgentKind) -> PathBuf {
     data_dir
         .join("hook-state")
@@ -184,6 +228,17 @@ fn briefed_marker_path(
         sanitize_briefed_key,
     );
     data_dir.join("briefed").join(key)
+}
+
+/// The once-per-session profile-digest marker beside a brief marker: same
+/// key, `profile-` prefix, so the two gates never share a file. The shell and
+/// PowerShell hooks name it the same way.
+fn profile_digest_marker_path(brief_marker: PathBuf) -> PathBuf {
+    let name = brief_marker
+        .file_name()
+        .map(|name| format!("profile-{}", name.to_string_lossy()))
+        .unwrap_or_else(|| "profile-".to_owned());
+    brief_marker.with_file_name(name)
 }
 
 fn sanitize_briefed_key(raw: &str) -> String {
@@ -320,7 +375,21 @@ fn after_background_drain_event_enqueue(
 
 /// Hidden drain-only fast path. Reads no stdin and writes no stdout.
 pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let dd = resolve_data_dir(data_dir.as_deref());
+    let runtime_env = RuntimeEnv::from_process();
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
+    if !dd.is_dir() {
+        // Purged (or never created): nothing was queued, and a warning has
+        // nowhere useful to go since `hook-drain.log` lived in that dir.
+        return Ok(());
+    }
+    // The hook path never runs a full `Config::load` (see the fast-path
+    // contract in `lib.rs`): an invalid config section elsewhere must not
+    // fail the drainer. Only the spool retry policy is needed, loaded
+    // tolerantly — any load error falls back to defaults.
+    let config =
+        Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd.clone()), runtime_env)
+            .unwrap_or_default();
+    let max_attempts = hook_spool::MaxAttempts::new(config.hook_spool.max_attempts);
     let spool = hook_spool::spool_dir(&dd);
     match hook_spool::drain_until_quiescent(
         &spool,
@@ -328,6 +397,7 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         background_drain_budget(),
         drain_event_timeout(),
         hook_spool::DrainLockWait::Bounded(Duration::from_secs(30)),
+        max_attempts,
     )
     .await
     {
@@ -444,6 +514,23 @@ fn is_redundant_cursor_copy(
         && cursor_hooks_installed()
 }
 
+/// A plugin-launched event that a settings-file hook already delivers, or
+/// that belongs to a session with no project folder (#1166). Ordinary
+/// settings-file hooks carry no origin and never take this path.
+fn is_dropped_plugin_copy(
+    args: &HookArgs,
+    raw: &serde_json::Value,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> bool {
+    use super::plugin_origin::{PluginOrigin, drops_plugin_event, settings_files_for};
+    let Some(origin) = PluginOrigin::from_env(&mut lookup) else {
+        return false;
+    };
+    let (cwd, _) = hook_context(&args.agent, raw);
+    let settings = settings_files_for(origin, cwd.as_deref(), &mut lookup);
+    drops_plugin_event(origin, &args.event, cwd.as_deref(), &settings)
+}
+
 fn write_success_response<W: std::io::Write>(
     stdout: &mut W,
     agent: AgentKind,
@@ -453,6 +540,13 @@ fn write_success_response<W: std::io::Write>(
         // Kiro adds successful SessionStart/UserPromptSubmit stdout to model
         // context, and v2/v3 Stop parse stdout for a block decision. Capture-only
         // hooks therefore stay silent unless SessionStart has real context.
+        Ok(())
+    } else if agent == AgentKind::Muse
+        && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
+    {
+        // Muse adds SessionStart and UserPromptSubmit stdout to the turn as
+        // developer context, so a capture-only reply stays empty rather than
+        // put `{}` in front of the model on every prompt.
         Ok(())
     } else if event == HookEvent::UserPrompt && agent.user_prompt_injects_handoff() {
         // Kimi Code injects any non-empty UserPromptSubmit stdout into the turn
@@ -522,6 +616,12 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
                 "ephemeralMessage": handoff,
             }]
         })
+    } else if agent == AgentKind::CopilotCli {
+        // Copilot CLI requires the SessionStart output envelope itself, rather
+        // than Claude Code's nested hookSpecificOutput shape.
+        serde_json::json!({
+            "additionalContext": handoff,
+        })
     } else {
         serde_json::json!({
             "hookSpecificOutput": {
@@ -551,6 +651,15 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     .await
 }
 
+/// [`run`] with the payload and output sink injected, so tests drive the hook
+/// implementation directly without stdin/stdout.
+///
+/// Hooks deliberately bypass the full `Config::load` (the fast-path contract
+/// in `lib.rs`): an unrelated invalid config section must never fail the hook
+/// or add stdout noise. The spool retry policy is the only config needed, and
+/// it is loaded tolerantly — a malformed config falls back to defaults rather
+/// than erroring. The process environment is captured once, here, and
+/// threaded down as data.
 async fn run_with_payload<W, S>(
     data_dir: Option<PathBuf>,
     args: HookArgs,
@@ -562,6 +671,18 @@ where
     W: std::io::Write,
     S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
+    let runtime_env = RuntimeEnv::from_process();
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
+    let spool_policy =
+        Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd), runtime_env.clone())
+            .unwrap_or_default();
+    let max_attempts = hook_spool::MaxAttempts::new(spool_policy.hook_spool.max_attempts);
+    // An empty `--server-url` means "not given": the plugin passes its unset
+    // option through as "", and the install's configured server applies.
+    let mut args = args;
+    if args.server_url.trim().is_empty() {
+        args.server_url.clone_from(&spool_policy.server_url);
+    }
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
@@ -578,7 +699,10 @@ where
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
         if agent_kind == AgentKind::Devin && hook_event == HookEvent::SessionEnd {
-            clear_session_id(&resolve_data_dir(data_dir.as_deref()), agent_kind);
+            clear_session_id(
+                &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+                agent_kind,
+            );
         }
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -597,13 +721,14 @@ where
     // fires before every model call; invocation zero is the only startup
     // boundary. Fail closed when the documented counter is absent so a later
     // invocation can never consume a handoff intended for the next session.
-    if !should_process_hook_event(agent_kind, hook_event, &json)
-        || is_redundant_cursor_copy(
+    let event_admits_capture = should_process_hook_event(agent_kind, hook_event, &json)
+        && !is_redundant_cursor_copy(
             agent_kind,
             &json,
             super::install_hooks::cursor_native_hooks_installed,
         )
-    {
+        && !is_dropped_plugin_copy(&args, &json, env_lookup);
+    if !event_admits_capture && !args.check_capture {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
@@ -638,18 +763,48 @@ where
     {
         payload = serde_json::to_string(&json)?;
     }
-    let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let (payload_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let tool_event = is_tool_event(&args.event);
+    // Some harnesses report a cwd other than where the tool ran: a subagent's
+    // parent session (#932), or Hermes' own process cwd while its tools take
+    // a per-call `workdir`/`path` (#1199). A recognized absolute location may
+    // select that checkout, but only when every path proves the same
+    // repository/marker boundary. This must precede capture policy and
+    // server-profile resolution so the destination's privacy and credentials
+    // remain authoritative.
+    let tool_routing_cwd = payload_cwd.as_deref().and_then(|cwd| {
+        tool_event
+            .then(|| tool_location_routing_cwd(agent_kind, &json, cwd))
+            .flatten()
+    });
+    if let Some(cwd) = tool_routing_cwd.as_deref()
+        && let Some(object) = json.as_object_mut()
+    {
+        // `HookEnvelope` deliberately gives the native body cwd precedence
+        // over the query fallback. Stamp the proven destination into that
+        // canonical field too, or a URL-only reroute would be cosmetic.
+        object.insert("cwd".into(), cwd.into());
+        payload = serde_json::to_string(&json)?;
+    }
+    let policy_cwd = tool_routing_cwd.or(payload_cwd);
     let inspection_cwd = policy_cwd.as_deref().map(lexical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
-    let tool_event = is_tool_event(&args.event);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
-        policy.inspect(
-            AgentKind::from_wire(&args.agent),
-            &json,
-            inspection_cwd.as_deref().unwrap_or(""),
-        )
+        let agent = AgentKind::from_wire(&args.agent);
+        let inspection_cwd = inspection_cwd.as_deref().unwrap_or("");
+        let decision = policy.inspect(agent, &json, inspection_cwd);
+        // Another checkout's `ignore_paths` protect its files from a call
+        // made here too (`cat ../other/secret.env`).
+        if decision.protocol().disposition() == CaptureDisposition::Drop {
+            return decision;
+        }
+        let own_marker = policy_cwd.as_deref().and_then(crate::marker::find_marker);
+        match foreign_capture_decision(agent, &json, inspection_cwd, own_marker.as_deref()) {
+            Some(foreign) => decision.stricter(foreign),
+            None => decision,
+        }
     });
-    let dd = resolve_data_dir(data_dir.as_deref());
+    let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
     // Precedence: an explicit flag (tests, one-off runs) wins; otherwise the
     // persisted per-install mode; otherwise the historical default.
     let capture_mode = args.capture_mode.map_or_else(
@@ -657,18 +812,40 @@ where
         crate::cli::CaptureModeArg::mode,
     );
     let route = resolve_hook_route(&dd, policy_cwd.as_deref(), || std::env::current_dir().ok());
-    // Marker presence is the opt-in signal under allowlist mode. Resolved from
-    // the same upward walk the policy uses, so opting in needs no new file.
-    let marker_present = policy_cwd
-        .as_deref()
-        .is_some_and(|cwd| crate::marker::find_marker(cwd).is_some());
+    let marker_present = marker_present(policy_cwd.as_deref());
+    let routing_valid = routing_valid(policy_cwd.as_deref());
     let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
+        let scope = policy_cwd.as_deref().map(|cwd| {
+            hook_scope(
+                cwd,
+                args.project_strategy
+                    .and_then(crate::cli::ProjectStrategyArg::baked),
+            )
+        });
+        let scope_resolution = match scope.as_ref() {
+            None => "unavailable",
+            Some(scope) if !scope.is_inspectable() => "unavailable",
+            Some(scope) if scope.is_partial() => "partial",
+            Some(scope) if scope.is_explicit() => "explicit",
+            Some(_) => "server-derived",
+        };
+        let policy_admits_capture = admits_capture
+            && routing_valid
+            && event_admits_capture
+            && !matches!(route, HookRoute::Rejected { .. })
+            && scope_resolution != "partial"
+            && scope_resolution != "unavailable"
+            && protocol.is_none_or(|p| p.disposition() != CaptureDisposition::Drop);
         let mut output = serde_json::json!({
             "capture_mode": capture_mode,
             "marker_present": marker_present,
             "admits_capture": admits_capture && !external_capture,
+            "policy_admits_capture": policy_admits_capture,
+            "event_admits_capture": event_admits_capture,
+            "scope": scope,
+            "scope_resolution": scope_resolution,
             "version": protocol.map_or(1, |protocol| protocol.version()),
             "policy_state": protocol.map_or(PolicyState::Inactive, |protocol| protocol.policy_state()),
             "tool_family": protocol.map_or(ai_memory_hooks::ToolFamily::Unknown, |protocol| protocol.tool_family()),
@@ -708,10 +885,12 @@ where
     // is `None` for UserPromptSubmit, SessionStart/End and Stop, so gating via
     // `CaptureDisposition` alone would still spool prompt text from an
     // opted-out repository while reporting it as excluded.
-    if !admits_capture {
+    if !admits_capture || !routing_valid {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
+    // Read before a metadata-only rewrite drops the payload's own fields.
+    let subagent_payload = payload_is_subagent(&json);
     if let Some(decision) = decision {
         match decision.protocol().disposition() {
             CaptureDisposition::Drop => {
@@ -741,10 +920,15 @@ where
         }
     }
 
-    let qs = cwd_query_suffix(
-        &args.agent,
-        &json,
-        args.project_strategy.and_then(|s| s.baked()),
+    let qs = policy_cwd.as_deref().map_or_else(
+        || {
+            cwd_query_suffix(
+                &args.agent,
+                &json,
+                args.project_strategy.and_then(|s| s.baked()),
+            )
+        },
+        |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
     let spool = hook_spool::spool_dir(&dd);
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
@@ -801,7 +985,7 @@ where
         let entry =
             hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present)
                 .routed_to(profile_name);
-        if hook_spool::enqueue(&spool, &entry).is_err() {
+        if hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_err() {
             eprintln!(
                 "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
             );
@@ -829,6 +1013,7 @@ where
                 INCREMENTAL_DRAIN_BUDGET,
                 INCREMENTAL_DRAIN_BUDGET,
                 hook_spool::DrainLockWait::NoWait,
+                max_attempts,
             )
             .await;
         }
@@ -860,6 +1045,7 @@ where
                 &dd,
                 start_drain_budget(),
                 drain_event_timeout(),
+                max_attempts,
             )
             .await;
         }
@@ -933,6 +1119,19 @@ where
                     policy_cwd.as_deref(),
                 )
             });
+        // The profile digest rides the first prompt the same way, gated on its
+        // own marker because it is on by default rather than an opt-in.
+        let profile_path = profile_digest_marker_path(briefed_marker_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        ));
+        let profile_qs = if profile_path.is_file() {
+            "&profile_digest=0"
+        } else {
+            ""
+        };
         let handoff_qs = if briefed_path.as_ref().is_some_and(|path| path.is_file()) {
             policy_cwd
                 .as_deref()
@@ -947,7 +1146,7 @@ where
             qs.clone()
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
             args.agent
         );
         let handoff =
@@ -960,6 +1159,7 @@ where
         if let Some(path) = briefed_path.as_deref() {
             mark_briefed(path);
         }
+        mark_briefed(&profile_path);
         if let Some(handoff) = handoff {
             writeln!(stdout, "{handoff}")?;
         }
@@ -984,7 +1184,7 @@ where
             canonical_session_id.as_deref(),
             policy_cwd.as_deref(),
         );
-        if !shown.is_file() && !payload_is_subagent(&json) {
+        if !shown.is_file() && !subagent_payload {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id
@@ -1014,7 +1214,9 @@ where
     // to flush the shared spool. `session-end` remains the primary close path,
     // but `stop` and `pre-compact` also trigger the helper so delivery does not
     // rely on the single hook most likely to be cancelled during agent shutdown.
-    if !external_capture
+    if !external_capture && session_end_drains_in_process(agent_kind, &args.event) {
+        drain_session_end_in_process(&spool, &dd, max_attempts).await;
+    } else if !external_capture
         && should_spawn_background_drainer(&args.event)
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
@@ -1061,6 +1263,413 @@ fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option
             extract_cwd(raw).filter(|cwd| !cwd.trim().is_empty()),
             session_id,
         )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileRouteAnchor {
+    marker: Option<PathBuf>,
+    repository: Option<PathBuf>,
+}
+
+/// Find the existing directory that can establish routing for a file target.
+/// New files may name one or more not-yet-created parent directories.
+fn existing_target_dir(path: &Path) -> Option<PathBuf> {
+    let mut candidate = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    loop {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        candidate = candidate.parent()?.to_path_buf();
+    }
+}
+
+fn file_route_anchor(cwd: &Path) -> FileRouteAnchor {
+    let cwd_text = cwd.to_string_lossy();
+    FileRouteAnchor {
+        marker: crate::marker::find_marker(&cwd_text),
+        repository: ai_memory_consolidate::discover_main_repo_root(cwd).ok(),
+    }
+}
+
+/// Pick a destination cwd only when a tool call's absolute location (file
+/// targets, a search directory, a shell `workdir`) proves a single
+/// repository/marker boundary different from the payload cwd, and the payload
+/// cwd's own capture policy would keep the event.
+///
+/// The second condition keeps a reroute from escaping the source's
+/// `ignore_paths`: patterns may name paths outside the source checkout
+/// (`~/vault/**`, an absolute path), and a shell command's arguments may name
+/// source files while its `workdir` points elsewhere. Without a reroute the
+/// event stays with the payload cwd, whose policy then drops it exactly as it
+/// would have before any rerouting existed.
+pub(crate) fn tool_location_routing_cwd(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    payload_cwd: &str,
+) -> Option<String> {
+    let paths = absolute_tool_location_paths(agent, raw, payload_cwd)?;
+    let source_dir = existing_target_dir(Path::new(payload_cwd))?;
+    let source_anchor = file_route_anchor(&source_dir);
+    let mut selected: Option<(FileRouteAnchor, PathBuf)> = None;
+    for path in paths {
+        let dir = existing_target_dir(Path::new(&path))?;
+        let anchor = file_route_anchor(&dir);
+        // An arbitrary absolute path is not a project and must not mint a new
+        // scope merely because a file tool happened to inspect it.
+        if anchor.marker.is_none() && anchor.repository.is_none() {
+            return None;
+        }
+        match &selected {
+            Some((expected, _)) if *expected != anchor => return None,
+            Some(_) => {}
+            None => selected = Some((anchor, dir)),
+        }
+    }
+    let (target_anchor, dir) = selected?;
+    if target_anchor == source_anchor {
+        return None;
+    }
+    let source_keeps = capture_policy(payload_cwd)
+        .inspect(agent, raw, &lexical_capture_cwd(payload_cwd))
+        .protocol()
+        .disposition()
+        == CaptureDisposition::Keep;
+    source_keeps.then(|| dir.to_string_lossy().into_owned())
+}
+
+/// How many markers other than the event's own one tool call may make
+/// [`foreign_capture_decision`] apply.
+const MAX_FOREIGN_MARKERS: usize = 16;
+/// How many directories, and directory entries read, following the glob
+/// syntax of one tool call's locations may cost, and how long: a hook has
+/// about 200 ms in all.
+const MAX_GLOB_DIRECTORIES: usize = 256;
+const MAX_GLOB_ENTRIES: usize = 32_768;
+const MAX_GLOB_TIME: Duration = Duration::from_millis(50);
+/// How many filesystem probes looking up the markers of one call's locations
+/// may cost; each directory's marker is found once ([`MarkerMemo`]), so only
+/// a tree built to be deep and wide reaches it.
+///
+/// [`MarkerMemo`]: crate::marker::MarkerMemo
+const MAX_LOOKUP_PROBES: usize = 16_384;
+
+/// The stricter decision of every other marker that governs a location the
+/// tool call names: a file-tool target, or a path a shell argument spells,
+/// resolved from the event's `cwd`. A checkout's `ignore_paths` must hold
+/// when the call is made from another checkout or an unmarked directory
+/// (`cat ../a/secret.env`), so each such marker's policy inspects the call
+/// as the event's own does. `None` when no other marker governs one.
+///
+/// Markers are found by the same lexical walk as the event's (no
+/// canonicalization), from the nearest existing directory of each location,
+/// with each directory's answer remembered for every lookup that passes it
+/// ([`MarkerMemo`]), so a deep tree costs one probe per directory. A location
+/// with glob syntax ([`glob_walk`]) is looked up from its literal root first,
+/// and, when that root lies outside the event's own checkout, every directory the
+/// glob could pass through below the root is checked for a marker of its
+/// own: each glob segment lists the child directories (never following a
+/// symlink), and a `**` lists the whole subtree except the own checkout's. A
+/// glob rooted inside the event's own checkout is not walked, so a monorepo's
+/// `packages/*/x` costs nothing; a checkout nested inside the event's own is
+/// not reached through one. The own checkout is the nearest `.git` root of
+/// the cwd unless that is the filesystem root or lies at or above the home
+/// directory ([`own_checkout`]).
+///
+/// The walk and the lookups share one budget of time, directories, entries
+/// and probes. Locations outside the own checkout come first: there a call
+/// naming more locations or markers than the bounds, a walk or lookup past
+/// the budget, glob syntax the walk cannot follow, or locations that cannot
+/// be read is unprovable and gets the fail-closed decision of an invalid
+/// policy. Inside the own checkout the own policy governs, so running out of
+/// budget there ends the lookup without failing closed.
+///
+/// [`MarkerMemo`]: crate::marker::MarkerMemo
+pub(crate) fn foreign_capture_decision(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    inspection_cwd: &str,
+    own_marker: Option<&Path>,
+) -> Option<CaptureDecision> {
+    foreign_decision_within(
+        agent,
+        raw,
+        inspection_cwd,
+        own_marker,
+        home_dir().as_deref(),
+        || GlobBudget::new(MAX_GLOB_TIME),
+    )
+}
+
+/// [`foreign_capture_decision`] with the home directory and the budget given;
+/// the budget is made once the event's own lookups are done.
+fn foreign_decision_within(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    inspection_cwd: &str,
+    own_marker: Option<&Path>,
+    home: Option<&Path>,
+    budget: impl FnOnce() -> GlobBudget,
+) -> Option<CaptureDecision> {
+    let unprovable = || {
+        Some(
+            CapturePolicy::resolve(CaptureSource::Invalid, inspection_cwd, None).inspect(
+                agent,
+                raw,
+                inspection_cwd,
+            ),
+        )
+    };
+    let Some(locations) =
+        capture_lookup_locations(agent, raw, inspection_cwd, home.and_then(Path::to_str))
+    else {
+        return unprovable();
+    };
+    let mut markers: Vec<PathBuf> = Vec::new();
+    let mut memo = crate::marker::MarkerMemo::with_home(home);
+    // The event's own lookups already paid for these, outside the budget; a
+    // location below the cwd then stops at it.
+    let cwd = Path::new(inspection_cwd);
+    let checkout = memo
+        .checkout_root(cwd, &mut || Some(()))
+        .flatten()
+        .filter(|root| own_checkout(root, home));
+    memo.remember(cwd, own_marker);
+    if cwd.is_dir() {
+        memo.note_directory(cwd);
+    }
+    let mut walk = budget();
+    // Locations outside the own checkout first: there another checkout's
+    // policy may apply, so running out of budget there is unprovable, and a
+    // long list inside the checkout must not spend it first. Inside it the
+    // own policy governs, as for a glob rooted there; a marker nested in it
+    // is found while the budget lasts, the shallowest locations first.
+    let (outside, mut inside): (Vec<String>, Vec<String>) =
+        locations.into_iter().partition(|location| {
+            checkout
+                .as_deref()
+                .is_none_or(|checkout| !Path::new(location).starts_with(checkout))
+        });
+    inside.sort_by_key(|location| Path::new(location).components().count());
+    let inside_from = outside.len();
+    for (index, location) in outside.into_iter().chain(inside).enumerate() {
+        // Past a bound, a location inside the own checkout ends the lookup;
+        // one outside it is unprovable.
+        let exhausted = || {
+            if index >= inside_from {
+                None
+            } else {
+                Some(unprovable())
+            }
+        };
+        let (lookup, steps) = match glob_walk(&location) {
+            GlobWalk::Literal => (location, None),
+            GlobWalk::Unprovable => return unprovable(),
+            GlobWalk::Walk { root, steps } => (root, Some(steps)),
+        };
+        // The literal root's marker first: a few probes, before a directory
+        // listing that may spend the rest of the time budget on its own.
+        let Some(dir) = memo.existing_dir(Path::new(&lookup), &mut || walk.probe()) else {
+            match exhausted() {
+                Some(decision) => return decision,
+                None => break,
+            }
+        };
+        let marker = match dir {
+            Some(dir) => {
+                let Some(marker) = memo.find_marker(&dir, &mut || walk.probe()) else {
+                    match exhausted() {
+                        Some(decision) => return decision,
+                        None => break,
+                    }
+                };
+                marker
+            }
+            None => None,
+        };
+        let below = match steps {
+            Some(steps) => {
+                let Some(found) =
+                    walk.markers_below(Path::new(&lookup), &steps, checkout.as_deref())
+                else {
+                    return unprovable();
+                };
+                found
+            }
+            None => Vec::new(),
+        };
+        for marker in marker.into_iter().chain(below) {
+            if Some(marker.as_path()) == own_marker || markers.contains(&marker) {
+                continue;
+            }
+            if markers.len() == MAX_FOREIGN_MARKERS {
+                return unprovable();
+            }
+            markers.push(marker);
+        }
+    }
+    markers
+        .iter()
+        .map(|marker| {
+            marker_capture_policy(marker, inspection_cwd).inspect(agent, raw, inspection_cwd)
+        })
+        .reduce(CaptureDecision::stricter)
+}
+
+/// Whether a checkout root counts as the event's own for the rules that a
+/// glob rooted inside it is not walked and that its locations come last:
+/// not the filesystem root, and not at or above the home directory (a
+/// dotfiles repository in `$HOME` would otherwise make every other checkout
+/// under it "own"). It still counts as a checkout for marker lookups.
+fn own_checkout(root: &Path, home: Option<&Path>) -> bool {
+    let home = home.map(crate::marker::absolute_normalized);
+    root.parent().is_some() && !home.is_some_and(|home| home.starts_with(root))
+}
+
+/// What following one call's glob locations and looking up their markers
+/// has cost so far.
+struct GlobBudget {
+    directories: usize,
+    entries: usize,
+    probes: usize,
+    /// Time spent since the walk started; injectable so a test can stand in
+    /// for a slow filesystem.
+    elapsed: Box<dyn FnMut() -> Duration>,
+    limit: Duration,
+}
+
+impl GlobBudget {
+    fn new(limit: Duration) -> Self {
+        let started = std::time::Instant::now();
+        Self::with_clock(limit, Box::new(move || started.elapsed()))
+    }
+
+    fn with_clock(limit: Duration, elapsed: Box<dyn FnMut() -> Duration>) -> Self {
+        Self {
+            directories: 0,
+            entries: 0,
+            probes: 0,
+            elapsed,
+            limit,
+        }
+    }
+
+    /// Counts one more filesystem probe of the marker lookup; `None` past
+    /// [`MAX_LOOKUP_PROBES`] or the time budget the walk shares.
+    fn probe(&mut self) -> Option<()> {
+        self.probes += 1;
+        (self.probes <= MAX_LOOKUP_PROBES && (self.elapsed)() <= self.limit).then_some(())
+    }
+
+    /// Counts one more directory the glob reaches; `None` past the bound.
+    fn reach(&mut self) -> Option<()> {
+        self.directories += 1;
+        (self.directories <= MAX_GLOB_DIRECTORIES).then_some(())
+    }
+
+    /// The marker files of every directory `steps` can reach below `root`,
+    /// `root` itself excluded (its lookup is the caller's). Nothing when
+    /// `root` lies inside the event's own `checkout`, and a `**` lists
+    /// nothing inside it. `None` past the bounds.
+    /// A step that reaches no directory ends the walk: the glob then matches
+    /// nothing there.
+    fn markers_below(
+        &mut self,
+        root: &Path,
+        steps: &[GlobStep],
+        checkout: Option<&Path>,
+    ) -> Option<Vec<PathBuf>> {
+        let mut found = Vec::new();
+        if checkout.is_some_and(|checkout| root.starts_with(checkout)) {
+            return Some(found);
+        }
+        let mut current = vec![root.to_path_buf()];
+        for step in steps {
+            let mut next = Vec::new();
+            for dir in &current {
+                match step {
+                    GlobStep::Named(name) => {
+                        let child = dir.join(name);
+                        if child.is_dir() {
+                            next.push(child);
+                        }
+                    }
+                    GlobStep::Matching(segment) => {
+                        next.extend(self.child_directories(dir)?.into_iter().filter(|child| {
+                            child.file_name().is_some_and(|name| {
+                                glob_segment_matches(segment, &name.to_string_lossy())
+                            })
+                        }))
+                    }
+                    GlobStep::Any => next.extend(self.child_directories(dir)?),
+                    GlobStep::AnyDepth => {
+                        if checkout.is_some_and(|checkout| dir.starts_with(checkout)) {
+                            continue;
+                        }
+                        // Counted as listed: a deep tree must not cost a
+                        // full listing before the bound applies. The own
+                        // checkout's subtree is skipped, as a glob rooted
+                        // in it is.
+                        let outside = |path: &PathBuf| {
+                            checkout.is_none_or(|checkout| !path.starts_with(checkout))
+                        };
+                        let mut pending: Vec<PathBuf> = self
+                            .child_directories(dir)?
+                            .into_iter()
+                            .filter(outside)
+                            .collect();
+                        while let Some(below) = pending.pop() {
+                            self.reach()?;
+                            pending.extend(
+                                self.child_directories(&below)?.into_iter().filter(outside),
+                            );
+                            next.push(below);
+                        }
+                    }
+                }
+            }
+            for dir in &next {
+                if !matches!(step, GlobStep::AnyDepth) {
+                    self.reach()?;
+                }
+                let marker = dir.join(ai_memory_core::repository_identity::MARKER_FILENAME);
+                if marker.is_file() {
+                    found.push(marker);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            current = next;
+        }
+        Some(found)
+    }
+
+    /// The child directories of `dir`, symlinks left out. An unreadable
+    /// directory has none the glob could match either.
+    fn child_directories(&mut self, dir: &Path) -> Option<Vec<PathBuf>> {
+        if (self.elapsed)() > self.limit {
+            return None;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Some(Vec::new());
+        };
+        let mut children = Vec::new();
+        for entry in entries {
+            self.entries += 1;
+            if self.entries > MAX_GLOB_ENTRIES {
+                return None;
+            }
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                children.push(entry.path());
+            }
+        }
+        Some(children)
     }
 }
 
@@ -1135,6 +1744,73 @@ fn resolve_hook_route(
     }
 }
 
+/// Whether the live hook would deliver events from `destination` to the same
+/// server as events from `source`, resolving each like [`resolve_hook_route`].
+/// A refused selection on either side delivers nowhere, so it never matches.
+/// A transcript import posts everything to one endpoint, so an event the hook
+/// would send elsewhere must not ride along.
+pub(crate) fn delivers_to_same_server(data_dir: &Path, source: &str, destination: &str) -> bool {
+    match (
+        resolve_hook_route(data_dir, Some(source), || None),
+        resolve_hook_route(data_dir, Some(destination), || None),
+    ) {
+        (HookRoute::InstallDefault, HookRoute::InstallDefault) => true,
+        (HookRoute::Profile(source), HookRoute::Profile(destination)) => source == destination,
+        _ => false,
+    }
+}
+
+/// Whether the live hook would file events from `destination` under the same
+/// project as events from `source`. Both must send the same routing hints
+/// ([`hook_scope`]). When those hints name no project or identity, the server
+/// derives one from the cwd itself. Under the default `basename` strategy it
+/// names the project after the cwd's own folder, and a cwd below a project
+/// anchored at its repository root (one first seen at that root) joins that
+/// project: the two agree in the same directory, or when `source` is the
+/// root of the repository and marker boundary `destination` lies in. Two
+/// subdirectories of one repository are two projects. Under `repo-root` it
+/// matches the cwd to the project that owns the enclosing repository: the
+/// two then agree inside one repository and marker boundary, or, outside any
+/// repository, in the same directory.
+/// A transcript import posts every event under one project, so an event the
+/// hook would file under another project must not ride along.
+pub(crate) fn routes_to_same_project(source: &str, destination: &str) -> bool {
+    routes_to_same_project_with(source, destination, |cwd| hook_scope(cwd, None))
+}
+
+fn routes_to_same_project_with(
+    source: &str,
+    destination: &str,
+    scope_of: impl Fn(&str) -> HookScope,
+) -> bool {
+    let scope = scope_of(source);
+    if scope != scope_of(destination) {
+        return false;
+    }
+    if scope.names_the_project() {
+        return true;
+    }
+    let (source_dir, destination_dir) = (
+        lexical_capture_cwd(source),
+        lexical_capture_cwd(destination),
+    );
+    if source_dir == destination_dir {
+        return true;
+    }
+    let anchor = |cwd: &str| existing_target_dir(Path::new(cwd)).map(|dir| file_route_anchor(&dir));
+    let same_repository = || match (anchor(source), anchor(destination)) {
+        (Some(source), Some(destination)) => source.repository.is_some() && source == destination,
+        _ => false,
+    };
+    if scope.derives_from_repo_root() {
+        return same_repository();
+    }
+    let source_dir = Path::new(&source_dir);
+    Path::new(&destination_dir).starts_with(source_dir)
+        && crate::marker::checkout_root(source_dir).as_deref() == Some(source_dir)
+        && same_repository()
+}
+
 /// Normalize the raw hook `cwd` into the base `policy.inspect` joins a tool
 /// event's relative candidate path onto — lexically, via
 /// `marker::absolute_normalized`, NOT `fs::canonicalize` (#671).
@@ -1152,7 +1828,7 @@ fn resolve_hook_route(
 /// including for a candidate file that doesn't exist on disk (canonicalize
 /// would `Err` on that and silently fall back to the raw, un-normalized
 /// cwd).
-fn lexical_capture_cwd(cwd: &str) -> String {
+pub(crate) fn lexical_capture_cwd(cwd: &str) -> String {
     crate::marker::absolute_normalized(Path::new(cwd))
         .into_os_string()
         .into_string()
@@ -1169,6 +1845,27 @@ fn lexical_capture_cwd(cwd: &str) -> String {
 /// path could forget.
 pub(crate) const CAPTURE_MODE_FILE: &str = "capture-mode";
 
+/// Marker presence is the opt-in signal under allowlist mode. Resolved from
+/// the same upward walk the policy uses, so opting in needs no new file.
+fn marker_present(cwd: Option<&str>) -> bool {
+    cwd.is_some_and(|cwd| crate::marker::find_marker(cwd).is_some())
+}
+
+/// An unreadable routing marker emits nothing rather than guess a scope.
+fn routing_valid(cwd: Option<&str>) -> bool {
+    cwd.is_none_or(|cwd| crate::marker::routing_selection(cwd).is_ok())
+}
+
+/// The hook's repository admission gate (#446) for a transcript import from
+/// the checkout at `cwd`: this install's persisted capture mode, the marker
+/// opt-in, and a readable routing marker. `backfill` and the `ai-memory run`
+/// ledger import nothing — prompts included — from a checkout the live hook
+/// would emit nothing for.
+pub(crate) fn checkout_admits_capture(data_dir: &Path, cwd: &str) -> bool {
+    repository_admits_capture(persisted_capture_mode(data_dir), marker_present(Some(cwd)))
+        && routing_valid(Some(cwd))
+}
+
 /// Read the persisted capture mode. Anything unreadable, absent, or
 /// unrecognised means the historical default: this file can only ever tighten
 /// capture, never silently loosen it below what the operator already had.
@@ -1179,6 +1876,14 @@ fn persisted_capture_mode(data_dir: &Path) -> CaptureMode {
     }
 }
 
+/// Whether this install's capture mode admits a checkout at `cwd`: the same
+/// gate a live hook applies, for callers that replay events outside a hook
+/// (`finalize-session`).
+pub(crate) fn admits_capture_at(data_dir: &Path, cwd: &Path) -> bool {
+    let marker_present = crate::marker::find_marker(&cwd.to_string_lossy()).is_some();
+    repository_admits_capture(persisted_capture_mode(data_dir), marker_present)
+}
+
 fn is_tool_event(event: &str) -> bool {
     matches!(
         event.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
@@ -1186,13 +1891,18 @@ fn is_tool_event(event: &str) -> bool {
     )
 }
 
-/// Resolve the data dir cheaply, without loading the full config (the hook
-/// fast-path skips config for latency). Mirrors `config.rs`: explicit
-/// `--data-dir`, else `AI_MEMORY_DATA_DIR`, else the platform local-data dir.
+/// Resolve the data dir for tests that exercise the hook implementation
+/// directly: explicit `--data-dir`, then the captured runtime environment, then
+/// the platform local-data directory.
+#[cfg(test)]
 fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
+    resolve_data_dir_with(data_dir, &RuntimeEnv::from_process())
+}
+
+fn resolve_data_dir_with(data_dir: Option<&Path>, runtime_env: &RuntimeEnv) -> PathBuf {
     let dir = data_dir
         .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("AI_MEMORY_DATA_DIR").map(PathBuf::from))
+        .or_else(|| runtime_env.data_dir().map(Path::to_path_buf))
         .unwrap_or_else(|| {
             dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -1253,6 +1963,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(CAPTURE_MODE_FILE), "\u{0}not-a-mode").unwrap();
         assert_eq!(persisted_capture_mode(tmp.path()), CaptureMode::Denylist);
+    }
+
+    #[test]
+    fn admits_capture_at_applies_the_allowlist_to_unmarked_checkouts() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        assert!(
+            admits_capture_at(data_dir.path(), checkout.path()),
+            "denylist mode (the default) admits any checkout"
+        );
+        std::fs::write(data_dir.path().join(CAPTURE_MODE_FILE), "allowlist\n").unwrap();
+        assert!(
+            !admits_capture_at(data_dir.path(), checkout.path()),
+            "allowlist mode admits no checkout without a marker"
+        );
+        std::fs::write(
+            checkout.path().join(".ai-memory.toml"),
+            "workspace = \"ws\"\nproject = \"proj\"\n",
+        )
+        .unwrap();
+        assert!(admits_capture_at(data_dir.path(), checkout.path()));
     }
 
     /// "The server is down": a loopback endpoint that accepts and immediately
@@ -1340,6 +2071,26 @@ mod tests {
     }
 
     #[test]
+    fn only_zero_session_end_drains_in_process() {
+        assert!(session_end_drains_in_process(
+            AgentKind::Zero,
+            "session-end"
+        ));
+        for event in ["session-start", "post-tool-use", "subagent-stop"] {
+            assert!(
+                !session_end_drains_in_process(AgentKind::Zero, event),
+                "{event}"
+            );
+        }
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Zcode] {
+            assert!(
+                !session_end_drains_in_process(agent, "session-end"),
+                "{agent:?}"
+            );
+        }
+    }
+
+    #[test]
     fn antigravity_preinvocation_only_maps_invocation_zero_to_session_start() {
         for (raw, expected) in [
             (serde_json::json!({"invocationNum": 0}), true),
@@ -1410,6 +2161,7 @@ mod tests {
             hook_spool::DrainResult::default(),
             hook_spool::DrainResult {
                 sent: 12,
+                durable: 12,
                 remaining: 0,
                 dropped: 0,
             },
@@ -1430,6 +2182,7 @@ mod tests {
         let clean = drain_report(&hook_spool::LockedDrainResult::Drained(
             hook_spool::DrainResult {
                 sent: 5,
+                durable: 5,
                 remaining: 0,
                 dropped: 0,
             },
@@ -1437,6 +2190,7 @@ mod tests {
         let lossy = drain_report(&hook_spool::LockedDrainResult::Drained(
             hook_spool::DrainResult {
                 sent: 0,
+                durable: 0,
                 remaining: 0,
                 dropped: 7,
             },
@@ -1470,6 +2224,7 @@ mod tests {
         let report = drain_report(&hook_spool::LockedDrainResult::Drained(
             hook_spool::DrainResult {
                 sent: 1,
+                durable: 1,
                 remaining: 4,
                 dropped: 0,
             },
@@ -2154,6 +2909,83 @@ mod tests {
         }
     }
 
+    fn zero_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "zero".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        }
+    }
+
+    /// Zero's sandbox kills the detached drainer with the hook (#1172), so its
+    /// session-end must deliver before the hook returns.
+    #[tokio::test]
+    async fn zero_session_end_delivers_in_process_without_a_detached_drainer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let (base, mut requests) = serve_requests("200 OK", r#"{"accepted":1}"#).await;
+        let mut stdout = Vec::new();
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            zero_hook_args("session-end", &base),
+            r#"{"sessionId":"s","cwd":"/tmp"}"#.into(),
+            &mut stdout,
+            |_, _| panic!("zero's session-end must not spawn a detached drainer"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        let request = first_request(&mut requests)
+            .await
+            .expect("drained in-process");
+        assert!(request.starts_with("POST /hook/batch"), "{request}");
+        assert_eq!(
+            hook_spool::spool_len(&spool),
+            0,
+            "delivered event left the spool"
+        );
+    }
+
+    /// With the sandbox's network denied the in-process drain fails fast and
+    /// the event stays spooled for `hook-drain` or the next session.
+    #[tokio::test]
+    async fn zero_session_end_without_network_keeps_the_event_spooled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let mut stdout = Vec::new();
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            zero_hook_args("session-end", &refused),
+            r#"{"sessionId":"s","cwd":"/tmp"}"#.into(),
+            &mut stdout,
+            |_, _| panic!("zero's session-end must not spawn a detached drainer"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].attempts, 0,
+            "an unreachable server costs no retry"
+        );
+    }
+
     #[tokio::test]
     async fn session_end_run_spawn_failure_keeps_event_queued_and_stdout_clean() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2302,6 +3134,1363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn absolute_file_target_uses_destination_scope_and_capture_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"source\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"destination\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let excluded = serde_json::json!({
+            "session_id": "cross-project",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("secret/private.txt")},
+            "tool_response": {"content": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+        });
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            excluded.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a dropped tool event must not start a drainer"),
+        )
+        .await
+        .unwrap();
+        let spool = hook_spool::spool_dir(&data_dir);
+        assert_eq!(hook_spool::spool_len(&spool), 0);
+
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let public = serde_json::json!({
+            "session_id": "cross-project",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("public.txt")},
+            "tool_response": {"content": "public"}
+        });
+        run_with_payload(
+            Some(data_dir),
+            args,
+            public.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a tool event below the threshold must only spool"),
+        )
+        .await
+        .unwrap();
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(query_param(&entries[0].url, "workspace"), Some("shared"));
+        assert_eq!(query_param(&entries[0].url, "project"), Some("destination"));
+        assert_eq!(
+            query_param(&entries[0].url, "cwd"),
+            Some(url_encode(destination.to_str().unwrap()).as_str())
+        );
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["cwd"], destination.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn absolute_file_target_cannot_escape_a_destination_server_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(
+            source.join(".ai-memory.toml"),
+            "workspace = \"shared\"\nproject = \"source\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "server = \"unregistered\"\nworkspace = \"shared\"\nproject = \"destination\"\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "claude-code".into();
+        let raw = serde_json::json!({
+            "session_id": "cross-profile",
+            "cwd": source,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": destination.join("public.txt")}
+        });
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a refused destination route must not start a drainer"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)),
+            0,
+            "the event must not fall back to the source repository's server"
+        );
+    }
+
+    #[test]
+    fn file_target_routing_refuses_relative_external_and_mixed_project_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(source.join(".ai-memory.toml"), "project = \"source\"\n").unwrap();
+        std::fs::write(
+            destination.join(".ai-memory.toml"),
+            "project = \"destination\"\n",
+        )
+        .unwrap();
+        let cwd = source.to_str().unwrap();
+        let relative = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "../destination/file.txt"}
+        });
+        assert_eq!(
+            tool_location_routing_cwd(AgentKind::ClaudeCode, &relative, cwd),
+            None,
+            "a relative path cannot independently prove a destination"
+        );
+
+        let external_dir = tmp.path().join("not-a-project");
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let external = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": external_dir.join("file.txt")}
+        });
+        assert_eq!(
+            tool_location_routing_cwd(AgentKind::ClaudeCode, &external, cwd),
+            None,
+            "an arbitrary absolute path must not mint a project"
+        );
+
+        let mixed = serde_json::json!({
+            "tool_name": "read",
+            "tool_input": {"paths": [
+                source.join("one.txt"),
+                destination.join("two.txt")
+            ]}
+        });
+        assert_eq!(
+            tool_location_routing_cwd(AgentKind::ClaudeCode, &mixed, cwd),
+            None,
+            "one event cannot be attributed to two projects"
+        );
+    }
+
+    /// Spool one native hook event and return what reached the spool.
+    async fn spool_one(
+        data_dir: &Path,
+        agent: &str,
+        capture_mode: Option<crate::cli::CaptureModeArg>,
+        raw: &serde_json::Value,
+    ) -> Vec<hook_spool::SpoolEntry> {
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = agent.into();
+        args.capture_mode = capture_mode;
+        run_with_payload(
+            Some(data_dir.to_path_buf()),
+            args,
+            raw.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a tool event below the threshold must only spool"),
+        )
+        .await
+        .unwrap();
+        let spool = hook_spool::spool_dir(data_dir);
+        if spool.exists() {
+            read_spooled_entries(&spool)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Hermes reports its own process cwd (usually `~`) on every tool event and
+    /// points each call at a repository through `workdir` or `path` (#1199).
+    /// Under allowlist mode the process cwd has no marker, so the tool's own
+    /// absolute location must find the repository's marker.
+    #[tokio::test]
+    async fn hermes_tool_location_finds_the_marker_the_process_cwd_lacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("dev").join("some-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"w\"\nproject = \"some-repo\"\n",
+        )
+        .unwrap();
+        let allowlist = Some(crate::cli::CaptureModeArg::Allowlist);
+        let event = |tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": tool,
+                "tool_input": input,
+                "session_id": "hermes-session",
+                "cwd": home,
+                "extra": {"tool_call_id": "call-1", "status": "ok"}
+            })
+        };
+
+        for (name, raw) in [
+            (
+                "terminal workdir",
+                event(
+                    "terminal",
+                    serde_json::json!({"command": "git status", "workdir": repo}),
+                ),
+            ),
+            (
+                "file path",
+                event(
+                    "read_file",
+                    serde_json::json!({"path": repo.join("README.md")}),
+                ),
+            ),
+            (
+                "search directory",
+                event(
+                    "search_files",
+                    serde_json::json!({"pattern": "fn", "path": repo}),
+                ),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, "hermes", allowlist, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert_eq!(
+                query_param(&entries[0].url, "project"),
+                Some("some-repo"),
+                "{name}"
+            );
+            let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+            assert_eq!(body["cwd"], repo.to_string_lossy().as_ref(), "{name}");
+        }
+
+        // Controls: a command with no location, or a relative one Hermes
+        // resolves against a session cwd the payload never carries, still
+        // belongs to the unmarked process cwd and is not captured.
+        for (name, raw) in [
+            (
+                "no workdir",
+                event("terminal", serde_json::json!({"command": "git status"})),
+            ),
+            (
+                "relative workdir",
+                event(
+                    "terminal",
+                    serde_json::json!({"command": "git status", "workdir": "dev/some-repo"}),
+                ),
+            ),
+            (
+                "relative search",
+                event(
+                    "search_files",
+                    serde_json::json!({"pattern": "fn", "path": "."}),
+                ),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            assert!(
+                spool_one(&data_dir, "hermes", allowlist, &raw)
+                    .await
+                    .is_empty(),
+                "{name}"
+            );
+        }
+    }
+
+    /// A shell `workdir` reroute lands under the destination's exclusions: a
+    /// command reading an ignored path there is dropped, a public one is kept.
+    #[tokio::test]
+    async fn workdir_reroute_applies_the_destination_capture_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "project = \"repo\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        for (command, spooled) in [("cat secret/token.txt", 0), ("cat README.md", 1)] {
+            let raw = serde_json::json!({
+                "tool_name": "terminal",
+                "tool_input": {"command": command, "workdir": repo},
+                "tool_response": "SENTINEL_CONTENT",
+                "session_id": "hermes-session",
+                "cwd": home,
+            });
+            let data_dir = tmp.path().join(format!("data-{spooled}"));
+            assert_eq!(
+                spool_one(&data_dir, "hermes", None, &raw).await.len(),
+                spooled,
+                "{command}"
+            );
+        }
+    }
+
+    /// Adversarial: a reroute must never escape the payload cwd's own
+    /// `ignore_paths`. The source excludes a path outside its checkout and a
+    /// path inside it; a file tool targeting the first, or a shell command
+    /// naming the second while its `workdir` points at another project, would
+    /// otherwise be judged only by the destination's (inactive) policy and
+    /// spooled. Controls: the same tools on public paths still reroute.
+    #[tokio::test]
+    async fn a_reroute_cannot_escape_the_source_capture_exclusions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let vault = tmp.path().join("vault");
+        let other = tmp.path().join("other");
+        for dir in [&source, &vault, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            source.join(".ai-memory.toml"),
+            format!(
+                "project = \"source\"\n[capture]\nignore_paths = [\"secret/**\", {:?}]\n",
+                format!("{}/**", vault.display())
+            ),
+        )
+        .unwrap();
+        std::fs::write(vault.join(".ai-memory.toml"), "project = \"vault\"\n").unwrap();
+        std::fs::write(other.join(".ai-memory.toml"), "project = \"other\"\n").unwrap();
+        let bash = |command: String| {
+            serde_json::json!({
+                "session_id": "escape",
+                "cwd": source,
+                "tool_name": "Bash",
+                "tool_input": {"command": command, "workdir": other},
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let read = |path: PathBuf| {
+            serde_json::json!({
+                "session_id": "escape",
+                "cwd": source,
+                "tool_name": "Read",
+                "tool_input": {"file_path": path},
+                "tool_response": {"content": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+
+        for (name, raw) in [
+            ("file outside the source", read(vault.join("key.md"))),
+            (
+                "shell naming a source file",
+                bash(format!("cat {}", source.join("secret/token.txt").display())),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            assert!(
+                spool_one(&data_dir, "claude-code", None, &raw)
+                    .await
+                    .is_empty(),
+                "{name}: the source exclusion must still drop the event"
+            );
+        }
+
+        for (name, raw, project) in [
+            ("public file", read(other.join("readme.md")), "other"),
+            ("public shell", bash("git status".to_owned()), "other"),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, "claude-code", None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert_eq!(
+                query_param(&entries[0].url, "project"),
+                Some(project),
+                "{name}"
+            );
+        }
+    }
+
+    /// Adversarial: checkout A's `ignore_paths` hold for a call made from
+    /// checkout B or from an unmarked directory, by a shell argument
+    /// (relative or absolute) or a file tool, whatever B's own policy says.
+    /// Controls: A's public files, and B's own files, are still captured.
+    #[tokio::test]
+    async fn another_checkouts_exclusions_hold_for_a_call_made_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let bare = tmp.path().join("unmarked");
+        let broken = tmp.path().join("broken");
+        for dir in [&a, &b, &bare, &broken] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(b.join(".ai-memory.toml"), "project = \"b\"\n").unwrap();
+        std::fs::write(broken.join(".ai-memory.toml"), "[capture\n").unwrap();
+        let event = |agent_cwd: &Path, tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "cross",
+                "cwd": agent_cwd,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let secret = a.join("secrets.env");
+        let cases = [
+            (
+                "relative shell",
+                "claude-code",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../a/secrets.env"}),
+                ),
+            ),
+            (
+                "absolute shell",
+                "claude-code",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": format!("cat {}", secret.display())}),
+                ),
+            ),
+            (
+                "unmarked hermes terminal",
+                "hermes",
+                event(
+                    &bare,
+                    "terminal",
+                    serde_json::json!({"command": format!("cat {}", secret.display())}),
+                ),
+            ),
+            (
+                "glob shell",
+                "claude-code",
+                event(&b, "Bash", serde_json::json!({"command": "cat ../a/*.env"})),
+            ),
+        ];
+        for (name, agent, raw) in cases {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            assert!(
+                spool_one(&data_dir, agent, None, &raw).await.is_empty(),
+                "{name}: A's exclusion must drop the event"
+            );
+        }
+        // A broken marker over the target fails closed: metadata-only.
+        let raw = event(
+            &b,
+            "Bash",
+            serde_json::json!({"command": "cat ../broken/x.md"}),
+        );
+        let entries = spool_one(&tmp.path().join("data-broken"), "claude-code", None, &raw).await;
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+            "{}",
+            entries[0].body
+        );
+        assert!(
+            entries[0].body.contains("\"metadata-only\""),
+            "{}",
+            entries[0].body
+        );
+        // More markers than the bound is unprovable: metadata-only.
+        let mut many = String::from("cat");
+        for index in 0..=MAX_FOREIGN_MARKERS {
+            let dir = tmp.path().join(format!("m{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".ai-memory.toml"), "project = \"m\"\n").unwrap();
+            many.push_str(&format!(" ../m{index}/x.md"));
+        }
+        let raw = event(&b, "Bash", serde_json::json!({"command": many}));
+        let entries = spool_one(&tmp.path().join("data-many"), "claude-code", None, &raw).await;
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"));
+        // Controls.
+        for (name, raw) in [
+            (
+                "public shell",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../a/public.md README.md"}),
+                ),
+            ),
+            (
+                "own file",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat secrets.env"}),
+                ),
+            ),
+            (
+                "few markers",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../m0/x.md ../m1/x.md"}),
+                ),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, "claude-code", None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                "{name}"
+            );
+        }
+    }
+
+    /// Adversarial: checkout A's `ignore_paths` also hold for a call from a
+    /// sibling checkout or an unmarked parent that reaches A through glob
+    /// syntax in a directory segment, through a search/list tool's path or
+    /// glob, or through an `apply_patch` header; glob syntax the lookup
+    /// cannot follow, and a file tool whose target cannot be read, fail
+    /// closed. Controls: public files, the event's own files and searches,
+    /// and ordinary globs are still captured whole.
+    #[tokio::test]
+    async fn globs_searches_and_unreadable_targets_answer_to_another_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("work");
+        let a = parent.join("a");
+        let b = parent.join("b");
+        for dir in [&a, &b, &b.join("src")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(b.join(".ai-memory.toml"), "project = \"b\"\n").unwrap();
+        let event = |agent_cwd: &Path, tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "cross-glob",
+                "cwd": agent_cwd,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let bash = |agent_cwd: &Path, command: &str| {
+            event(agent_cwd, "Bash", serde_json::json!({"command": command}))
+        };
+        let attacks = [
+            (
+                "sibling star",
+                "claude-code",
+                bash(&b, "cat ../*/secrets.env"),
+            ),
+            (
+                "parent star",
+                "claude-code",
+                bash(&parent, "cat */secrets.env"),
+            ),
+            ("brace", "claude-code", bash(&b, "cat ../{a,c}/secrets.env")),
+            ("bracket", "claude-code", bash(&b, "cat ../[a]/secrets.env")),
+            ("globstar", "claude-code", bash(&b, "cat ../**/secrets.env")),
+            (
+                "spanning brace",
+                "claude-code",
+                bash(&b, "cat ../{a/x,c}/secrets.env"),
+            ),
+            (
+                "grep path",
+                "claude-code",
+                event(
+                    &b,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "../a/secrets.env", "output_mode": "content"}),
+                ),
+            ),
+            (
+                "glob pattern",
+                "claude-code",
+                event(&b, "Glob", serde_json::json!({"pattern": "../a/*.env"})),
+            ),
+            (
+                "grep filter from the parent",
+                "claude-code",
+                event(
+                    &parent,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "glob": "*/secrets.env"}),
+                ),
+            ),
+            (
+                "gemini search",
+                "gemini-cli",
+                event(
+                    &b,
+                    "search_file_content",
+                    serde_json::json!({"pattern": "KEY", "dir_path": "../a"}),
+                ),
+            ),
+            (
+                "patch header",
+                "codex",
+                event(
+                    &b,
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n*** Update File: ../a/secrets.env\n+KEY\n*** End Patch"}),
+                ),
+            ),
+            (
+                "unreadable target",
+                "claude-code",
+                event(&parent, "Read", serde_json::json!({})),
+            ),
+        ];
+        for (name, agent, raw) in attacks {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.body.contains("SENTINEL_MUST_NOT_BE_SPOOLED")),
+                "{name}: {entries:?}"
+            );
+        }
+        let controls = [
+            ("public glob", "claude-code", bash(&b, "cat ../*/public.md")),
+            ("own glob", "claude-code", bash(&b, "ls src/*")),
+            (
+                "own globstar",
+                "claude-code",
+                bash(&b, "cat src/**/main.rs"),
+            ),
+            (
+                "own grep",
+                "claude-code",
+                event(
+                    &b,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "src"}),
+                ),
+            ),
+            (
+                "own glob tool",
+                "claude-code",
+                event(&b, "Glob", serde_json::json!({"pattern": "**/*.rs"})),
+            ),
+            (
+                "public grep",
+                "claude-code",
+                event(
+                    &parent,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "b"}),
+                ),
+            ),
+            (
+                "own patch",
+                "codex",
+                event(
+                    &b,
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n*** Add File: src/x.rs\n+fn x() {}\n*** End Patch"}),
+                ),
+            ),
+        ];
+        for (name, agent, raw) in controls {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                "{name}: {}",
+                entries[0].body
+            );
+        }
+    }
+
+    /// Regression: a glob rooted inside the event's own checkout is not
+    /// walked, so a monorepo with more matching directories than the walk's
+    /// bounds keeps its ordinary commands whole, with or without a policy of
+    /// its own (a search tool under an active policy is dropped by the search
+    /// rule, not by the walk). The sibling-checkout attack still drops.
+    #[tokio::test]
+    async fn a_monorepo_glob_inside_the_own_checkout_is_not_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let mono = work.join("mono");
+        let a = work.join("a");
+        std::fs::create_dir_all(mono.join(".git")).unwrap();
+        std::fs::create_dir_all(mono.join("log")).unwrap();
+        for index in 0..300 {
+            let package = mono.join("packages").join(format!("p{index}"));
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            std::fs::write(package.join("package.json"), "{}").unwrap();
+            std::fs::create_dir_all(mono.join("node_modules").join(format!("m{index}"))).unwrap();
+        }
+        const _: () = assert!(300 > MAX_GLOB_DIRECTORIES);
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let event = |tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "monorepo",
+                "cwd": mono,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let bash = |command: &str| event("Bash", serde_json::json!({"command": command}));
+        let shell = [
+            "cat packages/*/package.json",
+            "ls packages/*/src",
+            "du -sh packages/*",
+            "ls node_modules/*/package.json",
+            "for f in packages/*/package.json; do echo $f; done",
+            "tail -n 50 log/*.log",
+        ];
+        let searches = [
+            event(
+                "Glob",
+                serde_json::json!({"pattern": "packages/*/package.json"}),
+            ),
+            event(
+                "Grep",
+                serde_json::json!({"pattern": "x", "path": "packages", "glob": "*/package.json"}),
+            ),
+        ];
+        for policy in [None, Some("[capture]\nignore_paths = [\"private/**\"]\n")] {
+            if let Some(text) = policy {
+                std::fs::write(mono.join(".ai-memory.toml"), text).unwrap();
+            }
+            let label = if policy.is_some() { "active" } else { "none" };
+            for (index, command) in shell.iter().enumerate() {
+                let data_dir = tmp.path().join(format!("data-{label}-shell-{index}"));
+                let entries = spool_one(&data_dir, "claude-code", None, &bash(command)).await;
+                assert_eq!(entries.len(), 1, "{label}: {command}");
+                assert!(
+                    entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                    "{label}: {command}: {}",
+                    entries[0].body
+                );
+            }
+            for (index, raw) in searches.iter().enumerate() {
+                let data_dir = tmp.path().join(format!("data-{label}-search-{index}"));
+                let entries = spool_one(&data_dir, "claude-code", None, raw).await;
+                if policy.is_some() {
+                    assert!(entries.is_empty(), "{label}: {raw}");
+                } else {
+                    assert_eq!(entries.len(), 1, "{label}: {raw}");
+                    assert!(
+                        entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                        "{label}: {raw}: {}",
+                        entries[0].body
+                    );
+                }
+            }
+            for (index, command) in ["cat ../*/secrets.env", "cat ../a/*.env"]
+                .iter()
+                .enumerate()
+            {
+                let data_dir = tmp.path().join(format!("data-{label}-attack-{index}"));
+                let entries = spool_one(&data_dir, "claude-code", None, &bash(command)).await;
+                assert!(
+                    entries
+                        .iter()
+                        .all(|entry| !entry.body.contains("SENTINEL_MUST_NOT_BE_SPOOLED")),
+                    "{label}: {command}: {entries:?}"
+                );
+            }
+        }
+    }
+
+    /// A walk outside the event's own checkout stops, unprovable, past its
+    /// directory bound (counted while a `**` lists, not after) or its time
+    /// budget; under both it still finds a marker it reaches in time.
+    #[test]
+    fn a_glob_walk_outside_the_checkout_stops_at_its_bounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wide = tmp.path().join("wide");
+        for index in 0..=MAX_GLOB_DIRECTORIES {
+            std::fs::create_dir_all(wide.join(format!("d{index}"))).unwrap();
+        }
+        let narrow = tmp.path().join("narrow");
+        std::fs::create_dir_all(narrow.join("x").join("y")).unwrap();
+        std::fs::write(narrow.join("x").join(".ai-memory.toml"), "").unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        assert_eq!(
+            fast().markers_below(&wide, &[GlobStep::AnyDepth], None),
+            None
+        );
+        // The bound stops a deep tree's listing early, not after all of it.
+        let deep = tmp.path().join("deep");
+        for outer in 0..64 {
+            for inner in 0..64 {
+                std::fs::create_dir_all(deep.join(format!("d{outer}/e{inner}"))).unwrap();
+            }
+        }
+        let mut budget = fast();
+        assert_eq!(
+            budget.markers_below(&deep, &[GlobStep::AnyDepth], None),
+            None
+        );
+        assert!(budget.entries < 1_024, "{}", budget.entries);
+        assert_eq!(
+            fast().markers_below(&narrow, &[GlobStep::AnyDepth], None),
+            Some(vec![narrow.join("x").join(".ai-memory.toml")])
+        );
+        // Inside the event's own checkout nothing is walked at all.
+        assert_eq!(
+            fast().markers_below(&wide, &[GlobStep::AnyDepth], Some(tmp.path())),
+            Some(Vec::new())
+        );
+        // A filesystem slower than the budget fails closed.
+        let mut calls = 0;
+        let mut slow = GlobBudget::with_clock(
+            MAX_GLOB_TIME,
+            Box::new(move || {
+                calls += 1;
+                MAX_GLOB_TIME * calls
+            }),
+        );
+        assert_eq!(
+            slow.markers_below(&narrow, &[GlobStep::AnyDepth], None),
+            None
+        );
+    }
+
+    /// The payload of a Bash call made from `cwd`.
+    fn bash_call(cwd: &Path, command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "lookup",
+            "cwd": cwd,
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {"stdout": "x"}
+        })
+    }
+
+    /// The disposition [`foreign_decision_within`] gives a call, `None` when no
+    /// other marker governs it.
+    fn foreign_disposition(
+        cwd: &Path,
+        command: &str,
+        own_marker: Option<&Path>,
+        home: Option<&Path>,
+        budget: impl FnOnce() -> GlobBudget,
+    ) -> Option<CaptureDisposition> {
+        let raw = bash_call(cwd, command);
+        foreign_decision_within(
+            AgentKind::ClaudeCode,
+            &raw,
+            &lexical_capture_cwd(&cwd.to_string_lossy()),
+            own_marker,
+            home,
+            budget,
+        )
+        .map(|decision| decision.protocol().disposition())
+    }
+
+    /// Regression (the docs promised it; v2.6.3 kept the call): a `**` that
+    /// starts above the event's checkout skips the checkout's own subtree, so
+    /// a checkout with more directories than the walk's bound keeps
+    /// `ls ../**/README.md`. Adversarial: the sibling checkout's policy still
+    /// drops `cat ../**/secrets.env`.
+    #[test]
+    fn a_globstar_above_the_checkout_skips_the_own_subtree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let own = work.join("own");
+        let a = work.join("a");
+        std::fs::create_dir_all(own.join(".git")).unwrap();
+        for index in 0..300 {
+            std::fs::create_dir_all(own.join(format!("d{index}"))).unwrap();
+        }
+        const _: () = assert!(300 > MAX_GLOB_DIRECTORIES);
+        std::fs::create_dir_all(&a).unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        assert_eq!(
+            fast().markers_below(&work, &[GlobStep::AnyDepth], Some(&own)),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            fast().markers_below(&work, &[GlobStep::AnyDepth], None),
+            None,
+            "without the skip the own subtree exceeds the bound"
+        );
+        assert_eq!(
+            foreign_disposition(&own, "ls ../**/README.md", None, None, fast),
+            None
+        );
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            foreign_disposition(&own, "cat ../**/secrets.env", None, None, fast),
+            Some(CaptureDisposition::Drop)
+        );
+    }
+
+    /// Regression (v2.6.3 answered in milliseconds): many paths inside a deep
+    /// tree look each directory's marker up once, not once per path and
+    /// level, and the lookup shares the walk's budget. Running out of it
+    /// inside the own checkout keeps the call (the own policy governs there);
+    /// outside it the call is unprovable. Adversarial: a location outside
+    /// the checkout is looked up first, so a long list inside it cannot spend
+    /// the budget before another checkout's policy is found, and inside it a
+    /// shallow nested marker is found before a deep list.
+    #[test]
+    fn marker_lookups_in_a_deep_tree_cost_one_probe_per_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let own = work.join("own");
+        let a = work.join("a");
+        let depth = 300;
+        let deep = (0..depth).fold(own.clone(), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(own.join(".git")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let spread: Vec<String> = (1..=depth)
+            .map(|level| format!("{}f", "d/".repeat(level)))
+            .collect();
+        let inside = format!("cat {}", spread.join(" "));
+        // A clock that counts its readings: one per probe or listing.
+        let counted = |readings: std::rc::Rc<std::cell::Cell<usize>>, expire_after: usize| {
+            move || {
+                GlobBudget::with_clock(
+                    MAX_GLOB_TIME,
+                    Box::new(move || {
+                        readings.set(readings.get() + 1);
+                        if readings.get() > expire_after {
+                            MAX_GLOB_TIME * 2
+                        } else {
+                            Duration::ZERO
+                        }
+                    }),
+                )
+            }
+        };
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(
+                &own,
+                &inside,
+                None,
+                None,
+                counted(readings.clone(), usize::MAX)
+            ),
+            None
+        );
+        assert!(
+            readings.get() < 5 * depth,
+            "{} probes for {depth} levels",
+            readings.get()
+        );
+        // Out of budget inside the own checkout: kept.
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &inside, None, None, counted(readings, 10)),
+            None
+        );
+        // Out of budget outside it: unprovable.
+        let outside = (0..depth).fold(work.join("elsewhere"), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&outside).unwrap();
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(
+                &own,
+                &format!("cat {}/f", outside.display()),
+                None,
+                None,
+                counted(readings, 10)
+            ),
+            Some(CaptureDisposition::MetadataOnly)
+        );
+        // The other checkout's location comes first, whatever the order.
+        let attack = format!("{inside} ../a/secrets.env");
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &attack, None, None, counted(readings, 10)),
+            Some(CaptureDisposition::Drop)
+        );
+        // Inside the checkout the shallowest locations come first, so a
+        // marker nested near the top is found before a deep list spends the
+        // budget.
+        std::fs::create_dir_all(own.join("vendor")).unwrap();
+        std::fs::write(
+            own.join("vendor").join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let nested = format!("{inside} vendor/secrets.env");
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &nested, None, None, counted(readings, 10)),
+            Some(CaptureDisposition::Drop)
+        );
+    }
+
+    /// Adversarial: a `.git` at the home directory (a dotfiles repository)
+    /// does not make every checkout under home the event's own, so a glob
+    /// from `~/Projects` into a sibling checkout is still walked and that
+    /// checkout's policy drops the call. Control: a harmless glob is kept.
+    #[test]
+    fn a_dotfiles_checkout_at_home_is_not_the_own_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let projects = home.join("Projects");
+        let a = projects.join("a");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(projects.join("b")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        for command in [
+            "cat */secrets.env".to_owned(),
+            format!("cat {}/*/secrets.env", projects.display()),
+        ] {
+            assert_eq!(
+                foreign_disposition(&projects, &command, None, Some(&home), fast),
+                Some(CaptureDisposition::Drop),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            foreign_disposition(&projects, "cat */README.md", None, Some(&home), fast),
+            Some(CaptureDisposition::Keep)
+        );
+        assert!(!own_checkout(&home, Some(&home)));
+        assert!(!own_checkout(tmp.path(), Some(&home)));
+        assert!(!own_checkout(Path::new("/"), None));
+        assert!(own_checkout(&a, Some(&home)));
+    }
+
+    /// Adversarial: syntax that builds a step out of the event's checkout
+    /// reaches checkout A's policy: a `..` after a `**` (which can match no
+    /// directory), a brace that builds `..`, a zsh glob group, an ANSI-C
+    /// numeric escape, an indented patch header, and a Hermes `file_glob`.
+    /// Controls: the same shapes that stay inside the checkout are kept.
+    #[tokio::test]
+    async fn constructed_parent_steps_answer_to_another_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let a = work.join("a");
+        let b = work.join("b");
+        for dir in [&a, &b.join(".git"), &b.join("sub").join("x")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let event = |tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "constructed",
+                "cwd": b,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let bash = |command: &str| event("Bash", serde_json::json!({"command": command}));
+        let attacks = [
+            (
+                "globstar parent",
+                "claude-code",
+                bash("cat ./**/../a/secrets.env"),
+            ),
+            (
+                "globstar parent glob tool",
+                "claude-code",
+                event(
+                    "Glob",
+                    serde_json::json!({"pattern": "./**/../a/secrets.env"}),
+                ),
+            ),
+            (
+                "globstar parent grep filter",
+                "claude-code",
+                event(
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "glob": "**/../a/secrets.env"}),
+                ),
+            ),
+            ("brace dot", "claude-code", bash("cat .{.,x}/a/secrets.env")),
+            (
+                "brace empty",
+                "claude-code",
+                bash("cat {.,}./a/secrets.env"),
+            ),
+            (
+                "brace twice",
+                "claude-code",
+                bash("cat .{.,.}/a/secrets.env"),
+            ),
+            (
+                "brace sequence",
+                "claude-code",
+                bash("cat .{-..0}/a/secrets.env"),
+            ),
+            ("zsh group", "claude-code", bash("cat ../(a)/secrets.env")),
+            (
+                "zsh alternation",
+                "claude-code",
+                bash("cat ../(a|c)/secrets.env"),
+            ),
+            (
+                "ansi-c hex",
+                "claude-code",
+                bash("cat ..$'\\x2f'a/secrets.env"),
+            ),
+            (
+                "ansi-c octal",
+                "claude-code",
+                bash("cat $'\\056\\056'/a/secrets.env"),
+            ),
+            ("dot star", "claude-code", bash("cat .*/a/secrets.env")),
+            (
+                "dot question",
+                "claude-code",
+                bash("cat ./.?/a/secrets.env"),
+            ),
+            (
+                "indented patch header",
+                "codex",
+                event(
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n*** Add File: sub/y.rs\n+y\n  *** Update File: ../a/secrets.env\n+KEY\n*** End Patch"}),
+                ),
+            ),
+            (
+                "hermes file glob",
+                "hermes",
+                event(
+                    "search_files",
+                    serde_json::json!({"pattern": "KEY", "path": "..", "file_glob": "a/*.env"}),
+                ),
+            ),
+            (
+                "ansi-c in a double-quoted script",
+                "claude-code",
+                bash("bash -c \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\""),
+            ),
+            (
+                "ansi-c in a double-quoted eval",
+                "claude-code",
+                bash("eval \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\""),
+            ),
+            (
+                "posix class dot glob",
+                "claude-code",
+                bash("cat .[[:punct:]]/a/secrets.env"),
+            ),
+            ("extglob at", "claude-code", bash("cat .@(.)/a/secrets.env")),
+            (
+                "extglob optional",
+                "claude-code",
+                bash("cat .?(.)/a/secrets.env"),
+            ),
+            (
+                "extglob star",
+                "claude-code",
+                bash("cat .*(.)/a/secrets.env"),
+            ),
+            (
+                "extglob plus",
+                "claude-code",
+                bash("cat .+(.)/a/secrets.env"),
+            ),
+            (
+                "brace dot glob",
+                "claude-code",
+                bash("cat .{*,x}/a/secrets.env"),
+            ),
+            (
+                "oversized brace sequence",
+                "claude-code",
+                bash("cat .{-..~}/a/secrets.env"),
+            ),
+        ];
+        for (name, agent, raw) in attacks {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.body.contains("SENTINEL_MUST_NOT_BE_SPOOLED")),
+                "{name}: {entries:?}"
+            );
+        }
+        let controls = [
+            (
+                "own globstar parent",
+                "claude-code",
+                bash("cat sub/**/../README.md"),
+            ),
+            ("own brace", "claude-code", bash("cat {sub,lib}/README.md")),
+            ("own sequence", "claude-code", bash("cat v{1..3}/README.md")),
+            ("subshell", "claude-code", bash("(cd sub && ls)")),
+            ("dot list", "claude-code", bash("ls .*")),
+            ("dot directory", "claude-code", bash("cat .config/x")),
+            ("dot glob", "claude-code", bash("cat .github/*.yml")),
+            (
+                "ansi-c own",
+                "claude-code",
+                bash("cat sub$'\\x2f'x/README.md"),
+            ),
+            (
+                "indented own patch",
+                "codex",
+                event(
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n  *** Add File: sub/x.rs\n+fn x() {}\n*** End Patch"}),
+                ),
+            ),
+            (
+                "hermes own file glob",
+                "hermes",
+                event(
+                    "search_files",
+                    serde_json::json!({"pattern": "KEY", "path": "sub", "file_glob": "x/*.rs"}),
+                ),
+            ),
+            (
+                "double-quoted script",
+                "claude-code",
+                bash("bash -c \"echo \\$HOME && cat ../a/README.md\""),
+            ),
+            ("posix class own", "claude-code", bash("ls .[[:alpha:]]*")),
+            (
+                "posix class own directory",
+                "claude-code",
+                bash("cat .[[:alpha:]]x/README.md"),
+            ),
+            // Regression (v2.6.3 kept these): an expansion too large to list
+            // that cannot leave the checkout.
+            (
+                "oversized brace",
+                "claude-code",
+                bash("touch test/file{1..200}.txt"),
+            ),
+            (
+                "oversized directory brace",
+                "claude-code",
+                bash("mkdir -p build/{1..100}/out"),
+            ),
+            (
+                "oversized dotted brace",
+                "claude-code",
+                bash("rm -f logs/app.{1..99}.log"),
+            ),
+            (
+                "oversized product",
+                "claude-code",
+                bash("cat data/{a..h}{1..9}.csv"),
+            ),
+        ];
+        for (name, agent, raw) in controls {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                "{name}: {}",
+                entries[0].body
+            );
+        }
+    }
+
+    /// Under the default `basename` strategy the server files two
+    /// subdirectories of one unmarked repository under two projects, so an
+    /// import from one must not take the other's events. The same directory
+    /// still agrees, a subdirectory joins a project rooted at the repository
+    /// root, and a `repo-root` marker keeps the whole repository together.
+    #[test]
+    fn subdirectories_of_one_repository_are_one_project_only_under_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (basename, repo_root) = (tmp.path().join("rr"), tmp.path().join("rt"));
+        for repo in [&basename, &repo_root] {
+            for sub in ["sub1", "sub2"] {
+                std::fs::create_dir_all(repo.join(sub)).unwrap();
+            }
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(repo)
+                .status()
+                .unwrap();
+            assert!(init.success());
+        }
+        std::fs::write(
+            repo_root.join(".ai-memory.toml"),
+            "project_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
+        let path = |dir: &Path| dir.to_string_lossy().into_owned();
+        // An empty home keeps a developer's own `~/.ai-memory.toml` (which
+        // applies to every cwd) out of the routing decision.
+        let home = tempfile::tempdir().unwrap();
+        let routes_to_same_project = |source: &str, destination: &str| {
+            routes_to_same_project_with(source, destination, |cwd| {
+                crate::commands::hook_capture::hook_scope_with_home(cwd, None, Some(home.path()))
+            })
+        };
+        assert!(!routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename.join("sub2"))
+        ));
+        assert!(!routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename)
+        ));
+        assert!(routes_to_same_project(
+            &path(&basename),
+            &path(&basename.join("sub1"))
+        ));
+        assert!(routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename.join("sub1").join("."))
+        ));
+        assert!(routes_to_same_project(
+            &path(&repo_root.join("sub1")),
+            &path(&repo_root.join("sub2"))
+        ));
+    }
+
+    #[tokio::test]
     async fn shell_command_reading_an_ignored_path_is_dropped_before_spool() {
         for (command, spooled) in [("cat ./secret/*.md | head", 0), ("cat public/readme.md", 1)] {
             for event in ["pre-tool-use", "post-tool-use"] {
@@ -2334,6 +4523,218 @@ mod tests {
                     spooled,
                     "{event}: {command}"
                 );
+            }
+        }
+    }
+
+    /// Gemini CLI's `run_shell_command` and `read_many_files` were unknown
+    /// tools, so the native hook spooled their raw output even when they read
+    /// an ignored path. Both events of each call are now dropped before the
+    /// spool; public calls are still spooled with their family recorded.
+    #[tokio::test]
+    async fn gemini_cli_shell_and_read_many_files_exclusions_drop_before_spool() {
+        let cases = [
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat secret/token.txt"}),
+                0,
+            ),
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat token.txt", "dir_path": "secret"}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["secret/token.txt"]}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["README.md", "secret/token.txt"]}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["**/*.txt"]}),
+                0,
+            ),
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat README.md"}),
+                1,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["README.md", "src/**/*.rs"]}),
+                1,
+            ),
+        ];
+        for (tool, input, spooled) in cases {
+            for event in ["pre-tool-use", "post-tool-use"] {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    tmp.path().join(".ai-memory.toml"),
+                    "[capture]\nignore_paths = [\"secret/**\"]\n",
+                )
+                .unwrap();
+                let data_dir = tmp.path().join("data");
+                let mut args = devin_hook_args(event);
+                args.agent = "gemini-cli".into();
+                let raw = serde_json::json!({
+                    "session_id": "gemini", "cwd": tmp.path(),
+                    "tool_name": tool, "tool_input": input,
+                    "tool_response": {"llmContent": "SENTINEL_CONTENT"},
+                });
+                run_with_payload(
+                    Some(data_dir.clone()),
+                    args,
+                    raw.to_string(),
+                    &mut Vec::new(),
+                    |_, _| panic!("tool events below the threshold must only spool"),
+                )
+                .await
+                .unwrap();
+                let spool = hook_spool::spool_dir(&data_dir);
+                let entries = if spool.exists() {
+                    read_spooled_entries(&spool)
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(entries.len(), spooled, "{event}: {tool} {input}");
+                for entry in &entries {
+                    let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                    let family = if tool == "read_many_files" {
+                        "file"
+                    } else {
+                        "non-file"
+                    };
+                    assert_eq!(
+                        body["_ai_memory_capture"]["tool_family"], family,
+                        "{event}: {tool}"
+                    );
+                    assert_eq!(
+                        body["_ai_memory_capture"]["disposition"], "keep",
+                        "{event}: {tool}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Calls that used to carry an excluded file's content into the spool: a
+    /// Gemini `read_many_files` directory entry (read as `entry/**`), Copilot
+    /// CLI's runtime `view`/`create`, tools reading back an earlier command's
+    /// output, and a shell word with brace expansion or a bracket class. Each
+    /// attempt is dropped or stripped to metadata before the spool; the
+    /// public controls still spool with their content.
+    #[tokio::test]
+    async fn excluded_content_cannot_reach_the_spool_through_unevaluated_tool_shapes() {
+        let cases = [
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["docs"]}),
+                None,
+            ),
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["."]}),
+                None,
+            ),
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["src"]}),
+                Some("keep"),
+            ),
+            (
+                "copilot-cli",
+                "view",
+                serde_json::json!({"path": "docs/adr/0001.md"}),
+                None,
+            ),
+            (
+                "copilot-cli",
+                "create",
+                serde_json::json!({"path": "docs/adr/0002.md", "file_text": "x"}),
+                None,
+            ),
+            (
+                "copilot-cli",
+                "view",
+                serde_json::json!({"path": "src/lib.rs"}),
+                Some("keep"),
+            ),
+            (
+                "copilot-cli",
+                "read_bash",
+                serde_json::json!({"shellId": "s1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "BashOutput",
+                serde_json::json!({"bash_id": "b1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "TaskOutput",
+                serde_json::json!({"task_id": "b1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat docs/{adr,x}/0001.md"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat docs/ad[r]/0001.md"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat 'docs/{adr,x}/0001.md'"}),
+                Some("keep"),
+            ),
+        ];
+        for (agent, tool, input, expected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join(".ai-memory.toml"),
+                "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+            )
+            .unwrap();
+            let data_dir = tmp.path().join("data");
+            let raw = serde_json::json!({
+                "session_id": "gaps", "cwd": tmp.path(),
+                "tool_name": tool, "tool_input": input,
+                "tool_response": {"content": "SENTINEL_CONTENT"},
+                "tool_result": {"result_type": "success", "text_result_for_llm": "SENTINEL_CONTENT"},
+            });
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            let label = format!("{agent} {tool} {input}");
+            match expected {
+                None => assert!(entries.is_empty(), "{label}: must not spool"),
+                Some(disposition) => {
+                    assert_eq!(entries.len(), 1, "{label}");
+                    let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+                    assert_eq!(
+                        body["_ai_memory_capture"]["disposition"], disposition,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        entries[0].body.contains("SENTINEL_CONTENT"),
+                        disposition == "keep",
+                        "{label}"
+                    );
+                }
             }
         }
     }
@@ -2585,10 +4986,14 @@ mod tests {
                 "admits_capture",
                 "capture_mode",
                 "disposition",
+                "event_admits_capture",
                 "extraction_state",
                 "marker_present",
                 "path_count",
+                "policy_admits_capture",
                 "policy_state",
+                "scope",
+                "scope_resolution",
                 "server_profile",
                 "server_resolution",
                 "tool_family",
@@ -2597,6 +5002,282 @@ mod tests {
         );
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
         assert!(!String::from_utf8(stdout).unwrap().contains("SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn check_capture_refuses_partial_scope_and_excluded_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let marker = tmp.path().join(".ai-memory.toml");
+        for (declaration, path, admits, resolution) in [
+            ("workspace = \"team\"\n", "public.txt", false, "partial"),
+            (
+                "workspace = \"team\"\nproject = \"app\"\n",
+                "secret/token.txt",
+                false,
+                "explicit",
+            ),
+            (
+                "workspace = \"team\"\nproject = \"app\"\n",
+                "public.txt",
+                true,
+                "explicit",
+            ),
+        ] {
+            std::fs::write(
+                &marker,
+                format!("{declaration}[capture]\nignore_paths = [\"secret/**\"]\n"),
+            )
+            .unwrap();
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()), args,
+                serde_json::json!({"cwd":tmp.path(), "tool_name":"Edit", "tool_input":{"path":path,"content":"PRIVATE_CONTENT_SENTINEL"}}).to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            ).await.unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(report["policy_admits_capture"], admits, "{report}");
+            assert_eq!(report["scope_resolution"], resolution);
+            assert_eq!(report["scope"]["workspace"], "team");
+            let printed = String::from_utf8(stdout).unwrap();
+            assert!(!printed.contains("PRIVATE_CONTENT_SENTINEL"));
+            assert!(!printed.contains("token.txt"));
+            assert!(!data_dir.exists());
+        }
+    }
+
+    /// `--check-capture` is how an operator verifies what the native hook will
+    /// do, so its report must agree with what the same payload actually leaves
+    /// in the spool. Each marker variant runs through both paths with the same
+    /// payload cwd and capture mode: the event reaches the spool exactly when
+    /// `admits_capture` holds and the disposition is not `drop`, and a
+    /// `metadata-only` report means the spooled body is metadata only.
+    #[tokio::test]
+    async fn check_capture_report_matches_the_native_spool_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowlist = Some(crate::cli::CaptureModeArg::Allowlist);
+        // (name, marker, tool path, admits_capture, policy_admits_capture,
+        //  scope_resolution, disposition)
+        for (name, marker, path, admits, policy_admits, resolution, disposition) in [
+            (
+                "project-only",
+                Some("project = \"app\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "workspace-only",
+                Some("workspace = \"team\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "both",
+                Some("workspace = \"team\"\nproject = \"app\"\n"),
+                "public.txt",
+                true,
+                true,
+                "explicit",
+                "keep",
+            ),
+            // Names outside the recommended lowercase convention are forwarded
+            // as given; the hook does not judge them.
+            (
+                "unconventional-names",
+                Some("workspace = \"../evil\"\nproject = \"Bad Name!\"\n"),
+                "public.txt",
+                true,
+                true,
+                "explicit",
+                "keep",
+            ),
+            (
+                "empty-project",
+                Some("workspace = \"team\"\nproject = \"\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "invalid-toml",
+                Some("workspace = \"team\nproject = [\n"),
+                "public.txt",
+                true,
+                true,
+                "server-derived",
+                "metadata-only",
+            ),
+            (
+                "capture-exclusion",
+                Some(
+                    "workspace = \"team\"\nproject = \"app\"\n\
+                     [capture]\nignore_paths = [\"secret/**\"]\n",
+                ),
+                "secret/token.txt",
+                true,
+                false,
+                "explicit",
+                "drop",
+            ),
+            (
+                "no-marker",
+                None,
+                "public.txt",
+                false,
+                false,
+                "server-derived",
+                "keep",
+            ),
+        ] {
+            let repo = tmp.path().join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            if let Some(marker) = marker {
+                std::fs::write(repo.join(".ai-memory.toml"), marker).unwrap();
+            }
+            let raw = serde_json::json!({
+                "cwd": repo,
+                "tool_name": "Edit",
+                "tool_input": {"path": path, "content": "PRIVATE_CONTENT_SENTINEL"}
+            });
+
+            let check_data = tmp.path().join(format!("check-{name}"));
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            args.capture_mode = allowlist;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(check_data.clone()),
+                args,
+                raw.to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            )
+            .await
+            .unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert!(!check_data.exists(), "{name}: inspection wrote state");
+            assert_eq!(report["admits_capture"], admits, "{name}: {report}");
+            assert_eq!(
+                report["policy_admits_capture"], policy_admits,
+                "{name}: {report}"
+            );
+            assert_eq!(report["scope_resolution"], resolution, "{name}: {report}");
+            assert_eq!(report["disposition"], disposition, "{name}: {report}");
+
+            let entries = spool_one(
+                &tmp.path().join(format!("spool-{name}")),
+                "devin",
+                allowlist,
+                &raw,
+            )
+            .await;
+            let reported_spool =
+                report["admits_capture"] == true && report["disposition"] != "drop";
+            assert_eq!(
+                entries.len(),
+                usize::from(reported_spool),
+                "{name}: check-capture reported {report} but the native hook spooled {}",
+                entries.len()
+            );
+            if let Some(entry) = entries.first() {
+                let metadata_only = entry.body.contains("\"disposition\":\"metadata-only\"");
+                assert_eq!(
+                    metadata_only,
+                    report["disposition"] == "metadata-only",
+                    "{name}: {}",
+                    entry.body
+                );
+                assert_eq!(
+                    entry.body.contains("PRIVATE_CONTENT_SENTINEL"),
+                    !metadata_only,
+                    "{name}: {}",
+                    entry.body
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn check_capture_bounds_marker_hints_and_refuses_oversized_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        for (workspace, identity, admits) in [
+            ("x".repeat(513), "app".to_owned(), false),
+            ("team".to_owned(), "y".repeat(513), false),
+            ("team".to_owned(), "y".repeat(512), true),
+        ] {
+            std::fs::write(
+                tmp.path().join(".ai-memory.toml"),
+                format!(
+                    "workspace = \"{workspace}\"\nproject = \"app\"\nidentity = \"{identity}\"\n"
+                ),
+            )
+            .unwrap();
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()), args,
+                serde_json::json!({"cwd":tmp.path(), "tool_name":"Edit", "tool_input":{"path":"public.txt"}}).to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            ).await.unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(report["policy_admits_capture"], admits, "{report}");
+            assert_eq!(
+                report["scope_resolution"],
+                if admits { "explicit" } else { "unavailable" }
+            );
+            assert_eq!(report["scope"]["project"], "app");
+            let printed = String::from_utf8(stdout).unwrap();
+            for (field, value) in [("workspace", &workspace), ("identity", &identity)] {
+                if value.len() > 512 {
+                    assert!(report["scope"][field].is_null(), "{report}");
+                    assert!(!printed.contains(value));
+                } else {
+                    assert_eq!(report["scope"][field], value.as_str());
+                }
+            }
+            assert!(!data_dir.exists());
+            // Inspection bounds do not change the native routing contract.
+            let suffix = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+            assert!(suffix.contains(&workspace));
+            assert!(suffix.contains(&format!("&identity={identity}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn check_capture_reports_rejected_lifecycle_without_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = devin_hook_args("session-start");
+        args.agent = "antigravity-cli".into();
+        args.check_capture = true;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            serde_json::json!({"cwd":tmp.path(),"invocationNum":4}).to_string(),
+            &mut stdout,
+            |_, _| Err(std::io::Error::other("inspection must not spawn")),
+        )
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(report["event_admits_capture"], false);
+        assert_eq!(report["policy_admits_capture"], false);
+        assert!(!data_dir.exists());
     }
 
     #[tokio::test]
@@ -2809,6 +5490,19 @@ mod tests {
         }
     }
 
+    fn copilot_cli_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "copilot-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        }
+    }
+
     fn antigravity_hook_args(event: &str, server_url: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
@@ -2970,6 +5664,195 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn copilot_cli_session_start_prints_top_level_handoff_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "COPILOT-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            copilot_cli_hook_args("session-start", &base),
+            serde_json::json!({
+                "session_id": "copilot-session",
+                "cwd": tmp.path()
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({"additionalContext": "COPILOT-HANDOFF"})
+        );
+        assert!(
+            envelope.get("hookSpecificOutput").is_none(),
+            "Copilot reads the top-level SessionStart envelope"
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=copilot-cli")
+                    && request.contains("session_id=copilot-session")
+            }),
+            "{recorded:?}"
+        );
+    }
+
+    /// Droid documents SessionStart stdout as context and parses a JSON
+    /// stdout's `hookSpecificOutput.additionalContext`, so `--agent droid`
+    /// fetches the handoff and prints Claude Code's envelope (#1240).
+    #[tokio::test]
+    async fn droid_session_start_prints_hook_specific_handoff_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "DROID-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            HookArgs {
+                agent: "droid".into(),
+                ..copilot_cli_hook_args("session-start", &base)
+            },
+            serde_json::json!({
+                "session_id": "droid-session",
+                "transcript_path": tmp.path().join("s.jsonl"),
+                "cwd": tmp.path(),
+                "permission_mode": "auto-low",
+                "hook_event_name": "SessionStart",
+                "source": "startup"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "DROID-HANDOFF",
+                }
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=droid")
+                    && request.contains("session_id=droid-session")
+            }),
+            "{recorded:?}"
+        );
+    }
+
+    /// Muse injects SessionStart's `hookSpecificOutput.additionalContext` as
+    /// developer context (verified offline on Muse Code 1.4.7), so `--agent
+    /// muse` fetches the handoff for the payload's UUIDv7 session id and
+    /// prints Claude Code's envelope.
+    #[tokio::test]
+    async fn muse_session_start_prints_hook_specific_handoff_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "MUSE-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            HookArgs {
+                agent: "muse".into(),
+                ..copilot_cli_hook_args("session-start", &base)
+            },
+            serde_json::json!({
+                "cwd": tmp.path(),
+                "hook_event_name": "SessionStart",
+                "model": "muse-wonder-1.0",
+                "model_provider": "meta",
+                "permission_mode": "bypassPermissions",
+                "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+                "source": "startup",
+                "transcript_path": null
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "MUSE-HANDOFF",
+                }
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=muse")
+                    && request.contains("session_id=01a13669-dc61-7a72-b5ec-ad2f300ffd26")
+            }),
+            "{recorded:?}"
+        );
+    }
+
+    /// Muse adds SessionStart and UserPromptSubmit stdout to the turn as
+    /// developer context, so with no handoff to deliver the hook prints
+    /// nothing there, never `{}`. Control: its Stop still replies `{}`, and
+    /// Droid's prompt hook still prints `{}`.
+    #[tokio::test]
+    async fn muse_context_events_print_nothing_without_a_handoff() {
+        let run = |agent: &'static str, event: &'static str| async move {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, _requests) = serve_requests("404 Not Found", "").await;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(tmp.path().join("data")),
+                HookArgs {
+                    agent: agent.into(),
+                    ..copilot_cli_hook_args(event, &base)
+                },
+                serde_json::json!({
+                    "cwd": tmp.path(),
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": "Please do the file steps.",
+                    "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+                    "transcript_path": null,
+                    "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b"
+                })
+                .to_string(),
+                &mut stdout,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+            String::from_utf8(stdout).unwrap()
+        };
+        assert_eq!(run("muse", "user-prompt-submit").await, "");
+        assert_eq!(run("muse", "session-start").await, "");
+        assert_eq!(run("muse", "stop").await.trim(), "{}");
+        assert_eq!(run("droid", "user-prompt-submit").await.trim(), "{}");
+    }
+
     // ── #992: per-repository server profiles ─────────────────────────────
 
     /// Register `name` in `data_dir` with a token and the given roots.
@@ -3020,6 +5903,98 @@ mod tests {
         .await
         .unwrap();
         stdout
+    }
+
+    /// The Claude Code plugin passes an unset `server_url` option as "": the
+    /// event must go to the install's configured server, never to a bare
+    /// `/hook` path. A real flag value still wins.
+    #[tokio::test]
+    async fn empty_server_url_spools_to_the_configured_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("config.toml"),
+            "server_url = \"http://configured.example:4321\"\n",
+        )
+        .unwrap();
+        // A process-level override outranks the file, exactly as in production.
+        let expected = std::env::var("AI_MEMORY_SERVER_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| "http://configured.example:4321".to_owned());
+
+        run_prompt(&data_dir, claude_args("user-prompt-submit", ""), &work).await;
+        run_prompt(
+            &data_dir,
+            claude_args("user-prompt-submit", "https://flag.example"),
+            &work,
+        )
+        .await;
+
+        let mut urls: Vec<String> = read_spooled_entries(&hook_spool::spool_dir(&data_dir))
+            .into_iter()
+            .map(|entry| entry.url)
+            .collect();
+        urls.sort();
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert!(
+            urls.iter()
+                .any(|url| url.starts_with(&format!("{}/hook?", expected.trim_end_matches('/')))),
+            "{urls:?}"
+        );
+        assert!(
+            urls.iter()
+                .any(|url| url.starts_with("https://flag.example/hook?")),
+            "{urls:?}"
+        );
+    }
+
+    /// The origin check reads the plugin marker and the settings files only
+    /// through the injected lookup, so it is testable without process env.
+    /// Adversarial: a plugin event with a settings hook for the same event is
+    /// dropped; the same event without the origin (a settings-launched copy)
+    /// is never dropped.
+    #[test]
+    fn plugin_copy_is_dropped_only_with_the_plugin_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"/bin/ai-memory hook --event user-prompt-submit --agent claude-code --server-url http://h"}]}]}}"#,
+        )
+        .unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let raw = serde_json::json!({"session_id": "s", "cwd": work, "prompt": "p"});
+        let args = claude_args("user-prompt-submit", "http://h");
+        let config_dir = claude.to_string_lossy().into_owned();
+        let env = |origin: Option<&'static str>| {
+            let config_dir = config_dir.clone();
+            move |name: &str| match name {
+                "CLAUDE_CONFIG_DIR" => Some(config_dir.clone()),
+                super::super::plugin_origin::HOOK_ORIGIN_ENV => origin.map(str::to_owned),
+                _ => None,
+            }
+        };
+
+        assert!(is_dropped_plugin_copy(
+            &args,
+            &raw,
+            env(Some("claude-code-plugin"))
+        ));
+        assert!(!is_dropped_plugin_copy(&args, &raw, env(None)));
+        assert!(
+            !is_dropped_plugin_copy(
+                &claude_args("stop", "http://h"),
+                &raw,
+                env(Some("claude-code-plugin"))
+            ),
+            "no settings hook for stop: the plugin delivers it"
+        );
     }
 
     /// Two repositories on one install deliver to two servers, each with its
@@ -3076,6 +6051,118 @@ mod tests {
         );
         assert_eq!(entries[1].token.as_deref(), Some("tok-b"));
         assert_eq!(entries[1].profile.as_deref(), Some("team-b"));
+    }
+
+    /// Front door for Meta Muse Code's settings.json hooks (adversarial),
+    /// with Muse Code 1.4.7 payload shapes: a prompt from a marked checkout
+    /// is scoped by its marker, routed to the marker's server profile with
+    /// the profile's token (never the install's), and keyed by the payload's
+    /// UUIDv7 session id; a `read_file` of an ignored relative path from that
+    /// checkout is dropped before the spool while a control path is kept;
+    /// allowlist mode emits nothing from an unmarked checkout (printing
+    /// nothing either), and the same prompt without allowlist is captured.
+    #[tokio::test]
+    async fn muse_hooks_honour_marker_scope_profiles_exclusions_and_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let repo = repo_with_marker(
+            tmp.path(),
+            "repo",
+            "workspace = \"mw\"\nproject = \"mp\"\nserver = \"team-a\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        );
+        register_profile(
+            &data_dir,
+            "team-a",
+            "https://a.example",
+            &[&repo],
+            Some("tok-a"),
+        );
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+        let session = "01a13669-dc61-7a72-b5ec-ad2f300ffd26";
+        let muse = |event: &str| {
+            let mut args = claude_args(event, "https://default.example");
+            args.agent = "muse".into();
+            args
+        };
+        let run = |args: HookArgs, payload: serde_json::Value| {
+            let data_dir = data_dir.clone();
+            async move {
+                let mut stdout = Vec::new();
+                run_with_payload(
+                    Some(data_dir),
+                    args,
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| panic!("a Muse event must only spool"),
+                )
+                .await
+                .unwrap();
+                stdout
+            }
+        };
+        let prompt = |cwd: &Path| {
+            serde_json::json!({
+                "cwd": cwd,
+                "hook_event_name": "UserPromptSubmit",
+                "model": "muse-wonder-1.0",
+                "model_provider": "meta",
+                "permission_mode": "bypassPermissions",
+                "prompt": "Please do the file steps.",
+                "session_id": session,
+                "transcript_path": null,
+                "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b"
+            })
+        };
+        let read = |path: &str| {
+            serde_json::json!({
+                "cwd": repo,
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "tool_input": {"path": path},
+                "tool_name": "read_file",
+                "tool_response": format!("Read text file `{path}`.\n1|SECRET-BODY"),
+                "tool_use_id": "call_bc48188330cd",
+                "transcript_path": null
+            })
+        };
+
+        run(muse("user-prompt-submit"), prompt(&repo)).await;
+        let spool = hook_spool::spool_dir(&data_dir);
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        let url = &entries[0].url;
+        assert!(url.starts_with("https://a.example/hook?"), "{url}");
+        assert_eq!(entries[0].token.as_deref(), Some("tok-a"));
+        assert_eq!(query_param(url, "agent"), Some("muse"));
+        assert_eq!(query_param(url, "workspace"), Some("mw"));
+        assert_eq!(query_param(url, "project"), Some("mp"));
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["session_id"], session);
+
+        run(muse("post-tool-use"), read("secret/a.txt")).await;
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "an ignored relative path is dropped before the spool"
+        );
+        run(muse("post-tool-use"), read("src/lib.rs")).await;
+        assert_eq!(read_spooled_entries(&spool).len(), 2, "control path kept");
+
+        let unmarked = tmp.path().join("unmarked");
+        std::fs::create_dir_all(&unmarked).unwrap();
+        let mut allowlist = muse("user-prompt-submit");
+        allowlist.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+        let stdout = run(allowlist, prompt(&unmarked)).await;
+        assert!(stdout.is_empty(), "{:?}", String::from_utf8_lossy(&stdout));
+        assert_eq!(read_spooled_entries(&spool).len(), 2, "allowlist drop");
+        run(muse("user-prompt-submit"), prompt(&unmarked)).await;
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 3, "control: denylist captures it");
+        assert!(
+            entries[2].url.starts_with("https://default.example/hook?"),
+            "{}",
+            entries[2].url
+        );
     }
 
     /// Backward compatibility: without a `server` key the install default is
@@ -3156,6 +6243,7 @@ mod tests {
             let stdout = run_prompt(&data_dir, args, cwd).await;
             let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
             assert_eq!(output["server_resolution"], resolution, "{}", cwd.display());
+            assert_eq!(output["policy_admits_capture"], resolution == "marker");
             let printed = String::from_utf8(stdout).unwrap();
             for secret in ["tok-", "https://", &*tmp.path().to_string_lossy()] {
                 assert!(!printed.contains(secret), "{printed}");
@@ -3426,6 +6514,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("INSTALL-TOKEN"),
+            hook_spool::MaxAttempts::new(crate::config::DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS),
         )
         .await;
         assert_eq!(result.sent, 2, "{result:?}");
@@ -3740,7 +6829,42 @@ mod tests {
         let request = first_request(&mut requests).await.unwrap();
         assert!(request.starts_with("GET /handoff?"), "{request}");
         assert!(!request.contains("briefing"), "{request}");
-        assert!(!data_dir.join("briefed").exists());
+        // Only the profile digest's own gate is written; no brief marker.
+        let markers: Vec<String> = std::fs::read_dir(data_dir.join("briefed"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(markers, vec!["profile-session_abc".to_owned()]);
+    }
+
+    /// Kimi re-fetches on every prompt, so the profile digest rides the first
+    /// prompt only: later prompts of the session send `profile_digest=0`.
+    #[tokio::test]
+    async fn kimi_delivers_the_profile_digest_on_the_first_prompt_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let prompt = || {
+            serde_json::json!({ "session_id": "session_k", "cwd": cwd, "prompt": "hi" }).to_string()
+        };
+        for _ in 0..2 {
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                kimi_hook_args("user-prompt-submit", &base),
+                prompt(),
+                &mut stdout,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        }
+        let first = first_request(&mut requests).await.unwrap();
+        let second = first_request(&mut requests).await.unwrap();
+        assert!(!first.contains("profile_digest"), "{first}");
+        assert!(second.contains("&profile_digest=0"), "{second}");
     }
 
     #[tokio::test]

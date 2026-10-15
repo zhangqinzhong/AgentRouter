@@ -16,6 +16,13 @@ env:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes its in-flight run, so cancel it.
+# Pushes to main and manual dispatches are never cancelled: each is the record
+# for its commit (a dispatch is the pre-release matrix on an exact SHA).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fmt:
     name: rustfmt
@@ -70,7 +77,14 @@ jobs:
       - name: Regenerate the Tailwind bundle
         if: matrix.os == 'ubuntu-latest'
         run: echo "TAILWIND_BUILD=1" >> "$GITHUB_ENV"
-      - run: cargo test --workspace --all-targets
+      # nextest runs every test binary's tests in parallel across the runner's
+      # cores; `cargo test` ran the binaries one after another, which was most
+      # of this job's wall clock. Profile `ci` (.config/nextest.toml) runs every
+      # tier, including slow::/stress::, with no retries.
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --all-targets --profile ci
       # `--all-targets` deliberately excludes doctests, so a doc-comment code
       # block that fails to compile (e.g. an indented shell example rustdoc
       # reads as Rust) shipped unnoticed. Run them explicitly.
@@ -87,6 +101,28 @@ jobs:
           uv run --no-project python tests/e2e/external_relay_smoke.py
           --ai-memory-bin "${{ github.workspace }}/target/debug/ai-memory"
           --relay-bin "${{ github.workspace }}/target/debug/ai-memory-relay"
+      # The companion job runs the importer's unit tests without a server;
+      # its agentmemory end-to-end tests need the binary built above.
+      - name: agentmemory import against the real server
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          AI_MEMORY_IMPORTER_E2E_BIN: ${{ github.workspace }}/target/debug/ai-memory
+        run: cargo test --locked --manifest-path companions/ai-memory-importer/Cargo.toml e2e
+      # The Jev reranker adapter under docs/examples is stdlib Python with its
+      # own unittest suite; nothing else runs it. `unittest discover` exits 5
+      # when it finds no tests, so the step skips cleanly until a test file
+      # exists there.
+      - name: Jev reranker adapter example tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          dir=docs/examples/jev-reranker-adapter
+          if compgen -G "$dir/test_*.py" > /dev/null; then
+            uv run --no-project python -m unittest discover -s "$dir" -p 'test_*.py' -v
+          else
+            echo "no tests under $dir"
+          fi
       # The capture policy every generated OpenCode/OMP/Pi/OpenClaw plugin
       # embeds is TypeScript; only Node can execute it against the shared
       # capture-policy fixture. The test is ignored locally, where Node is not
@@ -100,6 +136,20 @@ jobs:
         # `--workspace` reuses the test binaries built above instead of
         # re-resolving features for one package.
         run: cargo test --workspace --lib -- --ignored --exact commands::render_shared::tests::generated_capture_policy_v1_node_runtime_evidence
+      # The optional TypeScript SDK (companions/ai-memory-ts) against the server
+      # built above: integration tests, the MCP schema drift test and every
+      # example. A pull request that changes an MCP tool schema fails here
+      # until the SDK's schema snapshot is updated, even when it never touches
+      # companions/. The harness gives the server a scratch data dir, a
+      # loopback port and an environment without inherited AI_MEMORY_* values.
+      - name: TypeScript SDK against the real server
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: companions/ai-memory-ts
+        env:
+          AI_MEMORY_BIN: ${{ github.workspace }}/target/debug/ai-memory
+        run: |
+          npm ci --ignore-scripts
+          npm run test:integration
       - name: Vendored tailwind.css is current
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css
@@ -156,7 +206,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        companion: [ai-memory-importer, ai-memory-relay]
+        companion: [ai-memory-client, ai-memory-importer, ai-memory-relay, ai-memory-wikisync]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -169,6 +219,59 @@ jobs:
       - run: cargo fmt --check --manifest-path companions/${{ matrix.companion }}/Cargo.toml
       - run: cargo clippy --locked --manifest-path companions/${{ matrix.companion }}/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --locked --manifest-path companions/${{ matrix.companion }}/Cargo.toml
+
+  # The TypeScript SDK's checks that need no server. They run on a pull
+  # request that touches the SDK or this workflow, and always on pushes and
+  # dispatches. Its tests against a real server run in the `test` job above,
+  # on every pull request.
+  sdk-ts-changes:
+    name: detect TypeScript SDK changes
+    runs-on: ubuntu-latest
+    permissions:
+      # `dorny/paths-filter` lists a pull request's changed files through the
+      # GitHub API; no checkout is needed.
+      pull-requests: read
+    outputs:
+      sdk: ${{ steps.filter.outputs.sdk }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            sdk:
+              - 'companions/ai-memory-ts/**'
+              - '.github/workflows/ci.yml'
+
+  sdk-ts:
+    name: TypeScript SDK (node ${{ matrix.node }})
+    needs: sdk-ts-changes
+    if: github.event_name != 'pull_request' || needs.sdk-ts-changes.outputs.sdk == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Node 22 is the supported floor; 24 is the current LTS.
+        node: ["22", "24"]
+    defaults:
+      run:
+        working-directory: companions/ai-memory-ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+      # Install scripts stay off: the lockfile holds dev tooling only.
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm run test:unit
+      # Every wire argument a wrapper can send exists in schema/tools.json.
+      - run: npm run schema:check
+      # The README method table and docs/arguments.md match src/coverage.ts.
+      - run: npm run docs:check
+      # TypeDoc with warnings as errors: an undocumented export fails.
+      - run: npm run docs:api
+      - run: npm audit --audit-level=moderate
 
   # Build the release binary on its own so a release-only failure
   # (LTO crash, codegen issue, dead-code-with-debug-assertions) doesn't
@@ -225,6 +328,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y rpm
       - run: scripts/check-native-packaging.sh
       - run: tests/wrapper_upgrade.sh
+      - run: tests/install_sh.sh
 
   # `tests/hooks/test_lib.sh` covers `hooks/_lib.sh`, the POSIX shell bundle —
   # the one shipped surface no Rust job reaches. Its own header says "POSIX
@@ -355,6 +459,8 @@ jobs:
           --ignore RUSTSEC-2024-0320
       - run: cargo audit --file companions/ai-memory-relay/Cargo.lock
       - run: cargo audit --file companions/ai-memory-importer/Cargo.lock
+      - run: cargo audit --file companions/ai-memory-client/Cargo.lock
+      - run: cargo audit --file companions/ai-memory-wikisync/Cargo.lock
 
   gitleaks:
     name: gitleaks (secret scan)

@@ -12,7 +12,16 @@ use crate::http_client::{ServerEndpoint, post_json};
 #[derive(Serialize)]
 struct PurgeProjectRequest {
     workspace: String,
-    project: String,
+    /// Exactly one of `project` / `project_id` is `Some`; the other is omitted
+    /// from the wire so an older server's `project: String` still sees what it
+    /// expects when the operator used the name form. (#1208)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    /// Set instead of `project` when the operator passed `--project-id`: the
+    /// server resolves the row by id, bypassing the name/legacy/canonical
+    /// lookup that a collision would otherwise send to the wrong row. (#1208)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
     confirm: bool,
     /// Purge even when a managed workstream still holds a live run lease.
     force: bool,
@@ -88,8 +97,11 @@ fn preview_message(outcome: &PreviewOutcome, fallback_label: &str) -> Option<Str
 /// Run the `purge-project` subcommand.
 ///
 /// Resolves the project name (auto-derived from the git repo root when
-/// `--project` is omitted), requires `--confirm` before sending the
-/// destructive request, then prints the JSON summary.
+/// `--project` is omitted) -- or, when `--project-id` is given, skips name
+/// resolution and targets that id directly, which is the only way to reach a
+/// legacy row whose name is shadowed by another project's `legacy_name` --
+/// requires `--confirm` before sending the destructive request, then prints
+/// the JSON summary.
 ///
 /// Without `--confirm`, first asks the server for a preview (`dry_run:
 /// true`, which wins over `confirm` server-side): the server reports the
@@ -110,29 +122,53 @@ fn preview_message(outcome: &PreviewOutcome, fallback_label: &str) -> Option<Str
 /// preview surfaced), the server is unreachable, or the server returns a
 /// non-2xx response.
 pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
-    let (workspace, project) =
-        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+    // An id target skips name resolution entirely: `resolve_scope` would
+    // auto-derive a project name from the CWD, which is exactly the ambiguity
+    // `--project-id` exists to sidestep. The workspace still resolves the
+    // normal way (marker, else `default`), since the server needs it to scope
+    // the id lookup.
+    let (workspace, project, project_id) = match args.project_id {
+        Some(id) => (
+            super::resolve_workspace(config, args.workspace.as_deref())?,
+            None,
+            Some(id),
+        ),
+        None => {
+            let (ws, project) =
+                super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+            (ws, Some(project), None)
+        }
+    };
+    // The flag that names the target, for the refusal's "re-run with" line and
+    // the preview's fallback label. A `--project-id` run has no resolved name
+    // to print, so the id stands in.
+    let (target_flag, target_label) = match (&project, &project_id) {
+        (Some(project), _) => (format!("--project {project}"), project.clone()),
+        (None, Some(id)) => (format!("--project-id {id}"), id.clone()),
+        (None, None) => bail!("one of --project or --project-id is required"),
+    };
 
     if !args.confirm {
         let request = PurgeProjectRequest {
             workspace: workspace.clone(),
             project: project.clone(),
+            project_id: project_id.clone(),
             confirm: false,
             force: args.force,
             compact: args.compact,
             dry_run: true,
         };
         let outcome = run_preview(config, "/admin/purge-project", &request).await;
-        let fallback_label = format!("{}/{}", workspace, project);
+        let fallback_label = format!("{}/{}", workspace, target_label);
         if let Some(line) = preview_message(&outcome, &fallback_label) {
             println!("{line}");
         }
         bail!(
             "purge-project is destructive and irreversible.\n\
              Re-run with --confirm to proceed:\n\n  \
-             ai-memory purge-project --workspace {} --project {} --confirm",
+             ai-memory purge-project --workspace {} {} --confirm",
             workspace,
-            project,
+            target_flag,
         );
     }
 
@@ -143,6 +179,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
         &PurgeProjectRequest {
             workspace: workspace.clone(),
             project: project.clone(),
+            project_id: project_id.clone(),
             confirm: true,
             force: args.force,
             compact: args.compact,
@@ -152,7 +189,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
     .await?;
 
     // Human-friendly one-liner followed by the raw JSON for scripting.
-    let fallback_label = format!("{}/{}", workspace, project);
+    let fallback_label = format!("{}/{}", workspace, target_label);
     let label = report["label"].as_str().unwrap_or(&fallback_label);
     println!("{}", purge_summary_line("Purged", label, &report));
     if let Some(ids) = report["workstream_ids"].as_array()
@@ -360,7 +397,8 @@ mod tests {
     fn preview_request() -> PurgeProjectRequest {
         PurgeProjectRequest {
             workspace: "default".into(),
-            project: "scratch".into(),
+            project: Some("scratch".into()),
+            project_id: None,
             confirm: false,
             force: false,
             compact: false,

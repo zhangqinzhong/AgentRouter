@@ -7,3 +7,16 @@ d8361d3c3a86f870f74841b53c568c64fe42ab1f:crates/ai-memory-core/src/sanitize.rs:g
 d8361d3c3a86f870f74841b53c568c64fe42ab1f:crates/ai-memory-core/src/sanitize.rs:generic-api-key:257
 47c9cf2e71712153e3162942a8cb28667a6be27a:crates/ai-memory-core/src/sanitize.rs:generic-api-key:631
 47c9cf2e71712153e3162942a8cb28667a6be27a:crates/ai-memory-core/src/sanitize.rs:generic-api-key:633
+9aaa7f73a33b49a4c4ce790d373c83bb24c17306:crates/ai-memory-cli/tests/suite/backup_agents.rs:github-pat:183
+9aaa7f73a33b49a4c4ce790d373c83bb24c17306:crates/ai-memory-cli/tests/suite/backup_agents.rs:github-pat:213
+# Fixed relay queue error label; contains no credential material.
+d7ba81976c35b0462f35a4efc53b44347c42295a:companions/ai-memory-relay/src/relay.rs:generic-api-key:331
+4927e9f3c9243db213b7b77c000b4622038cc34f:crates/ai-memory-core/src/sanitize.rs:generic-api-key:526
+# Synthetic idempotency key in a PowerShell outage test; contains no credential material.
+adc65423be5e8379b0f40de1d7fb38b094e0940d:tests/hooks/test_spool_ps.ps1:generic-api-key:21
+# Planted canary in the /admin/metrics leak test (split with concat! since); contains no credential material.
+0832025e2aaba073f07da516633bf7b70d6dce86:crates/ai-memory-mcp/tests/suite/admin_metrics.rs:github-pat:31
+# Synthetic credential-shaped id in an importer refusal test (split since); contains no credential material.
+47523180f01f1361e030cd16d45712f7889c99a9:companions/ai-memory-importer/src/agentmemory/vault.rs:github-pat:498
+# Synthetic key in an importer redaction test (split since); contains no credential material.
+47523180f01f1361e030cd16d45712f7889c99a9:companions/ai-memory-importer/src/agentmemory/export/tests.rs:generic-api-key:272

@@ -16,8 +16,11 @@
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::debug;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+use tracing::{debug, warn};
 
 use crate::error::LlmResult;
 use crate::provider::{LlmProvider, complete_structured};
@@ -205,6 +208,179 @@ impl Reranker for LlmReranker {
     }
 }
 
+/// How many extra candidates to fetch for the reranker to reorder. The
+/// point of reranking is promoting a hit RRF put below the cut, so the
+/// candidate pool has to be deeper than the caller's limit.
+pub const RERANK_OVERFETCH: usize = 3;
+/// Hard cap on rerank candidates, whatever `limit * RERANK_OVERFETCH`
+/// works out to — bounds both prompt size and latency.
+pub const RERANK_MAX_CANDIDATES: usize = 30;
+/// Maximum number of provider-backed rerank calls executing concurrently,
+/// across every search surface sharing one [`RerankStage`]. Saturated
+/// requests keep the locally computed order without waiting.
+pub const RERANK_MAX_IN_FLIGHT: usize = 4;
+/// Wall-clock budget for one rerank call. Past this, the search answers
+/// from the adjusted pre-rerank order instead of waiting.
+pub const RERANK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The post-fusion rerank step every search surface runs: the configured
+/// [`Reranker`] behind one shared concurrency gate.
+///
+/// Cloning shares the gate, so `memory_query` and the web search together
+/// never hold more than [`RERANK_MAX_IN_FLIGHT`] provider calls.
+#[derive(Clone)]
+pub struct RerankStage {
+    reranker: Arc<dyn Reranker>,
+    gate: Arc<Semaphore>,
+}
+
+impl RerankStage {
+    /// Wrap a reranker with a fresh concurrency gate.
+    #[must_use]
+    pub fn new(reranker: Arc<dyn Reranker>) -> Self {
+        Self {
+            reranker,
+            gate: Arc::new(Semaphore::new(RERANK_MAX_IN_FLIGHT)),
+        }
+    }
+
+    /// The wrapped reranker.
+    #[must_use]
+    pub fn reranker(&self) -> &Arc<dyn Reranker> {
+        &self.reranker
+    }
+
+    /// The shared concurrency gate.
+    #[must_use]
+    pub fn gate(&self) -> &Arc<Semaphore> {
+        &self.gate
+    }
+
+    /// How many fused candidates to fetch so the reranker can promote a hit
+    /// from below the caller's `limit`.
+    #[must_use]
+    pub fn fetch_limit(&self, limit: usize) -> usize {
+        limit.max(
+            limit
+                .saturating_mul(RERANK_OVERFETCH)
+                .min(RERANK_MAX_CANDIDATES),
+        )
+    }
+
+    /// Reorder the bounded prefix of `hits` by reranker relevance and cut to
+    /// `limit`. `candidate` describes a hit to the reranker; `record` stores
+    /// the relevance it got. On saturation, a provider error, a timeout or a
+    /// malformed answer the fused order is kept (cut to `limit`), never an
+    /// error.
+    pub async fn apply<T>(
+        &self,
+        query: &str,
+        mut hits: Vec<T>,
+        limit: usize,
+        timeout: Duration,
+        candidate: impl Fn(&T) -> RerankCandidate,
+        mut record: impl FnMut(&mut T, f32),
+    ) -> Vec<T> {
+        let reranker = &self.reranker;
+        let candidate_count = hits.len().min(RERANK_MAX_CANDIDATES);
+        if candidate_count < 2 {
+            hits.truncate(limit);
+            return hits;
+        }
+        let Ok(_permit) = self.gate.clone().try_acquire_owned() else {
+            debug!(
+                reranker = reranker.name(),
+                model = reranker.model(),
+                max_in_flight = RERANK_MAX_IN_FLIGHT,
+                "reranker concurrency limit reached; keeping pre-rerank order"
+            );
+            hits.truncate(limit);
+            return hits;
+        };
+        let candidates: Vec<RerankCandidate> =
+            hits.iter().take(candidate_count).map(candidate).collect();
+        let scored = match tokio::time::timeout(timeout, reranker.rerank(query, &candidates)).await
+        {
+            Ok(Ok(scores)) => scores,
+            Ok(Err(e)) => {
+                // Redacted fields only: the `Display` of a provider
+                // failure carries the upstream response body.
+                warn!(
+                    reranker = reranker.name(),
+                    model = reranker.model(),
+                    error_class = %e.class(),
+                    error_status = ?e.http_status(),
+                    "reranker failed; keeping pre-rerank order"
+                );
+                hits.truncate(limit);
+                return hits;
+            }
+            Err(_) => {
+                warn!(
+                    reranker = reranker.name(),
+                    model = reranker.model(),
+                    timeout_secs = timeout.as_secs_f64(),
+                    "reranker timed out; keeping pre-rerank order"
+                );
+                hits.truncate(limit);
+                return hits;
+            }
+        };
+        let candidate_index: HashMap<&str, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, candidate)| (candidate.id.as_str(), idx))
+            .collect();
+        let mut relevance = vec![None; candidates.len()];
+        let mut invalid = scored.len() != candidates.len();
+        for score in &scored {
+            let Some(&idx) = candidate_index.get(score.id.as_str()) else {
+                invalid = true;
+                continue;
+            };
+            if !score.relevance.is_finite()
+                || !(0.0..=1.0).contains(&score.relevance)
+                || relevance[idx].replace(score.relevance).is_some()
+            {
+                invalid = true;
+            }
+        }
+        if invalid || relevance.iter().any(Option::is_none) {
+            warn!(
+                reranker = reranker.name(),
+                model = reranker.model(),
+                scored = scored.len(),
+                candidates = candidates.len(),
+                "reranker returned incomplete or invalid scores; keeping pre-rerank order"
+            );
+            hits.truncate(limit);
+            return hits;
+        }
+        let relevance: Vec<f32> = relevance
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect();
+
+        let tail = hits.split_off(candidate_count);
+        let mut indexed: Vec<(usize, T)> = hits.into_iter().enumerate().collect();
+        indexed.sort_by(|a, b| {
+            relevance[b.0]
+                .total_cmp(&relevance[a.0])
+                .then(a.0.cmp(&b.0))
+        });
+        let mut out: Vec<T> = indexed
+            .into_iter()
+            .map(|(idx, mut entry)| {
+                record(&mut entry, relevance[idx]);
+                entry
+            })
+            .collect();
+        out.extend(tail);
+        out.truncate(limit);
+        out
+    }
+}
+
 /// Map 1-based prompt indices back onto candidate ids, dropping
 /// out-of-range indices and duplicates (a model that hallucinates
 /// `[99]` loses that judgement instead of corrupting the ranking).
@@ -240,6 +416,91 @@ fn map_judgements(
 mod tests {
     use super::*;
     use crate::{ChatResponse, LlmError};
+
+    /// Scores candidates in reverse order and counts its calls.
+    struct Reverse(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Reranker for Reverse {
+        fn name(&self) -> &'static str {
+            "reverse"
+        }
+        fn model(&self) -> &str {
+            "reverse"
+        }
+        async fn rerank(
+            &self,
+            _query: &str,
+            candidates: &[RerankCandidate],
+        ) -> LlmResult<Vec<RerankScore>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = candidates.len() as f32;
+            Ok(candidates
+                .iter()
+                .enumerate()
+                .map(|(i, c)| RerankScore {
+                    id: c.id.clone(),
+                    relevance: (i as f32 + 1.0) / n,
+                })
+                .collect())
+        }
+    }
+
+    fn apply_ids(
+        stage: &RerankStage,
+        ids: &[&str],
+    ) -> impl std::future::Future<Output = Vec<String>> {
+        let stage = stage.clone();
+        let hits: Vec<(String, Option<f32>)> =
+            ids.iter().map(|id| ((*id).to_owned(), None)).collect();
+        async move {
+            stage
+                .apply(
+                    "q",
+                    hits,
+                    10,
+                    RERANK_TIMEOUT,
+                    |(id, _)| RerankCandidate {
+                        id: id.clone(),
+                        title: id.clone(),
+                        snippet: String::new(),
+                    },
+                    |(_, score), relevance| *score = Some(relevance),
+                )
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_stage_reorders_and_clones_share_one_gate() {
+        let reranker = Arc::new(Reverse(std::sync::atomic::AtomicUsize::new(0)));
+        let stage = RerankStage::new(reranker.clone());
+        assert_eq!(apply_ids(&stage, &["a", "b", "c"]).await, ["c", "b", "a"]);
+
+        // A clone (the web search's copy) draws on the same permits: with
+        // them all held through the original, the clone keeps fused order and
+        // never calls the provider.
+        let web_copy = stage.clone();
+        let _held: Vec<_> = (0..RERANK_MAX_IN_FLIGHT)
+            .map(|_| stage.gate().clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(
+            apply_ids(&web_copy, &["a", "b", "c"]).await,
+            ["a", "b", "c"]
+        );
+        assert_eq!(reranker.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fetch_limit_overfetches_up_to_the_cap() {
+        let stage = RerankStage::new(Arc::new(Reverse(std::sync::atomic::AtomicUsize::new(0))));
+        assert_eq!(stage.fetch_limit(5), 15);
+        assert_eq!(stage.fetch_limit(20), RERANK_MAX_CANDIDATES);
+        assert_eq!(stage.fetch_limit(50), 50);
+    }
 
     fn candidates() -> Vec<RerankCandidate> {
         vec![

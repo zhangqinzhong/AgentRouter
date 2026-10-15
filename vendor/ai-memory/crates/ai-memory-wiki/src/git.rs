@@ -116,6 +116,160 @@ pub struct Checkpoint {
 enum CommitGit2Error {
     Open(git2::Error),
     Other(git2::Error),
+    Wiki(WikiError),
+}
+
+enum OpenRepositoryError {
+    Git(git2::Error),
+    Wiki(WikiError),
+}
+
+fn open_validated_repository(root: &Path) -> Result<Repository, OpenRepositoryError> {
+    let expected_git_dir =
+        crate::confinement::inspect_git_directory(root).map_err(OpenRepositoryError::Wiki)?;
+    let repo = Repository::open(root).map_err(OpenRepositoryError::Git)?;
+    let workdir = repo.workdir().ok_or_else(|| {
+        OpenRepositoryError::Wiki(WikiError::Confinement {
+            path: root.to_path_buf(),
+            reason: "wiki repository must have a working tree",
+        })
+    })?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    let canonical_workdir = workdir
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    let canonical_git_dir = repo
+        .path()
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    let canonical_common_dir = repo
+        .commondir()
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    let canonical_expected_git_dir = expected_git_dir
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    if canonical_workdir != canonical_root {
+        return Err(OpenRepositoryError::Wiki(WikiError::Confinement {
+            path: workdir.to_path_buf(),
+            reason: "wiki repository working directory escapes the wiki root",
+        }));
+    }
+    if canonical_git_dir != canonical_expected_git_dir
+        || canonical_common_dir != canonical_expected_git_dir
+    {
+        return Err(OpenRepositoryError::Wiki(WikiError::Confinement {
+            path: repo.path().to_path_buf(),
+            reason: "wiki repository metadata escapes the in-root .git directory",
+        }));
+    }
+    Ok(repo)
+}
+
+fn map_open_error(error: OpenRepositoryError) -> WikiError {
+    match error {
+        OpenRepositoryError::Git(error) => map_git_err(error),
+        OpenRepositoryError::Wiki(error) => error,
+    }
+}
+
+fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<()> {
+    match open_validated_repository(root) {
+        Ok(_) => Ok(()),
+        Err(OpenRepositoryError::Git(error))
+            if cfg!(windows) && should_try_commit_cli_fallback(&error) =>
+        {
+            validate_cli_fallback_root(root)
+        }
+        Err(error) => Err(map_open_error(error)),
+    }
+}
+
+fn validate_cli_fallback_root(root: &Path) -> WikiResult<()> {
+    let git_dir = crate::confinement::inspect_git_directory(root)?;
+    crate::confinement::inspect_tree_except(root, &[git_dir.as_path()])?;
+    let worktree = git_resolved_path(root, "--show-toplevel")?;
+    let resolved_git_dir = git_resolved_path(root, "--absolute-git-dir")?;
+    let common_dir = git_resolved_path(root, "--git-common-dir")?;
+    validate_resolved_repository_paths(root, &git_dir, &worktree, &resolved_git_dir, &common_dir)
+}
+
+fn git_resolved_path(root: &Path, argument: &str) -> WikiResult<PathBuf> {
+    let output = git_command(root)
+        .args(["rev-parse", "--path-format=absolute", argument])
+        .output()?;
+    if !output.status.success() {
+        return Err(WikiError::Io(std::io::Error::other(format!(
+            "git repository validation exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let path = PathBuf::from(raw.trim());
+    if path.as_os_str().is_empty() {
+        return Err(WikiError::Confinement {
+            path: root.to_path_buf(),
+            reason: "git CLI returned an empty repository path",
+        });
+    }
+    if !path.is_absolute() {
+        return Err(WikiError::Confinement {
+            path,
+            reason: "git CLI returned a non-absolute repository path",
+        });
+    }
+    Ok(path)
+}
+
+fn validate_resolved_repository_paths(
+    root: &Path,
+    expected_git_dir: &Path,
+    worktree: &Path,
+    git_dir: &Path,
+    common_dir: &Path,
+) -> WikiResult<()> {
+    let canonical_root = root.canonicalize()?;
+    let canonical_expected_git_dir = expected_git_dir.canonicalize()?;
+    let canonical_worktree = worktree.canonicalize()?;
+    let canonical_git_dir = git_dir.canonicalize()?;
+    let canonical_common_dir = common_dir.canonicalize()?;
+    if canonical_worktree != canonical_root {
+        return Err(WikiError::Confinement {
+            path: worktree.to_path_buf(),
+            reason: "git CLI resolved a working directory outside the wiki root",
+        });
+    }
+    if canonical_git_dir != canonical_expected_git_dir
+        || canonical_common_dir != canonical_expected_git_dir
+    {
+        return Err(WikiError::Confinement {
+            path: git_dir.to_path_buf(),
+            reason: "git CLI resolved metadata outside the in-root .git directory",
+        });
+    }
+    Ok(())
+}
+
+fn git_command(root: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .arg("-C")
+        .arg(root); // lgtm [rust/command-line-injection]
+    command
 }
 
 impl GitAdapter {
@@ -125,13 +279,19 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn open_or_init(root: &Path) -> WikiResult<Self> {
-        std::fs::create_dir_all(root)?;
-        match Repository::open(root) {
-            Ok(_) => debug!(root = %root.display(), "wiki repo already initialised"),
-            Err(_) => {
+        crate::confinement::initialize_root(root)?;
+        let git_dir = root.join(".git");
+        match std::fs::symlink_metadata(&git_dir) {
+            Ok(_) => {
+                validate_repository_or_allow_cli_fallback(root)?;
+                debug!(root = %root.display(), "wiki repo already initialised");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 debug!(root = %root.display(), "initialising wiki repo");
                 init_repo(root)?;
+                validate_repository_or_allow_cli_fallback(root)?;
             }
+            Err(error) => return Err(error.into()),
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -221,21 +381,55 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn commit_all(&self, message: &str) -> WikiResult<Option<git2::Oid>> {
-        match self.commit_all_git2(message) {
+        self.commit_all_with_fallback(message, commit_all_fallback)
+    }
+
+    fn commit_all_with_fallback<F>(
+        &self,
+        message: &str,
+        fallback: F,
+    ) -> WikiResult<Option<git2::Oid>>
+    where
+        F: FnOnce(&Path, &str, git2::Error) -> WikiResult<Option<git2::Oid>>,
+    {
+        // One hold of the commit lock spans the confinement walk and the
+        // commit. Our own commit activity churns `.git` lock and temp
+        // files and atomic temp names in the tree; a walk beside it saw
+        // entries that vanished between read_dir and stat. Writers we do
+        // not serialize (the git CLI, a second adapter) remain covered by
+        // the walk's own vanish tolerance.
+        let mut slot = self.writing();
+        let git_dir = crate::confinement::inspect_git_directory(&self.root)?;
+        crate::confinement::inspect_tree_except(&self.root, &[git_dir.as_path()])?;
+        match self.commit_all_git2(&mut slot, message) {
             Ok(result) => Ok(result),
-            Err(CommitGit2Error::Open(e)) if should_try_commit_cli_fallback(&e) => {
-                commit_all_fallback(&self.root, message, e)
-            }
-            Err(CommitGit2Error::Open(e) | CommitGit2Error::Other(e)) => Err(map_git_err(e)),
+            Err(CommitGit2Error::Open(error)) => commit_open_error_with_fallback_on(
+                cfg!(windows),
+                &self.root,
+                message,
+                error,
+                fallback,
+            ),
+            Err(CommitGit2Error::Other(error)) => Err(map_git_err(error)),
+            Err(CommitGit2Error::Wiki(error)) => Err(error),
         }
     }
 
-    fn commit_all_git2(&self, message: &str) -> Result<Option<git2::Oid>, CommitGit2Error> {
-        let mut slot = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
+    /// Called with the commit lock already held by
+    /// [`commit_all_with_fallback`]; `slot` is that lock's payload.
+    fn commit_all_git2(
+        &self,
+        slot: &mut Option<Open>,
+        message: &str,
+    ) -> Result<Option<git2::Oid>, CommitGit2Error> {
         if slot.is_none() {
-            let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
+            let repo = open_validated_repository(&self.root).map_err(|error| match error {
+                OpenRepositoryError::Git(error) => CommitGit2Error::Open(error),
+                OpenRepositoryError::Wiki(error) => CommitGit2Error::Wiki(error),
+            })?;
             *slot = Some(Open { repo, head: None });
         }
+        crate::confinement::inspect_git_directory(&self.root).map_err(CommitGit2Error::Wiki)?;
         let open = slot.as_mut().expect("opened above");
         let head_now = open.repo.head().ok().and_then(|h| h.target());
         if open.head.is_some() && open.head != head_now {
@@ -413,20 +607,32 @@ impl GitAdapter {
         Ok(Some(oid))
     }
 
-    /// Count commits reachable from HEAD. Returns 0 for an empty repo.
+    /// Count commits reachable from HEAD. Returns 0 for an empty or unreadable repo.
     /// Useful for the test suite + for `ai-memory status`.
     #[must_use]
     pub fn commit_count(&self) -> usize {
-        let Ok(repo) = Repository::open(&self.root) else {
-            return commit_count_fallback(&self.root);
+        self.commit_count_checked().unwrap_or(0)
+    }
+
+    pub(crate) fn commit_count_checked(&self) -> WikiResult<usize> {
+        let repo = match open_validated_repository(&self.root) {
+            Ok(repo) => repo,
+            Err(OpenRepositoryError::Git(error)) => {
+                #[cfg(windows)]
+                if should_try_commit_cli_fallback(&error) {
+                    return commit_count_fallback_checked(&self.root);
+                }
+                return Err(map_git_err(error));
+            }
+            Err(OpenRepositoryError::Wiki(error)) => return Err(error),
         };
         let Ok(mut walk) = repo.revwalk() else {
-            return 0;
+            return Ok(0);
         };
         if walk.push_head().is_err() {
-            return 0;
+            return Ok(0);
         }
-        walk.count()
+        Ok(walk.count())
     }
 
     /// Return the most recent commits reachable from HEAD.
@@ -436,13 +642,20 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn recent_checkpoints(&self, limit: usize) -> WikiResult<Vec<Checkpoint>> {
+        let repo = match open_validated_repository(&self.root) {
+            Ok(repo) => repo,
+            Err(OpenRepositoryError::Git(error)) => {
+                #[cfg(windows)]
+                if should_try_commit_cli_fallback(&error) {
+                    return recent_checkpoints_fallback(&self.root, limit, error);
+                }
+                return Err(map_git_err(error));
+            }
+            Err(OpenRepositoryError::Wiki(error)) => return Err(error),
+        };
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let repo = match Repository::open(&self.root) {
-            Ok(repo) => repo,
-            Err(e) => return recent_checkpoints_fallback(&self.root, limit, map_git_err(e)),
-        };
         let mut walk = repo.revwalk().map_err(map_git_err)?;
         if walk.push_head().is_err() {
             return Ok(Vec::new());
@@ -473,9 +686,16 @@ impl GitAdapter {
     /// # Errors
     /// Returns [`WikiError`] when the revision, path, or blob cannot be read.
     pub fn file_at_rev(&self, rev: &str, path: &Path) -> WikiResult<Vec<u8>> {
-        let repo = match Repository::open(&self.root) {
+        let repo = match open_validated_repository(&self.root) {
             Ok(repo) => repo,
-            Err(e) => return file_at_rev_fallback(&self.root, rev, path, map_git_err(e)),
+            Err(OpenRepositoryError::Git(error)) => {
+                #[cfg(windows)]
+                if should_try_commit_cli_fallback(&error) {
+                    return file_at_rev_fallback(&self.root, rev, path, map_git_err(error));
+                }
+                return Err(map_git_err(error));
+            }
+            Err(OpenRepositoryError::Wiki(error)) => return Err(error),
         };
         let object = repo.revparse_single(rev).map_err(map_git_err)?;
         let commit = object.peel_to_commit().map_err(map_git_err)?;
@@ -502,6 +722,16 @@ impl GitAdapter {
 /// read it" would drop the commit).
 #[allow(clippy::disallowed_methods)]
 impl GitAdapter {
+    fn confined(&self, path: &Path, prepare: crate::confinement::Prepare) -> WikiResult<PathBuf> {
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| WikiError::Confinement {
+                path: path.to_path_buf(),
+                reason: "path is outside the wiki root",
+            })?;
+        crate::confinement::tree_path(&self.root, relative, prepare)
+    }
+
     fn writing(&self) -> MutexGuard<'_, Option<Open>> {
         self.commit_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -512,8 +742,9 @@ impl GitAdapter {
     /// Propagates the filesystem error.
     pub fn write_atomic(&self, path: &Path, bytes: &[u8]) -> WikiResult<()> {
         let _writing = self.writing();
-        crate::atomic::write_atomic(path, bytes)?;
-        self.mark_written(path);
+        let path = self.confined(path, crate::confinement::Prepare::Parents)?;
+        crate::atomic::write_atomic(&path, bytes)?;
+        self.mark_written(&path);
         Ok(())
     }
 
@@ -522,10 +753,11 @@ impl GitAdapter {
         &self,
         tmp: tempfile::NamedTempFile,
         path: &Path,
-    ) -> Result<std::fs::File, tempfile::PersistError> {
+    ) -> WikiResult<std::fs::File> {
         let _writing = self.writing();
-        let file = crate::atomic::persist_with_retry(tmp, path)?;
-        self.mark_written(path);
+        let path = self.confined(path, crate::confinement::Prepare::Parents)?;
+        let file = crate::atomic::persist_with_retry(tmp, &path)?;
+        self.mark_written(&path);
         Ok(file)
     }
 
@@ -534,20 +766,21 @@ impl GitAdapter {
     /// # Errors
     /// Propagates the filesystem error.
     pub fn append(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        self.append_checked(path, bytes)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn append_checked(&self, path: &Path, bytes: &[u8]) -> WikiResult<()> {
         let _writing = self.writing();
         use std::io::Write as _;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
+        let path = self.confined(path, crate::confinement::Prepare::Parents)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?; // lgtm [rust/path-injection]
         file.write_all(bytes)?;
         file.sync_data()?;
-        self.mark_written(path);
+        self.mark_written(&path);
         Ok(())
     }
 
@@ -556,10 +789,17 @@ impl GitAdapter {
     /// # Errors
     /// Propagates the filesystem error.
     pub fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.rename_checked(from, to)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn rename_checked(&self, from: &Path, to: &Path) -> WikiResult<()> {
         let _writing = self.writing();
-        std::fs::rename(from, to)?;
-        self.mark_written(from);
-        self.mark_written(to);
+        let from = self.confined(from, crate::confinement::Prepare::Inspect)?;
+        let to = self.confined(to, crate::confinement::Prepare::Parents)?;
+        std::fs::rename(&from, &to)?;
+        self.mark_written(&from);
+        self.mark_written(&to);
         Ok(())
     }
 
@@ -568,9 +808,15 @@ impl GitAdapter {
     /// # Errors
     /// Propagates the filesystem error.
     pub fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.remove_file_checked(path)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn remove_file_checked(&self, path: &Path) -> WikiResult<()> {
         let _writing = self.writing();
-        std::fs::remove_file(path)?;
-        self.mark_written(path);
+        let path = self.confined(path, crate::confinement::Prepare::Inspect)?;
+        std::fs::remove_file(&path)?; // lgtm [rust/path-injection]
+        self.mark_written(&path);
         Ok(())
     }
 
@@ -579,9 +825,15 @@ impl GitAdapter {
     /// # Errors
     /// Propagates the filesystem error.
     pub fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        self.remove_dir_all_checked(path)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn remove_dir_all_checked(&self, path: &Path) -> WikiResult<()> {
         let _writing = self.writing();
-        std::fs::remove_dir_all(path)?;
-        self.mark_written(path);
+        let path = self.confined(path, crate::confinement::Prepare::Inspect)?;
+        std::fs::remove_dir_all(&path)?;
+        self.mark_written(&path);
         Ok(())
     }
 }
@@ -642,22 +894,51 @@ fn stage_paths(
     Ok(paths.len())
 }
 
+fn commit_open_error_with_fallback_on<F>(
+    windows: bool,
+    root: &Path,
+    message: &str,
+    error: git2::Error,
+    fallback: F,
+) -> WikiResult<Option<git2::Oid>>
+where
+    F: FnOnce(&Path, &str, git2::Error) -> WikiResult<Option<git2::Oid>>,
+{
+    if should_try_commit_cli_fallback_on(windows, &error) {
+        validate_cli_fallback_root(root)?;
+        fallback(root, message, error)
+    } else {
+        Err(map_git_err(error))
+    }
+}
+
+fn should_try_commit_cli_fallback(error: &git2::Error) -> bool {
+    should_try_commit_cli_fallback_on(cfg!(windows), error)
+}
+
+fn should_try_commit_cli_fallback_on(windows: bool, error: &git2::Error) -> bool {
+    !matches!(error.code(), ErrorCode::Owner)
+        && (matches!(error.code(), ErrorCode::NotFound)
+            || windows
+                && matches!(error.class(), git2::ErrorClass::Os)
+                && error.message().contains("failed to resolve path"))
+}
+
 #[cfg(windows)]
 fn commit_all_fallback(
     root: &Path,
     message: &str,
     original: git2::Error,
 ) -> WikiResult<Option<git2::Oid>> {
+    validate_cli_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 commit failed; trying git CLI fallback");
     run_git(root, ["add", "-A"])?;
-    let diff = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let diff = git_command(root)
         .args(["diff", "--cached", "--quiet", "--exit-code"])
         .status()
-        .map_err(|e| {
+        .map_err(|error| {
             WikiError::Io(std::io::Error::other(format!(
-                "{original}; git diff fallback failed to start: {e}"
+                "{original}; git diff fallback failed to start: {error}"
             )))
         })?;
     if diff.success() {
@@ -692,58 +973,27 @@ fn commit_all_fallback(
     Err(map_git_err(original))
 }
 
-fn should_try_commit_cli_fallback(error: &git2::Error) -> bool {
-    if matches!(error.code(), ErrorCode::NotFound) {
-        return true;
-    }
-
-    // An owner-check failure must NOT fall back to the git CLI: the CLI runs
-    // the same CVE-2022-24765 ownership guard and would refuse identically, so
-    // a fallback would only mask the real cause. Let it map through to
-    // `WikiError::GitOwner` and surface at ERROR instead.
-    if matches!(error.code(), ErrorCode::Owner) {
-        return false;
-    }
-
-    #[cfg(windows)]
-    {
-        // On native Windows, libgit2 can fail to reopen a freshly initialised
-        // wiki repo under dot-prefixed temp dirs with an OS path-resolution
-        // error. The fallback still runs only for Repository::open failures;
-        // real permission or repo corruption errors must also pass through the
-        // Git CLI before they are treated as recoverable.
-        if matches!(error.class(), git2::ErrorClass::Os)
-            && error.message().contains("failed to resolve path")
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
 #[cfg(windows)]
-fn commit_count_fallback(root: &Path) -> usize {
-    let Ok(out) = git_output(root, ["rev-list", "--count", "HEAD"]) else {
-        return 0;
-    };
+fn commit_count_fallback_checked(root: &Path) -> WikiResult<usize> {
+    validate_cli_fallback_root(root)?;
+    let out = git_output(root, ["rev-list", "--count", "HEAD"])?;
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse()
-        .unwrap_or(0)
-}
-
-#[cfg(not(windows))]
-fn commit_count_fallback(_root: &Path) -> usize {
-    0
+        .map_err(|error| {
+            WikiError::Io(std::io::Error::other(format!(
+                "git fallback returned an invalid commit count: {error}"
+            )))
+        })
 }
 
 #[cfg(windows)]
 fn recent_checkpoints_fallback(
     root: &Path,
     limit: usize,
-    original: WikiError,
+    original: git2::Error,
 ) -> WikiResult<Vec<Checkpoint>> {
+    validate_cli_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 log failed; trying git CLI fallback");
     let limit = limit.to_string();
     let out = git_output(root, ["log", "-n", &limit, "--format=%H%x1f%s%x1f%ct"])?;
@@ -768,15 +1018,6 @@ fn recent_checkpoints_fallback(
     Ok(checkpoints)
 }
 
-#[cfg(not(windows))]
-fn recent_checkpoints_fallback(
-    _root: &Path,
-    _limit: usize,
-    original: WikiError,
-) -> WikiResult<Vec<Checkpoint>> {
-    Err(original)
-}
-
 #[cfg(windows)]
 fn file_at_rev_fallback(
     root: &Path,
@@ -784,6 +1025,7 @@ fn file_at_rev_fallback(
     path: &Path,
     original: WikiError,
 ) -> WikiResult<Vec<u8>> {
+    validate_cli_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 show failed; trying git CLI fallback");
     let rel = slash_path(path);
     let spec = format!("{rev}:{rel}");
@@ -791,41 +1033,44 @@ fn file_at_rev_fallback(
     Ok(out.stdout)
 }
 
-#[cfg(not(windows))]
-fn file_at_rev_fallback(
-    _root: &Path,
-    _rev: &str,
-    _path: &Path,
-    original: WikiError,
-) -> WikiResult<Vec<u8>> {
-    Err(original)
-}
-
 fn init_repo(root: &Path) -> WikiResult<()> {
     match Repository::init(root) {
         Ok(_) => Ok(()),
-        Err(e) => init_repo_fallback(root, e),
+        Err(error) => init_error_with_fallback_on(cfg!(windows), root, error, init_repo_fallback),
+    }
+}
+
+fn init_error_with_fallback_on<F>(
+    windows: bool,
+    root: &Path,
+    error: git2::Error,
+    fallback: F,
+) -> WikiResult<()>
+where
+    F: FnOnce(&Path, git2::Error) -> WikiResult<()>,
+{
+    if !windows {
+        return Err(map_git_err(error));
+    }
+    validate_init_fallback_root(root)?;
+    fallback(root, error)
+}
+
+fn validate_init_fallback_root(root: &Path) -> WikiResult<()> {
+    crate::confinement::initialize_root(root)?;
+    match std::fs::symlink_metadata(root.join(".git")) {
+        Ok(_) => validate_cli_fallback_root(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
 #[cfg(windows)]
 fn init_repo_fallback(root: &Path, original: git2::Error) -> WikiResult<()> {
+    validate_init_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 init failed; trying git CLI fallback");
-    let status = std::process::Command::new("git")
-        .arg("init")
-        .arg("-q")
-        .arg(root)
-        .status()
-        .map_err(|io| {
-            WikiError::Io(std::io::Error::other(format!(
-                "{original}; git init fallback failed to start: {io}"
-            )))
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(map_git_err(original))
-    }
+    run_git(root, ["init", "-q"])?;
+    validate_cli_fallback_root(root)
 }
 
 #[cfg(not(windows))]
@@ -835,12 +1080,10 @@ fn init_repo_fallback(_root: &Path, original: git2::Error) -> WikiResult<()> {
 
 #[cfg(windows)]
 fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let status = git_command(root)
         .args(args)
         .status()
-        .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
+        .map_err(|error| WikiError::Io(std::io::Error::other(error.to_string())))?;
     if status.success() {
         Ok(())
     } else {
@@ -852,19 +1095,17 @@ fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<()> {
 
 #[cfg(windows)]
 fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<std::process::Output> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let output = git_command(root)
         .args(args)
         .output()
-        .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
-    if out.status.success() {
-        Ok(out)
+        .map_err(|error| WikiError::Io(std::io::Error::other(error.to_string())))?;
+    if output.status.success() {
+        Ok(output)
     } else {
         Err(WikiError::Io(std::io::Error::other(format!(
             "git fallback exited with status {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         ))))
     }
 }
@@ -896,13 +1137,428 @@ mod tests {
     }
 
     #[test]
+    fn commit_count_public_api_remains_a_plain_usize() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let count: usize = adapter.commit_count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn windows_commit_fallback_accepts_established_eligible_errors() {
+        let eligible = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+        assert!(should_try_commit_cli_fallback_on(true, &eligible));
+        assert!(!should_try_commit_cli_fallback_on(false, &eligible));
+
+        let wrong_class = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Repository,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+        assert!(!should_try_commit_cli_fallback_on(true, &wrong_class));
+        let not_found = git2::Error::new(
+            ErrorCode::NotFound,
+            git2::ErrorClass::Repository,
+            "not found",
+        );
+        assert!(should_try_commit_cli_fallback_on(true, &not_found));
+        assert!(should_try_commit_cli_fallback_on(false, &not_found));
+
+        let owner = git2::Error::new(
+            ErrorCode::Owner,
+            git2::ErrorClass::Os,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+        assert!(!should_try_commit_cli_fallback_on(true, &owner));
+        let wrong_message = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "repository is corrupt",
+        );
+        assert!(!should_try_commit_cli_fallback_on(true, &wrong_message));
+    }
+
+    #[test]
+    fn public_filesystem_wrappers_preserve_io_signatures_and_non_not_found_confinement() {
+        fn assert_signatures(
+            append: fn(&GitAdapter, &Path, &[u8]) -> std::io::Result<()>,
+            rename: fn(&GitAdapter, &Path, &Path) -> std::io::Result<()>,
+            remove_file: fn(&GitAdapter, &Path) -> std::io::Result<()>,
+            remove_dir_all: fn(&GitAdapter, &Path) -> std::io::Result<()>,
+        ) {
+            let _ = (append, rename, remove_file, remove_dir_all);
+        }
+        assert_signatures(
+            GitAdapter::append,
+            GitAdapter::rename,
+            GitAdapter::remove_file,
+            GitAdapter::remove_dir_all,
+        );
+
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let linked = root.join("linked");
+        if !link_directory(&outside, &linked) {
+            return;
+        }
+        let error = adapter.append(&linked.join("log.md"), b"x").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn windows_init_error_dispatches_fallback_after_root_preflight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir(&root).unwrap();
+        let called = AtomicBool::new(false);
+        let error = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to initialize repository",
+        );
+
+        init_error_with_fallback_on(true, &root, error, |validated, _| {
+            assert_eq!(validated, root);
+            called.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert!(called.load(Ordering::Relaxed));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn invalid_root_never_reaches_init_fallback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempdir();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir(&outside).unwrap();
+        if !link_directory(&outside, &root) {
+            return;
+        }
+        let called = AtomicBool::new(false);
+        let error = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to initialize repository",
+        );
+
+        assert!(matches!(
+            init_error_with_fallback_on(true, &root, error, |_, _| {
+                called.store(true, Ordering::Relaxed);
+                Ok(())
+            }),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(!called.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn init_is_idempotent_and_creates_dotgit() {
         let tmp = tempdir();
         let root = tmp.path().join("wiki");
-        let _adapter = GitAdapter::open_or_init(&root).unwrap();
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
         assert!(root.join(".git").is_dir());
-        // Second open is a no-op.
-        let _adapter2 = GitAdapter::open_or_init(&root).unwrap();
+        let adapter2 = GitAdapter::open_or_init(&root).unwrap();
+        assert_eq!(adapter.commit_count(), 0);
+        assert!(adapter2.recent_checkpoints(1).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("skipping .git reparse assertion: Windows privilege unavailable");
+                false
+            }
+            Err(error) => panic!("failed to create .git directory link: {error}"),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn git_metadata_link_is_refused_without_touching_external_repository() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir(&root).unwrap();
+        let external = tmp.path().join("external-git");
+        Repository::init_bare(&external).unwrap();
+        let before = std::fs::read(external.join("HEAD")).unwrap();
+        if !link_directory(&external, &root.join(".git")) {
+            return;
+        }
+
+        assert!(matches!(
+            GitAdapter::open_or_init(&root),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(std::fs::read(external.join("HEAD")).unwrap(), before);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn eligible_windows_open_error_dispatches_the_fallback_after_validation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let called = AtomicBool::new(false);
+        let error = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+
+        assert!(
+            commit_open_error_with_fallback_on(
+                true,
+                &adapter.root,
+                "fallback",
+                error,
+                |root, message, _| {
+                    assert_eq!(root, adapter.root);
+                    assert_eq!(message, "fallback");
+                    called.store(true, Ordering::Relaxed);
+                    Ok(None)
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(called.load(Ordering::Relaxed));
+    }
+
+    fn assert_eligible_fallback_is_refused(root: &Path) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let called = AtomicBool::new(false);
+        let error = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+        assert!(
+            commit_open_error_with_fallback_on(true, root, "refused", error, |_, _, _| {
+                called.store(true, Ordering::Relaxed);
+                Ok(None)
+            },)
+            .is_err()
+        );
+        assert!(!called.load(Ordering::Relaxed));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn linked_git_metadata_never_reaches_commit_fallback() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        adapter.close();
+        let original = root.join(".git-original");
+        std::fs::rename(root.join(".git"), &original).unwrap();
+        if !link_directory(&original, &root.join(".git")) {
+            return;
+        }
+
+        assert_eligible_fallback_is_refused(&adapter.root);
+    }
+
+    #[test]
+    fn gitfile_metadata_never_reaches_commit_fallback() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        adapter.close();
+        let original = root.join(".git-original");
+        std::fs::rename(root.join(".git"), &original).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", original.display()),
+        )
+        .unwrap();
+
+        assert_eligible_fallback_is_refused(&adapter.root);
+    }
+
+    #[test]
+    fn out_of_root_worktree_never_reaches_commit_fallback() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        Repository::open(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_str("core.worktree", outside.to_str().unwrap())
+            .unwrap();
+
+        assert_eligible_fallback_is_refused(&adapter.root);
+    }
+
+    #[test]
+    fn fallback_preflight_refuses_invalid_git_metadata() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        std::fs::write(root.join(".git/commondir"), "../outside\n").unwrap();
+
+        assert!(matches!(
+            validate_cli_fallback_root(&adapter.root),
+            Err(WikiError::Confinement { .. })
+        ));
+    }
+
+    #[test]
+    fn fallback_resolved_paths_must_match_the_validated_repository() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let git_dir = root.join(".git");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        assert!(
+            validate_resolved_repository_paths(&root, &git_dir, &root, &git_dir, &git_dir,).is_ok()
+        );
+        for (worktree, resolved_git_dir, common_dir) in [
+            (outside.as_path(), git_dir.as_path(), git_dir.as_path()),
+            (root.as_path(), outside.as_path(), git_dir.as_path()),
+            (root.as_path(), git_dir.as_path(), outside.as_path()),
+        ] {
+            assert!(matches!(
+                validate_resolved_repository_paths(
+                    &root,
+                    &git_dir,
+                    worktree,
+                    resolved_git_dir,
+                    common_dir,
+                ),
+                Err(WikiError::Confinement { .. })
+            ));
+        }
+        assert_eq!(adapter.root(), root);
+    }
+
+    #[test]
+    fn gitfile_redirect_outside_is_refused_without_touching_target() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir(&root).unwrap();
+        let external = tmp.path().join("external-git");
+        Repository::init_bare(&external).unwrap();
+        let before = std::fs::read(external.join("HEAD")).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", external.display()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            GitAdapter::open_or_init(&root),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(std::fs::read(external.join("HEAD")).unwrap(), before);
+    }
+
+    #[test]
+    fn git_metadata_redirect_files_are_refused_before_repository_open() {
+        for relative in [
+            "commondir",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+        ] {
+            let tmp = tempdir();
+            let root = tmp.path().join("wiki");
+            let adapter = GitAdapter::open_or_init(&root).unwrap();
+            let redirect = root.join(".git").join(relative);
+            std::fs::create_dir_all(redirect.parent().unwrap()).unwrap();
+            std::fs::write(&redirect, "../outside\n").unwrap();
+
+            assert!(matches!(
+                adapter.recent_checkpoints(0),
+                Err(WikiError::Confinement { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn configured_worktree_outside_the_wiki_root_is_refused() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let external = tmp.path().join("external-worktree");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("canary"), "outside canary").unwrap();
+        let repo = Repository::init(&root).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("core.worktree", external.to_str().unwrap())
+            .unwrap();
+        drop(repo);
+
+        assert!(matches!(
+            GitAdapter::open_or_init(&root),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(external.join("canary")).unwrap(),
+            "outside canary"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn checkpoint_and_revision_reads_refuse_a_replaced_git_directory() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "one")]);
+        adapter.close();
+        let original = root.join(".git-original");
+        std::fs::rename(root.join(".git"), &original).unwrap();
+        let external = root.parent().unwrap().join("external-git");
+        Repository::init_bare(&external).unwrap();
+        let before = std::fs::read(external.join("HEAD")).unwrap();
+        if !link_directory(&external, &root.join(".git")) {
+            return;
+        }
+
+        assert!(matches!(
+            adapter.commit_all("refused"),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            adapter.recent_checkpoints(1),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            adapter.file_at_rev("HEAD", Path::new("a.md")),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            adapter.commit_count_checked(),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(adapter.commit_count(), 0);
+        assert_eq!(std::fs::read(external.join("HEAD")).unwrap(), before);
     }
 
     #[test]
@@ -1275,35 +1931,14 @@ mod tests {
         assert!(!is_racy_read(&other_message));
     }
 
-    /// A libgit2 owner-check failure is not silently "recovered": it must not
-    /// trigger the git CLI fallback (the CLI enforces the same CVE-2022-24765
-    /// guard and would refuse identically), and it must map to the distinct
-    /// `GitOwner` variant so startup can surface it at ERROR. A generic error
-    /// still maps to the opaque I/O variant — proving the classification bites.
     #[test]
-    fn owner_error_is_surfaced_not_recovered() {
+    fn owner_error_is_surfaced_distinctly() {
         let owner = git2::Error::new(
             ErrorCode::Owner,
             git2::ErrorClass::Config,
             "repository path is not owned by current user",
         );
-        assert!(
-            !should_try_commit_cli_fallback(&owner),
-            "an owner error must not fall back to the git CLI (same guard)"
-        );
-        assert!(
-            matches!(map_git_err(owner), WikiError::GitOwner(_)),
-            "an owner error must map to the distinct GitOwner variant"
-        );
-
-        // Control: a NotFound error still asks for the CLI fallback, and a
-        // generic error is still the opaque I/O variant (not GitOwner).
-        let not_found = git2::Error::new(
-            ErrorCode::NotFound,
-            git2::ErrorClass::Repository,
-            "not found",
-        );
-        assert!(should_try_commit_cli_fallback(&not_found));
+        assert!(matches!(map_git_err(owner), WikiError::GitOwner(_)));
         let generic = git2::Error::new(
             ErrorCode::GenericError,
             git2::ErrorClass::Os,

@@ -10,7 +10,8 @@
 //! 3. If the new content equals the old, returns `NoOp` — never
 //!    touches the disk on a redundant call.
 //! 4. Otherwise copies the existing file to `<path>.bak-<unix-ts>`
-//!    so the user has a recovery path.
+//!    so the user has a recovery path ([`apply_atomic_with_backup`] can
+//!    put it in a private directory instead).
 //! 5. Writes the new content via the canonical
 //!    [`ai_memory_wiki::write_atomic`] (sibling tempfile + fsync +
 //!    rename + parent-dir fsync).
@@ -63,6 +64,57 @@ pub fn apply_atomic<F>(path: &Path, mutator: F) -> Result<ApplyOutcome>
 where
     F: FnOnce(&str) -> Result<String>,
 {
+    apply_atomic_with_backup(path, None, mutator)
+}
+
+/// A backup kept away from the file it protects: `<dir>/<stem>-<unix-ts>`
+/// plus the target's extension, owner-only on Unix. For a target inside a
+/// checkout, where a sibling `.bak-<ts>` would show up untracked and could be
+/// committed with whatever the file held.
+#[derive(Debug, Clone)]
+pub struct PrivateBackup {
+    /// Directory the backup is written to; created owner-only when missing.
+    pub dir: PathBuf,
+    /// File-name prefix that tells this target's backups apart in `dir`.
+    pub stem: String,
+}
+
+/// A [`PrivateBackup::stem`] naming a checkout: its directory flattened to
+/// safe characters and bounded to the tail (the repository-name end), plus a
+/// short hash of the full path so checkouts that flatten alike stay apart.
+pub(crate) fn checkout_backup_stem(checkout: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    let checkout = checkout.to_string_lossy();
+    let mut flat = String::with_capacity(checkout.len());
+    for c in checkout.chars() {
+        let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+            c
+        } else {
+            '-'
+        };
+        if !(c == '-' && flat.ends_with('-')) {
+            flat.push(c);
+        }
+    }
+    let flat = flat.trim_matches('-');
+    let tail = &flat[flat.len().saturating_sub(64)..];
+    let digest = format!("{:x}", Sha256::digest(checkout.as_bytes()));
+    format!("{}-{}", tail.trim_start_matches('-'), &digest[..12])
+}
+
+/// [`apply_atomic`], writing the backup to `private_backup` instead of next
+/// to `path` when one is given.
+///
+/// # Errors
+/// Propagates IO + mutator failures.
+pub fn apply_atomic_with_backup<F>(
+    path: &Path,
+    private_backup: Option<&PrivateBackup>,
+    mutator: F,
+) -> Result<ApplyOutcome>
+where
+    F: FnOnce(&str) -> Result<String>,
+{
     let write_target = resolve_write_target(path)?;
     let existed = write_target.exists();
     let original = if existed {
@@ -85,9 +137,15 @@ where
     }
 
     if existed {
-        let backup = backup_path_for(path);
-        fs::copy(&write_target, &backup)
-            .with_context(|| format!("backing up {} → {}", path.display(), backup.display()))?;
+        match private_backup {
+            None => {
+                let backup = backup_path_for(path);
+                fs::copy(&write_target, &backup).with_context(|| {
+                    format!("backing up {} → {}", path.display(), backup.display())
+                })?;
+            }
+            Some(private) => write_private_backup(path, private, &original)?,
+        }
     }
 
     write_atomic(&write_target, &new_content)?;
@@ -140,6 +198,29 @@ fn backup_path_for(path: &Path) -> PathBuf {
     let mut bak = path.as_os_str().to_owned();
     bak.push(format!(".bak-{stamp}"));
     PathBuf::from(bak)
+}
+
+fn write_private_backup(path: &Path, private: &PrivateBackup, original: &str) -> Result<()> {
+    let mut name = format!("{}-{}", private.stem, Timestamp::now().as_second());
+    if let Some(extension) = path.extension() {
+        name.push('.');
+        name.push_str(&extension.to_string_lossy());
+    }
+    let backup = private.dir.join(name);
+    let context = || format!("backing up {} → {}", path.display(), backup.display());
+    crate::commands::path_util::create_private_dir(&private.dir).with_context(context)?;
+    // Owner-only from creation: the content can carry machine-specific hook
+    // commands, and on Unix the mode is set before any byte is written.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&backup).with_context(context)?;
+    std::io::Write::write_all(&mut file, original.as_bytes()).with_context(context)?;
+    Ok(())
 }
 
 /// Atomic write via the canonical [`ai_memory_wiki::write_atomic`]
@@ -240,6 +321,56 @@ mod tests {
         let outcome = apply_atomic(&p, |_| Ok("hello\n".into())).unwrap();
         assert_eq!(outcome, ApplyOutcome::Created);
         assert_eq!(fs::read_to_string(&p).unwrap(), "hello\n");
+    }
+
+    /// A private backup lands in its own directory, owner-only, and leaves
+    /// nothing next to the target; the default still backs up beside it.
+    #[test]
+    fn private_backup_lands_outside_the_target_directory() {
+        let tmp = TempDir::new().unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        let target = checkout.join("settings.local.json");
+        fs::write(&target, "old\n").unwrap();
+        let backups = tmp.path().join("data").join("backups");
+        let private = PrivateBackup {
+            dir: backups.clone(),
+            stem: "checkout-id".to_string(),
+        };
+
+        let outcome =
+            apply_atomic_with_backup(&target, Some(&private), |_| Ok("new\n".into())).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Updated);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        let siblings: Vec<_> = fs::read_dir(&checkout)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(siblings, ["settings.local.json"], "no backup beside it");
+        let saved: Vec<_> = fs::read_dir(&backups).unwrap().flatten().collect();
+        assert_eq!(saved.len(), 1);
+        let name = saved[0].file_name().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("checkout-id-") && name.ends_with(".json"),
+            "{name}"
+        );
+        assert_eq!(fs::read_to_string(saved[0].path()).unwrap(), "old\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = saved[0].metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Control: without a private backup the copy sits next to the target.
+        apply_atomic(&target, |_| Ok("newer\n".into())).unwrap();
+        assert!(
+            fs::read_dir(&checkout)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".bak-"))
+        );
     }
 
     #[test]

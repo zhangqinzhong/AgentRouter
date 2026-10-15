@@ -87,6 +87,51 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// A search query embedded for the vector stream, with the stored-vector
+/// identity it may be compared against.
+#[derive(Debug, Clone)]
+pub struct QueryVector {
+    /// The query embedding.
+    pub vector: Vec<f32>,
+    /// Provider of the eligible stored vectors.
+    pub provider: String,
+    /// Model identity of the eligible stored vectors. This is
+    /// [`Embedder::model_identity`], not [`Embedder::model`]: stored vectors
+    /// are keyed by the document identity, which a configured document
+    /// prefix folds in.
+    pub model: String,
+    /// Dimensionality of the eligible stored vectors.
+    pub dim: u32,
+}
+
+/// Embed `query` for hybrid retrieval, or `None` when the embedder fails.
+///
+/// The one place every search surface (`memory_query`, the web search) turns
+/// a query into a vector, so they select the same stored vectors. A failure
+/// degrades the search to FTS5 + entity + graph rather than failing it.
+pub async fn embed_search_query(embedder: &dyn Embedder, query: &str) -> Option<QueryVector> {
+    // `embed_query`, not `embed`: an asymmetric embedder (configured
+    // query/document prefixes, or Google's RETRIEVAL_QUERY task type)
+    // must see this text on the query side, not the document side.
+    match embedder.embed_query(query).await {
+        Ok(vector) => Some(QueryVector {
+            vector,
+            provider: embedder.provider().to_string(),
+            model: embedder.model_identity(),
+            dim: embedder.dim(),
+        }),
+        Err(e) => {
+            tracing::warn!(
+                provider = embedder.provider(),
+                model = embedder.model(),
+                error = %e,
+                "embedder failed; degrading search to FTS5 + entity + graph"
+            );
+            None
+        }
+    }
+}
+
 /// OpenAI Embeddings API (`text-embedding-3-small` by default, 1536 dim).
 pub struct OpenAiEmbedder {
     client: reqwest::Client,

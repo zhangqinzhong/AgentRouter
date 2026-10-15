@@ -39,7 +39,11 @@ fn run_hook_full_agent(
     if capture_assistant {
         args.push("--capture-assistant".to_string());
     }
+    // A developer's own `~/.ai-memory.toml` applies to every cwd, so the
+    // hook would annotate these payloads; the empty data dir stands in for
+    // a home without one.
     let mut child = Command::new(bin())
+        .env("AI_MEMORY_HOME", data_dir)
         .args(["--data-dir"])
         .arg(data_dir)
         .args(&args)

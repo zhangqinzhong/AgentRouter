@@ -22,6 +22,91 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::path_util::home_dir;
 use crate::config::RuntimeEnv;
+use ai_memory_core::repository_identity::{
+    IdentitySource, IdentityStyle, MARKER_FILENAME, MarkerAliases, RepositoryIdentity,
+    accept_wire_identity,
+};
+
+const MAX_HOME_ROUTES: usize = 64;
+const MAX_ROUTE_SELECTOR_BYTES: usize = 512;
+const MAX_ROUTE_VALUE_BYTES: usize = 512;
+const MAX_HOME_ROUTE_FILE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvalidHomeRoutes;
+
+impl std::fmt::Display for InvalidHomeRoutes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the home .ai-memory.toml route map is invalid")
+    }
+}
+
+impl std::error::Error for InvalidHomeRoutes {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HomeRoute {
+    pub(crate) workspace: String,
+    pub(crate) project: String,
+    pub(crate) identity_style: Option<IdentityStyle>,
+    pub(crate) aliases: MarkerAliases,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathSelector {
+    root: PathRoot,
+    components: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathRoot {
+    Posix,
+    Drive(String),
+    Unc(String, String),
+}
+
+impl PathRoot {
+    fn same_root(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Posix, Self::Posix) => true,
+            (Self::Drive(left), Self::Drive(right)) => left.eq_ignore_ascii_case(right),
+            (Self::Unc(left_server, left_share), Self::Unc(right_server, right_share)) => {
+                left_server.eq_ignore_ascii_case(right_server)
+                    && left_share.eq_ignore_ascii_case(right_share)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathRoute {
+    selector: PathSelector,
+    route: HomeRoute,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HomeRoutes {
+    identities: Vec<(String, HomeRoute)>,
+    paths: Vec<PathRoute>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutingSource {
+    LocalMarker,
+    HomeIdentityRoute,
+    HomePathRoute,
+    HomeRoot,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RoutingSelection {
+    pub(crate) path: PathBuf,
+    pub(crate) fields: RoutingFields,
+    pub(crate) source: RoutingSource,
+    pub(crate) remote_identity: Option<RepositoryIdentity>,
+}
+
+pub(crate) type RoutingSelectionResult = Result<Option<RoutingSelection>, InvalidHomeRoutes>;
 
 /// The scope fields a marker declares, plus where it was found.
 ///
@@ -38,13 +123,618 @@ pub(crate) struct MarkerScope {
     pub(crate) project: Option<String>,
     /// `project_strategy = "…"`, or the install-wide env default.
     pub(crate) project_strategy: Option<String>,
+    /// Explicit repository identity, which keeps name derivation on the legacy
+    /// local path because it is already an operator-chosen coordinate.
+    pub(crate) identity: Option<String>,
+    /// Explicit remote naming style from marker/home routing. When absent, current
+    /// static CLI clients choose and send [`IdentityStyle::Path`]; only omission
+    /// at the server/wire boundary defaults to legacy [`IdentityStyle::HostPath`]
+    /// for old-client compatibility.
+    pub(crate) identity_style: Option<IdentityStyle>,
+    /// Normalized remote discovered for the selected checkout, when any.
+    pub(crate) remote_identity: Option<RepositoryIdentity>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RoutingFields {
+    pub(crate) workspace: Option<String>,
+    pub(crate) project: Option<String>,
+    pub(crate) project_strategy: Option<String>,
+    pub(crate) identity: Option<String>,
+    pub(crate) identity_style: Option<String>,
+    pub(crate) aliases: Result<
+        Option<ai_memory_core::repository_identity::MarkerAliases>,
+        ai_memory_core::repository_identity::MarkerAliasError,
+    >,
+}
+
+impl Default for RoutingFields {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            project: None,
+            project_strategy: None,
+            identity: None,
+            identity_style: None,
+            aliases: Ok(None),
+        }
+    }
+}
+
+impl RoutingFields {
+    fn from_text(text: &str) -> Self {
+        Self {
+            workspace: parse_key_in(text, "workspace"),
+            project: parse_key_in(text, "project"),
+            project_strategy: parse_key_in(text, "project_strategy"),
+            identity: parse_key_in(text, "identity"),
+            identity_style: parse_key_in(text, "identity_style"),
+            aliases: parse_aliases_in(text),
+        }
+    }
+
+    fn apply_route(&mut self, route: &HomeRoute) {
+        self.workspace = Some(route.workspace.clone());
+        self.project = Some(route.project.clone());
+        self.project_strategy = None;
+        self.identity = None;
+        self.identity_style = route.identity_style.map(|style| style.as_str().to_owned());
+        self.aliases = Ok((!route.aliases.is_empty()).then(|| route.aliases.clone()));
+    }
+}
+
+impl HomeRoutes {
+    fn parse(text: &str, home: &Path) -> Result<Self, ()> {
+        let saw_route_syntax = text
+            .lines()
+            .any(|line| recognizable_route_syntax(line.trim()));
+        if !saw_route_syntax {
+            return Ok(Self::default());
+        }
+        let mut parsed = Self::default();
+        let mut current: Option<(RouteKind, String, RouteFields)> = None;
+        let mut raw_selectors = std::collections::HashSet::new();
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some((kind, selector)) = parse_route_header(trimmed) {
+                if let Some(route) = current.take() {
+                    parsed.push_route(route, home)?;
+                }
+                if !raw_selectors.insert(selector.clone()) {
+                    return Err(());
+                }
+                current = Some((kind, selector, RouteFields::default()));
+                continue;
+            }
+            if trimmed.starts_with("[routes")
+                || trimmed.starts_with("routes.")
+                || trimmed
+                    .strip_prefix("routes")
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+            {
+                return Err(());
+            }
+            if trimmed.starts_with('[') {
+                if let Some(route) = current.take() {
+                    parsed.push_route(route, home)?;
+                }
+                continue;
+            }
+            if let Some((_, _, fields)) = current.as_mut() {
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let (key, value) = trimmed.split_once('=').ok_or(())?;
+                fields.insert(key.trim(), value.trim())?;
+            } else if recognizable_malformed_root_line(trimmed) {
+                return Err(());
+            }
+        }
+        if let Some(route) = current {
+            parsed.push_route(route, home)?;
+        }
+        Ok(parsed)
+    }
+
+    fn push_route(
+        &mut self,
+        (kind, raw_selector, fields): (RouteKind, String, RouteFields),
+        home: &Path,
+    ) -> Result<(), ()> {
+        self.check_capacity(&raw_selector)?;
+        let route = fields.finish()?;
+        match kind {
+            RouteKind::Identity => {
+                let identity =
+                    accept_wire_identity(&raw_selector, IdentitySource::GitRemote.as_str())
+                        .ok_or(())?;
+                if identity.identity != raw_selector
+                    || !valid_identity_selector(&raw_selector)
+                    || self
+                        .identities
+                        .iter()
+                        .any(|(existing, _)| existing == &identity.identity)
+                {
+                    return Err(());
+                }
+                self.identities.push((identity.identity, route));
+            }
+            RouteKind::Path => {
+                let selector = PathSelector::parse(&raw_selector, home)?;
+                if self
+                    .paths
+                    .iter()
+                    .any(|existing| existing.selector.same_selector(&selector))
+                {
+                    return Err(());
+                }
+                self.paths.push(PathRoute { selector, route });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_capacity(&self, selector: &str) -> Result<(), ()> {
+        if self.identities.len() + self.paths.len() >= MAX_HOME_ROUTES
+            || selector.is_empty()
+            || selector.len() > MAX_ROUTE_SELECTOR_BYTES
+            || selector.chars().any(char::is_control)
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn select(
+        &self,
+        cwd: &str,
+        remote: Option<&RepositoryIdentity>,
+    ) -> Result<Option<(HomeRoute, RoutingSource)>, ()> {
+        if let Some(remote) = remote.filter(|identity| identity.source == IdentitySource::GitRemote)
+            && let Some((_, route)) = self
+                .identities
+                .iter()
+                .find(|(selector, _)| selector == &remote.identity)
+        {
+            return Ok(Some((route.clone(), RoutingSource::HomeIdentityRoute)));
+        }
+        let cwd = parse_absolute_selector(cwd)?;
+        let mut matched: Option<&PathRoute> = None;
+        for candidate in self
+            .paths
+            .iter()
+            .filter(|candidate| candidate.selector.contains(&cwd))
+        {
+            match matched {
+                None => matched = Some(candidate),
+                Some(current)
+                    if candidate.selector.components.len() > current.selector.components.len() =>
+                {
+                    matched = Some(candidate);
+                }
+                Some(current)
+                    if candidate.selector.components.len() == current.selector.components.len() =>
+                {
+                    return Err(());
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(matched.map(|route| (route.route.clone(), RoutingSource::HomePathRoute)))
+    }
+}
+
+impl PathSelector {
+    fn same_selector(&self, other: &Self) -> bool {
+        if !self.root.same_root(&other.root) || self.components.len() != other.components.len() {
+            return false;
+        }
+        let windows = matches!(self.root, PathRoot::Drive(_) | PathRoot::Unc(_, _));
+        self.components
+            .iter()
+            .zip(&other.components)
+            .all(|(left, right)| {
+                if windows {
+                    left.eq_ignore_ascii_case(right)
+                } else {
+                    left == right
+                }
+            })
+    }
+
+    fn parse(raw: &str, home: &Path) -> Result<Self, ()> {
+        if raw.is_empty()
+            || raw.len() > MAX_ROUTE_SELECTOR_BYTES
+            || raw.chars().any(char::is_control)
+        {
+            return Err(());
+        }
+        if let Some(rest) = raw.strip_prefix("~/") {
+            let mut depth = 0usize;
+            for component in rest.replace('\\', "/").split('/') {
+                match component {
+                    "" | "." => {}
+                    ".." if depth == 0 => return Err(()),
+                    ".." => depth -= 1,
+                    _ => depth += 1,
+                }
+            }
+            return parse_absolute_selector(&format!(
+                "{}/{}",
+                home.to_string_lossy().trim_end_matches(['/', '\\']),
+                rest
+            ));
+        }
+        parse_absolute_selector(raw)
+    }
+
+    fn contains(&self, cwd: &Self) -> bool {
+        if !self.root.same_root(&cwd.root) || self.components.len() > cwd.components.len() {
+            return false;
+        }
+        let windows = matches!(self.root, PathRoot::Drive(_) | PathRoot::Unc(_, _));
+        self.components
+            .iter()
+            .zip(&cwd.components)
+            .all(|(left, right)| {
+                if windows {
+                    left.eq_ignore_ascii_case(right)
+                } else {
+                    left == right
+                }
+            })
+    }
+}
+
+fn parse_absolute_selector(raw: &str) -> Result<PathSelector, ()> {
+    let replaced = raw.replace('\\', "/");
+    let (root, rest) = if let Some(rest) = replaced.strip_prefix("//") {
+        let mut parts = rest.split('/').filter(|part| !part.is_empty());
+        let server = parts.next().ok_or(())?;
+        let share = parts.next().ok_or(())?;
+        (
+            PathRoot::Unc(server.to_ascii_lowercase(), share.to_ascii_lowercase()),
+            parts.collect::<Vec<_>>(),
+        )
+    } else if replaced.as_bytes().get(1) == Some(&b':')
+        && replaced.as_bytes().get(2) == Some(&b'/')
+        && replaced.as_bytes()[0].is_ascii_alphabetic()
+    {
+        (
+            PathRoot::Drive(replaced[..1].to_ascii_uppercase()),
+            replaced[3..]
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .collect(),
+        )
+    } else if let Some(rest) = replaced.strip_prefix('/') {
+        (
+            PathRoot::Posix,
+            rest.split('/').filter(|part| !part.is_empty()).collect(),
+        )
+    } else {
+        return Err(());
+    };
+    let mut components: Vec<String> = Vec::new();
+    for component in rest {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            value => components.push(value.to_owned()),
+        }
+    }
+    if components.is_empty() {
+        return Err(());
+    }
+    Ok(PathSelector { root, components })
+}
+
+fn valid_identity_selector(value: &str) -> bool {
+    let mut segments = value.split('/');
+    let Some(host) = segments.next() else {
+        return false;
+    };
+    !host.starts_with('.')
+        && !host.ends_with('.')
+        && host.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
+        && segments.clone().count() >= 1
+        && segments.all(|segment| {
+            !segment.is_empty()
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-')
+                })
+        })
+}
+
+fn valid_route_name(value: &str) -> bool {
+    value.len() <= MAX_ROUTE_VALUE_BYTES
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RouteKind {
+    Identity,
+    Path,
+}
+
+#[derive(Debug, Default)]
+struct RouteFields {
+    workspace: Option<String>,
+    project: Option<String>,
+    identity_style: Option<String>,
+    aliases: Option<String>,
+}
+
+fn recognizable_route_syntax(line: &str) -> bool {
+    line.starts_with("[routes")
+        || line.starts_with("routes.")
+        || line
+            .strip_prefix("routes")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+        || line.starts_with("route_")
+}
+
+fn recognizable_malformed_root_line(line: &str) -> bool {
+    if line.is_empty() || line.starts_with('#') {
+        return false;
+    }
+    if line.starts_with("route_") {
+        return true;
+    }
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+    let key = key.trim();
+    let value = value.trim();
+    matches!(
+        key,
+        "workspace"
+            | "project"
+            | "project_strategy"
+            | "drop_subagent_captures"
+            | "identity"
+            | "identity_style"
+            | "server"
+    ) && value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .is_none_or(|inner| inner.contains('"'))
+}
+
+fn parse_route_header(line: &str) -> Option<(RouteKind, String)> {
+    let body = line.strip_prefix("[routes.")?.strip_suffix(']')?;
+    let (kind, quoted) = body.split_once('.')?;
+    let selector = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    if selector.contains(['"', '\\']) {
+        return None;
+    }
+    let kind = match kind {
+        "identity" => RouteKind::Identity,
+        "path" => RouteKind::Path,
+        _ => return None,
+    };
+    Some((kind, selector.to_owned()))
+}
+
+impl RouteFields {
+    fn insert(&mut self, key: &str, value: &str) -> Result<(), ()> {
+        let slot = match key {
+            "route_workspace" => &mut self.workspace,
+            "route_project" => &mut self.project,
+            "route_identity_style" => &mut self.identity_style,
+            "route_aliases" => &mut self.aliases,
+            _ => return Err(()),
+        };
+        if slot.replace(value.to_owned()).is_some() {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<HomeRoute, ()> {
+        let string_value = |raw: Option<String>| {
+            let raw = raw.ok_or(())?;
+            if raw.len() > MAX_ROUTE_VALUE_BYTES + 2 || raw.contains('\\') {
+                return Err(());
+            }
+            let value = raw
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .ok_or(())?;
+            if value.is_empty() || value.len() > MAX_ROUTE_VALUE_BYTES || value.contains('"') {
+                return Err(());
+            }
+            Ok(value.to_owned())
+        };
+        let workspace = string_value(self.workspace)?;
+        let project = string_value(self.project)?;
+        if !valid_route_name(&workspace) || !valid_route_name(&project) {
+            return Err(());
+        }
+        let identity_style = self
+            .identity_style
+            .map(|raw| string_value(Some(raw)))
+            .transpose()?
+            .map(|style| IdentityStyle::from_str_opt(&style).ok_or(()))
+            .transpose()?;
+        let aliases = match self.aliases {
+            None => MarkerAliases::default(),
+            Some(raw) => {
+                if raw.len() > MAX_ROUTE_VALUE_BYTES || raw.contains('\\') {
+                    return Err(());
+                }
+                let marker = format!("aliases = {raw}");
+                ai_memory_core::repository_identity::parse_marker_aliases(&marker)
+                    .map_err(|_| ())?
+                    .ok_or(())?
+            }
+        };
+        Ok(HomeRoute {
+            workspace,
+            project,
+            identity_style,
+            aliases,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MarkerInspection {
+    pub(crate) status: &'static str,
+    pub(crate) fields: RoutingFields,
+    pub(crate) scope: Option<MarkerScope>,
+    pub(crate) route_identity: Option<RepositoryIdentity>,
+}
+
+#[cfg(test)]
+pub(crate) fn inspect_scope(cwd: &str, env: &RuntimeEnv) -> MarkerInspection {
+    inspect_scope_for(cwd, cwd, env)
+}
+
+pub(crate) fn inspect_scope_for(
+    lookup_cwd: &str,
+    identity_cwd: &str,
+    env: &RuntimeEnv,
+) -> MarkerInspection {
+    use std::io::Read as _;
+    let empty = |status| MarkerInspection {
+        status,
+        fields: RoutingFields::default(),
+        scope: None,
+        route_identity: None,
+    };
+    if env.ignore_marker() {
+        return empty("ignored");
+    }
+    let selection = match routing_selection_with_home(
+        lookup_cwd,
+        identity_cwd,
+        env.home_dir().map(Path::new),
+        false,
+    ) {
+        Ok(Some(selection)) => selection,
+        Err(_) => return empty("invalid_home_routes"),
+        Ok(None) => {
+            if let Some(path) = find_marker_with_home(lookup_cwd, env.home_dir().map(Path::new))
+                && std::fs::read_to_string(path)
+                    .is_ok_and(|text| text.parse::<toml_edit::DocumentMut>().is_err())
+            {
+                return empty("invalid");
+            }
+            return empty("absent");
+        }
+    };
+    let limit = ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
+    let text = (|| {
+        let mut bytes = Vec::new();
+        std::fs::File::open(&selection.path)
+            .ok()?
+            .take((limit + 1) as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= limit).then_some(())?;
+        String::from_utf8(bytes).ok()
+    })();
+    let Some(text) = text else {
+        return empty("unreadable");
+    };
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return empty("invalid");
+    };
+    let route_identity = selection.remote_identity;
+    let fields = selection.fields;
+    if matches!(
+        selection.source,
+        RoutingSource::LocalMarker | RoutingSource::HomeRoot
+    ) {
+        for (key, parsed) in [
+            ("workspace", &fields.workspace),
+            ("project", &fields.project),
+            ("project_strategy", &fields.project_strategy),
+            ("identity", &fields.identity),
+            ("identity_style", &fields.identity_style),
+        ] {
+            let strict = document.get(key).and_then(toml_edit::Item::as_str);
+            if strict != parsed.as_deref()
+                || document
+                    .get(key)
+                    .is_some_and(|item| item.as_str().is_none())
+            {
+                return empty("conflicting");
+            }
+        }
+    }
+    if fields.aliases.is_err()
+        || fields
+            .identity_style
+            .as_deref()
+            .is_some_and(|style| IdentityStyle::from_str_opt(style).is_none())
+        || fields
+            .project_strategy
+            .as_deref()
+            .is_some_and(|strategy| !matches!(strategy, "repo-root" | "repo_root" | "basename"))
+    {
+        return empty("conflicting");
+    }
+    let scope = MarkerScope {
+        path: selection.path,
+        workspace: fields.workspace.clone(),
+        project: fields.project.clone(),
+        project_strategy: fields.project_strategy.clone().or_else(|| {
+            env.project_strategy()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        }),
+        identity: fields.identity.clone(),
+        identity_style: fields
+            .identity_style
+            .as_deref()
+            .and_then(IdentityStyle::from_str_opt),
+        remote_identity: route_identity.clone(),
+    };
+    MarkerInspection {
+        status: match selection.source {
+            RoutingSource::HomeIdentityRoute => "home_identity_route",
+            RoutingSource::HomePathRoute => "home_path_route",
+            _ => "valid",
+        },
+        fields,
+        scope: scope.declares_scope().then_some(scope),
+        route_identity,
+    }
 }
 
 impl MarkerScope {
     /// Whether this marker declares anything that changes scope resolution.
     /// A marker that only carries `[capture]` rules does not.
     pub(crate) fn declares_scope(&self) -> bool {
-        self.workspace.is_some() || self.project.is_some() || self.is_repo_root()
+        self.workspace.is_some()
+            || self.project.is_some()
+            || self.identity.is_some()
+            || self.identity_style.is_some()
+            || self.remote_identity.is_some()
+            || self.is_repo_root()
+    }
+
+    pub(crate) fn canonical_remote_project(&self) -> Option<String> {
+        if self.project.is_some() || self.identity.is_some() {
+            return None;
+        }
+        let repository = self.remote_identity.as_ref()?;
+        (self.identity_style.unwrap_or(IdentityStyle::Path) == IdentityStyle::Path)
+            .then(|| ai_memory_core::repository_identity::path_style_name(repository))
+            .flatten()
     }
 
     /// Whether the effective strategy asks for repo-root project naming.
@@ -68,29 +758,171 @@ impl MarkerScope {
 /// Returns `None` when no marker is found, when the operator disabled marker
 /// resolution, or when the marker declares nothing scope-related — callers
 /// then keep their existing fallbacks untouched.
-pub(crate) fn read_scope(cwd: &str, env: &RuntimeEnv) -> Option<MarkerScope> {
-    if env.ignore_marker() {
-        return None;
-    }
-    let path = find_settings_marker_with_home(cwd, env.home_dir().map(Path::new))?;
-    // One read, three keys: the marker is re-read per key nowhere else on a
-    // hot path, but this one runs on every client command.
-    let text = std::fs::read_to_string(&path).ok()?;
+pub(crate) fn read_scope(
+    cwd: &str,
+    env: &RuntimeEnv,
+) -> Result<Option<MarkerScope>, InvalidHomeRoutes> {
+    read_scope_for(cwd, cwd, env)
+}
+
+pub(crate) fn read_scope_for(
+    lookup_cwd: &str,
+    identity_cwd: &str,
+    env: &RuntimeEnv,
+) -> Result<Option<MarkerScope>, InvalidHomeRoutes> {
+    let Some(selection) = routing_selection_with_home(
+        lookup_cwd,
+        identity_cwd,
+        env.home_dir().map(Path::new),
+        env.ignore_marker(),
+    )?
+    else {
+        return Ok(None);
+    };
     let mut scope = MarkerScope {
-        workspace: parse_key_in(&text, "workspace"),
-        project: parse_key_in(&text, "project"),
-        project_strategy: parse_key_in(&text, "project_strategy"),
-        path,
+        workspace: selection.fields.workspace,
+        project: selection.fields.project,
+        project_strategy: selection.fields.project_strategy,
+        identity: selection.fields.identity,
+        identity_style: selection
+            .fields
+            .identity_style
+            .as_deref()
+            .and_then(IdentityStyle::from_str_opt),
+        remote_identity: selection
+            .remote_identity
+            .or_else(|| discover_remote_identity(identity_cwd))
+            .or_else(|| {
+                (lookup_cwd != identity_cwd)
+                    .then(|| discover_remote_identity(lookup_cwd))
+                    .flatten()
+            }),
+        path: selection.path,
     };
     if scope.project_strategy.is_none() {
-        // The install-wide `--project-strategy` default, if one was baked into
-        // the environment. Empty values are treated as unset.
         scope.project_strategy = env
             .project_strategy()
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned);
     }
-    scope.declares_scope().then_some(scope)
+    Ok(scope.declares_scope().then_some(scope))
+}
+
+pub(crate) fn routing_selection(cwd: &str) -> RoutingSelectionResult {
+    routing_selection_for(cwd, cwd)
+}
+
+pub(crate) fn routing_selection_for(
+    lookup_cwd: &str,
+    identity_cwd: &str,
+) -> RoutingSelectionResult {
+    routing_selection_with_home(lookup_cwd, identity_cwd, home_dir().as_deref(), false)
+}
+
+pub(crate) fn routing_selection_with_home(
+    lookup_cwd: &str,
+    identity_cwd: &str,
+    home: Option<&Path>,
+    ignore_marker: bool,
+) -> RoutingSelectionResult {
+    if ignore_marker {
+        return Ok(None);
+    }
+    let local = find_settings_marker_with_home(lookup_cwd, home).filter(|path| {
+        home.is_none_or(|home| {
+            absolute_normalized(path) != absolute_normalized(&home.join(MARKER_FILENAME))
+        })
+    });
+    if let Some(path) = local {
+        let text = std::fs::read_to_string(&path).ok();
+        let Some(text) = text else {
+            return Ok(None);
+        };
+        let fields = RoutingFields::from_text(&text);
+        let remote_identity = if fields
+            .aliases
+            .as_ref()
+            .is_ok_and(|aliases| aliases.is_some())
+        {
+            discover_remote_identity(identity_cwd).or_else(|| {
+                (lookup_cwd != identity_cwd)
+                    .then(|| discover_remote_identity(lookup_cwd))
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        return Ok(Some(RoutingSelection {
+            path,
+            fields,
+            source: RoutingSource::LocalMarker,
+            remote_identity,
+        }));
+    }
+    let Some(home) = home else {
+        return Ok(None);
+    };
+    let path = home.join(MARKER_FILENAME);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(InvalidHomeRoutes),
+    };
+    let expected = file.metadata().map_err(|_| InvalidHomeRoutes)?.len();
+    if expected > MAX_HOME_ROUTE_FILE_BYTES as u64 {
+        return Err(InvalidHomeRoutes);
+    }
+    let mut bytes = Vec::with_capacity(MAX_HOME_ROUTE_FILE_BYTES + 1);
+    use std::io::Read as _;
+    (&file)
+        .take((MAX_HOME_ROUTE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| InvalidHomeRoutes)?;
+    if bytes.len() > MAX_HOME_ROUTE_FILE_BYTES
+        || bytes.len() as u64 != expected
+        || file.metadata().map_err(|_| InvalidHomeRoutes)?.len() != expected
+    {
+        return Err(InvalidHomeRoutes);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| InvalidHomeRoutes)?;
+    let mut fields = RoutingFields::from_text(&text);
+    let remote_identity = discover_remote_identity(identity_cwd).or_else(|| {
+        (lookup_cwd != identity_cwd)
+            .then(|| discover_remote_identity(lookup_cwd))
+            .flatten()
+    });
+    let routes = HomeRoutes::parse(&text, home).map_err(|_| InvalidHomeRoutes)?;
+    match routes.select(identity_cwd, remote_identity.as_ref()) {
+        Ok(Some((route, source))) => {
+            fields.apply_route(&route);
+            return Ok(Some(RoutingSelection {
+                path,
+                fields,
+                source,
+                remote_identity,
+            }));
+        }
+        Err(()) => return Err(InvalidHomeRoutes),
+        Ok(None) => {}
+    }
+    Ok(Some(RoutingSelection {
+        path,
+        fields,
+        source: RoutingSource::HomeRoot,
+        remote_identity,
+    }))
+}
+
+pub(crate) fn discover_remote_identity(cwd: &str) -> Option<RepositoryIdentity> {
+    let (upstream, origin) = ai_memory_consolidate::read_identity_remotes(Path::new(cwd));
+    [upstream.as_deref(), origin.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(ai_memory_core::repository_identity::normalize_remote_url)
+        .map(|identity| RepositoryIdentity {
+            identity,
+            source: IdentitySource::GitRemote,
+        })
 }
 
 /// Derive a project name from the **main** repository root, so linked
@@ -131,7 +963,14 @@ pub(crate) fn find_settings_marker(cwd: &str) -> Option<PathBuf> {
 }
 
 fn find_settings_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let home_marker = home.map(|home| absolute_normalized(&home.join(MARKER_FILENAME)));
     find_marker_matching(cwd, home, OutsideHome::StopAtCheckoutRoot, |path| {
+        if home_marker
+            .as_ref()
+            .is_some_and(|marker| absolute_normalized(path) == *marker)
+        {
+            return Some(path.to_path_buf());
+        }
         std::fs::read_to_string(path)
             .is_ok_and(|text| declares_more_than_capture(&text))
             .then(|| path.to_path_buf())
@@ -185,11 +1024,193 @@ fn find_marker_matching<T>(
     }
 }
 
+/// [`find_marker`] for the many directories one event names: every directory
+/// a lookup passes through keeps its answer (and its [`checkout_root`]), so a
+/// deep tree costs one probe per directory rather than one walk per lookup.
+/// Each filesystem probe first calls the caller's `spend`; when that refuses,
+/// the lookup stops with `None`.
+pub(crate) struct MarkerMemo {
+    home: Option<PathBuf>,
+    governing: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    checkouts: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    /// Directories known to exist: one a probe found, and every ancestor of
+    /// it.
+    directories: std::collections::HashSet<PathBuf>,
+}
+
+impl MarkerMemo {
+    pub(crate) fn with_home(home: Option<&Path>) -> Self {
+        Self {
+            home: home.map(absolute_normalized),
+            governing: std::collections::HashMap::new(),
+            checkouts: std::collections::HashMap::new(),
+            directories: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Records that `dir` exists, and with it every ancestor.
+    pub(crate) fn note_directory(&mut self, dir: &Path) {
+        for ancestor in absolute_normalized(dir).ancestors() {
+            if !self.directories.insert(ancestor.to_path_buf()) {
+                break;
+            }
+        }
+    }
+
+    /// The nearest existing directory at or above `path` (an existing path's
+    /// parent when it is not a directory), probing only what is not known
+    /// already; `path` is taken as given, never joined to the process's own
+    /// directory; `Some(None)` when there is none, `None` when `spend` refuses
+    /// a probe first.
+    pub(crate) fn existing_dir(
+        &mut self,
+        path: &Path,
+        spend: &mut dyn FnMut() -> Option<()>,
+    ) -> Option<Option<PathBuf>> {
+        let mut candidate = path;
+        loop {
+            if self.directories.contains(candidate) {
+                return Some(Some(candidate.to_path_buf()));
+            }
+            spend()?;
+            if candidate.is_dir() {
+                self.note_directory(candidate);
+                return Some(Some(candidate.to_path_buf()));
+            }
+            match candidate.parent() {
+                Some(parent) => candidate = parent,
+                None => return Some(None),
+            }
+        }
+    }
+
+    /// The marker [`find_marker`] finds from `dir`; `None` when `spend`
+    /// refuses a probe first.
+    pub(crate) fn find_marker(
+        &mut self,
+        dir: &Path,
+        spend: &mut dyn FnMut() -> Option<()>,
+    ) -> Option<Option<PathBuf>> {
+        let mut current = absolute_normalized(dir);
+        let mut chain = Vec::new();
+        let found = loop {
+            if let Some(known) = self.governing.get(&current) {
+                break known.clone();
+            }
+            spend()?;
+            let candidate = current.join(MARKER_FILENAME);
+            if candidate.is_file() {
+                chain.push(current);
+                break Some(candidate);
+            }
+            // The same boundary as `find_marker_matching`: `$HOME` for a
+            // directory inside it, else the nearest `.git` root (the
+            // directory itself outside any checkout), else the filesystem
+            // root when home is unknown.
+            let boundary = match self.home.as_deref() {
+                Some(home) if current.starts_with(home) => current == home,
+                // Below a directory known to lie in no checkout, this one is
+                // a checkout root or in none: a boundary either way.
+                Some(_) => {
+                    current
+                        .parent()
+                        .is_some_and(|parent| matches!(self.checkouts.get(parent), Some(None)))
+                        || self
+                            .checkout_root(&current, spend)?
+                            .is_none_or(|root| root == current)
+                }
+                None => false,
+            };
+            let parent = current.parent().map(Path::to_path_buf);
+            chain.push(current);
+            match parent {
+                Some(parent)
+                    if !boundary
+                        && Some(parent.as_path()) != chain.last().map(PathBuf::as_path) =>
+                {
+                    current = parent;
+                }
+                _ => break None,
+            }
+        };
+        for dir in chain {
+            self.governing.insert(dir, found.clone());
+        }
+        Some(found)
+    }
+
+    /// Records the marker an earlier [`find_marker`] found from `dir`, for
+    /// `dir` and every directory that walk passed: up to the marker's own
+    /// directory, or to the walk's boundary when it found none. Call it after
+    /// [`Self::checkout_root`] of `dir`, which that boundary may need.
+    pub(crate) fn remember(&mut self, dir: &Path, marker: Option<&Path>) {
+        let start = absolute_normalized(dir);
+        let stop = match marker {
+            Some(marker) => marker.parent().map(absolute_normalized),
+            None => match self.home.as_deref() {
+                Some(home) if start.starts_with(home) => Some(home.to_path_buf()),
+                Some(_) => self.checkouts.get(&start).cloned().flatten(),
+                None => None,
+            },
+        };
+        // Outside a checkout (or for a marker not above `dir`) the walk
+        // checked `dir` alone.
+        let stop = match (marker, &stop) {
+            (_, Some(stop)) if start.starts_with(stop) => Some(stop.clone()),
+            (None, None) if self.home.is_none() => None,
+            _ => Some(start.clone()),
+        };
+        let mut current = Some(start.as_path());
+        while let Some(dir) = current {
+            self.governing
+                .insert(dir.to_path_buf(), marker.map(Path::to_path_buf));
+            if Some(dir) == stop.as_deref() {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
+
+    /// [`checkout_root`] of `dir`, remembered for every directory passed.
+    pub(crate) fn checkout_root(
+        &mut self,
+        dir: &Path,
+        spend: &mut dyn FnMut() -> Option<()>,
+    ) -> Option<Option<PathBuf>> {
+        let mut current = absolute_normalized(dir);
+        let mut chain = Vec::new();
+        let found = loop {
+            if let Some(known) = self.checkouts.get(&current) {
+                break known.clone();
+            }
+            spend()?;
+            if current.join(".git").exists() {
+                let root = current.clone();
+                chain.push(current);
+                break Some(root);
+            }
+            let parent = current.parent().map(Path::to_path_buf);
+            chain.push(current);
+            match parent {
+                Some(parent) if Some(parent.as_path()) != chain.last().map(PathBuf::as_path) => {
+                    current = parent;
+                }
+                _ => break None,
+            }
+        };
+        for dir in chain {
+            self.checkouts.insert(dir, found.clone());
+        }
+        Some(found)
+    }
+}
+
 /// Whether a marker's raw text declares anything beyond a `[capture]`
 /// section: any root-level scope key (`workspace`/`project`/
 /// `project_strategy`), or any of the other settings
 /// `hook_capture::marker_query_suffix_impl` forwards (`[recall]
-/// default_global`, `[briefing]` keys, top-level `drop_subagent_captures`).
+/// default_global`, `[briefing]` and `[profile]` keys, top-level
+/// `drop_subagent_captures`).
 /// A marker with any of these is a resolution boundary; only a marker whose
 /// only content is `[capture]` (e.g. `ignore_paths`) is transparent (#668).
 ///
@@ -198,14 +1219,21 @@ fn find_marker_matching<T>(
 /// the file. That is conservative on purpose: it can only turn a marker INTO
 /// a boundary, never wrongly make one transparent.
 fn declares_more_than_capture(text: &str) -> bool {
-    const QUOTED_KEYS: [&str; 5] = [
+    const QUOTED_KEYS: [&str; 6] = [
         "workspace",
         "project",
         "project_strategy",
         "drop_subagent_captures",
         "identity",
+        "identity_style",
     ];
-    const FLAG_KEYS: [&str; 3] = ["default_global", "inject_on_session_start", "max_chars"];
+    const FLAG_KEYS: [&str; 5] = [
+        "default_global",
+        "inject_on_session_start",
+        "max_chars",
+        "contribute",
+        "consume",
+    ];
     QUOTED_KEYS
         .iter()
         .any(|key| parse_key_in(text, key).is_some())
@@ -213,6 +1241,11 @@ fn declares_more_than_capture(text: &str) -> bool {
             .iter()
             .any(|key| parse_flag_in(text, key).is_some())
         || server_selection_in(text).is_some()
+        || text.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix("aliases")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
 }
 
 /// A marker's `server = "<profile>"` selection (#992), and the directory of
@@ -342,7 +1375,7 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     stack.into_iter().collect()
 }
 
-fn checkout_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn checkout_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start;
     loop {
         if dir.join(".git").exists() {
@@ -381,6 +1414,15 @@ fn parse_key_in(text: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn parse_aliases_in(
+    text: &str,
+) -> Result<
+    Option<ai_memory_core::repository_identity::MarkerAliases>,
+    ai_memory_core::repository_identity::MarkerAliasError,
+> {
+    ai_memory_core::repository_identity::parse_marker_aliases(text)
 }
 
 /// Parse a root-level `key = <value>` line, accepting a quoted string
@@ -425,6 +1467,15 @@ pub(crate) fn is_truthy(value: &str) -> bool {
     )
 }
 
+/// An explicitly falsy marker flag, for settings that stay on unless turned
+/// off (`[profile] contribute` / `consume`), matching the server's reading.
+pub(crate) fn is_falsy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +1501,93 @@ mod tests {
             Some(marker),
             "a marker in any ancestor wins"
         );
+    }
+
+    /// The memoized lookup answers exactly as `find_marker` does from every
+    /// directory, inside home and outside it, in and out of a checkout, with
+    /// and without a home; each directory costs one probe of each kind at
+    /// most, however many lookups pass it, and directories an earlier walk
+    /// already covered (`remember`) cost none.
+    #[test]
+    fn marker_memo_answers_like_find_marker_once_per_directory() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let dirs = [
+            home.join("p").join("q").join("r"),
+            home.join("s").join("t"),
+            root.join("out").join("repo").join("u").join("v"),
+            root.join("out").join("repo").join("w").join("z"),
+            root.join("out").join("norepo").join("x").join("y"),
+        ];
+        for dir in &dirs {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(root.join("out").join("repo").join(".git")).unwrap();
+        for marked in [
+            home.join("p"),
+            root.join("out").join("repo"),
+            root.join("out").join("repo").join("w"),
+            root.join("out").join("norepo").join("x"),
+        ] {
+            write_marker(&marked, "workspace = \"w\"\n");
+        }
+        let every: Vec<PathBuf> = dirs
+            .iter()
+            .flat_map(|dir| dir.ancestors().take_while(|a| a.starts_with(&root)))
+            .map(Path::to_path_buf)
+            .collect();
+        for home in [Some(home.as_path()), None] {
+            let mut memo = MarkerMemo::with_home(home);
+            let mut probes = 0;
+            for dir in &every {
+                let found = memo.find_marker(dir, &mut || {
+                    probes += 1;
+                    Some(())
+                });
+                assert_eq!(
+                    found,
+                    Some(find_marker_with_home(dir.to_str().unwrap(), home)),
+                    "{dir:?} with home {home:?}"
+                );
+            }
+            let levels = every
+                .iter()
+                .map(|dir| dir.components().count())
+                .sum::<usize>();
+            assert!(
+                probes <= 2 * every.len() + 2 * root.components().count(),
+                "{probes}"
+            );
+            assert!(probes < levels, "{probes} probes, {levels} levels");
+            // A refused probe stops the lookup.
+            let mut fresh = MarkerMemo::with_home(home);
+            assert_eq!(fresh.find_marker(&dirs[0], &mut || None), None);
+            // What an earlier walk found costs nothing to look up again.
+            for dir in &dirs {
+                let mut seeded = MarkerMemo::with_home(home);
+                if home.is_none() || !dir.starts_with(home.unwrap()) {
+                    seeded.checkout_root(dir, &mut || Some(()));
+                }
+                let found = find_marker_with_home(dir.to_str().unwrap(), home);
+                seeded.remember(dir, found.as_deref());
+                for ancestor in dir.ancestors().take_while(|a| a.starts_with(&root)) {
+                    let mut spent = false;
+                    let answer = seeded.find_marker(ancestor, &mut || {
+                        spent = true;
+                        Some(())
+                    });
+                    assert_eq!(
+                        answer,
+                        Some(find_marker_with_home(ancestor.to_str().unwrap(), home)),
+                        "{ancestor:?} below {dir:?} with home {home:?}"
+                    );
+                    if ancestor == dir.as_path() {
+                        assert!(!spent, "{dir:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -484,6 +1622,32 @@ mod tests {
         assert!(outer_marker.exists());
     }
 
+    /// A `$HOME` ending in a separator is the same boundary. The hook scripts
+    /// mirror this.
+    #[test]
+    fn a_trailing_separator_on_home_keeps_the_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("org").join("repo");
+        let plain = home.join("plain");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&plain).unwrap();
+        let org_marker = write_marker(&home.join("org"), "workspace = \"org\"\n");
+        write_marker(tmp.path(), "workspace = \"above\"\nserver = \"x\"\n");
+        let slashed = PathBuf::from(format!("{}/", home.display()));
+
+        assert_eq!(
+            find_marker_with_home(repo.to_str().unwrap(), Some(&slashed)),
+            Some(org_marker)
+        );
+        assert_eq!(
+            find_marker_with_home(plain.to_str().unwrap(), Some(&slashed)),
+            None,
+            "a marker above home must not leak in"
+        );
+        assert!(find_server_selection(plain.to_str().unwrap(), Some(&slashed)).is_none());
+    }
+
     #[test]
     fn marker_walk_outside_home_checks_only_cwd_without_a_checkout() {
         let tmp = TempDir::new().unwrap();
@@ -507,6 +1671,468 @@ mod tests {
 
     /// Happy-path TOML parser: extracts each declared root-level
     /// `key = "value"` pair. Mirrors the shell `ai_memory_parse_toml_key`.
+    #[test]
+    fn marker_aliases_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../ai-memory-core/fixtures/remote_identity_cases.json"
+        ))
+        .unwrap();
+        for case in cases["marker_aliases"].as_array().unwrap() {
+            let parsed = parse_aliases_in(case["toml"].as_str().unwrap());
+            match case["status"].as_str().unwrap() {
+                "valid" => {
+                    let got = parsed.unwrap().unwrap().as_slice().to_vec();
+                    let expected = case["aliases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>();
+                    assert_eq!(got, expected, "{}", case["toml"]);
+                }
+                "absent" => assert_eq!(parsed.unwrap(), None, "{}", case["toml"]),
+                "invalid" => assert!(parsed.is_err(), "{}", case["toml"]),
+                status => panic!("unknown fixture status {status}"),
+            }
+        }
+    }
+
+    #[test]
+    fn home_routes_match_the_shared_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../ai-memory-core/fixtures/home_route_cases.json"
+        ))
+        .unwrap();
+        let home = Path::new("/home/operator");
+        for case in fixture["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let generated = case["generate"].as_str();
+            let text = match generated {
+                Some("65_routes") => (0..65)
+                    .map(|index| format!("[routes.path.\"/route/{index}\"]\nroute_workspace=\"ws\"\nroute_project=\"p{index}\"\n"))
+                    .collect(),
+                Some("selector_512") => format!(
+                    "[routes.path.\"/{}\"]\nroute_workspace=\"bounds\"\nroute_project=\"valid\"\n",
+                    "a".repeat(511)
+                ),
+                Some("selector_513") => format!(
+                    "[routes.path.\"/{}\"]\nroute_workspace=\"bounds\"\nroute_project=\"invalid\"\n",
+                    "a".repeat(512)
+                ),
+                Some("oversized_file") => format!("#{}\n", "x".repeat(MAX_HOME_ROUTE_FILE_BYTES)),
+                Some(other) => panic!("unknown fixture generator {other}"),
+                None => case["toml"]
+                    .as_str()
+                    .unwrap()
+                    .replace("{{HOME}}", home.to_str().unwrap())
+                    .replace("{{LONG_513}}", &"a".repeat(513)),
+            };
+            let parsed = HomeRoutes::parse(&text, home);
+            if case["status"] == "invalid" {
+                assert!(
+                    parsed.is_err() || text.len() > MAX_HOME_ROUTE_FILE_BYTES,
+                    "{name}"
+                );
+                continue;
+            }
+            let routes = parsed.unwrap();
+            let cwd = match case["cwd_generate"].as_str() {
+                Some("selector_512_child") => format!("/{}/child", "a".repeat(511)),
+                Some(other) => panic!("unknown cwd fixture generator {other}"),
+                None => case["cwd"]
+                    .as_str()
+                    .unwrap()
+                    .replace("{{HOME}}", home.to_str().unwrap()),
+            };
+            let identity = case["identity"]
+                .as_str()
+                .map(|identity| RepositoryIdentity {
+                    identity: identity.to_owned(),
+                    source: IdentitySource::GitRemote,
+                });
+            let selected = routes.select(&cwd, identity.as_ref()).unwrap();
+            if case["status"] == "none" {
+                assert!(selected.is_none(), "{name}");
+            } else {
+                let (route, source) = selected.unwrap_or_else(|| panic!("{name}"));
+                assert_eq!(
+                    route.workspace,
+                    case["workspace"].as_str().unwrap(),
+                    "{name}"
+                );
+                assert_eq!(route.project, case["project"].as_str().unwrap(), "{name}");
+                assert_eq!(
+                    source,
+                    if case["source"] == "identity" {
+                        RoutingSource::HomeIdentityRoute
+                    } else {
+                        RoutingSource::HomePathRoute
+                    },
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn home_routes_prefer_identity_then_longest_component_path() {
+        let home = Path::new("/home/operator");
+        let routes = HomeRoutes::parse(
+            r#"
+[routes.path."~/src"]
+route_workspace = "path"
+route_project = "broad"
+[routes.path."~/src/api"]
+route_workspace = "path"
+route_project = "api"
+[routes.identity."github.com/acme/api"]
+route_workspace = "identity"
+route_project = "acme-api"
+route_identity_style = "path"
+route_aliases = ["main"]
+"#,
+            home,
+        )
+        .unwrap();
+        let identity = RepositoryIdentity {
+            identity: "github.com/acme/api".into(),
+            source: IdentitySource::GitRemote,
+        };
+        let (route, source) = routes
+            .select("/home/operator/src/api/crate", Some(&identity))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, RoutingSource::HomeIdentityRoute);
+        assert_eq!(route.workspace, "identity");
+        assert_eq!(route.project, "acme-api");
+        assert_eq!(route.identity_style, Some(IdentityStyle::Path));
+        assert_eq!(route.aliases.as_slice(), &["main"]);
+
+        let (route, source) = routes
+            .select("/home/operator/src/api/crate", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, RoutingSource::HomePathRoute);
+        assert_eq!(route.project, "api");
+        assert!(
+            routes
+                .select("/home/operator/src/api-sibling", None)
+                .unwrap()
+                .is_some_and(|(route, _)| route.project == "broad")
+        );
+        assert!(
+            routes
+                .select("/home/operator/src-api", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn home_routes_keep_forges_and_platform_path_roots_distinct() {
+        let routes = HomeRoutes::parse(
+            r#"
+[routes.identity."github.com/acme/api"]
+route_workspace = "oss"
+route_project = "github-api"
+[routes.identity."gitlab.com/acme/api"]
+route_workspace = "oss"
+route_project = "gitlab-api"
+[routes.path."C:/Work/API"]
+route_workspace = "win"
+route_project = "drive"
+[routes.path."//Server/Share/API"]
+route_workspace = "win"
+route_project = "unc"
+"#,
+            Path::new("C:/Users/tester"),
+        )
+        .unwrap();
+        for (identity, expected) in [
+            ("github.com/acme/api", "github-api"),
+            ("gitlab.com/acme/api", "gitlab-api"),
+        ] {
+            let remote = RepositoryIdentity {
+                identity: identity.into(),
+                source: IdentitySource::GitRemote,
+            };
+            assert_eq!(
+                routes
+                    .select("C:/elsewhere", Some(&remote))
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .project,
+                expected
+            );
+        }
+        assert_eq!(
+            routes
+                .select(r"c:\work\api\src", None)
+                .unwrap()
+                .unwrap()
+                .0
+                .project,
+            "drive"
+        );
+        assert_eq!(
+            routes
+                .select(r"\\server\share\api\src", None)
+                .unwrap()
+                .unwrap()
+                .0
+                .project,
+            "unc"
+        );
+    }
+
+    #[test]
+    fn malformed_duplicate_and_ambiguous_home_routes_fail_closed() {
+        let home = Path::new("/home/operator");
+        for text in [
+            "[routes.identity.\"api\"]\nroute_workspace=\"oss\"\nroute_project=\"api\"\n",
+            "[routes.path.\"relative/api\"]\nroute_workspace=\"oss\"\nroute_project=\"api\"\n",
+            "[routes.path.\"~/api\"]\nroute_workspace=\"Bad\"\nroute_project=\"api\"\n",
+            "[routes.path.\"~/api\"]\nroute_workspace=\"oss\"\nroute_project=\"api\"\nroute_aliases=[\"../bad\"]\n",
+            "[routes.path.\"~/api\"]\nroute_workspace=\"oss\"\nroute_project=\"api\"\nunknown=\"x\"\n",
+        ] {
+            assert!(HomeRoutes::parse(text, home).is_err(), "{text}");
+        }
+        let duplicate = "[routes.identity.\"github.com/acme/api\"]\nroute_workspace=\"oss\"\nroute_project=\"api\"\n[routes.identity.\"github.com/acme/api\"]\nroute_workspace=\"other\"\nroute_project=\"other\"\n";
+        assert!(HomeRoutes::parse(duplicate, home).is_err());
+        let escaped =
+            "[routes.path.\"C:\\\\Work\\\\API\"]\nroute_workspace=\"oss\"\nroute_project=\"api\"\n";
+        assert!(HomeRoutes::parse(escaped, home).is_err());
+        let too_many = (0..=MAX_HOME_ROUTES)
+            .map(|index| format!("[routes.path.\"/route/{index}\"]\nroute_workspace=\"oss\"\nroute_project=\"route-{index}\"\n"))
+            .collect::<String>();
+        assert!(HomeRoutes::parse(&too_many, home).is_err());
+
+        let routes = HomeRoutes {
+            identities: Vec::new(),
+            paths: vec![
+                PathRoute {
+                    selector: PathSelector::parse("~/api", home).unwrap(),
+                    route: HomeRoute {
+                        workspace: "one".into(),
+                        project: "one".into(),
+                        identity_style: None,
+                        aliases: MarkerAliases::default(),
+                    },
+                },
+                PathRoute {
+                    selector: PathSelector::parse("/home/operator/api", home).unwrap(),
+                    route: HomeRoute {
+                        workspace: "two".into(),
+                        project: "two".into(),
+                        identity_style: None,
+                        aliases: MarkerAliases::default(),
+                    },
+                },
+            ],
+        };
+        assert!(routes.select("/home/operator/api", None).is_err());
+    }
+
+    #[test]
+    fn home_route_selection_works_outside_home_and_local_marker_wins() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside/repo");
+        fs::create_dir_all(outside.join(".git")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        write_marker(
+            &home,
+            &format!(
+                "workspace = \"fallback\"\nproject = \"fallback\"\n[routes.path.\"{}\"]\nroute_workspace = \"routed\"\nroute_project = \"outside\"\n",
+                outside.to_string_lossy().replace('\\', "/")
+            ),
+        );
+        let selected = routing_selection_with_home(
+            outside.to_str().unwrap(),
+            outside.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.source, RoutingSource::HomePathRoute);
+        assert_eq!(selected.fields.workspace.as_deref(), Some("routed"));
+        assert_eq!(selected.fields.project.as_deref(), Some("outside"));
+
+        write_marker(&outside, "workspace = \"local\"\nproject = \"repo\"\n");
+        let selected = routing_selection_with_home(
+            outside.to_str().unwrap(),
+            outside.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.source, RoutingSource::LocalMarker);
+        assert_eq!(selected.fields.workspace.as_deref(), Some("local"));
+        assert_eq!(selected.fields.project.as_deref(), Some("repo"));
+    }
+
+    #[test]
+    fn home_identity_route_forwards_aliases_only_with_remote_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["remote", "add", "origin", "git@github.com:acme/api.git"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        write_marker(
+            &home,
+            "[routes.identity.\"github.com/acme/api\"]\nroute_workspace=\"oss\"\nroute_project=\"acme-api\"\nroute_identity_style=\"path\"\nroute_aliases=[\"main\"]\n",
+        );
+        let selected = routing_selection_with_home(
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.source, RoutingSource::HomeIdentityRoute);
+        assert_eq!(selected.fields.project.as_deref(), Some("acme-api"));
+        assert_eq!(selected.fields.identity_style.as_deref(), Some("path"));
+        assert_eq!(
+            selected.fields.aliases.unwrap().unwrap().as_slice(),
+            &["main"]
+        );
+        assert_eq!(
+            selected.remote_identity.unwrap().identity,
+            "github.com/acme/api"
+        );
+    }
+
+    #[test]
+    fn home_root_settings_remain_the_fallback_without_a_route_match() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let checkout = tmp.path().join("outside/repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        write_marker(
+            &home,
+            "workspace = \"fallback\"\nproject = \"fallback\"\n[routes.path.\"~/src\"]\nroute_workspace = \"oss\"\nroute_project = \"api\"\n",
+        );
+        let selected = routing_selection_with_home(
+            checkout.to_str().unwrap(),
+            checkout.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.source, RoutingSource::HomeRoot);
+        assert_eq!(selected.fields.workspace.as_deref(), Some("fallback"));
+        assert_eq!(selected.fields.project.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn matched_home_route_replaces_only_routing_fields() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let checkout = home.join("src/api/lib");
+        fs::create_dir_all(&checkout).unwrap();
+        write_marker(
+            &home,
+            "workspace=\"wrong\"\nproject=\"wrong\"\nproject_strategy=\"repo-root\"\ndrop_subagent_captures=\"true\"\n[recall]\ndefault_global=true\n[briefing]\ninject_on_session_start=true\nmax_chars=3210\n[profile]\ncontribute=true\nconsume=false\n[routes.path.\"~/src/api\"]\nroute_workspace=\"right\"\nroute_project=\"api\"\n",
+        );
+        let selected = routing_selection_with_home(
+            checkout.to_str().unwrap(),
+            checkout.to_str().unwrap(),
+            Some(&home),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.fields.workspace.as_deref(), Some("right"));
+        assert_eq!(selected.fields.project.as_deref(), Some("api"));
+        assert_eq!(selected.fields.project_strategy, None);
+        let text = fs::read_to_string(selected.path).unwrap();
+        assert_eq!(
+            parse_key_in(&text, "drop_subagent_captures").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            parse_flag_in(&text, "default_global").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            parse_flag_in(&text, "inject_on_session_start").as_deref(),
+            Some("true")
+        );
+        assert_eq!(parse_flag_in(&text, "consume").as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn recognized_root_scalars_require_one_exact_quoted_value() {
+        for line in [
+            "workspace = \"wrong\" junk \"x\"",
+            "workspace = \"wrong\" # comment",
+            "workspace = \"wrong\"\"x\"",
+            "workspace = wrong",
+        ] {
+            assert!(recognizable_malformed_root_line(line), "{line}");
+        }
+        assert!(!recognizable_malformed_root_line("workspace = \"valid\""));
+    }
+
+    #[test]
+    fn malformed_home_routes_do_not_fall_through_to_root_home_scope() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let checkout = tmp.path().join("outside/repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        write_marker(
+            &home,
+            "workspace = \"wrong\"\nproject = \"wrong\"\n[routes.path.\"relative\"]\nroute_workspace = \"oss\"\nroute_project = \"api\"\n",
+        );
+        assert!(
+            routing_selection_with_home(
+                checkout.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+                Some(&home),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn old_root_parser_ignores_namespaced_route_fields() {
+        let text = r#"
+[routes.identity."github.com/acme/api"]
+route_workspace = "oss"
+route_project = "acme-api"
+route_identity_style = "path"
+route_aliases = ["main"]
+"#;
+        assert_eq!(parse_key_in(text, "workspace"), None);
+        assert_eq!(parse_key_in(text, "project"), None);
+        assert_eq!(parse_key_in(text, "identity_style"), None);
+        assert_eq!(parse_aliases_in(text).unwrap(), None);
+    }
+
     #[test]
     fn parse_toml_key_extracts_root_level_strings() {
         let tmp = TempDir::new().unwrap();
@@ -587,6 +2213,9 @@ project = "infra" # this is fine
             workspace: None,
             project: None,
             project_strategy: None,
+            identity: None,
+            identity_style: None,
+            remote_identity: None,
         };
 
         for spelling in ["repo-root", "repo_root"] {
@@ -621,6 +2250,7 @@ project = "infra" # this is fine
         write_marker(&inner, "[capture]\nignore_paths = [\"secret/**\"]\n");
 
         let scope = read_scope(inner.to_str().unwrap(), &RuntimeEnv::default())
+            .unwrap()
             .expect("the outer marker still declares scope");
         assert_eq!(scope.workspace.as_deref(), Some("acme"));
         assert_eq!(scope.project.as_deref(), Some("infra"));
@@ -632,8 +2262,8 @@ project = "infra" # this is fine
     }
 
     /// When every marker in the ancestor chain is capture-only (or none
-    /// exist), behavior is unchanged from before #668: `read_scope` returns
-    /// `None` so the caller falls back to `DEFAULT_WORKSPACE` + repo-root.
+    /// exist), `read_scope` returns `None` so the caller uses the normal
+    /// remote-path identity, or the cwd basename when no valid remote exists.
     #[test]
     fn read_scope_still_none_when_only_capture_only_markers_exist() {
         let tmp = TempDir::new().unwrap();
@@ -643,7 +2273,7 @@ project = "infra" # this is fine
         write_marker(&inner, "[capture]\nignore_paths = [\"other/**\"]\n");
 
         assert_eq!(
-            read_scope(inner.to_str().unwrap(), &RuntimeEnv::default()),
+            read_scope(inner.to_str().unwrap(), &RuntimeEnv::default()).unwrap(),
             None
         );
     }
@@ -662,10 +2292,49 @@ project = "infra" # this is fine
         write_marker(&inner, "[briefing]\ninject_on_session_start = true\n");
 
         assert_eq!(
-            read_scope(inner.to_str().unwrap(), &RuntimeEnv::default()),
+            read_scope(inner.to_str().unwrap(), &RuntimeEnv::default()).unwrap(),
             None,
             "a briefing-only marker is a settings boundary: it stops the walk \
              but declares no scope of its own"
+        );
+    }
+
+    #[test]
+    fn strict_inspection_rejects_invalid_routing_without_exposing_fields() {
+        let tmp = TempDir::new().unwrap();
+        let inner = tmp.path().join("sub");
+        fs::create_dir_all(&inner).unwrap();
+        write_marker(
+            tmp.path(),
+            "workspace = [\nproject = \"private-project\"\nidentity = \"private/identity\"\n",
+        );
+
+        let inspection = inspect_scope(inner.to_str().unwrap(), &RuntimeEnv::default());
+        assert_eq!(inspection.status, "invalid");
+        assert!(inspection.scope.is_none());
+        assert!(inspection.fields.workspace.is_none());
+        assert!(inspection.fields.project.is_none());
+        assert!(inspection.fields.identity.is_none());
+    }
+
+    #[test]
+    fn strict_inspection_uses_the_same_capture_only_walk_as_scope_resolution() {
+        let tmp = TempDir::new().unwrap();
+        write_marker(
+            tmp.path(),
+            "workspace = \"acme\"\nproject = \"infra\"\nidentity_style = \"path\"\n",
+        );
+        let inner = tmp.path().join("sub");
+        fs::create_dir_all(&inner).unwrap();
+        write_marker(&inner, "[capture]\nignore_paths = [\"secret/**\"]\n");
+
+        let inspection = inspect_scope(inner.to_str().unwrap(), &RuntimeEnv::default());
+        assert_eq!(inspection.status, "valid");
+        assert_eq!(inspection.fields.workspace.as_deref(), Some("acme"));
+        assert_eq!(inspection.fields.project.as_deref(), Some("infra"));
+        assert_eq!(
+            inspection.scope,
+            read_scope(inner.to_str().unwrap(), &RuntimeEnv::default()).unwrap()
         );
     }
 

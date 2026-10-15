@@ -15,7 +15,9 @@ use secrecy::SecretString;
 use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
-use crate::openai::{OpenAiProvider, RequestDialect, enforce_strict_object_schemas};
+use crate::openai::{
+    OpenAiProvider, RequestDialect, enforce_strict_object_schemas, is_length_truncated,
+};
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
@@ -99,6 +101,21 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Send `chat_template_kwargs: {"enable_thinking": false}` with every
+    /// request, for thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models): the engine otherwise spends the output budget
+    /// on a reasoning pass before the structured payload and can truncate
+    /// it. The factory calls this with
+    /// `ProviderConfig::compat_disable_thinking`; `new` defaults it off so
+    /// existing vLLM / Ollama / LM Studio setups are unchanged. Forwarded
+    /// to the inner Chat Completions client, where the `Compat` dialect
+    /// gate keeps it off the wire for every other dialect.
+    #[must_use]
+    pub fn with_disable_thinking(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_disable_thinking(enabled);
+        self
+    }
+
     /// Repoint the wrapped [`OpenAiProvider`] at another base URL.
     ///
     /// For a wrapper that constructs with a product default and lets the
@@ -146,6 +163,21 @@ impl OpenAiCompatProvider {
         operation_id: &'static str,
     ) -> Self {
         self.inner = self.inner.with_client_headers(user_agent, operation_id);
+        self
+    }
+
+    /// Send `X-Request-Id` with the logical operation id on every chat
+    /// attempt, for gateways that record it (for example as `req=<id>`) and
+    /// forward it to the engine. The id is shared by every attempt of one
+    /// operation — the strict-to-tolerant fallback reuses it, so one
+    /// operation is correlatable end to end. Enabled by the factory only
+    /// for the configured `openai-compat` provider;
+    /// [`crate::OpenCodeProvider`] keeps its own `x-opencode-session`
+    /// contract and does not set it. A static `AI_MEMORY_LLM_HEADERS` entry
+    /// for this name is refused at startup on that path.
+    #[must_use]
+    pub(crate) fn with_request_id_header(mut self) -> Self {
+        self.inner = self.inner.with_request_id_header();
         self
     }
     /// Endpoint the inner client will call. Test-visible so
@@ -267,10 +299,26 @@ impl OpenAiCompatProvider {
         // Default (and strict fallback): most older local engines don't
         // honour `response_format`. Ask for JSON and extract the first
         // balanced `{…}` object from the text.
-        let res = self
+        let (res, finish_reason) = self
             .inner
-            .complete_with_operation_id(request, operation_id)
+            .complete_with_operation_id_and_finish_reason(request, operation_id)
             .await?;
+        // A `length` stop means the engine hit its output budget before
+        // the JSON could finish (the Qwen3-with-thinking-on case this
+        // guard exists for). Terminal and content-free: a tolerant retry
+        // would just re-truncate and double the token spend, and the old
+        // `unexpected-shape` / `serde` classes pointed at the wrong cause.
+        if is_length_truncated(finish_reason.as_deref()) {
+            return Err(LlmError::TruncatedResponse {
+                model: res.model,
+                completion_tokens: res.usage.as_ref().map(|u| u.output_tokens),
+            });
+        }
+        // No content at all (missing, empty, or whitespace-only) is a
+        // distinct terminal failure: nothing was produced to parse.
+        if res.text.trim().is_empty() {
+            return Err(LlmError::EmptyContent { model: res.model });
+        }
         // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
         // `<think>…</think>` before the JSON. Strip those blocks (and any
         // surrounding markdown fences) before trying to parse — otherwise
@@ -373,6 +421,180 @@ fn first_json_object(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::SecretString;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn chat_response_with_content(content: &str) -> serde_json::Value {
+        json!({
+            "model": "model-x",
+            "choices": [{
+                "message": { "content": content },
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+        })
+    }
+
+    fn request_id_of(request: &wiremock::Request) -> Option<String> {
+        request
+            .headers
+            .get(crate::openai::REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// Acceptance (a): the header is present on the wire in the accepted
+    /// format — a 36-character `[A-Za-z0-9._:-]` value (UUID v7 display
+    /// string) well inside the 64-character header contract — and it carries
+    /// exactly the operation's id, as a single value.
+    #[tokio::test]
+    async fn the_request_id_header_carries_the_operation_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_content("ok")),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(server.uri(), None, "model-x")
+            .expect("provider builds")
+            .with_request_id_header();
+        let operation_id = LlmOperationId::new();
+        provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let value = request_id_of(&requests[0]).expect("x-request-id is on the wire");
+        assert_eq!(value, operation_id.to_string());
+        // Exactly one value: `reqwest` appends, so a duplicate would be two.
+        assert_eq!(
+            requests[0]
+                .headers
+                .get_all(crate::openai::REQUEST_ID_HEADER)
+                .into_iter()
+                .count(),
+            1
+        );
+        // Accepted format: 36-char UUID v7, inside the <=64 char contract.
+        assert_eq!(value.len(), 36, "UUID display form is 36 characters");
+        assert!(
+            value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')),
+            "the gateway accepts [A-Za-z0-9._:-]: {value:?}"
+        );
+        let uuid = uuid::Uuid::parse_str(&value).expect("valid UUID");
+        assert_eq!(uuid.get_version_num(), 7, "time-ordered v7 id");
+    }
+
+    /// Acceptance (b): the strict-to-tolerant fallback is a SECOND HTTP
+    /// call of the same operation — both attempts must carry the same
+    /// `x-request-id`, and only that value.
+    #[tokio::test]
+    async fn the_strict_fallback_reuses_the_request_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body is JSON");
+                if body.get("response_format").is_some() {
+                    ResponseTemplate::new(400)
+                        .set_body_string("unsupported parameter: response_format")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(chat_response_with_content(r#"{"ok":true}"#))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(server.uri(), None, "model-x")
+            .expect("provider builds")
+            .with_strict(true)
+            .with_request_id_header();
+        let operation_id = LlmOperationId::new();
+        let value = provider
+            .complete_structured_raw_with_operation_id(
+                ChatRequest::user_prompt("emit JSON"),
+                json!({
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"],
+                }),
+                operation_id,
+            )
+            .await
+            .expect("the tolerant fallback parses the JSON");
+
+        assert_eq!(value, json!({ "ok": true }));
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 2, "strict attempt + tolerant fallback");
+        let expected = operation_id.to_string();
+        for request in &requests {
+            assert_eq!(
+                request_id_of(request),
+                Some(expected.clone()),
+                "every attempt of one operation carries the same id"
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get_all(crate::openai::REQUEST_ID_HEADER)
+                    .into_iter()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// Acceptance (e): `opencode` routes through this wrapper internally but
+    /// keeps its own `x-opencode-session` contract — it must NOT gain the
+    /// `x-request-id` header.
+    #[tokio::test]
+    async fn the_opencode_transport_keeps_its_contract_without_a_request_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_content("ok")),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = crate::OpenCodeProvider::new(SecretString::from("sk-test"), "model-x")
+            .expect("provider builds")
+            .with_base_url(server.uri());
+        let operation_id = LlmOperationId::new();
+        provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(crate::opencode::OPENCODE_SESSION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(operation_id.to_string().as_str()),
+            "the x-opencode-session contract is preserved"
+        );
+        assert!(
+            requests[0]
+                .headers
+                .get(crate::openai::REQUEST_ID_HEADER)
+                .is_none(),
+            "opencode must not gain the openai-compat x-request-id header"
+        );
+    }
 
     /// The low-level constructor stays tolerant so wrappers can choose their
     /// own compatibility policy; runtime configuration supplies the default.
@@ -383,6 +605,18 @@ mod tests {
         assert!(!p.strict);
         let p = p.with_strict(true);
         assert!(p.strict);
+    }
+
+    /// The thinking switch is opt-in at the wrapper too: `new` leaves it
+    /// off (existing vLLM / Ollama / LM Studio setups are unchanged) and
+    /// `with_disable_thinking` forwards it to the inner client.
+    #[test]
+    fn disable_thinking_defaults_off_and_reaches_the_inner_provider() {
+        let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "qwen3.8-27b")
+            .expect("provider builds");
+        assert!(!p.inner.disable_thinking());
+        let p = p.with_disable_thinking(true);
+        assert!(p.inner.disable_thinking());
     }
 
     #[test]

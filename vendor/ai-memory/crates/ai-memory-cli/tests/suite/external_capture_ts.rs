@@ -25,7 +25,7 @@
 
 /// Slow tier: three process spawns per case (CLI render plus one Node run).
 mod slow_generated_runtime {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
 
     use serde_json::Value;
@@ -54,12 +54,26 @@ mod slow_generated_runtime {
     /// The plugin exactly as `install-hooks` would write it, minus the three
     /// human-facing comment lines the non-`--apply` render prints first.
     fn render_opencode_plugin(home: &Path, server_url: &str) -> String {
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let opencode = bin.join("opencode");
+            std::fs::write(&opencode, "#!/bin/sh\nprintf '1.18.34\\n'\n").unwrap();
+            let mut permissions = std::fs::metadata(&opencode).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&opencode, permissions).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bin.join("opencode.cmd"), "@echo off\r\necho 1.18.34\r\n").unwrap();
         let output = hermetic(BIN)
             .args(["install-hooks", "--agent", "opencode", "--server-url"])
             .arg(server_url)
             .env("HOME", home)
             .env("USERPROFILE", home)
             .env("AI_MEMORY_HOME", home)
+            .env("PATH", bin)
             .current_dir(home)
             .output()
             .expect("render opencode plugin");
@@ -86,9 +100,11 @@ const port = Number(process.argv[2]);
 const directory = process.argv[3]!;
 const events: string[] = [];
 let handoffs = 0;
+const unmarked: string[] = [];
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   req.resume();
+  if (req.headers["x-ai-memory-client"] !== "open-code") unmarked.push(url.pathname);
   if (url.pathname === "/hook") {
     events.push(url.searchParams.get("event") ?? "?");
     res.writeHead(204);
@@ -120,7 +136,7 @@ const transformed: { system: string[] } = { system: [] };
 await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, transformed);
 await hooks.dispose();
 server.close();
-console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
+console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.system }));
 "#;
 
     /// One plugin run. `hermetic` drops every ambient `AI_MEMORY_*` var, and
@@ -205,23 +221,13 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
             .collect()
     }
 
-    /// Retained fixture root: `keep()` hands back the path and cancels the
-    /// delete-on-drop, so the generated plugin stays inspectable after a run.
-    fn fixture_root() -> PathBuf {
-        let dir = tempfile::tempdir().expect("fixture root").keep();
-        eprintln!(
-            "generated-plugin runtime fixture retained at {}",
-            dir.display()
-        );
-        dir
-    }
-
     #[test]
     fn generated_plugin_stops_capture_for_an_external_owner_but_still_fetches_context() {
         if !node_strip_types_available() {
             return;
         }
-        let dir = fixture_root();
+        let guard = tempfile::tempdir().expect("fixture root");
+        let dir = guard.path().to_path_buf();
         let mut port = free_port();
         write_fixture(&dir, port);
 
@@ -233,6 +239,7 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
         assert_eq!(spooled_entries(&dir), 0, "owned run must spool nothing new");
         // Context delivery is a separate path and must survive the handover.
         assert_eq!(owned["handoffs"], 1, "{owned}");
+        assert_eq!(owned["unmarked"], serde_json::json!([]), "{owned}");
         assert_eq!(owned["system"][0], "HANDOFF_SENTINEL", "{owned}");
 
         // Controls: unset and whitespace-only are not an owner, so the same
@@ -248,6 +255,13 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
                 );
             }
             assert_eq!(captured["handoffs"], 1, "{label}: {captured}");
+            // An unauthenticated server reached by a LAN name refuses a
+            // handoff fetch without the client marker.
+            assert_eq!(
+                captured["unmarked"],
+                serde_json::json!([]),
+                "{label}: requests without the client marker: {captured}"
+            );
             assert_eq!(
                 captured["system"][0], "HANDOFF_SENTINEL",
                 "{label}: {captured}"
@@ -262,7 +276,8 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
         if !node_strip_types_available() {
             return;
         }
-        let dir = fixture_root();
+        let guard = tempfile::tempdir().expect("fixture root");
+        let dir = guard.path().to_path_buf();
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = taken.local_addr().unwrap().port();
         let mut port = busy;

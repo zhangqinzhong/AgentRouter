@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::{AuthLevel, Capability};
+use ai_memory_core::AuthLevel;
 use ai_memory_store::{PendingAutoImproveReview, PendingAutoImproveScope};
 use askama::Template;
 use axum::Extension;
@@ -17,10 +17,9 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::html_auth::AdminRequired;
 use crate::state::WebState;
 use crate::templates::{
-    AdminRequiredView, PendingRow, PendingView, SelectOption, encode_segment, humanize, page_href,
+    PendingRow, PendingView, SelectOption, encode_segment, humanize, page_href,
 };
 
 /// Most proposals one page load reads. A queue this long needs the CLI, and
@@ -56,7 +55,7 @@ pub(crate) async fn handler(
     level: Option<Extension<AuthLevel>>,
     Query(query): Query<PendingQuery>,
 ) -> Response {
-    if let Err(response) = require_admin(&state, level).await {
+    if let Err(response) = super::require_admin(&state, level).await {
         return response;
     }
 
@@ -137,31 +136,6 @@ fn scope_key(scope: &PendingAutoImproveScope) -> String {
         encode_segment(&scope.workspace_name),
         encode_segment(&scope.project_name)
     )
-}
-
-/// Refuse the page unless the caller may use `/admin`, with the same
-/// `Capability::Admin` decision `require_root_for_multiuser_admin` makes.
-async fn require_admin(
-    state: &WebState,
-    level: Option<Extension<AuthLevel>>,
-) -> Result<(), Response> {
-    let level = level.map_or(AuthLevel::Anonymous, |Extension(level)| level);
-    let distinguishes_operators = state
-        .reader
-        .distinguishes_operators(state.trusted_proxy_identity)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
-    match level.authorize(Capability::Admin, distinguishes_operators) {
-        Ok(()) => Ok(()),
-        Err(e) if e.is_authentication_required() => Err(StatusCode::UNAUTHORIZED.into_response()),
-        Err(_) => {
-            let mut response = render(AdminRequiredView {}, StatusCode::FORBIDDEN);
-            // A 403 here means "not root", not "change your password": keep
-            // the HTML auth redirect from sending the user to that form.
-            response.extensions_mut().insert(AdminRequired);
-            Err(response)
-        }
-    }
 }
 
 fn scope_label(review: &PendingAutoImproveReview) -> String {

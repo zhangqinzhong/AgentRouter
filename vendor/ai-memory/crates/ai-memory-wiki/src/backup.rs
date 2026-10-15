@@ -136,6 +136,7 @@ fn create_pre_migration_backup_inner(
     dest_override: Option<&Path>,
     in_container: bool,
 ) -> WikiResult<BackupReceipt> {
+    crate::confinement::inspect_tree_if_present(&data_dir.join("wiki"))?;
     // One spelling for every comparison below: `destination_dir` returns a
     // canonical path, so the walk must produce canonical paths too or the
     // self-exclusion guards (`path == dest_dir`, `path == archive_path`)
@@ -144,6 +145,7 @@ fn create_pre_migration_backup_inner(
     let data_dir = &data_dir
         .canonicalize()
         .unwrap_or_else(|_| data_dir.to_path_buf());
+    crate::confinement::inspect_tree(data_dir)?;
     let dest_dir = destination_dir(dest_override, data_dir, in_container)?;
     let stamp = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
     let archive_path = dest_dir.join(format!("ai-memory-backup-{label}-{stamp}.tar.gz"));
@@ -164,8 +166,14 @@ fn create_pre_migration_backup_inner(
                 let rel = path
                     .strip_prefix(data_dir)
                     .map_err(|e| WikiError::Io(std::io::Error::other(e)))?;
-                let ft = entry.file_type()?;
-                if ft.is_dir() {
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if crate::confinement::is_link_like(&metadata) {
+                    return Err(WikiError::Confinement {
+                        path,
+                        reason: "symbolic links and reparse points are not allowed in backups",
+                    });
+                }
+                if metadata.is_dir() {
                     // Never archive the destination itself (a container
                     // default of <data_dir>/backups, or an override
                     // pointed inside the data dir) — self-inclusion
@@ -174,7 +182,7 @@ fn create_pre_migration_backup_inner(
                         continue;
                     }
                     stack.push(path);
-                } else if ft.is_file() {
+                } else if metadata.is_file() {
                     let file_name = path.file_name().and_then(|n| n.to_str());
                     if path == archive_path
                         || file_name == Some("pre-migration-backup.json.tmp")
@@ -192,8 +200,6 @@ fn create_pre_migration_backup_inner(
                     tar.append_path_with_name(&path, rel)?;
                     expected += 1;
                 }
-                // Symlinks are skipped: nothing in a data dir should be
-                // one, and following one out of the tree must not happen.
             }
         }
         tar.into_inner()?.finish()?;
@@ -262,6 +268,26 @@ mod tests {
         std::fs::write(tmp.path().join("wiki/ws/proj/notes/a.md"), "---\n---\nbody").unwrap();
         std::fs::write(tmp.path().join("db.sqlite"), b"not really a db").unwrap();
         tmp
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_migration_backup_refuses_a_linked_wiki_tree_without_an_archive() {
+        let data = data_dir_with_content();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("canary.md"), "outside canary").unwrap();
+        std::os::unix::fs::symlink(outside.path(), data.path().join("wiki/linked")).unwrap();
+        let dest = TempDir::new().unwrap();
+
+        assert!(matches!(
+            create_pre_migration_backup(data.path(), "test", Some(dest.path())),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("canary.md")).unwrap(),
+            "outside canary"
+        );
     }
 
     #[test]

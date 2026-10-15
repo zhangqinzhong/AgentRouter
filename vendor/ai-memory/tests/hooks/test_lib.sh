@@ -17,6 +17,11 @@ TMP=$(mktemp -d)
 ORIG_HOME=${HOME:-}
 HOME="$TMP"
 export HOME
+# The data dir comes from XDG_DATA_HOME before HOME, so an exported one would
+# send this suite's spooled events, and its auth-header lookups, to the
+# caller's real install.
+CALLER_SPOOL="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$ORIG_HOME/.local/share}/ai-memory}/hook-spool"
+unset AI_MEMORY_DATA_DIR XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME
 unset AI_MEMORY_RUN_ID AI_MEMORY_MANAGED_WORKSTREAM_ID AI_MEMORY_MANAGED_WORKSTREAM_NAME
 trap 'rm -rf "$TMP"; HOME=$ORIG_HOME' EXIT
 
@@ -85,6 +90,28 @@ assert_eq "outside HOME stops at checkout root" "" \
     "$(ai_memory_find_marker "$TMP/outside/repo/src")"
 assert_eq "outside HOME plain dir rejects parent marker" "" \
     "$(ai_memory_find_marker "$TMP/outside/plain")"
+HOME="$TMP"
+export HOME
+
+# A trailing slash on $HOME does not move the boundary.
+mkdir -p "$TMP/slash-home/org/repo/.git" "$TMP/slash-home/plain/src"
+printf 'workspace = "org"\n' >"$TMP/slash-home/org/.ai-memory.toml"
+printf 'workspace = "above-home"\nserver = "team-b"\n' >"$TMP/.ai-memory.toml"
+for slash_home in "$TMP/slash-home" "$TMP/slash-home/" "$TMP/slash-home//"; do
+    HOME="$slash_home"
+    export HOME
+    assert_eq "HOME=$slash_home: marker above the checkout root" \
+        "$TMP/slash-home/org/.ai-memory.toml" \
+        "$(ai_memory_find_marker "$TMP/slash-home/org/repo")"
+    assert_eq "HOME=$slash_home: settings marker above the checkout root" \
+        "$TMP/slash-home/org/.ai-memory.toml" \
+        "$(ai_memory_find_settings_marker "$TMP/slash-home/org/repo")"
+    assert_eq "HOME=$slash_home: walk stops at HOME" "" \
+        "$(ai_memory_find_marker "$TMP/slash-home/plain/src")"
+    assert_eq "HOME=$slash_home: server walk stops at HOME" "no" \
+        "$(ai_memory_server_routed "$TMP/slash-home/plain/src" && echo yes || echo no)"
+done
+rm -f "$TMP/.ai-memory.toml"
 HOME="$TMP"
 export HOME
 
@@ -222,14 +249,112 @@ assert_eq "json_string escapes a control byte as a \u escape" "yes" "$CTRL_ESCAP
 
 # --- marker_qs --------------------------------------------------------
 QS=$(ai_memory_marker_qs "$TMP/a/b/c")
-assert_eq "marker_qs single key" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=deep" "$QS"
+assert_eq "marker_qs single key" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=deep&profile_contribute=1&profile_consume=1" "$QS"
 
 printf 'workspace = "ws1"\nproject = "p1"\nproject_strategy = "repo-root"\n' >"$TMP/a/b/.ai-memory.toml"
 QS2=$(ai_memory_marker_qs "$TMP/a/b/c")
-assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=ws1&project=p1&project_src=marker&project_strategy=repo-root" "$QS2"
+assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=ws1&project=p1&project_src=marker&project_strategy=repo-root&profile_contribute=1&profile_consume=1" "$QS2"
 
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> cwd only" "&cwd=$(ai_memory_url_encode "$TMP/nonexistent")" "$QS3"
+
+mkdir -p "$TMP/aliases"
+git -C "$TMP/aliases" init -q
+git -C "$TMP/aliases" remote add origin git@git.example.test:acme/api.git
+printf 'project = "acme-api"\naliases = [" former-name ", "legacy_name", "former-name"]\n' >"$TMP/aliases/.ai-memory.toml"
+ALIAS_JSON='["former-name","legacy_name"]'
+ALIAS_QS=$(ai_memory_marker_qs "$TMP/aliases")
+assert_eq "marker aliases keep canonical project and forward remote identity" "yes" \
+    "$(case "$ALIAS_QS" in *'&project=acme-api&project_src=marker'*"&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&identity_style=path&aliases=$(ai_memory_url_encode "$ALIAS_JSON")"*) printf yes ;; *) printf no ;; esac)"
+
+mkdir -p "$TMP/home-routes/src/api/lib" "$TMP/home-routes/src/api-sibling"
+HOME="$TMP/home-routes"
+export HOME
+cat >"$HOME/.ai-memory.toml" <<EOF
+workspace = "fallback"
+project = "fallback"
+[routes.path."~/src"]
+route_workspace = "oss"
+route_project = "broad"
+[routes.path."~/src/api"]
+route_workspace = "oss"
+route_project = "acme-api"
+route_aliases = ["old-api"]
+EOF
+HOME_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
+assert_eq "home route uses longest component path and marker provenance" "yes" \
+    "$(case "$HOME_ROUTE" in *'&workspace=oss&project=acme-api&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+assert_eq "non-git home path route omits aliases" "no" \
+    "$(case "$HOME_ROUTE" in *'&aliases='*) printf yes ;; *) printf no ;; esac)"
+PS_ROUTE_STATIC=$(grep -Fq 'if ($aliases) { $qs += "&aliases=' hooks/lib/ai-memory-hook.ps1 \
+    && grep -Fq 'if (-not $stack.Count) { return $null }' hooks/lib/ai-memory-hook.ps1 \
+    && printf ok || printf fail)
+assert_eq "powershell route bundle omits cleared aliases and rejects roots (static)" "ok" "$PS_ROUTE_STATIC"
+mkdir -p "$HOME/src/api/.git"
+git -C "$HOME/src/api" init -q
+git -C "$HOME/src/api" remote add origin git@github.com:acme/api.git
+cat >>"$HOME/.ai-memory.toml" <<EOF
+[routes.identity."github.com/acme/api"]
+route_workspace = "identity"
+route_project = "identity-api"
+route_identity_style = "path"
+route_aliases = ["main"]
+[routes.identity."gitlab.com/acme/api"]
+route_workspace = "wrong"
+route_project = "wrong"
+EOF
+HOME_IDENTITY_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
+assert_eq "home exact hostful identity wins path and forwards aliases safely" "yes" \
+    "$(case "$HOME_IDENTITY_ROUTE" in *'&workspace=identity&project=identity-api&project_src=marker'*'&identity=github.com%2Facme%2Fapi&identity_src=git_remote&identity_style=path'*'&aliases=%5B%22main%22%5D'*) printf yes ;; *) printf no ;; esac)"
+HOME_SIBLING=$(ai_memory_marker_qs "$HOME/src/api-sibling")
+assert_eq "home route does not string-prefix match a sibling" "yes" \
+    "$(case "$HOME_SIBLING" in *'&project=broad&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+printf 'workspace = "local"\nproject = "local-project"\n' >"$HOME/src/api/.ai-memory.toml"
+LOCAL_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
+assert_eq "local settings marker wins over home route" "yes" \
+    "$(case "$LOCAL_ROUTE" in *'&workspace=local&project=local-project&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+rm -f "$HOME/src/api/.ai-memory.toml"
+cat >"$HOME/.ai-memory.toml" <<EOF
+workspace = "wrong"
+project = "wrong"
+project_strategy = "repo-root"
+drop_subagent_captures = "true"
+[recall]
+default_global = true
+[briefing]
+inject_on_session_start = true
+max_chars = 3210
+[profile]
+contribute = true
+consume = false
+[routes.path."~/src/api"]
+route_workspace = "right"
+route_project = "api"
+EOF
+HOME_FLAG_ROUTE=$(ai_memory_marker_qs "$HOME/src/api")
+assert_eq "home route replaces scope and keeps root privacy settings" "yes" \
+    "$(case "$HOME_FLAG_ROUTE" in *'&workspace=right&project=api&project_src=marker'*'&drop_subagent=true&default_global=true&profile_contribute=1&profile_consume=0'*) printf yes ;; *) printf no ;; esac)"
+printf 'workspace = "wrong"\nproject = "wrong"\n[routes.path."relative"]\nroute_workspace = "oss"\nroute_project = "api"\n' >"$HOME/.ai-memory.toml"
+assert_eq "malformed home routes fail closed instead of root fallback" "&ai_memory_invalid_home_routes=1" \
+    "$(ai_memory_marker_qs "$HOME/src/api")"
+printf 'workspace = wrong\n' >"$HOME/.ai-memory.toml"
+assert_eq "malformed root-only home marker keeps legacy parser behavior" "yes" \
+    "$(case "$(ai_memory_marker_qs "$HOME/src/api")" in *'&ai_memory_invalid_home_routes=1'*) printf no ;; *) printf yes ;; esac)"
+ai_memory_home
+ROUTE_FS=$(printf '\034')
+printf '[routes.path."C:/Work/API"]\nroute_workspace="windows"\nroute_project="drive"\n[routes.path."//Server/Share/API"]\nroute_workspace="windows"\nroute_project="unc"\n' >"$HOME/.ai-memory.toml"
+assert_eq "home drive route matches components" "windows${ROUTE_FS}drive${ROUTE_FS}${ROUTE_FS}" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'c:/work/api/lib' '')"
+assert_eq "home UNC route matches components" "windows${ROUTE_FS}unc${ROUTE_FS}${ROUTE_FS}" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" '//server/share/api/lib' '')"
+printf '[routes.path."C:/"]\nroute_workspace="windows"\nroute_project="drive"\n' >"$HOME/.ai-memory.toml"
+assert_eq "home drive root route is rejected" "invalid" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'C:/child' '')"
+printf '[routes.path."//server/share"]\nroute_workspace="windows"\nroute_project="unc"\n' >"$HOME/.ai-memory.toml"
+assert_eq "home UNC root route is rejected" "invalid" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" '//server/share/child' '')"
+HOME="$TMP"
+export HOME
 
 # --- capture-only marker transparency (#668) ---------------------------
 # A nested marker whose only content is [capture] must not shadow an outer
@@ -247,7 +372,7 @@ assert_eq "capture-only marker: find_settings_marker skips it for the outer" \
     "$TMP/scope/.ai-memory.toml" \
     "$(ai_memory_find_settings_marker "$TMP/scope/inner")"
 assert_eq "capture-only marker: marker_qs forwards the OUTER scope" \
-    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
 
 # --- repository identity (#708) ----------------------------------------
@@ -262,15 +387,28 @@ if command -v git >/dev/null 2>&1; then
     git -C "$TMP/idrepo" remote add origin "https://someone:tok3n@git.example.test/Acme/API.git"
     ID_CWD=$(ai_memory_url_encode "$TMP/idrepo")
     assert_eq "identity: undeclared checkout sends its remote" \
-        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=path" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     printf 'project = "mine"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: a declared project routes by name" \
-        "&cwd=$ID_CWD&project=mine&project_src=marker" \
+        "&cwd=$ID_CWD&project=mine&project_src=marker&profile_contribute=1&profile_consume=1" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     printf 'project = "mine"\nidentity = "Acme/Platform"\n' >"$TMP/idrepo/.ai-memory.toml"
     assert_eq "identity: an explicit identity outranks the project" \
-        "&cwd=$ID_CWD&project=mine&project_src=marker&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit" \
+        "&cwd=$ID_CWD&project=mine&project_src=marker&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit&profile_contribute=1&profile_consume=1" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    # #1033: either explicit style rides along with a remote identity only.
+    printf 'identity_style = "path"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: the path style rides along with the remote" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=path&profile_contribute=1&profile_consume=1" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    printf 'identity_style = "host_path"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: the host-path opt-out rides along with the remote" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote&identity_style=host_path&profile_contribute=1&profile_consume=1" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    printf 'identity_style = "path"\nidentity = "Acme/Platform"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: a declared identity sends no style" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit&profile_contribute=1&profile_consume=1" \
         "$(ai_memory_marker_qs "$TMP/idrepo")"
     rm -rf "$TMP/idrepo"
 fi
@@ -282,8 +420,44 @@ printf '[briefing]\ninject_on_session_start = true\n' >"$TMP/scope/inner/.ai-mem
 assert_eq "briefing-only marker is a settings boundary, not transparent" \
     "" "$(ai_memory_parse_toml_key "$(ai_memory_find_settings_marker "$TMP/scope/inner")" workspace)"
 assert_eq "marker_qs stops at the briefing-only boundary" \
-    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
+
+# A marker that only sets `[profile]` keys is a settings boundary too, and
+# marker_qs forwards both flags (quoted or bare) as explicit 0/1 values.
+mkdir -p "$TMP/profile-only/inner"
+printf 'workspace = "outer"\n' >"$TMP/profile-only/.ai-memory.toml"
+printf '[profile]\ncontribute = false\nconsume = "no"\n' >"$TMP/profile-only/inner/.ai-memory.toml"
+assert_eq "profile-only marker is a settings boundary" \
+    "$TMP/profile-only/inner/.ai-memory.toml" "$(ai_memory_find_settings_marker "$TMP/profile-only/inner")"
+assert_eq "marker_qs forwards [profile] contribute and consume" \
+    "&cwd=$(ai_memory_url_encode "$TMP/profile-only/inner")&profile_contribute=0&profile_consume=0" \
+    "$(ai_memory_marker_qs "$TMP/profile-only/inner")"
+assert_eq "marker_qs sends explicit [profile] defaults when a marker omits the keys" \
+    "&cwd=$(ai_memory_url_encode "$TMP/profile-only")&workspace=outer&profile_contribute=1&profile_consume=1" \
+    "$(ai_memory_marker_qs "$TMP/profile-only")"
+PSH=""
+if command -v pwsh >/dev/null 2>&1; then
+    PSH=$(command -v pwsh)
+elif command -v powershell >/dev/null 2>&1; then
+    PSH=$(command -v powershell)
+fi
+if [ -n "$PSH" ]; then
+    PS_LIB=$(host_path "$PWD/hooks/lib/ai-memory-hook.ps1")
+    PS_CWD=$(host_path "$TMP/profile-only/inner")
+    PS_QS=$(HOME="$TMP" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+        ". '$PS_LIB'; Get-AiMemoryMarkerQuery -Cwd '$PS_CWD'")
+    case "$PS_QS" in
+        *"&profile_contribute=0&profile_consume=0"*) PS_PROFILE="ok" ;;
+        *) PS_PROFILE="got: $PS_QS" ;;
+    esac
+    assert_eq "powershell marker query forwards [profile] flags" "ok" "$PS_PROFILE"
+else
+    PS_PROFILE=$(grep -q '&profile_contribute=' hooks/lib/ai-memory-hook.ps1 \
+        && grep -q '&profile_consume=' hooks/lib/ai-memory-hook.ps1 \
+        && printf 'ok' || printf 'missing')
+    assert_eq "powershell marker query forwards [profile] flags (static)" "ok" "$PS_PROFILE"
+fi
 
 # A capture-only marker with no scope-declaring ancestor: still transparent,
 # and resolution falls back exactly as it does with no marker at all.
@@ -314,7 +488,7 @@ if command -v git >/dev/null 2>&1; then
     printf 'workspace = "oss"\nproject_strategy = "repo-root"\n' >"$REPO/.ai-memory.toml"
     QSR=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "repo-root: subdir resolves to repo basename" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root&profile_contribute=1&profile_consume=1" \
         "$QSR"
 
     rm -f "$REPO/.ai-memory.toml"
@@ -329,7 +503,7 @@ if command -v git >/dev/null 2>&1; then
         >"$REPO/.ai-memory.toml"
     QSO=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "marker project strategy overrides env default" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=basename" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=basename&profile_contribute=1&profile_consume=1" \
         "$QSO"
     unset AI_MEMORY_PROJECT_STRATEGY
 
@@ -346,7 +520,7 @@ if command -v git >/dev/null 2>&1; then
     if git -C "$REPO" worktree add -q "$WT" >/dev/null 2>&1; then
         QSW=$(ai_memory_marker_qs "$WT")
         assert_eq "repo-root: out-of-tree worktree collapses to main repo" \
-            "&cwd=$(ai_memory_url_encode "$WT")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root" \
+            "&cwd=$(ai_memory_url_encode "$WT")&workspace=oss&project=acme-api&project_src=repo-root&project_strategy=repo-root&profile_contribute=1&profile_consume=1" \
             "$QSW"
     fi
 
@@ -355,7 +529,7 @@ if command -v git >/dev/null 2>&1; then
         >"$REPO/.ai-memory.toml"
     QSP=$(ai_memory_marker_qs "$REPO/crates/cli")
     assert_eq "explicit project pin beats repo-root" \
-        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=repo-root" \
+        "&cwd=$(ai_memory_url_encode "$REPO/crates/cli")&workspace=oss&project=pinned&project_src=marker&project_strategy=repo-root&profile_contribute=1&profile_consume=1" \
         "$QSP"
 
     PSH=""
@@ -469,7 +643,81 @@ printf '%s' '{"e":"unreachable"}' \
 assert_eq "post_hook spools an undelivered event" "1" \
     "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
 
+# A 429 saturation response must spool the event for retry, while terminal 4xx is dropped.
+rm -f "$TMP/spool-data/hook-spool/"*.json
+curl() {
+    cat >/dev/null
+    printf '429'
+    return 0
+}
+printf '%s' '{"e":"saturated"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "post_hook spools on 429 saturation" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+
+rm -f "$TMP/spool-data/hook-spool/"*.json
+curl() {
+    cat >/dev/null
+    printf '400'
+    return 0
+}
+printf '%s' '{"e":"bad-request"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "post_hook drops terminal 400 refusal" "0" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+
+# A 429 saturation response during drain must keep the entry queued rather than retiring it.
+rm -f "$TMP/spool-data/hook-spool/"*.json
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"drain-saturated"}'
+curl() {
+    cat >/dev/null
+    printf '429'
+    return 0
+}
+ai_memory_drain_spool 64 >/dev/null 2>&1
+assert_eq "drain keeps entry queued on 429 saturation" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+unset -f curl
+
 unset AI_MEMORY_DATA_DIR
+
+# --- PowerShell bundle spool parity (static) ---------------------------
+# The PS lib shares this offline-spool contract (same <data>/hook-spool
+# dir, same entry writer, same dispatch as `ai_memory_post_hook`: 2xx kicks
+# a detached drain, a terminal 4xx is dropped, everything undeliverable is
+# spooled), so a Windows script install loses no events during a server
+# outage either (#580 parity). Static first — no pwsh needed — then a
+# behavioral probe where pwsh exists.
+PS_LIB="$(dirname "$0")/../../hooks/lib/ai-memory-hook.ps1"
+PS_SPOOL_STATIC=$(grep -q 'function Write-AiMemorySpoolEvent' "$PS_LIB" \
+    && grep -q 'function Invoke-AiMemoryDrainSpool' "$PS_LIB" \
+    && grep -q 'function Invoke-AiMemoryKickDrain' "$PS_LIB" \
+    && grep -Fq '"hook-spool"' "$PS_LIB" \
+    && grep -Fq '"{0:D13}-{1}-{2:x16}.json"' "$PS_LIB" \
+    && grep -Fq '"auth_mode"' "$PS_LIB" \
+    && grep -Fq 'Write-AiMemorySpoolEvent -Url' "$PS_LIB" \
+    && grep -Fq 'Invoke-AiMemoryKickDrain' "$PS_LIB" \
+    && grep -Fq 'if ($Status -lt 400 -or $Status -ge 500 -or $Status -eq 408 -or $Status -eq 425 -or $Status -eq 429) {' "$PS_LIB" \
+    && grep -Fq 'if ($code -eq 408 -or $code -eq 425 -or $code -eq 429) {' "$PS_LIB" \
+    && grep -Fq -- '--ai-memory-drain-spool' "$PS_LIB" \
+    && grep -Fq '$script:AiMemoryLibFile = $PSCommandPath' "$PS_LIB" \
+    && grep -Fq 'RedirectStandardOutput' "$PS_LIB" \
+    && printf ok || printf bad)
+assert_eq "powershell bundle spools undelivered events (static)" "ok" "$PS_SPOOL_STATIC"
+# The ingest key must ride the initial POST too, or an ambiguous delivery
+# and its spooled replay could double-ingest (the reason the shell bundle
+# mints `ai_memory_ingest_key` before the first POST).
+PS_KEY_STATIC=$(grep -Fq '&ingest_key=ps$(' "$PS_LIB" \
+    && printf ok || printf bad)
+assert_eq "powershell POST and spool replay share an ingest key (static)" "ok" "$PS_KEY_STATIC"
+
+if command -v pwsh >/dev/null 2>&1; then
+    PS_SPOOL_OUT=$(pwsh -NoProfile -File "$(dirname "$0")/test_spool_ps.ps1" "$(host_path "$PS_LIB")" 2>&1) \
+        && PASS=$((PASS + $(printf '%s\n' "$PS_SPOOL_OUT" | sed -n 's/.*checks=\([0-9]*\).*/\1/p') )) \
+        || { FAIL=$((FAIL + 1)); printf '  FAIL powershell spool behavioral probe\n%s\n' "$PS_SPOOL_OUT"; }
+else
+    printf '  skip powershell spool behavioral probe (pwsh unavailable)\n'
+fi
 
 # --- external capture ownership (AI_MEMORY_CAPTURE_OWNER) -------------
 # A wrapper, extension or managed launcher that already produces this
@@ -659,6 +907,42 @@ unset AI_MEMORY_DATA_DIR GROK_LOG
 PATH=${PATH#"$TMP/bin:"}
 export PATH
 
+# --- session-start bundles that must never fetch a handoff (#998) ------
+# grok, kimi-code and pool each document in their own session-start.sh why
+# SessionStart must not call /handoff at all: Grok and Kimi discard its
+# stdout, and Pool's own comment says fetching there would be destructive
+# and silently lose an undelivered handoff. #1001 (the real [briefing]
+# delivery fix for #998) only touches the eight session-start bundles that
+# DO fetch a handoff; these three are deliberately not among them, and a
+# regression here would silently burn a single-use handoff with nothing to
+# show for it on the harness side. A PATH curl shim runs the real shipped
+# scripts, so what is asserted is what ships.
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$SSTART_LOG"
+exit 0
+EOF
+chmod +x "$TMP/bin/curl"
+PATH="$TMP/bin:$PATH"
+export PATH
+
+for bundle in grok kimi-code pool; do
+    SSTART_LOG="$TMP/session-start-$bundle.log"
+    : >"$SSTART_LOG"
+    export SSTART_LOG
+    printf '{"cwd":"%s","session_id":"sstart-%s"}' "$TMP" "$bundle" \
+        | sh "$(dirname "$0")/../../hooks/$bundle/session-start.sh" >/dev/null 2>&1
+    assert_eq "$bundle: session-start posts the capture event" "1" \
+        "$(wc -l <"$SSTART_LOG" | tr -d ' ')"
+    assert_eq "$bundle: session-start never fetches a handoff" "0" \
+        "$(grep -c '/handoff' "$SSTART_LOG")"
+done
+
+unset SSTART_LOG
+PATH=${PATH#"$TMP/bin:"}
+export PATH
+
 # --- grok PowerShell bundle parity -------------------------------------
 # The PS lib is the documented fallback when the native binary is absent.
 # Static parity first (no pwsh needed): the child-session key set must
@@ -710,7 +994,7 @@ assert_eq "a server-only marker is a settings boundary" \
     "$TMP/server-only/inner/.ai-memory.toml" \
     "$(ai_memory_find_settings_marker "$TMP/server-only/inner")"
 assert_eq "an unrouted repository is unchanged" \
-    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
 
 AI_MEMORY_DATA_DIR="$TMP/routed-data"
@@ -790,6 +1074,78 @@ PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOn
             END {exit !ok}' hooks/lib/ai-memory-hook.ps1 \
     && printf 'ok' || printf 'missing')
 assert_eq "powershell session-start handoff GET carries the briefing keys" "ok" "$PS_BRIEF_STATIC"
+
+# --- client marker header on every request ------------------------------
+# An unauthenticated server reached through a non-loopback host name refuses
+# a handoff fetch without `X-AI-Memory-Client`, which a web page cannot add.
+# Every curl branch (env token, header file, no auth) of the GET, the event
+# POST and the spool drain must send it. The stub logs one line per request:
+# "marked" or "UNMARKED".
+curl() {
+    _tmk=UNMARKED
+    _tdata=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -H) shift; [ "$#" -gt 0 ] || break
+                [ "$1" = "X-AI-Memory-Client: hook-sh" ] && _tmk=marked ;;
+            -X) shift ;;
+            --data-binary) shift; [ "$#" -gt 0 ] || break; _tdata="$1" ;;
+        esac
+        shift
+    done
+    [ "$_tdata" = "@-" ] && cat >/dev/null
+    printf '%s\n' "$_tmk" >>"$MARKER_LOG"
+    printf '200'
+    return 0
+}
+AI_MEMORY_DATA_DIR="$TMP/client-marker"
+export AI_MEMORY_DATA_DIR
+mkdir -p "$AI_MEMORY_DATA_DIR"
+MARKER_LOG="$AI_MEMORY_DATA_DIR/marker.log"
+: >"$MARKER_LOG"
+marker_round() {
+    # The hooks call it under `|| true`; without that, `set -e` stops at the
+    # missing auth-header file lookup inside it.
+    ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor" >/dev/null 2>&1 || true
+    printf '%s' '{"e":"marker"}' \
+        | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=stop&agent=cursor" >/dev/null 2>&1
+}
+marker_round                                   # no auth
+(umask 077; printf 'Authorization: Bearer file-token\n' >"$AI_MEMORY_DATA_DIR/auth-header")
+marker_round                                   # header file
+rm -f "$AI_MEMORY_DATA_DIR/auth-header"
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"m1"}'
+ai_memory_drain_spool 64 >/dev/null 2>&1       # drain without a token
+AI_MEMORY_AUTH_TOKEN=env-token
+export AI_MEMORY_AUTH_TOKEN
+marker_round                                   # env token
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"m2"}'
+unset AI_MEMORY_AUTH_TOKEN
+ai_memory_drain_spool 64 >/dev/null 2>&1       # drain with the spooled token
+unset -f curl
+assert_eq "client marker: every curl branch was exercised" "yes" \
+    "$([ "$(awk 'END { print NR + 0 }' "$MARKER_LOG")" -ge 8 ] && printf 'yes' || printf 'no')"
+assert_eq "client marker: no request went out without it" "0" \
+    "$(grep -c UNMARKED "$MARKER_LOG")"
+unset AI_MEMORY_DATA_DIR
+
+# The PowerShell helper builds its request headers in one hashtable per call
+# site; each must carry the marker, and every Invoke-WebRequest must pass one.
+PS_HELPER=hooks/lib/ai-memory-hook.ps1
+PS_HEADER_TABLES=$(grep -Ec '^[[:space:]]*\$[Hh]eaders = @\{\}' "$PS_HELPER")
+PS_MARKED_TABLES=$(grep -Ec '^[[:space:]]*\$[Hh]eaders\["X-AI-Memory-Client"\] = "hook-ps"' "$PS_HELPER")
+PS_REQUESTS=$(grep -c 'Invoke-WebRequest `' "$PS_HELPER")
+PS_REQUESTS_WITH_HEADERS=$(grep -A6 'Invoke-WebRequest `' "$PS_HELPER" | grep -Ec -- '-Headers \$[Hh]eaders')
+assert_eq "powershell: header tables found" "yes" \
+    "$([ "$PS_HEADER_TABLES" -ge 2 ] && printf 'yes' || printf 'no (%s)' "$PS_HEADER_TABLES")"
+assert_eq "powershell: every header table carries the client marker" "$PS_HEADER_TABLES" "$PS_MARKED_TABLES"
+assert_eq "powershell: every request passes the header table" "$PS_REQUESTS" "$PS_REQUESTS_WITH_HEADERS"
+
+# A spooled fixture event names this run's temp tree or targets the fake
+# `memory.test` host. Live sessions share the spool and may mention that host
+# in their own payloads, where it is JSON-escaped, so match only the URL field.
+assert_eq "no fixture event was spooled into the caller's data dir" "" \
+    "$(grep -rlF -e "$TMP" -e '{"url":"http://memory.test' "$CALLER_SPOOL" 2>/dev/null | head -n 1)"
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

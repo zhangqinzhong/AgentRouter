@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::sqlite_ro::{open_sqlite_ro, virtual_path};
+use super::sqlite_ro::{has_table, open_sqlite_ro, virtual_path};
 use super::AgentAdapter;
 use crate::models::*;
 use anyhow::{anyhow, Result};
@@ -47,6 +47,11 @@ impl CopilotAdapter {
             }
         }
         let ro = open_sqlite_ro(&self.db, "copilot")?;
+        // 库在、表还没建 = 确实没有会话;读不出(None)才是不知道
+        if !(has_table(&ro.conn, "sessions").ok()? && has_table(&ro.conn, "turns").ok()?) {
+            *self.rows_cache.lock().unwrap() = Some((mtime, Vec::new()));
+            return Some(Vec::new());
+        }
         let mut stmt = ro
             .conn
             .prepare(
@@ -199,9 +204,14 @@ impl AgentAdapter for CopilotAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        let Some(rows) = self.rows() else {
+        // 库不在 = 没有会话;库在却读不出报 Err,scanner 冻结这一家这一轮。
+        // 当成没有会话的话,这一轮会把整家会话当磁盘已删清掉。
+        if !self.db.is_file() {
             return Ok(Vec::new());
-        };
+        }
+        let rows = self
+            .rows()
+            .ok_or_else(|| anyhow!("{} exists but could not be read", self.db.display()))?;
         Ok(rows
             .into_iter()
             .filter(|row| row.turn_count > 0)

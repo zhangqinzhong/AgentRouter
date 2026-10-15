@@ -39,7 +39,7 @@ pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
     // away, and would announce a project the request never carries.
     let (workspace, project) = if all_projects {
         (
-            super::resolve_workspace(config, args.workspace.as_deref()),
+            super::resolve_workspace(config, args.workspace.as_deref())?,
             String::new(),
         )
     } else {
@@ -73,6 +73,7 @@ pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::cli::{Cli, Command};
+    use crate::config::{Config, RuntimeEnv};
     use clap::Parser;
 
     #[test]
@@ -86,6 +87,27 @@ mod tests {
         assert!(
             args.force && args.project.is_none(),
             "--force without --project must fan out to all projects"
+        );
+    }
+
+    #[test]
+    fn force_with_explicit_workspace_bypasses_invalid_home_routes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(home.join(".ai-memory.toml"), "route_project=\"orphan\"\n").unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_and_home_for_tests(
+                repo.to_string_lossy(),
+                home.to_string_lossy(),
+            ),
+            ..Config::default()
+        };
+        assert_eq!(
+            super::super::resolve_workspace(&config, Some("explicit")).unwrap(),
+            "explicit"
         );
     }
 

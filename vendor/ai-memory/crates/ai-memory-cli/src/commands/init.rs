@@ -57,6 +57,83 @@ token_pepper = \"{pepper}\"
     )
 }
 
+/// The `bearer_token_file` line appended to a rendered config.
+fn render_bearer_token_file_line(raw: &str) -> String {
+    format!(
+        "
+# Root bearer token, one line in an owner-only file. A relative path resolves
+# against the data dir. Written by `ai-memory init` on a fresh data dir; the
+# server requires it on every route but /healthz, and hooks, the CLI and
+# `ai-memory mcp-bridge` read it from there. Harness configs never hold it.
+bearer_token_file = {}
+",
+        toml_edit::Value::from(raw)
+    )
+}
+
+/// Which `bearer_token_file` a config being written should record, minting the
+/// token when this is a fresh install.
+///
+/// - A config being rewritten with `--force` that already named a token file
+///   keeps naming it, so the rewrite does not silently turn auth off.
+/// - A fresh install (no config and no database yet) with no bearer supplied
+///   another way gets a new token at `auth-tokens/default`.
+/// - Anything else, an existing install above all, records nothing and keeps
+///   the loopback no-auth behaviour it had (`ai-memory auth enable` opts in).
+fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<RecordedBearer>> {
+    if let Some(raw) = config
+        .auth
+        .bearer_token_file
+        .as_ref()
+        .filter(|raw| !raw.as_os_str().is_empty())
+    {
+        let token = config
+            .auth
+            .token_file_path()
+            .map(crate::local_auth::provision_root_token)
+            .transpose()?;
+        return Ok(Some(RecordedBearer {
+            raw: raw.to_string_lossy().into_owned(),
+            token,
+        }));
+    }
+    if !fresh || config.auth.bearer_token.is_some() {
+        return Ok(None);
+    }
+    let root = &config.data_dir;
+    let minted =
+        crate::local_auth::provision_root_token(&crate::server_profiles::root_token_path(root))?;
+    crate::local_auth::seed_hook_credential(root, &minted.token)?;
+    println!(
+        "Generated a root bearer token in {} (owner-only). The server requires it on every \
+         route but /healthz; hooks, the CLI and `ai-memory mcp-bridge` read it from there.",
+        minted.path.display()
+    );
+    Ok(Some(RecordedBearer {
+        raw: crate::server_profiles::ROOT_TOKEN_RELATIVE.to_owned(),
+        token: Some(minted),
+    }))
+}
+
+/// The `bearer_token_file` a written config records, and the token read from
+/// (or minted into) that file.
+struct RecordedBearer {
+    raw: String,
+    token: Option<crate::local_auth::RootToken>,
+}
+
+/// What one `init` did, for a caller (`setup`) that keeps going in the same
+/// process after it.
+pub(crate) struct InitOutcome {
+    /// The config file `init` wrote or found.
+    pub(crate) config_path: PathBuf,
+    /// False when a config file already existed and was left untouched.
+    pub(crate) config_written: bool,
+    /// The root bearer the written config names in `bearer_token_file`, so the
+    /// caller can adopt it the way `Config::load` would have.
+    pub(crate) root_token: Option<crate::local_auth::RootToken>,
+}
+
 /// Run the `init` subcommand.
 ///
 /// Creates `<data_dir>/{wiki,raw,db,models}` (idempotent) and writes a default
@@ -65,11 +142,32 @@ token_pepper = \"{pepper}\"
 /// systemd units can pass `--config /etc/ai-memory/config.toml` or
 /// `--config ~/.config/ai-memory/config.toml` without changing the data root.
 ///
+/// On a fresh data dir it also mints the root bearer token (see
+/// [`root_bearer_for_new_config`]).
+///
 /// # Errors
 /// Returns an error if directories cannot be created or the config file
 /// cannot be written.
 pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Result<()> {
+    initialize(config, &args, config_path).map(|_| ())
+}
+
+/// [`run`], reporting what it did.
+///
+/// # Errors
+/// As [`run`].
+pub(crate) fn initialize(
+    config: &Config,
+    args: &InitArgs,
+    config_path: Option<&Path>,
+) -> Result<InitOutcome> {
     let root = &config.data_dir;
+    let cfg_path = init_config_path(root, config_path);
+    // Decided before anything is created: a data dir that already has a
+    // database is an existing install even when it never had a config file
+    // (env-configured and container installs), and it must keep running the
+    // way it did.
+    let fresh = !cfg_path.exists() && !root.join("db").join(ai_memory_store::DB_FILENAME).exists();
     create_private_dir_all(root)
         .with_context(|| format!("creating data root {}", root.display()))?;
 
@@ -79,7 +177,11 @@ pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Resul
         tracing::info!(path = %path.display(), "ensured directory");
     }
 
-    let cfg_path = init_config_path(root, config_path);
+    let mut outcome = InitOutcome {
+        config_path: cfg_path.clone(),
+        config_written: false,
+        root_token: None,
+    };
     if cfg_path.exists() && !args.force {
         tracing::info!(
             path = %cfg_path.display(),
@@ -96,20 +198,28 @@ pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Resul
         // (anyhow's `with_context` would conflict), so map manually.
         let pepper = generate_token_hex(TOKEN_PEPPER_BYTES)
             .map_err(|e| anyhow::anyhow!("generating auth token_pepper: {e}"))?;
+        let recorded = root_bearer_for_new_config(config, fresh)?;
+        let bearer_line = recorded
+            .as_ref()
+            .map(|bearer| render_bearer_token_file_line(&bearer.raw))
+            .unwrap_or_default();
+        outcome.root_token = recorded.and_then(|bearer| bearer.token);
         let body = format!(
-            "{}{}",
+            "{}{}{}",
             DEFAULT_CONFIG_TOML,
-            render_default_auth_block(&pepper)
+            render_default_auth_block(&pepper),
+            bearer_line
         );
         let mut f = private_config_file(&cfg_path, args.force)
             .with_context(|| format!("creating {}", cfg_path.display()))?;
         f.write_all(body.as_bytes())
             .with_context(|| format!("writing {}", cfg_path.display()))?;
         tracing::info!(path = %cfg_path.display(), "wrote default config");
+        outcome.config_written = true;
     }
 
     tracing::info!("init complete");
-    Ok(())
+    Ok(outcome)
 }
 
 /// Create missing directory components with owner-only access without changing
@@ -324,6 +434,132 @@ mod tests {
         assert!(
             !data_dir.join("config.toml").exists(),
             "explicit --config must not also write data-dir config"
+        );
+    }
+
+    /// Load the rendered config through the production loader, with no
+    /// process environment, the way the server and every client will.
+    fn load(data_dir: &Path, config_path: Option<&Path>) -> Config {
+        Config::load_with_runtime_env(
+            config_path,
+            Some(data_dir.to_path_buf()),
+            crate::config::RuntimeEnv::default(),
+        )
+        .unwrap()
+    }
+
+    /// New-install default: a fresh data dir gets a root bearer, recorded as a relative
+    /// `bearer_token_file` the loader resolves, and the hook credential files
+    /// carry the same token. The token is in no rendered config.
+    #[test]
+    fn a_fresh_init_mints_a_root_bearer_the_loader_reads() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("data");
+        run(&cfg_in(&root), InitArgs { force: false }, None).unwrap();
+
+        let token_path = crate::server_profiles::root_token_path(&root);
+        let token = crate::config::read_trimmed_secret(&token_path).expect("token minted");
+        let body = std::fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(
+            body.contains("bearer_token_file = \"auth-tokens/default\""),
+            "{body}"
+        );
+        assert!(
+            !body.contains(&token),
+            "the token never goes into config.toml"
+        );
+
+        let loaded = load(&root, None);
+        assert_eq!(loaded.auth.bearer_token.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            loaded.auth.renderable_bearer_token(),
+            None,
+            "a file-sourced token is never handed to a harness renderer"
+        );
+        assert_eq!(
+            crate::config::read_hook_auth_token(&root).as_deref(),
+            Some(token.as_str()),
+            "hooks read the same token from the files they already know"
+        );
+    }
+
+    /// Re-running init leaves the token alone; `--force` rewrites the config
+    /// but keeps naming (and reusing) the same token file, so a rewrite never
+    /// silently turns auth off or rotates a credential clients hold.
+    #[test]
+    fn re_running_init_keeps_the_same_root_bearer() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("data");
+        run(&cfg_in(&root), InitArgs { force: false }, None).unwrap();
+        let token_path = crate::server_profiles::root_token_path(&root);
+        let first = crate::config::read_trimmed_secret(&token_path).unwrap();
+
+        run(&load(&root, None), InitArgs { force: false }, None).unwrap();
+        run(&load(&root, None), InitArgs { force: true }, None).unwrap();
+
+        assert_eq!(
+            crate::config::read_trimmed_secret(&token_path),
+            Some(first.clone())
+        );
+        assert_eq!(load(&root, None).auth.bearer_token, Some(first));
+    }
+
+    /// Control: a data dir that already holds a database is an existing
+    /// install, even with no config file. It gets no token and keeps the
+    /// loopback no-auth behaviour.
+    #[test]
+    fn init_on_an_existing_install_does_not_turn_auth_on() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("data");
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(root.join("db").join(ai_memory_store::DB_FILENAME), b"").unwrap();
+
+        run(&cfg_in(&root), InitArgs { force: false }, None).unwrap();
+
+        let body = std::fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(!body.contains("bearer_token_file"), "{body}");
+        assert!(!crate::server_profiles::root_token_path(&root).exists());
+        assert!(crate::config::read_hook_auth_token(&root).is_none());
+        assert!(load(&root, None).auth.bearer_token.is_none());
+    }
+
+    /// An operator who already supplies a bearer (`AI_MEMORY_AUTH_TOKEN` or
+    /// an inline key) chose their credential; a second one would leave the
+    /// hooks holding a token the server does not enforce.
+    #[test]
+    fn init_with_a_supplied_bearer_mints_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("data");
+        let mut config = cfg_in(&root);
+        config.auth.bearer_token = Some("operator-token".into());
+
+        run(&config, InitArgs { force: false }, None).unwrap();
+
+        assert!(!crate::server_profiles::root_token_path(&root).exists());
+        let body = std::fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(!body.contains("bearer_token_file"), "{body}");
+    }
+
+    /// With `--config` outside the data dir the token still lives in the data
+    /// dir, and the relative path resolves there.
+    #[test]
+    fn a_fresh_init_with_an_external_config_resolves_the_token_in_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("data");
+        let config_path = tmp.path().join("etc").join("config.toml");
+        run(
+            &cfg_in(&root),
+            InitArgs { force: false },
+            Some(&config_path),
+        )
+        .unwrap();
+
+        let token =
+            crate::config::read_trimmed_secret(&crate::server_profiles::root_token_path(&root))
+                .unwrap();
+        assert_eq!(
+            load(&root, Some(&config_path)).auth.bearer_token,
+            Some(token)
         );
     }
 

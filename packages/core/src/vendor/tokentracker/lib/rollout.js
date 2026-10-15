@@ -48,6 +48,11 @@ const CLAUDE_MEM_OBSERVER_PROJECT_REF =
   "https://local.tokentracker/claude-mem/observer-sessions";
 const PROJECT_ABSENT_CONTEXT_RESCAN_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CODEX_COLD_SKIP_RECENT_DAYS = 2;
+// A rollout keeps its creation date in its name, but Codex appends to a session
+// for as long as it stays open, so a file dated Monday can still be growing on
+// Thursday. Cold files younger than this are stat'ed every sync and re-read when
+// they grew past the cursor; older ones stay stat-free and rely on the daily audit.
+const DEFAULT_CODEX_COLD_GROWTH_STAT_DAYS = 30;
 const FILE_METADATA_CONCURRENCY = 32;
 
 async function mapConcurrent(items, concurrency, mapper) {
@@ -675,6 +680,7 @@ async function filterColdCodexRolloutFiles({
   auditDue = false,
   nowMs = Date.now(),
   recentDays = DEFAULT_CODEX_COLD_SKIP_RECENT_DAYS,
+  growthStatDays = DEFAULT_CODEX_COLD_GROWTH_STAT_DAYS,
   diagnostics = null,
 } = {}) {
   const files = Array.isArray(rolloutFiles) ? rolloutFiles : [];
@@ -759,6 +765,27 @@ async function filterColdCodexRolloutFiles({
       continue;
     }
 
+    // Neither check below notices an append: the day-level skip keys off the
+    // directory stat, which only changes when a file is added or removed, and
+    // the cursor offset records how far we read, not how big the file is.
+    // Stat recent cold files and keep any that grew past the cursor; the parse
+    // resumes from the offset.
+    if (isRecentColdRollout(rolloutDate, { nowMs, growthStatDays })) {
+      await loadCodexCursorDirectory(filePath);
+      if (cursorStoreRestarted) break;
+      const readOffset = Number(cursors.files[filePath]?.offset);
+      if (Number.isFinite(readOffset) && readOffset > 0) {
+        const stat = await fs.stat(filePath).catch(() => null);
+        if (syncDiagnostics) {
+          syncDiagnostics.cold_growth_stats = Number(syncDiagnostics.cold_growth_stats || 0) + 1;
+        }
+        if (stat && stat.size > readOffset) {
+          out.push(entry);
+          continue;
+        }
+      }
+    }
+
     if (await canSkipCodexDirectory(filePath)) {
       skipped += 1;
       continue;
@@ -814,6 +841,16 @@ async function filterColdCodexRolloutFiles({
     );
   }
   return { rolloutFiles: out, skipped, restarted: false };
+}
+
+function isRecentColdRollout(rolloutDate, { nowMs = Date.now(), growthStatDays } = {}) {
+  const days = Number(growthStatDays);
+  if (!Number.isFinite(days) || days <= 0) return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(rolloutDate || ""));
+  if (!match) return false;
+  const created = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])).getTime();
+  if (!Number.isFinite(created)) return false;
+  return nowMs - created <= days * 24 * 60 * 60 * 1000;
 }
 
 function activeCodexRolloutDates(
@@ -19486,25 +19523,39 @@ async function parseAntigravityIncremental({
 }
 
 function decodeAntigravityVarint(buf, offset) {
-  let res = 0;
-  let shift = 0;
-  while (offset < buf.length) {
-    const b = buf[offset++];
-    res += (b & 0x7f) * 2 ** shift;
-    if (!(b & 0x80)) break;
-    shift += 7;
+  if (!Buffer.isBuffer(buf) || !Number.isSafeInteger(offset) || offset < 0) {
+    throw new RangeError("invalid Antigravity protobuf offset");
   }
-  return [res, offset];
+  const start = offset;
+  let res = 0;
+  for (let count = 0; count < 10; count++) {
+    if (offset >= buf.length) throw new RangeError("truncated Antigravity protobuf varint");
+    const b = buf[offset++];
+    if (count === 9 && b > 1) throw new RangeError("Antigravity protobuf varint exceeds 64 bits");
+    res += (b & 0x7f) * 2 ** (count * 7);
+    if (!(b & 0x80)) {
+      if (Number.isSafeInteger(res)) return [res, offset];
+      let exact = 0n;
+      for (let i = start; i < offset; i++) {
+        exact |= BigInt(buf[i] & 0x7f) << BigInt((i - start) * 7);
+      }
+      return [exact, offset];
+    }
+  }
+  throw new RangeError("overlong Antigravity protobuf varint");
 }
 
 function findAntigravityProtoFields(buf) {
+  if (!Buffer.isBuffer(buf)) throw new RangeError("invalid Antigravity protobuf payload");
   const fields = [];
   let offset = 0;
   while (offset < buf.length) {
     const [tag, next] = decodeAntigravityVarint(buf, offset);
+    if (typeof tag !== "number") throw new RangeError("unsafe Antigravity protobuf field tag");
     offset = next;
-    const fieldNum = tag >> 3;
+    const fieldNum = Math.floor(tag / 8);
     const wireType = tag & 7;
+    if (fieldNum <= 0) throw new RangeError("invalid Antigravity protobuf field number");
     if (wireType === 0) {
       const [val, vNext] = decodeAntigravityVarint(buf, offset);
       offset = vNext;
@@ -19512,52 +19563,105 @@ function findAntigravityProtoFields(buf) {
     } else if (wireType === 2) {
       const [len, lNext] = decodeAntigravityVarint(buf, offset);
       offset = lNext;
+      if (typeof len !== "number" || len > buf.length - offset) {
+        throw new RangeError("truncated Antigravity protobuf field");
+      }
       fields.push({ num: fieldNum, val: buf.subarray(offset, offset + len) });
       offset += len;
     } else if (wireType === 1) {
+      if (buf.length - offset < 8) throw new RangeError("truncated Antigravity protobuf field");
       offset += 8;
     } else if (wireType === 5) {
+      if (buf.length - offset < 4) throw new RangeError("truncated Antigravity protobuf field");
       offset += 4;
     } else {
-      break;
+      throw new RangeError("unsupported Antigravity protobuf wire type");
     }
   }
   return fields;
 }
 
 function extractAntigravityGenInfo(buf) {
-  const root = findAntigravityProtoFields(buf);
-  const f1 = root.find((f) => f.num === 1)?.val;
-  if (!f1) return null;
+  try {
+    const root = findAntigravityProtoFields(buf);
+    const f1 = root.find((f) => f.num === 1)?.val;
+    if (!f1) return null;
 
-  const inner = findAntigravityProtoFields(f1);
-  let model = null;
-  const f19 = inner.find((f) => f.num === 19)?.val;
-  if (f19) model = Buffer.from(f19).toString("utf8").trim();
+    const inner = findAntigravityProtoFields(f1);
+    let model = null;
+    const f19 = inner.find((f) => f.num === 19)?.val;
+    if (f19) model = Buffer.from(f19).toString("utf8").trim();
 
-  let contextTokens = 0;
-  const f9 = inner.find((f) => f.num === 9)?.val;
-  if (f9) {
-    const f10 = findAntigravityProtoFields(f9).find((f) => f.num === 10)?.val;
-    if (f10) {
-      const tok = findAntigravityProtoFields(f10).find((f) => f.num === 1)?.val;
-      if (Number.isFinite(tok)) contextTokens = tok;
+    let contextTokens = 0;
+    const f9 = inner.find((f) => f.num === 9)?.val;
+    if (f9) {
+      const f10 = findAntigravityProtoFields(f9).find((f) => f.num === 10)?.val;
+      if (f10) {
+        const tok = findAntigravityProtoFields(f10).find((f) => f.num === 1)?.val;
+        if (Number.isSafeInteger(tok)) contextTokens = tok;
+      }
     }
-  }
 
-  let lastStepIndex = null;
-  for (const f of inner) {
-    if (f.num !== 20 || !f.val) continue;
-    const kv = findAntigravityProtoFields(f.val);
-    const k = kv.find((x) => x.num === 1)?.val;
-    const v = kv.find((x) => x.num === 2)?.val;
-    if (k && Buffer.from(k).toString("utf8") === "last_step_index" && v) {
-      const parsed = parseInt(Buffer.from(v).toString("utf8"), 10);
-      if (Number.isFinite(parsed)) lastStepIndex = parsed;
+    let lastStepIndex = null;
+    for (const f of inner) {
+      if (f.num !== 20 || !f.val) continue;
+      const kv = findAntigravityProtoFields(f.val);
+      const k = kv.find((x) => x.num === 1)?.val;
+      const v = kv.find((x) => x.num === 2)?.val;
+      if (k && Buffer.from(k).toString("utf8") === "last_step_index" && v) {
+        const rawStepIndex = Buffer.from(v).toString("utf8").trim();
+        if (/^\d+$/.test(rawStepIndex)) {
+          const parsed = Number(rawStepIndex);
+          if (Number.isSafeInteger(parsed)) lastStepIndex = parsed;
+        }
+      }
     }
-  }
 
-  return { model, contextTokens, lastStepIndex };
+    let uncachedInput;
+    let cachedInput;
+    let outputTokens;
+    let textOutput;
+    let reasoningOutput;
+    let hasUsageMetadata = false;
+    const f4 = inner.find((f) => f.num === 4)?.val;
+    if (f4) {
+      // Field 4 is Antigravity's per-turn usage: system prefix, prompt, output
+      // checksum, cached prompt, text output, and reasoning output.
+      const f4fields = findAntigravityProtoFields(f4);
+      const sTok = f4fields.find((f) => f.num === 1)?.val;
+      const pTok = f4fields.find((f) => f.num === 2)?.val;
+      const cTok = f4fields.find((f) => f.num === 5)?.val;
+      const oTok = f4fields.find((f) => f.num === 3)?.val;
+      const tTok = f4fields.find((f) => f.num === 9)?.val;
+      const rTok = f4fields.find((f) => f.num === 10)?.val;
+      if (
+        Number.isSafeInteger(sTok) ||
+        Number.isSafeInteger(pTok) ||
+        Number.isSafeInteger(cTok) ||
+        Number.isSafeInteger(oTok) ||
+        Number.isSafeInteger(tTok) ||
+        Number.isSafeInteger(rTok)
+      ) {
+        hasUsageMetadata = true;
+        uncachedInput = (Number.isSafeInteger(sTok) ? sTok : 0) + (Number.isSafeInteger(pTok) ? pTok : 0);
+        cachedInput = Number.isSafeInteger(cTok) ? cTok : 0;
+        outputTokens = Number.isSafeInteger(oTok) ? oTok : 0;
+        textOutput = Number.isSafeInteger(tTok) ? tTok : 0;
+        reasoningOutput = Number.isSafeInteger(rTok) ? rTok : 0;
+      }
+    }
+
+    return {
+      model,
+      contextTokens,
+      lastStepIndex,
+      ...(hasUsageMetadata
+        ? { uncachedInput, cachedInput, outputTokens, textOutput, reasoningOutput, hasUsageMetadata: true }
+        : {}),
+    };
+  } catch (_error) {
+    return null;
+  }
 }
 
 function resolveAntigravityDbPath(transcriptPath) {
@@ -19582,7 +19686,11 @@ function readAntigravityConversationDb(dbPath) {
       if (!r || typeof r.hex !== "string" || !r.hex.startsWith("X'")) continue;
       const buf = Buffer.from(r.hex.slice(2, -1), "hex");
       const info = extractAntigravityGenInfo(buf);
-      if (info && info.lastStepIndex != null && info.contextTokens > 0) {
+      if (
+        info &&
+        info.lastStepIndex != null &&
+        (info.hasUsageMetadata || info.contextTokens > 0)
+      ) {
         stepMap.set(info.lastStepIndex + 1, info);
       }
     }
@@ -19688,7 +19796,12 @@ async function parseAntigravityFile({
 
     if (!isNewEvent) {
       if (parsed.type === "PLANNER_RESPONSE") {
-        if (dbContextTokens > 0) {
+        if (dbTurn?.hasUsageMetadata) {
+          contextTokens =
+            dbContextTokens > 0
+              ? dbContextTokens
+              : (dbTurn.uncachedInput || 0) + (dbTurn.cachedInput || 0);
+        } else if (dbContextTokens > 0) {
           contextTokens = dbContextTokens;
         }
         previousContextTokens = contextTokens;
@@ -19720,28 +19833,49 @@ async function parseAntigravityFile({
     let billedPlanner = false;
 
     if (parsed.type === "PLANNER_RESPONSE") {
-      const content = typeof parsed.content === "string" ? parsed.content : "";
-      const thinking = typeof parsed.thinking === "string" ? parsed.thinking : "";
+      if (dbTurn?.hasUsageMetadata) {
+        const uncached = dbTurn.uncachedInput || 0;
+        const cached = dbTurn.cachedInput || 0;
+        const reasoning = dbTurn.reasoningOutput || 0;
+        let output = 0;
+        if (Number.isFinite(dbTurn.textOutput) && dbTurn.textOutput > 0) {
+          output = dbTurn.textOutput;
+        } else if (Number.isFinite(dbTurn.outputTokens)) {
+          output = Math.max(0, dbTurn.outputTokens - reasoning);
+        }
+        delta.input_tokens = uncached;
+        delta.cached_input_tokens = cached;
+        delta.output_tokens = output;
+        delta.reasoning_output_tokens = reasoning;
+        delta.total_tokens = uncached + cached + output + reasoning;
+        delta.billable_total_tokens = delta.total_tokens;
+        delta.conversation_count = 1;
+        billedPlanner = delta.total_tokens > 0;
+        contextTokens = dbContextTokens > 0 ? dbContextTokens : uncached + cached;
+      } else {
+        const content = typeof parsed.content === "string" ? parsed.content : "";
+        const thinking = typeof parsed.thinking === "string" ? parsed.thinking : "";
 
-      if (dbContextTokens > 0) {
-        contextTokens = dbContextTokens;
+        if (dbContextTokens > 0) {
+          contextTokens = dbContextTokens;
+        }
+        if (lastPlannerModel && model !== lastPlannerModel) {
+          previousContextTokens = 0;
+        }
+        const inputDelta = Math.max(0, contextTokens - previousContextTokens);
+
+        const outputTokens =
+          antigravityValueTokens(content) + antigravityValueTokens(parsed.tool_calls);
+        const reasoningTokens = antigravityValueTokens(thinking);
+
+        delta.input_tokens = inputDelta;
+        delta.output_tokens = outputTokens;
+        delta.reasoning_output_tokens = reasoningTokens;
+        delta.total_tokens = inputDelta + outputTokens + reasoningTokens;
+        delta.billable_total_tokens = delta.total_tokens;
+        delta.conversation_count = 1;
+        billedPlanner = delta.total_tokens > 0;
       }
-      if (lastPlannerModel && model !== lastPlannerModel) {
-        previousContextTokens = 0;
-      }
-      const inputDelta = Math.max(0, contextTokens - previousContextTokens);
-
-      const outputTokens =
-        antigravityValueTokens(content) + antigravityValueTokens(parsed.tool_calls);
-      const reasoningTokens = antigravityValueTokens(thinking);
-
-      delta.input_tokens = inputDelta;
-      delta.output_tokens = outputTokens;
-      delta.reasoning_output_tokens = reasoningTokens;
-      delta.total_tokens = inputDelta + outputTokens + reasoningTokens;
-      delta.billable_total_tokens = delta.total_tokens;
-      delta.conversation_count = 1;
-      billedPlanner = delta.total_tokens > 0;
     }
 
     if (!billedPlanner) {

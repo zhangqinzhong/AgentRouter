@@ -38,7 +38,9 @@ mod slow {
 
     use serde_json::{Value, json};
 
-    use crate::e2e_support::{hermetic, run_cli, session_count, start_serve, write_jsonl};
+    use crate::e2e_support::{
+        ServerGuard, hermetic, run_cli, session_count, start_serve, write_jsonl,
+    };
 
     const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
     const WORKSPACE: &str = "backfill-e2e-ws";
@@ -79,6 +81,17 @@ mod slow {
         None
     }
 
+    fn status_json(data_dir: &Path, home: &Path, cwd: &Path, base: &str) -> Value {
+        serde_json::from_str(&run_cli(
+            &["status", "--json"],
+            data_dir,
+            home,
+            Some(cwd),
+            base,
+        ))
+        .expect("status JSON remains compatible")
+    }
+
     /// Call a memory tool over the stateless Streamable-HTTP `/mcp` transport
     /// (the default `serve` mode: no `initialize` handshake needed) and return
     /// the joined text of the tool result.
@@ -115,6 +128,56 @@ mod slow {
             .filter_map(|item| item.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Start the real server (loopback, no auth, hermetic: no embedder, no
+    /// wiki watcher — a machine-global inotify instance concurrent server
+    /// children can exhaust, #745).
+    async fn start_backfill_server(
+        client: &reqwest::Client,
+        data_dir: &Path,
+        home: &Path,
+        cwd: &Path,
+    ) -> (ServerGuard, String) {
+        start_serve(client, &data_dir.join("serve.log"), |port| {
+            let mut cmd = hermetic(BIN);
+            cmd.args([
+                "serve",
+                "--transport",
+                "http",
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                PROJECT,
+                "--no-watcher",
+            ])
+            .env("AI_MEMORY_DATA_DIR", data_dir)
+            .env("AI_MEMORY_HOME", home)
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
+            cmd.current_dir(cwd);
+            cmd
+        })
+        .await
+    }
+
+    fn backfill_report(data_dir: &Path, home: &Path, cwd: &Path, base: &str) -> Value {
+        serde_json::from_str(&run_cli(
+            &[
+                "backfill",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                PROJECT,
+                "--json",
+            ],
+            data_dir,
+            home,
+            Some(cwd),
+            base,
+        ))
+        .expect("backfill --json report")
     }
 
     #[tokio::test]
@@ -156,31 +219,9 @@ mod slow {
             ],
         );
 
-        // Start the real server (loopback, no auth, hermetic: no embedder, no
-        // wiki watcher — a machine-global inotify instance concurrent server
-        // children can exhaust, #745).
         let client = reqwest::Client::new();
-        let (server, base) = start_serve(&client, &data_dir.path().join("serve.log"), |port| {
-            let mut cmd = hermetic(BIN);
-            cmd.args([
-                "serve",
-                "--transport",
-                "http",
-                "--bind",
-                &format!("127.0.0.1:{port}"),
-                "--workspace",
-                WORKSPACE,
-                "--project",
-                PROJECT,
-                "--no-watcher",
-            ])
-            .env("AI_MEMORY_DATA_DIR", data_dir.path())
-            .env("AI_MEMORY_HOME", home.path())
-            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
-            cmd.current_dir(&cwd);
-            cmd
-        })
-        .await;
+        let (server, base) =
+            start_backfill_server(&client, data_dir.path(), home.path(), &cwd).await;
 
         // Phase 1 — the store is empty before backfill.
         assert_eq!(
@@ -296,6 +337,326 @@ mod slow {
             "the re-run must not duplicate the imported session",
         );
 
+        let observations_before = status_json(data_dir.path(), home.path(), &cwd, &base)["counts"]
+            ["observations"]
+            .as_u64()
+            .unwrap();
+        let forced: Value = serde_json::from_str(&run_cli(
+            &[
+                "backfill",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                PROJECT,
+                "--force",
+                "--json",
+            ],
+            data_dir.path(),
+            home.path(),
+            Some(&cwd),
+            &base,
+        ))
+        .expect("forced replay report");
+        assert_eq!(forced["imported_sessions"], 1);
+        assert_eq!(
+            session_count(&client, &base, WORKSPACE, PROJECT).await,
+            1,
+            "a real second replay must reuse the session",
+        );
+        let status = status_json(data_dir.path(), home.path(), &cwd, &base);
+        assert!(status["ingest"]["replayed"].as_u64().unwrap_or(0) >= 2);
+        assert!(status["ingest"]["ignored_end"].as_u64().unwrap_or(0) >= 1);
+        assert_eq!(
+            status["counts"]["observations"].as_u64(),
+            Some(observations_before),
+            "the second replay must create no duplicate observations"
+        );
+
+        drop(server);
+    }
+
+    const AG_MINE: &str = "a0d5ac62-2501-4780-b783-76d159c56cb3";
+    const AG_THEIRS: &str = "9576275f-7c4e-4709-b372-22d1ad2a0af8";
+    /// Rare, non-secret tokens: a secret-shaped canary would be redacted by the
+    /// sanitizer and could not show a leak from another project.
+    const AG_OWN: &str = "wombatnebulaagyown";
+    const AG_FOREIGN: &str = "pangolinquasaragyforeign";
+    const AG_RESUMED: &str = "ocelotpulsaragyresumed";
+
+    fn push_varint(output: &mut Vec<u8>, mut value: usize) {
+        while value >= 0x80 {
+            output.push(u8::try_from(value & 0x7f).unwrap() | 0x80);
+            value >>= 7;
+        }
+        output.push(u8::try_from(value).unwrap());
+    }
+
+    fn push_bytes_field(output: &mut Vec<u8>, field: u8, value: &[u8]) {
+        output.push((field << 3) | 2);
+        push_varint(output, value.len());
+        output.extend_from_slice(value);
+    }
+
+    /// Plant an `agy` conversation store whose metadata names `workspace`: the
+    /// workspace `file://` URI sits in field 1 of the message in field 1.
+    fn plant_antigravity_conversation(home: &Path, id: &str, workspace: &Path) {
+        let root = home.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&root).expect("conversations dir");
+        let mut nested = Vec::new();
+        push_bytes_field(
+            &mut nested,
+            1,
+            format!("file://{}", workspace.display()).as_bytes(),
+        );
+        let mut metadata = Vec::new();
+        push_bytes_field(&mut metadata, 1, &nested);
+        let connection =
+            rusqlite::Connection::open(root.join(format!("{id}.db"))).expect("conversation db");
+        connection
+            .execute_batch(
+                "CREATE TABLE trajectory_metadata_blob (id text DEFAULT \"main\", data blob, PRIMARY KEY (id))",
+            )
+            .expect("metadata table");
+        connection
+            .execute(
+                "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+                [metadata],
+            )
+            .expect("metadata row");
+    }
+
+    fn agy_prompt(id: &str, workspace: &Path, display: &str, millis: i64) -> Value {
+        json!({
+            "display": display,
+            "timestamp": millis,
+            "workspace": workspace.to_string_lossy(),
+            "conversationId": id,
+        })
+    }
+
+    /// `agy` keeps one `history.jsonl` for every project. Backfill imports this
+    /// conversation's prompts from it, in order, and nothing typed in another
+    /// conversation or another directory reaches the store.
+    #[tokio::test]
+    async fn backfill_imports_antigravity_prompts_from_history_and_nothing_foreign() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project cwd");
+        let elsewhere = tempfile::tempdir().expect("other project");
+        let cwd = fs::canonicalize(project.path()).expect("canonicalize project cwd");
+        let other = fs::canonicalize(elsewhere.path()).expect("canonicalize other project");
+        plant_antigravity_conversation(home.path(), AG_MINE, &cwd);
+        plant_antigravity_conversation(home.path(), AG_THEIRS, &other);
+        let past = 1_780_000_000_000;
+        write_jsonl(
+            &home.path().join(".gemini/antigravity-cli/history.jsonl"),
+            &[
+                agy_prompt(AG_MINE, &cwd, &format!("first {AG_OWN} prompt"), past),
+                agy_prompt(
+                    AG_THEIRS,
+                    &other,
+                    &format!("{AG_FOREIGN} elsewhere"),
+                    past + 1,
+                ),
+                agy_prompt(AG_THEIRS, &cwd, &format!("{AG_FOREIGN} here"), past + 2),
+                agy_prompt(AG_MINE, &other, &format!("{AG_RESUMED} resumed"), past + 3),
+                agy_prompt(AG_MINE, &cwd, "second prompt", past + 4),
+            ],
+        );
+        let client = reqwest::Client::new();
+        let (server, base) =
+            start_backfill_server(&client, data_dir.path(), home.path(), &cwd).await;
+
+        let report = backfill_report(data_dir.path(), home.path(), &cwd, &base);
+
+        assert_eq!(report["imported_sessions"], 1, "{report}");
+        assert_eq!(report["imported_events"], 2, "{report}");
+        assert_eq!(report["failed_sessions"], 0, "{report}");
+        let hits = call_tool(
+            &client,
+            &base,
+            "memory_query",
+            json!({ "query": AG_OWN, "limit": 10, "workspace": WORKSPACE, "project": PROJECT }),
+        )
+        .await;
+        assert!(
+            hits.contains(AG_OWN),
+            "imported prompt not searchable: {hits}"
+        );
+        assert!(
+            tree_contains(data_dir.path(), AG_OWN).is_some(),
+            "the own prompt must persist, or the absence checks prove nothing",
+        );
+        for foreign in [AG_FOREIGN, AG_RESUMED] {
+            if let Some(path) = tree_contains(data_dir.path(), foreign) {
+                panic!("{foreign} leaked into {}", path.display());
+            }
+        }
+
+        drop(server);
+    }
+
+    /// Without `history.jsonl` the session imports with no events instead of
+    /// failing the whole backfill.
+    #[tokio::test]
+    async fn backfill_succeeds_on_antigravity_without_history() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project cwd");
+        let cwd = fs::canonicalize(project.path()).expect("canonicalize project cwd");
+        plant_antigravity_conversation(home.path(), AG_MINE, &cwd);
+        let client = reqwest::Client::new();
+        let (server, base) =
+            start_backfill_server(&client, data_dir.path(), home.path(), &cwd).await;
+
+        let report = backfill_report(data_dir.path(), home.path(), &cwd, &base);
+
+        assert_eq!(report["imported_sessions"], 1, "{report}");
+        assert_eq!(report["imported_events"], 0, "{report}");
+        assert_eq!(report["failed_sessions"], 0, "{report}");
+
+        drop(server);
+    }
+
+    /// Open a live Antigravity session the way its `PreInvocation` hook would.
+    async fn open_antigravity_session(client: &reqwest::Client, base: &str, cwd: &Path) {
+        let url = format!(
+            "{base}/hook?event=session-start&agent=antigravity-cli&workspace={WORKSPACE}\
+             &project={PROJECT}&session_id={AG_MINE}"
+        );
+        let status = client
+            .post(url)
+            .json(&json!({ "session_id": AG_MINE, "cwd": cwd.to_string_lossy() }))
+            .send()
+            .await
+            .expect("session-start hook")
+            .status();
+        assert!(status.is_success(), "session-start rejected: {status}");
+    }
+
+    fn finalize_antigravity(data_dir: &Path, home: &Path, cwd: &Path, base: &str, reopen: bool) {
+        let mut args = vec![
+            "finalize-session",
+            "--agent",
+            "antigravity-cli",
+            "--workspace",
+            WORKSPACE,
+            "--project",
+            PROJECT,
+        ];
+        if reopen {
+            args.extend(["--reopen", "--session-id", AG_MINE]);
+        }
+        run_cli(&args, data_dir, home, Some(cwd), base);
+    }
+
+    async fn stored_prompts(client: &reqwest::Client, base: &str) -> usize {
+        let text = call_tool(
+            client,
+            base,
+            "memory_read_session_observations",
+            json!({
+                "workspace": WORKSPACE,
+                "project": PROJECT,
+                "session_id": AG_MINE,
+                "kinds": ["user-prompt"],
+                "limit": 100,
+            }),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("non-JSON observations: {text}: {e}"));
+        v["observations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing observations: {text}"))
+            .len()
+    }
+
+    /// Antigravity's live hooks carry no prompt, so `finalize-session` replays
+    /// the session's prompts from `history.jsonl` before its session-end: the
+    /// summary page is titled by the first prompt, a foreign prompt never
+    /// lands, a repeated `--reopen` stores nothing twice, and a prompt typed
+    /// after the first finalize arrives with the next one.
+    #[tokio::test]
+    async fn finalize_session_replays_antigravity_prompts_once() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project cwd");
+        let elsewhere = tempfile::tempdir().expect("other project");
+        let cwd = fs::canonicalize(project.path()).expect("canonicalize project cwd");
+        let other = fs::canonicalize(elsewhere.path()).expect("canonicalize other project");
+        plant_antigravity_conversation(home.path(), AG_MINE, &cwd);
+        let history = home.path().join(".gemini/antigravity-cli/history.jsonl");
+        let past = 1_780_000_000_000;
+        let mut lines = vec![
+            agy_prompt(AG_MINE, &cwd, &format!("first {AG_OWN} prompt"), past),
+            agy_prompt(
+                AG_THEIRS,
+                &other,
+                &format!("{AG_FOREIGN} elsewhere"),
+                past + 1,
+            ),
+            agy_prompt(AG_MINE, &cwd, "second prompt", past + 2),
+        ];
+        write_jsonl(&history, &lines);
+        let client = reqwest::Client::new();
+        let (server, base) =
+            start_backfill_server(&client, data_dir.path(), home.path(), &cwd).await;
+        open_antigravity_session(&client, &base, &cwd).await;
+
+        finalize_antigravity(data_dir.path(), home.path(), &cwd, &base, false);
+
+        assert_eq!(stored_prompts(&client, &base).await, 2);
+        let page = call_tool(
+            &client,
+            &base,
+            "memory_read_page",
+            json!({
+                "workspace": WORKSPACE,
+                "project": PROJECT,
+                "path": format!("sessions/{AG_MINE}.md"),
+            }),
+        )
+        .await;
+        assert!(
+            page.contains(AG_OWN),
+            "the summary page must be built from the replayed prompts: {page}"
+        );
+        if let Some(path) = tree_contains(data_dir.path(), AG_FOREIGN) {
+            panic!("{AG_FOREIGN} leaked into {}", path.display());
+        }
+
+        finalize_antigravity(data_dir.path(), home.path(), &cwd, &base, true);
+        assert_eq!(
+            stored_prompts(&client, &base).await,
+            2,
+            "a repeated --reopen must not store the prompts twice"
+        );
+
+        lines.push(agy_prompt(AG_MINE, &cwd, "third prompt", past + 3));
+        write_jsonl(&history, &lines);
+        finalize_antigravity(data_dir.path(), home.path(), &cwd, &base, true);
+        assert_eq!(stored_prompts(&client, &base).await, 3);
+
+        drop(server);
+    }
+
+    /// A live Antigravity session without `history.jsonl` still finalizes.
+    #[tokio::test]
+    async fn finalize_session_succeeds_on_antigravity_without_history() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project cwd");
+        let cwd = fs::canonicalize(project.path()).expect("canonicalize project cwd");
+        plant_antigravity_conversation(home.path(), AG_MINE, &cwd);
+        let client = reqwest::Client::new();
+        let (server, base) =
+            start_backfill_server(&client, data_dir.path(), home.path(), &cwd).await;
+        open_antigravity_session(&client, &base, &cwd).await;
+
+        finalize_antigravity(data_dir.path(), home.path(), &cwd, &base, false);
+
+        assert_eq!(stored_prompts(&client, &base).await, 0);
         drop(server);
     }
 }

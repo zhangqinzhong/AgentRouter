@@ -1,16 +1,18 @@
 //! Incremental, read-only extraction from native harness session stores.
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
+use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ai_memory_core::{
-    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NewWorkstreamEvent, WorkstreamEventKind,
+    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NativeSessionIdentity, NewWorkstreamEvent,
+    Sanitizer, WorkstreamEventKind,
 };
 use anyhow::{Context as _, Result, anyhow};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -20,8 +22,23 @@ use crate::{ManagedHarness, clean_path};
 
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
-const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
+const MAX_SESSION_HEADER_BYTES: usize = 128 * 1024;
+const MAX_SOURCE_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_EXPORTED_EVENTS: usize = 4_096;
+const MAX_EXPORTED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SOURCE_RECORDS: usize = 32_768;
+const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SESSION_METADATA_BYTES: u64 = 1024 * 1024;
+/// `agy` cuts `display` near 8 KiB; 4-byte UTF-8 and JSON escaping stay well
+/// under this.
+const MAX_ANTIGRAVITY_HISTORY_LINE_BYTES: usize = 64 * 1024;
+/// A new conversation's first prompt is logged without an id, within a second
+/// of its `.db` being created.
+const ANTIGRAVITY_OPENING_PROMPT_WINDOW: Duration = Duration::from_secs(5);
 const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
+/// Event metadata key holding the working directory the event's own record
+/// was written in, when the harness records one per record.
+pub const RECORD_CWD_KEY: &str = "cwd";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +62,27 @@ pub struct ExportedTranscript {
     pub losses: Vec<String>,
 }
 
+/// Ordered semantic identity for a bounded transcript interval.
+#[must_use]
+pub fn transcript_interval_digests(events: &[NewWorkstreamEvent]) -> Vec<String> {
+    events.iter().map(transcript_event_digest).collect()
+}
+
+fn transcript_event_digest(event: &NewWorkstreamEvent) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        event.event_id.as_str(),
+        event.kind.as_str(),
+        event.role.as_deref().unwrap_or_default(),
+        event.occurred_at.as_deref().unwrap_or_default(),
+        event.content.as_str(),
+    ] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileCursor {
     path: String,
@@ -56,7 +94,8 @@ struct FileCursor {
     flavor: Option<FileFlavor>,
     /// Hash of every committed byte through `offset`. Kimi Code and Grok can
     /// rewrite their journals in place (Kimi on fork/compaction/resume, Grok
-    /// on rewind); Kiro's append-only behavior is not documented. Those
+    /// on rewind); Kiro's and Copilot's append-only behavior is not
+    /// documented; `agy` may trim its shared Antigravity history. Those
     /// adapters validate this prefix before trusting the byte offset. Other
     /// JSONL adapters remain offset-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,7 +133,11 @@ const fn file_flavor(harness: ManagedHarness) -> Option<FileFlavor> {
 const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
     matches!(
         harness,
-        ManagedHarness::Kimi | ManagedHarness::Kiro | ManagedHarness::KiroV3 | ManagedHarness::Grok
+        ManagedHarness::Kimi
+            | ManagedHarness::Kiro
+            | ManagedHarness::KiroV3
+            | ManagedHarness::Grok
+            | ManagedHarness::Copilot
     )
 }
 
@@ -113,29 +156,424 @@ pub async fn export_transcript(
     native_session_id: &str,
     source_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
-    if harness == ManagedHarness::OpenCode {
-        return export_opencode(home, session_dir, native_session_id, source_cursor);
+    let home = home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let session_dir = session_dir.map(Path::to_path_buf);
+    let native_session_id = native_session_id.to_owned();
+    let source_cursor = source_cursor.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        export_transcript_blocking(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            source_cursor.as_deref(),
+            None,
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("native transcript reader failed: {error}"))?
+}
+
+fn export_transcript_blocking(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    let transcript = if harness == ManagedHarness::OpenCode {
+        export_opencode_range(
+            home,
+            session_dir,
+            native_session_id,
+            source_cursor,
+            final_cursor,
+        )?
+    } else if harness == ManagedHarness::OpenCode2 {
+        export_opencode2_range(
+            home,
+            session_dir,
+            native_session_id,
+            source_cursor,
+            final_cursor,
+        )?
+    } else if harness == ManagedHarness::Crush {
+        export_crush_range(
+            home,
+            cwd,
+            session_dir,
+            native_session_id,
+            source_cursor,
+            final_cursor,
+        )?
+    } else if harness == ManagedHarness::Antigravity {
+        // Only user prompts are importable (from `agy`'s history.jsonl); a
+        // bounded recovery range is not supported for this harness.
+        if final_cursor.is_some() {
+            return Err(anyhow!(
+                "antigravity transcripts support no bounded recovery range; this session's events come from hook capture"
+            ));
+        }
+        export_antigravity(home, cwd, session_dir, native_session_id, source_cursor)?
+    } else {
+        let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
+            .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
+        export_jsonl_range(
+            harness,
+            &path,
+            native_session_id,
+            source_cursor,
+            final_cursor,
+        )?
+    };
+    validate_export_bounds(transcript)
+}
+
+/// Export only records inside an exact previously captured cursor range.
+/// Both cursor identities are validated against the adapter/session, and rows
+/// or bytes appended after `final_cursor` are never read.
+pub async fn export_transcript_range(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    source_cursor: Option<&str>,
+    final_cursor: &str,
+) -> Result<ExportedTranscript> {
+    let home = home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let session_dir = session_dir.map(Path::to_path_buf);
+    let native_session_id = native_session_id.to_owned();
+    let source_cursor = source_cursor.map(str::to_owned);
+    let final_cursor = final_cursor.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if let Some(source_cursor) = source_cursor.as_deref() {
+            validate_transcript_cursor(
+                harness,
+                &home,
+                &cwd,
+                session_dir.as_deref(),
+                &native_session_id,
+                source_cursor,
+            )?;
+        }
+        validate_transcript_cursor(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            &final_cursor,
+        )?;
+        validate_cursor_range(harness, source_cursor.as_deref(), &final_cursor)?;
+        export_transcript_blocking(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            source_cursor.as_deref(),
+            Some(&final_cursor),
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("native transcript range reader failed: {error}"))?
+}
+
+/// Export only records after a cursor previously returned for this exact
+/// adapter/session. Invalid or stale cursors fail closed instead of replaying
+/// the complete transcript.
+pub async fn export_transcript_delta(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    source_cursor: &str,
+) -> Result<ExportedTranscript> {
+    let home = home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let session_dir = session_dir.map(Path::to_path_buf);
+    let native_session_id = native_session_id.to_owned();
+    let source_cursor = source_cursor.to_owned();
+    tokio::task::spawn_blocking(move || {
+        validate_transcript_cursor(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            &source_cursor,
+        )?;
+        export_transcript_blocking(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            Some(&source_cursor),
+            None,
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("native transcript delta reader failed: {error}"))?
+}
+
+fn validate_cursor_range(
+    harness: ManagedHarness,
+    source_cursor: Option<&str>,
+    final_cursor: &str,
+) -> Result<()> {
+    if matches!(
+        harness,
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 | ManagedHarness::Crush
+    ) {
+        let start = source_cursor
+            .map(serde_json::from_str::<SqlCursor>)
+            .transpose()
+            .context("invalid native transcript SQL cursor")?
+            .unwrap_or_default();
+        let end: SqlCursor = serde_json::from_str(final_cursor)
+            .context("invalid native transcript final SQL cursor")?;
+        if (end.updated, end.id.as_str()) < (start.updated, start.id.as_str()) {
+            return Err(anyhow!(
+                "native transcript final cursor precedes its start cursor"
+            ));
+        }
+    } else if let Some(source_cursor) = source_cursor {
+        let start: FileCursor =
+            serde_json::from_str(source_cursor).context("invalid native transcript file cursor")?;
+        let end: FileCursor = serde_json::from_str(final_cursor)
+            .context("invalid native transcript final file cursor")?;
+        if start.path != end.path || start.flavor != end.flavor || end.offset < start.offset {
+            return Err(anyhow!(
+                "native transcript final cursor precedes or changes its start cursor"
+            ));
+        }
     }
-    if harness == ManagedHarness::OpenCode2 {
-        return export_opencode2(home, session_dir, native_session_id, source_cursor);
+    Ok(())
+}
+
+fn validate_transcript_cursor(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    source_cursor: &str,
+) -> Result<()> {
+    if matches!(
+        harness,
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 | ManagedHarness::Crush
+    ) {
+        serde_json::from_str::<SqlCursor>(source_cursor)
+            .context("invalid native transcript SQL cursor")?;
+        return Ok(());
     }
-    if harness == ManagedHarness::Crush {
-        return export_crush(home, cwd, session_dir, native_session_id, source_cursor);
-    }
-    if harness == ManagedHarness::Antigravity {
-        // The conversation store keeps every step as an undocumented protobuf
-        // blob whose step-type enum is unversioned, so message text cannot be
-        // decoded without guessing at a schema that changes between `agy`
-        // releases. Conversation identity and workspace are read (they are
-        // stable fields observed in current metadata); the visible-event
-        // ledger for this harness comes from lifecycle-hook capture instead.
-        return Err(anyhow!(
-            "antigravity conversations expose no decodable transcript; this session's events come from hook capture"
-        ));
-    }
+    let cursor: FileCursor =
+        serde_json::from_str(source_cursor).context("invalid native transcript file cursor")?;
     let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
         .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
-    export_jsonl(harness, &path, native_session_id, source_cursor)
+    if Path::new(&cursor.path) != path || cursor.flavor != file_flavor(harness) {
+        return Err(anyhow!(
+            "native transcript cursor does not match this adapter session"
+        ));
+    }
+    let len = fs::metadata(&path)?.len();
+    if cursor.offset > len {
+        return Err(anyhow!(
+            "native transcript cursor is past the current transcript end"
+        ));
+    }
+    if journal_rewrites_in_place(harness) {
+        let expected = cursor
+            .prefix_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow!("native transcript cursor has no prefix identity"))?;
+        let mut file = File::open(path)?;
+        let actual = hash_file_prefix(&mut file, cursor.offset)?
+            .map(|hasher| format!("{:x}", hasher.finalize()))
+            .ok_or_else(|| anyhow!("native transcript cursor prefix is incomplete"))?;
+        if actual != expected {
+            return Err(anyhow!(
+                "native transcript changed before the recovery cursor"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_export_bounds(transcript: ExportedTranscript) -> Result<ExportedTranscript> {
+    if transcript.events.len() > MAX_EXPORTED_EVENTS {
+        return Err(anyhow!(
+            "native transcript exceeds the {MAX_EXPORTED_EVENTS} event recovery limit"
+        ));
+    }
+    let mut bytes = 0_usize;
+    for event in &transcript.events {
+        bytes = bytes.saturating_add(serde_json::to_vec(event)?.len());
+        if bytes > MAX_EXPORTED_BYTES {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_EXPORTED_BYTES} byte recovery limit"
+            ));
+        }
+    }
+    Ok(transcript)
+}
+
+fn enforce_parse_bounds(
+    events: &[NewWorkstreamEvent],
+    checked_events: &mut usize,
+    event_bytes: &mut usize,
+    source_bytes: &mut usize,
+    source_record_bytes: usize,
+) -> Result<()> {
+    *source_bytes = source_bytes.saturating_add(source_record_bytes);
+    if *source_bytes > MAX_SOURCE_BYTES {
+        return Err(anyhow!(
+            "native transcript exceeds the {MAX_SOURCE_BYTES} source-byte limit"
+        ));
+    }
+    if events.len() > MAX_EXPORTED_EVENTS {
+        return Err(anyhow!(
+            "native transcript exceeds the {MAX_EXPORTED_EVENTS} event recovery limit"
+        ));
+    }
+    for event in &events[*checked_events..] {
+        *event_bytes = event_bytes.saturating_add(serde_json::to_vec(event)?.len());
+        if *event_bytes > MAX_EXPORTED_BYTES {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_EXPORTED_BYTES} byte recovery limit"
+            ));
+        }
+    }
+    *checked_events = events.len();
+    Ok(())
+}
+
+/// Capture the exact adapter cursor at the current end of one native session.
+/// Recovery may use it only for that same session and adapter.
+pub async fn transcript_baseline(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<String> {
+    let home = home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let session_dir = session_dir.map(Path::to_path_buf);
+    let native_session_id = native_session_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        transcript_baseline_blocking(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("native transcript baseline reader failed: {error}"))?
+}
+
+fn transcript_baseline_blocking(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<String> {
+    let sql_cursor = |db: PathBuf, sql: &str| -> Result<String> {
+        let connection = Connection::open_with_flags(
+            &db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let cursor = connection
+            .query_row(sql, params![native_session_id], |row| {
+                Ok(SqlCursor {
+                    updated: row.get(0)?,
+                    id: row.get(1)?,
+                })
+            })
+            .optional()?
+            .unwrap_or_default();
+        Ok(serde_json::to_string(&cursor)?)
+    };
+    match harness {
+        ManagedHarness::OpenCode => sql_cursor(
+            opencode_db(home, session_dir),
+            "SELECT p.time_updated, p.id FROM part p WHERE p.session_id = ?1 ORDER BY p.time_updated DESC, p.id DESC LIMIT 1",
+        ),
+        ManagedHarness::OpenCode2 => sql_cursor(
+            opencode_db(home, session_dir),
+            "SELECT time_updated, id FROM session_message WHERE session_id = ?1 ORDER BY time_updated DESC, id DESC LIMIT 1",
+        ),
+        ManagedHarness::Crush => sql_cursor(
+            crush_db(home, cwd, session_dir),
+            "SELECT updated_at, id FROM messages WHERE session_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1",
+        ),
+        ManagedHarness::Antigravity => Err(anyhow!(
+            "{} does not expose a reliable transcript cursor",
+            harness.as_str()
+        )),
+        _ => {
+            let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
+                .ok_or_else(|| {
+                    anyhow!("native transcript for {native_session_id} was not found")
+                })?;
+            let mut file = File::open(&path)?;
+            let mut reader = BufReader::new(&mut file);
+            let mut offset = 0_u64;
+            let mut committed_offset = 0_u64;
+            let mut prefix_hasher = Sha256::new();
+            let mut line = Vec::new();
+            let mut records = 0_usize;
+            loop {
+                line.clear();
+                let read = std::io::Read::by_ref(&mut reader)
+                    .take((MAX_SOURCE_RECORD_BYTES + 1) as u64)
+                    .read_until(b'\n', &mut line)?;
+                if read == 0 {
+                    break;
+                }
+                records += 1;
+                if records > MAX_SOURCE_RECORDS {
+                    return Err(anyhow!(
+                        "native transcript baseline exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+                    ));
+                }
+                if read > MAX_SOURCE_RECORD_BYTES {
+                    return Err(anyhow!(
+                        "native transcript baseline record exceeds the {MAX_SOURCE_RECORD_BYTES} byte limit"
+                    ));
+                }
+                offset = offset.saturating_add(read as u64);
+                if offset > MAX_SOURCE_BYTES as u64 {
+                    return Err(anyhow!(
+                        "native transcript baseline exceeds the {MAX_SOURCE_BYTES} source-byte limit"
+                    ));
+                }
+                if !line.ends_with(b"\n") {
+                    break;
+                }
+                prefix_hasher.update(&line);
+                committed_offset = offset;
+            }
+            Ok(serde_json::to_string(&FileCursor {
+                path: path.to_string_lossy().into_owned(),
+                offset: committed_offset,
+                flavor: file_flavor(harness),
+                prefix_sha256: journal_rewrites_in_place(harness)
+                    .then(|| format!("{:x}", prefix_hasher.finalize())),
+            })?)
+        }
+    }
 }
 
 /// New sessions appeared in a store that records no launch identity and none
@@ -209,6 +647,197 @@ pub async fn discover_native_session(
     Ok(None)
 }
 
+/// Whether a Claude transcript was written by a Claude Code background session
+/// (one the Claude Code daemon hosts), whose records carry
+/// `"sessionKind": "bg"`. Foreground transcripts never carry the field, so this
+/// keeps the launcher from asking Claude about live sessions on every resume.
+pub fn claude_session_ran_in_background(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<bool> {
+    let Some(path) = locate_session_file(
+        ManagedHarness::Claude,
+        home,
+        cwd,
+        session_dir,
+        native_session_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    let reader = BufReader::new(File::open(&path)?);
+    for line in reader.lines() {
+        let line = line?;
+        if !line.contains("\"sessionKind\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("sessionKind").and_then(Value::as_str) == Some("bg")
+            && value.get("sessionId").and_then(Value::as_str) == Some(native_session_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The id `claude attach` takes for `native_session_id` when `claude agents
+/// --json` lists it as a live background session in this checkout.
+///
+/// Claude Code refuses `--resume` on a background session that is still
+/// running and points at `claude attach <id>`, whose `<id>` is the short id
+/// the listing prints, not the full session id. Anything unexpected in the
+/// listing yields `None`, so the launcher keeps its native resume.
+pub fn claude_live_background_attach_id(
+    agents_json: &[u8],
+    native_session_id: &str,
+    cwd: &Path,
+) -> Option<String> {
+    let sessions: Vec<Value> = serde_json::from_slice(agents_json).ok()?;
+    sessions.iter().find_map(|session| {
+        let attach_id = session.get("id").and_then(Value::as_str)?;
+        let matches = session.get("sessionId").and_then(Value::as_str) == Some(native_session_id)
+            && session.get("kind").and_then(Value::as_str) == Some("background")
+            && session
+                .get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|recorded| same_path(Path::new(recorded), cwd));
+        (matches
+            && attach_id
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphanumeric())
+            && attach_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .then(|| attach_id.to_string())
+    })
+}
+
+/// Where a Claude Code launch's conversation went on, when it left the
+/// session the launcher started or resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeContinuation {
+    /// `/resume` attached to a background session the daemon hosts.
+    Background(String),
+    /// `/clear` started a new session in the same process.
+    Cleared(String),
+}
+
+impl ClaudeContinuation {
+    /// The native session the conversation continued in.
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Background(id) | Self::Cleared(id) => id,
+        }
+    }
+}
+
+/// Find the session `native_session_id`'s Claude Code process continued in
+/// during this run, if it left it.
+///
+/// Every record a Claude Code process writes names the session the process
+/// launched with in `session_id`, while `sessionId` names the transcript's own
+/// session. Two moves leave that launch session behind:
+///
+/// - `/resume` on a background session (one hosted by the Claude Code daemon)
+///   keeps going in the background session's transcript, whose records carry
+///   `"sessionKind": "bg"`. The daemon's hooks never see this run's id.
+/// - `/clear` starts a new session whose transcript records the `/clear`
+///   command itself.
+///
+/// Without this the workstream stays on the launch session, and the next
+/// launch resumes a transcript that holds none of the later conversation.
+///
+/// Only transcripts written since `started_at` are read, the newest first, so
+/// a chain of `/clear`s ends on the last one. A background record must match
+/// this checkout exactly; a cleared session may have moved into a directory
+/// below it. Transcripts without those fields (older Claude Code builds)
+/// never match.
+pub fn claude_continued_session(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    started_at: SystemTime,
+) -> Result<Option<ClaudeContinuation>> {
+    if !valid_native_session_id(native_session_id) {
+        return Ok(None);
+    }
+    let mut candidates = collect_session_files(ManagedHarness::Claude, home, session_dir)?;
+    candidates.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
+    let attached_marker = format!("\"session_id\":\"{native_session_id}\"");
+    for path in candidates.into_iter().take(512) {
+        if modified(&path).is_some_and(|time| time + Duration::from_secs(2) < started_at) {
+            break;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if stem == native_session_id {
+            continue;
+        }
+        let reader = BufReader::new(File::open(&path)?);
+        let mut cleared = false;
+        let mut cleared_in_checkout = false;
+        for line in reader.lines() {
+            let line = line?;
+            let clear_command = line.contains(CLAUDE_CLEAR_COMMAND);
+            if !clear_command && !line.contains(&attached_marker) {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
+                continue;
+            };
+            if session == native_session_id || !valid_native_session_id(session) {
+                continue;
+            }
+            let recorded_cwd = value.get("cwd").and_then(Value::as_str).map(Path::new);
+            if clear_command && session == stem && is_claude_clear_command(&value) {
+                cleared = true;
+            }
+            if value.get("session_id").and_then(Value::as_str) != Some(native_session_id) {
+                continue;
+            }
+            if value.get("sessionKind").and_then(Value::as_str) == Some("bg") {
+                if recorded_cwd.is_some_and(|recorded| same_path(recorded, cwd)) {
+                    return Ok(Some(ClaudeContinuation::Background(session.to_string())));
+                }
+            } else if session == stem
+                && recorded_cwd.is_some_and(|recorded| path_within(recorded, cwd))
+            {
+                cleared_in_checkout = true;
+            }
+        }
+        if cleared && cleared_in_checkout {
+            return Ok(Some(ClaudeContinuation::Cleared(stem.to_string())));
+        }
+    }
+    Ok(None)
+}
+
+const CLAUDE_CLEAR_COMMAND: &str = "<command-name>/clear</command-name>";
+
+/// The user record Claude Code writes for a `/clear` typed at its prompt.
+fn is_claude_clear_command(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("user")
+        && value
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.trim_start().starts_with(CLAUDE_CLEAR_COMMAND))
+}
+
 /// List newest native sessions whose recorded working directory matches the
 /// current checkout. Native stores are opened read-only and unrelated paths are
 /// excluded before candidates reach the launcher prompt.
@@ -264,6 +893,60 @@ pub async fn list_native_sessions(
         }
     }
     Ok(sessions)
+}
+
+/// Resolve the on-disk directory holding this harness's native "memory"
+/// store for the given checkout, when the harness has one and a session
+/// recorded for this cwd can be found.
+///
+/// Claude Code keeps a `memory/` directory as a sibling of its own session
+/// transcripts, at `<home>/.claude/projects/<project-dir>/memory/` — the
+/// native store `ai-memory doctor` warns about capturing unless a marker's
+/// `ignore_paths` excludes it (harness-issue #1003). `<project-dir>`'s name
+/// is Claude Code's own encoding of the cwd, which is **not** the same
+/// encoding on every platform (native Windows also folds `\` and `:`, not
+/// only `/`), so this never re-derives that name. Instead it reuses the same
+/// content-based match [`list_native_sessions`] uses — read each session
+/// file's own recorded `cwd` until one matches — and returns that file's
+/// parent directory, which is correct on any platform by construction.
+///
+/// Callers should pass the checkout's **repository root**, not an arbitrary
+/// subdirectory: Claude Code keys this store by repository root, so a
+/// worktree or a subdirectory shares the root's `memory/` directory. This
+/// function itself does no such resolution -- it matches whatever `cwd` it
+/// is given against recorded session cwds -- so passing a subdirectory here
+/// finds nothing even when a `memory/` store genuinely exists for the
+/// repository.
+///
+/// Harnesses with no known native-memory convention return `None`
+/// unconditionally; callers should treat that as "nothing to report", not as
+/// an error.
+#[must_use]
+pub fn native_memory_dir(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if harness != ManagedHarness::Claude {
+        return None;
+    }
+    let mut files = collect_session_files(harness, home, session_dir).ok()?;
+    files.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
+    for path in files {
+        let Ok(Some((_, recorded_cwd))) = session_header_for_cwd(harness, &path, cwd) else {
+            continue;
+        };
+        if same_path(&recorded_cwd, cwd) {
+            let memory_dir = path.parent()?.join("memory");
+            return memory_dir.is_dir().then_some(memory_dir);
+        }
+    }
+    None
 }
 
 /// Whether the native store holds `native_session_id` for this checkout.
@@ -384,11 +1067,22 @@ pub async fn wait_for_transcript_flush(
     Ok(())
 }
 
+#[cfg(test)]
 fn export_jsonl(
     harness: ManagedHarness,
     path: &Path,
     native_session_id: &str,
     source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    export_jsonl_range(harness, path, native_session_id, source_cursor, None)
+}
+
+fn export_jsonl_range(
+    harness: ManagedHarness,
+    path: &Path,
+    native_session_id: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
     let flavor = file_flavor(harness);
     let cursor = source_cursor
@@ -396,9 +1090,29 @@ fn export_jsonl(
         .filter(|cursor| {
             Path::new(&cursor.path) == path && (cursor.flavor.is_none() || cursor.flavor == flavor)
         });
+    let final_cursor = final_cursor
+        .map(serde_json::from_str::<FileCursor>)
+        .transpose()
+        .context("invalid native transcript final file cursor")?;
+    if final_cursor
+        .as_ref()
+        .is_some_and(|cursor| Path::new(&cursor.path) != path || cursor.flavor != flavor)
+    {
+        return Err(anyhow!(
+            "native transcript final cursor does not match this adapter session"
+        ));
+    }
     let mut file = File::open(path)
         .with_context(|| format!("opening native transcript {}", path.display()))?;
-    let len = file.metadata()?.len();
+    let file_len = file.metadata()?.len();
+    let len = final_cursor
+        .as_ref()
+        .map_or(file_len, |cursor| cursor.offset);
+    if len > file_len {
+        return Err(anyhow!(
+            "native transcript final cursor is past the current transcript end"
+        ));
+    }
     let (start, mut prefix_hasher) = if journal_rewrites_in_place(harness) {
         let validated = if let Some(cursor) = cursor.as_ref().filter(|cursor| cursor.offset <= len)
             && let Some(expected) = cursor.prefix_sha256.as_deref()
@@ -423,12 +1137,42 @@ fn export_jsonl(
     let mut line = Vec::new();
     let mut events = Vec::new();
     let mut losses = Vec::new();
+    let mut records = 0_usize;
+    let mut source_bytes = 0_usize;
+    let mut checked_events = 0_usize;
+    let mut event_bytes = 0_usize;
+    let mut codex_turn_cwd: Option<String> = None;
     loop {
         line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
+        let remaining = len.saturating_sub(offset);
+        if remaining == 0 {
+            break;
+        }
+        let read_limit = remaining.min((MAX_SOURCE_RECORD_BYTES + 1) as u64);
+        let read = std::io::Read::by_ref(&mut reader)
+            .take(read_limit)
+            .read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
+        records += 1;
+        if records > MAX_SOURCE_RECORDS {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+            ));
+        }
+        if read > MAX_SOURCE_RECORD_BYTES {
+            return Err(anyhow!(
+                "native transcript record exceeds the {MAX_SOURCE_RECORD_BYTES} byte limit"
+            ));
+        }
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            read,
+        )?;
         offset += read as u64;
         if !line.ends_with(b"\n") {
             break;
@@ -461,6 +1205,7 @@ fn export_jsonl(
         } else {
             source_id(&value).unwrap_or_else(|| format!("byte-{}", offset - read as u64))
         };
+        let first_event = events.len();
         match harness {
             ManagedHarness::Claude => parse_claude(
                 &value,
@@ -519,6 +1264,13 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::Copilot => parse_copilot(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::OpenCode
             | ManagedHarness::OpenCode2
             | ManagedHarness::Crush
@@ -529,6 +1281,28 @@ fn export_jsonl(
                 ));
             }
         }
+        let record_cwd = match harness {
+            ManagedHarness::Claude => value.get("cwd").and_then(Value::as_str),
+            ManagedHarness::Codex => {
+                if matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("session_meta" | "turn_context")
+                ) && let Some(cwd) = value.pointer("/payload/cwd").and_then(Value::as_str)
+                {
+                    codex_turn_cwd = Some(cwd.to_owned());
+                }
+                codex_turn_cwd.as_deref()
+            }
+            _ => None,
+        };
+        stamp_record_cwd(&mut events[first_event..], record_cwd);
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            0,
+        )?;
     }
     if harness == ManagedHarness::Kimi {
         annotate_kimi_subagents(path, &mut losses);
@@ -539,12 +1313,34 @@ fn export_jsonl(
             path: path.to_string_lossy().into_owned(),
             offset: committed_offset,
             flavor,
-            prefix_sha256: journal_rewrites_in_place(harness)
-                .then(|| format!("{:x}", prefix_hasher.finalize())),
+            prefix_sha256: if journal_rewrites_in_place(harness) {
+                final_cursor
+                    .and_then(|cursor| cursor.prefix_sha256.clone())
+                    .or_else(|| Some(format!("{:x}", prefix_hasher.finalize())))
+            } else {
+                None
+            },
         })?),
         events,
         losses: deduplicate_losses(losses),
     })
+}
+
+/// Label each event with the working directory its record was written in.
+/// Claude Code records `cwd` on every line and Codex in each `turn_context`,
+/// and both follow the session as it moves, so the session's opening cwd can
+/// be the wrong base for a relative path. Imports resolve tool arguments and
+/// the capture policy from this label, as the live hook does from each event's
+/// own `cwd`.
+fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
+    let Some(cwd) = cwd.filter(|cwd| Path::new(cwd).is_absolute()) else {
+        return;
+    };
+    for event in events {
+        if let Some(metadata) = event.metadata.as_object_mut() {
+            metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
+        }
+    }
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -610,6 +1406,30 @@ fn parse_claude(
         losses.push("Claude non-conversation message records were intentionally excluded".into());
         return;
     }
+    if role == "user" && value.get("isCompactSummary").is_some_and(truthy) {
+        // The summary Claude Code writes after compacting the conversation,
+        // recorded as a user turn the operator never typed.
+        let text = message.get("content").map(value_text).unwrap_or_default();
+        if !text.is_empty() {
+            push_event(
+                events,
+                AgentKind::ClaudeCode,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::Compaction,
+                Some("assistant"),
+                &text,
+                timestamp(value),
+                json!({}),
+            );
+        }
+        return;
+    }
+    if role == "user" && claude_task_notification(value, message) {
+        losses.push("Claude task notifications were intentionally excluded".into());
+        return;
+    }
     parse_content_blocks(
         AgentKind::ClaudeCode,
         session,
@@ -620,6 +1440,66 @@ fn parse_claude(
         events,
         losses,
     );
+}
+
+/// A user turn Claude Code writes itself to report a background task: a
+/// monitored command's streamed output, a finished background command or
+/// agent and its result. No prompt hook fires for it, so live capture never
+/// stores it as a prompt. Recognized by an `origin.kind` of
+/// `task-notification` in any case, or by a first text block that opens with
+/// a `<task-notification>` tag in any case, attributes allowed, after any
+/// byte-order mark, zero-width character or whitespace.
+fn claude_task_notification(record: &Value, message: &Value) -> bool {
+    let origin = |value: &Value| {
+        value
+            .pointer("/origin/kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("task-notification"))
+    };
+    if origin(record) || origin(message) {
+        return true;
+    }
+    let first_text = match message.get("content") {
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(Value::Array(blocks)) => blocks.iter().find_map(|block| {
+            block.as_str().or_else(|| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| first_string(block, &["text"]))
+                    .flatten()
+            })
+        }),
+        _ => None,
+    };
+    first_text.is_some_and(|text| {
+        const TAG: &str = "<task-notification";
+        let text = text.trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}'
+                )
+        });
+        text.get(..TAG.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(TAG))
+            && text[TAG.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+    })
+}
+
+/// A record flag Claude Code writes as `true`, and that a rewritten
+/// transcript may carry as `"true"` or `1`.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_some_and(|n| n != 0.0),
+        Value::String(text) => {
+            let text = text.trim();
+            text.eq_ignore_ascii_case("true") || text == "1"
+        }
+        _ => false,
+    }
 }
 
 fn parse_codex(
@@ -688,7 +1568,7 @@ fn parse_codex(
                 Some("assistant"),
                 &format!("{name}: {body}"),
                 timestamp(value),
-                json!({"tool": name}),
+                with_tool_use_id(json!({"tool": name}), first_string(payload, &["call_id"])),
             );
         }
         "function_call_output" | "custom_tool_call_output" | "tool_result" => {
@@ -703,7 +1583,7 @@ fn parse_codex(
                 Some("tool"),
                 body,
                 timestamp(value),
-                json!({}),
+                with_tool_use_id(json!({}), first_string(payload, &["call_id"])),
             );
         }
         "web_search_call" => {
@@ -784,10 +1664,13 @@ fn parse_pi_family(
                         Some("tool"),
                         &body,
                         timestamp(value),
-                        json!({
-                            "tool": tool,
-                            "is_error": message.get("isError").or_else(|| message.get("is_error")).and_then(Value::as_bool).unwrap_or(false)
-                        }),
+                        with_tool_use_id(
+                            json!({
+                                "tool": tool,
+                                "is_error": message.get("isError").or_else(|| message.get("is_error")).and_then(Value::as_bool).unwrap_or(false)
+                            }),
+                            first_string(message, &["toolCallId", "tool_call_id"]),
+                        ),
                     );
                 }
                 _ => losses.push(format!(
@@ -1780,6 +2663,152 @@ fn parse_grok(
     }
 }
 
+/// Copilot CLI `events.jsonl` records (verified on 1.0.92). Each record is
+/// `{type, data, id, timestamp, parentId}`. Only the user's typed text, the
+/// assistant's visible text and tool requests, completed tool output, and
+/// compaction summaries are imported. `transformedContent` (the prompt with
+/// injected datetime/context), `reasoningText`/`reasoningOpaque`, hook output
+/// (where ai-memory's own startup packet lands), permission prompts, model
+/// snapshots, and session telemetry never reach the ledger.
+fn parse_copilot(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let data = value.get("data").unwrap_or(&Value::Null);
+    match record_type {
+        "system.message" => {
+            losses.push("Copilot system prompt records were intentionally excluded".into());
+        }
+        "model.messages_snapshot" => {
+            losses.push("Copilot model message snapshots were intentionally excluded".into());
+        }
+        "user.message" => {
+            if let Some(text) = data.get("content").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::CopilotCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    text,
+                    timestamp(value),
+                    json!({}),
+                );
+            }
+        }
+        "assistant.message" => {
+            if ["reasoningText", "reasoningOpaque", "reasoningBlocks"]
+                .iter()
+                .any(|key| data.get(*key).is_some_and(|value| !value.is_null()))
+            {
+                losses.push("Copilot hidden reasoning was intentionally excluded".into());
+            }
+            let block_count = match data.get("content").and_then(Value::as_str) {
+                Some(text) if !text.trim().is_empty() => {
+                    push_event(
+                        events,
+                        AgentKind::CopilotCli,
+                        session,
+                        record_id,
+                        0,
+                        WorkstreamEventKind::Message,
+                        Some("assistant"),
+                        text,
+                        timestamp(value),
+                        json!({}),
+                    );
+                    1
+                }
+                _ => 0,
+            };
+            let requests = data
+                .get("toolRequests")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for (index, request) in requests.iter().enumerate() {
+                let name = first_string(request, &["name"]).unwrap_or("tool");
+                let arguments = request
+                    .get("arguments")
+                    .map(compact_json)
+                    .unwrap_or_default();
+                push_event(
+                    events,
+                    AgentKind::CopilotCli,
+                    session,
+                    record_id,
+                    block_count + index,
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    &format!("{name}: {arguments}"),
+                    timestamp(value),
+                    with_tool_use_id(
+                        json!({"tool": name}),
+                        first_string(request, &["toolCallId"]),
+                    ),
+                );
+            }
+        }
+        "tool.execution_complete" => {
+            let success = data.get("success").and_then(Value::as_bool);
+            // `detailedContent` repeats the output as a diff carrying absolute
+            // paths; the model-visible `content` is the portable record.
+            let body = if success == Some(false) {
+                data.get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .map(|message| format!("error: {message}"))
+            } else {
+                data.get("result")
+                    .and_then(|result| result.get("content"))
+                    .map(value_text)
+            };
+            push_event(
+                events,
+                AgentKind::CopilotCli,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolResult,
+                Some("tool"),
+                body.as_deref().unwrap_or_default(),
+                timestamp(value),
+                with_tool_use_id(
+                    json!({"success": success}),
+                    first_string(data, &["toolCallId"]),
+                ),
+            );
+        }
+        "session.compaction_complete" => {
+            if data.get("success").and_then(Value::as_bool) == Some(true)
+                && let Some(text) = data.get("summaryContent").and_then(Value::as_str)
+            {
+                push_event(
+                    events,
+                    AgentKind::CopilotCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Compaction,
+                    Some("assistant"),
+                    text,
+                    timestamp(value),
+                    json!({}),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_content_blocks(
     agent: AgentKind,
@@ -1855,7 +2884,10 @@ fn parse_content_blocks(
                     Some("assistant"),
                     &format!("{name}: {input}"),
                     occurred_at.clone(),
-                    json!({"tool": name}),
+                    with_tool_use_id(
+                        json!({"tool": name}),
+                        first_string(block, &["id", "toolCallId", "tool_call_id", "call_id"]),
+                    ),
                 );
             }
             "tool_result" | "toolResult" => {
@@ -1877,7 +2909,13 @@ fn parse_content_blocks(
                     Some("tool"),
                     &body,
                     occurred_at.clone(),
-                    json!({"is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false)}),
+                    with_tool_use_id(
+                        json!({"is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false)}),
+                        first_string(
+                            block,
+                            &["tool_use_id", "toolCallId", "tool_call_id", "call_id"],
+                        ),
+                    ),
                 );
             }
             "thinking" | "reasoning" | "redacted_thinking" => {
@@ -1907,7 +2945,7 @@ fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
     let trimmed = text.trim_start();
     match agent {
         AgentKind::Codex => {
-            trimmed.starts_with("# AGENTS.md instructions for ")
+            ai_memory_core::looks_like_codex_instructions(trimmed)
                 || trimmed.starts_with("<environment_context>")
                 || trimmed.starts_with("<permissions instructions>")
                 || trimmed.starts_with("<INSTRUCTIONS>")
@@ -1928,11 +2966,22 @@ fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn export_opencode(
     home: &Path,
     session_dir: Option<&Path>,
     session: &str,
     source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    export_opencode_range(home, session_dir, session, source_cursor, None)
+}
+
+fn export_opencode_range(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
     let db = opencode_db(home, session_dir);
     let connection = Connection::open_with_flags(
@@ -1948,25 +2997,57 @@ fn export_opencode(
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
+    let upper = final_cursor
+        .map(serde_json::from_str::<SqlCursor>)
+        .transpose()
+        .context("invalid native transcript final SQL cursor")?
+        .unwrap_or(SqlCursor {
+            updated: i64::MAX,
+            id: "\u{10ffff}".to_string(),
+        });
     let mut statement = connection.prepare(
-        "SELECT p.id, p.time_updated, m.data, p.data
+        "SELECT p.id, p.time_updated, length(m.data), length(p.data), m.data, p.data
          FROM part p JOIN message m ON m.id = p.message_id
          WHERE p.session_id = ?1 AND (p.time_updated > ?2 OR (p.time_updated = ?2 AND p.id > ?3))
-         ORDER BY p.time_updated, p.id",
+           AND (p.time_updated < ?4 OR (p.time_updated = ?4 AND p.id <= ?5))
+         ORDER BY p.time_updated, p.id
+         LIMIT ?6",
     )?;
-    let rows = statement.query_map(params![session, cursor.updated, cursor.id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
+    let mut rows = statement.query(params![
+        session,
+        cursor.updated,
+        cursor.id,
+        upper.updated,
+        upper.id,
+        (MAX_SOURCE_RECORDS + 1) as i64
+    ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
     let mut next_cursor = cursor;
-    for row in rows {
-        let (id, updated, message_raw, part_raw) = row?;
+    let mut source_bytes = 0_usize;
+    let mut checked_events = 0_usize;
+    let mut event_bytes = 0_usize;
+    let mut records = 0_usize;
+    while let Some(row) = rows.next()? {
+        records += 1;
+        if records > MAX_SOURCE_RECORDS {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+            ));
+        }
+        let updated = row.get::<_, i64>(1)?;
+        let message_len = row.get::<_, usize>(2)?;
+        let part_len = row.get::<_, usize>(3)?;
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            message_len.saturating_add(part_len),
+        )?;
+        let id = row.get::<_, String>(0)?;
+        let message_raw = row.get::<_, String>(4)?;
+        let part_raw = row.get::<_, String>(5)?;
         next_cursor = SqlCursor {
             updated,
             id: id.clone(),
@@ -1980,6 +3061,13 @@ fn export_opencode(
             continue;
         };
         parse_opencode(&message, &part, session, &id, &mut events, &mut losses);
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            0,
+        )?;
     }
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -1989,12 +3077,24 @@ fn export_opencode(
     })
 }
 
+#[cfg(test)]
 fn export_crush(
     home: &Path,
     cwd: &Path,
     session_dir: Option<&Path>,
     session: &str,
     source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    export_crush_range(home, cwd, session_dir, session, source_cursor, None)
+}
+
+fn export_crush_range(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
     let db = crush_db(home, cwd, session_dir);
     let connection = Connection::open_with_flags(
@@ -2005,27 +3105,57 @@ fn export_crush(
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
+    let upper = final_cursor
+        .map(serde_json::from_str::<SqlCursor>)
+        .transpose()
+        .context("invalid native transcript final SQL cursor")?
+        .unwrap_or(SqlCursor {
+            updated: i64::MAX,
+            id: "\u{10ffff}".to_string(),
+        });
     let mut statement = connection.prepare(
-        "SELECT id, role, parts, updated_at, is_summary_message \
+        "SELECT id, role, length(parts), parts, updated_at, is_summary_message \
          FROM messages \
          WHERE session_id = ?1 \
            AND (updated_at > ?2 OR (updated_at = ?2 AND id > ?3)) \
-         ORDER BY updated_at, id",
+           AND (updated_at < ?4 OR (updated_at = ?4 AND id <= ?5)) \
+         ORDER BY updated_at, id LIMIT ?6",
     )?;
-    let rows = statement.query_map(params![session, cursor.updated, cursor.id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-        ))
-    })?;
+    let mut rows = statement.query(params![
+        session,
+        cursor.updated,
+        cursor.id,
+        upper.updated,
+        upper.id,
+        (MAX_SOURCE_RECORDS + 1) as i64
+    ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
     let mut next_cursor = cursor;
-    for row in rows {
-        let (id, role, parts_raw, updated, is_summary) = row?;
+    let mut source_bytes = 0_usize;
+    let mut checked_events = 0_usize;
+    let mut event_bytes = 0_usize;
+    let mut records = 0_usize;
+    while let Some(row) = rows.next()? {
+        records += 1;
+        if records > MAX_SOURCE_RECORDS {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+            ));
+        }
+        let parts_len = row.get::<_, usize>(2)?;
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            parts_len,
+        )?;
+        let id = row.get::<_, String>(0)?;
+        let role = row.get::<_, String>(1)?;
+        let parts_raw = row.get::<_, String>(3)?;
+        let updated = row.get::<_, i64>(4)?;
+        let is_summary = row.get::<_, i64>(5)?;
         next_cursor = SqlCursor {
             updated,
             id: id.clone(),
@@ -2047,6 +3177,13 @@ fn export_crush(
             &mut events,
             &mut losses,
         );
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            0,
+        )?;
     }
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -2285,11 +3422,38 @@ fn locate_session_file(
         let exact = root.join(format!("{id}.db"));
         return Ok(session_path_matches(harness, &exact, id, cwd)?.then_some(exact));
     }
+    if harness == ManagedHarness::Copilot {
+        // The session directory is named by its UUID, so no scan is needed;
+        // the header still has to name this checkout.
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let exact = root.join(id).join("events.jsonl");
+        return Ok(session_path_matches(harness, &exact, id, cwd)?.then_some(exact));
+    }
     if harness == ManagedHarness::Claude {
-        let encoded = cwd.to_string_lossy().replace('/', "-");
-        let exact = root.join(encoded).join(format!("{id}.jsonl"));
-        if exact.is_file() {
+        // The project folder is the cwd with every character outside
+        // `[A-Za-z0-9]` turned into `-` (#1167). A name that does not derive
+        // from the cwd (a shortened long path) is found by probing each
+        // folder for the exact file, before the bounded scan below, which a
+        // large store can exhaust before reaching the transcript.
+        let exact = root
+            .join(claude_project_dir_name(cwd))
+            .join(format!("{id}.jsonl"));
+        if session_path_matches(harness, &exact, id, cwd)? {
             return Ok(Some(exact));
+        }
+        if let Ok(buckets) = fs::read_dir(root) {
+            for bucket in buckets.take(MAX_SCAN_FILES) {
+                let bucket = bucket?;
+                if !bucket.file_type()?.is_dir() {
+                    continue;
+                }
+                let candidate = bucket.path().join(format!("{id}.jsonl"));
+                if session_path_matches(harness, &candidate, id, cwd)? {
+                    return Ok(Some(candidate));
+                }
+            }
         }
     }
     if harness == ManagedHarness::Kimi {
@@ -2364,14 +3528,50 @@ fn locate_session_file(
         }
         return Ok(None);
     }
-    let mut files = collect_session_files(harness, home, session_dir)?;
-    files.sort_by_key(|path| temporary_transcript(path));
-    for path in files.into_iter().take(2_000) {
+    let files = collect_session_files(harness, home, session_dir)?;
+    for path in lookup_candidates(files, id) {
         if session_path_matches(harness, &path, id, cwd)? {
             return Ok(Some(path));
         }
     }
     Ok(None)
+}
+
+/// The transcripts a session lookup reads, in the order it reads them, up to a
+/// fixed number. A store can hold more than that, and the directory walk lists
+/// them in no useful order, so the order decides which sessions can be found.
+/// Codex, Pi, OMP and Grok put the session id in the transcript's file or
+/// directory name, so a transcript that names it comes first. Within each
+/// group temporary copies go last; naming ranks above that because OMP can
+/// leave a session only as an atomic-write temp, which a store-wide
+/// temporary-last rule would push past the cap. The rest follow newest
+/// first, as discovery and listing do.
+fn lookup_candidates(mut files: Vec<PathBuf>, id: &str) -> Vec<PathBuf> {
+    files.sort_by_cached_key(|path| {
+        (
+            !names_session(path, id),
+            temporary_transcript(path),
+            Reverse(modified(path)),
+            path.clone(),
+        )
+    });
+    files.truncate(2_000);
+    files
+}
+
+fn names_session(path: &Path, id: &str) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_string_lossy().contains(id))
+}
+
+/// The folder Claude Code keeps a project's transcripts in: the cwd with
+/// every character outside `[A-Za-z0-9]` replaced by `-`, so `/a/b.c_d` is
+/// `-a-b-c-d` and `C:\\Users\\me` is `C--Users-me`.
+fn claude_project_dir_name(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn session_path_matches(
@@ -2388,6 +3588,14 @@ fn session_path_matches(
 }
 
 fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
+    if harness == ManagedHarness::Claude {
+        // `<id>/subagents/agent-*.jsonl` sidechains carry the parent's session
+        // id and cwd; they are part of a session, never one of their own.
+        return path.extension().is_some_and(|ext| ext == "jsonl")
+            && !path
+                .components()
+                .any(|component| component.as_os_str() == "subagents");
+    }
     if harness == ManagedHarness::Grok {
         // Only the conversation journal. `events.jsonl`, `updates.jsonl`, and
         // `rewind_points.jsonl` in the same session directory carry harness
@@ -2433,6 +3641,16 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
         // One SQLite database per conversation, named by its id.
         return path.extension().is_some_and(|ext| ext == "db");
     }
+    if harness == ManagedHarness::Copilot {
+        // `<session-state>/<uuid>/events.jsonl` only; checkpoints, files and
+        // research artifacts in the same directory are not transcripts.
+        return path.file_name().and_then(|name| name.to_str()) == Some("events.jsonl")
+            && path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| Uuid::parse_str(name).is_ok());
+    }
     path.extension().is_some_and(|ext| ext == "jsonl")
         || matches!(harness, ManagedHarness::Pi | ManagedHarness::Omp) && temporary_transcript(path)
 }
@@ -2443,6 +3661,25 @@ fn temporary_transcript(path: &Path) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.contains(".jsonl."))
+}
+
+fn read_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native transcript metadata exceeds its byte limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native transcript metadata exceeds its byte limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
@@ -2461,12 +3698,20 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
     if harness == ManagedHarness::Antigravity {
         return antigravity_session_header(path);
     }
+    if harness == ManagedHarness::Copilot {
+        return copilot_session_header(path);
+    }
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = String::new();
     for _ in 0..64 {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let read = std::io::Read::take(&mut reader, (MAX_SESSION_HEADER_BYTES + 1) as u64)
+            .read_line(&mut line)?;
+        if read == 0 {
             break;
+        }
+        if read > MAX_SESSION_HEADER_BYTES {
+            return Ok(None);
         }
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -2495,7 +3740,8 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             | ManagedHarness::Kiro
             | ManagedHarness::KiroV3
             | ManagedHarness::Grok
-            | ManagedHarness::Antigravity => (None, None),
+            | ManagedHarness::Antigravity
+            | ManagedHarness::Copilot => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -2547,6 +3793,46 @@ fn command_code_session_header(path: &Path) -> Result<Option<(String, PathBuf)>>
     Ok(Some((id.to_string(), cwd)))
 }
 
+/// Copilot CLI opens every `events.jsonl` with a `session.start` record
+/// naming the session and its working directory. Fail closed when that first
+/// record is missing, oversized, or disagrees with the directory name.
+fn copilot_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(dir_id) = path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return Ok(None);
+    };
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = String::new();
+    let read =
+        std::io::Read::take(&mut reader, (MAX_EVENT_BYTES + 1) as u64).read_line(&mut line)?;
+    if read == 0 || read > MAX_EVENT_BYTES {
+        return Ok(None);
+    }
+    let Ok(header) = serde_json::from_str::<Value>(&line) else {
+        return Ok(None);
+    };
+    if header.get("type").and_then(Value::as_str) != Some("session.start") {
+        return Ok(None);
+    }
+    let data = header.get("data").unwrap_or(&Value::Null);
+    let (Some(id), Some(cwd)) = (
+        data.get("sessionId").and_then(Value::as_str),
+        data.get("context")
+            .and_then(|context| context.get("cwd"))
+            .and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let cwd = PathBuf::from(cwd);
+    if id != dir_id || Uuid::parse_str(id).is_err() || !cwd.is_absolute() {
+        return Ok(None);
+    }
+    Ok(Some((id.to_string(), cwd)))
+}
+
 fn session_header_for_cwd(
     harness: ManagedHarness,
     path: &Path,
@@ -2571,10 +3857,11 @@ fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let Some(session_dir) = path.ancestors().nth(3) else {
         return Ok(None);
     };
-    let Ok(raw) = fs::read_to_string(session_dir.join("state.json")) else {
+    let Ok(raw) = read_bounded_file(&session_dir.join("state.json"), MAX_SESSION_METADATA_BYTES)
+    else {
         return Ok(None);
     };
-    let Ok(state) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(state) = serde_json::from_slice::<Value>(&raw) else {
         return Ok(None);
     };
     let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
@@ -2617,10 +3904,11 @@ fn kiro_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     if Uuid::parse_str(stem).is_err() {
         return Ok(None);
     }
-    let Ok(raw) = fs::read_to_string(path.with_extension("json")) else {
+    let Ok(raw) = read_bounded_file(&path.with_extension("json"), MAX_SESSION_METADATA_BYTES)
+    else {
         return Ok(None);
     };
-    let Ok(metadata) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(metadata) = serde_json::from_slice::<Value>(&raw) else {
         return Ok(None);
     };
     let Some(id) = metadata.get("session_id").and_then(Value::as_str) else {
@@ -2654,10 +3942,13 @@ fn kiro_v3_session_header(path: &Path, cwd: &Path) -> Result<Option<(String, Pat
     if Uuid::parse_str(uuid).is_err() {
         return Ok(None);
     }
-    let Ok(raw) = fs::read_to_string(session_dir.join("session.json")) else {
+    let Ok(raw) = read_bounded_file(
+        &session_dir.join("session.json"),
+        MAX_SESSION_METADATA_BYTES,
+    ) else {
         return Ok(None);
     };
-    let Ok(metadata) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(metadata) = serde_json::from_slice::<Value>(&raw) else {
         return Ok(None);
     };
     if metadata.get("schemaVersion").and_then(Value::as_str) != Some("1.0.0")
@@ -2687,10 +3978,13 @@ fn grok_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let Some(session_dir) = path.parent() else {
         return Ok(None);
     };
-    let Ok(raw) = fs::read_to_string(session_dir.join("summary.json")) else {
+    let Ok(raw) = read_bounded_file(
+        &session_dir.join("summary.json"),
+        MAX_SESSION_METADATA_BYTES,
+    ) else {
         return Ok(None);
     };
-    let Ok(summary) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(summary) = serde_json::from_slice::<Value>(&raw) else {
         return Ok(None);
     };
     let info = summary.get("info").unwrap_or(&Value::Null);
@@ -2701,6 +3995,407 @@ fn grok_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Antigravity's conversation store keeps every step as an undocumented
+/// protobuf blob whose step-type enum is unversioned, so assistant and tool
+/// steps are never decoded. `agy` also appends each typed prompt to
+/// `history.jsonl` beside the store, and that is the only source read here.
+///
+/// The file is shared by every conversation and workspace, so a line is kept
+/// only when both its `conversationId` and its `workspace` match the validated
+/// conversation: resuming a conversation from another directory keeps its id
+/// but records that directory. A new conversation's first prompt is written
+/// before its id exists; it is attributed only when exactly one unlabelled
+/// prompt from this workspace was typed as the conversation's `.db` appeared.
+fn export_antigravity(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    let db = locate_session_file(ManagedHarness::Antigravity, home, cwd, session_dir, session)?
+        .ok_or_else(|| anyhow!("native transcript for {session} was not found"))?;
+    let mut losses = Vec::new();
+    let history = session_root(ManagedHarness::Antigravity, home, session_dir)
+        .parent()
+        .map(|dir| dir.join("history.jsonl"));
+    let opened = history.and_then(|path| {
+        let file = File::open(&path).ok()?;
+        let len = file.metadata().ok()?.len();
+        Some((path, file, len))
+    });
+    let Some((history, mut file, len)) = opened else {
+        losses.push(
+            "Antigravity history.jsonl is missing or unreadable; no user prompts were imported"
+                .into(),
+        );
+        losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
+        return Ok(ExportedTranscript {
+            native_session_id: session.to_string(),
+            source_cursor: None,
+            events: Vec::new(),
+            losses,
+        });
+    };
+    // `agy` could trim or rewrite its history, so the offset is trusted only
+    // while the bytes before it are unchanged.
+    let cursor = source_cursor
+        .and_then(|raw| serde_json::from_str::<FileCursor>(raw).ok())
+        .filter(|cursor| Path::new(&cursor.path) == history && cursor.offset <= len);
+    let validated = if let Some(cursor) = cursor
+        && let Some(expected) = cursor.prefix_sha256.as_deref()
+        && let Some(hasher) = hash_file_prefix(&mut file, cursor.offset)?
+        && format!("{:x}", hasher.clone().finalize()) == expected
+    {
+        Some((cursor.offset, hasher))
+    } else {
+        None
+    };
+    let (start, mut prefix_hasher) = validated.unwrap_or_else(|| (0, Sha256::new()));
+    file.seek(SeekFrom::Start(start))?;
+
+    let created = birth_millis(&db);
+    let checkout = cwd.canonicalize().ok();
+    let in_checkout = |workspace: &str| {
+        checkout.is_some() && Path::new(workspace).canonicalize().ok() == checkout
+    };
+    let mut reader = BufReader::new(file);
+    let mut offset = start;
+    let mut line = Vec::new();
+    let mut prompts: Vec<HistoryPrompt> = Vec::new();
+    // Unlabelled prompts from this checkout that could have opened it.
+    let mut openers: Vec<HistoryPrompt> = Vec::new();
+    loop {
+        let read = match read_bounded_line(
+            &mut reader,
+            MAX_ANTIGRAVITY_HISTORY_LINE_BYTES,
+            session.as_bytes(),
+            &mut line,
+            &mut prefix_hasher,
+        )? {
+            BoundedLine::Eof | BoundedLine::Partial => break,
+            BoundedLine::Oversized { read, mentions } => {
+                offset += read;
+                if mentions {
+                    losses.push("oversized Antigravity history records were skipped".into());
+                }
+                continue;
+            }
+            BoundedLine::Line(read) => read,
+        };
+        let line_offset = offset;
+        offset += read;
+        let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+        // Only a record naming this conversation can be its loss; one naming
+        // another is skipped unparsed, and an unlabelled one is a possible
+        // opening prompt, skipped silently when unusable.
+        let names_session = contains_bytes(raw, session.as_bytes());
+        if !names_session && contains_bytes(raw, b"\"conversationId\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+            if names_session {
+                losses.push("malformed Antigravity history records were skipped".into());
+            }
+            continue;
+        };
+        if value
+            .get("conversationId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != session)
+        {
+            continue;
+        }
+        let entry = match antigravity_history_entry(&value) {
+            Ok(entry) => entry,
+            Err(loss) => {
+                if value.get("conversationId").is_some() {
+                    losses.push(loss.into());
+                }
+                continue;
+            }
+        };
+        let prompt = || HistoryPrompt {
+            offset: line_offset,
+            hash: format!("{:x}", Sha256::digest(raw)),
+            millis: entry.millis,
+            display: entry.display.to_string(),
+            metadata: json!({}),
+        };
+        match (entry.conversation, entry.kind) {
+            (Some(_), AntigravityHistoryKind::SlashCommand) => {
+                losses.push("Antigravity slash commands were intentionally excluded".into());
+            }
+            (Some(_), AntigravityHistoryKind::Shell) => {
+                losses.push("Antigravity shell commands were intentionally excluded".into());
+            }
+            (Some(_), AntigravityHistoryKind::Prompt) => {
+                if in_checkout(entry.workspace) {
+                    prompts.push(prompt());
+                } else {
+                    losses.push(
+                        "Antigravity prompts typed in another workspace were excluded".into(),
+                    );
+                }
+            }
+            // Without a creation time no window applies; only a read from
+            // the start can still hold the opening prompt worth reporting.
+            (None, AntigravityHistoryKind::Prompt)
+                if created.map_or(start == 0, |created| {
+                    opening_window_contains(created, entry.millis)
+                }) && in_checkout(entry.workspace) =>
+            {
+                openers.push(prompt());
+            }
+            (None, _) => {}
+        }
+    }
+    let opening = antigravity_opening_prompt(created, openers, |millis| {
+        antigravity_conversation_started_near(&db, cwd, millis)
+    });
+    match opening {
+        Ok(Some(mut opener)) => {
+            opener.metadata = json!({"attribution": "inferred"});
+            prompts.push(opener);
+            prompts.sort_by_key(|prompt| prompt.offset);
+        }
+        Ok(None) => {}
+        Err(loss) => losses.push(loss.into()),
+    }
+    let mut events = Vec::new();
+    for prompt in prompts {
+        push_event(
+            &mut events,
+            AgentKind::AntigravityCli,
+            session,
+            &format!("{}-{}", prompt.millis, prompt.hash),
+            0,
+            WorkstreamEventKind::Message,
+            Some("user"),
+            &prompt.display,
+            jiff::Timestamp::from_millisecond(prompt.millis)
+                .ok()
+                .map(|timestamp| timestamp.to_string()),
+            prompt.metadata,
+        );
+    }
+    losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
+    Ok(ExportedTranscript {
+        native_session_id: session.to_string(),
+        source_cursor: Some(serde_json::to_string(&FileCursor {
+            path: history.to_string_lossy().into_owned(),
+            offset,
+            flavor: None,
+            prefix_sha256: Some(format!("{:x}", prefix_hasher.finalize())),
+        })?),
+        events,
+        losses: deduplicate_losses(losses),
+    })
+}
+
+const ANTIGRAVITY_PROMPTS_ONLY: &str = "Antigravity assistant and tool steps are not decodable; only user prompts from history.jsonl were imported";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AntigravityHistoryKind {
+    Prompt,
+    SlashCommand,
+    Shell,
+}
+
+#[derive(Debug)]
+struct AntigravityHistoryEntry<'a> {
+    conversation: Option<&'a str>,
+    kind: AntigravityHistoryKind,
+    workspace: &'a str,
+    display: &'a str,
+    millis: i64,
+}
+
+/// The file carries no version field, so each record is checked field by
+/// field; unknown keys are ignored and anything else unexpected is skipped.
+fn antigravity_history_entry(value: &Value) -> Result<AntigravityHistoryEntry<'_>, &'static str> {
+    let conversation = match value.get("conversationId") {
+        None => None,
+        Some(Value::String(id)) => Some(id.as_str()),
+        Some(_) => return Err("malformed Antigravity history records were skipped"),
+    };
+    let kind = match value.get("type").map(Value::as_str) {
+        None => AntigravityHistoryKind::Prompt,
+        Some(Some("slash_command")) => AntigravityHistoryKind::SlashCommand,
+        Some(Some("shell")) => AntigravityHistoryKind::Shell,
+        Some(_) => return Err("Antigravity history records of an unknown type were skipped"),
+    };
+    let display = value
+        .get("display")
+        .and_then(Value::as_str)
+        .filter(|display| !display.trim().is_empty())
+        .ok_or("Antigravity history records without a prompt were skipped")?;
+    let millis = value
+        .get("timestamp")
+        .and_then(Value::as_i64)
+        .filter(|millis| *millis > 0)
+        .ok_or("Antigravity history records without a valid timestamp were skipped")?;
+    let workspace = value
+        .get("workspace")
+        .and_then(Value::as_str)
+        .filter(|workspace| !workspace.is_empty())
+        .ok_or("Antigravity history records without a workspace were skipped")?;
+    Ok(AntigravityHistoryEntry {
+        conversation,
+        kind,
+        workspace,
+        display,
+        millis,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+struct HistoryPrompt {
+    offset: u64,
+    hash: String,
+    millis: i64,
+    display: String,
+    metadata: Value,
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn birth_millis(path: &Path) -> Option<i64> {
+    let created = fs::metadata(path)
+        .and_then(|metadata| metadata.created())
+        .ok()?;
+    i64::try_from(created.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
+}
+
+fn opening_window_contains(created_millis: i64, millis: i64) -> bool {
+    u128::from(created_millis.abs_diff(millis)) <= ANTIGRAVITY_OPENING_PROMPT_WINDOW.as_millis()
+}
+
+/// Pick the unlabelled prompt that opened the conversation from `candidates`,
+/// the ones from this checkout already inside the window around the `.db`
+/// creation time. It is attributed only when it is the single candidate and
+/// no other conversation of this checkout started near it, since that one
+/// could own it just as well. The first labelled prompt is no anchor: its
+/// time depends on how long the user took to type it.
+fn antigravity_opening_prompt(
+    created_millis: Option<i64>,
+    mut candidates: Vec<HistoryPrompt>,
+    other_started_near: impl FnOnce(i64) -> bool,
+) -> Result<Option<HistoryPrompt>, &'static str> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if created_millis.is_none() {
+        return Err(
+            "Antigravity opening prompt was not attributed: the conversation store records no creation time",
+        );
+    }
+    if candidates.len() > 1 {
+        return Err(
+            "Antigravity opening prompt was not attributed: several unlabelled prompts match the conversation start",
+        );
+    }
+    if other_started_near(candidates[0].millis) {
+        return Err(
+            "Antigravity opening prompt was not attributed: another conversation in this workspace started at the same time",
+        );
+    }
+    Ok(candidates.pop())
+}
+
+/// Whether another conversation of this checkout had its store created within
+/// the opening window of `millis`. An unreadable store counts, so doubt never
+/// attributes a prompt.
+fn antigravity_conversation_started_near(db: &Path, cwd: &Path, millis: i64) -> bool {
+    let Some(entries) = db.parent().and_then(|dir| fs::read_dir(dir).ok()) else {
+        return false;
+    };
+    entries.flatten().take(MAX_SCAN_FILES).any(|entry| {
+        let path = entry.path();
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return false;
+        };
+        path != db
+            && path.extension().is_some_and(|extension| extension == "db")
+            && birth_millis(&path).is_some_and(|born| opening_window_contains(born, millis))
+            && session_path_matches(ManagedHarness::Antigravity, &path, id, cwd).unwrap_or(true)
+    })
+}
+
+enum BoundedLine {
+    Eof,
+    /// Bytes after the last newline: a record still being written.
+    Partial,
+    Line(u64),
+    /// A complete record longer than the limit, consumed without buffering;
+    /// `mentions` tells whether it contains the needle anywhere.
+    Oversized {
+        read: u64,
+        mentions: bool,
+    },
+}
+
+/// Read one newline-terminated record into `line`, buffering at most `max`
+/// bytes of it; an oversized record is only searched for `needle`. `hasher` takes every byte of a complete record and none of a
+/// partial one, so it always covers exactly the committed prefix.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    max: usize,
+    needle: &[u8],
+    line: &mut Vec<u8>,
+    hasher: &mut Sha256,
+) -> std::io::Result<BoundedLine> {
+    line.clear();
+    let mut pending = hasher.clone();
+    let mut consumed = 0u64;
+    let mut oversized = false;
+    let mut mentions = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(if consumed == 0 {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Partial
+            });
+        }
+        let (chunk, done) = match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (&buffer[..=index], true),
+            None => (buffer, false),
+        };
+        let used = chunk.len();
+        pending.update(chunk);
+        if !oversized && line.len() + used <= max + 1 {
+            line.extend_from_slice(chunk);
+        } else {
+            // Past the limit only a tail one byte shorter than `needle` is
+            // kept, so a needle split across chunks is still found.
+            oversized = true;
+            line.extend_from_slice(chunk);
+            mentions |= contains_bytes(line, needle);
+            line.drain(..line.len().saturating_sub(needle.len().saturating_sub(1)));
+        }
+        consumed += used as u64;
+        reader.consume(used);
+        if done {
+            *hasher = pending;
+            return Ok(if oversized {
+                BoundedLine::Oversized {
+                    read: consumed,
+                    mentions,
+                }
+            } else {
+                BoundedLine::Line(consumed)
+            });
+        }
+    }
 }
 
 /// Antigravity keeps one SQLite database per conversation, named
@@ -2727,8 +4422,8 @@ fn antigravity_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> 
         return Ok(None);
     };
     let blob = connection.query_row(
-        "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1",
-        [],
+        "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' AND length(data) <= ?1 LIMIT 1",
+        params![MAX_SESSION_METADATA_BYTES as i64],
         |row| row.get::<_, Vec<u8>>(0),
     );
     let Ok(blob) = blob else {
@@ -3013,8 +4708,12 @@ fn list_crush_sessions(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let mut statement = connection
-        .prepare("SELECT id, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?1")?;
+    // Sub-agent and title sessions name their session as parent; discovery
+    // skips them for the same reason.
+    let mut statement = connection.prepare(
+        "SELECT id, updated_at FROM sessions WHERE parent_session_id IS NULL \
+         ORDER BY updated_at DESC LIMIT ?1",
+    )?;
     let rows = statement.query_map([limit as i64], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
@@ -3126,11 +4825,22 @@ fn opencode_directories(cwd: &Path) -> (String, String) {
 /// is encrypted and excluded like v1's hidden reasoning; anything else
 /// unrecognized becomes a bounded loss, never a guess — the beta schema is
 /// still changing.
+#[cfg(test)]
 fn export_opencode2(
     home: &Path,
     session_dir: Option<&Path>,
     session: &str,
     source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    export_opencode2_range(home, session_dir, session, source_cursor, None)
+}
+
+fn export_opencode2_range(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
     let db = opencode_db(home, session_dir);
     let connection = Connection::open_with_flags(
@@ -3146,24 +4856,54 @@ fn export_opencode2(
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
+    let upper = final_cursor
+        .map(serde_json::from_str::<SqlCursor>)
+        .transpose()
+        .context("invalid native transcript final SQL cursor")?
+        .unwrap_or(SqlCursor {
+            updated: i64::MAX,
+            id: "\u{10ffff}".to_string(),
+        });
     let mut statement = connection.prepare(
-        "SELECT id, time_updated, type, data FROM session_message \
+        "SELECT id, time_updated, type, length(data), data FROM session_message \
          WHERE session_id = ?1 AND (time_updated > ?2 OR (time_updated = ?2 AND id > ?3)) \
-         ORDER BY time_updated, id",
+           AND (time_updated < ?4 OR (time_updated = ?4 AND id <= ?5)) \
+         ORDER BY time_updated, id LIMIT ?6",
     )?;
-    let rows = statement.query_map(params![session, cursor.updated, cursor.id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
+    let mut rows = statement.query(params![
+        session,
+        cursor.updated,
+        cursor.id,
+        upper.updated,
+        upper.id,
+        (MAX_SOURCE_RECORDS + 1) as i64
+    ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
     let mut next_cursor = cursor;
-    for row in rows {
-        let (id, updated, message_type, data_raw) = row?;
+    let mut source_bytes = 0_usize;
+    let mut checked_events = 0_usize;
+    let mut event_bytes = 0_usize;
+    let mut records = 0_usize;
+    while let Some(row) = rows.next()? {
+        records += 1;
+        if records > MAX_SOURCE_RECORDS {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+            ));
+        }
+        let data_len = row.get::<_, usize>(3)?;
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            data_len,
+        )?;
+        let id = row.get::<_, String>(0)?;
+        let updated = row.get::<_, i64>(1)?;
+        let message_type = row.get::<_, String>(2)?;
+        let data_raw = row.get::<_, String>(4)?;
         next_cursor = SqlCursor {
             updated,
             id: id.clone(),
@@ -3173,6 +4913,13 @@ fn export_opencode2(
             continue;
         };
         parse_opencode2(&message_type, &data, session, &id, &mut events, &mut losses);
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            0,
+        )?;
     }
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -3414,7 +5161,18 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::KiroV3 => home.join(".kiro/sessions"),
         ManagedHarness::Grok => home.join(".grok/sessions"),
         ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
+        ManagedHarness::Copilot => home.join(".copilot/session-state"),
     }
+}
+
+/// The primary native store root a launch reads: `session_dir` when an
+/// override resolved one, otherwise the harness default under `home`.
+pub fn native_store_root(
+    harness: ManagedHarness,
+    home: &Path,
+    session_dir: Option<&Path>,
+) -> PathBuf {
+    session_root(harness, home, session_dir)
 }
 
 /// Kiro CLI 2.16.2 honored `KIRO_HOME` for its v2 store but wrote v3 sessions
@@ -3521,6 +5279,16 @@ fn value_text(value: &Value) -> String {
     }
 }
 
+/// Record the native id pairing a tool call with its result, so a transcript
+/// import can apply one capture decision to both halves (`backfill`, the
+/// `ai-memory run` ledger).
+fn with_tool_use_id(mut metadata: Value, id: Option<&str>) -> Value {
+    if let (Some(id), Some(object)) = (id, metadata.as_object_mut()) {
+        object.insert("tool_use_id".into(), Value::String(id.to_owned()));
+    }
+    metadata
+}
+
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
@@ -3541,13 +5309,11 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 fn valid_native_session_id(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= MAX_NATIVE_SESSION_ID_BYTES
+    NativeSessionIdentity::parse(value, &Sanitizer::builtin()).is_ok()
         && !value.starts_with('-')
         && value != "."
         && value != ".."
         && !value.contains(['/', '\\'])
-        && !value.chars().any(char::is_control)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -3629,8 +5395,9 @@ mod tests {
                         json!({"type":"session","id":"other-id","cwd":other})
                     ),
                     // Kimi's header lives in state.json and Grok's in
-                    // summary.json, not the journal; covered by their own
-                    // discovery tests.
+                    // summary.json, not the journal; Copilot's journal must
+                    // sit in a UUID-named directory. All are covered by their
+                    // own discovery tests.
                     ManagedHarness::OpenCode
                     | ManagedHarness::OpenCode2
                     | ManagedHarness::Crush
@@ -3639,7 +5406,8 @@ mod tests {
                     | ManagedHarness::Kiro
                     | ManagedHarness::KiroV3
                     | ManagedHarness::Grok
-                    | ManagedHarness::Antigravity => {
+                    | ManagedHarness::Antigravity
+                    | ManagedHarness::Copilot => {
                         unreachable!()
                     }
                 },
@@ -3861,6 +5629,294 @@ mod tests {
         assert_eq!(second.events.len(), 1);
         assert_eq!(second.events[0].content, "visible alternate branch");
         assert_eq!(second.events[0].metadata["parent_id"], "u1");
+    }
+
+    #[tokio::test]
+    async fn persisted_baseline_exports_only_offline_append_and_rejects_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41d";
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join(format!("{session}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd}),
+                json!({"type":"message","id":"before","timestamp":"2026-08-07T17:00:01Z","message":{"role":"user","content":[{"type":"text","text":"prior live history"}],"meta":{"source":"user"}}})
+            ),
+        )
+        .unwrap();
+        let baseline = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":"after","timestamp":"2026-08-07T17:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"offline append"}],"meta":{"source":"model"}}})
+        )
+        .unwrap();
+        let delta = export_transcript_delta(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            &baseline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0].content, "offline append");
+        let final_cursor = delta.source_cursor.clone().unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":"later","timestamp":"2026-08-07T17:00:03Z","message":{"role":"user","content":[{"type":"text","text":"later resumed work"}],"meta":{"source":"user"}}})
+        )
+        .unwrap();
+        let exact = export_transcript_range(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            Some(&baseline),
+            &final_cursor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exact.events.len(), 1);
+        assert_eq!(exact.events[0].content, "offline append");
+
+        fs::write(&path, b"{}\n").unwrap();
+        let error = export_transcript_delta(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            &baseline,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("past the current transcript end")
+                || error.to_string().contains("was not found"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_baseline_refuses_oversized_records_before_unbounded_growth() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41f";
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join(format!("{session}.jsonl"));
+        let mut bytes = format!(
+            "{}\n",
+            json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+        )
+        .into_bytes();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_SOURCE_RECORD_BYTES + 2));
+        fs::write(&path, bytes).unwrap();
+        let error = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("record exceeds"), "{error:#}");
+    }
+
+    /// An oversized FIRST JSONL record is rejected by the byte caps before any
+    /// unbounded allocation: the session-listing paths every degraded
+    /// pre/post snapshot uses skip the transcript (a valid header on a later
+    /// line is deliberately never reached) instead of reading the record.
+    #[tokio::test]
+    async fn an_oversized_first_record_is_skipped_by_session_listing_caps() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "9c8d7a06-93e4-4a01-b14e-64f2f1f2b3c4";
+        let transcripts = temp
+            .path()
+            .join(".claude/projects")
+            .join(cwd.to_string_lossy().replace('/', "-"));
+        fs::create_dir_all(&transcripts).unwrap();
+        let claude_path = transcripts.join(format!("{session}.jsonl"));
+        let oversized_header = json!({
+            "sessionId": session,
+            "cwd": cwd,
+            "padding": "x".repeat(MAX_SOURCE_RECORD_BYTES + 2),
+        });
+        let valid_header = json!({"sessionId": session, "cwd": cwd});
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(&claude_path).unwrap();
+            writeln!(file, "{oversized_header}").unwrap();
+            writeln!(file, "{valid_header}").unwrap();
+        }
+        assert!(
+            list_native_sessions(ManagedHarness::Claude, temp.path(), &cwd, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a transcript whose first record exceeds the header cap is skipped, header or not"
+        );
+
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let command_code_path = bucket.join(format!("{session}.jsonl"));
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(&command_code_path).unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "type":"session","version":3,"id":session,
+                    "timestamp":"2026-08-07T17:00:00Z","cwd":cwd,
+                    "padding":"y".repeat(MAX_EVENT_BYTES + 2),
+                })
+            )
+            .unwrap();
+        }
+        assert!(
+            list_native_sessions(
+                ManagedHarness::CommandCode,
+                temp.path(),
+                &cwd,
+                Some(&store),
+                10
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the tighter first-line cap rejects before the source-record cap is even reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_empty_range_stays_empty_after_later_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41e";
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join(format!("{session}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+            ),
+        )
+        .unwrap();
+        let baseline = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap();
+        let final_cursor = baseline.clone();
+        use std::io::Write as _;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}",
+            json!({"type":"message","id":"later","message":{"role":"user","content":[{"type":"text","text":"later resumed work"}]}})
+        )
+        .unwrap();
+        let exact = export_transcript_range(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            Some(&baseline),
+            &final_cursor,
+        )
+        .await
+        .unwrap();
+        assert!(exact.events.is_empty());
+    }
+
+    #[test]
+    fn jsonl_scan_stops_at_source_byte_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.jsonl");
+        let record = format!(
+            "{}\n",
+            json!({"type":"system","padding":"x".repeat(MAX_SOURCE_RECORD_BYTES / 2)})
+        );
+        let mut file = fs::File::create(&path).unwrap();
+        use std::io::Write as _;
+        for _ in 0..(MAX_SOURCE_BYTES / record.len() + 2) {
+            file.write_all(record.as_bytes()).unwrap();
+        }
+        let error = export_jsonl(ManagedHarness::CommandCode, &path, "session", None).unwrap_err();
+        assert!(error.to_string().contains("source-byte limit"), "{error:#}");
+    }
+
+    #[test]
+    fn exported_transcript_caps_count_and_serialized_bytes() {
+        let event = NewWorkstreamEvent {
+            event_id: "event".into(),
+            agent: AgentKind::ClaudeCode,
+            native_session_id: "session".into(),
+            source_record_id: None,
+            kind: WorkstreamEventKind::Message,
+            role: Some("user".into()),
+            content: "x".repeat(MAX_EVENT_BYTES),
+            occurred_at: None,
+            metadata: Value::Null,
+        };
+        let too_many = ExportedTranscript {
+            events: vec![event.clone(); MAX_EXPORTED_EVENTS + 1],
+            ..ExportedTranscript::default()
+        };
+        assert!(
+            validate_export_bounds(too_many)
+                .unwrap_err()
+                .to_string()
+                .contains("event recovery limit")
+        );
+        let too_large = ExportedTranscript {
+            events: vec![event; MAX_EXPORTED_BYTES / MAX_EVENT_BYTES + 1],
+            ..ExportedTranscript::default()
+        };
+        assert!(
+            validate_export_bounds(too_large)
+                .unwrap_err()
+                .to_string()
+                .contains("byte recovery limit")
+        );
     }
 
     #[tokio::test]
@@ -4134,8 +6190,9 @@ mod tests {
         let connection = Connection::open(repo.join(".crush").join("crush.db")).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE sessions(id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL);\n\
-                 INSERT INTO sessions VALUES ('above', 1800000000);",
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                 updated_at INTEGER NOT NULL);\n\
+                 INSERT INTO sessions(id, updated_at) VALUES ('above', 1800000000);",
             )
             .unwrap();
 
@@ -4205,7 +6262,8 @@ mod tests {
         let connection = Connection::open(&db).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE sessions(id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL);\n\
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                 updated_at INTEGER NOT NULL);\n\
                  CREATE TABLE messages(\
                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,\
                     parts TEXT NOT NULL, updated_at INTEGER NOT NULL,\
@@ -4214,9 +6272,20 @@ mod tests {
             .unwrap();
         for (id, updated) in [("older", 1_700_000_000_i64), ("newer", 1_800_000_000)] {
             connection
-                .execute("INSERT INTO sessions VALUES (?1, ?2)", params![id, updated])
+                .execute(
+                    "INSERT INTO sessions(id, updated_at) VALUES (?1, ?2)",
+                    params![id, updated],
+                )
                 .unwrap();
         }
+        // A sub-agent session, newer than both, is not a session of its own.
+        connection
+            .execute(
+                "INSERT INTO sessions(id, parent_session_id, updated_at) \
+                 VALUES ('child', 'newer', 1900000000)",
+                [],
+            )
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO messages VALUES ('m1', 'newer', 'assistant', ?1, 1, 0)",
@@ -4271,6 +6340,65 @@ mod tests {
         assert_eq!(second.events[0].content, "ok");
     }
 
+    /// Claude Code writes `cwd` on every record and Codex in each
+    /// `turn_context`; each event carries the cwd of the record it came from,
+    /// so an import resolves relative tool arguments from where the call ran.
+    #[test]
+    fn jsonl_events_carry_their_record_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let docs = root.join("docs");
+        let claude = temp.path().join("claude.jsonl");
+        let record = |uuid: &str, cwd: &Path, content: Value| json!({"type":"assistant","uuid":uuid,"cwd":cwd,"message":{"role":"assistant","content":content}});
+        fs::write(
+            &claude,
+            [
+                record("one", &root, json!("at the root")),
+                record(
+                    "two",
+                    &docs,
+                    json!([{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}]),
+                ),
+                json!({"type":"assistant","uuid":"three","cwd":"relative","message":{"role":"assistant","content":"no usable cwd"}}),
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat(),
+        )
+        .unwrap();
+        let events = export_jsonl(ManagedHarness::Claude, &claude, "s", None)
+            .unwrap()
+            .events;
+        let cwds: Vec<_> = events
+            .iter()
+            .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
+            .collect();
+        assert_eq!(cwds, [root.to_str(), docs.to_str(), None], "{events:?}");
+        assert_eq!(events[1].metadata["tool"], "Bash");
+
+        let codex = temp.path().join("codex.jsonl");
+        let item = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+        fs::write(
+            &codex,
+            [
+                json!({"type":"session_meta","payload":{"id":"s","cwd":root}}),
+                item("first turn"),
+                json!({"type":"turn_context","payload":{"cwd":docs}}),
+                item("second turn"),
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat(),
+        )
+        .unwrap();
+        let events = export_jsonl(ManagedHarness::Codex, &codex, "s", None)
+            .unwrap()
+            .events;
+        let cwds: Vec<_> = events
+            .iter()
+            .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
+            .collect();
+        assert_eq!(cwds, [root.to_str(), docs.to_str()], "{events:?}");
+    }
+
     #[test]
     fn incomplete_final_jsonl_record_does_not_advance_cursor() {
         let temp = tempfile::tempdir().unwrap();
@@ -4308,6 +6436,381 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn claude_project_dir_name_replaces_every_non_alphanumeric() {
+        for (cwd, folder) in [
+            (
+                "/mnt/data/Projects/ai-memory",
+                "-mnt-data-Projects-ai-memory",
+            ),
+            ("/home/me/.config/Claude", "-home-me--config-Claude"),
+            (
+                "/mnt/data/Projects/frank_mega",
+                "-mnt-data-Projects-frank-mega",
+            ),
+            ("/home/me/my repo", "-home-me-my-repo"),
+            (r"C:\Users\me\my.repo", "C--Users-me-my-repo"),
+            ("/home/me/café", "-home-me-caf-"),
+        ] {
+            assert_eq!(claude_project_dir_name(Path::new(cwd)), folder, "{cwd}");
+        }
+    }
+
+    /// #1167: a cwd with `.` or `_` maps to a folder the old `/`-only rule
+    /// missed; the transcript is found there, a folder whose name does not
+    /// derive from the cwd is still probed, and neither a subagent sidechain
+    /// nor another checkout's transcript with the same id is returned.
+    #[test]
+    fn claude_transcript_is_located_by_the_real_folder_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join(".claude/projects");
+        let cwd = temp.path().join("work/my.repo_x");
+        fs::create_dir_all(&cwd).unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        let record =
+            |cwd: &Path| format!("{}\n", json!({"type": "user", "sessionId": id, "cwd": cwd}));
+        let locate =
+            || locate_session_file(ManagedHarness::Claude, temp.path(), &cwd, None, id).unwrap();
+
+        // A subagent sidechain and another checkout's transcript, both with
+        // the same session id, come first and must never be returned.
+        let other_cwd = temp.path().join("elsewhere");
+        let other = projects.join(claude_project_dir_name(&other_cwd));
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(format!("{id}.jsonl")), record(&other_cwd)).unwrap();
+        let folder = projects.join(claude_project_dir_name(&cwd));
+        let sidechain = folder.join(id).join("subagents");
+        fs::create_dir_all(&sidechain).unwrap();
+        fs::write(sidechain.join("agent-x.jsonl"), record(&cwd)).unwrap();
+        assert_eq!(locate(), None);
+
+        let exact = folder.join(format!("{id}.jsonl"));
+        fs::write(&exact, record(&cwd)).unwrap();
+        assert_eq!(locate(), Some(exact.clone()));
+
+        // A folder whose name is not derived from the cwd is probed too.
+        fs::remove_file(&exact).unwrap();
+        let shortened = projects.join("-work-my-repo-x-1a2b3c");
+        fs::create_dir_all(&shortened).unwrap();
+        fs::write(shortened.join(format!("{id}.jsonl")), record(&cwd)).unwrap();
+        assert_eq!(locate(), Some(shortened.join(format!("{id}.jsonl"))));
+    }
+
+    /// A store can hold more transcripts than a lookup reads, and the walk
+    /// lists them in no useful order. The transcript named after the session
+    /// id is read first wherever the walk put it, and temporary copies last.
+    #[test]
+    fn session_lookup_reads_the_transcript_named_after_the_id_first() {
+        let id = "5973b6c0-94b8-487b-a530-2aeb6098ae0e";
+        let root = Path::new("/store/sessions");
+        let decoy = |n: usize| root.join(format!("rollout-{n:04}.jsonl"));
+
+        let named = root.join(format!("rollout-2500-{id}.jsonl"));
+        let mut files = (0..2_500).map(&decoy).collect::<Vec<_>>();
+        files.push(named.clone());
+        let candidates = lookup_candidates(files, id);
+        assert_eq!(candidates.len(), 2_000);
+        assert_eq!(candidates.first(), Some(&named));
+
+        // Grok keeps each session in a directory named after it.
+        let grok = root.join(id).join("chat_history.jsonl");
+        let candidates = lookup_candidates(vec![decoy(1), decoy(2), grok.clone()], id);
+        assert_eq!(candidates.first(), Some(&grok));
+
+        // The real transcript still wins over its own temporary copy, but a
+        // temporary copy that names the id outranks every unrelated
+        // transcript: OMP can leave a session only as an atomic-write temp.
+        let temporary = root.join(format!("{id}.jsonl.1a2b.tmp"));
+        let candidates = lookup_candidates(vec![temporary.clone(), decoy(1), named.clone()], id);
+        assert_eq!(candidates, [named, temporary.clone(), decoy(1)]);
+
+        let mut files = (0..2_500).map(&decoy).collect::<Vec<_>>();
+        files.push(temporary.clone());
+        let candidates = lookup_candidates(files, id);
+        assert_eq!(candidates.first(), Some(&temporary));
+    }
+
+    #[test]
+    fn claude_session_ran_in_background_needs_its_own_bg_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let project = temp
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_dir_name(&cwd));
+        fs::create_dir_all(&project).unwrap();
+        let write = |id: &str, records: &[Value]| {
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(project.join(format!("{id}.jsonl")), body).unwrap();
+        };
+        let ran = |id: &str| claude_session_ran_in_background(temp.path(), &cwd, None, id).unwrap();
+
+        write(
+            "fg",
+            &[json!({"type": "user", "sessionId": "fg", "cwd": cwd})],
+        );
+        assert!(!ran("fg"));
+        // A foreground transcript can quote another session's bg record (a
+        // pasted log, a tool result); only its own sessionId counts.
+        write(
+            "quoting",
+            &[
+                json!({"type": "user", "sessionId": "quoting", "cwd": cwd,
+                     "message": {"content": "{\"sessionKind\":\"bg\",\"sessionId\":\"other\"}"}}),
+                json!({"type": "user", "sessionId": "other", "sessionKind": "bg", "cwd": cwd}),
+            ],
+        );
+        assert!(!ran("quoting"));
+        write(
+            "bg",
+            &[
+                json!({"type": "mode", "sessionId": "bg"}),
+                json!({"type": "user", "sessionId": "bg", "sessionKind": "bg", "cwd": cwd}),
+            ],
+        );
+        assert!(ran("bg"));
+        assert!(!ran("missing"));
+    }
+
+    #[test]
+    fn claude_live_background_attach_id_matches_only_a_live_background_session_here() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let listing = |entries: Value| serde_json::to_vec(&entries).unwrap();
+        let entry = |id: &str, session: &str, kind: &str, cwd: &Path| json!({"id": id, "sessionId": session, "kind": kind, "status": "idle", "cwd": cwd});
+        let full = "94e41265-4001-431c-828e-1c54953e596b";
+
+        let live = listing(json!([
+            entry("aaaa1111", "another-session", "background", &cwd),
+            entry("94e41265", full, "background", &cwd),
+        ]));
+        assert_eq!(
+            claude_live_background_attach_id(&live, full, &cwd).as_deref(),
+            Some("94e41265")
+        );
+        for refused in [
+            // The same session listed as an interactive one, or from another
+            // checkout, is not attached to from here.
+            listing(json!([entry("94e41265", full, "interactive", &cwd)])),
+            listing(json!([entry("94e41265", full, "background", &other)])),
+            // An id that could smuggle an option or path into argv.
+            listing(json!([entry("--help", full, "background", &cwd)])),
+            listing(json!([entry("../x", full, "background", &cwd)])),
+            listing(json!([])),
+            b"not json".to_vec(),
+            listing(json!({"sessions": []})),
+        ] {
+            assert_eq!(claude_live_background_attach_id(&refused, full, &cwd), None);
+        }
+    }
+
+    #[test]
+    fn claude_continued_session_follows_only_this_checkouts_bg_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let write = |name: &str, records: &[Value]| {
+            let path = project.join(format!("{name}.jsonl"));
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(&path, body).unwrap();
+            path
+        };
+        let record = |session: &str, attached: &str, kind: Option<&str>, cwd: &Path| {
+            let mut value = json!({
+                "type": "user",
+                "sessionId": session,
+                "session_id": attached,
+                "cwd": cwd,
+            });
+            if let Some(kind) = kind {
+                value["sessionKind"] = json!(kind);
+            }
+            value
+        };
+        let find = |id: &str| {
+            claude_continued_session(temp.path(), &cwd, None, id, started_at)
+                .unwrap()
+                .map(|continuation| continuation.session_id().to_owned())
+        };
+
+        // The foreground transcript names itself; it is never the answer.
+        write("fg", &[record("fg", "fg", None, &cwd)]);
+        assert_eq!(find("fg"), None);
+
+        // Without `sessionKind: bg`, or from another checkout, a record that
+        // names the foreground session is not a background continuation.
+        write("plain", &[record("plain", "fg", None, &cwd)]);
+        write(
+            "elsewhere",
+            &[record("elsewhere", "fg", Some("bg"), &other)],
+        );
+        assert_eq!(find("fg"), None);
+
+        // A concurrent launch in this checkout attached its own foreground
+        // session to a background one; that conversation is not this run's.
+        write(
+            "concurrent",
+            &[record("concurrent", "other-fg", Some("bg"), &cwd)],
+        );
+        assert_eq!(find("fg"), None);
+        assert_eq!(find("other-fg").as_deref(), Some("concurrent"));
+
+        // A transcript last written before the run started is not read.
+        let stale = write("stale", &[record("stale", "fg", Some("bg"), &cwd)]);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(started_at - Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(find("fg"), None);
+
+        write(
+            "bg",
+            &[
+                record("bg", "earlier-client", Some("bg"), &cwd),
+                record("bg", "fg", Some("bg"), &cwd),
+            ],
+        );
+        assert_eq!(find("fg").as_deref(), Some("bg"));
+        assert_eq!(find("unrelated"), None);
+    }
+
+    #[test]
+    fn claude_continued_session_follows_only_this_launchs_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let nested = cwd.join("packages/app");
+        let other = temp.path().join("other");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let write = |name: &str, records: &[Value], age: Duration| {
+            let path = project.join(format!("{name}.jsonl"));
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(&path, body).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(SystemTime::now() - age)
+                .unwrap();
+        };
+        // Claude Code's real shape: the `/clear` record carries no
+        // `session_id`; later records name the launch session there.
+        let clear = |session: &str, cwd: &Path| {
+            json!({
+                "type": "user",
+                "sessionId": session,
+                "cwd": cwd,
+                "message": {"role": "user", "content": format!(
+                    "{CLAUDE_CLEAR_COMMAND}\n            <command-message>clear</command-message>"
+                )},
+            })
+        };
+        let turn = |session: &str, launch: &str, cwd: &Path| json!({"type": "user", "sessionId": session, "session_id": launch, "cwd": cwd});
+        let find =
+            |id: &str| claude_continued_session(temp.path(), &cwd, None, id, started_at).unwrap();
+        let recent = Duration::from_secs(5);
+
+        write("launch", &[turn("launch", "launch", &cwd)], recent);
+        assert_eq!(find("launch"), None);
+
+        // A transcript that names the launch session without having been
+        // cleared is neither a clear nor a background continuation.
+        write("plain", &[turn("plain", "launch", &cwd)], recent);
+        // Text that merely quotes `/clear` is not the command record.
+        write(
+            "quoted",
+            &[
+                json!({"type": "user", "sessionId": "quoted", "cwd": cwd,
+                    "message": {"role": "user", "content": format!("what does {CLAUDE_CLEAR_COMMAND} do?")}}),
+                turn("quoted", "launch", &cwd),
+            ],
+            recent,
+        );
+        // Another checkout's clear, and a concurrent launch's clear here.
+        write(
+            "elsewhere",
+            &[
+                clear("elsewhere", &other),
+                turn("elsewhere", "launch", &other),
+            ],
+            recent,
+        );
+        write(
+            "concurrent",
+            &[
+                clear("concurrent", &cwd),
+                turn("concurrent", "other-launch", &cwd),
+            ],
+            recent,
+        );
+        // A subagent file holds the cleared session's records under its own
+        // stem; it is not a session to resume.
+        write(
+            "agent-1",
+            &[clear("subagent", &cwd), turn("subagent", "launch", &cwd)],
+            recent,
+        );
+        // A clear made before this run started is not read.
+        write(
+            "stale",
+            &[clear("stale", &cwd), turn("stale", "launch", &cwd)],
+            Duration::from_secs(600),
+        );
+        assert_eq!(find("launch"), None);
+        assert_eq!(
+            find("other-launch"),
+            Some(ClaudeContinuation::Cleared("concurrent".into()))
+        );
+
+        // The clear this launch made, even after moving below the checkout.
+        write(
+            "cleared",
+            &[clear("cleared", &cwd), turn("cleared", "launch", &nested)],
+            Duration::from_secs(3),
+        );
+        assert_eq!(
+            find("launch"),
+            Some(ClaudeContinuation::Cleared("cleared".into()))
+        );
+
+        // A second `/clear` in the same process: the newest one wins.
+        write(
+            "cleared-again",
+            &[
+                clear("cleared-again", &cwd),
+                turn("cleared-again", "launch", &cwd),
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            find("launch"),
+            Some(ClaudeContinuation::Cleared("cleared-again".into()))
+        );
     }
 
     #[test]
@@ -4394,6 +6897,120 @@ mod tests {
         );
     }
 
+    /// Claude Code writes background-task reports (a monitored command's
+    /// streamed output, a finished background agent's result) and its compact
+    /// summary as user turns. Neither is a prompt: the reports are excluded,
+    /// with or without the `origin` tag, and the summary becomes a compaction
+    /// event. A typed prompt, including one quoting the tag, stays a message.
+    #[test]
+    fn claude_adapter_keeps_task_notifications_and_compact_summaries_out_of_prompts() {
+        let user = |uuid: &str, extra: Value, content: Value| {
+            let mut record = json!({
+                "type":"user", "uuid":uuid,
+                "message":{"role":"user","content":content},
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                record[key] = value.clone();
+            }
+            record
+        };
+        let records = [
+            user(
+                "monitor",
+                json!({"origin":{"kind":"task-notification"}}),
+                "<task-notification>\n<event>MONITORSENTINEL line</event>\n</task-notification>"
+                    .into(),
+            ),
+            user(
+                "agent",
+                json!({}),
+                json!([{"type":"text","text":"<task-notification>\n<result>AGENTSENTINEL</result>\n</task-notification>"}]),
+            ),
+            user(
+                "tagged",
+                json!({"origin":{"kind":"task-notification","producer":"session-task"}}),
+                "[SYSTEM NOTIFICATION - TAGSENTINEL]".into(),
+            ),
+            user(
+                "summary",
+                json!({"isCompactSummary":true,"isVisibleInTranscriptOnly":true}),
+                "This session is being continued. SUMMARYSENTINEL".into(),
+            ),
+            user(
+                "typed",
+                json!({"origin":{"kind":"human"}}),
+                "why does <task-notification> show up?".into(),
+            ),
+            user(
+                "bom",
+                json!({}),
+                "\u{feff}\u{200b} <Task-Notification id=\"t1\">BOMSENTINEL</Task-Notification>"
+                    .into(),
+            ),
+            user(
+                "later-block",
+                json!({}),
+                json!([{"type":"image","source":{}},{"type":"text","text":"<TASK-NOTIFICATION>\nLATERSENTINEL"}]),
+            ),
+            user(
+                "origin-case",
+                json!({"origin":{"kind":"Task-Notification"}}),
+                "[ORIGINSENTINEL]".into(),
+            ),
+            user(
+                "summary-string",
+                json!({"isCompactSummary":"true"}),
+                "STRINGSUMMARY".into(),
+            ),
+            user(
+                "summary-number",
+                json!({"isCompactSummary":1}),
+                "NUMBERSUMMARY".into(),
+            ),
+            user(
+                "lookalike",
+                json!({"isCompactSummary":"false"}),
+                "<task-notifications are odd>".into(),
+            ),
+        ];
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        for record in &records {
+            let id = record["uuid"].as_str().unwrap();
+            parse_claude(record, "session", id, &mut events, &mut losses);
+        }
+        let messages: Vec<&str> = events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::Message)
+            .map(|event| event.content.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "why does <task-notification> show up?",
+                "<task-notifications are odd>"
+            ]
+        );
+        let compactions: Vec<&str> = events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::Compaction)
+            .map(|event| event.content.as_str())
+            .collect();
+        assert_eq!(
+            compactions,
+            [
+                "This session is being continued. SUMMARYSENTINEL",
+                "STRINGSUMMARY",
+                "NUMBERSUMMARY"
+            ]
+        );
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert_eq!(
+            losses,
+            ["Claude task notifications were intentionally excluded"; 6]
+        );
+    }
+
     #[test]
     fn event_ids_are_stable() {
         let mut first = Vec::new();
@@ -4436,6 +7053,20 @@ mod tests {
         parse_codex(&value, "session", "record", &mut events, &mut losses);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].content, "actual request");
+    }
+
+    #[test]
+    fn codex_adapter_excludes_the_bare_instructions_heading() {
+        // Codex omits ` for <cwd>` when only the global AGENTS.md contributes.
+        // Backfill then replayed that file as a prompt in every project.
+        let value = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"# AGENTS.md instructions\n\n<INSTRUCTIONS>\nNever commit secrets.\n</INSTRUCTIONS>"},
+            {"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&value, "session", "record", &mut events, &mut losses);
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
@@ -4645,6 +7276,36 @@ mod tests {
             export_opencode2(home.path(), None, "s2", first.source_cursor.as_deref()).unwrap();
         assert!(second.events.is_empty());
         assert!(second.losses.is_empty());
+    }
+
+    #[test]
+    fn opencode_sql_scan_stops_at_source_byte_cap_before_json_parse() {
+        let home = tempfile::tempdir().unwrap();
+        let db = opencode_db(home.path(), None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);\
+                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                                   time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES ('m1', 's1', ?1)",
+                [json!({"role":"user"}).to_string()],
+            )
+            .unwrap();
+        let oversized = "x".repeat(MAX_SOURCE_BYTES + 1);
+        connection
+            .execute(
+                "INSERT INTO part VALUES ('p1', 'm1', 's1', 1, ?1)",
+                [oversized],
+            )
+            .unwrap();
+        let error = export_opencode(home.path(), None, "s1", None).unwrap_err();
+        assert!(error.to_string().contains("source-byte limit"), "{error:#}");
     }
 
     #[test]
@@ -5376,6 +8037,223 @@ mod tests {
         );
     }
 
+    fn copilot_session_start(id: &str, cwd: &Path) -> Value {
+        json!({"type":"session.start","data":{"sessionId":id,"version":1,
+               "producer":"copilot-agent","copilotVersion":"1.0.92",
+               "context":{"cwd":cwd}},"id":"start","timestamp":"2026-10-07T13:00:33.339Z"})
+    }
+
+    #[tokio::test]
+    async fn copilot_discovery_requires_uuid_directory_header_and_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let root = temp.path().join("session-state");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+
+        let matching = "318db77d-e19b-4750-82df-192a6b931437";
+        let wrong_checkout = "c79ce9b8-de85-442e-915a-1c6ec4f74719";
+        let mismatched_header = "0e88ebd2-ed54-4f5a-9056-46e041e3b44d";
+        let phantom = "5b1f0c3e-7a2d-4e8b-9c6f-1d2e3f4a5b6c";
+        for (dir, header) in [
+            (matching, copilot_session_start(matching, &cwd)),
+            (
+                wrong_checkout,
+                copilot_session_start(wrong_checkout, &other),
+            ),
+            // A header naming a session other than its directory must never
+            // surface that phantom id as a candidate.
+            (mismatched_header, copilot_session_start(phantom, &cwd)),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("events.jsonl"), format!("{header}\n")).unwrap();
+        }
+        // Workspace metadata and non-UUID directories are not transcripts.
+        fs::write(root.join(matching).join("workspace.yaml"), "id: x\n").unwrap();
+        fs::create_dir_all(root.join("not-a-uuid")).unwrap();
+        fs::write(
+            root.join("not-a-uuid/events.jsonl"),
+            format!("{}\n", copilot_session_start("not-a-uuid", &cwd)),
+        )
+        .unwrap();
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Copilot, temp.path(), &cwd, Some(&root), 8)
+                .await
+                .unwrap();
+        let ids: Vec<_> = sessions
+            .iter()
+            .map(|session| session.native_session_id.as_str())
+            .collect();
+        assert_eq!(ids, [matching]);
+
+        let found = locate_session_file(
+            ManagedHarness::Copilot,
+            temp.path(),
+            &cwd,
+            Some(&root),
+            matching,
+        )
+        .unwrap();
+        assert_eq!(found, Some(root.join(matching).join("events.jsonl")));
+        for foreign in [
+            wrong_checkout,
+            mismatched_header,
+            phantom,
+            "not-a-uuid",
+            "../x",
+        ] {
+            assert!(
+                !native_session_exists(
+                    ManagedHarness::Copilot,
+                    temp.path(),
+                    &cwd,
+                    Some(&root),
+                    foreign
+                )
+                .unwrap(),
+                "{foreign} must not resolve for this checkout"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_store_defaults_below_home() {
+        let home = Path::new("/home/user");
+        assert_eq!(
+            session_root(ManagedHarness::Copilot, home, None),
+            home.join(".copilot/session-state")
+        );
+    }
+
+    /// Record shapes captured from a real Copilot CLI 1.0.92 session (paths,
+    /// ids, and long fields shortened).
+    #[test]
+    fn copilot_adapter_excludes_private_records_and_keeps_visible_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let records = [
+            copilot_session_start("318db77d-e19b-4750-82df-192a6b931437", temp.path()),
+            json!({"type":"session.model_change","data":{"newModel":"claude-sonnet-5"},"id":"r1"}),
+            json!({"type":"user.message","data":{"content":"read note.txt",
+                   "transformedContent":"<current_datetime>2026-10-07</current_datetime>\n\nread note.txt"},
+                   "id":"r2","timestamp":"2026-10-07T13:00:35.074Z"}),
+            json!({"type":"system.message","data":{"role":"system","content":"You are the GitHub Copilot CLI"},"id":"r3"}),
+            json!({"type":"hook.end","data":{"hookType":"sessionStart","success":true,
+                   "output":{"additionalContext":"ai-memory startup packet"}},"id":"r4"}),
+            json!({"type":"assistant.message","data":{"content":"","reasoningText":"private plan",
+                   "reasoningOpaque":"opaque","toolRequests":[{"toolCallId":"call-1","name":"view",
+                   "arguments":{"path":"note.txt"},"type":"function"}]},"id":"r5"}),
+            json!({"type":"tool.execution_start","data":{"toolCallId":"call-1","toolName":"view",
+                   "arguments":{"path":"note.txt"}},"id":"r6"}),
+            json!({"type":"permission.requested","data":{"permissionRequest":{"kind":"shell"}},"id":"r7"}),
+            json!({"type":"tool.execution_complete","data":{"toolCallId":"call-1","success":true,
+                   "result":{"content":"hello\n","detailedContent":"diff --git a/abs/path"}},"id":"r8"}),
+            json!({"type":"tool.execution_complete","data":{"toolCallId":"call-2","success":false,
+                   "result":null,"error":{"message":"Permission denied","code":"denied"}},"id":"r9"}),
+            json!({"type":"assistant.message","data":{"content":"hello","toolRequests":[]},"id":"r10"}),
+            json!({"type":"session.resume","data":{"context":{"cwd":temp.path()}},"id":"r11"}),
+            json!({"type":"model.messages_snapshot","data":{"messages":[{"role":"system","content":"private"}]},"id":"r12"}),
+            json!({"type":"session.compaction_complete","data":{"success":true,
+                   "summaryContent":"<overview>read a file</overview>"},"id":"r13"}),
+            json!({"type":"session.compaction_complete","data":{"success":false,
+                   "summaryContent":"failed attempt"},"id":"r14"}),
+        ];
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+
+        let export = export_jsonl(ManagedHarness::Copilot, &path, "copilot-session", None).unwrap();
+        // A call and its result share the Copilot call id, so a transcript
+        // import can give the result the call's capture decision.
+        let ids: Vec<_> = export
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    WorkstreamEventKind::ToolCall | WorkstreamEventKind::ToolResult
+                )
+            })
+            .map(|event| event.metadata.get("tool_use_id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, [Some("call-1"), Some("call-1"), Some("call-2")]);
+        let contents: Vec<_> = export
+            .events
+            .iter()
+            .map(|event| (event.kind, event.content.as_str()))
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                (WorkstreamEventKind::Message, "read note.txt"),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "view: {\"path\":\"note.txt\"}"
+                ),
+                (WorkstreamEventKind::ToolResult, "hello\n"),
+                (WorkstreamEventKind::ToolResult, "error: Permission denied"),
+                (WorkstreamEventKind::Message, "hello"),
+                (
+                    WorkstreamEventKind::Compaction,
+                    "<overview>read a file</overview>"
+                ),
+            ]
+        );
+        assert!(export.events.iter().all(|event| {
+            event.agent == AgentKind::CopilotCli
+                && !event.content.contains("private")
+                && !event.content.contains("startup packet")
+                && !event.content.contains("current_datetime")
+                && !event.content.contains("abs/path")
+        }));
+        for expected in [
+            "system prompt records",
+            "hidden reasoning",
+            "message snapshots",
+        ] {
+            assert!(
+                export.losses.iter().any(|loss| loss.contains(expected)),
+                "missing loss annotation for {expected}"
+            );
+        }
+        let cursor: FileCursor = serde_json::from_str(&export.source_cursor.unwrap()).unwrap();
+        assert!(cursor.prefix_sha256.is_some());
+    }
+
+    #[test]
+    fn copilot_export_is_incremental_and_holds_back_an_incomplete_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let first_line = json!({"type":"user.message","data":{"content":"one"},"id":"a"});
+        let second_line = json!({"type":"assistant.message","data":{"content":"two"},"id":"b"});
+        // A record still being written has no trailing newline yet.
+        let partial = second_line.to_string();
+        fs::write(&path, format!("{first_line}\n{}", &partial[..10])).unwrap();
+        let first = export_jsonl(ManagedHarness::Copilot, &path, "s", None).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert!(first.losses.is_empty());
+
+        fs::write(&path, format!("{first_line}\n{second_line}\n")).unwrap();
+        let second = export_jsonl(
+            ManagedHarness::Copilot,
+            &path,
+            "s",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].content, "two");
+
+        // Re-reading from scratch yields identical event ids.
+        let replay = export_jsonl(ManagedHarness::Copilot, &path, "s", None).unwrap();
+        assert_eq!(replay.events[0].event_id, first.events[0].event_id);
+        assert_eq!(replay.events[1].event_id, second.events[0].event_id);
+    }
+
     fn push_protobuf_varint(output: &mut Vec<u8>, mut value: u64) {
         loop {
             let byte = (value & 0x7f) as u8;
@@ -5516,23 +8394,575 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
-    /// Every step payload is an undocumented protobuf blob, so the ledger for
-    /// this harness comes from hook capture. The failure has to say so.
-    #[tokio::test]
-    async fn antigravity_transcript_export_explains_why_it_is_unavailable() {
+    #[test]
+    fn transcript_interval_identity_is_ordered_and_semantic() {
+        let event = |id: &str, role: &str, timestamp: &str, content: &str| NewWorkstreamEvent {
+            event_id: id.into(),
+            agent: AgentKind::ClaudeCode,
+            native_session_id: "session".into(),
+            source_record_id: None,
+            kind: WorkstreamEventKind::Message,
+            role: Some(role.into()),
+            content: content.into(),
+            occurred_at: Some(timestamp.into()),
+            metadata: json!({}),
+        };
+        let first = event("one", "user", "2026-10-07T10:00:00Z", "hello");
+        let second = event("two", "assistant", "2026-10-07T10:00:01Z", "world");
+        let expected = transcript_interval_digests(&[first.clone(), second.clone()]);
+        assert_eq!(
+            transcript_interval_digests(&[first.clone(), second.clone()]),
+            expected
+        );
+        assert_ne!(
+            transcript_interval_digests(&[second.clone(), first.clone()]),
+            expected,
+            "row order is part of interval identity"
+        );
+        for changed in [
+            event("one", "assistant", "2026-10-07T10:00:00Z", "hello"),
+            event("one", "user", "2026-10-07T10:00:02Z", "hello"),
+            event("one", "user", "2026-10-07T10:00:00Z", "changed"),
+        ] {
+            assert_ne!(
+                transcript_interval_digests(&[changed, second.clone()]),
+                expected
+            );
+        }
+    }
+
+    const AG_MINE: &str = "a0d5ac62-2501-4780-b783-76d159c56cb3";
+    const AG_THEIRS: &str = "9576275f-7c4e-4709-b372-22d1ad2a0af8";
+    /// Far from any fixture `.db` creation time, so unlabelled lines at this
+    /// time are never opening-prompt candidates.
+    const AG_PAST: i64 = 1_780_000_000_000;
+
+    struct AntigravityFixture {
+        temp: tempfile::TempDir,
+        root: PathBuf,
+        cwd: PathBuf,
+        other: PathBuf,
+    }
+
+    /// A fake home holding this checkout's conversation `AG_MINE`.
+    fn antigravity_fixture() -> AntigravityFixture {
         let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".gemini/antigravity-cli/conversations");
+        let cwd = temp.path().join("checkout");
+        let other = temp.path().join("elsewhere");
+        for dir in [&root, &cwd, &other] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        write_antigravity_conversation(&root, AG_MINE, &file_uri(&cwd));
+        AntigravityFixture {
+            temp,
+            root,
+            cwd,
+            other,
+        }
+    }
+
+    fn history_line(id: Option<&str>, workspace: &Path, display: &str, millis: i64) -> String {
+        let mut line = json!({
+            "display": display,
+            "timestamp": millis,
+            "workspace": workspace.to_string_lossy(),
+        });
+        if let Some(id) = id {
+            line["conversationId"] = json!(id);
+        }
+        line.to_string()
+    }
+
+    fn write_antigravity_history(root: &Path, lines: &[String]) {
+        let mut body = lines.join("\n");
+        body.push('\n');
+        fs::write(root.parent().unwrap().join("history.jsonl"), body).unwrap();
+    }
+
+    async fn export_antigravity_fixture(
+        fixture: &AntigravityFixture,
+        cursor: Option<&str>,
+    ) -> ExportedTranscript {
+        export_transcript(
+            ManagedHarness::Antigravity,
+            fixture.temp.path(),
+            &fixture.cwd,
+            None,
+            AG_MINE,
+            cursor,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn prompts(exported: &ExportedTranscript) -> Vec<&str> {
+        exported
+            .events
+            .iter()
+            .map(|event| {
+                assert_eq!(event.role.as_deref(), Some("user"));
+                assert_eq!(event.agent, AgentKind::AntigravityCli);
+                event.content.as_str()
+            })
+            .collect()
+    }
+
+    /// `history.jsonl` holds every conversation of every workspace. Only this
+    /// conversation's prompts typed in this checkout may come out.
+    #[tokio::test]
+    async fn antigravity_history_exports_only_this_conversations_prompts_in_this_workspace() {
+        let fixture = antigravity_fixture();
+        let (cwd, other) = (&fixture.cwd, &fixture.other);
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                history_line(Some(AG_MINE), cwd, "own first", AG_PAST),
+                history_line(Some(AG_THEIRS), cwd, "canary-same-workspace", AG_PAST + 1),
+                history_line(
+                    Some(AG_THEIRS),
+                    other,
+                    "canary-other-workspace",
+                    AG_PAST + 2,
+                ),
+                history_line(None, other, "canary-unlabelled", AG_PAST + 3),
+                history_line(Some(AG_MINE), cwd, "own second", AG_PAST + 4),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own first", "own second"]);
+        assert!(
+            !exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another workspace")),
+            "other conversations are not this session's losses: {:?}",
+            exported.losses
+        );
+    }
+
+    /// `agy --conversation=<id>` run from another directory keeps the id but
+    /// records that directory, so the id alone must not admit the line.
+    #[tokio::test]
+    async fn antigravity_history_drops_prompts_from_a_resumed_conversation_in_another_workspace() {
+        let fixture = antigravity_fixture();
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                history_line(Some(AG_MINE), &fixture.other, "canary-resumed", AG_PAST),
+                history_line(Some(AG_MINE), &fixture.cwd, "own", AG_PAST + 1),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own"]);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another workspace")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    /// The conversation itself must belong to this checkout before any
+    /// history line is read, even when the history names this checkout.
+    #[tokio::test]
+    async fn antigravity_export_rejects_a_conversation_from_another_workspace() {
+        let fixture = antigravity_fixture();
+        write_antigravity_conversation(&fixture.root, AG_THEIRS, &file_uri(&fixture.other));
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                Some(AG_THEIRS),
+                &fixture.cwd,
+                "canary",
+                AG_PAST,
+            )],
+        );
+
         let error = export_transcript(
             ManagedHarness::Antigravity,
-            temp.path(),
-            temp.path(),
+            fixture.temp.path(),
+            &fixture.cwd,
             None,
-            "a0d5ac62-2501-4780-b783-76d159c56cb3",
+            AG_THEIRS,
             None,
         )
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("hook capture"), "{error}");
+
+        assert!(error.contains("not found"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn antigravity_export_rejects_unknown_or_traversal_ids() {
+        let fixture = antigravity_fixture();
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(Some("../x"), &fixture.cwd, "canary", AG_PAST)],
+        );
+        for id in ["11111111-1111-1111-1111-111111111111", "../x", "not-a-uuid"] {
+            let error = export_transcript(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &fixture.cwd,
+                None,
+                id,
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("not found"), "{id}: {error}");
+        }
+    }
+
+    /// The file has no version field: anything unexpected is skipped with a
+    /// loss, and unknown keys are ignored.
+    #[tokio::test]
+    async fn antigravity_history_skips_malformed_lines_with_losses() {
+        let fixture = antigravity_fixture();
+        let cwd = fixture.cwd.to_string_lossy();
+        let record = |extra: Value| {
+            let mut line = json!({
+                "conversationId": AG_MINE,
+                "workspace": cwd,
+                "display": "canary",
+                "timestamp": AG_PAST,
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                if value.is_null() {
+                    line.as_object_mut().unwrap().remove(key);
+                } else {
+                    line[key] = value.clone();
+                }
+            }
+            line.to_string()
+        };
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                format!(r#"{{"conversationId":"{AG_MINE}","display":"#),
+                record(json!({"timestamp": "1780000000000"})),
+                record(json!({"timestamp": -5})),
+                record(json!({"timestamp": 1.78e12})),
+                record(json!({"display": ""})),
+                record(json!({"display": null})),
+                record(json!({"workspace": null})),
+                record(json!({"type": "weird"})),
+                record(json!({"display": "own", "futureKey": {"nested": true}})),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own"]);
+        for expected in [
+            "malformed Antigravity history records",
+            "without a valid timestamp",
+            "without a prompt",
+            "without a workspace",
+            "of an unknown type",
+        ] {
+            assert!(
+                exported.losses.iter().any(|loss| loss.contains(expected)),
+                "missing {expected:?} in {:?}",
+                exported.losses
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_history_drops_slash_and_shell_entries() {
+        let fixture = antigravity_fixture();
+        let typed = |kind: &str| {
+            let mut line: Value =
+                serde_json::from_str(&history_line(Some(AG_MINE), &fixture.cwd, "/x", AG_PAST))
+                    .unwrap();
+            line["type"] = json!(kind);
+            line.to_string()
+        };
+        write_antigravity_history(&fixture.root, &[typed("slash_command"), typed("shell")]);
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty());
+        for expected in ["slash commands", "shell commands"] {
+            assert!(
+                exported.losses.iter().any(|loss| loss.contains(expected)),
+                "missing {expected:?} in {:?}",
+                exported.losses
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_history_skips_an_oversized_line_and_keeps_reading() {
+        let fixture = antigravity_fixture();
+        let huge = "x".repeat(MAX_ANTIGRAVITY_HISTORY_LINE_BYTES + 1);
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                history_line(Some(AG_MINE), &fixture.cwd, &huge, AG_PAST),
+                history_line(Some(AG_MINE), &fixture.cwd, "own", AG_PAST + 1),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own"]);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("oversized")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    /// A missing history is a degraded source, not a failed import.
+    #[tokio::test]
+    async fn antigravity_history_missing_file_yields_no_events() {
+        let fixture = antigravity_fixture();
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty());
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("history.jsonl is missing")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    /// `agy` caps a prompt near 8 KiB; such a prompt in multibyte text stays
+    /// under the line limit and comes out whole, stamped from epoch ms.
+    #[tokio::test]
+    async fn antigravity_history_converts_millis_and_keeps_a_long_multibyte_prompt() {
+        let fixture = antigravity_fixture();
+        let long = "é🙂".repeat(4_096);
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                Some(AG_MINE),
+                &fixture.cwd,
+                &long,
+                1_780_000_000_123,
+            )],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), [long.as_str()]);
+        assert_eq!(
+            exported.events[0].occurred_at.as_deref(),
+            Some("2026-05-28T20:26:40.123Z")
+        );
+        assert_eq!(exported.events[0].metadata, json!({}));
+    }
+
+    fn opener(millis: i64) -> HistoryPrompt {
+        HistoryPrompt {
+            offset: 0,
+            hash: String::new(),
+            millis,
+            display: "opening".into(),
+            metadata: json!({}),
+        }
+    }
+
+    #[test]
+    fn antigravity_opening_prompt_takes_the_single_candidate() {
+        assert_eq!(
+            antigravity_opening_prompt(Some(AG_PAST), vec![opener(AG_PAST + 400)], |_| false),
+            Ok(Some(opener(AG_PAST + 400)))
+        );
+        assert_eq!(
+            antigravity_opening_prompt(Some(AG_PAST), Vec::new(), |_| true),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn antigravity_opening_prompt_rejects_ambiguous_or_contested_candidates() {
+        assert!(
+            antigravity_opening_prompt(
+                Some(AG_PAST),
+                vec![opener(AG_PAST), opener(AG_PAST + 100)],
+                |_| false
+            )
+            .unwrap_err()
+            .contains("several")
+        );
+        assert!(
+            antigravity_opening_prompt(Some(AG_PAST), vec![opener(AG_PAST)], |millis| {
+                millis == AG_PAST
+            })
+            .unwrap_err()
+            .contains("another conversation")
+        );
+    }
+
+    /// The missing creation time is reported only when a prompt was left
+    /// unattributed because of it.
+    #[test]
+    fn antigravity_opening_prompt_needs_a_creation_time_only_for_a_candidate() {
+        assert!(
+            antigravity_opening_prompt(None, vec![opener(AG_PAST)], |_| false)
+                .unwrap_err()
+                .contains("no creation time")
+        );
+        assert_eq!(
+            antigravity_opening_prompt(None, Vec::new(), |_| false),
+            Ok(None)
+        );
+    }
+
+    /// A conversation of one prompt has no labelled line at all; its prompt is
+    /// found from the `.db` creation time alone. Skipped where the filesystem
+    /// records no birth time.
+    #[tokio::test]
+    async fn antigravity_opening_prompt_covers_a_single_prompt_conversation() {
+        let fixture = antigravity_fixture();
+        let db = fixture.root.join(format!("{AG_MINE}.db"));
+        let Ok(created) = fs::metadata(&db).and_then(|metadata| metadata.created()) else {
+            return;
+        };
+        let created =
+            i64::try_from(created.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap();
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                history_line(None, &fixture.cwd, "canary-before-window", created - 6_000),
+                history_line(None, &fixture.other, "canary-other-workspace", created),
+                history_line(None, &fixture.cwd, "opening", created + 300),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["opening"]);
+        assert_eq!(
+            exported.events[0].metadata,
+            json!({"attribution": "inferred"})
+        );
+    }
+
+    /// A conversation opened without a typed prompt (`agy -p`) must not take
+    /// the opening prompt of another conversation of this checkout started at
+    /// the same moment. Skipped where the filesystem records no birth time.
+    #[tokio::test]
+    async fn antigravity_opening_prompt_is_refused_when_another_conversation_started_with_it() {
+        let fixture = antigravity_fixture();
+        write_antigravity_conversation(&fixture.root, AG_THEIRS, &file_uri(&fixture.cwd));
+        let Some(created) = birth_millis(&fixture.root.join(format!("{AG_MINE}.db"))) else {
+            return;
+        };
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                None,
+                &fixture.cwd,
+                "canary-theirs-opening",
+                created,
+            )],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty(), "{:?}", exported.events);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another conversation")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    /// Unusable records of other conversations, or unlabelled ones, are not
+    /// this conversation's losses.
+    #[tokio::test]
+    async fn antigravity_history_reports_no_losses_for_foreign_records() {
+        let fixture = antigravity_fixture();
+        let huge = "x".repeat(MAX_ANTIGRAVITY_HISTORY_LINE_BYTES + 1);
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                format!(r#"{{"conversationId":"{AG_THEIRS}","display":"#),
+                history_line(Some(AG_THEIRS), &fixture.cwd, &huge, AG_PAST),
+                json!({"conversationId": AG_THEIRS, "display": "x", "timestamp": AG_PAST})
+                    .to_string(),
+                json!({"display": "shell", "timestamp": AG_PAST, "type": "shell"}).to_string(),
+                history_line(Some(AG_MINE), &fixture.cwd, "own", AG_PAST + 1),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["own"]);
+        assert_eq!(
+            exported.losses,
+            [ANTIGRAVITY_PROMPTS_ONLY],
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_history_cursor_returns_only_appended_prompts() {
+        let fixture = antigravity_fixture();
+        let first = history_line(Some(AG_MINE), &fixture.cwd, "first", AG_PAST);
+        write_antigravity_history(&fixture.root, std::slice::from_ref(&first));
+        let initial = export_antigravity_fixture(&fixture, None).await;
+        assert_eq!(prompts(&initial), ["first"]);
+
+        write_antigravity_history(
+            &fixture.root,
+            &[
+                first,
+                history_line(Some(AG_MINE), &fixture.cwd, "second", AG_PAST + 1),
+            ],
+        );
+        let next = export_antigravity_fixture(&fixture, initial.source_cursor.as_deref()).await;
+
+        assert_eq!(prompts(&next), ["second"]);
+    }
+
+    /// A trimmed or rewritten history invalidates the byte offset, so the
+    /// read starts over instead of skipping or splitting records.
+    #[tokio::test]
+    async fn antigravity_history_cursor_restarts_after_truncation_or_rewrite() {
+        let fixture = antigravity_fixture();
+        let line =
+            |display: &str, millis: i64| history_line(Some(AG_MINE), &fixture.cwd, display, millis);
+        write_antigravity_history(
+            &fixture.root,
+            &[line("aaaa", AG_PAST), line("bbbb", AG_PAST + 1)],
+        );
+        let cursor = export_antigravity_fixture(&fixture, None)
+            .await
+            .source_cursor;
+
+        write_antigravity_history(&fixture.root, &[line("cccc", AG_PAST + 2)]);
+        let truncated = export_antigravity_fixture(&fixture, cursor.as_deref()).await;
+        assert_eq!(prompts(&truncated), ["cccc"]);
+
+        let cursor = truncated.source_cursor;
+        write_antigravity_history(&fixture.root, &[line("dddd", AG_PAST + 3)]);
+        let rewritten = export_antigravity_fixture(&fixture, cursor.as_deref()).await;
+        assert_eq!(prompts(&rewritten), ["dddd"]);
     }
 
     const KIRO_SESSION_A: &str = "3f6d1c2a-0000-4000-8000-000000000aaa";
@@ -5937,5 +9367,111 @@ mod tests {
         assert_eq!(protobuf_field(&[0x22, 0x10, b'x'], 4), None);
         // A ten-byte varint may carry only one payload bit in its final byte.
         assert_eq!(protobuf_varint(&[0xff; 10]), None);
+    }
+
+    #[test]
+    fn native_memory_dir_finds_the_sibling_memory_directory_for_claude() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        // Claude Code's own project-directory name is irrelevant here -- the
+        // whole point of this function is to find it by content, never by
+        // guessing the encoding (which differs between POSIX and native
+        // Windows).
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": cwd})),
+        )
+        .unwrap();
+        let memory_dir = project_dir.join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("fact.md"), "hello").unwrap();
+
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            Some(memory_dir)
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_without_a_memory_subdirectory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": cwd})),
+        )
+        .unwrap();
+
+        // A real session was found, but it never created a memory/ store.
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_when_no_session_matches_this_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": other})),
+        )
+        .unwrap();
+        fs::create_dir_all(project_dir.join("memory")).unwrap();
+
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_for_harnesses_with_no_known_convention() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+
+        // Codex has no established native-memory convention today, so this
+        // must return None unconditionally rather than guess at a location.
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Codex, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_identity_adapter_preserves_exact_and_rejects_privacy_changes() {
+        for id in [
+            "sk-abcdefghijklmnopqrstuvwx",
+            "native\u{202e}tail",
+            "native\u{200b}tail",
+            "native\u{feff}tail",
+        ] {
+            assert!(
+                !valid_native_session_id(id),
+                "adapter must reject dirty identity"
+            );
+        }
+        for id in ["session_vendor-01", "native-界-01"] {
+            assert!(valid_native_session_id(id));
+        }
+        for id in ["../session", "-selector", "a/b", "a\\b", ".", ".."] {
+            assert!(!valid_native_session_id(id));
+        }
     }
 }

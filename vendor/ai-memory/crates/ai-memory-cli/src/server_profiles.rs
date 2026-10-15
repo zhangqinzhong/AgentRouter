@@ -131,6 +131,59 @@ fn token_path(data_dir: &Path, name: &ProfileName) -> PathBuf {
     data_dir.join(TOKEN_DIR).join(name.as_str())
 }
 
+/// The name under `auth-tokens/` that holds this install's own root bearer
+/// once `init` or `auth enable` provisions one. It shares the profile layout
+/// and parsing rules, so `server add`, `server remove` and `auth enable`
+/// refuse to let a registered profile of the same name share the file.
+pub(crate) const ROOT_TOKEN_NAME: &str = "default";
+
+/// `[auth].bearer_token_file` as `init` and `auth enable` record it: relative,
+/// so it resolves against whichever path the data dir is mounted at.
+pub(crate) const ROOT_TOKEN_RELATIVE: &str = "auth-tokens/default";
+
+/// `<data_dir>/auth-tokens/default`.
+#[must_use]
+pub(crate) fn root_token_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(TOKEN_DIR).join(ROOT_TOKEN_NAME)
+}
+
+/// Write the root bearer to `path`: the token directory `0700`, the file
+/// `0600`, replaced atomically.
+///
+/// # Errors
+/// Propagates directory creation and write failures.
+pub(crate) fn store_root_token(path: &Path, token: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        crate::commands::path_util::create_private_dir(dir)
+            .context("cannot create the token directory")?;
+    }
+    write_private(path, &format!("{token}\n"))
+}
+
+/// Whether `servers.toml` registers a profile named [`ROOT_TOKEN_NAME`].
+///
+/// # Errors
+/// An unreadable or invalid registry, which cannot prove the name is free.
+pub(crate) fn root_token_name_is_registered(data_dir: &Path) -> Result<bool> {
+    let name = ProfileName(ROOT_TOKEN_NAME.to_owned());
+    Ok(load(data_dir)?.profiles.contains_key(&name))
+}
+
+/// Whether a registered profile would read the same file as the root bearer
+/// at `root_token`: a profile named `default` while the root bearer lives at
+/// `auth-tokens/default`. Its server would then be handed this install's root
+/// credential.
+pub(crate) fn profile_shares_root_token(
+    data_dir: &Path,
+    name: &ProfileName,
+    root_token: Option<&Path>,
+) -> bool {
+    root_token.is_some_and(|path| {
+        crate::marker::absolute_normalized(path)
+            == crate::marker::absolute_normalized(&token_path(data_dir, name))
+    })
+}
+
 /// Load `servers.toml`. A missing file is an empty registry; anything else
 /// that is not exactly the documented shape is an error, so a typo can only
 /// ever make routing refuse, never make it guess.
@@ -397,7 +450,8 @@ pub(crate) fn remove(data_dir: &Path, name: &ProfileName) -> Result<bool> {
     Ok(discard_token(data_dir, name)? || existed)
 }
 
-/// Remove every stored profile token, keeping the registry itself.
+/// Remove every stored profile token, keeping the registry itself and the
+/// server's own root bearer.
 ///
 /// `uninstall` removes the hooks, which are the only readers of these
 /// tokens; leaving them on disk would strand live credentials the same way
@@ -405,10 +459,42 @@ pub(crate) fn remove(data_dir: &Path, name: &ProfileName) -> Result<bool> {
 /// survives, so a later reinstall lists each profile with `token: missing`
 /// and refuses its events until a token is stored again.
 ///
+/// `keep` is the file `[auth].bearer_token_file` names. That one is the
+/// server's credential, not a hook's: removing it would leave a server that
+/// refuses to start until `ai-memory auth enable` mints a new one.
+///
 /// # Errors
 /// Propagates IO failures other than "not found".
-pub(crate) fn clear_tokens(data_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir_all(data_dir.join(TOKEN_DIR)) {
+pub(crate) fn clear_tokens(data_dir: &Path, keep: Option<&Path>) -> std::io::Result<()> {
+    let dir = data_dir.join(TOKEN_DIR);
+    let keep = keep.map(crate::marker::absolute_normalized);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut kept = false;
+    for entry in entries {
+        let path = entry?.path();
+        if keep.as_ref() == Some(&crate::marker::absolute_normalized(&path)) {
+            kept = true;
+            continue;
+        }
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if kept {
+        return Ok(());
+    }
+    match std::fs::remove_dir(&dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -751,7 +837,7 @@ mod tests {
         )
         .unwrap();
 
-        clear_tokens(dd.path()).unwrap();
+        clear_tokens(dd.path(), None).unwrap();
         assert!(!dd.path().join(TOKEN_DIR).exists());
         assert_eq!(read_token(dd.path(), &name("a")), None);
         assert_eq!(read_token(dd.path(), &name("b")), None);
@@ -762,7 +848,68 @@ mod tests {
             "the profile is still registered, only its token is gone"
         );
 
-        clear_tokens(dd.path()).expect("clearing an already-clear store is not an error");
+        clear_tokens(dd.path(), None).expect("clearing an already-clear store is not an error");
+    }
+
+    /// The root bearer `[auth].bearer_token_file` names is the server's own
+    /// credential: uninstall clears every profile token around it and keeps
+    /// it, or the next `serve` would refuse to start.
+    #[test]
+    fn clear_tokens_keeps_the_root_bearer_and_removes_profile_tokens() {
+        let dd = tempfile::tempdir().unwrap();
+        let root = root_token_path(dd.path());
+        store_root_token(&root, "root-secret").unwrap();
+        add(
+            dd.path(),
+            &name("b"),
+            "https://b.example",
+            &[],
+            Some("tok-b"),
+        )
+        .unwrap();
+
+        clear_tokens(dd.path(), Some(&root)).unwrap();
+        assert_eq!(
+            read_token(dd.path(), &name("b")),
+            None,
+            "profile token removed"
+        );
+        assert_eq!(
+            crate::config::read_trimmed_secret(&root).as_deref(),
+            Some("root-secret"),
+            "the root bearer survives"
+        );
+
+        // Control: without a configured root bearer the same file is just a
+        // token in the directory, and goes with the rest.
+        clear_tokens(dd.path(), None).unwrap();
+        assert!(!dd.path().join(TOKEN_DIR).exists());
+    }
+
+    #[test]
+    fn a_default_profile_shares_the_root_bearer_only_at_its_path() {
+        let dd = tempfile::tempdir().unwrap();
+        let root = root_token_path(dd.path());
+        assert!(profile_shares_root_token(
+            dd.path(),
+            &name("default"),
+            Some(&root)
+        ));
+        assert!(!profile_shares_root_token(
+            dd.path(),
+            &name("team-b"),
+            Some(&root)
+        ));
+        assert!(!profile_shares_root_token(
+            dd.path(),
+            &name("default"),
+            None
+        ));
+        assert!(!profile_shares_root_token(
+            dd.path(),
+            &name("default"),
+            Some(&dd.path().join("elsewhere"))
+        ));
     }
 
     #[test]

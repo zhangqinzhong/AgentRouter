@@ -8,31 +8,66 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 
+use ai_memory_store::ResolvedScope;
+
 use crate::state::WebState;
-use crate::templates::{Folder, PageRow, ProjectView, humanize, page_href};
+use crate::templates::{
+    Folder, MailboxRow, PageRow, ProjectView, SessionRow, humanize, page_href, project_href,
+    session_href,
+};
+
+/// Pending messages listed on the project page before it says there are more.
+const MAILBOX_LIMIT: usize = 5;
+
+/// Recent sessions listed on the project page.
+const SESSION_LIMIT: usize = 10;
+
+/// Sidebar bucket for pages directly under the wiki root.
+const ROOT_FOLDER: &str = "(root)";
+
+/// Pages listed per sidebar folder before "View all".
+const FOLDER_PREVIEW: usize = 5;
+
+/// Leading body characters shown per message.
+const SNIPPET_CHARS: usize = 160;
 
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
 ) -> Response {
-    if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
-        return super::page::refusal_response(&refusal);
-    }
-    render(&state, workspace, project).await.into_response()
+    let viewer_id = viewer.as_ref().map(|axum::Extension(viewer)| viewer.user());
+    let authorized = match super::authorize_read(&state, viewer, &workspace, &project).await {
+        Ok(authorized) => authorized,
+        Err(refusal) => return super::page::refusal_response(&refusal),
+    };
+    let owner = super::api::owner_filter_for(actor);
+    render(&state, workspace, project, viewer_id, authorized, owner)
+        .await
+        .into_response()
 }
 
 async fn render(
     state: &WebState,
     workspace: String,
     project: String,
+    viewer: Option<ai_memory_core::UserId>,
+    authorized: Option<ResolvedScope>,
+    owner: ai_memory_core::OwnerFilter,
 ) -> Result<Html<String>, StatusCode> {
-    let pages = state
-        .reader
-        .list_pages(&workspace, &project)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (pages, (mailbox, mailbox_total), sessions) = tokio::try_join!(
+        async {
+            state
+                .reader
+                .list_pages(&workspace, &project)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        },
+        mailbox(state, &workspace, &project, viewer, authorized),
+        sessions(state, &workspace, &project, authorized, owner),
+    )?;
 
     // Build sidebar folder trees (group by first path segment), split
     // into knowledge and machinery. A store accumulates far more
@@ -40,8 +75,8 @@ async fn render(
     // bundle indexes) than curated knowledge; listing them as peers
     // buried the concepts/decisions/rules a human actually opens this
     // UI for.
-    let mut knowledge_map: BTreeMap<String, Vec<PageRow>> = BTreeMap::new();
-    let mut system_map: BTreeMap<String, Vec<PageRow>> = BTreeMap::new();
+    let mut knowledge_map: BTreeMap<String, Vec<(String, PageRow)>> = BTreeMap::new();
+    let mut system_map: BTreeMap<String, Vec<(String, PageRow)>> = BTreeMap::new();
     for p in &pages {
         let folder = p
             .path
@@ -55,28 +90,25 @@ async fn render(
                     None
                 }
             })
-            .unwrap_or_else(|| "(root)".to_owned());
+            .unwrap_or_else(|| ROOT_FOLDER.to_owned());
         let map = if is_system_page(&p.path) {
             &mut system_map
         } else {
             &mut knowledge_map
         };
-        map.entry(folder).or_default().push(PageRow {
-            path: p.path.clone(),
-            href: page_href(&workspace, &project, &p.path),
-            title: p.title.clone(),
-            kind: p.kind.clone(),
-            updated_relative: humanize(&p.updated_at),
-        });
+        map.entry(folder).or_default().push((
+            p.updated_at.clone(),
+            PageRow {
+                path: p.path.clone(),
+                href: page_href(&workspace, &project, &p.path),
+                title: p.title.clone(),
+                kind: p.kind.clone(),
+                updated_relative: humanize(&p.updated_at),
+            },
+        ));
     }
-    let folders: Vec<Folder> = knowledge_map
-        .into_iter()
-        .map(|(name, pages)| Folder { name, pages })
-        .collect();
-    let system: Vec<Folder> = system_map
-        .into_iter()
-        .map(|(name, pages)| Folder { name, pages })
-        .collect();
+    let folders = to_folders(knowledge_map, &workspace, &project);
+    let system = to_folders(system_map, &workspace, &project);
 
     // Recent pages: knowledge only, sorted by updated_at desc, take 20.
     // Machinery updates constantly (logs append every consolidation,
@@ -100,16 +132,192 @@ async fn render(
         })
         .collect();
 
+    let mailbox_capped = mailbox_total > mailbox.len() as u64;
     let html = ProjectView {
         workspace,
         project,
         folders,
         system,
         recent,
+        mailbox,
+        mailbox_total,
+        mailbox_capped,
+        sessions,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html))
+}
+
+/// Turn grouped pages into sidebar folders: newest first, capped at
+/// `FOLDER_PREVIEW`, each linked to its namespace listing.
+fn to_folders(
+    map: BTreeMap<String, Vec<(String, PageRow)>>,
+    workspace: &str,
+    project: &str,
+) -> Vec<Folder> {
+    map.into_iter()
+        .map(|(name, mut rows)| {
+            rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
+            let total = rows.len();
+            // `(root)` has no namespace URL to hold the rest, so it lists all.
+            let href =
+                (name != ROOT_FOLDER).then(|| page_href(workspace, project, &format!("{name}/")));
+            let keep = if href.is_some() {
+                FOLDER_PREVIEW
+            } else {
+                total
+            };
+            Folder {
+                href,
+                total,
+                pages: rows.into_iter().take(keep).map(|(_, row)| row).collect(),
+                name,
+            }
+        })
+        .collect()
+}
+
+/// The project's pending inbox, read-only: this page never pops or cancels,
+/// so the claim-once queue stays the agents' alone.
+///
+/// Returns the rows to list and how many messages are pending in all, so the
+/// page can say "5 of 12" rather than hide the rest. The route has
+/// already authorized the viewer for this project; sender names are filtered
+/// again per row in the store.
+async fn mailbox(
+    state: &WebState,
+    workspace: &str,
+    project: &str,
+    viewer: Option<ai_memory_core::UserId>,
+    authorized: Option<ResolvedScope>,
+) -> Result<(Vec<MailboxRow>, u64), StatusCode> {
+    let Some(scope) = mailbox_scope(state, workspace, project, authorized).await? else {
+        return Ok((Vec::new(), 0));
+    };
+    let (entries, total) = tokio::try_join!(
+        state.reader.list_inbox_with_senders(
+            scope.workspace_id,
+            scope.project_id,
+            viewer,
+            MAILBOX_LIMIT
+        ),
+        state
+            .reader
+            .pending_message_count(scope.workspace_id, scope.project_id),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let total = total.max(entries.len() as u64);
+    let rows = entries
+        .into_iter()
+        .map(|entry| {
+            let (sender, sender_href) = match entry.sender {
+                Some((workspace, project)) => (
+                    format!("{workspace}/{project}"),
+                    Some(project_href(&workspace, &project)),
+                ),
+                None => ("a project you cannot read".to_owned(), None),
+            };
+            MailboxRow {
+                subject: entry
+                    .message
+                    .subject
+                    .filter(|subject| !subject.trim().is_empty())
+                    .unwrap_or_else(|| "(no subject)".to_owned()),
+                sender,
+                sender_href,
+                snippet: snippet(&entry.message.body),
+                created_relative: humanize(&entry.message.created_at.to_string()),
+            }
+        })
+        .collect();
+    Ok((rows, total))
+}
+
+/// The project's most recent sessions, open ones included, through the same
+/// owner-filtered reader as `/api/v1/.../sessions`: a session another operator
+/// owns is not listed.
+async fn sessions(
+    state: &WebState,
+    workspace: &str,
+    project: &str,
+    authorized: Option<ResolvedScope>,
+    owner: ai_memory_core::OwnerFilter,
+) -> Result<Vec<SessionRow>, StatusCode> {
+    let Some(scope) = mailbox_scope(state, workspace, project, authorized).await? else {
+        return Ok(Vec::new());
+    };
+    let sessions = state
+        .reader
+        .sessions_for_scope(
+            scope.workspace_id,
+            scope.project_id,
+            owner,
+            true,
+            SESSION_LIMIT,
+            0,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(sessions
+        .into_iter()
+        .map(|s| {
+            let id = s.session_id.to_string();
+            SessionRow {
+                href: session_href(workspace, project, &id),
+                agent_kind: s.agent_kind,
+                short_id: crate::templates::short_id(&id),
+                observation_count: s.observation_count,
+                started_relative: humanize(&s.started_at),
+                open: s.ended_at.is_none(),
+            }
+        })
+        .collect())
+}
+
+/// The project whose pages this page lists, or `None` when there is none.
+///
+/// Matches the exact name, as `list_pages` does, so an alias that resolves to
+/// another project cannot put that project's mail beside these pages. A URL
+/// that names no project renders an empty mailbox, as it renders no pages.
+async fn mailbox_scope(
+    state: &WebState,
+    workspace: &str,
+    project: &str,
+    authorized: Option<ResolvedScope>,
+) -> Result<Option<ResolvedScope>, StatusCode> {
+    let workspace_id = match authorized {
+        Some(scope) => scope.workspace_id,
+        None => match ai_memory_store::lookup_existing_workspace(&state.reader, workspace).await {
+            Ok(workspace_id) => workspace_id,
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        },
+    };
+    let project_id = state
+        .reader
+        .find_project(workspace_id, project.to_owned())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(project_id.map(|project_id| ResolvedScope {
+        workspace_id,
+        project_id,
+    }))
+}
+
+/// First [`SNIPPET_CHARS`] characters of `body` on one line.
+fn snippet(body: &str) -> String {
+    // Lazy, so a large body is read only up to the cut.
+    let mut flat = body
+        .split_whitespace()
+        .flat_map(|word| std::iter::once(' ').chain(word.chars()))
+        .skip(1);
+    let cut: String = flat.by_ref().take(SNIPPET_CHARS).collect();
+    if flat.next().is_some() {
+        format!("{cut}…")
+    } else {
+        cut
+    }
 }
 
 /// Machinery rather than knowledge: hidden from Recent Activity and

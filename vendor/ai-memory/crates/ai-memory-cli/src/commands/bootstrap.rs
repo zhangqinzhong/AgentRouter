@@ -192,6 +192,7 @@ fn local_dry_run(
         rationale: "(dry-run; LLM not invoked, no network round-trip)".to_string(),
         dry_run: true,
         llm_chunks,
+        manifest_warning: None,
     }
 }
 
@@ -206,6 +207,9 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
         "Bootstrap"
     };
     println!("\n{kind} complete for {workspace}/{project}\n");
+    if let Some(warning) = &outcome.manifest_warning {
+        eprintln!("ai-memory: warning: {warning}");
+    }
 
     println!("Sources loaded into the LLM:");
     let c = &outcome.sources_by_kind;

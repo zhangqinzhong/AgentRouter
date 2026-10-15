@@ -72,6 +72,57 @@ impl std::str::FromStr for WorkstreamEventKind {
     }
 }
 
+/// Exact original native identity accepted for a managed binding.
+///
+/// This validates privacy and representation only, not native authenticity,
+/// transcript existence, or association with a particular run.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NativeSessionIdentity(String);
+
+impl NativeSessionIdentity {
+    /// Validate the original UTF-8 bytes without rewriting them.
+    ///
+    /// # Errors
+    /// Refuses empty/oversized identities, controls, invisible formatting,
+    /// redaction placeholders, and any change made by the privacy scrubber.
+    pub fn parse(original: &str, sanitizer: &crate::Sanitizer) -> Result<Self, crate::MemoryError> {
+        if original.trim().is_empty()
+            || original.len() > 512
+            || original.chars().any(|c| {
+                c.is_control()
+                    || matches!(c,
+                '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}' | '\u{feff}')
+            })
+            || original.contains("[REDACTED:")
+            || sanitizer.scrub(original) != original
+        {
+            return Err(crate::MemoryError::MalformedRecord(
+                "native session identity is UNKNOWN; refusing managed binding".into(),
+            ));
+        }
+        Ok(Self(original.to_owned()))
+    }
+
+    /// Borrow exactly the accepted original bytes.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Carry exactly the accepted original bytes into existing wire/storage fields.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// Compatible privacy projection for history: invalid identities are UNKNOWN.
+    #[must_use]
+    pub fn project(original: &str, sanitizer: &crate::Sanitizer) -> String {
+        Self::parse(original, sanitizer).map_or_else(|_| String::new(), Self::into_string)
+    }
+}
+
 /// One normalized event uploaded from a native harness transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewWorkstreamEvent {
@@ -98,6 +149,60 @@ pub struct NewWorkstreamEvent {
     /// opaque provider reasoning.
     #[serde(default)]
     pub metadata: serde_json::Value,
+}
+
+/// Scrub correlation labels with the configured privacy strip, then bound each
+/// UTF-8 value. Unknown keys and non-scalar adapter dumps are discarded.
+/// These labels are untrusted attribution, never scope or authority.
+#[must_use]
+pub fn scrub_workstream_provenance(
+    sanitizer: &crate::Sanitizer,
+    source_record_id: Option<&str>,
+    metadata: &serde_json::Value,
+) -> (Option<String>, serde_json::Value) {
+    let scrub = |value: &str| crate::truncate_utf8_bytes(&sanitizer.scrub(value), 512);
+    let source = source_record_id
+        .map(scrub)
+        .filter(|id| !id.trim().is_empty());
+    let mut allowed = serde_json::Map::new();
+    // Only fields emitted by the shipped native adapters and run boundaries.
+    for key in [
+        "tool",
+        "tool_call_id",
+        "tool_use_id",
+        "parent_id",
+        "summary_type",
+        "status",
+    ] {
+        if let Some(value) = metadata.get(key).and_then(serde_json::Value::as_str) {
+            allowed.insert(key.into(), serde_json::Value::String(scrub(value)));
+        }
+    }
+    if let Some(value) = metadata
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+    {
+        allowed.insert("is_error".into(), value.into());
+    }
+    if let Some(value) = metadata
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        && i32::try_from(value).is_ok()
+    {
+        allowed.insert("exit_code".into(), value.into());
+    }
+    if let Some(value) = metadata
+        .get("loss_count")
+        .and_then(serde_json::Value::as_u64)
+    {
+        allowed.insert("loss_count".into(), value.into());
+    }
+    let metadata = if allowed.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(allowed)
+    };
+    (source, metadata)
 }
 
 /// Repository state captured without mutating the checkout.
@@ -146,8 +251,21 @@ pub struct PrepareManagedRunRequest {
     /// Create and select a fresh named workstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_workstream: Option<String>,
+    /// Expire an active lease owned by this same operator before opening the
+    /// replacement run. This is an explicit recovery override for a launcher
+    /// that exited without releasing its lease; it never permits cross-owner
+    /// takeover.
+    #[serde(default)]
+    pub force_unlock: bool,
     /// Diagnostic owner label (host and process id), not an authorization key.
     pub lease_owner: String,
+    /// The checkout's git-remote identity (`github.com/acme/api`), sent only
+    /// when `project` is the name that identity derives. The server then
+    /// routes by identity, as hook capture does, so a project created from the
+    /// folder name before identities were recorded is claimed instead of
+    /// twinned under the derived name. Old servers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_identity: Option<String>,
 }
 
 /// Result of preparing a managed invocation.
@@ -177,6 +295,9 @@ pub struct PrepareManagedRunResponse {
     /// session. Old servers omit this field, which safely defaults to fresh.
     #[serde(default)]
     pub may_adopt_existing_session: bool,
+    /// Warning when project-name promotion committed but its wiki manifest did not refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<crate::repository_identity::ManifestWarning>,
 }
 
 /// One-time startup context for harnesses without a SessionStart hook.
@@ -270,6 +391,10 @@ pub struct ListManagedWorkstreamsRequest {
     pub worktree_fingerprint: String,
     /// Maximum number of workstreams to return.
     pub limit: usize,
+    /// Number of workstreams to skip in the same stable checkout-local order.
+    /// Omitted by older clients for the first page.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 /// One checkout-local managed workstream returned by discovery reads.
@@ -337,6 +462,13 @@ pub struct WorkstreamEvent {
     pub agent: AgentKind,
     /// Source native session.
     pub native_session_id: String,
+    /// Bounded, scrubbed native record label. Absent on older servers and
+    /// startup-context reads; it is not an authentication or deduplication key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_record_id: Option<String>,
+    /// Bounded adapter correlation labels, scrubbed even for legacy rows.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
     /// Semantic event family.
     pub kind: WorkstreamEventKind,
     /// Optional message role.
@@ -352,6 +484,33 @@ pub struct WorkstreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_workstream_event_has_no_provenance() {
+        let event: WorkstreamEvent = serde_json::from_value(serde_json::json!({
+            "sequence": 1, "event_id": "event-1", "agent": "codex",
+            "native_session_id": "native-1", "kind": "message", "content": "visible",
+        }))
+        .unwrap();
+        assert!(event.source_record_id.is_none());
+        assert!(event.metadata.is_null());
+        let encoded = serde_json::to_value(event).unwrap();
+        assert!(encoded.get("source_record_id").is_none());
+        assert!(encoded.get("metadata").is_none());
+    }
+
+    #[test]
+    fn workstream_listing_without_offset_defaults_to_the_first_page() {
+        let request: ListManagedWorkstreamsRequest = serde_json::from_value(serde_json::json!({
+            "workspace": "default",
+            "project": "app",
+            "repo_fingerprint": "repo",
+            "worktree_fingerprint": "tree",
+            "limit": 20,
+        }))
+        .unwrap();
+        assert_eq!(request.offset, 0);
+    }
 
     #[test]
     fn older_run_status_reads_as_nothing_linked() {
@@ -381,6 +540,7 @@ mod tests {
 
         assert!(!response.may_adopt_existing_session);
         assert!(response.resolved_agent.is_none());
+        assert!(response.manifest_warning.is_none());
     }
 
     #[test]
@@ -398,5 +558,103 @@ mod tests {
 
         assert!(!request.automatic_harness);
         assert!(request.available_agents.is_empty());
+        assert!(!request.force_unlock);
+    }
+
+    #[test]
+    fn forced_unlock_is_explicit_on_the_wire() {
+        let request: PrepareManagedRunRequest = serde_json::from_value(serde_json::json!({
+            "workspace": "default",
+            "project": "memory",
+            "cwd": "/repo",
+            "repo_fingerprint": "repo",
+            "worktree_fingerprint": "worktree",
+            "agent": "codex",
+            "force_unlock": true,
+            "lease_owner": "host:2"
+        }))
+        .unwrap();
+
+        assert!(request.force_unlock);
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["force_unlock"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn native_identity_original_bytes_limits_privacy_and_collisions() {
+        let sanitizer = crate::Sanitizer::builtin();
+        for id in [
+            "vendor-session_01".into(),
+            "x".repeat(501),
+            "x".repeat(512),
+            "界".repeat(170) + "ab",
+            "café".into(),
+            "cafe\u{301}".into(),
+            " vendor ".into(),
+        ] {
+            assert_eq!(
+                NativeSessionIdentity::parse(&id, &sanitizer)
+                    .unwrap()
+                    .as_str(),
+                id
+            );
+            assert_eq!(NativeSessionIdentity::project(&id, &sanitizer), id);
+        }
+        let unsafe_ids = [
+            "".into(),
+            " ".into(),
+            "x".repeat(513),
+            "界".repeat(171),
+            "x\0y".into(),
+            "x\u{1b}[31my".into(),
+            "x\ny".into(),
+            "x\ty".into(),
+            "x\u{85}y".into(),
+            "x\u{202e}y".into(),
+            "x\u{200b}y".into(),
+            "x\u{feff}y".into(),
+            "[REDACTED:api_key]".into(),
+            "sk-abcdefghijklmnopqrstuvwx".into(),
+        ];
+        for id in unsafe_ids {
+            assert!(
+                NativeSessionIdentity::parse(&id, &sanitizer).is_err(),
+                "dirty native identity must be refused"
+            );
+            assert_eq!(NativeSessionIdentity::project(&id, &sanitizer), "");
+            assert!(
+                !NativeSessionIdentity::parse(&id, &sanitizer)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains(&id)
+                    || id.is_empty()
+                    || id == " "
+            );
+        }
+        let a = "sk-abcdefghijklmnopqrstuvwx";
+        let b = "sk-zyxwvutsrqponmlkjihgfedcba";
+        assert_eq!(sanitizer.scrub(a), sanitizer.scrub(b));
+        assert!(NativeSessionIdentity::parse(a, &sanitizer).is_err());
+        assert!(NativeSessionIdentity::parse(b, &sanitizer).is_err());
+        let a = "x".repeat(512) + "a";
+        let b = "x".repeat(512) + "b";
+        assert_eq!(&a[..512], &b[..512]);
+        assert!(NativeSessionIdentity::parse(&a, &sanitizer).is_err());
+        assert!(NativeSessionIdentity::parse(&b, &sanitizer).is_err());
+        let cfg = crate::SanitizeConfig {
+            extra_patterns: vec!["vendor-private".into()],
+            ..Default::default()
+        };
+        assert!(
+            NativeSessionIdentity::parse("vendor-private", &crate::Sanitizer::new(&cfg).unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            crate::SessionId::from_native("vendor-id"),
+            crate::SessionId::from_native("vendor-id")
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Durable queue state for opt-in SessionEnd LLM consolidation.
+//! Durable queue state for SessionEnd and open-session checkpoint LLM work.
 
 use ai_memory_core::{ProjectId, SessionId, WorkspaceId};
 use jiff::Timestamp;
@@ -54,6 +54,12 @@ impl SessionConsolidationJob {
     }
 }
 
+/// Whether the session must already have ended, or may be in any state.
+enum EnqueueEligibility {
+    EndedSession,
+    AnySession,
+}
+
 /// Enqueue the current observation generation for an ended session.
 ///
 /// Returns `true` only when a new generation was inserted. A duplicate end,
@@ -65,9 +71,53 @@ pub fn enqueue(
     project_id: ProjectId,
     session_id: SessionId,
 ) -> StoreResult<bool> {
-    let now = Timestamp::now().as_microsecond();
-    let tx = conn.transaction()?;
-    let inserted = tx.execute(
+    enqueue_eligible(
+        conn,
+        workspace_id,
+        project_id,
+        session_id,
+        EnqueueEligibility::EndedSession,
+    )
+}
+
+/// Enqueue the current observation generation for a session checkpoint
+/// (PreCompact / PostCompaction).
+///
+/// Returns `true` only when a new generation was inserted. A duplicate of the
+/// same generation, a missing or mismatched scope, or an observation-less
+/// session returns `false` without creating work. The session may already have
+/// ended: a resumed session keeps its `ended_at` while it captures again, and a
+/// checkpoint there has just replaced the page with the rule-based one, so the
+/// rewrite must still be queued. Generations order it against SessionEnd's
+/// job: the later one covers more observations and supersedes a pending
+/// older one.
+pub fn enqueue_checkpoint(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+) -> StoreResult<bool> {
+    enqueue_eligible(
+        conn,
+        workspace_id,
+        project_id,
+        session_id,
+        EnqueueEligibility::AnySession,
+    )
+}
+
+fn enqueue_eligible(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    eligibility: EnqueueEligibility,
+) -> StoreResult<bool> {
+    let ended_predicate = match eligibility {
+        EnqueueEligibility::EndedSession => "AND s.ended_at IS NOT NULL",
+        EnqueueEligibility::AnySession => "",
+    };
+    let sql = format!(
         "INSERT OR IGNORE INTO session_consolidation_jobs \
          (session_id, workspace_id, project_id, generation, state, requested_at, \
           next_attempt_at, started_at, completed_at, attempts, claim_id, last_error) \
@@ -76,9 +126,14 @@ pub fn enqueue(
          FROM sessions s \
          JOIN observations o ON o.session_id = s.id \
          WHERE s.id = ?1 AND s.workspace_id = ?2 AND s.project_id = ?3 \
-           AND s.ended_at IS NOT NULL \
+           {ended_predicate} \
          GROUP BY s.id, s.workspace_id, s.project_id \
-         HAVING COUNT(o.id) > 0",
+         HAVING COUNT(o.id) > 0"
+    );
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let inserted = tx.execute(
+        &sql,
         params![
             session_id.as_bytes(),
             workspace_id.as_bytes(),
@@ -351,7 +406,7 @@ mod tests {
     use super::*;
     use crate::Store;
 
-    async fn ended_session() -> (tempfile::TempDir, Store, WorkspaceId, ProjectId, SessionId) {
+    async fn open_session() -> (tempfile::TempDir, Store, WorkspaceId, ProjectId, SessionId) {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let workspace_id = store
@@ -379,6 +434,11 @@ mod tests {
             .await
             .unwrap();
         insert_observation(&store, workspace_id, project_id, session_id).await;
+        (tmp, store, workspace_id, project_id, session_id)
+    }
+
+    async fn ended_session() -> (tempfile::TempDir, Store, WorkspaceId, ProjectId, SessionId) {
+        let (tmp, store, workspace_id, project_id, session_id) = open_session().await;
         store.writer.end_session(session_id, None).await.unwrap();
         (tmp, store, workspace_id, project_id, session_id)
     }
@@ -406,6 +466,159 @@ mod tests {
                 },
                 &Sanitizer::default(),
             ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_enqueue_inserts_a_job_for_an_open_session() {
+        let (_tmp, store, workspace_id, project_id, session_id) = open_session().await;
+        assert!(
+            store
+                .writer
+                .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .writer
+                .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+                .await
+                .unwrap(),
+            "the same open-session generation must be idempotent"
+        );
+        let now = Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.session_id(), session_id);
+        assert_eq!(job.generation(), 1);
+        store
+            .writer
+            .complete_session_consolidation(job)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_enqueue_queues_a_resumed_sessions_new_generation() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        // SessionEnd already queued this generation; a checkpoint of the same
+        // generation adds nothing.
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .writer
+                .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+                .await
+                .unwrap(),
+            "the same generation is queued once"
+        );
+        // The session resumes (it keeps ended_at) and compacts: the checkpoint
+        // replaced the page with the rule-based one, so its rewrite must queue.
+        insert_observation(&store, workspace_id, project_id, session_id).await;
+        assert!(
+            store
+                .writer
+                .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+                .await
+                .unwrap(),
+            "a checkpoint on a resumed session queues its new generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_enqueue_still_refuses_an_open_session() {
+        let (_tmp, store, workspace_id, project_id, session_id) = open_session().await;
+        assert!(
+            !store
+                .writer
+                .enqueue_session_consolidation(workspace_id, project_id, session_id)
+                .await
+                .unwrap(),
+            "SessionEnd enqueue must still require ended_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_enqueue_supersedes_a_pending_checkpoint() {
+        let (_tmp, store, workspace_id, project_id, session_id) = open_session().await;
+        assert!(
+            store
+                .writer
+                .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
+        insert_observation(&store, workspace_id, project_id, session_id).await;
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
+        let now = Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.generation(), 2, "the SessionEnd generation must run");
+        store
+            .writer
+            .complete_session_consolidation(job)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "the pending checkpoint must have been superseded"
+        );
+    }
+
+    /// Without the SessionEnd opt-in nothing supersedes a pending checkpoint,
+    /// so it still runs once after the end and rewrites the whole session.
+    #[tokio::test]
+    async fn pending_checkpoint_survives_an_end_without_the_session_end_opt_in() {
+        let (_tmp, store, workspace_id, project_id, session_id) = open_session().await;
+        assert!(
+            store
+                .writer
+                .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
+        insert_observation(&store, workspace_id, project_id, session_id).await;
+        store.writer.end_session(session_id, None).await.unwrap();
+
+        let now = Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .expect("the checkpoint must still be claimable after the end");
+        assert_eq!(job.generation(), 1);
+        store
+            .writer
+            .complete_session_consolidation(job)
             .await
             .unwrap();
     }

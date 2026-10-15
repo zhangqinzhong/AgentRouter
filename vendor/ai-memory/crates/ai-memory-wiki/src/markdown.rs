@@ -3,16 +3,32 @@
 //! We deliberately do *not* use `gray_matter` here: it parses fine but
 //! loses comments and key ordering on re-serialise, which is exactly the
 //! "duplicate frontmatter on already-frontmatter'd files" class of bug
-//! basic-memory hit (#528). Going through `serde_yaml` directly keeps the
-//! round-trip predictable.
+//! basic-memory hit (#528). Reading through [`crate::frontmatter_yaml`] and
+//! writing through `serde-saphyr` directly keeps the round-trip predictable.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-use ai_memory_core::{LinkTarget, PagePath};
+use ai_memory_core::{DEFAULT_WORKSPACE_NAME, GLOBAL_SCOPE_PROJECT, LinkTarget, PagePath};
 use serde::{Deserialize, Serialize};
 
-use crate::error::WikiResult;
+use crate::error::{WikiError, WikiResult};
+
+/// `yaml_12` emits plain scalars the way `serde_yaml` 0.9 did (no quotes
+/// around dates or `yes`), but prefixes this header, which a frontmatter
+/// block never carried.
+const YAML_12_HEADER: &str = "%YAML 1.2\n---\n";
+
+/// Serializer options for frontmatter, chosen to match `serde_yaml` 0.9
+/// output. The one remaining difference: a value that needs quoting gets
+/// double quotes where `serde_yaml` used single quotes.
+fn frontmatter_emit_options() -> serde_saphyr::SerializerOptions {
+    serde_saphyr::ser_options! {
+        yaml_12: true,
+        // Never fold long single-line strings into `>` blocks.
+        folded_wrap_chars: usize::MAX,
+    }
+}
 
 /// A parsed markdown document with detached frontmatter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,8 +74,7 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
     {
         let fm_str = rest[..end].trim_end_matches('\r');
         let body = rest[end + close.len()..].to_string();
-        let fm_yaml: serde_yaml::Value = serde_yaml::from_str(fm_str)?;
-        let fm_json: serde_json::Value = serde_json::to_value(fm_yaml)?;
+        let fm_json = crate::frontmatter_yaml::parse(fm_str).map_err(WikiError::Yaml)?;
         return Ok(Markdown {
             frontmatter: fm_json,
             body,
@@ -72,7 +87,7 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
 }
 
 /// Emit a [`Markdown`] back to a string. Frontmatter is serialised through
-/// `serde_yaml` (so it round-trips deterministically); a `Null` or empty
+/// `serde-saphyr` (so it round-trips deterministically); a `Null` or empty
 /// object frontmatter is omitted entirely.
 ///
 /// # Errors
@@ -85,9 +100,11 @@ pub fn emit(md: &Markdown) -> WikiResult<String> {
     };
     let mut out = String::with_capacity(md.body.len() + 32);
     if has_fm {
-        let yaml = serde_yaml::to_string(&md.frontmatter)?;
+        let yaml =
+            serde_saphyr::to_string_with_options(&md.frontmatter, frontmatter_emit_options())?;
+        let yaml = yaml.strip_prefix(YAML_12_HEADER).unwrap_or(&yaml);
         out.push_str("---\n");
-        out.push_str(&yaml);
+        out.push_str(yaml);
         if !yaml.ends_with('\n') {
             out.push('\n');
         }
@@ -167,8 +184,10 @@ impl CodeFence {
 /// Extract internal wiki links from a markdown body.
 ///
 /// Supports `[[wiki links]]`, `[[wiki links|labels]]`, cross-project
-/// `[[project:path]]` / `[[workspace/project:path]]` wikilinks, and
-/// ordinary markdown links such as `[label](../decisions/foo.md#anchor)`.
+/// `[[project:path]]` / `[[workspace/project:path]]` wikilinks, the reserved
+/// `[[_global:path]]` form (always the `_global` project in the default
+/// workspace), and ordinary markdown links such as
+/// `[label](../decisions/foo.md#anchor)`.
 /// External URLs, anchors, images, and non-markdown assets are ignored, and
 /// so is anything inside a fenced block or an inline code span, which the
 /// page shows as code rather than as a link.
@@ -338,13 +357,7 @@ pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget
             continue;
         };
         for target in list.iter().filter_map(|v| v.as_str()) {
-            let (workspace, project, raw_path) = match target.split_once(':') {
-                None => (None, None, target),
-                Some((scope, path)) => match scope.split_once('/') {
-                    None => (None, Some(scope.to_string()), path),
-                    Some((ws, proj)) => (Some(ws.to_string()), Some(proj.to_string()), path),
-                },
-            };
+            let (workspace, project, raw_path) = split_scope(target);
             // Same terminal normalization as wikilinks: extension-less
             // targets gain `.md`; a directory target, a stem-less `.md`, and
             // anything with a non-md extension are not pages and are skipped.
@@ -380,13 +393,20 @@ pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget
 /// of a wikilink target. Returns `(workspace, project, path_part)`. URL and
 /// scheme-prefixed targets carry no scope (the `:` belongs to the scheme);
 /// [`normalize_link_target`] rejects those downstream.
+///
+/// `[[_global:path]]` is a project-only qualifier, but the reserved
+/// preferences project lives in [`DEFAULT_WORKSPACE_NAME`], not in the
+/// source page's workspace (issue #1042). An explicit
+/// `[[workspace/_global:path]]` keeps the named workspace.
 fn split_scope(target: &str) -> LinkKey {
     let lower = target.to_ascii_lowercase();
     if target.contains("://")
         || lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
+        || lower.starts_with("file:")
     {
         return (None, None, target.to_string());
     }
@@ -397,11 +417,14 @@ fn split_scope(target: &str) -> LinkKey {
                 .chars()
                 .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
         if scope_ok {
-            let (workspace, project) = match scope.split_once('/') {
+            let (mut workspace, project) = match scope.split_once('/') {
                 Some((ws, proj)) => (Some(ws.trim().to_string()), proj.trim()),
                 None => (None, scope),
             };
             if !project.is_empty() {
+                if workspace.is_none() && project == GLOBAL_SCOPE_PROJECT {
+                    workspace = Some(DEFAULT_WORKSPACE_NAME.to_string());
+                }
                 return (
                     workspace,
                     Some(project.to_string()),
@@ -514,6 +537,95 @@ fn rewrite_wikilinks_in_segment(
     }
 }
 
+/// Rewrite `body`, replacing each wikilink whose normalised
+/// `(workspace, project, path)` key appears in `delink` with its plain label
+/// text: the `|label` when one is present, otherwise the raw target text.
+/// Every other wikilink — resolved cross-scope links and all same-project
+/// links included — is copied byte-identically, and fenced code blocks /
+/// inline code spans are skipped exactly as [`extract_links`] skips them, so
+/// an example `[[project:path]]` shown as code is never rewritten.
+///
+/// The consolidation apply path uses this to strip cross-scope links the
+/// store cannot resolve (#1218): the `delink` set is built from
+/// [`extract_links`] keys, so a key computed here matches byte-for-byte.
+/// Wikilink targets are project-root-relative, so `page_path` only matters
+/// for the (never-delinked) same-project form.
+#[must_use]
+pub fn delink_wikilinks(
+    body: &str,
+    page_path: &PagePath,
+    delink: &BTreeSet<(Option<String>, Option<String>, String)>,
+) -> String {
+    if delink.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<CodeFence> = None;
+    for raw_line in body.split_inclusive('\n') {
+        let (line, terminator) = split_line_terminator(raw_line);
+        let (next_fence, is_fence_or_code) = CodeFence::step(fence, line);
+        fence = next_fence;
+        if is_fence_or_code {
+            out.push_str(line);
+            out.push_str(terminator);
+            continue;
+        }
+        let code_spans = inline_code_spans(line);
+        let mut pos = 0;
+        for span in &code_spans {
+            delink_wikilinks_in_segment(&line[pos..span.start], page_path, delink, &mut out);
+            out.push_str(&line[span.clone()]);
+            pos = span.end;
+        }
+        delink_wikilinks_in_segment(&line[pos..], page_path, delink, &mut out);
+        out.push_str(terminator);
+    }
+    out
+}
+
+fn delink_wikilinks_in_segment(
+    seg: &str,
+    page_path: &PagePath,
+    delink: &BTreeSet<(Option<String>, Option<String>, String)>,
+    out: &mut String,
+) {
+    let mut rest = seg;
+    loop {
+        let Some(start) = rest.find("[[") else {
+            out.push_str(rest);
+            return;
+        };
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            out.push_str(&rest[start..]);
+            return;
+        };
+        let raw = &after_start[..end];
+        // Parse exactly as `extract_wikilinks` does so a key in `delink`
+        // (built from `extract_links` output) hits the same occurrence.
+        let (target_part, label) = raw
+            .split_once('|')
+            .map_or((raw, None), |(t, l)| (t, Some(l)));
+        let unlabelled = target_part.trim();
+        let (workspace, project, path_part) = split_scope(unlabelled);
+        let delinked = normalize_link_target(&path_part, page_path, true)
+            .is_some_and(|path| delink.contains(&(workspace, project, path)));
+        if delinked {
+            let text = label
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .unwrap_or(unlabelled);
+            out.push_str(text);
+        } else {
+            out.push_str("[[");
+            out.push_str(raw);
+            out.push_str("]]");
+        }
+        rest = &after_start[end + 2..];
+    }
+}
+
 /// Resolve a local `[[...]]` wikilink target into `(bundle-relative href,
 /// display label)`. Returns `None` when the target is cross-project,
 /// cross-workspace, empty, or otherwise not a page — the caller then keeps
@@ -528,7 +640,13 @@ fn resolve_local_wikilink(
         .map_or((raw, None), |(t, l)| (t, Some(l)));
     let target_part = target_part.trim();
     let (workspace, project, path_part) = split_scope(target_part);
-    if workspace.is_some() {
+    // `split_scope` pins `[[_global:path]]` to the default workspace. When
+    // we are exporting that same reserved project, the target is still a
+    // local page even though the workspace is now explicit.
+    let exporting_global_home = own_project == GLOBAL_SCOPE_PROJECT
+        && project.as_deref() == Some(GLOBAL_SCOPE_PROJECT)
+        && workspace.as_deref() == Some(DEFAULT_WORKSPACE_NAME);
+    if workspace.is_some() && !exporting_global_home {
         return None; // no cross-workspace Markdown equivalent
     }
     if let Some(project) = &project
@@ -541,14 +659,20 @@ fn resolve_local_wikilink(
     // source page — `page_path` is unused on this branch of
     // `normalize_link_target`/`resolve_relative`), `.md` appended,
     // traversal collapsed.
-    let target = normalize_link_target(&path_part, page_path, true)?;
+    // Split off a trailing #anchor/?query so it survives the rewrite.
+    let (clean_path, suffix) = match path_part.find(['#', '?']) {
+        Some(i) => (&path_part[..i], &path_part[i..]),
+        None => (path_part.as_str(), ""),
+    };
+    let target = normalize_link_target(clean_path, page_path, true)?;
     let page_dir: Vec<&str> = page_path
         .as_str()
         .rsplit_once('/')
         .map_or_else(Vec::new, |(dir, _)| {
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
-    let href = relative_href(&page_dir, &target);
+    let mut href = relative_href(&page_dir, &target);
+    href.push_str(suffix);
     let display = label.map_or(target_part, str::trim).to_string();
     Some((href, display))
 }
@@ -769,7 +893,9 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
     if lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
+        || lower.starts_with("file:")
     {
         return None;
     }
@@ -906,6 +1032,30 @@ mod tests {
     }
 
     #[test]
+    fn extract_relation_links_global_target_pins_default_workspace() {
+        let fm = serde_json::json!({
+            "relations": {
+                "fixes": ["_global:python-env"],
+                "contradicts": ["other/_global:notes/x.md"],
+            }
+        });
+        let links = extract_relation_links(&fm);
+        let fixes = links
+            .iter()
+            .find(|l| l.relation == Some(ai_memory_core::Relation::Fixes))
+            .unwrap();
+        assert_eq!(fixes.workspace.as_deref(), Some(DEFAULT_WORKSPACE_NAME));
+        assert_eq!(fixes.project.as_deref(), Some(GLOBAL_SCOPE_PROJECT));
+        assert_eq!(fixes.path.as_str(), "python-env.md");
+        let contra = links
+            .iter()
+            .find(|l| l.relation == Some(ai_memory_core::Relation::Contradicts))
+            .unwrap();
+        assert_eq!(contra.workspace.as_deref(), Some("other"));
+        assert_eq!(contra.project.as_deref(), Some(GLOBAL_SCOPE_PROJECT));
+    }
+
+    #[test]
     fn unknown_relation_keys_and_bad_targets_are_skipped() {
         let fm = serde_json::json!({
             "relations": {
@@ -983,11 +1133,78 @@ mod tests {
         assert_eq!(l.path.as_str(), "decisions/adr-1.md");
     }
 
+    /// `[[_global:path]]` is a project-only qualifier, but the reserved
+    /// preferences project lives in the default workspace (#1042). Pinning
+    /// the workspace here is what lets a page outside `default` resolve.
+    #[test]
+    fn extract_links_global_wikilink_pins_default_workspace() {
+        let links = extract_links(
+            "see [[_global:python-env]] and [[_global:local-machine.md|env]]",
+            &page(),
+        );
+        let pinned: Vec<_> = links
+            .iter()
+            .filter(|l| l.project.as_deref() == Some(GLOBAL_SCOPE_PROJECT))
+            .collect();
+        assert_eq!(pinned.len(), 2, "{links:?}");
+        assert!(
+            pinned
+                .iter()
+                .all(|l| l.workspace.as_deref() == Some(DEFAULT_WORKSPACE_NAME)),
+            "project-only _global must name the default workspace: {links:?}"
+        );
+        assert!(pinned.iter().any(|l| l.path.as_str() == "python-env.md"));
+        assert!(pinned.iter().any(|l| l.path.as_str() == "local-machine.md"));
+
+        let sibling = extract_links("[[infra:runbooks/02.md]]", &page());
+        let l = sibling
+            .iter()
+            .find(|l| l.is_cross_project())
+            .expect("infra");
+        assert_eq!(
+            l.workspace, None,
+            "non-global project-only stays source-workspace"
+        );
+        assert_eq!(l.project.as_deref(), Some("infra"));
+
+        let explicit = extract_links("[[other/_global:notes/x.md]]", &page());
+        let l = explicit
+            .iter()
+            .find(|l| l.is_cross_project())
+            .expect("explicit");
+        assert_eq!(
+            l.workspace.as_deref(),
+            Some("other"),
+            "an explicit workspace is kept"
+        );
+        assert_eq!(l.project.as_deref(), Some(GLOBAL_SCOPE_PROJECT));
+    }
+
     #[test]
     fn extract_links_url_wikilink_is_not_a_scope() {
         // `https://...` must not be parsed as project "https".
         let links = extract_links("[[https://example.com]] [[mailto:a@b.com]]", &page());
         assert!(links.is_empty(), "URLs/schemes are not links: {links:?}");
+    }
+
+    #[test]
+    fn extract_links_file_and_vbscript_schemes_are_not_scopes() {
+        // `/web` already leaves these literal. Without the same prefixes
+        // here, `[[file:notes/x.md]]` peels `file` as a project scope and
+        // indexes a cross-project edge no page write can satisfy.
+        let links = extract_links(
+            "[[file:notes/x.md]] [[vbscript:msgbox]] [[file:///etc/passwd]]",
+            &page(),
+        );
+        assert!(
+            links.is_empty(),
+            "file/vbscript schemes are not wiki links: {links:?}"
+        );
+        let md = extract_links("[x](file:notes/x.md) [y](vbscript:msgbox)", &page());
+        assert!(
+            md.is_empty(),
+            "file/vbscript markdown destinations are not wiki links: {md:?}"
+        );
     }
 
     #[test]
@@ -1101,6 +1318,245 @@ mod tests {
         assert_eq!(emit(&md).unwrap(), "Hello\n");
     }
 
+    fn frontmatter_of(yaml: &str) -> serde_json::Value {
+        parse(&format!("---\n{yaml}\n---\nbody\n"))
+            .unwrap()
+            .frontmatter
+    }
+
+    /// What `serde_yaml` 0.9 indexed for each value spelling (`None`: it
+    /// refused the page). A hand-edited page must index the same now.
+    #[test]
+    fn frontmatter_values_match_serde_yaml_0_9() {
+        use serde_json::json;
+        let cases: &[(&str, Option<serde_json::Value>)] = &[
+            // Leading zeros, digit separators, upper-case prefixes and
+            // out-of-range floats were text.
+            ("007", Some(json!("007"))),
+            ("+08", Some(json!("+08"))),
+            ("-01", Some(json!("-01"))),
+            ("1_000", Some(json!("1_000"))),
+            ("0X1F", Some(json!("0X1F"))),
+            ("0O17", Some(json!("0O17"))),
+            ("1e999", Some(json!("1e999"))),
+            // Infinity and NaN have no JSON form; serde_json wrote null.
+            (".inf", Some(json!(null))),
+            ("-.inf", Some(json!(null))),
+            (".nan", Some(json!(null))),
+            ("+.nan", Some(json!("+.nan"))),
+            // Integers wider than 64 bits were refused.
+            ("18446744073709551616", None),
+            ("-18446744073709551616", None),
+            (
+                "18446744073709551615",
+                Some(json!(18_446_744_073_709_551_615_u64)),
+            ),
+            ("-9223372036854775808", Some(json!(i64::MIN))),
+            // A local tag became a one-entry map; core tags kept the text.
+            ("!foo bar", Some(json!({ "!foo": "bar" }))),
+            ("!foo [1, 007]", Some(json!({ "!foo": [1, "007"] }))),
+            ("!!timestamp 2026-10-12", Some(json!("2026-10-12"))),
+            ("!!str 123", Some(json!("123"))),
+            ("!!binary aGVsbG8=", Some(json!("aGVsbG8="))),
+            // Controls.
+            ("yes", Some(json!("yes"))),
+            ("on", Some(json!("on"))),
+            ("True", Some(json!(true))),
+            ("2026-10-12", Some(json!("2026-10-12"))),
+            ("2026-10-12T01:08:40Z", Some(json!("2026-10-12T01:08:40Z"))),
+            ("0.92", Some(json!(0.92))),
+            ("1e3", Some(json!(1000.0))),
+            ("0x1F", Some(json!(31))),
+            ("0o17", Some(json!(15))),
+            ("0b101", Some(json!(5))),
+            ("1:20", Some(json!("1:20"))),
+            ("~", Some(json!(null))),
+            ("", Some(json!(null))),
+            ("'123'", Some(json!("123"))),
+        ];
+        for (yaml, expected) in cases {
+            let parsed = parse(&format!("---\nv: {yaml}\n---\nbody\n"));
+            match expected {
+                Some(value) => assert_eq!(
+                    parsed.map(|md| md.frontmatter).ok(),
+                    Some(json!({ "v": value })),
+                    "v: {yaml}"
+                ),
+                None => assert!(
+                    matches!(parsed, Err(crate::error::WikiError::Yaml(_))),
+                    "v: {yaml} must be refused, got {parsed:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn last_block_scalar_drops_its_final_newline_as_serde_yaml_did() {
+        // The fence drops the newline before `---`, so the YAML ends without
+        // one; libyaml did not count the missing break into the block.
+        let fm = frontmatter_of("a: |\n  kept\nb: |\n  last");
+        assert_eq!(fm, serde_json::json!({ "a": "kept\n", "b": "last" }));
+        let fm = frontmatter_of("b: |\n  last\n ");
+        assert_eq!(fm, serde_json::json!({ "b": "last\n" }));
+    }
+
+    #[test]
+    fn empty_frontmatter_block_is_null() {
+        let md = parse("---\n\n---\nbody\n").unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, "body\n");
+    }
+
+    #[test]
+    fn duplicate_frontmatter_keys_are_rejected() {
+        let err = parse("---\ntitle: a\ntitle: b\n---\nbody\n").unwrap_err();
+        let crate::error::WikiError::Yaml(msg) = err else {
+            panic!("expected WikiError::Yaml, got {err:?}");
+        };
+        assert!(msg.contains("duplicate"), "{msg}");
+        assert!(msg.contains("line 2"), "error names the location: {msg}");
+    }
+
+    #[test]
+    fn block_scalars_and_multiline_strings_round_trip() {
+        let fm =
+            frontmatter_of("lit: |\n  one\n  two\nfold: >\n  folded\n  text\nstrip: |-\n  keep");
+        assert_eq!(
+            fm,
+            serde_json::json!({
+                "lit": "one\ntwo\n",
+                "fold": "folded text\n",
+                "strip": "keep",
+            })
+        );
+        let emitted = emit(&Markdown {
+            frontmatter: fm.clone(),
+            body: String::new(),
+        })
+        .unwrap();
+        // serde_yaml 0.9 wrote newline-bearing strings as literal blocks.
+        assert_eq!(
+            emitted,
+            "---\nlit: |\n  one\n  two\nfold: |\n  folded text\nstrip: keep\n---\n"
+        );
+        assert_eq!(parse(&emitted).unwrap().frontmatter, fm);
+    }
+
+    #[test]
+    fn keys_and_values_that_need_quotes_round_trip() {
+        let fm = serde_json::json!({
+            "key: colon": "a # b",
+            "#hash": "@at",
+            "123": "true",
+            "": "null",
+            "plain": "2026-10-12",
+        });
+        let emitted = emit(&Markdown {
+            frontmatter: fm.clone(),
+            body: String::new(),
+        })
+        .unwrap();
+        // Quoting uses double quotes (serde_yaml 0.9 used single quotes);
+        // dates stay plain, as serde_yaml wrote them.
+        assert_eq!(
+            emitted,
+            "---\n\"key: colon\": \"a # b\"\n\"#hash\": \"@at\"\n\"123\": \"true\"\n\"\": \"null\"\nplain: 2026-10-12\n---\n"
+        );
+        assert_eq!(parse(&emitted).unwrap().frontmatter, fm);
+    }
+
+    #[test]
+    fn non_ascii_and_long_strings_emit_plain_on_one_line() {
+        let long = "word ".repeat(400).trim_end().to_string();
+        let fm = serde_json::json!({ "title": "Olá — 日本語 🎉", "long": long });
+        let emitted = emit(&Markdown {
+            frontmatter: fm.clone(),
+            body: String::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            emitted,
+            format!("---\ntitle: Olá — 日本語 🎉\nlong: {long}\n---\n")
+        );
+        assert_eq!(parse(&emitted).unwrap().frontmatter, fm);
+    }
+
+    /// A page in the shape serde_yaml 0.9 wrote (compact list indent, plain
+    /// timestamps, `{}`/`[]` for empty collections) re-emits byte for byte,
+    /// so the parser swap rewrites nothing on a page's next save.
+    #[test]
+    fn serde_yaml_shaped_page_re_emits_byte_for_byte() {
+        let src = "---\n\
+            kind: decision\n\
+            confidence: 0.92\n\
+            pinned: false\n\
+            created_at: 2026-10-12T01:08:40Z\n\
+            status: yes\n\
+            tags:\n\
+            - rust\n\
+            - 日本語\n\
+            summary: |\n  First line.\n  Second line.\n\
+            evidence:\n\
+            - kind: observation\n  id: 019e5633-4140-7dd0-9e2f-118825ca6355\n  at: 2026-07-18T09:35:52Z\n\
+            - kind: page\n  path: decisions/0001.md\n\
+            relations: {}\n\
+            aliases: []\n\
+            ---\n\
+            # Body\n";
+        assert_eq!(emit(&parse(src).unwrap()).unwrap(), src);
+    }
+
+    #[test]
+    fn frontmatter_alias_bomb_is_refused_quickly() {
+        // Nine levels of nine-fold aliases expand to 9^9 nodes.
+        let mut yaml = String::from("a: &a [x, x, x, x, x, x, x, x, x]\n");
+        let mut prev = 'a';
+        for name in "bcdefghi".chars() {
+            let refs = vec![format!("*{prev}"); 9].join(", ");
+            yaml.push_str(&format!("{name}: &{name} [{refs}]\n"));
+            prev = name;
+        }
+        let started = std::time::Instant::now();
+        let err = parse(&format!("---\n{yaml}---\nbody\n")).unwrap_err();
+        assert!(
+            matches!(err, crate::error::WikiError::Yaml(_)),
+            "alias bomb must surface as a YAML error: {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "alias bomb refusal must stay bounded, took {:?}",
+            started.elapsed()
+        );
+
+        // Control: ordinary anchors and aliases still parse, as before.
+        let fm = frontmatter_of("base: &b\n  tier: core\nref: *b\nlist: [*b]\nmerged:\n  <<: *b");
+        assert_eq!(
+            fm,
+            serde_json::json!({
+                "base": { "tier": "core" },
+                "ref": { "tier": "core" },
+                "list": [{ "tier": "core" }],
+                // serde_yaml 0.9 kept `<<` as an ordinary key.
+                "merged": { "<<": { "tier": "core" } },
+            })
+        );
+    }
+
+    #[test]
+    fn frontmatter_nesting_is_capped_at_serde_yaml_depth() {
+        let nested = |depth: usize, inner: &str| {
+            format!("{}{inner}{}", "[".repeat(depth), "]".repeat(depth))
+        };
+        // serde_yaml allowed 128 nested collections, the top mapping included.
+        assert!(parse(&format!("---\nv: {}\n---\n", nested(127, "1"))).is_ok());
+        let err = parse(&format!("---\nv: {}\n---\n", nested(128, "1"))).unwrap_err();
+        assert!(matches!(err, crate::error::WikiError::Yaml(_)), "{err:?}");
+        // An alias counts the depth it lands at, as serde_yaml's replay did.
+        let deep_alias = format!("a: &a {}\nb: {}", nested(100, "1"), nested(30, "*a"));
+        let err = parse(&format!("---\n{deep_alias}\n---\n")).unwrap_err();
+        assert!(matches!(err, crate::error::WikiError::Yaml(_)), "{err:?}");
+    }
+
     #[test]
     fn title_priority_frontmatter_then_heading_then_stem() {
         let path = PagePath::new("notes/foo.md").unwrap();
@@ -1140,6 +1596,63 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    /// Build a `delink` key exactly as the consolidation guard does: from
+    /// `extract_links` output for the cross-project targets named in
+    /// `targets`.
+    fn delink_set(body: &str, page: &PagePath, targets: &[&str]) -> BTreeSet<LinkKey> {
+        extract_links(body, page)
+            .into_iter()
+            .filter(|l| l.project.is_some() && targets.contains(&l.path.as_str()))
+            .map(|l| (l.workspace, l.project, l.path.as_str().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn delink_wikilinks_strips_only_listed_cross_scope_links() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "See [[infra:runbooks/02.md]] and [[infra:runbooks/missing.md|the gap]], \
+                    plus [[notes/pending.md]] and [[infra:runbooks/02.md|again]].\n";
+        let delink = delink_set(body, &page, &["runbooks/missing.md"]);
+        let out = delink_wikilinks(body, &page, &delink);
+        assert_eq!(
+            out,
+            "See [[infra:runbooks/02.md]] and the gap, \
+             plus [[notes/pending.md]] and [[infra:runbooks/02.md|again]].\n",
+            "only the unresolved link is de-linked; the resolved one and the \
+             same-project pending link stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn delink_wikilinks_without_label_keeps_the_target_text() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "Depends on [[_global:nope]].\n";
+        let delink = delink_set(body, &page, &["nope.md"]);
+        assert_eq!(delink.len(), 1, "_global target is extracted");
+        assert_eq!(
+            delink_wikilinks(body, &page, &delink),
+            "Depends on _global:nope.\n"
+        );
+    }
+
+    #[test]
+    fn delink_wikilinks_skips_code_and_leaves_empty_set_untouched() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "```\n[[infra:runbooks/missing.md]]\n```\n\
+                    Inline `[[infra:runbooks/missing.md]]` stays code, \
+                    but [[infra:runbooks/missing.md]] is prose.\n";
+        let delink = delink_set(body, &page, &["runbooks/missing.md"]);
+        let out = delink_wikilinks(body, &page, &delink);
+        assert_eq!(
+            out,
+            "```\n[[infra:runbooks/missing.md]]\n```\n\
+             Inline `[[infra:runbooks/missing.md]]` stays code, \
+             but infra:runbooks/missing.md is prose.\n"
+        );
+        // An empty set must be a byte-identical no-op.
+        assert_eq!(delink_wikilinks(body, &page, &BTreeSet::new()), body);
     }
 
     #[test]
@@ -1206,6 +1719,27 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_local_wikilinks_preserves_anchor_and_query_fragments() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("See [[decisions/b.md#context]].", &path, "proj"),
+            "See [decisions/b.md#context](../decisions/b.md#context)."
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b#context|the decision]]", &path, "proj"),
+            "[the decision](../decisions/b.md#context)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b.md?v=1#part-2]]", &path, "proj"),
+            "[decisions/b.md?v=1#part-2](../decisions/b.md?v=1#part-2)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b#my section|My Section]]", &path, "proj"),
+            "[My Section](<../decisions/b.md#my section>)"
+        );
+    }
+
+    #[test]
     fn rewrite_local_wikilinks_leaves_cross_project_untouched() {
         let path = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
@@ -1215,6 +1749,27 @@ mod tests {
         assert_eq!(
             rewrite_local_wikilinks("[[ws/other-project:decisions/b.md]]", &path, "proj"),
             "[[ws/other-project:decisions/b.md]]"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[_global:python-env.md]]", &path, "proj"),
+            "[[_global:python-env.md]]"
+        );
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_resolves_global_when_exporting_global() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("[[_global:python-env.md]]", &path, GLOBAL_SCOPE_PROJECT),
+            "[_global:python-env.md](../python-env.md)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks(
+                "[[default/_global:python-env.md]]",
+                &path,
+                GLOBAL_SCOPE_PROJECT,
+            ),
+            "[default/_global:python-env.md](../python-env.md)"
         );
     }
 

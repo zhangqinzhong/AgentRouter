@@ -435,12 +435,15 @@ async fn pending_page_gate_sees_the_trusted_proxy_setting_through_the_mount() {
             f.store.reader.clone(),
             f.wiki.clone(),
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &[],
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();

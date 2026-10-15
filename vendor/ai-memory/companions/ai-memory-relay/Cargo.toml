@@ -17,6 +17,7 @@ path = "src/main.rs"
 unsafe_code = "forbid"
 
 [dependencies]
+ai-memory-client = { version = "0.1.0", path = "../ai-memory-client" }
 anyhow = "1"
 # Read the bearer token separately to keep it out of clap's Debug output.
 clap = { version = "4", features = ["derive"] }

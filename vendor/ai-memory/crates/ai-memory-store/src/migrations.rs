@@ -897,6 +897,391 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v71_to_v72_preserves_session_state_and_accepts_grizzybot() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 71).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user) \
+             VALUES (?1, ?2, ?3, 'zcode', '/repo', 1, 2, 7, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        // V64 mail points at sessions with ON DELETE SET NULL; the rebuild
+        // must neither null the sender nor leave a dangling reference.
+        let message_id = uuid::Uuid::now_v7();
+        conn.execute(
+            "INSERT INTO agent_messages \
+             (id, from_workspace_id, from_project_id, from_agent, from_session_id, \
+              to_workspace_id, to_project_id, body, created_at) \
+             VALUES (?1, ?2, ?3, 'zcode', ?4, ?2, ?3, 'hello', 1)",
+            params![
+                message_id.as_bytes().as_slice(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                existing.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let sender: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT from_session_id FROM agent_messages WHERE id = ?1",
+                params![message_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sender.as_deref(), Some(existing.as_bytes().as_slice()));
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('agent_messages')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0, "agent_messages must still reference sessions");
+
+        let preserved: (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("zcode".into(), "/repo".into(), 7, Some("user:alice".into()))
+        );
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Grizzybot,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    #[test]
+    fn v72_to_v73_preserves_grizzybot_sessions_and_accepts_copilot_cli() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 72).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user) \
+             VALUES (?1, ?2, ?3, 'grizzybot', '/repo', 1, 2, 7, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "grizzybot".into(),
+                "/repo".into(),
+                7,
+                Some("user:alice".into())
+            )
+        );
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::CopilotCli,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    #[test]
+    fn v77_to_v78_preserves_sessions_and_their_ingest_keys_and_accepts_droid() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 77).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user) \
+             VALUES (?1, ?2, ?3, 'copilot-cli', '/repo', 1, 2, 7, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        // V77 points ingest_keys at sessions; the table rebuild must leave
+        // that reference intact.
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, session_id, agent_kind) \
+             VALUES (?1, 'k1', 1, ?2, 'copilot-cli')",
+            params![project_id.as_bytes(), existing.as_bytes()],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "copilot-cli".into(),
+                "/repo".into(),
+                7,
+                Some("user:alice".into())
+            )
+        );
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('ingest_keys')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0, "ingest_keys must still reference sessions");
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Droid,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    /// V80 rebuilds `sessions` again, for Meta Muse Code: rows, the ingest
+    /// keys and observations that reference them, and the scope-pairing
+    /// triggers all survive, and a `muse` session is accepted afterwards.
+    #[test]
+    fn v79_to_v80_preserves_sessions_ingest_keys_and_observations_and_accepts_muse() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 79).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user) \
+             VALUES (?1, ?2, ?3, 'droid', '/repo', 1, 2, 7, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        // V79 cannot store a Muse session yet.
+        assert!(
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, started_at) \
+                 VALUES (?1, ?2, ?3, 'muse', 1)",
+                params![
+                    SessionId::new().as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+            )
+            .is_err(),
+            "the V79 CHECK must reject muse"
+        );
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, session_id, agent_kind) \
+             VALUES (?1, 'k1', 1, ?2, 'droid')",
+            params![project_id.as_bytes(), existing.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'prompt', 'kept', 'kept body', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("droid".into(), "/repo".into(), 7, Some("user:alice".into()))
+        );
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![existing.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 1, "the session's observations survive");
+        for table in ["ingest_keys", "observations"] {
+            let dangling: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{table}')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(dangling, 0, "{table} must still reference sessions");
+        }
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Muse,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
     /// V62 was reshaped in place (#776) from an in-migration backfill to
     /// DDL-only + a boot-path backfill, changing its checksum. A store that
     /// applied the ORIGINAL V62 recorded the old checksum; `run` must still
@@ -966,6 +1351,46 @@ mod tests {
         );
         assert!(after.contains("superseded_at IS NOT NULL"), "{after}");
         assert!(!after.contains("supersedes IS NULL"), "{after}");
+    }
+
+    #[test]
+    fn project_coordinate_keys_upgrade_and_backfill_without_changing_project_ids() {
+        let coordinate_version = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.name() == "project_coordinate_keys")
+            .map(refinery::Migration::version)
+            .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, coordinate_version - 1).unwrap();
+        let workspace_id = [8_u8; 16];
+        let project_id = [9_u8; 16];
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'acme', 1)",
+            params![workspace_id.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at, identity, identity_source) \
+             VALUES (?1, ?2, 'api', 1, 'github.com/acme/group/api', 'git_remote')",
+            params![project_id.as_slice(), workspace_id.as_slice()],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        assert_eq!(crate::project_coordinates::backfill(&mut conn).unwrap(), 1);
+        let row: (Vec<u8>, String, String, String) = conn
+            .query_row(
+                "SELECT id, name, canonical_name, legacy_name FROM projects",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, project_id);
+        assert_eq!(row.1, "api");
+        assert_eq!(row.2, "acme-group-api");
+        assert_eq!(row.3, "api");
+        assert_eq!(crate::project_coordinates::backfill(&mut conn).unwrap(), 0);
     }
 
     /// Upstream's `UNIQUE (workspace_id, name)` is case-sensitive, so one

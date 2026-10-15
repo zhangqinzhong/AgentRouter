@@ -35,25 +35,26 @@ default-members = [
 ]
 
 [workspace.package]
-version = "2.5.2"
+version = "3.0.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
+homepage = "https://aimemory.sh"
 repository = "https://github.com/akitaonrails/ai-memory"
 authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "2.4.0" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "2.4.0" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "2.4.0" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "2.4.0" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "2.4.0" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "2.4.0" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "2.4.0" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "2.4.0" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "2.4.0" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "2.3.2" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "3.0.0" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "3.0.0" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.0.0" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.0.0" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.0.0" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.0.0" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.0.0" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "3.0.0" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.0.0" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.0.0" }
 
 # (Workspace shared deps follow below)
 
@@ -69,7 +70,8 @@ serde = { version = "1", features = ["derive"] }
 # alphabetised on every write — semantically equivalent but a giant
 # cosmetic diff the user didn't ask for.
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_yaml = "0.9"
+# Wiki frontmatter YAML. Each crate opts into the half it uses.
+serde-saphyr = { version = "1.3", default-features = false }
 # Zed's settings.json is JSONC despite the .json suffix. Its CST lets
 # install/uninstall preserve comments, trailing commas, and unrelated layout.
 jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
@@ -126,6 +128,7 @@ notify = "8"
 notify-debouncer-full = "0.6"
 sysinfo = "0.32"
 fs2 = "0.4"
+libc = "0.2"
 
 # Windows NTFS file-index (inode equivalent) for own-write detection.
 winapi-util = "0.1"

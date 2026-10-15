@@ -238,4 +238,152 @@ else:
   run_version_check_case docker_classic_gated  "docker" "x86_64" "${H_INDEX}" "" "" "${MULTI_ARCH_JSON}" 0
 fi
 
+# ---- mcp-bridge native host routing (#1147) -------------------------------
+
+# The session-aware MCP bridge must run on the host: its --server-url loopback
+# is unreachable from inside the helper container on Docker Desktop. The
+# wrapper must exec the checksum-verified native client without ever invoking
+# the container engine.
+BRIDGE_CASE_DIR="${TMP_ROOT}/mcp_bridge"
+mkdir -p "${BRIDGE_CASE_DIR}/home" "${BRIDGE_CASE_DIR}/cache"
+
+FAKE_NATIVE="${BRIDGE_CASE_DIR}/native-ai-memory"
+cat >"${FAKE_NATIVE}" <<'NATIVE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
+NATIVE
+chmod 0755 "${FAKE_NATIVE}"
+
+BRIDGE_DOCKER="${BRIDGE_CASE_DIR}/docker"
+cat >"${BRIDGE_DOCKER}" <<'DOCKER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"
+exit 0
+DOCKER
+chmod 0755 "${BRIDGE_DOCKER}"
+
+: >"${BRIDGE_CASE_DIR}/native.log"
+: >"${BRIDGE_CASE_DIR}/docker.log"
+HOME="${BRIDGE_CASE_DIR}/home" \
+XDG_CACHE_HOME="${BRIDGE_CASE_DIR}/cache" \
+AI_MEMORY_DOCKER="${BRIDGE_DOCKER}" \
+AI_MEMORY_NATIVE_BIN="${FAKE_NATIVE}" \
+AI_MEMORY_WRAPPER_TEST_LOG="${BRIDGE_CASE_DIR}/native.log" \
+AI_MEMORY_DOCKER_TEST_LOG="${BRIDGE_CASE_DIR}/docker.log" \
+  "${ROOT}/bin/ai-memory" mcp-bridge --server-url http://127.0.0.1:49374/mcp </dev/null
+
+assert_contains "${BRIDGE_CASE_DIR}/native.log" "mcp-bridge --server-url http://127.0.0.1:49374/mcp"
+if [ -s "${BRIDGE_CASE_DIR}/docker.log" ]; then
+  fail "mcp-bridge unexpectedly reached the container engine: $(cat "${BRIDGE_CASE_DIR}/docker.log")"
+fi
+printf 'wrapper mcp-bridge native routing checks passed\n'
+
+# ---- lifecycle hook native host routing ----------------------------------
+
+# `ai-memory hook` is what every generated hook config and plugin calls. Inside
+# the helper container it costs ~280 ms per event and its default loopback URL
+# is the container, not the host server. The wrapper must exec the native
+# client with the payload on stdin and never touch the container engine: not
+# through AI_MEMORY_DOCKER, and not through a `docker` found on PATH.
+HOOK_CASE_DIR="${TMP_ROOT}/hook"
+mkdir -p "${HOOK_CASE_DIR}/home" "${HOOK_CASE_DIR}/cache" "${HOOK_CASE_DIR}/path"
+
+HOOK_NATIVE="${HOOK_CASE_DIR}/native-ai-memory"
+cat >"${HOOK_NATIVE}" <<'NATIVE'
+#!/usr/bin/env bash
+printf 'argv: %s\n' "$*" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
+printf 'stdin: %s\n' "$(cat)" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
+NATIVE
+chmod 0755 "${HOOK_NATIVE}"
+
+for engine in docker podman; do
+  cat >"${HOOK_CASE_DIR}/path/${engine}" <<'DOCKER'
+#!/usr/bin/env bash
+printf '%s %s\n' "$(basename "$0")" "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"
+exit 0
+DOCKER
+  chmod 0755 "${HOOK_CASE_DIR}/path/${engine}"
+done
+
+run_hook_case() {
+  local native_bin="$1"
+  shift
+  HOME="${HOOK_CASE_DIR}/home" \
+  XDG_CACHE_HOME="${HOOK_CASE_DIR}/cache" \
+  PATH="${HOOK_CASE_DIR}/path:${PATH}" \
+  AI_MEMORY_DOCKER="${HOOK_CASE_DIR}/path/docker" \
+  AI_MEMORY_NATIVE_BIN="${native_bin}" \
+  AI_MEMORY_WRAPPER_TEST_LOG="${HOOK_CASE_DIR}/native.log" \
+  AI_MEMORY_DOCKER_TEST_LOG="${HOOK_CASE_DIR}/docker.log" \
+    "${ROOT}/bin/ai-memory" "$@"
+}
+
+assert_no_container() {
+  if [ -s "${HOOK_CASE_DIR}/docker.log" ]; then
+    fail "$1 unexpectedly reached the container engine: $(cat "${HOOK_CASE_DIR}/docker.log")"
+  fi
+}
+
+: >"${HOOK_CASE_DIR}/native.log"
+: >"${HOOK_CASE_DIR}/docker.log"
+printf '{"session_id":"s-1"}' \
+  | run_hook_case "${HOOK_NATIVE}" hook --agent claude-code --event session-start
+assert_contains "${HOOK_CASE_DIR}/native.log" "argv: hook --agent claude-code --event session-start"
+assert_contains "${HOOK_CASE_DIR}/native.log" 'stdin: {"session_id":"s-1"}'
+assert_no_container "hook"
+
+: >"${HOOK_CASE_DIR}/native.log"
+run_hook_case "${HOOK_NATIVE}" hook-drain </dev/null
+assert_contains "${HOOK_CASE_DIR}/native.log" "argv: hook-drain"
+assert_no_container "hook-drain"
+
+# Without a usable native client the hook drops the event, says why on stderr,
+# and still exits 0 at once; it never falls back to the container.
+: >"${HOOK_CASE_DIR}/native.log"
+hook_status=0
+printf '{}' | run_hook_case "${HOOK_CASE_DIR}/missing-ai-memory" \
+  hook --agent claude-code --event session-start 2>"${HOOK_CASE_DIR}/missing.err" \
+  || hook_status=$?
+[ "${hook_status}" -eq 0 ] || fail "hook without a native client exited ${hook_status}, want 0"
+assert_contains "${HOOK_CASE_DIR}/missing.err" "AI_MEMORY_NATIVE_BIN is not executable"
+assert_contains "${HOOK_CASE_DIR}/missing.err" "lifecycle hook event not captured"
+assert_no_container "hook without a native client"
+
+# On the hook path the wrapper only reuses an installed client: no update check
+# and no download, which could take seconds or hang. With nothing installed it
+# never runs curl; with a client installed it execs it without asking GitHub.
+cat >"${HOOK_CASE_DIR}/path/curl" <<'CURL'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"
+exit 1
+CURL
+chmod 0755 "${HOOK_CASE_DIR}/path/curl"
+run_cached_hook_case() {
+  HOME="${HOOK_CASE_DIR}/home" \
+  XDG_CACHE_HOME="${HOOK_CASE_DIR}/cache" \
+  XDG_DATA_HOME="${HOOK_CASE_DIR}/data" \
+  PATH="${HOOK_CASE_DIR}/path:${PATH}" \
+  AI_MEMORY_DOCKER="${HOOK_CASE_DIR}/path/docker" \
+  AI_MEMORY_WRAPPER_TEST_LOG="${HOOK_CASE_DIR}/native.log" \
+  AI_MEMORY_DOCKER_TEST_LOG="${HOOK_CASE_DIR}/docker.log" \
+    "${ROOT}/bin/ai-memory" "$@"
+}
+: >"${HOOK_CASE_DIR}/docker.log"
+hook_status=0
+printf '{}' | run_cached_hook_case hook --agent claude-code --event session-start \
+  2>"${HOOK_CASE_DIR}/uncached.err" || hook_status=$?
+[ "${hook_status}" -eq 0 ] || fail "hook with no installed client exited ${hook_status}, want 0"
+assert_contains "${HOOK_CASE_DIR}/uncached.err" "not installed yet"
+assert_no_container "hook with no installed client (no curl, no engine)"
+
+mkdir -p "${HOOK_CASE_DIR}/data/ai-memory/native-runner"
+cp "${HOOK_NATIVE}" "${HOOK_CASE_DIR}/data/ai-memory/native-runner/ai-memory"
+: >"${HOOK_CASE_DIR}/native.log"
+: >"${HOOK_CASE_DIR}/docker.log"
+printf '{"session_id":"s-2"}' \
+  | run_cached_hook_case hook --agent claude-code --event user-prompt-submit
+assert_contains "${HOOK_CASE_DIR}/native.log" "argv: hook --agent claude-code --event user-prompt-submit"
+assert_no_container "hook with an installed client (no update check)"
+printf 'wrapper hook native routing checks passed\n'
+
 printf 'wrapper upgrade ownership checks passed\n'

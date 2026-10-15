@@ -8,10 +8,18 @@
 //! existing project is claimed in place rather than split away, and somebody
 //! who may not write to it cannot take its identity.
 
-use ai_memory_core::repository_identity::{IdentitySource, RepositoryIdentity};
-use ai_memory_core::{NewUser, ProjectId, UserId, WorkspaceId};
+use ai_memory_core::repository_identity::{
+    IdentitySource, IdentityStyle, MarkerAliases, RepositoryIdentity,
+};
+use ai_memory_core::{
+    AgentKind, NewHandoff, NewPage, NewSession, NewUser, OwnerFilter, PagePath, ProjectId,
+    SessionId, Tier, UserId, WorkspaceId,
+};
 use ai_memory_store::{
-    AccessMode, GrantLevel, IdentityResolution, ProjectAccess, ProjectPrincipal, Store,
+    AccessMode, GrantLevel, IdentityResolution, ProjectAccess, ProjectCoordinateCollisionReason,
+    ProjectCoordinateStatus, ProjectPrincipal, ScopeName, ScopeResolutionError, Store,
+    create_explicit_scope_guarded, lookup_existing_scope, lookup_existing_scope_guarded,
+    resolve_many_existing_scopes,
 };
 
 fn remote(identity: &str) -> RepositoryIdentity {
@@ -29,16 +37,18 @@ async fn workspace(store: &Store) -> WorkspaceId {
         .unwrap()
 }
 
-async fn user(store: &Store, name: &str, byte: u8) -> UserId {
+async fn user(store: &Store, name: &str) -> UserId {
     store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: name.to_owned(),
                 name: None,
                 email: None,
             },
-            [byte; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap()
@@ -62,11 +72,46 @@ async fn resolve(
     name: &str,
     creator: Option<UserId>,
 ) -> (ProjectId, IdentityResolution) {
+    resolve_styled(store, ws, identity, IdentityStyle::HostPath, name, creator).await
+}
+
+async fn resolve_styled(
+    store: &Store,
+    ws: WorkspaceId,
+    identity: &RepositoryIdentity,
+    style: IdentityStyle,
+    name: &str,
+    creator: Option<UserId>,
+) -> (ProjectId, IdentityResolution) {
     store
         .writer
         .resolve_project_by_identity(
             ws,
             identity.clone(),
+            style,
+            name,
+            Some("/work/api".to_owned()),
+            None,
+            creator,
+        )
+        .await
+        .unwrap()
+}
+
+async fn resolve_capture(
+    store: &Store,
+    ws: WorkspaceId,
+    identity: &RepositoryIdentity,
+    style: IdentityStyle,
+    name: &str,
+    creator: Option<UserId>,
+) -> (ProjectId, IdentityResolution) {
+    store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            identity.clone(),
+            style,
             name,
             Some("/work/api".to_owned()),
             None,
@@ -177,8 +222,8 @@ async fn an_outsider_cannot_take_an_unclaimed_projects_identity() {
         .set_access_mode(team_project, ai_memory_store::AccessMode::Restricted)
         .await
         .unwrap();
-    let member = user(&store, "member", 1).await;
-    let outsider = user(&store, "outsider", 2).await;
+    let member = user(&store, "member").await;
+    let outsider = user(&store, "outsider").await;
     store
         .writer
         .grant_memory(member, team_project, GrantLevel::Write, None)
@@ -234,8 +279,8 @@ async fn a_created_or_split_project_admits_its_creator() {
         .await
         .unwrap();
     let ws = workspace(&store).await;
-    let alice = user(&store, "alice", 1).await;
-    let bob = user(&store, "bob", 2).await;
+    let alice = user(&store, "alice").await;
+    let bob = user(&store, "bob").await;
 
     let (a, how) = resolve(
         &store,
@@ -296,6 +341,7 @@ async fn the_prefix_parent_is_the_candidate_when_given() {
         .resolve_project_by_identity(
             ws,
             remote("github.com/acme/monorepo"),
+            IdentityStyle::HostPath,
             "src",
             None,
             Some(parent),
@@ -314,4 +360,1339 @@ async fn the_prefix_parent_is_the_candidate_when_given() {
             .is_none(),
         "no fragment project for the subdirectory"
     );
+}
+
+fn explicit(identity: &str) -> RepositoryIdentity {
+    RepositoryIdentity {
+        identity: identity.to_owned(),
+        source: IdentitySource::Explicit,
+    }
+}
+
+/// #1033: under the `path` style a new repository is named from its path
+/// without the host, so every worktree and clone — whatever its folder is
+/// called — lands in that one project.
+#[tokio::test]
+async fn the_path_style_names_a_new_project_from_the_host_less_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repo = remote("gitlab.com/acme/group/api");
+
+    let (id, how) = resolve_styled(&store, ws, &repo, IdentityStyle::Path, "main", None).await;
+    assert_eq!(how, IdentityResolution::Created);
+    assert_eq!(row(&store, id).0, "acme-group-api");
+    assert_eq!(row(&store, id).1, "gitlab.com/acme/group/api");
+
+    for folder in ["fix-1025", "main"] {
+        let (again, how) =
+            resolve_styled(&store, ws, &repo, IdentityStyle::Path, folder, None).await;
+        assert_eq!((again, how), (id, IdentityResolution::Matched), "{folder}");
+    }
+    assert!(
+        store
+            .reader
+            .find_project(ws, "main".into())
+            .await
+            .unwrap()
+            .is_none(),
+        "no folder-named project was created alongside it"
+    );
+}
+
+/// The collision the path style must never merge: the same path on another
+/// forge is a different repository. Whichever arrives second keeps the name it
+/// would have had without the style — the folder name, or the split name when
+/// that is taken too — and the first project is left untouched.
+#[tokio::test]
+async fn the_same_path_on_another_forge_falls_back_instead_of_merging() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let github = remote("github.com/acme/api");
+
+    let (first, _) = resolve_styled(&store, ws, &github, IdentityStyle::Path, "api", None).await;
+    assert_eq!(row(&store, first).0, "acme-api");
+
+    let (gitlab, how) = resolve_styled(
+        &store,
+        ws,
+        &remote("gitlab.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        None,
+    )
+    .await;
+    assert_eq!(how, IdentityResolution::Created);
+    assert_ne!(gitlab, first, "another forge's repository is never adopted");
+    assert_eq!(row(&store, gitlab).0, "api");
+    assert_eq!(row(&store, gitlab).1, "gitlab.com/acme/api");
+
+    // Its folder is called `acme-api` too: that name belongs to the GitHub
+    // project, so it splits, and the split name is taken as well.
+    let (bitbucket, how) = resolve_styled(
+        &store,
+        ws,
+        &remote("bitbucket.org/acme/api"),
+        IdentityStyle::Path,
+        "acme-api",
+        None,
+    )
+    .await;
+    assert_eq!(how, IdentityResolution::Split);
+    assert_eq!(row(&store, bitbucket).0, "acme-api-2");
+
+    assert_eq!(
+        row(&store, first),
+        (
+            "acme-api".into(),
+            "github.com/acme/api".into(),
+            "git_remote".into(),
+            Some("/work/api".into())
+        ),
+        "the first project kept its name, identity and path"
+    );
+}
+
+/// A project already holding the path name without any identity is some other
+/// checkout's folder project. Taking it would merge two repositories, so the
+/// newcomer falls back and the holder stays unclaimed.
+#[tokio::test]
+async fn an_unclaimed_project_holding_the_path_name_is_not_taken() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let holder = store
+        .writer
+        .get_or_create_project(ws, "acme-api", None)
+        .await
+        .unwrap();
+
+    let (id, how) = resolve_styled(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        None,
+    )
+    .await;
+    assert_eq!(how, IdentityResolution::Created);
+    assert_ne!(id, holder);
+    assert_eq!(row(&store, id).0, "api");
+    assert_eq!(row(&store, holder).1, "", "the holder was not claimed");
+}
+
+/// Opting an install in renames nothing: a repository that already has a
+/// project — claimed by identity, or still unclaimed under its folder name —
+/// resolves exactly as it would without the style.
+#[tokio::test]
+async fn opting_in_leaves_existing_projects_where_they_are() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+
+    let claimed_repo = remote("github.com/acme/api");
+    let (claimed, _) = resolve(&store, ws, &claimed_repo, "api", None).await;
+    let (again, how) =
+        resolve_styled(&store, ws, &claimed_repo, IdentityStyle::Path, "api", None).await;
+    assert_eq!((again, how), (claimed, IdentityResolution::Matched));
+    assert_eq!(row(&store, claimed).0, "api", "not renamed to acme-api");
+
+    let legacy = store
+        .writer
+        .get_or_create_project(ws, "web", None)
+        .await
+        .unwrap();
+    let (id, how) = resolve_styled(
+        &store,
+        ws,
+        &remote("github.com/acme/web"),
+        IdentityStyle::Path,
+        "web",
+        None,
+    )
+    .await;
+    assert_eq!((id, how), (legacy, IdentityResolution::Claimed));
+    assert_eq!(row(&store, legacy).0, "web");
+    assert!(
+        store
+            .reader
+            .find_project(ws, "acme-web".into())
+            .await
+            .unwrap()
+            .is_none(),
+        "no path-named twin split off the legacy project"
+    );
+}
+
+#[tokio::test]
+async fn old_client_omitted_style_stays_host_path_and_does_not_promote() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "api", None).await.0;
+
+    let (resolved, how) = resolve_capture(
+        &store,
+        ws,
+        &repository,
+        IdentityStyle::default(),
+        "api-clone",
+        None,
+    )
+    .await;
+
+    assert_eq!(resolved, project);
+    assert_eq!(how, IdentityResolution::Matched);
+    assert_eq!(row(&store, project).0, "api");
+}
+
+#[tokio::test]
+async fn explicit_path_capture_claims_and_promotes_an_identityless_legacy_name_in_one_transaction()
+{
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let legacy = store
+        .writer
+        .get_or_create_project(ws, "api", None)
+        .await
+        .unwrap();
+
+    let (project, how) = resolve_capture(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        None,
+    )
+    .await;
+
+    assert_eq!(project, legacy);
+    assert_eq!(how, IdentityResolution::Promoted);
+    assert_eq!(row(&store, project).0, "acme-api");
+    assert_eq!(row(&store, project).1, "github.com/acme/api");
+}
+
+#[tokio::test]
+async fn explicit_path_capture_promotes_an_authorized_legacy_name_without_changing_uuid() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "api", None).await.0;
+
+    let (promoted, how) = resolve_capture(
+        &store,
+        ws,
+        &repository,
+        IdentityStyle::Path,
+        "api-clone",
+        None,
+    )
+    .await;
+
+    assert_eq!(promoted, project);
+    assert_eq!(how, IdentityResolution::Promoted);
+    assert_eq!(row(&store, project).0, "acme-api");
+}
+
+#[tokio::test]
+async fn unauthorized_capture_cannot_claim_or_promote_an_identityless_legacy_name() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = store
+        .writer
+        .get_or_create_project(ws, "api", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let outsider = user(&store, "claim-promotion-outsider").await;
+
+    let (resolved, how) = resolve_capture(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        Some(outsider),
+    )
+    .await;
+
+    assert_eq!(resolved, project);
+    assert_eq!(how, IdentityResolution::Unclaimed);
+    assert_eq!(row(&store, project).0, "api");
+    assert_eq!(row(&store, project).1, "");
+}
+
+#[tokio::test]
+async fn unauthorized_capture_resolves_but_cannot_promote_a_legacy_name() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "api", None).await.0;
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let outsider = user(&store, "promotion-outsider").await;
+
+    let (resolved, how) = resolve_capture(
+        &store,
+        ws,
+        &repository,
+        IdentityStyle::Path,
+        "api-clone",
+        Some(outsider),
+    )
+    .await;
+
+    assert_eq!(resolved, project);
+    assert_eq!(how, IdentityResolution::Matched);
+    assert_eq!(row(&store, project).0, "api");
+}
+
+/// The style only renames what has a host to drop: a declared identity keeps
+/// the name the client sent.
+#[tokio::test]
+async fn the_path_style_leaves_a_declared_identity_named_as_sent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let (id, how) = resolve_styled(
+        &store,
+        ws,
+        &explicit("acme/platform"),
+        IdentityStyle::Path,
+        "platform",
+        None,
+    )
+    .await;
+    assert_eq!(how, IdentityResolution::Created);
+    assert_eq!(row(&store, id).0, "platform");
+}
+
+fn preserved_page(ws: WorkspaceId, project: ProjectId) -> NewPage {
+    NewPage {
+        workspace_id: ws,
+        project_id: project,
+        path: PagePath::new("notes/preserved.md").unwrap(),
+        title: "Preserved".into(),
+        body: "preserved page".into(),
+        tier: Tier::Semantic,
+        frontmatter_json: serde_json::json!({}),
+        pinned: false,
+        links: Vec::new(),
+        author_id: None,
+        expires_at: None,
+        entities: Vec::new(),
+        evidence: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn marker_aliases_require_same_remote_identity_and_preserve_uuid() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "former-name", None)
+        .await
+        .0;
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let writer = user(&store, "alias-writer").await;
+    store
+        .writer
+        .grant_memory(writer, project, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    let aliases = MarkerAliases::new(["former-name"]).unwrap();
+
+    let read = store
+        .reader
+        .resolve_existing_project_aliases(
+            ws,
+            "acme-api".into(),
+            aliases.clone(),
+            repository.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read, Some(project));
+    assert_eq!(
+        row(&store, project).0,
+        "former-name",
+        "read does not rename"
+    );
+
+    let outsider = user(&store, "alias-outsider").await;
+    let refused = store
+        .writer
+        .resolve_project_aliases_for_write(
+            ws,
+            "acme-api",
+            aliases.clone(),
+            repository.clone(),
+            Some(ProjectPrincipal::user(outsider)),
+            true,
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        Err(ai_memory_store::StoreError::Forbidden(_))
+    ));
+    assert_eq!(row(&store, project).0, "former-name");
+
+    let promoted = store
+        .writer
+        .resolve_project_aliases_for_write(
+            ws,
+            "acme-api",
+            aliases,
+            repository,
+            Some(ProjectPrincipal::user(writer)),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(promoted.project_id, project);
+    assert_eq!(promoted.promoted_from.as_deref(), Some("former-name"));
+    assert_eq!(row(&store, project).0, "acme-api");
+}
+
+#[tokio::test]
+async fn marker_aliases_cannot_promote_to_an_arbitrary_marker_project() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "former-name", None)
+        .await
+        .0;
+    let aliases = MarkerAliases::new(["former-name"]).unwrap();
+
+    let resolved = store
+        .writer
+        .resolve_project_aliases_for_write(
+            ws,
+            "attacker-chosen-name",
+            aliases,
+            repository,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(resolved.project_id, project);
+    assert_eq!(resolved.promoted_from, None);
+    assert_eq!(row(&store, project).0, "former-name");
+}
+
+#[tokio::test]
+async fn hostile_ambiguous_and_cross_workspace_marker_aliases_fail_closed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let legitimate = resolve(&store, ws, &repository, "former-name", None)
+        .await
+        .0;
+    let hostile = resolve(
+        &store,
+        ws,
+        &remote("gitlab.com/other/private"),
+        "restricted",
+        None,
+    )
+    .await
+    .0;
+    store
+        .writer
+        .set_access_mode(hostile, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let open_hostile = resolve(
+        &store,
+        ws,
+        &remote("bitbucket.org/other/public"),
+        "open-project",
+        None,
+    )
+    .await
+    .0;
+    assert_ne!(open_hostile, legitimate);
+
+    assert_eq!(
+        store
+            .reader
+            .resolve_existing_project_aliases(
+                ws,
+                "acme-api".into(),
+                MarkerAliases::new(["former-name"]).unwrap(),
+                repository.clone(),
+            )
+            .await
+            .unwrap(),
+        Some(legitimate)
+    );
+    for hostile_name in ["restricted", "open-project"] {
+        assert!(
+            store
+                .reader
+                .resolve_existing_project_aliases(
+                    ws,
+                    "future-api".into(),
+                    MarkerAliases::new([hostile_name]).unwrap(),
+                    repository.clone(),
+                )
+                .await
+                .is_err(),
+            "{hostile_name}"
+        );
+    }
+    assert!(
+        store
+            .reader
+            .resolve_existing_project_aliases(
+                ws,
+                "future-api".into(),
+                MarkerAliases::new(["former-name", "restricted"]).unwrap(),
+                repository.clone(),
+            )
+            .await
+            .is_err()
+    );
+
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    let _foreign = resolve(&store, other_ws, &repository, "foreign-only", None).await;
+    assert_eq!(
+        store
+            .reader
+            .resolve_existing_project_aliases(
+                ws,
+                "missing-canonical".into(),
+                MarkerAliases::new(["foreign-only"]).unwrap(),
+                remote("github.com/acme/else"),
+            )
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn coordinate_diagnostic_classifies_exact_canonical_legacy_and_missing_without_mutation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let repository = remote("github.com/acme/api");
+    let project = resolve(&store, ws, &repository, "checkout-blue", None)
+        .await
+        .0;
+    let before: (i64, String, i64) = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM projects), name, \
+             (SELECT COUNT(*) FROM audit_log) FROM projects WHERE id = ?1",
+            [project.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    for (name, status, rename_eligible) in [
+        ("checkout-blue", ProjectCoordinateStatus::Exact, false),
+        ("acme-api", ProjectCoordinateStatus::CanonicalCompat, true),
+        ("api", ProjectCoordinateStatus::LegacyCompat, false),
+    ] {
+        let diagnostic = store
+            .reader
+            .diagnose_project_coordinate(
+                "default".into(),
+                name.into(),
+                Some(repository.clone()),
+                IdentityStyle::Path,
+            )
+            .await
+            .unwrap();
+        assert_eq!(diagnostic.status, status, "{name}");
+        assert_eq!(diagnostic.project_id, Some(project));
+        assert_eq!(diagnostic.current_name.as_deref(), Some("checkout-blue"));
+        assert_eq!(diagnostic.canonical_candidate.as_deref(), Some("acme-api"));
+        assert_eq!(diagnostic.legacy_candidate.as_deref(), Some("api"));
+        assert_eq!(diagnostic.identity_source.as_deref(), Some("git_remote"));
+        assert_eq!(diagnostic.rename_eligible, rename_eligible);
+    }
+    let no_identity = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "acme-api".into(),
+            None,
+            IdentityStyle::HostPath,
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_identity.status, ProjectCoordinateStatus::CanonicalCompat);
+    assert_eq!(no_identity.project_id, Some(project));
+    assert!(no_identity.rename_eligible);
+    assert_eq!(no_identity.identity_style, None);
+
+    let missing = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "unknown".into(),
+            Some(repository),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status, ProjectCoordinateStatus::Missing);
+    assert_eq!(missing.project_id, Some(project));
+    assert_eq!(missing.current_name.as_deref(), Some("checkout-blue"));
+    assert_eq!(missing.canonical_candidate.as_deref(), Some("acme-api"));
+    assert!(!missing.rename_eligible);
+
+    let after: (i64, String, i64) = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM projects), name, \
+             (SELECT COUNT(*) FROM audit_log) FROM projects WHERE id = ?1",
+            [project.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn coordinate_diagnostic_reports_cross_forge_and_identityless_collisions() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let _github = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        "github-api",
+        None,
+    )
+    .await
+    .0;
+    let gitlab = resolve(
+        &store,
+        ws,
+        &remote("gitlab.com/acme/api"),
+        "gitlab-api",
+        None,
+    )
+    .await
+    .0;
+    let ambiguous = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "acme-api".into(),
+            Some(remote("gitlab.com/acme/api")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ambiguous.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(
+        ambiguous.collision_reason,
+        Some(ProjectCoordinateCollisionReason::CrossForgeCollision)
+    );
+    assert_eq!(ambiguous.candidate_count, 2);
+    assert_eq!(ambiguous.project_id, Some(gitlab));
+
+    let identityless = store
+        .writer
+        .get_or_create_project(ws, "occupied", None)
+        .await
+        .unwrap();
+    let identity_backed = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/occupied"),
+        "elsewhere",
+        None,
+    )
+    .await
+    .0;
+    let occupied = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "occupied".into(),
+            Some(remote("github.com/acme/occupied")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(occupied.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(
+        occupied.collision_reason,
+        Some(ProjectCoordinateCollisionReason::UnclaimedIdentitylessProject)
+    );
+    assert_eq!(occupied.candidate_count, 2);
+    assert_eq!(occupied.project_id, Some(identity_backed));
+    assert_ne!(identityless, identity_backed);
+
+    let unclaimed_only = store
+        .writer
+        .get_or_create_project(ws, "unclaimed-only", None)
+        .await
+        .unwrap();
+    let unclaimed = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "unclaimed-only".into(),
+            Some(remote("github.com/acme/unclaimed-only")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unclaimed.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(unclaimed.project_id, Some(unclaimed_only));
+    assert_eq!(
+        unclaimed.collision_reason,
+        Some(ProjectCoordinateCollisionReason::UnclaimedIdentitylessProject)
+    );
+    assert!(!unclaimed.rename_eligible);
+
+    let holder = resolve(
+        &store,
+        ws,
+        &explicit("another/repository"),
+        "acme-target-taken",
+        None,
+    )
+    .await
+    .0;
+    let intended = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/target-taken"),
+        "legacy-target",
+        None,
+    )
+    .await
+    .0;
+    let occupied = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "acme-target-taken".into(),
+            Some(remote("github.com/acme/target-taken")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(occupied.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(occupied.project_id, Some(intended));
+    assert_eq!(
+        occupied.collision_reason,
+        Some(ProjectCoordinateCollisionReason::CanonicalTargetOccupied)
+    );
+    assert_eq!(occupied.candidate_count, 2);
+    assert_ne!(holder, intended);
+
+    let foreign = resolve(
+        &store,
+        ws,
+        &remote("github.com/other/occupied-name"),
+        "occupied-name",
+        None,
+    )
+    .await
+    .0;
+    let foreign_occupied = store
+        .reader
+        .diagnose_project_coordinate(
+            "default".into(),
+            "occupied-name".into(),
+            Some(remote("gitlab.com/acme/unrelated")),
+            IdentityStyle::Path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign_occupied.status, ProjectCoordinateStatus::Ambiguous);
+    assert_eq!(foreign_occupied.project_id, Some(foreign));
+    assert_eq!(
+        foreign_occupied.collision_reason,
+        Some(ProjectCoordinateCollisionReason::CrossIdentityOccupied)
+    );
+    assert!(!foreign_occupied.rename_eligible);
+}
+
+#[tokio::test]
+async fn canonical_and_legacy_reads_resolve_one_legacy_row_without_renaming() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
+        .await
+        .0;
+    for name in ["api", "acme-api"] {
+        assert_eq!(
+            lookup_existing_scope(&store.reader, "default", name)
+                .await
+                .unwrap()
+                .project_id,
+            project
+        );
+    }
+    assert_eq!(row(&store, project).0, "api");
+
+    let deduplicated = resolve_many_existing_scopes(
+        &store.reader,
+        &[
+            ScopeName::new("default", "api"),
+            ScopeName::new("default", "acme-api"),
+        ],
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(deduplicated.len(), 1);
+    assert_eq!(deduplicated[0].project_id, project);
+}
+
+#[tokio::test]
+async fn authorized_write_promotes_in_place_and_preserves_dependents_and_legacy_lookup() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let owner = user(&store, "promotion-owner").await;
+    let project = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        "api",
+        Some(owner),
+    )
+    .await
+    .0;
+    store
+        .writer
+        .upsert_page(preserved_page(ws, project))
+        .await
+        .unwrap();
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: ws,
+            project_id: project,
+            agent_kind: AgentKind::Codex,
+            cwd: Some("/clone/api".into()),
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(owner, project, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: project,
+            from_session_id: Some(session),
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: Some("/clone/api".into()),
+            summary: "continue".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let promoted = create_explicit_scope_guarded(
+        &store.reader,
+        &store.writer,
+        "default",
+        "acme-api",
+        Some(owner),
+    )
+    .await
+    .unwrap();
+    assert_eq!(promoted.scope.project_id, project);
+    assert_eq!(row(&store, project).0, "acme-api");
+    let audit: (i64, Option<Vec<u8>>, String) = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*), MAX(author_id), MAX(detail) FROM audit_log \
+             WHERE op = 'promote_project_name' AND project_id = ?1",
+            [project.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(audit.0, 1);
+    assert_eq!(audit.1.as_deref(), Some(owner.as_bytes().as_slice()));
+    assert!(audit.2.contains("\"from\":\"api\""));
+    assert!(audit.2.contains("\"to\":\"acme-api\""));
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(ws, project, "notes/preserved.md")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    for table in ["sessions", "project_grants", "handoffs"] {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE project_id = ?1"),
+                [project.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "{table}");
+    }
+    assert_eq!(
+        store
+            .reader
+            .list_handoffs(ws, project, None, OwnerFilter::Any, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        lookup_existing_scope(&store.reader, "default", "api")
+            .await
+            .unwrap()
+            .project_id,
+        project
+    );
+}
+
+#[tokio::test]
+async fn distinct_current_canonical_and_legacy_keys_resolve_without_guessing_checkout_names() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = resolve(
+        &store,
+        ws,
+        &remote("gitlab.com/acme/group/api"),
+        "checkout-blue",
+        None,
+    )
+    .await
+    .0;
+    for key in ["checkout-blue", "acme-group-api", "api"] {
+        assert_eq!(
+            lookup_existing_scope(&store.reader, "default", key)
+                .await
+                .unwrap()
+                .project_id,
+            project
+        );
+    }
+    assert_eq!(row(&store, project).0, "checkout-blue");
+    for key in ["group-api", "checkout-red"] {
+        assert!(
+            lookup_existing_scope(&store.reader, "default", key)
+                .await
+                .unwrap_err()
+                .is_not_found()
+        );
+    }
+    let foreign = store
+        .writer
+        .get_or_create_workspace("foreign")
+        .await
+        .unwrap();
+    for key in ["checkout-blue", "acme-group-api", "api"] {
+        assert!(
+            lookup_existing_scope(&store.reader, "foreign", key)
+                .await
+                .unwrap_err()
+                .is_not_found()
+        );
+        assert!(
+            store
+                .reader
+                .find_project(foreign, key.to_owned())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_only_user_cannot_promote_a_legacy_name() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let owner = user(&store, "promotion-owner").await;
+    let reader = user(&store, "promotion-reader").await;
+    let project = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        "api",
+        Some(owner),
+    )
+    .await
+    .0;
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(reader, project, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "acme-api",
+            Some(reader),
+            ProjectAccess::Read,
+        )
+        .await
+        .unwrap()
+        .project_id,
+        project
+    );
+    assert!(
+        create_explicit_scope_guarded(
+            &store.reader,
+            &store.writer,
+            "default",
+            "acme-api",
+            Some(reader),
+        )
+        .await
+        .unwrap_err()
+        .is_forbidden()
+    );
+    assert_eq!(row(&store, project).0, "api");
+}
+
+#[tokio::test]
+async fn explicit_path_capture_falls_back_when_another_identity_claims_the_canonical_key() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let github = remote("github.com/acme/api");
+    let gitlab = remote("gitlab.com/acme/api");
+    let existing = resolve(&store, ws, &github, "api", None).await.0;
+    let conflicting = resolve(&store, ws, &gitlab, "acme-api", None).await.0;
+
+    let (resolved, how) =
+        resolve_capture(&store, ws, &github, IdentityStyle::Path, "api-clone", None).await;
+
+    assert_eq!(resolved, existing);
+    assert_eq!(how, IdentityResolution::Matched);
+    assert_eq!(row(&store, existing).0, "api");
+    assert_eq!(row(&store, conflicting).0, "acme-api");
+}
+
+#[tokio::test]
+async fn canonical_target_conflict_rolls_back_the_promotion() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let legacy = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
+        .await
+        .0;
+    let conflict = store
+        .writer
+        .get_or_create_project(ws, "acme-api", None)
+        .await
+        .unwrap();
+    let error =
+        create_explicit_scope_guarded(&store.reader, &store.writer, "default", "acme-api", None)
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        ScopeResolutionError::ProjectNameAmbiguous { .. }
+    ));
+    assert_eq!(row(&store, legacy).0, "api");
+    assert_eq!(row(&store, conflict).0, "acme-api");
+}
+
+#[tokio::test]
+async fn audit_failure_rolls_back_promotion_and_keeps_the_writer_alive() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
+        .await
+        .0;
+    store
+        .writer
+        .upsert_page(preserved_page(ws, project))
+        .await
+        .unwrap();
+    let owner = user(&store, "rollback-owner").await;
+    store
+        .writer
+        .grant_memory(owner, project, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: session,
+            workspace_id: ws,
+            project_id: project,
+            agent_kind: AgentKind::Other,
+            cwd: Some("/rollback/api".into()),
+            actor_user: None,
+            occurred_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: project,
+            from_session_id: Some(session),
+            from_agent: AgentKind::Other,
+            to_agent: None,
+            cwd: None,
+            summary: "rollback baton".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let snapshot = || {
+        ["pages", "sessions", "project_grants", "handoffs"].map(|table| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} WHERE project_id = ?1"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([project.as_bytes().to_vec()], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+    };
+    let before = snapshot();
+    assert!(before.iter().all(|rows| !rows.is_empty()));
+    conn.execute_batch(
+        "CREATE TRIGGER fail_promotion_audit BEFORE INSERT ON audit_log \
+         WHEN NEW.op = 'promote_project_name' \
+         BEGIN SELECT RAISE(ABORT, 'forced promotion audit failure'); END;",
+    )
+    .unwrap();
+
+    assert!(
+        create_explicit_scope_guarded(&store.reader, &store.writer, "default", "acme-api", None,)
+            .await
+            .is_err()
+    );
+    assert_eq!(row(&store, project).0, "api");
+    let audit_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE op = 'promote_project_name'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_count, 0);
+    assert_eq!(snapshot(), before, "every dependent row is unchanged");
+    assert!(
+        store
+            .reader
+            .page_body_by_ids(ws, project, "notes/preserved.md")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    conn.execute_batch("DROP TRIGGER fail_promotion_audit")
+        .unwrap();
+    let later = store
+        .writer
+        .get_or_create_project(ws, "writer-still-alive", None)
+        .await
+        .unwrap();
+    assert_ne!(later, project);
+}
+
+#[tokio::test]
+async fn exact_name_that_is_another_forges_canonical_key_fails_closed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let exact = resolve(
+        &store,
+        ws,
+        &remote("github.com/unrelated/tool"),
+        "acme-api",
+        None,
+    )
+    .await
+    .0;
+    let canonical = resolve(
+        &store,
+        ws,
+        &remote("gitlab.com/acme/api"),
+        "gitlab-api",
+        None,
+    )
+    .await
+    .0;
+    assert_ne!(exact, canonical);
+    let error = lookup_existing_scope(&store.reader, "default", "acme-api")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ScopeResolutionError::ProjectNameAmbiguous { .. }
+    ));
+}
+
+/// A clone without the marker that declares `widget` creates `acme-widget`
+/// with `widget` as its legacy key (#1144). The refusal names both projects
+/// and the key each answers by, so the operator can tell which one to purge
+/// or rename, but never names a restricted project: the project list hides
+/// those names from callers without a grant, and this lookup runs before any
+/// caller is authorized.
+#[tokio::test]
+async fn an_ambiguous_name_names_its_holders_but_not_a_restricted_one() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let declared = store
+        .writer
+        .get_or_create_project(ws, "widget", None)
+        .await
+        .unwrap();
+    let clone = resolve_capture(
+        &store,
+        ws,
+        &remote("github.com/acme/widget"),
+        IdentityStyle::Path,
+        "acme-widget",
+        None,
+    )
+    .await
+    .0;
+    assert_ne!(declared, clone);
+    assert_eq!(row(&store, clone).0, "acme-widget");
+
+    let error = lookup_existing_scope(&store.reader, "default", "widget")
+        .await
+        .unwrap_err();
+    assert!(error.is_bad_request());
+    assert_eq!(
+        error.to_string(),
+        "project 'widget' is ambiguous in workspace 'default': it is the name of \
+         project 'widget' and the legacy key of project 'acme-widget'"
+    );
+
+    store
+        .writer
+        .set_access_mode(clone, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let error = lookup_existing_scope(&store.reader, "default", "widget")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "project 'widget' is ambiguous in workspace 'default': it is the name of \
+         project 'widget' and the legacy key of a restricted project"
+    );
+    assert!(!error.to_string().contains("acme-widget"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_legacy_and_canonical_resolve_or_create_converge_on_one_uuid() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let project = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
+        .await
+        .0;
+    let resolve =
+        |name| create_explicit_scope_guarded(&store.reader, &store.writer, "default", name, None);
+    let (a, b) = tokio::join!(resolve("api"), resolve("acme-api"));
+    assert_eq!(a.unwrap().scope.project_id, project);
+    assert_eq!(b.unwrap().scope.project_id, project);
+    assert_eq!(row(&store, project).0, "acme-api");
+}
+
+/// Naming a project differently changes nothing about reads: a lookup is
+/// still no-create, and the folder name a static client might guess resolves
+/// to nothing rather than to a fresh project.
+#[tokio::test]
+async fn reads_of_a_path_named_project_stay_no_create() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let (id, _) = resolve_styled(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        IdentityStyle::Path,
+        "api",
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        store
+            .reader
+            .find_project(ws, "acme-api".into())
+            .await
+            .unwrap(),
+        Some(id)
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            store.reader.find_project(ws, "api".into()).await.unwrap(),
+            None,
+            "a lookup of the folder name finds nothing and creates nothing"
+        );
+    }
 }

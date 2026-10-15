@@ -153,7 +153,7 @@ command or a consolidation job, not a migration.
 If a migration needs to update the SQLite index alongside the file moves, use
 `WriterHandle` methods. Never open a second `Connection`; never call
 `ops::*` directly from a migration. This upholds invariant #2 (single-writer
-actor) from `CLAUDE.md`.
+actor) from `AGENTS.md`.
 
 ## Tracking
 

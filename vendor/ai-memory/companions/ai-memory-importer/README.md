@@ -49,6 +49,76 @@ observation names `external:<source>` and assistant/system observations retain
 extension provenance. A reader can therefore distinguish an explicit import
 and its source without adding product-specific agent kinds to core.
 
+### agentmemory
+
+Two routes read what agentmemory exports. Both write through the MCP
+`memory_write_page` tool with explicit `workspace` and `project`, every write
+conditional: `create_only` for a page's first version and `expected_page_id`
+for each later one. They refuse a server older than ai-memory 3.0, which would
+ignore those arguments. Pages land under `--dest-prefix` (default
+`imported/agentmemory`), never under ai-memory's own `sessions/` or any other
+reserved family.
+
+`agentmemory-vault --dir <vault>` reads the Obsidian vault agentmemory's
+Obsidian export writes: `memories/`, `lessons/`, `crystals/` and `sessions/`,
+each page with YAML frontmatter and `[[id]]` wikilinks. The generated `MOC.md`
+index is skipped. A wikilink to another imported page is rewritten to its new
+path; a link to anything else becomes plain text. `--workspace` and
+`--project` name the one destination.
+
+`agentmemory-export --file <export.json> --mapping <mapping.json>` reads the
+`ExportData` JSON file agentmemory's export command writes. It takes a file
+only: the importer never contacts an agentmemory server and never handles its
+credentials. The mapping file is required, because agentmemory names a
+project by its directory basename and two repositories can share one:
+
+```json
+{
+  "projects": {
+    "api": {"workspace": "acme", "project": "acme-api"},
+    "web": {"workspace": "acme", "project": "acme-web"}
+  },
+  "cwds": {
+    "/home/me/other/api": {"workspace": "other", "project": "other-api"}
+  },
+  "unscoped": {"workspace": "acme", "project": "acme-misc"}
+}
+```
+
+`cwds` matches a session's exact working directory and wins over `projects`;
+records tied to that session (its summary, the memories that cite it) follow
+it. `unscoped` receives records that name no project. A record the mapping
+does not cover is listed in the dry run, and `--apply` refuses to run until the
+mapping covers it.
+
+| agentmemory record | ai-memory page | `kind` / `tier` |
+| --- | --- | --- |
+| memory (every version) | `memories/<first-version-id>.md` | `preference`, `decision` (architecture), `workflow`, `pattern`, `bug`, `fact` / `semantic`, or `procedural` for workflow and pattern |
+| lesson | `lessons/<id>.md` | `lesson` / `semantic` |
+| insight | `insights/<id>.md` | `insight` / `semantic` |
+| semantic memory | `semantic/<id>.md` | `fact` / `semantic` |
+| procedural memory | `procedural/<id>.md` | `procedure` / `procedural` |
+| crystal | `crystals/<id>.md` | `crystal` / `episodic` |
+| session and its summary | `sessions/<id>.md` | `session` / `episodic` |
+
+The paths are relative to `--dest-prefix`. A memory's versions are written
+oldest first to one path, each conditional on the one before, so ai-memory
+keeps its own supersession chain. `forgetAfter` becomes `expires_at`, so an
+expired memory is hidden from normal reads as soon as it lands. Concepts and
+tags become page tags, after the `agentmemory-import` tag every page carries.
+Related records become wikilinks (qualified with `workspace/project:` when the
+target landed in another project), or plain ids when they were not imported.
+Deleted lessons and insights are skipped.
+
+Compressed observations are dropped by default; the session summaries carry
+their value. `--replay-observations` replays each session's observations
+through `/hook/batch` as one `external-import` session (`source_event`
+`agentmemory-observation`, at most 254 per session), so the server sanitizer
+applies a second time. Graph nodes and edges, actions, signals, routines,
+sentinels, sketches, checkpoints, facets, access logs and any key a newer
+export adds are not imported; the manifest counts each under `dropped`. An
+export page whose `pagination.hasMore` is true needs `--allow-partial`.
+
 Claude memory graph and Qdrant imports remain roadmap items; there are no code
 stubs for them.
 
@@ -84,6 +154,13 @@ stubs for them.
   extension messages. The dry-run and manifest report the truncation count.
 - Conversation bodies receive client-side credential redaction before replay
   and then cross ai-memory's normal server sanitizer as a second boundary.
+  The [shared private privacy helpers](../ai-memory-client) scrub nested values
+  before event hashes, previews, manifests and delivery. Sensitive native source
+  identities are refused before deriving an imported session ID or writing a
+  manifest. Valid native session strings are preserved exactly. UTF-8 byte caps
+  keep complete redaction markers, and numeric token metrics use an exact
+  11-name allowlist. Body provenance remains untrusted and cannot supply actor
+  or destination authority.
 - Stable session IDs derive from `(workspace, project, source, session_id)`.
   Each replay event has a stable `ingest_key`; a changed transcript gets a new
   terminal generation key, so rerunning an interrupted import is safe and
@@ -93,6 +170,31 @@ stubs for them.
   the same source to resume via the stable keys.
 - There is no inbox or watch-folder mode. Import is an explicit one-shot
   operation.
+
+The agentmemory routes keep the same dry-run default, `--apply` plus
+`--manifest-out`, auth and path rules, with these differences:
+
+- Writes use MCP `memory_write_page` only, each conditional, so the server
+  refuses a page that appears or changes during the import. A destination page this import did not write is never
+  replaced; the run stops and names it.
+- `--dest-prefix` must be relative and portable. `..`, absolute paths, a
+  Windows drive, and a first segment that is reserved (`sessions`,
+  `session-logs`, `procedures`, `decisions`, `gotchas`, `profile`) or starts
+  with `_` or `.` are refused. Every planned path is checked to stay under the
+  prefix, and two records that map to one path abort the plan.
+- Vault folders and entries that are symlinks are refused; hidden entries and
+  non-Markdown files are skipped and counted. Pages are capped at 1 MiB each
+  and 100,000 per vault; an export file at 256 MiB.
+- Every page and replayed observation is redacted client-side before the plan,
+  the manifest or any request exists. Record ids that look like credentials
+  are refused.
+- Each record has a stable ingest key, a UUIDv5 of its agentmemory id, written
+  on the page's last line. A rerun finds the key in the page the server
+  already holds and skips it, so an interrupted import resumes without
+  duplicates and a finished one writes nothing. The manifest records each
+  version as `written`, `present` (already there) or `failed`.
+- Without `--create-destination`, every destination must already exist; the
+  check is a read, which never creates a scope.
 
 ## Usage
 
@@ -165,6 +267,30 @@ destination must already exist unless `--create-destination` is passed. Source
 files are read once; adapters should write their completed generic JSON export
 before invoking the importer.
 
+## agentmemory usage
+
+```bash
+# Obsidian vault: dry run, then apply.
+cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+  agentmemory-vault --dir ~/.agentmemory/vault --workspace default --project my-project
+AI_MEMORY_AUTH_TOKEN=... \
+cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+  agentmemory-vault --dir ~/.agentmemory/vault --workspace default --project my-project \
+  --apply --manifest-out /tmp/agentmemory-vault-manifest.json
+
+# ExportData JSON: dry run (lists unmapped projects and dropped counts), then apply.
+cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+  agentmemory-export --file agentmemory-export.json --mapping mapping.json
+AI_MEMORY_AUTH_TOKEN=... \
+cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+  agentmemory-export --file agentmemory-export.json --mapping mapping.json \
+  --apply --manifest-out /tmp/agentmemory-export-manifest.json
+```
+
+Options shared by both: `--dest-prefix`, `--server-url`, `--create-destination`
+and `--show-body`. `agentmemory-export` adds `--replay-observations` and
+`--allow-partial`.
+
 ## Validation
 
 Run these from the repository root:
@@ -173,6 +299,16 @@ Run these from the repository root:
 cargo fmt --check --manifest-path companions/ai-memory-importer/Cargo.toml
 cargo test --manifest-path companions/ai-memory-importer/Cargo.toml
 cargo clippy --manifest-path companions/ai-memory-importer/Cargo.toml --all-targets -- -D warnings
+```
+
+The agentmemory end-to-end tests start a real `ai-memory serve` in a
+temporary data directory when `AI_MEMORY_IMPORTER_E2E_BIN` names the binary
+(CI sets it); without it they report a skip:
+
+```bash
+cargo build --bin ai-memory
+AI_MEMORY_IMPORTER_E2E_BIN="$PWD/target/debug/ai-memory" \
+  cargo test --manifest-path companions/ai-memory-importer/Cargo.toml e2e
 ```
 
 Root hygiene checks remain separate:

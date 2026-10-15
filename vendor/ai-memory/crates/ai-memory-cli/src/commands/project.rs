@@ -1,8 +1,10 @@
-//! `ai-memory project` — project settings (#708).
+//! `ai-memory project` — local marker setup and server project settings (#708).
 //!
-//! Thin HTTP client over `/admin/projects/*`, root-only like `ai-memory
-//! grant`: access is an operator decision, made against the server rather than
-//! a database the operator's laptop usually cannot open.
+//! `project init` creates a local `.ai-memory.toml` and never contacts the
+//! server. The remaining actions are thin HTTP clients over `/admin/projects/*`,
+//! root-only like `ai-memory grant`: access is an operator decision, made
+//! against the server rather than a database the operator's laptop usually
+//! cannot open.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -14,12 +16,19 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// Dispatch a `project` subcommand.
 ///
 /// # Errors
-/// Transport failures, a non-root token, an unknown project or mode.
+/// Local marker initialization failures, or a transport failure, non-root
+/// token, unknown project, or invalid mode for a server-side action.
 pub async fn run(config: &Config, args: ProjectArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     match args.command {
-        ProjectCommand::Access(args) => access(&ep, args).await,
-        ProjectCommand::Grants(args) => crate::commands::grant::list_for_project(&ep, &args).await,
+        ProjectCommand::Init(args) => crate::commands::project_init::run(config, args),
+        ProjectCommand::Access(args) => {
+            let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+            access(&ep, args).await
+        }
+        ProjectCommand::Grants(args) => {
+            let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+            crate::commands::grant::list_for_project(&ep, &args).await
+        }
     }
 }
 

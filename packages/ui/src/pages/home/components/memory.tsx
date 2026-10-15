@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { BrainCircuit, ChevronLeft, FileText, LoaderCircle, Play, Plus, RefreshCw, Search, Square, Terminal } from "lucide-react";
 import { MemoryModelSettingsPanel } from "./memory-model-settings";
 import { MemoryProjectSetupPanel } from "./memory-project-setup";
@@ -10,6 +10,7 @@ import piIcon from "@/assets/agent-logos/pi.svg";
 import mimoIcon from "@/assets/provider-icons/xiaomi-mimo.png";
 import { useAppText } from "../shared/i18n";
 import { documentPageClassName, PageHeader } from "./page-primitives";
+import { memoryPreviewLines } from "./memory-preview";
 
 type Tab = "library" | "search" | "sessions" | "handoffs" | "clients" | "maintenance" | "settings";
 const tabs: Array<[Tab, string]> = [["library", "Project memory"], ["clients", "Clients"], ["settings", "Settings"]];
@@ -49,6 +50,31 @@ function message(error: unknown) { return error instanceof Error ? error.message
 function scopeOf(project: MemoryProject): MemoryScope { return { workspace: project.workspace_name, project: project.project_name }; }
 function keyOf(scope?: MemoryScope) { return scope ? `${scope.workspace}/${scope.project}` : ""; }
 function date(value?: string) { return value ? new Date(value).toLocaleString() : "—"; }
+function MemoryClientTargetRow({ client, target, kind, busy, preview, previewError, previewRef, onAction, onClose, t }: {
+  client: MemoryClient; target: MemoryClientTarget; kind: "mcp" | "hooks"; busy: string;
+  preview?: { row: string; before: string; text: string }; previewError?: { row: string; text: string };
+  previewRef: RefObject<HTMLDivElement>; onAction: (operation: "preview" | "install" | "remove") => void; onClose: () => void; t: (text: string) => string;
+}) {
+  const configured = kind === "mcp" ? target.mcpConfigured : target.hooksConfigured;
+  const file = kind === "mcp" ? target.mcpPath : target.hookPath;
+  const row = `${client.id}:${target.id}:${kind}`;
+  const open = preview?.row === row;
+  return (
+    <div className="py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="text-[13px] font-medium">{t(memoryClientVariantLabel(client, kind))} <span className="ml-1 text-[10px] font-normal text-muted-foreground">{t(kind === "mcp" ? "Read and write memory" : "Capture sessions")}</span></div>
+          <div className={`mt-1 text-[11px] ${configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>{t(configured ? "Configured · reload client" : "Not configured or changed")}</div>
+          <code className="mt-1 block break-all text-[10px] text-muted-foreground">{file}</code>
+        </div>
+        <Button size="sm" variant={open ? "secondary" : "ghost"} aria-expanded={open} disabled={!!busy && !open} onClick={() => open ? onClose() : onAction("preview")}>{busy === `preview:${row}` && <LoaderCircle className="mr-1 h-3 w-3 animate-spin" />}{t(open ? "Collapse" : "Preview")}</Button>
+        <Button size="sm" variant="outline" disabled={!!busy} onClick={() => onAction(configured ? "remove" : "install")}>{t(configured ? "Disconnect" : "Connect")}</Button>
+      </div>
+      {open ? <div ref={previewRef} className="mt-2 max-h-80 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-5">{memoryPreviewLines(preview?.before || "", preview?.text || "").map((line, index) => <div key={index} className={line.added ? "whitespace-pre text-red-600 dark:text-red-400" : "whitespace-pre text-foreground"}>{line.text || " "}</div>)}</div> : null}
+      {previewError?.row === row ? <div role="alert" className="mt-2 border-l-2 border-destructive pl-3 text-sm text-destructive">{previewError.text}</div> : null}
+    </div>
+  );
+}
 function rows(value: any): any[] {
   if (Array.isArray(value)) return value;
   for (const key of ["sessions", "handoffs", "observations", "hits", "pages", "edges"]) if (Array.isArray(value?.[key])) return value[key];
@@ -70,7 +96,9 @@ export function MemoryView() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<any[]>([]);
   const [clients, setClients] = useState<MemoryClient[]>([]);
-  const [preview, setPreview] = useState("");
+  const [clientPreview, setClientPreview] = useState<{ row: string; before: string; text: string }>();
+  const [clientPreviewError, setClientPreviewError] = useState<{ row: string; text: string }>();
+  const clientPreviewRef = useRef<HTMLDivElement>(null);
   const [config, setConfig] = useState("");
   const [logs, setLogs] = useState("");
   const [tools, setTools] = useState<MemoryTool[]>([]);
@@ -118,7 +146,8 @@ export function MemoryView() {
 
   useEffect(() => {
     const id = ++generation.current;
-    setPage(undefined); setResults([]); setPages([]); setPreview(""); setError(""); setEditor(undefined);
+    setPage(undefined); setResults([]); setPages([]); setError(""); setEditor(undefined);
+    if (tab !== "clients") { setClientPreview(undefined); setClientPreviewError(undefined); }
     if (!running && tab !== "settings") { setLoading(false); return; }
     setLoading(true);
     const load = async () => {
@@ -161,14 +190,27 @@ export function MemoryView() {
     setEditor({ workspace: current?.workspace || scope?.workspace || "", project: current?.project || scope?.project || "",
       path: current?.path || "", body: current?.body_markdown || "# ", pinned: current?.pinned || false });
   }
+  useEffect(() => { clientPreviewRef.current?.scrollIntoView({ block: "nearest" }); }, [clientPreview?.row, clientPreview?.text]);
   async function clientAction(client: MemoryClient, target: MemoryClientTarget, kind: "mcp" | "hooks", operation: "preview" | "install" | "remove") {
+    const row = `${client.id}:${target.id}:${kind}`;
     const path = kind === "mcp" ? target.mcpPath : target.hookPath;
     if (operation !== "preview" && !window.confirm(`${t(operation === "install" ? "Apply client configuration?" : "Remove client integration?")}\n${client.label} · ${kind}\n${path}\n${t("Other client settings and memory data are preserved.")}`)) return;
-    await perform(client.id + target.id + kind, async () => {
-      const response = await call<{ output: string; path: string }>({ action: "client", client: client.id, target: target.id, kind, operation, confirmed: operation !== "preview" });
-      setPreview(`${response.path}\n\n${response.output}`);
-      setClients(await call<MemoryClient[]>({ action: "clients" }));
-      if (operation === "install") setNotice(t("Configuration saved. Reload the client, then verify capture with a real session."));
+    await perform(`${operation}:${row}`, async () => {
+      try {
+        const response = await call<{ output: string; path: string; before?: string }>({ action: "client", client: client.id, target: target.id, kind, operation, confirmed: operation !== "preview" });
+        if (operation === "preview") {
+          setClientPreview({ row, before: response.before || "", text: response.output });
+          setClientPreviewError(undefined);
+        } else setClientPreview((current) => current?.row === row ? undefined : current);
+        setClients(await call<MemoryClient[]>({ action: "clients" }));
+        if (operation === "install") setNotice(t("Configuration saved. Reload the client, then verify capture with a real session."));
+      } catch (error) {
+        if (operation === "preview") {
+          setClientPreview((current) => current?.row === row ? undefined : current);
+          setClientPreviewError({ row, text: message(error) });
+        }
+        throw error;
+      }
     });
   }
 
@@ -265,20 +307,10 @@ export function MemoryView() {
           {["zcode", "grok", "zero"].includes(client.id) && <p className="mb-3 text-xs text-muted-foreground">{t(client.id === "zcode" ? "ZCode has no session-end event. Finish the session from Project memory > Sessions after your work is complete." : "This client retrieves handoffs through MCP; startup hook output is not injected.")}</p>}
           <div className="space-y-3">{client.targets.map((target) => <section key={target.id} className="rounded-lg border border-border/60 p-3">
             <div className="mb-2 flex items-start justify-between gap-3"><div><h5 className="text-[13px] font-medium">{target.label}</h5><div className="mt-1 text-[11px] text-muted-foreground">{target.scope === "global" ? t("Global client configuration") : t("AgentRouter profile")}</div></div><span className="text-[10px] text-muted-foreground">{target.profileId || "global"}</span></div>
-            <div className="divide-y divide-border/50">{(["mcp", "hooks"] as const).filter((kind) => kind === "mcp" ? target.mcpSupported : target.hooksSupported).map((kind) => {
-              const configured = kind === "mcp" ? target.mcpConfigured : target.hooksConfigured;
-              const file = kind === "mcp" ? target.mcpPath : target.hookPath;
-              return <div key={kind} className="flex flex-wrap items-center gap-2 py-3">
-                <div className="min-w-0 flex-1"><div className="text-[13px] font-medium">{t(memoryClientVariantLabel(client, kind))} <span className="ml-1 text-[10px] font-normal text-muted-foreground">{t(kind === "mcp" ? "Read and write memory" : "Capture sessions")}</span></div>
-                  <div className={`mt-1 text-[11px] ${configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>{t(configured ? "Configured · reload client" : "Not configured or changed")}</div><code className="mt-1 block break-all text-[10px] text-muted-foreground">{file}</code></div>
-                <Button size="sm" variant="ghost" disabled={!!busy} onClick={() => void clientAction(client, target, kind, "preview")}>{t("Preview")}</Button>
-                <Button size="sm" variant="outline" disabled={!!busy} onClick={() => void clientAction(client, target, kind, configured ? "remove" : "install")}>{t(configured ? "Disconnect" : "Connect")}</Button>
-              </div>;
-            })}</div>
+            <div className="divide-y divide-border/50">{(["mcp", "hooks"] as const).filter((kind) => kind === "mcp" ? target.mcpSupported : target.hooksSupported).map((kind) => <MemoryClientTargetRow key={kind} client={client} target={target} kind={kind} busy={busy} preview={clientPreview} previewError={clientPreviewError} previewRef={clientPreviewRef} onAction={(operation) => void clientAction(client, target, kind, operation)} onClose={() => setClientPreview((current) => current?.row === `${client.id}:${target.id}:${kind}` ? undefined : current)} t={t} />)}</div>
           </section>)}</div>
         </div>)}
       </section>)}</div>
-      {preview && <pre className="mt-4 max-h-96 overflow-auto rounded-md border border-border p-4 text-[11px]">{preview}</pre>}
       <details className="mt-5 text-[13px] text-muted-foreground"><summary className="cursor-pointer hover:text-foreground">{t("Enable capture for a project")}</summary><p className="mt-2 leading-6">{t("Session capture requires a .ai-memory.toml file in the project root with its workspace and project names. Reload the client after connecting.")}</p></details>
     </section>}
     {running && tab === "maintenance" && <section className="space-y-4">

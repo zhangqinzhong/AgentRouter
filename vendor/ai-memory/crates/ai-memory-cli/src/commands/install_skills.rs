@@ -4,8 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, GROK_SKILL_DIR, HERMES_SKILL_DIR,
-    MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
+    GROK_HANDOFF_RULE_CONTENT, GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER,
+    GROK_RULES_DIR, GROK_SKILL_DIR, HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill,
+    SKILLS_DIR,
 };
 use anyhow::{Context, Result, bail};
 
@@ -35,6 +37,9 @@ struct InstallReport {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct PreparedInstall {
     plans: Vec<(PathBuf, &'static ManagedSkill)>,
+    /// `$GROK_HOME/rules/ai-memory-handoff.md` when installing global Grok
+    /// skills. Project scope, `--target-dir`, and other agents leave this empty.
+    grok_handoff_rule: Option<PathBuf>,
 }
 
 /// Run the `install-skills` subcommand.
@@ -43,25 +48,116 @@ pub(super) struct PreparedInstall {
 /// Returns an error when target roots cannot be resolved, an unmanaged
 /// same-name skill would be overwritten without `--force`, or a skill
 /// file cannot be written.
-pub fn run(_config: &Config, args: InstallSkillsArgs) -> Result<()> {
-    let roots = resolve_target_roots_from_env(&args)?;
+pub fn run(config: &Config, args: InstallSkillsArgs) -> Result<()> {
+    let roots = resolve_target_roots_from_env(&args, &config.runtime_env)?;
 
     if args.print {
-        print_install_plan(&roots);
+        print_install_plan(&roots, grok_handoff_rule_path_for(&args)?);
         return Ok(());
     }
 
-    let prepared = prepare_install(&args)?;
+    let prepared = prepare_install(&args, &config.runtime_env)?;
     print_reports(apply_prepared_install(prepared)?);
 
     Ok(())
 }
 
-pub(super) fn prepare_install(args: &InstallSkillsArgs) -> Result<PreparedInstall> {
-    let roots = resolve_target_roots_from_env(args)?;
+pub(super) fn prepare_install(
+    args: &InstallSkillsArgs,
+    env: &crate::config::RuntimeEnv,
+) -> Result<PreparedInstall> {
+    let roots = resolve_target_roots_from_env(args, env)?;
     let plans = skill_file_plans(&roots);
+    let grok_handoff_rule = grok_handoff_rule_path_for(args)?;
     validate_overwrite_safety(&plans, args.force)?;
-    Ok(PreparedInstall { plans })
+    if let Some(path) = &grok_handoff_rule {
+        validate_rule_overwrite(path, args.force)?;
+    }
+    Ok(PreparedInstall {
+        plans,
+        grok_handoff_rule,
+    })
+}
+
+/// After `install-hooks --agent grok --apply` writes the hook file, also
+/// install the always-on first-turn rule, which the hook's first turn relies
+/// on. An unmanaged same-name file is skipped with a warning so a
+/// user-authored rule cannot fail the hook install. The global Grok skills are
+/// `install-skills --scope global --agent grok`'s job, so `uninstall --only
+/// hooks` removes everything this writes.
+///
+/// The companions go into the Grok home the hook file was written to, never
+/// the process `GROK_HOME`: a relocated home (`ai-memory run grok --env
+/// GROK_HOME=...`, or `--config-file`) must receive them, and a confined
+/// install must not write outside it. A hook file outside the
+/// `<grok home>/hooks/ai-memory.json` layout names no home, so the companions
+/// are skipped with a note.
+pub(super) fn install_grok_companions_after_hooks(hook_file: &Path) -> Result<()> {
+    match grok_home_of_hook_file(hook_file) {
+        Some(home) => {
+            install_grok_rule_in(home, false);
+            Ok(())
+        }
+        None => {
+            eprintln!(
+                "[ai-memory] note: skipped the Grok first-turn rule: {} is not \
+                 <grok home>/hooks/ai-memory.json, so it names no Grok home",
+                hook_file.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The Grok home a hook file at `<home>/hooks/ai-memory.json` belongs to.
+fn grok_home_of_hook_file(hook_file: &Path) -> Option<&Path> {
+    let hooks_dir = hook_file.parent()?;
+    (hook_file.file_name()? == "ai-memory.json" && hooks_dir.file_name()? == "hooks")
+        .then(|| hooks_dir.parent())
+        .flatten()
+}
+
+fn install_grok_rule_in(grok_home: &Path, force: bool) {
+    let rule_path = grok_handoff_rule_destination(grok_home);
+    match write_grok_handoff_rule(&rule_path, force) {
+        Ok(outcome) => {
+            println!(
+                "✓ {} {} ({})",
+                outcome.verb(),
+                rule_path.display(),
+                outcome_detail(outcome),
+            );
+        }
+        Err(err) => {
+            eprintln!("[ai-memory] warning: skipped Grok first-turn handoff rule: {err}");
+        }
+    }
+}
+
+fn grok_handoff_rule_destination(grok_home: &Path) -> PathBuf {
+    grok_home
+        .join(GROK_RULES_DIR)
+        .join(GROK_HANDOFF_RULE_FILENAME)
+}
+
+fn should_install_grok_handoff_rule(args: &InstallSkillsArgs) -> bool {
+    args.target_dir.is_none()
+        && args.scope == InstallSkillsScope::Global
+        && args.agent == InstallSkillsAgent::Grok
+}
+
+fn grok_handoff_rule_path_for(args: &InstallSkillsArgs) -> Result<Option<PathBuf>> {
+    if !should_install_grok_handoff_rule(args) {
+        return Ok(None);
+    }
+    Ok(Some(grok_handoff_rule_destination(
+        &install_mcp::grok_home()?,
+    )))
+}
+
+fn write_grok_handoff_rule(path: &Path, force: bool) -> Result<ApplyOutcome> {
+    validate_rule_overwrite(path, force)?;
+    apply_atomic(path, |_| Ok(GROK_HANDOFF_RULE_CONTENT.to_string()))
 }
 
 pub(super) fn run_prepared(prepared: PreparedInstall) -> Result<()> {
@@ -85,21 +181,33 @@ fn print_reports(reports: Vec<InstallReport>) {
     }
 }
 
-fn resolve_target_roots_from_env(args: &InstallSkillsArgs) -> Result<Vec<TargetRoot>> {
+/// The harness homes come from the environment `Config::load` captured, not
+/// the live process (invariant #1).
+fn resolve_target_roots_from_env(
+    args: &InstallSkillsArgs,
+    env: &crate::config::RuntimeEnv,
+) -> Result<Vec<TargetRoot>> {
     let cwd = std::env::current_dir().context("getting CWD for install-skills target")?;
     let home = home_dir();
-    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-    let grok_home = (args.scope == InstallSkillsScope::Global
-        && args.agent == InstallSkillsAgent::Grok)
-        .then(install_mcp::grok_home)
-        .transpose()?;
-    let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let appdata = env.var_os("APPDATA").map(PathBuf::from);
+    // Grok and Copilot CLI relocate their whole config home, global skills
+    // included, through GROK_HOME / COPILOT_HOME.
+    let agent_home = match (args.scope, args.agent) {
+        (InstallSkillsScope::Global, InstallSkillsAgent::Grok) => {
+            Some(install_mcp::grok_home_in(env.var_os("GROK_HOME"))?)
+        }
+        (InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli) => {
+            Some(install_mcp::copilot_home_in(env.var_os("COPILOT_HOME"))?)
+        }
+        _ => None,
+    };
+    let claude_config_dir = claude_config_dir(env.var_os("CLAUDE_CONFIG_DIR"));
     resolve_target_roots_for_platform(
         args,
         &cwd,
         home.as_deref(),
         appdata.as_deref(),
-        grok_home.as_deref(),
+        agent_home.as_deref(),
         claude_config_dir.as_deref(),
         SkillHostPlatform::current(),
     )
@@ -119,7 +227,7 @@ fn resolve_target_roots_for_platform(
     cwd: &Path,
     home: Option<&Path>,
     appdata: Option<&Path>,
-    grok_home: Option<&Path>,
+    agent_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<Vec<TargetRoot>> {
@@ -135,7 +243,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -147,7 +255,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -159,7 +267,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -171,7 +279,19 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
+                claude_config_dir,
+                platform,
+            )?]
+        }
+        InstallSkillsAgent::CopilotCli => {
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::CopilotCli,
+                cwd,
+                home,
+                appdata,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -183,7 +303,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -195,7 +315,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?,
@@ -205,7 +325,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?,
@@ -237,6 +357,7 @@ enum SkillRootKind {
     Agents,
     Devin,
     Grok,
+    CopilotCli,
     Hermes,
 }
 
@@ -247,7 +368,7 @@ fn agent_root(
     cwd: &Path,
     home: Option<&Path>,
     appdata: Option<&Path>,
-    grok_home: Option<&Path>,
+    agent_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<PathBuf> {
@@ -261,10 +382,10 @@ fn agent_root(
     }
 
     if scope == InstallSkillsScope::Global
-        && kind == SkillRootKind::Grok
-        && let Some(grok_home) = grok_home
+        && matches!(kind, SkillRootKind::Grok | SkillRootKind::CopilotCli)
+        && let Some(agent_home) = agent_home
     {
-        return Ok(grok_home.join(SKILLS_DIR));
+        return Ok(agent_home.join(SKILLS_DIR));
     }
 
     // Claude Code relocates its whole config dir under $CLAUDE_CONFIG_DIR;
@@ -288,6 +409,12 @@ fn agent_root(
         SkillRootKind::Agents => AGENTS_SKILL_DIR,
         SkillRootKind::Devin => DEVIN_SKILL_DIR,
         SkillRootKind::Grok => GROK_SKILL_DIR,
+        // Copilot CLI reads project skills from the repository's `.github`
+        // and personal skills from `~/.copilot`.
+        SkillRootKind::CopilotCli => match scope {
+            InstallSkillsScope::Project => GITHUB_SKILL_DIR,
+            InstallSkillsScope::Global => COPILOT_SKILL_DIR,
+        },
         SkillRootKind::Hermes => HERMES_SKILL_DIR,
     };
     Ok(base.join(agent_dir).join(SKILLS_DIR))
@@ -297,13 +424,22 @@ fn agent_root(
 fn install_managed_skills(roots: &[TargetRoot], force: bool) -> Result<Vec<InstallReport>> {
     let plans = skill_file_plans(roots);
     validate_overwrite_safety(&plans, force)?;
-    apply_prepared_install(PreparedInstall { plans })
+    apply_prepared_install(PreparedInstall {
+        plans,
+        grok_handoff_rule: None,
+    })
 }
 
 fn apply_prepared_install(prepared: PreparedInstall) -> Result<Vec<InstallReport>> {
-    let mut reports = Vec::with_capacity(prepared.plans.len());
+    let mut reports = Vec::with_capacity(
+        prepared.plans.len() + usize::from(prepared.grok_handoff_rule.is_some()),
+    );
     for (path, skill) in prepared.plans {
         let outcome = apply_atomic(&path, |_| Ok(skill.content.to_string()))?;
+        reports.push(InstallReport { path, outcome });
+    }
+    if let Some(path) = prepared.grok_handoff_rule {
+        let outcome = apply_atomic(&path, |_| Ok(GROK_HANDOFF_RULE_CONTENT.to_string()))?;
         reports.push(InstallReport { path, outcome });
     }
     Ok(reports)
@@ -346,19 +482,53 @@ fn validate_overwrite_safety(
     Ok(())
 }
 
-fn print_install_plan(roots: &[TargetRoot]) {
+fn validate_rule_overwrite(path: &Path, force: bool) -> Result<()> {
+    if force || !path.exists() {
+        return Ok(());
+    }
+    let existing =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    if !existing.contains(GROK_HANDOFF_RULE_MARKER) {
+        bail!(
+            "refusing to overwrite unmanaged Grok rule at {}. \
+             Move or rename the existing file, or rerun with --force to back it up and replace it.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn print_install_plan(roots: &[TargetRoot], grok_handoff_rule: Option<PathBuf>) {
+    print!("{}", render_install_plan(roots, grok_handoff_rule));
+}
+
+fn render_install_plan(roots: &[TargetRoot], grok_handoff_rule: Option<PathBuf>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let push_file = |out: &mut String, content: &str| {
+        out.push_str(content);
+        if !content.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    };
     for root in roots {
-        println!("# Skill root: {}\n", root.path.display());
+        let _ = writeln!(out, "# Skill root: {}\n", root.path.display());
         for skill in MANAGED_SKILLS {
             let path = root.path.join(skill.relative_path);
-            println!("# Would write: {}\n", path.display());
-            print!("{}", skill.content);
-            if !skill.content.ends_with('\n') {
-                println!();
-            }
-            println!();
+            let _ = writeln!(out, "# Would write: {}\n", path.display());
+            push_file(&mut out, skill.content);
         }
     }
+    if let Some(path) = grok_handoff_rule {
+        let _ = writeln!(
+            out,
+            "# Would write Grok first-turn handoff rule: {}\n",
+            path.display()
+        );
+        push_file(&mut out, GROK_HANDOFF_RULE_CONTENT);
+    }
+    out
 }
 
 fn outcome_detail(outcome: ApplyOutcome) -> &'static str {
@@ -374,7 +544,9 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use ai_memory_core::routing_skills::{MANAGED_MARKER, MANAGED_SKILLS};
+    use ai_memory_core::routing_skills::{
+        GROK_HANDOFF_RULE_CONTENT, GROK_HANDOFF_RULE_MARKER, MANAGED_MARKER, MANAGED_SKILLS,
+    };
 
     use super::*;
     use crate::cli::{InstallSkillsAgent, InstallSkillsArgs, InstallSkillsScope};
@@ -546,6 +718,77 @@ mod tests {
         assert_eq!(root_names(&roots), ["/custom/grok/skills"]);
     }
 
+    /// COPILOT_HOME and GROK_HOME come from the captured environment, never
+    /// the live process: an injected value decides the global root.
+    #[test]
+    fn global_harness_homes_come_from_the_captured_environment() {
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[
+            ("COPILOT_HOME", "/injected/copilot"),
+            ("GROK_HOME", "/injected/grok"),
+        ]);
+        let copilot = resolve_target_roots_from_env(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            copilot[0].path,
+            Path::new("/injected/copilot").join(SKILLS_DIR)
+        );
+        let grok = resolve_target_roots_from_env(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Grok),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(grok[0].path, Path::new("/injected/grok").join(SKILLS_DIR));
+    }
+
+    #[test]
+    fn copilot_cli_skill_roots_split_project_github_and_global_copilot_home() {
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+        let project = resolve_target_roots(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::CopilotCli),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&project), ["/repo/.github/skills"]);
+
+        let global = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&global), ["/home/alice/.copilot/skills"]);
+
+        let relocated = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli),
+            cwd,
+            Some(home),
+            None,
+            Some(Path::new("/custom/copilot")),
+            None,
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&relocated), ["/custom/copilot/skills"]);
+
+        // COPILOT_HOME never moves project skills out of the repository.
+        let project_relocated = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::CopilotCli),
+            cwd,
+            Some(home),
+            None,
+            Some(Path::new("/custom/copilot")),
+            None,
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&project_relocated), ["/repo/.github/skills"]);
+    }
+
     #[test]
     fn global_claude_skill_root_uses_injected_claude_config_dir() {
         let roots = resolve_target_roots_for_platform(
@@ -671,5 +914,168 @@ mod tests {
                 .unwrap()
                 .contains(MANAGED_MARKER)
         );
+    }
+
+    #[test]
+    fn only_global_grok_without_target_dir_installs_the_handoff_rule() {
+        assert!(should_install_grok_handoff_rule(&args(
+            InstallSkillsScope::Global,
+            InstallSkillsAgent::Grok,
+        )));
+        assert!(!should_install_grok_handoff_rule(&args(
+            InstallSkillsScope::Project,
+            InstallSkillsAgent::Grok,
+        )));
+        assert!(!should_install_grok_handoff_rule(&args(
+            InstallSkillsScope::Global,
+            InstallSkillsAgent::ClaudeCode,
+        )));
+        assert!(!should_install_grok_handoff_rule(&args(
+            InstallSkillsScope::Global,
+            InstallSkillsAgent::Both,
+        )));
+        let mut target_dir = args(InstallSkillsScope::Global, InstallSkillsAgent::Grok);
+        target_dir.target_dir = Some(PathBuf::from("/custom/skills"));
+        assert!(!should_install_grok_handoff_rule(&target_dir));
+    }
+
+    #[test]
+    fn global_grok_install_writes_the_handoff_rule_next_to_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grok_home = tmp.path();
+        let skills_root = grok_home.join("skills");
+        let rule_path = grok_handoff_rule_destination(grok_home);
+        let reports = apply_prepared_install(PreparedInstall {
+            plans: skill_file_plans(&[TargetRoot::new(skills_root.clone())]),
+            grok_handoff_rule: Some(rule_path.clone()),
+        })
+        .unwrap();
+
+        assert_eq!(reports.len(), MANAGED_SKILLS.len() + 1);
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.outcome == ApplyOutcome::Created)
+        );
+        assert!(
+            fs::read_to_string(&rule_path)
+                .unwrap()
+                .contains(GROK_HANDOFF_RULE_MARKER)
+        );
+        assert_eq!(
+            fs::read_to_string(&rule_path).unwrap(),
+            GROK_HANDOFF_RULE_CONTENT
+        );
+        for skill in MANAGED_SKILLS {
+            assert!(skills_root.join(skill.relative_path).exists());
+        }
+        assert!(!grok_home.join(".grok/skills").exists());
+    }
+
+    #[test]
+    fn project_grok_skill_install_does_not_plan_the_handoff_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".grok/skills");
+        let reports = install_managed_skills(&[TargetRoot::new(root.clone())], false).unwrap();
+        assert_eq!(reports.len(), MANAGED_SKILLS.len());
+        assert!(
+            !tmp.path()
+                .join("rules")
+                .join("ai-memory-handoff.md")
+                .exists()
+        );
+        assert!(!root.join("ai-memory-handoff.md").exists());
+    }
+
+    #[test]
+    fn refuses_to_overwrite_unmanaged_grok_handoff_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rule_path = grok_handoff_rule_destination(tmp.path());
+        fs::create_dir_all(rule_path.parent().unwrap()).unwrap();
+        fs::write(&rule_path, "# my grok rule\n").unwrap();
+
+        let err = write_grok_handoff_rule(&rule_path, false).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("refusing to overwrite unmanaged Grok rule"));
+        assert!(message.contains("--force"));
+        assert_eq!(fs::read_to_string(&rule_path).unwrap(), "# my grok rule\n");
+    }
+
+    #[test]
+    fn force_overwrites_unmanaged_grok_handoff_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rule_path = grok_handoff_rule_destination(tmp.path());
+        fs::create_dir_all(rule_path.parent().unwrap()).unwrap();
+        fs::write(&rule_path, "# my grok rule\n").unwrap();
+
+        let outcome = write_grok_handoff_rule(&rule_path, true).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Updated);
+        assert!(
+            fs::read_to_string(&rule_path)
+                .unwrap()
+                .contains(GROK_HANDOFF_RULE_MARKER)
+        );
+    }
+
+    #[test]
+    fn grok_handoff_rule_install_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rule_path = grok_handoff_rule_destination(tmp.path());
+        assert_eq!(
+            write_grok_handoff_rule(&rule_path, false).unwrap(),
+            ApplyOutcome::Created
+        );
+        assert_eq!(
+            write_grok_handoff_rule(&rule_path, false).unwrap(),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// The hook install writes the first-turn rule into the Grok home its
+    /// hook file belongs to, and nothing else: no global skills, so
+    /// `uninstall --only hooks` takes back all of it.
+    #[test]
+    fn grok_hook_install_writes_only_the_rule_beside_its_hook_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grok_home = tmp.path().join("relocated-grok");
+        let hook_file = grok_home.join("hooks").join("ai-memory.json");
+
+        install_grok_companions_after_hooks(&hook_file).unwrap();
+
+        assert!(
+            fs::read_to_string(grok_handoff_rule_destination(&grok_home))
+                .unwrap()
+                .contains(GROK_HANDOFF_RULE_MARKER)
+        );
+        assert!(!grok_home.join(SKILLS_DIR).exists(), "no global skills");
+    }
+
+    /// A hook file outside `<home>/hooks/ai-memory.json` names no Grok home,
+    /// so nothing is written beside it or anywhere else.
+    #[test]
+    fn grok_hook_file_outside_the_layout_installs_no_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_file = tmp.path().join("custom").join("grok-hooks.json");
+
+        install_grok_companions_after_hooks(&hook_file).unwrap();
+
+        assert_eq!(grok_home_of_hook_file(&hook_file), None);
+        assert!(!tmp.path().join("rules").exists());
+        assert!(!tmp.path().join("custom").join("rules").exists());
+    }
+
+    #[test]
+    fn print_plan_includes_the_grok_handoff_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = vec![TargetRoot::new(tmp.path().join("skills"))];
+        let rule = grok_handoff_rule_destination(tmp.path());
+        let plan = render_install_plan(&roots, Some(rule.clone()));
+        assert!(plan.contains(&format!(
+            "# Would write Grok first-turn handoff rule: {}",
+            rule.display()
+        )));
+        assert!(plan.contains(GROK_HANDOFF_RULE_MARKER));
+        // Without a rule path (project scope, --target-dir) the plan names none.
+        assert!(!render_install_plan(&roots, None).contains("first-turn handoff rule:"));
     }
 }

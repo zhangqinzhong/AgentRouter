@@ -104,3 +104,31 @@ public struct KeychainTokenStore: TokenStore, Sendable {
 public enum KeychainError: Error, Equatable, Sendable {
     case unhandled(OSStatus)
 }
+
+/// The root bearer `ai-memory init` writes on a fresh data dir
+/// (`<data_dir>/auth-tokens/default`, owner-only). The app reads it when the
+/// Keychain holds no token, so an install it initialized is authorized
+/// without pasting anything; a token saved in Settings still wins.
+public enum DataDirToken {
+    public static func path(dataDir: URL) -> URL {
+        dataDir.appending(path: "auth-tokens/default")
+    }
+
+    public static func read(dataDir: URL, fileManager: FileManager = .default) -> String? {
+        guard let data = fileManager.contents(atPath: path(dataDir: dataDir).path),
+              let text = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+        let token = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    /// The Keychain token when one is saved, else the data dir's token file.
+    public static func effective(saved: String?, dataDir: URL, fileManager: FileManager = .default) -> String? {
+        if let saved, !saved.isEmpty {
+            return saved
+        }
+        return read(dataDir: dataDir, fileManager: fileManager)
+    }
+}

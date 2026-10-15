@@ -14,7 +14,7 @@ import { MemoryClients } from "./clients";
 import { memoryReadPath, MemoryTransport } from "./transport";
 
 const execute = promisify(execFile);
-export const MEMORY_VERSION = "2.5.2";
+export const MEMORY_VERSION = "3.0.0";
 const defaultSettings: MemorySettings = { autoStart: false, semanticSearch: false };
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function waitForExit(child: ChildProcess, timeout: number): Promise<void> {
@@ -48,7 +48,7 @@ export class MemoryService {
     this.home = options.home ?? resolveRuntimeAppPath("home");
     this.transport = new MemoryTransport(this.endpoint, () => this.token);
     this.projects = new MemoryProjects(options.dataDir, (args) => this.command(args));
-    this.clients = new MemoryClients(this.home, options.dataDir, this.endpoint, (args) => this.command(args), process.env, () => this.token, () => this.executable(), options.configDir ?? CONFIGDIR);
+    this.clients = new MemoryClients(this.home, options.dataDir, this.endpoint, (args, env) => this.command(args, env), process.env, () => this.token, () => this.executable(), options.configDir ?? CONFIGDIR);
   }
 
   status(): MemoryStatus {
@@ -192,6 +192,9 @@ export class MemoryService {
     try {
       this.token = this.accessToken();
       if (this.externalReuse && await this.adoptExisting()) {
+        // Preview and install shell out to the CLI. Attaching to the
+        // already-running server does not stage that binary.
+        if (this.findRuntime()) this.prepareRuntime();
         this.external = true;
         this.state = "running";
         this.startedAt = new Date().toISOString();
@@ -328,9 +331,9 @@ export class MemoryService {
       RUST_LOG: "info,refinery_core=warn",
       ...(this.settings().semanticSearch ? {} : { AI_MEMORY_EMBEDDING_PROVIDER: "none" }) };
   }
-  private async command(args: string[]): Promise<string> {
+  private async command(args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
     const result = await execute(this.executable(), ["--data-dir", this.options.dataDir, ...args], {
-      cwd: this.options.dataDir, env: this.environment(), encoding: "utf8", timeout: 120_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true
+      cwd: this.options.dataDir, env: env ? { ...this.environment(), ...env } : this.environment(), encoding: "utf8", timeout: 120_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true
     }).catch((error) => { throw new Error(this.redact(error.stderr || error.message || "Memory command failed.")); });
     return this.redact([result.stdout, result.stderr].filter(Boolean).join("\n"));
   }

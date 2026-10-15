@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Core domain types and errors for ai-memory."
@@ -24,7 +25,7 @@ tracing.workspace = true
 schemars.workspace = true
 
 [dev-dependencies]
-serde_yaml.workspace = true
+serde-saphyr = { workspace = true, features = ["deserialize"] }
 
 [lints]
 workspace = true

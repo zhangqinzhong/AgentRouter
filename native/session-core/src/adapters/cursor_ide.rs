@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::sqlite_ro::{open_sqlite_ro, virtual_path};
+use super::sqlite_ro::{has_table, open_sqlite_ro, virtual_path};
 use super::AgentAdapter;
 use crate::models::*;
 use anyhow::{anyhow, Result};
@@ -250,6 +250,10 @@ impl CursorIdeAdapter {
         let mtime = super::sqlite_ro::db_cache_stamp(&self.db);
         self.rows_cache.get_or_try_build(mtime, || {
             let ro = open_sqlite_ro(&self.db, "cursor-ide")?;
+            // 库在、没有 cursorDiskKV = 确实没有会话;读不出才是 None
+            if !has_table(&ro.conn, "cursorDiskKV").ok()? {
+                return Some(Vec::new());
+            }
             let mut stmt = ro
                 .conn
                 .prepare(&format!(
@@ -597,9 +601,13 @@ impl AgentAdapter for CursorIdeAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        let Some(rows) = self.rows() else {
+        // 库不在 = 没有会话;库在却读不出报 Err,scanner 冻结这一家这一轮。
+        if !self.db.is_file() {
             return Ok(Vec::new());
-        };
+        }
+        let rows = self
+            .rows()
+            .ok_or_else(|| anyhow!("{} exists but could not be read", self.db.display()))?;
         Ok(rows
             .into_iter()
             .map(|row| SessionFileRef {

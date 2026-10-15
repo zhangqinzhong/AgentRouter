@@ -81,8 +81,10 @@ ai-memory-relay status --queue-dir "$HOME/.ai-memory-relay"
 
 `enqueue` validates the whole array and commits it in one transaction. Each body
 must be an object with explicit `session_id` and `cwd` strings. Use the harness's
-native identity and canonical hook event names. Other body fields keep their
-values, including an `_ai_memory_capture` block. The relay does not translate
+native identity and canonical hook event names. Sensitive identities are refused
+without renaming them. Shared private capture helpers scrub new body text and
+credential values before serialization, hashing and enqueueing. An
+`_ai_memory_capture` block remains untrusted provenance. The relay does not translate
 provider transcripts or infer parent agents and workflows.
 
 For authenticated servers, supply `AI_MEMORY_AUTH_TOKEN` through the flush
@@ -151,7 +153,15 @@ print event bodies. Receipts count acknowledgements, including policy drops.
 
 ## Local data and recovery
 
-The queue contains producer-supplied event bodies before server sanitization.
+New queue bodies receive local credential sanitation before persistence, then
+cross the normal server sanitizer on delivery. Legacy pending bytes, digest,
+native identity, ingest key and attempt state remain exact. A stored item that
+fails the privacy check (only possible for one queued before local sanitation)
+is never sent: the flush drops it locally as `dropped_policy`, keeps a receipt
+so its key stays replay-protected, and reports the count without payload. Its
+session's later events continue instead of waiting behind it. See the [shared
+privacy helpers](../ai-memory-client).
+
 The producer must apply its capture exclusions before enqueueing. The relay
 does not load the project's `[capture] ignore_paths` settings or inspect tool
 payloads for sensitive paths. Server sanitization cannot protect a local queue
@@ -213,3 +223,46 @@ lost response, distinct event identities and 15 concurrent sessions. It also
 checks handoff delivery with native capture suppressed, rejected authentication
 and acknowledged session collisions. Temporary data and logs are retained, and
 the test prints their directory.
+Receipt assertions cover stored events, lost-response replays and collision drops.
+
+## Receipt outcomes and queue compatibility
+
+Batch ACKs may include `results: [{index, outcome}]`. When present, results must
+match every acknowledged index exactly, ascending and without duplicates.
+The complete ACK, including legacy prefix and failure fields, is validated before
+any item is released. Missing entries, extra indices or non-string outcomes retain
+the entire batch. An absent results field from an older server maps acknowledged
+events to `unknown`; future outcome strings also map to `unknown`.
+
+Receipts persist `stored`, `replayed`, `resumed`, `ignored_end`,
+`dropped_policy`, `dropped_subagent`, `dropped_unauthorized`,
+`dropped_collision`, `dropped_invalid` or `unknown`. All acknowledged outcomes release events,
+including drops. Flush reports `acknowledged_outcomes` for that invocation.
+Status adds `receipt_outcomes`, with all ten fixed keys, including zero counts,
+for receipts within the retained 30-day window measured from first attempt.
+These are bounded delivery counts, not lifetime observation totals.
+
+A receipt keeps its first known outcome when another acknowledgement arrives
+for the same key. A legacy NULL or `unknown` outcome can be filled by a later
+known result. Delivery timestamps may advance without changing that outcome.
+A lost first response has no receipt yet, so its retry can record `replayed`.
+
+Opening a version 1 queue upgrades it to version 2 in one IMMEDIATE transaction,
+adding nullable receipt outcomes and updating schema metadata together. Pending
+order, binding, hashes, pins and existing receipt metadata survive; old NULL
+outcomes count as `unknown`. Concurrent opens recheck the version under the write
+lock. An interrupted migration rolls back and can be retried on reopen.
+After the transaction commits, journal configuration retries only SQLite
+BUSY/LOCKED errors within one 10-second budget. Each attempt rechecks the
+identity and schema version metadata on the same connection; a changed identity
+or schema version stops the open without retrying or adopting that database. The
+checks cover the presence of user objects and the `identity`/`schema_version`
+metadata; they do not validate the complete table structure. This wait
+budget covers journal configuration, separately from the existing SQLite busy
+timeout on transactions. Concurrent processes use SQLite's file locks.
+When the budget expires, the queue reports that it is busy and asks you to
+retry opening the same queue. A committed migration and pending events remain
+in that directory; do not switch queues or restore a backup to clear contention.
+Unknown schemas are refused. Older relay binaries refuse version 2 queues:
+downgrading requires restoring a pre-upgrade backup while all queue users are
+stopped. Do not recreate a queue to bypass its delivery history.

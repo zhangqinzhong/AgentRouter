@@ -1719,4 +1719,907 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    async fn owner_finish_user(store: &Store, name: &str) -> (ai_memory_core::UserId, String) {
+        let id = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: name.into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let token = ai_memory_store::generate_api_key().unwrap();
+        store
+            .writer
+            .create_api_credential(
+                ai_memory_core::ApiCredentialId::new(),
+                id,
+                "owner-finish".into(),
+                ai_memory_store::hash_token(&token, &TokenPepper::new("finish-pepper")),
+                None,
+            )
+            .await
+            .unwrap();
+        (id, token)
+    }
+
+    async fn owner_finish_run(
+        store: &Store,
+        ws: ai_memory_core::WorkspaceId,
+        project: ai_memory_core::ProjectId,
+        name: &str,
+        owner: Option<String>,
+    ) -> ai_memory_store::PreparedWorkstreamRun {
+        store
+            .writer
+            .prepare_workstream_run_owned(
+                ai_memory_store::PrepareWorkstreamRun {
+                    workspace_id: ws,
+                    project_id: project,
+                    repo_fingerprint: "repo".into(),
+                    worktree_fingerprint: "tree".into(),
+                    cwd: "/repo".into(),
+                    agent: ai_memory_core::AgentKind::Codex,
+                    automatic_harness: false,
+                    available_agents: Vec::new(),
+                    selection: ai_memory_store::WorkstreamSelection::New(name.into()),
+                    lease_owner: "diagnostic-only".into(),
+                },
+                owner,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn owner_finish_http(store: &Store, root: &std::path::Path, auth: AuthState) -> Router {
+        ai_memory_hooks::workstream_router(ai_memory_hooks::WorkstreamState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            sanitizer: ai_memory_core::Sanitizer::default(),
+            wiki: ai_memory_wiki::Wiki::new(root, store.writer.clone())
+                .unwrap()
+                .with_store_reader(store.reader.clone()),
+            data_dir: root.into(),
+            home_dir: None,
+            trusted_proxy_identity: auth.actor_proxy_bearer().is_some(),
+        })
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(auth),
+            require_bearer,
+        ))
+    }
+
+    async fn owner_finish_request(
+        http: &Router,
+        id: ai_memory_core::ManagedRunId,
+        token: Option<&str>,
+        events: serde_json::Value,
+        complete: bool,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("/workstream/runs/{id}/finish"))
+            .header("Content-Type", "application/json")
+            .header("X-Memory-Actor-User", "alice")
+            .header("X-Memory-Actor-Sub", "alice")
+            .header("X-Memory-Actor-Issuer", "https://idp.example");
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let payload = serde_json::json!({
+            "native_session_id": "native-owner", "source_cursor": "foreign-cursor",
+            "events": events, "complete": complete, "exit_code": 9, "checkpoint": {},
+            "actor": {"user": "alice"}, "principal": {"is_root": true}
+        });
+        let request = request.body(Body::from(payload.to_string())).unwrap();
+        http.clone().oneshot(request).await.unwrap()
+    }
+
+    fn owner_finish_events() -> serde_json::Value {
+        serde_json::json!([{
+            "event_id": "owner-finish-event", "agent": "codex", "native_session_id": "native-owner",
+            "kind": "message", "role": "assistant", "content": "owner finish evidence",
+            "metadata": {"actor_user": "alice", "owner_user": "user:alice", "is_root": true}
+        }])
+    }
+
+    async fn owner_finish_prepare_http(
+        http: &Router,
+        token: &str,
+        name: &str,
+    ) -> ai_memory_core::PrepareManagedRunResponse {
+        let response = http
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workstream/runs")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("X-Memory-Actor-User", "alice")
+                    .header("X-Memory-Actor-Issuer", "https://idp.example")
+                    .header("X-Memory-Actor-Sub", "alice")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspace": "finish-compat", "project": "restricted", "cwd": "/repo",
+                            "repo_fingerprint": "compat-repo", "worktree_fingerprint": name,
+                            "agent": "codex", "new_workstream": name, "lease_owner": "display-only"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "authenticated prepare must remain legitimate"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_trusted_proxy_preserves_restricted_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("finish-compat")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "restricted", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        // A DB user with the same display name must not change the proxy's OIDC owner.
+        let (alice, db_token) = owner_finish_user(&store, "alice").await;
+        let auth = AuthState::new(Some("root-finish-token".into()))
+            .with_trusted_proxy_bearer("proxy-finish-token")
+            .with_multiuser(
+                TokenPepper::new("finish-pepper"),
+                store.reader.clone(),
+                store.writer.clone(),
+            );
+        let http = owner_finish_http(&store, tmp.path(), auth.clone());
+        let run = owner_finish_prepare_http(&http, "proxy-finish-token", "proxy-owned").await;
+        let before = owner_finish_snapshot(&store).await;
+        for token in [None, Some("invalid-token")] {
+            assert_eq!(
+                owner_finish_request(&http, run.run_id, token, owner_finish_events(), true)
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for invalid in [true, false] {
+            let mut events = owner_finish_events();
+            if invalid {
+                events[0]["agent"] = serde_json::json!("claude-code");
+            }
+            let response = http.clone().oneshot(
+                Request::builder().method("POST").uri(format!("/workstream/runs/{}/finish", run.run_id))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer proxy-finish-token")
+                    .header("X-Memory-Actor-User", "alice")
+                    .header("X-Memory-Actor-Issuer", "https://idp.example")
+                    .header("X-Memory-Actor-Sub", "bob")
+                    .body(Body::from(serde_json::json!({"events": events, "complete": true, "checkpoint": {}, "actor": {"sub": "alice"}, "principal": {"is_root": true}}).to_string())).unwrap()
+            ).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "foreign proxy owner must be refused before payload handling"
+            );
+        }
+        let malformed = http
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workstream/runs/{}/finish", run.run_id))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer proxy-finish-token")
+                    .header("X-Memory-Actor-Issuer", "https://idp.example")
+                    .body(Body::from("{\"events\":[],\"complete\":true}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        // Enabling proxy authentication never exempts an actual DB principal from grants.
+        let db_run = owner_finish_run(
+            &store,
+            ws,
+            project,
+            "db-no-grant",
+            Some("user:alice".into()),
+        )
+        .await;
+        let db_before = owner_finish_snapshot(&store).await;
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                db_run.run_id,
+                Some(&db_token),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "a DB principal must retain its current project grant check with proxy enabled"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, db_before);
+        assert!(!tmp.path().join("raw/workstreams").exists());
+        // The configured server flag is also required, not just User without a DB id.
+        let without_proxy_policy =
+            ai_memory_hooks::workstream_router(ai_memory_hooks::WorkstreamState {
+                writer: store.writer.clone(),
+                reader: store.reader.clone(),
+                sanitizer: ai_memory_core::Sanitizer::default(),
+                wiki: ai_memory_wiki::Wiki::new(tmp.path(), store.writer.clone())
+                    .unwrap()
+                    .with_store_reader(store.reader.clone()),
+                data_dir: tmp.path().into(),
+                home_dir: None,
+                trusted_proxy_identity: false,
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(auth),
+                require_bearer,
+            ));
+        assert_eq!(
+            owner_finish_request(
+                &without_proxy_policy,
+                run.run_id,
+                Some("proxy-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "proxy compatibility requires the server's trusted-proxy configuration"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, db_before);
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE managed_runs SET lease_expires_at = 0 WHERE id = ?1",
+            rusqlite::params![run.run_id.as_bytes()],
+        )
+        .unwrap();
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some("proxy-finish-token"),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a genuine proxy owner must finish the restricted run it prepared"
+        );
+        let finished = owner_finish_snapshot(&store).await;
+        let foreign_retry = http.clone().oneshot(
+            Request::builder().method("POST").uri(format!("/workstream/runs/{}/finish", run.run_id))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer proxy-finish-token")
+                .header("X-Memory-Actor-User", "alice")
+                .header("X-Memory-Actor-Issuer", "https://idp.example")
+                .header("X-Memory-Actor-Sub", "bob")
+                .body(Body::from(serde_json::json!({"events": owner_finish_events(), "complete": true, "checkpoint": {}}).to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(
+            foreign_retry.status(),
+            StatusCode::FORBIDDEN,
+            "finished proxy retries must still refuse a foreign owner"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, finished);
+        let retry = owner_finish_request(
+            &http,
+            run.run_id,
+            Some("proxy-finish-token"),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(retry.into_body(), 65536)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["imported_events"],
+            0
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, finished);
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                run.run_id,
+                Some(&db_token),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "a DB username cannot forge the proxy's qualified OIDC owner"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, finished);
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                db_run.run_id,
+                Some(&db_token),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_active_api_key_survives_disabled_human_login() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("finish-compat")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "restricted", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let (alice, token) = owner_finish_user(&store, "alice").await;
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        store.writer.set_user_disabled(alice, true).await.unwrap();
+        let http = owner_finish_http(
+            &store,
+            tmp.path(),
+            AuthState::new(Some("root-finish-token".into())).with_multiuser(
+                TokenPepper::new("finish-pepper"),
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let run = owner_finish_prepare_http(&http, &token, "api-human-disabled").await;
+        let response =
+            owner_finish_request(&http, run.run_id, Some(&token), owner_finish_events(), true)
+                .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an active API key with Write must finish after human login is disabled"
+        );
+        let revoked = owner_finish_prepare_http(&http, &token, "api-grant-revoked").await;
+        store
+            .writer
+            .revoke_memory(alice, project, None)
+            .await
+            .unwrap();
+        let before = owner_finish_snapshot(&store).await;
+        let response = owner_finish_request(
+            &http,
+            revoked.run_id,
+            Some(&token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "disabled human login does not waive current API-user project grants"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        assert!(
+            !tmp.path()
+                .join(format!(
+                    "raw/workstreams/{}/segments",
+                    revoked.workstream_id
+                ))
+                .exists()
+        );
+        let credentials = store
+            .reader
+            .list_api_credentials_for_user(alice)
+            .await
+            .unwrap();
+        store
+            .writer
+            .revoke_api_credential(credentials[0].id)
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_finish_request(&http, run.run_id, Some(&token), owner_finish_events(), true)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "a revoked API key must be refused by the real middleware"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+    }
+
+    async fn owner_finish_snapshot(store: &Store) -> Vec<Vec<rusqlite::types::Value>> {
+        store
+            .reader
+            .with_conn(|conn| {
+                let mut result = Vec::new();
+                for table in [
+                    "managed_runs",
+                    "workstreams",
+                    "workstream_events",
+                    "workstream_native_sessions",
+                    "workstream_events_fts_data",
+                    "workstream_events_fts_idx",
+                    "workstream_events_fts_docsize",
+                    "sessions",
+                ] {
+                    let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))?;
+                    let count = stmt.column_count();
+                    let rows =
+                        stmt.query_map([], |row| (0..count).map(|i| row.get(i)).collect())?;
+                    result.extend(
+                        rows.collect::<rusqlite::Result<Vec<Vec<rusqlite::types::Value>>>>()?,
+                    );
+                }
+                Ok(result)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_refuses_another_writer_before_payload_or_segment() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("owner-finish")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "shared", None)
+            .await
+            .unwrap();
+        let (alice, alice_token) = owner_finish_user(&store, "alice").await;
+        let (bob, bob_token) = owner_finish_user(&store, "bob").await;
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        for user in [alice, bob] {
+            store
+                .writer
+                .grant_memory(user, project, ai_memory_store::GrantLevel::Write, None)
+                .await
+                .unwrap();
+        }
+        let run = owner_finish_run(&store, ws, project, "owned", Some("user:alice".into())).await;
+        let http = owner_finish_http(
+            &store,
+            tmp.path(),
+            AuthState::new(Some("root-finish-token".into())).with_multiuser(
+                TokenPepper::new("finish-pepper"),
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let before = owner_finish_snapshot(&store).await;
+        let mut invalid = owner_finish_events();
+        invalid[0]["agent"] = serde_json::json!("claude-code");
+        let response =
+            owner_finish_request(&http, run.run_id, Some(&bob_token), invalid, true).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "owner refusal must precede payload validation"
+        );
+        for complete in [false, true] {
+            let response = owner_finish_request(
+                &http,
+                run.run_id,
+                Some(&bob_token),
+                owner_finish_events(),
+                complete,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "Write permission must not bypass another author's owner"
+            );
+        }
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        assert!(
+            !tmp.path().join("raw/workstreams").exists(),
+            "foreign owner must write no raw segment"
+        );
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some(&alice_token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let before = owner_finish_snapshot(&store).await;
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some(&bob_token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "finished retries still check the owner"
+        );
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some(&alice_token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["imported_events"],
+            0
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_real_auth_rungs_shared_and_project_controls() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("rungs").await.unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "shared", None)
+            .await
+            .unwrap();
+        let anonymous_http = owner_finish_http(&store, tmp.path(), AuthState::new(None));
+        let anonymous_run = owner_finish_run(&store, ws, project, "anonymous", None).await;
+        assert_eq!(
+            owner_finish_request(
+                &anonymous_http,
+                anonymous_run.run_id,
+                None,
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let (alice, token) = owner_finish_user(&store, "alice").await;
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let http = owner_finish_http(
+            &store,
+            tmp.path(),
+            AuthState::new(Some("root-finish-token".into())).with_multiuser(
+                TokenPepper::new("finish-pepper"),
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let shared = owner_finish_run(&store, ws, project, "shared-root", None).await;
+        let before = owner_finish_snapshot(&store).await;
+        assert_eq!(
+            owner_finish_request(
+                &anonymous_http,
+                shared.run_id,
+                None,
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "an anonymous caller must not acquire root on topology reload"
+        );
+        assert_eq!(
+            owner_finish_request(&http, shared.run_id, None, owner_finish_events(), true)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                shared.run_id,
+                Some(&token),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "Read is insufficient for finish"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                shared.run_id,
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "authenticated root without actor may finish NULL-owned runs"
+        );
+        store
+            .writer
+            .grant_memory(alice, project, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        let owned =
+            owner_finish_run(&store, ws, project, "owned-user", Some("user:alice".into())).await;
+        let before = owner_finish_snapshot(&store).await;
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                owned.run_id,
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+            "root without actor must not become Any"
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        // Exercise the real DB-user tier with only its optional viewer marker removed.
+        let without_viewer = ai_memory_hooks::workstream_router(ai_memory_hooks::WorkstreamState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            sanitizer: ai_memory_core::Sanitizer::default(),
+            wiki: ai_memory_wiki::Wiki::new(tmp.path(), store.writer.clone())
+                .unwrap()
+                .with_store_reader(store.reader.clone()),
+            data_dir: tmp.path().into(),
+            home_dir: None,
+            trusted_proxy_identity: false,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut request: Request<Body>, next: Next| async move {
+                request
+                    .extensions_mut()
+                    .remove::<ai_memory_core::AuthorizedViewer>();
+                next.run(request).await
+            },
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(
+                AuthState::new(Some("root-finish-token".into())).with_multiuser(
+                    TokenPepper::new("finish-pepper"),
+                    store.reader.clone(),
+                    store.writer.clone(),
+                ),
+            ),
+            require_bearer,
+        ));
+        let response = owner_finish_request(
+            &without_viewer,
+            owned.run_id,
+            Some(&token),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "DB-user authority must survive an absent optional viewer marker"
+        );
+        for (workspace, name) in [
+            (ws, "foreign-project"),
+            (
+                store
+                    .writer
+                    .get_or_create_workspace("other-rungs")
+                    .await
+                    .unwrap(),
+                "shared",
+            ),
+        ] {
+            let foreign = store
+                .writer
+                .get_or_create_project(workspace, name, None)
+                .await
+                .unwrap();
+            store
+                .writer
+                .set_access_mode(foreign, ai_memory_store::AccessMode::Restricted)
+                .await
+                .unwrap();
+            let run = owner_finish_run(&store, workspace, foreign, name, None).await;
+            let before = owner_finish_snapshot(&store).await;
+            assert_eq!(
+                owner_finish_request(&http, run.run_id, Some(&token), owner_finish_events(), true)
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(owner_finish_snapshot(&store).await, before);
+            assert!(
+                !tmp.path()
+                    .join("raw/workstreams")
+                    .join(run.workstream_id.to_string())
+                    .exists()
+            );
+            store
+                .writer
+                .grant_memory(alice, foreign, ai_memory_store::GrantLevel::Write, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                owner_finish_request(&http, run.run_id, Some(&token), owner_finish_events(), true)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_finish_http_preserves_late_active_terminal_and_missing_phases() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("phases")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "shared", None)
+            .await
+            .unwrap();
+        let http = owner_finish_http(
+            &store,
+            tmp.path(),
+            AuthState::new(Some("root-finish-token".into())),
+        );
+        let run = owner_finish_run(&store, ws, project, "late-active", None).await;
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE managed_runs SET lease_expires_at = 0 WHERE id = ?1",
+            [run.run_id.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                run.run_id,
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "active is allowed even after the lease timestamp"
+        );
+        let before = owner_finish_snapshot(&store).await;
+        let response = owner_finish_request(
+            &http,
+            run.run_id,
+            Some("root-finish-token"),
+            owner_finish_events(),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["imported_events"],
+            0
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        let expired = owner_finish_run(&store, ws, project, "cancelled", None).await;
+        assert!(
+            store
+                .writer
+                .cancel_managed_run(expired.run_id)
+                .await
+                .unwrap()
+        );
+        let before = owner_finish_snapshot(&store).await;
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                expired.run_id,
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            owner_finish_request(
+                &http,
+                ai_memory_core::ManagedRunId::new(),
+                Some("root-finish-token"),
+                owner_finish_events(),
+                true
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(owner_finish_snapshot(&store).await, before);
+        assert!(
+            !tmp.path()
+                .join("raw/workstreams")
+                .join(expired.workstream_id.to_string())
+                .exists()
+        );
+    }
 }

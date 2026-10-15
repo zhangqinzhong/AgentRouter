@@ -98,3 +98,71 @@ fn integration_tests_cost_at_most_one_binary_per_crate() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// Every function a CodeQL model under `.github/codeql/extensions` names must
+/// still exist where its path says. A renamed or moved function would leave
+/// the model matching nothing, and the alerts it clears would silently return.
+#[test]
+fn codeql_model_targets_exist() {
+    let repo_root = crates_dir()
+        .parent()
+        .expect("crates/ lives in the repository root")
+        .to_path_buf();
+    // Crate name in a model path -> that crate's source root.
+    let crate_roots = [
+        ("ai_memory_cli", crates_dir().join("ai-memory-cli/src")),
+        (
+            "ai_memory_importer",
+            repo_root.join("companions/ai-memory-importer/src"),
+        ),
+        (
+            "ai_memory_client",
+            repo_root.join("companions/ai-memory-client/src"),
+        ),
+    ];
+    let models_dir = repo_root.join(".github/codeql/extensions/ai-memory-models/models");
+    let mut targets = 0;
+    let mut problems = Vec::new();
+    for entry in fs::read_dir(&models_dir)
+        .expect("read the CodeQL model dir")
+        .flatten()
+    {
+        let text = fs::read_to_string(entry.path()).expect("read model file");
+        for token in text.split('"') {
+            let mut segments: Vec<&str> = token.split("::").collect();
+            let Some((_, src)) = crate_roots
+                .iter()
+                .find(|(name, _)| segments.len() > 1 && segments[0] == *name)
+            else {
+                continue;
+            };
+            targets += 1;
+            segments.remove(0);
+            let function = segments.pop().expect("a path names a function");
+            let module = segments.join("/");
+            // A crate-root function lives in `lib.rs`; a module is either
+            // `name.rs` or `name/mod.rs`.
+            let candidates = if module.is_empty() {
+                vec!["lib.rs".to_string()]
+            } else {
+                vec![format!("{module}.rs"), format!("{module}/mod.rs")]
+            };
+            let source = candidates
+                .iter()
+                .find_map(|file| fs::read_to_string(src.join(file)).ok())
+                .unwrap_or_default();
+            if !source.contains(&format!("fn {function}(")) {
+                problems.push(format!(
+                    "{token}: no `fn {function}(` in {}/{module}{{.rs,/mod.rs}}",
+                    src.display()
+                ));
+            }
+        }
+    }
+    assert!(targets > 0, "the model dir names no modeled function");
+    assert!(
+        problems.is_empty(),
+        "stale CodeQL model targets:\n{}",
+        problems.join("\n")
+    );
+}

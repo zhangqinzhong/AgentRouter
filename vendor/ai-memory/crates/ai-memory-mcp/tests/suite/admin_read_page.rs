@@ -17,6 +17,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -46,6 +47,11 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(unix)]
+fn symlink(target: &std::path::Path, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
 }
 
 /// A page present in the store but NOT on disk (the index is ahead of the
@@ -150,6 +156,58 @@ async fn read_page_serves_on_disk_page() {
         "written to disk via the wiki",
         "{body}"
     );
+    assert!(body.get("served_from").is_none(), "{body}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_page_does_not_db_fallback_through_a_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+    let path = PagePath::new("notes/linked.md").unwrap();
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter: serde_json::json!({"title": "Stored Copy"}),
+            body: "database fallback must stay hidden".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Stored Copy".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let outside = TempDir::new().unwrap();
+    let canary = outside.path().join("page.md");
+    std::fs::write(&canary, "outside canary").unwrap();
+    let abs = state.wiki.abs_path(ws, proj, &path);
+    std::fs::remove_file(&abs).unwrap();
+    symlink(&canary, &abs);
+
+    let resp = get(
+        state,
+        "/admin/read-page?workspace=default&project=scratch&path=notes%2Flinked.md",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(resp).await;
+    assert!(body["error"].as_str().unwrap_or("").contains("confinement"));
     assert!(body.get("served_from").is_none(), "{body}");
 }
 

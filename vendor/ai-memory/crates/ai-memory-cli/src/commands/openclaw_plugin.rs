@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::render_shared::{
-    ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime, ts_string_literal,
-    ts_timeout_signal,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime,
+    ts_string_literal, ts_timeout_signal,
 };
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
@@ -208,108 +208,15 @@ pub(crate) fn manifest_json() -> String {
         + "\n"
 }
 
-/// Emit the OpenClaw plugin's `applyMarkerParams` TypeScript function.
+/// Emit OpenClaw's `applyMarkerParams` TypeScript from the shared generator.
 ///
-/// `None` reproduces the historical marker-only function byte-for-byte (the
-/// OpenClaw variant always sets `cwd`, even with no marker). `Some(default)`
-/// prepends a `DEFAULT_PROJECT_STRATEGY` const and applies that install-time
-/// default when no marker pins a `project_strategy` (#128); a marker's own
-/// `project` / `project_strategy` still win (§3.3). Mirrors the opencode/omp
-/// `ts_apply_marker_params` in `install_hooks.rs`.
-///
-/// Scope/settings resolution walks past a capture-only marker to the nearest
-/// ancestor marker that declares a setting (#668) via `findSettingsMarker`
-/// (`TS_FIND_SETTINGS_MARKER`, shared with `ts_apply_marker_params` so both
-/// copies stay equivalent).
+/// OpenClaw omits managed-run forwarding but otherwise uses the shared
+/// repository-identity/default-path routing generated for TypeScript clients.
 fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
-    let toml_flag = super::install_hooks::TS_TOML_FLAG;
-    let find_settings_marker = super::install_hooks::TS_FIND_SETTINGS_MARKER;
-    let Some(default) = default_strategy else {
-        return format!(
-            "{toml_flag}\n{find_settings_marker}\n{}",
-            r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
-  if (!cwd) return;
-  url.searchParams.set("cwd", cwd);
-  const marker = findSettingsMarker(cwd);
-  if (!marker) return;
-  try {
-    const body = readFileSync(marker, "utf8");
-    const workspace = tomlKey(body, "workspace");
-    const project = tomlKey(body, "project");
-    const projectStrategy = tomlKey(body, "project_strategy");
-    const dropSubagent = tomlKey(body, "drop_subagent_captures");
-    const defaultGlobal = tomlFlag(body, "default_global");
-    const briefing = tomlFlag(body, "inject_on_session_start");
-    const briefingBudget = tomlFlag(body, "max_chars");
-    if (workspace) url.searchParams.set("workspace", workspace);
-    if (project) url.searchParams.set("project", project);
-    // `project_src` tells the server a marker rescope from a host-derived
-    // repo-root name; only the latter yields to sticky routing (#394).
-    if (project) url.searchParams.set("project_src", "marker");
-    if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
-    if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
-    if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
-    if (briefing) url.searchParams.set("briefing", briefing);
-    if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
-    if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
-      const repoProject = repoRootProject(cwd);
-      if (repoProject) {
-        url.searchParams.set("project", repoProject);
-        url.searchParams.set("project_src", "repo-root");
-      }
-    }
-  } catch (_e) {
-  }
-}"#
-        );
-    };
-    let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
-  if (!cwd) return;
-  url.searchParams.set("cwd", cwd);
-  let workspace: string | undefined;
-  let project: string | undefined;
-  let projectStrategy: string | undefined;
-  let dropSubagent: string | undefined;
-  let defaultGlobal: string | undefined;
-  let briefing: string | undefined;
-  let briefingBudget: string | undefined;
-  const marker = findSettingsMarker(cwd);
-  if (marker) {
-    try {
-      const body = readFileSync(marker, "utf8");
-      workspace = tomlKey(body, "workspace");
-      project = tomlKey(body, "project");
-      projectStrategy = tomlKey(body, "project_strategy");
-      dropSubagent = tomlKey(body, "drop_subagent_captures");
-      defaultGlobal = tomlFlag(body, "default_global");
-      briefing = tomlFlag(body, "inject_on_session_start");
-      briefingBudget = tomlFlag(body, "max_chars");
-    } catch (_e) {
-    }
-  }
-  // `project_src` tells the server a marker rescope from a host-derived
-  // repo-root name; only the latter yields to sticky routing (#394).
-  let projectSrc: string | undefined = project ? "marker" : undefined;
-  if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;
-  if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
-    const repoProject = repoRootProject(cwd);
-    if (repoProject) {
-      project = repoProject;
-      projectSrc = "repo-root";
-    }
-  }
-  if (workspace) url.searchParams.set("workspace", workspace);
-  if (project) url.searchParams.set("project", project);
-  if (projectSrc) url.searchParams.set("project_src", projectSrc);
-  if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
-  if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
-  if (defaultGlobal) url.searchParams.set("default_global", defaultGlobal);
-  if (briefing) url.searchParams.set("briefing", briefing);
-  if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
-}"#;
-    format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{find_settings_marker}\n{body}",
-        ts_string_literal(default)
+    super::install_hooks::ts_apply_marker_params(default_strategy, true).replacen(
+        "  const managedRun = process.env.AI_MEMORY_RUN_ID;\n  if (managedRun) url.searchParams.set(\"managed_run\", managedRun);\n",
+        "",
+        1,
     )
 }
 
@@ -332,7 +239,7 @@ fn build_plugin(
 
 import {{ definePluginEntry }} from "openclaw/plugin-sdk/plugin-entry";
 import {{ execFileSync }} from "node:child_process";
-import {{ closeSync, existsSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, unlinkSync, writeFileSync }} from "node:fs";
+import {{ closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync }} from "node:fs";
 import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
@@ -342,11 +249,7 @@ const AGENT = "openclaw";
 {capture_policy}
 
 {timeout_signal}
-function authHeaders(): Record<string, string> {{
-  const token = resolveToken();
-  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
-}}
-
+{auth_headers}
 function findMarker(cwd: string | undefined): string | undefined {{
   if (!cwd) return undefined;
   let dir = resolve(cwd);
@@ -470,13 +373,14 @@ function postPreCompact(event: any, ctx: any): void {{
   const url = new URL(`${{SERVER}}/hook`);
   url.searchParams.set("event", eventName);
   url.searchParams.set("agent", AGENT);
-  applyMarkerParams(url, typeof body.cwd === "string" ? body.cwd : undefined);
+  if (!applyMarkerParams(url, typeof body.cwd === "string" ? body.cwd : undefined)) return;
   const policy = capturePolicy(body, typeof body.cwd === "string" ? body.cwd : undefined);
   if (policy.disposition === "drop") return;
   try {{
-    // Fire-and-forget, but never silent loss: an unreachable server or
-    // 5xx spools the event in the CLI hook-spool format for a later
-    // drain (#580); a delivered post opportunistically drains backlog.
+    // Fire-and-forget, but never silent loss: an unreachable server, a
+    // 5xx or a transient 4xx spools the event in the CLI hook-spool format
+    // for a later drain (#580); a delivered post opportunistically drains
+    // backlog.
     // Tracked in pendingHookRequests so session_end can await a bounded
     // flush instead of letting teardown kill the in-flight fetch (#676).
     const request = fetch(url, {{
@@ -487,7 +391,7 @@ function postPreCompact(event: any, ctx: any): void {{
     }})
       .catch(() => undefined)
       .then((resp) => {{
-        if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);
+        if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(url, policy.payload);
         else requestSpoolDrain();
       }})
       .catch(() => undefined);
@@ -503,7 +407,7 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
   if (captureServerRouted(currentCwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
-  applyMarkerParams(url, currentCwd);
+  if (!applyMarkerParams(url, currentCwd)) return undefined;
   try {{
     const response = await fetch(url, {{
       headers: authHeaders(),
@@ -583,6 +487,7 @@ export default definePluginEntry({{
         token_line = token_line,
         repo_root_project = super::install_hooks::TS_REPO_ROOT_PROJECT,
         timeout_signal = ts_timeout_signal(),
+        auth_headers = ts_auth_headers_fn(),
         spool_runtime = ts_spool_runtime(),
     )
 }
@@ -599,10 +504,9 @@ mod tests {
         let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(plugin.contains("function spoolFailedHook("));
         assert!(plugin.contains("async function drainHookSpool()"));
-        assert!(
-            plugin
-                .contains("if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);")
-        );
+        assert!(plugin.contains(
+            "if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(url, policy.payload);"
+        ));
         assert!(plugin.contains("else requestSpoolDrain();"));
         crate::commands::render_shared::assert_shared_ts_delivery_runtime("openclaw", &plugin);
         assert!(plugin.contains(r#"return join(env, "hook-spool");"#));
@@ -658,6 +562,8 @@ mod tests {
         assert!(plugin.contains("tomlKey(body, \"project_strategy\")"));
         assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
+        assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         assert!(plugin.contains("function tomlFlag"));
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
@@ -668,10 +574,8 @@ mod tests {
         // outer marker's scope here either.
         assert!(plugin.contains("function findSettingsMarker"));
         assert!(plugin.contains("function declaresSettings"));
-        assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
-        assert!(
-            plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
-        );
+        assert!(plugin.contains("let marker = findSettingsMarker(cwd);"));
+        assert!(plugin.contains("if (declaresSettings(text)) return marker;"));
         assert!(plugin.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(
             plugin.contains("import { basename, dirname, join, resolve, sep } from \"node:path\";")
@@ -680,17 +584,18 @@ mod tests {
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(plugin.matches("windowsHide: true").count(), 2);
+        assert_eq!(plugin.matches("windowsHide: true").count(), 3);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
                 .contains("projectStrategy === \"repo-root\" || projectStrategy === \"repo_root\"")
         );
-        assert!(plugin.contains("url.searchParams.set(\"project\", repoProject)"));
+        assert!(plugin.contains("project = repoProject;"));
+        assert!(plugin.contains("projectSource = \"repo-root\";"));
         assert!(plugin.contains(
-            "applyMarkerParams(url, typeof body.cwd === \"string\" ? body.cwd : undefined);"
+            "if (!applyMarkerParams(url, typeof body.cwd === \"string\" ? body.cwd : undefined)) return;"
         ));
-        assert!(plugin.contains("applyMarkerParams(url, currentCwd);"));
+        assert!(plugin.contains("if (!applyMarkerParams(url, currentCwd)) return undefined;"));
         assert!(plugin.contains("fetchHandoff"));
         assert!(plugin.contains("// capture-policy-v1 (generated; do not fork between adapters)"));
         assert!(plugin.contains("const policy = capturePolicy(body"));
@@ -725,9 +630,364 @@ mod tests {
             "must apply the default when a marker pins no strategy: {plugin}"
         );
         assert!(
-            plugin.contains("const marker = findSettingsMarker(cwd);"),
+            plugin.contains("let marker = findSettingsMarker(cwd);"),
             "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
         );
+    }
+
+    #[test]
+    fn openclaw_executes_shared_home_route_runtime() {
+        if !std::process::Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo_root = home.join("src/api");
+        let repo = repo_root.join("lib");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["remote", "add", "origin", "git@github.com:acme/api.git"])
+                .current_dir(&repo_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../ai-memory-core/fixtures/home_route_cases.json"
+        ))
+        .unwrap();
+        let text = fixture["cases"][0]["toml"]
+            .as_str()
+            .unwrap()
+            .replace("{{HOME}}", &home.to_string_lossy());
+        std::fs::write(home.join(".ai-memory.toml"), text).unwrap();
+        let module = tmp.path().join("openclaw-route.ts");
+        let plugin = build_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        let helpers = plugin
+            .split_once("function tomlFlag")
+            .unwrap()
+            .1
+            .split_once("function postHook")
+            .unwrap()
+            .0;
+        let source = format!(
+            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst routeCwd={1};const direct=homeRoute(readHomeRouteText(join(homedir(),\".ai-memory.toml\")),routeCwd,\"github.com/acme/api\");const url=new URL(\"http://h/hook\");const ok=applyMarkerParams(url,routeCwd);process.stdout.write((direct?.project??\"none\")+\":\"+String(ok)+url.search);",
+            helpers,
+            serde_json::to_string(&repo.to_string_lossy()).unwrap()
+        );
+        std::fs::write(&module, source).unwrap();
+        let output = std::process::Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let query = String::from_utf8(output.stdout).unwrap();
+        assert!(query.starts_with("identity-api:true?cwd="), "{query}");
+        for expected in [
+            "workspace=identity",
+            "project=identity-api",
+            "identity=github.com%2Facme%2Fapi",
+            "identity_src=git_remote",
+            "identity_style=path",
+            "aliases=%5B%22main%22%5D",
+            "drop_subagent=true",
+            "default_global=true",
+            "briefing=true",
+            "briefing_budget=3210",
+            "profile_consume=0",
+        ] {
+            assert!(query.contains(expected), "{expected}: {query}");
+        }
+    }
+
+    #[test]
+    fn openclaw_executes_every_shared_home_route_fixture() {
+        if !std::process::Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../ai-memory-core/fixtures/home_route_cases.json"
+        ))
+        .unwrap();
+        let cases = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| {
+                let text = match case["generate"].as_str() {
+                    Some("65_routes") => (0..65)
+                        .map(|index| format!("[routes.path.\"/route/{index}\"]\nroute_workspace=\"ws\"\nroute_project=\"p{index}\"\n"))
+                        .collect(),
+                    Some("selector_512") => format!("[routes.path.\"/{}\"]\nroute_workspace=\"bounds\"\nroute_project=\"valid\"\n", "a".repeat(511)),
+                    Some("selector_513") => format!("[routes.path.\"/{}\"]\nroute_workspace=\"bounds\"\nroute_project=\"invalid\"\n", "a".repeat(512)),
+                    Some("oversized_file") => format!("#{}\n", "x".repeat(65_536)),
+                    Some(other) => panic!("unknown fixture generator {other}"),
+                    None => case["toml"]
+                        .as_str()
+                        .unwrap()
+                        .replace("{{HOME}}", &home.to_string_lossy())
+                        .replace("{{LONG_513}}", &"a".repeat(513)),
+                };
+                let mut cwd = match case["cwd_generate"].as_str() {
+                    Some("selector_512_child") => format!("/{}/child", "a".repeat(511)),
+                    Some(other) => panic!("unknown cwd fixture generator {other}"),
+                    None => case["cwd"]
+                        .as_str()
+                        .unwrap()
+                        .replace("{{HOME}}", &home.to_string_lossy()),
+                };
+                if let Some(identity) = case["identity"].as_str() {
+                    let repo = home
+                        .join("fixture-repos")
+                        .join(case["name"].as_str().unwrap());
+                    std::fs::create_dir_all(&repo).unwrap();
+                    assert!(
+                        std::process::Command::new("git")
+                            .args(["init", "-q"])
+                            .current_dir(&repo)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                    assert!(
+                        std::process::Command::new("git")
+                            .args([
+                                "remote",
+                                "add",
+                                "origin",
+                                &format!("https://{identity}.git"),
+                            ])
+                            .current_dir(&repo)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                    cwd = repo.to_string_lossy().into_owned();
+                } else if cwd.starts_with(&*home.to_string_lossy()) {
+                    std::fs::create_dir_all(&cwd).unwrap();
+                }
+                serde_json::json!({
+                    "name": case["name"],
+                    "text": text,
+                    "cwd": cwd,
+                    "identity": case["identity"],
+                    "status": case["status"],
+                    "source": case["source"],
+                    "workspace": case["workspace"],
+                    "project": case["project"],
+                    "style": case["style"],
+                    "aliases": case["aliases"],
+                    "flags": case["flags"]
+                })
+            })
+            .collect::<Vec<_>>();
+        let plugin = build_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        let helpers = plugin
+            .split_once("function tomlFlag")
+            .unwrap()
+            .1
+            .split_once("function postHook")
+            .unwrap()
+            .0;
+        let module = tmp.path().join("openclaw-all-routes.ts");
+        let source = format!(
+            "import {{ execFileSync as realExecFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction execFileSync(command:string,args:string[],options?:any):string{{return realExecFileSync(command,args,options) as string;}}\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst cases={} as any[];for(const c of cases){{const file=join(homedir(),\".ai-memory.toml\");writeFileSync(file,c.text);const url=new URL(\"http://h/hook\");let applied=false;let helper=\"none\";try{{const route=homeRoute(readHomeRouteText(file),c.cwd,c.identity);helper=route?route.workspace+\"/\"+route.project:\"none\";}}catch{{helper=\"invalid\";}}try{{applied=applyMarkerParams(url,c.cwd);}}catch{{applied=false;}}process.stdout.write(JSON.stringify({{name:c.name,applied,helper,params:Object.fromEntries(url.searchParams)}})+\"\\n\");}}",
+            helpers,
+            serde_json::to_string(&cases).unwrap()
+        );
+        std::fs::write(&module, source).unwrap();
+        // A Windows cwd such as `c:/work/api/lib` is relative on Unix, so the
+        // marker walk starts in node's working directory; run it from the temp
+        // dir so a contributor's `.ai-memory.toml` in the checkout is not found.
+        let output = std::process::Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .current_dir(tmp.path())
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let results = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let result: serde_json::Value = serde_json::from_str(line).unwrap();
+                (result["name"].as_str().unwrap().to_owned(), result)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for case in &cases {
+            let name = case["name"].as_str().unwrap();
+            let result = &results[name];
+            match case["status"].as_str().unwrap() {
+                "invalid" => {
+                    assert_eq!(result["helper"], "invalid", "{name}: {result}");
+                    assert_eq!(result["applied"], false, "{name}: {result}");
+                }
+                "none" => {
+                    assert_eq!(result["helper"], "none", "{name}: {result}");
+                    assert_eq!(result["applied"], true, "{name}: {result}");
+                    assert!(
+                        result["params"].get("workspace").is_none(),
+                        "{name}: {result}"
+                    );
+                    assert!(
+                        result["params"].get("project").is_none(),
+                        "{name}: {result}"
+                    );
+                }
+                "valid" => {
+                    assert_eq!(result["applied"], true, "{name}: {result}");
+                    assert_eq!(
+                        result["params"]["workspace"], case["workspace"],
+                        "{name}: {result}"
+                    );
+                    assert_eq!(
+                        result["params"]["project"], case["project"],
+                        "{name}: {result}"
+                    );
+                    assert_eq!(
+                        result["params"]["project_src"], "marker",
+                        "{name}: {result}"
+                    );
+                    let has_remote = result["params"]["identity_src"] == "git_remote";
+                    if case["source"] == "identity" && has_remote {
+                        assert_eq!(
+                            result["params"]["identity"], case["identity"],
+                            "{name}: {result}"
+                        );
+                    } else if case["source"] == "path" {
+                        assert!(
+                            result["params"].get("aliases").is_none(),
+                            "{name}: {result}"
+                        );
+                    }
+                    if let Some(style) = case["style"].as_str()
+                        && has_remote
+                    {
+                        assert_eq!(
+                            result["params"]["identity_style"], style,
+                            "{name}: {result}"
+                        );
+                    }
+                    if let Some(aliases) = case["aliases"].as_str()
+                        && has_remote
+                    {
+                        assert_eq!(result["params"]["aliases"], aliases, "{name}: {result}");
+                    }
+                    if let Some(flags) = case["flags"].as_str() {
+                        for pair in flags.split('&') {
+                            let (key, value) = pair.split_once('=').unwrap();
+                            assert_eq!(result["params"][key], value, "{name}: {result}");
+                        }
+                    }
+                }
+                status => panic!("unknown fixture status {status}"),
+            }
+        }
+    }
+
+    #[test]
+    fn openclaw_runtime_preserves_marker_and_home_identity_precedence() {
+        if !std::process::Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["remote", "add", "origin", "git@github.com:acme/api.git"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let marker = repo.join(".ai-memory.toml");
+        let home_marker = home.join(".ai-memory.toml");
+        let module = tmp.path().join("openclaw-identity-gate.ts");
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        let helpers = plugin
+            .split_once("function tomlFlag")
+            .unwrap()
+            .1
+            .split_once("function postHook")
+            .unwrap()
+            .0;
+        let source = format!(
+            "import {{ execFileSync }} from \"node:child_process\";\nimport {{ closeSync, existsSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, unlinkSync, writeFileSync }} from \"node:fs\";\nimport {{ basename, dirname, join, resolve, sep }} from \"node:path\";\nimport {{ homedir }} from \"node:os\";\nfunction readFileSync(path:string,encoding?:\"utf8\"):any{{return readMarkerText(path,encoding);}}\nfunction tomlKey(text:string,key:string):string|undefined{{const m=new RegExp(`^\\\\s*${{key}}\\\\s*=\\\\s*\"([^\"]*)\"`,`m`).exec(text);return m?.[1];}}\nfunction tomlFlag{}\nconst repoCwd={};const marker={};const homeMarker={};const run=(body:string)=>{{writeFileSync(marker,body);const url=new URL(\"http://h/hook\");applyMarkerParams(url,repoCwd);return Object.fromEntries(url.searchParams);}};const noMarkerUrl=new URL(\"http://h/hook\");applyMarkerParams(noMarkerUrl,repoCwd);const noMarker=Object.fromEntries(noMarkerUrl.searchParams);const plain=run('project=\"api\"\\n');const aliases=run('project=\"api\"\\naliases=[\"old-api\"]\\n');unlinkSync(marker);writeFileSync(homeMarker,'[routes.identity.\"github.com/acme/api\"]\\nroute_workspace=\"oss\"\\nroute_project=\"api\"\\n');const routedUrl=new URL(\"http://h/hook\");applyMarkerParams(routedUrl,repoCwd);process.stdout.write(JSON.stringify({{noMarker,plain,aliases,routed:Object.fromEntries(routedUrl.searchParams)}}));",
+            helpers,
+            serde_json::to_string(&repo.to_string_lossy()).unwrap(),
+            serde_json::to_string(&marker.to_string_lossy()).unwrap(),
+            serde_json::to_string(&home_marker.to_string_lossy()).unwrap(),
+        );
+        std::fs::write(&module, source).unwrap();
+        let output = std::process::Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["noMarker"]["identity_src"], "git_remote", "{result}");
+        assert_eq!(result["noMarker"]["identity_style"], "path", "{result}");
+        assert!(result["plain"].get("identity").is_none(), "{result}");
+        assert_eq!(result["aliases"]["identity_src"], "git_remote", "{result}");
+        assert_eq!(result["aliases"]["aliases"], "[\"old-api\"]", "{result}");
+        assert_eq!(result["routed"]["identity_src"], "git_remote", "{result}");
+        assert_eq!(result["routed"]["workspace"], "oss", "{result}");
+        assert_eq!(result["routed"]["project_src"], "marker", "{result}");
     }
 
     #[test]

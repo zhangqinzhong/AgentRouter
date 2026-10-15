@@ -3,8 +3,8 @@
 use std::str::FromStr as _;
 
 use ai_memory_core::{
-    AgentKind, ManagedRunId, NewWorkstreamEvent, ProjectId, WorkspaceId, WorkstreamEvent,
-    WorkstreamEventKind, WorkstreamId,
+    AgentKind, ManagedRunId, NativeSessionIdentity, NewWorkstreamEvent, ProjectId, Sanitizer,
+    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, WorkstreamId, scrub_workstream_provenance,
 };
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -28,6 +28,124 @@ pub enum WorkstreamSelection {
     Named(String),
     /// Create and select a fresh named workstream.
     New(String),
+}
+
+impl WorkstreamSelection {
+    /// Validate caller-controlled selection data before any scope mutation.
+    pub fn validate(&self) -> StoreResult<()> {
+        match self {
+            Self::Current => Ok(()),
+            Self::Named(name) | Self::New(name) => validate_workstream_name(name),
+        }
+    }
+}
+
+/// Authenticated authority for a managed-run mutation: finish (its preflight
+/// and its import transaction), cancel, heartbeat, native-session link and
+/// context acceptance.
+///
+/// Construct only from middleware extensions, never transcript metadata. Owner
+/// filters are derived here so this boundary cannot request `OwnerFilter::Any`.
+#[derive(Debug, Clone)]
+pub struct ManagedRunAuthority {
+    principal: crate::ProjectPrincipal,
+    owner: ai_memory_core::OwnerFilter,
+    distinguishes_operators: bool,
+    project_policy: RunProjectPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RunProjectPolicy {
+    Grants,
+    TrustedProxyLegacy,
+}
+
+impl ManagedRunAuthority {
+    /// Reduce the actual HTTP auth extensions to one immutable finish authority.
+    /// A DB user's attribution id remains authoritative without a viewer marker.
+    #[must_use]
+    pub fn from_auth(
+        level: ai_memory_core::AuthLevel,
+        viewer: Option<ai_memory_core::AuthorizedViewer>,
+        user_id: Option<ai_memory_core::UserId>,
+        actor: &ai_memory_core::ActorContext,
+        trusted_proxy_identity: bool,
+    ) -> Self {
+        use ai_memory_core::AuthLevel;
+        let user = viewer
+            .map(ai_memory_core::AuthorizedViewer::user)
+            .or(user_id);
+        let principal = match level {
+            AuthLevel::Root => crate::ProjectPrincipal::root(),
+            AuthLevel::User => user.map_or_else(
+                crate::ProjectPrincipal::anonymous,
+                crate::ProjectPrincipal::user,
+            ),
+            AuthLevel::Anonymous => crate::ProjectPrincipal::anonymous(),
+        };
+        let owner = if level == AuthLevel::Anonymous {
+            ai_memory_core::OwnerFilter::Unattributed
+        } else {
+            ai_memory_core::OwnerFilter::for_actor_context(actor)
+        };
+        // The real proxy middleware has an identity and User capability, but
+        // no DB principal. Preserve its viewer-less project policy only when
+        // this server actually enables trusted proxy authentication.
+        let project_policy = match (level, user, actor.identity_key(), trusted_proxy_identity) {
+            (AuthLevel::User, None, Some(_), true) => RunProjectPolicy::TrustedProxyLegacy,
+            _ => RunProjectPolicy::Grants,
+        };
+        Self {
+            principal,
+            owner,
+            distinguishes_operators: trusted_proxy_identity || level == AuthLevel::User,
+            project_policy,
+        }
+    }
+}
+
+/// Resolve only the real run scope and owner, without creating a scope or
+/// changing the active-project pointer. Both callers supply a SQL snapshot.
+pub(crate) fn authorize_run_mutation(
+    conn: &Connection,
+    run_id: ManagedRunId,
+    authority: &ManagedRunAuthority,
+) -> StoreResult<()> {
+    let (owner, workspace, project) = conn
+        .query_row(
+            "SELECT r.owner_user, w.workspace_id, w.project_id FROM managed_runs r \
+             LEFT JOIN workstreams w ON w.id = r.workstream_id WHERE r.id = ?1",
+            params![run_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound("managed run not found".into()))?;
+    if !authority.owner.admits(owner.as_deref()) {
+        return Err(StoreError::Forbidden(
+            "managed run belongs to another operator",
+        ));
+    }
+    let workspace = WorkspaceId::from_slice(&workspace)?;
+    let project = ProjectId::from_slice(&project)?;
+    let project_authz = crate::project_authz::resolve_project_authz_strict(
+        conn,
+        workspace,
+        project,
+        &authority.principal,
+        authority.distinguishes_operators,
+    )?;
+    match authority.project_policy {
+        RunProjectPolicy::TrustedProxyLegacy => Ok(()),
+        RunProjectPolicy::Grants => project_authz
+            .authorize(crate::ProjectAccess::Write)
+            .map_err(|failure| StoreError::Forbidden(failure.message())),
+    }
 }
 
 /// Store-level input for opening a managed run.
@@ -79,9 +197,66 @@ pub struct PreparedWorkstreamRun {
     pub may_adopt_existing_session: bool,
 }
 
+/// Result of binding a SessionStart to an exact or recovered managed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedRunSessionLink {
+    /// The supplied run was active and accepted the native session.
+    Exact(ManagedRunId),
+    /// A stale supplied id was replaced by the sole safe current candidate.
+    Adopted(ManagedRunId),
+    /// No live run matched the current repository and operator.
+    NoMatch,
+    /// More than one run matched, so choosing one would be unsafe.
+    Ambiguous,
+    /// The supplied active run disagreed with the request boundary.
+    Refused,
+}
+
+/// Exact boundary used to link or recover one managed SessionStart.
+#[derive(Debug, Clone)]
+pub struct LinkOrAdoptManagedRunSession {
+    /// Run id supplied by the child hook; it may be terminal for Codex.
+    pub supplied_run_id: ManagedRunId,
+    /// Already-resolved workspace receiving the SessionStart.
+    pub workspace_id: WorkspaceId,
+    /// Already-resolved project receiving the SessionStart.
+    pub project_id: ProjectId,
+    /// Canonical checkout cwd recorded by both launcher and hook.
+    pub cwd: String,
+    /// Harness reporting the native session.
+    pub agent: AgentKind,
+    /// Harness-native session id to bind exactly once.
+    pub native_session_id: String,
+    /// Topology-aware qualified operator identity, or shared `None`.
+    pub owner_user: Option<String>,
+}
+
+/// Scope a later hook event of a managed run resolved to.
+///
+/// The SessionStart binding goes through [`LinkOrAdoptManagedRunSession`];
+/// every later event carrying the run id goes through this, and both enforce
+/// the same run boundary.
+#[derive(Debug, Clone)]
+pub struct LinkManagedRunSessionInScope {
+    /// Run id the hook event carried.
+    pub run_id: ManagedRunId,
+    /// Workspace the event was admitted to.
+    pub workspace_id: WorkspaceId,
+    /// Project the event was admitted to.
+    pub project_id: ProjectId,
+    /// Harness reporting the native session.
+    pub agent: AgentKind,
+    /// Harness-native session id to bind.
+    pub native_session_id: String,
+    /// Topology-aware qualified operator identity, or shared `None`.
+    pub owner_user: Option<String>,
+}
+
 /// Store-level finish input after the raw segment has been made durable.
 #[derive(Debug, Clone)]
 pub struct FinishWorkstreamRun {
+    /// Configured, reusable privacy strip for the provenance storage boundary.
+    pub sanitizer: Sanitizer,
     /// Managed invocation.
     pub run_id: ManagedRunId,
     /// Actual native session, when observed.
@@ -217,21 +392,83 @@ struct FinishRunRow {
     sync_after: i64,
     sync_through: i64,
     context_delivered: bool,
+    exit_code: Option<i32>,
 }
 
 struct LinkRunRow {
     workstream: Vec<u8>,
     agent: String,
     native_session: Option<String>,
+    native_session_linked: bool,
     sync_through: i64,
     context_delivered: bool,
+}
+
+struct ManagedRunBoundaryRow {
+    state: String,
+    workspace: Vec<u8>,
+    project: Vec<u8>,
+    cwd: String,
+    agent: String,
+    owner_user: Option<String>,
+    native_session: Option<String>,
+}
+
+impl ManagedRunBoundaryRow {
+    const SELECT: &str = "SELECT mr.state, w.workspace_id, w.project_id, w.cwd, mr.agent_kind, \
+                mr.owner_user, mr.native_session_id \
+         FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
+         WHERE mr.id = ?1";
+
+    fn read(tx: &Transaction<'_>, run_id: ManagedRunId) -> StoreResult<Option<Self>> {
+        Ok(tx
+            .query_row(Self::SELECT, params![run_id.as_bytes()], |row| {
+                Ok(Self {
+                    state: row.get(0)?,
+                    workspace: row.get(1)?,
+                    project: row.get(2)?,
+                    cwd: row.get(3)?,
+                    agent: row.get(4)?,
+                    owner_user: row.get(5)?,
+                    native_session: row.get(6)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// The scope and operator a native session may join this run from: the
+    /// run's own project and its launching operator (a shared run admits only
+    /// shared callers). SessionStart also pins the checkout `cwd`; a later
+    /// event's `cwd` follows the agent around the checkout, so it is not
+    /// compared there.
+    fn admits(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cwd: Option<&str>,
+        owner_user: Option<&str>,
+    ) -> bool {
+        self.workspace.as_slice() == workspace_id.as_bytes()
+            && self.project.as_slice() == project_id.as_bytes()
+            && cwd.is_none_or(|cwd| self.cwd == cwd)
+            && self.owner_user.as_deref() == owner_user
+    }
 }
 
 /// Atomically select a workstream, expire stale leases, and open one run.
 pub(crate) fn prepare_run(
     conn: &mut Connection,
     input: &PrepareWorkstreamRun,
+    owner_user: Option<&str>,
+    force_unlock: bool,
 ) -> StoreResult<PreparedWorkstreamRun> {
+    if owner_user
+        .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
+    {
+        return Err(StoreError::InvalidState(
+            "invalid managed-run owner identity".into(),
+        ));
+    }
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     tx.execute(
@@ -241,21 +478,29 @@ pub(crate) fn prepare_run(
     )?;
 
     let (workstream_id, workstream_name) = select_workstream(&tx, input, now)?;
-    let busy: Option<(String, i64)> = tx
+    let busy: Option<(Vec<u8>, String, i64, Option<String>)> = tx
         .query_row(
-            "SELECT lease_owner, lease_expires_at FROM managed_runs \
+            "SELECT id, lease_owner, lease_expires_at, owner_user FROM managed_runs \
              WHERE workstream_id = ?1 AND state = 'active'",
             params![workstream_id.as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if let Some((owner, expires)) = busy {
-        return Err(StoreError::WorkstreamBusy(format!(
-            "owned by {owner} until {}",
-            Timestamp::from_microsecond(expires)
-                .map(|t| t.to_string())
-                .unwrap_or_else(|_| expires.to_string())
-        )));
+    if let Some((run_id, owner, expires, active_owner_user)) = busy {
+        if force_unlock && active_owner_user.as_deref() == owner_user {
+            tx.execute(
+                "UPDATE managed_runs SET state = 'expired', ended_at = ?1, \
+                 lease_expires_at = ?1 WHERE id = ?2 AND state = 'active'",
+                params![now, run_id],
+            )?;
+        } else {
+            return Err(StoreError::WorkstreamBusy(format!(
+                "owned by {owner} until {}",
+                Timestamp::from_microsecond(expires)
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|_| expires.to_string())
+            )));
+        }
     }
 
     let latest_sequence: i64 = tx.query_row(
@@ -295,15 +540,16 @@ pub(crate) fn prepare_run(
     let run_id = ManagedRunId::new();
     tx.execute(
         "INSERT INTO managed_runs( \
-             id, workstream_id, agent_kind, lease_owner, native_session_id, state, \
+             id, workstream_id, agent_kind, lease_owner, native_session_id, owner_user, state, \
              sync_after, sync_through, context_delivered, lease_expires_at, started_at \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, 0, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10)",
         params![
             run_id.as_bytes(),
             workstream_id.as_bytes(),
             agent.as_str(),
             input.lease_owner,
             native_session_id,
+            owner_user,
             sync_after,
             latest_sequence,
             now + LEASE_MICROS,
@@ -508,14 +754,30 @@ pub(crate) fn link_native_session(
     agent: AgentKind,
     native_session_id: &str,
 ) -> StoreResult<bool> {
-    if native_session_id.trim().is_empty() {
-        return Ok(false);
-    }
+    let native_identity =
+        match NativeSessionIdentity::parse(native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(false),
+        };
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
+    let linked = link_native_session_in_transaction(&tx, run_id, agent, &native_identity, now)?;
+    tx.commit()?;
+    Ok(linked)
+}
+
+fn link_native_session_in_transaction(
+    tx: &Transaction<'_>,
+    run_id: ManagedRunId,
+    agent: AgentKind,
+    native_session_id: &NativeSessionIdentity,
+    now: i64,
+) -> StoreResult<bool> {
+    let native_session_id = native_session_id.as_str();
     let run: Option<LinkRunRow> = tx
         .query_row(
-            "SELECT workstream_id, agent_kind, native_session_id, sync_through, context_delivered \
+            "SELECT workstream_id, agent_kind, native_session_id, \
+                    native_session_linked_at IS NOT NULL, sync_through, context_delivered \
              FROM managed_runs WHERE id = ?1 AND state = 'active'",
             params![run_id.as_bytes()],
             |row| {
@@ -523,8 +785,9 @@ pub(crate) fn link_native_session(
                     workstream: row.get(0)?,
                     agent: row.get(1)?,
                     native_session: row.get(2)?,
-                    sync_through: row.get(3)?,
-                    context_delivered: row.get(4)?,
+                    native_session_linked: row.get(3)?,
+                    sync_through: row.get(4)?,
+                    context_delivered: row.get(5)?,
                 })
             },
         )
@@ -535,7 +798,7 @@ pub(crate) fn link_native_session(
     if run.agent != agent.as_str() {
         return Ok(false);
     }
-    if run.context_delivered
+    if (run.context_delivered || run.native_session_linked)
         && run
             .native_session
             .as_deref()
@@ -582,8 +845,159 @@ pub(crate) fn link_native_session(
              native_session_linked_at = ?3 WHERE id = ?4",
         params![native_session_id, initial_delivery, now, run_id.as_bytes()],
     )?;
-    tx.commit()?;
     Ok(true)
+}
+
+/// Bind a SessionStart to its exact run, or recover one stale Codex daemon id.
+///
+/// Candidate selection and linking share one writer transaction. Recovery is
+/// deliberately narrow: only a missing/terminal Codex id can be replaced, and
+/// only by the sole live, undelivered, never-linked run in the same repository
+/// and operator bucket.
+pub(crate) fn link_or_adopt_native_session(
+    conn: &mut Connection,
+    input: &LinkOrAdoptManagedRunSession,
+) -> StoreResult<ManagedRunSessionLink> {
+    if input.native_session_id.trim().is_empty()
+        || input.cwd.trim().is_empty()
+        || input
+            .owner_user
+            .as_deref()
+            .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
+    {
+        return Ok(ManagedRunSessionLink::Refused);
+    }
+
+    let native_identity =
+        match NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(ManagedRunSessionLink::Refused),
+        };
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let supplied = ManagedRunBoundaryRow::read(&tx, input.supplied_run_id)?;
+
+    let selected = match supplied {
+        Some(run) if run.state == "active" => {
+            let boundary_matches = run.admits(
+                input.workspace_id,
+                input.project_id,
+                Some(&input.cwd),
+                input.owner_user.as_deref(),
+            ) && run.agent == input.agent.as_str();
+            if !boundary_matches {
+                tx.commit()?;
+                return Ok(ManagedRunSessionLink::Refused);
+            }
+            (input.supplied_run_id, false)
+        }
+        _ if input.agent == AgentKind::Codex => {
+            let mut statement = tx.prepare(
+                "SELECT mr.id FROM managed_runs mr \
+                 JOIN workstreams w ON w.id = mr.workstream_id \
+                 WHERE w.workspace_id = ?1 AND w.project_id = ?2 AND w.cwd = ?3 \
+                   AND mr.agent_kind = ?4 AND mr.owner_user IS ?5 \
+                   AND mr.state = 'active' AND mr.lease_expires_at > ?6 \
+                   AND mr.context_delivered = 0 AND mr.native_session_linked_at IS NULL \
+                 ORDER BY mr.started_at DESC, mr.id DESC LIMIT 2",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    input.workspace_id.as_bytes(),
+                    input.project_id.as_bytes(),
+                    input.cwd.as_str(),
+                    input.agent.as_str(),
+                    input.owner_user.as_deref(),
+                    now,
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            let candidates = rows.collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            match candidates.as_slice() {
+                [only] => (ManagedRunId::from_slice(only)?, true),
+                [] => {
+                    tx.commit()?;
+                    return Ok(ManagedRunSessionLink::NoMatch);
+                }
+                _ => {
+                    tx.commit()?;
+                    return Ok(ManagedRunSessionLink::Ambiguous);
+                }
+            }
+        }
+        _ => {
+            tx.commit()?;
+            return Ok(ManagedRunSessionLink::NoMatch);
+        }
+    };
+
+    if !link_native_session_in_transaction(&tx, selected.0, input.agent, &native_identity, now)? {
+        tx.commit()?;
+        return Ok(ManagedRunSessionLink::Refused);
+    }
+    tx.commit()?;
+    Ok(if selected.1 {
+        ManagedRunSessionLink::Adopted(selected.0)
+    } else {
+        ManagedRunSessionLink::Exact(selected.0)
+    })
+}
+
+/// Bind the native session a later hook event of a managed run reported.
+///
+/// The event's admitted scope and operator must match the run's boundary, as
+/// at SessionStart: a run id alone, obtained out of band, must not let another
+/// operator or another project repoint the run's current session. A boundary
+/// mismatch that would change nothing (the run already holds this session) is
+/// a quiet no-op rather than a refusal.
+pub(crate) fn link_native_session_in_scope(
+    conn: &mut Connection,
+    input: &LinkManagedRunSessionInScope,
+) -> StoreResult<ManagedRunSessionLink> {
+    if input
+        .owner_user
+        .as_deref()
+        .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
+    {
+        return Ok(ManagedRunSessionLink::Refused);
+    }
+    let native_identity =
+        match NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(ManagedRunSessionLink::NoMatch),
+        };
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let Some(run) =
+        ManagedRunBoundaryRow::read(&tx, input.run_id)?.filter(|run| run.state == "active")
+    else {
+        tx.commit()?;
+        return Ok(ManagedRunSessionLink::NoMatch);
+    };
+    if !run.admits(
+        input.workspace_id,
+        input.project_id,
+        None,
+        input.owner_user.as_deref(),
+    ) {
+        tx.commit()?;
+        return Ok(
+            if run.native_session.as_deref() == Some(native_identity.as_str()) {
+                ManagedRunSessionLink::NoMatch
+            } else {
+                ManagedRunSessionLink::Refused
+            },
+        );
+    }
+    let linked =
+        link_native_session_in_transaction(&tx, input.run_id, input.agent, &native_identity, now)?;
+    tx.commit()?;
+    Ok(if linked {
+        ManagedRunSessionLink::Exact(input.run_id)
+    } else {
+        ManagedRunSessionLink::NoMatch
+    })
 }
 
 /// Mark the assigned synchronization packet delivered to SessionStart.
@@ -638,14 +1052,33 @@ fn accept_context_in_transaction(
 /// Index one immutable source segment and close the run atomically.
 pub(crate) fn finish_run(
     conn: &mut Connection,
+    authority: &ManagedRunAuthority,
     input: &FinishWorkstreamRun,
+) -> StoreResult<FinishedWorkstreamRun> {
+    finish_run_inner(conn, authority, input, false)
+}
+
+pub(crate) fn recover_run(
+    conn: &mut Connection,
+    authority: &ManagedRunAuthority,
+    input: &FinishWorkstreamRun,
+) -> StoreResult<FinishedWorkstreamRun> {
+    finish_run_inner(conn, authority, input, true)
+}
+
+fn finish_run_inner(
+    conn: &mut Connection,
+    authority: &ManagedRunAuthority,
+    input: &FinishWorkstreamRun,
+    recover_expired: bool,
 ) -> StoreResult<FinishedWorkstreamRun> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
+    authorize_run_mutation(&tx, input.run_id, authority)?;
     let run: Option<FinishRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, state, \
-                    sync_after, sync_through, context_delivered \
+                    sync_after, sync_through, context_delivered, exit_code \
              FROM managed_runs WHERE id = ?1",
             params![input.run_id.as_bytes()],
             |row| {
@@ -657,6 +1090,7 @@ pub(crate) fn finish_run(
                     sync_after: row.get(4)?,
                     sync_through: row.get(5)?,
                     context_delivered: row.get(6)?,
+                    exit_code: row.get(7)?,
                 })
             },
         )
@@ -675,6 +1109,7 @@ pub(crate) fn finish_run(
         sync_after,
         sync_through,
         context_delivered,
+        exit_code,
     } = run;
     let latest_before: i64 = tx.query_row(
         "SELECT COALESCE(MAX(sequence), 0) FROM workstream_events WHERE workstream_id = ?1",
@@ -682,12 +1117,44 @@ pub(crate) fn finish_run(
         |row| row.get(0),
     )?;
     if state == "finished" {
+        if recover_expired {
+            validate_finished_recovery(
+                &tx,
+                &workstream,
+                &agent_wire,
+                linked_session.as_deref(),
+                exit_code,
+                input,
+            )?;
+        }
+        tx.commit()?;
         return Ok(FinishedWorkstreamRun {
             imported_events: 0,
             latest_sequence: latest_before,
         });
     }
-    if state != "active" {
+    if state == "expired" && recover_expired {
+        let superseded: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_runs newer \
+             JOIN managed_runs current ON current.id = ?2 \
+             WHERE newer.workstream_id = ?1 AND \
+               (newer.started_at > current.started_at OR \
+                (newer.started_at = current.started_at AND newer.rowid > current.rowid)))",
+            params![workstream, input.run_id.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if superseded {
+            return Err(StoreError::InvalidState(format!(
+                "managed run {} was superseded and cannot be recovered",
+                input.run_id
+            )));
+        }
+        tx.execute(
+            "UPDATE managed_runs SET state = 'active', ended_at = NULL, lease_expires_at = ?1 \
+             WHERE id = ?2 AND state = 'expired'",
+            params![now + LEASE_MICROS, input.run_id.as_bytes()],
+        )?;
+    } else if state != "active" {
         return Err(StoreError::InvalidState(format!(
             "managed run {} is {state}",
             input.run_id
@@ -699,9 +1166,24 @@ pub(crate) fn finish_run(
         .as_deref()
         .or(linked_session.as_deref());
 
+    let sanitizer = Sanitizer::builtin();
+    let validate = |id: &str| {
+        NativeSessionIdentity::parse(id, &sanitizer).map_err(|_| {
+            StoreError::InvalidState(
+                "native session identity is UNKNOWN; refusing managed binding".into(),
+            )
+        })
+    };
+    let native_identity = native_session.map(validate).transpose()?;
+    let native_session = native_identity.as_ref().map(NativeSessionIdentity::as_str);
+    let event_identities = input
+        .events
+        .iter()
+        .map(|event| validate(&event.native_session_id))
+        .collect::<StoreResult<Vec<_>>>()?;
     let mut latest = latest_before;
     let mut imported = 0_usize;
-    for event in &input.events {
+    for (event, event_identity) in input.events.iter().zip(event_identities) {
         if event.agent != agent {
             return Err(StoreError::InvalidState(format!(
                 "event {} belongs to {}, managed run expects {}",
@@ -718,25 +1200,44 @@ pub(crate) fn finish_run(
                 event.event_id, event.native_session_id
             )));
         }
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workstream_events \
-             WHERE workstream_id = ?1 AND event_id = ?2)",
-            params![workstream, event.event_id],
-            |row| row.get(0),
-        )?;
-        if exists {
+        let existing: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT agent_kind, native_session_id, kind FROM workstream_events \
+             WHERE workstream_id = ?1 AND event_id = ?2",
+                params![workstream, event.event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            // Privacy patterns and bounds can change between uploads. Replay
+            // keeps the first indexed data and compares only stable identity.
+            if existing.0 != event.agent.as_str()
+                || existing.1 != event.native_session_id
+                || existing.2 != event.kind.as_str()
+            {
+                return Err(StoreError::InvalidState(
+                    "workstream event id reused with different identity".into(),
+                ));
+            }
             continue;
         }
-        latest += 1;
+        let (source_record_id, metadata) = scrub_workstream_provenance(
+            &input.sanitizer,
+            event.source_record_id.as_deref(),
+            &event.metadata,
+        );
+        let metadata_json = serde_json::to_string(&metadata)?;
         // Store-boundary bound (defense in depth): the hook layer already
-        // scrubs and normalizes event content, but the store is the last gate
-        // before durable persistence — bound the free-text `content` so a
-        // caller that ever forgets cannot write unbounded prose to the DB.
-        // `metadata_json` is left intact: it is structured JSON and
-        // truncating the serialized form would corrupt it; its size is
-        // bounded by the event schema, not free text.
-        let content =
-            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES);
+        // scrubs and caps event content, but the store is the last gate
+        // before durable persistence — scrub with the caller's sanitizer and
+        // then bound the free-text `content`, so a caller that ever forgets
+        // cannot write unbounded prose (or a secret straddling the cap, cut
+        // into an unmatched prefix, #1113) to the DB.
+        let content = ai_memory_core::truncate_utf8_bytes(
+            &input.sanitizer.scrub(&event.content),
+            WORKSTREAM_CONTENT_MAX_BYTES,
+        );
+        latest += 1;
         tx.execute(
             "INSERT INTO workstream_events( \
                  workstream_id, sequence, event_id, agent_kind, native_session_id, \
@@ -748,13 +1249,13 @@ pub(crate) fn finish_run(
                 latest,
                 event.event_id,
                 event.agent.as_str(),
-                event.native_session_id,
-                event.source_record_id,
+                event_identity.as_str(),
+                source_record_id,
                 event.kind.as_str(),
                 event.role,
                 content,
                 event.occurred_at,
-                serde_json::to_string(&event.metadata)?,
+                metadata_json,
                 input.segment_path,
                 now,
             ],
@@ -827,6 +1328,108 @@ pub(crate) fn finish_run(
     })
 }
 
+fn validate_finished_recovery(
+    tx: &Transaction<'_>,
+    workstream: &[u8],
+    agent_wire: &str,
+    linked_session: Option<&str>,
+    exit_code: Option<i32>,
+    input: &FinishWorkstreamRun,
+) -> StoreResult<()> {
+    if input.native_session_id.as_deref() != linked_session
+        || (input.complete && input.exit_code != exit_code)
+        || (!input.complete && (input.source_cursor.is_some() || input.exit_code.is_some()))
+    {
+        return Err(StoreError::InvalidState(
+            "finished managed run recovery is not an exact replay".into(),
+        ));
+    }
+    for event in &input.events {
+        type StoredEvent = (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        );
+        let stored: Option<StoredEvent> = tx
+            .query_row(
+                "SELECT agent_kind, native_session_id, kind, source_record_id, role, content, \
+                        occurred_at, metadata_json FROM workstream_events \
+                 WHERE workstream_id = ?1 AND event_id = ?2",
+                params![workstream, event.event_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (source_record_id, metadata) = scrub_workstream_provenance(
+            &input.sanitizer,
+            event.source_record_id.as_deref(),
+            &event.metadata,
+        );
+        let expected = (
+            event.agent.as_str(),
+            event.native_session_id.as_str(),
+            event.kind.as_str(),
+            source_record_id.as_deref(),
+            event.role.as_deref(),
+            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES),
+            event.occurred_at.as_deref(),
+            serde_json::to_string(&metadata)?,
+        );
+        let exact = stored.as_ref().is_some_and(|stored| {
+            stored.0 == expected.0
+                && stored.1 == expected.1
+                && stored.2 == expected.2
+                && stored.3.as_deref() == expected.3
+                && stored.4.as_deref() == expected.4
+                && stored.5 == expected.5
+                && stored.6.as_deref() == expected.6
+                && stored.7 == expected.7
+        });
+        if !exact || event.agent.as_str() != agent_wire {
+            return Err(StoreError::InvalidState(
+                "finished managed run recovery contains uncommitted or changed events".into(),
+            ));
+        }
+    }
+    let stored_cursor = if let Some(native_session) = linked_session {
+        tx.query_row(
+            "SELECT source_cursor FROM workstream_native_sessions \
+             WHERE workstream_id = ?1 AND agent_kind = ?2 AND native_session_id = ?3",
+            params![workstream, agent_wire, native_session],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidState(
+                "finished managed run recovery has no durable native session".into(),
+            )
+        })?
+    } else {
+        None
+    };
+    if input.complete && stored_cursor != input.source_cursor {
+        return Err(StoreError::InvalidState(
+            "finished managed run recovery cannot advance its source cursor".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reader-side managed-run status.
 pub(crate) fn run_status(
     conn: &Connection,
@@ -881,8 +1484,10 @@ pub(crate) fn list_recent(
     repo_fingerprint: &str,
     worktree_fingerprint: &str,
     limit: usize,
+    offset: usize,
 ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
     let mut statement = conn.prepare(
         "WITH scoped AS ( \
              SELECT id, name, created_at, selected_at, updated_at \
@@ -896,7 +1501,7 @@ pub(crate) fn list_recent(
                     EXISTS(SELECT 1 FROM current_workstream \
                            WHERE current_workstream.id = scoped.id) AS is_current \
              FROM scoped \
-              ORDER BY is_current DESC, scoped.updated_at DESC, scoped.id DESC LIMIT ?5 \
+              ORDER BY is_current DESC, scoped.updated_at DESC, scoped.id DESC LIMIT ?5 OFFSET ?6 \
          ) \
          SELECT recent.id, recent.name, recent.created_at, recent.updated_at, \
                 recent.is_current, native.agent_kind \
@@ -913,6 +1518,7 @@ pub(crate) fn list_recent(
             repo_fingerprint,
             worktree_fingerprint,
             limit,
+            offset,
         ],
         |row| {
             Ok((
@@ -1117,6 +1723,8 @@ pub(crate) fn run_context(
             event_id,
             agent: AgentKind::from_wire(&agent),
             native_session_id,
+            source_record_id: None,
+            metadata: serde_json::Value::Null,
             kind: WorkstreamEventKind::from_str(&kind)?,
             role,
             content,
@@ -1144,6 +1752,7 @@ pub(crate) fn search_events(
     query: &str,
     limit: usize,
     stopwords: &crate::fts_query::FtsStopwords,
+    sanitizer: &Sanitizer,
 ) -> StoreResult<Vec<WorkstreamEvent>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
     let free_text = query
@@ -1152,65 +1761,92 @@ pub(crate) fn search_events(
         .replace("content:", "");
     let fts_query = crate::prepare_fts5_query(&free_text, stopwords);
     let sql = if fts_query.is_empty() {
-        "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at \
+        "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at, \
+                source_record_id, metadata_json \
          FROM workstream_events WHERE workstream_id = ?1 ORDER BY sequence DESC LIMIT ?2"
     } else {
         "SELECT e.sequence, e.event_id, e.agent_kind, e.native_session_id, e.kind, \
-                e.role, e.content, e.occurred_at \
+                e.role, e.content, e.occurred_at, e.source_record_id, e.metadata_json \
          FROM workstream_events_fts f \
          JOIN workstream_events e ON e.rowid = f.rowid \
          WHERE workstream_events_fts MATCH ?2 AND e.workstream_id = ?1 \
          ORDER BY f.rank LIMIT ?3"
     };
     let mut statement = conn.prepare(sql)?;
-    let read_row = |row: &rusqlite::Row<'_>| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, Option<String>>(7)?,
-        ))
-    };
     let mut events = Vec::new();
     if fts_query.is_empty() {
-        let rows = statement.query_map(params![workstream_id.as_bytes(), limit], read_row)?;
+        let rows = statement.query_map(params![workstream_id.as_bytes(), limit], read_event_row)?;
         for row in rows {
-            events.push(stored_event(row?)?);
+            events.push(stored_event(row?, sanitizer)?);
         }
     } else {
         let rows = statement.query_map(
             params![workstream_id.as_bytes(), fts_query, limit],
-            read_row,
+            read_event_row,
         )?;
         for row in rows {
-            events.push(stored_event(row?)?);
+            events.push(stored_event(row?, sanitizer)?);
         }
     }
     Ok(events)
 }
 
-fn stored_event(
-    row: (
-        i64,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-    ),
-) -> StoreResult<WorkstreamEvent> {
-    let (sequence, event_id, agent, native_session_id, kind, role, content, occurred_at) = row;
+type EventRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn stored_event(row: EventRow, sanitizer: &Sanitizer) -> StoreResult<WorkstreamEvent> {
+    let (
+        sequence,
+        event_id,
+        agent,
+        native_session_id,
+        kind,
+        role,
+        content,
+        occurred_at,
+        source,
+        metadata,
+    ) = row;
+    // Oversized or malformed legacy dumps carry no trusted correlation data.
+    let metadata = if metadata.len() <= 16 * 1024 {
+        serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
+    let (source_record_id, metadata) =
+        scrub_workstream_provenance(sanitizer, source.as_deref(), &metadata);
     Ok(WorkstreamEvent {
         sequence,
         event_id,
         agent: AgentKind::from_wire(&agent),
-        native_session_id,
+        native_session_id: NativeSessionIdentity::project(&native_session_id, sanitizer),
+        source_record_id,
+        metadata,
         kind: WorkstreamEventKind::from_str(&kind)?,
         role,
         content,

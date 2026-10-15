@@ -1,23 +1,56 @@
 # MCP install guide - additional clients
 
+For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
+It shows direct MCP writes, queries and handoffs without a native hook adapter.
+
+Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
+`install-mcp` client; their hand-written recipes are in
+[`install.md`](install.md#clients-without-an-install-mcp-writer).
+
 > All snippets below default to `http://127.0.0.1:49374` (local server). For a
 > remote server (homelab, LAN box) substitute the appropriate URL AND add an
 > `Authorization: Bearer <token>` header to the `headers` block when bearer auth
 > is enabled. The MCP wire protocol expects the `/mcp` path suffix on the URL.
 
+> **Token kept in the data dir.** When this install's bearer comes from
+> `[auth].bearer_token_file` (every fresh `ai-memory init`, and
+> `ai-memory auth enable`), `install-mcp` never writes it into a client's
+> config. Claude Code gets the session-aware `ai-memory mcp-bridge` stdio
+> entry, and Muse Code always gets one (`mcp-bridge --agent muse`, which reads
+> the token file itself); Codex (`bearer_token_env_var`), Prime Agent (`bearerTokenEnvVar`) and
+> Factory Droid (`Bearer ${AI_MEMORY_AUTH_TOKEN}` in `headers`) name
+> `AI_MEMORY_AUTH_TOKEN`, which you export where you start them. Every
+> other client gets a local stdio entry, in its own format, that runs
+> `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
+> the token file at launch and forwards no session id, so the client passes
+> `workspace` and `project` like any static client. The client must find
+> `ai-memory` on its `PATH` (GUI apps may need the full path). ZCode keeps
+> HTTP entries only and is refused. Passing `--auth-token` explicitly (or
+> `AI_MEMORY_AUTH_TOKEN`) keeps the HTTP snippets below, header included.
+
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
-> required), so any client that points a remote URL at `/mcp` — including
-> OpenCode `type: "remote"` and plain `curl` — works without an
+> required), so any client that points a remote URL at `/mcp`, including
+> OpenCode `type: "remote"` and plain `curl`, works without an
 > `mcp-remote` stdio shim (issue #3). The `mcp-remote` bridge is still
 > needed for **Claude Desktop** specifically, because its config only
-> supports stdio servers — not because of session state. If you run a
+> supports stdio servers; session state has nothing to do with it. If you run a
 > client that *requires* MCP session continuity or server-initiated SSE
 > streams, start the server with `ai-memory serve --transport http
 > --http-stateful` to restore rmcp's session mode.
 
 This page documents how to register ai-memory as an MCP server with
-agent CLIs beyond the README quick start.
+agent CLIs beyond the README quick start. For OpenCode, the generic
+`install-mcp --client opencode` command probes `opencode --version` and writes
+the matching V1 direct `mcp` or V2 nested `mcp.servers` entry. Strict semantic
+major 1 and 2 outputs are accepted; malformed, timed-out, and future-major
+probes fail rather than guessing. During a V1/V2 transition, hook and MCP
+installers reuse an ownership-verified endpoint and bearer from either known
+schema; conflicting generated entries fail for explicit resolution, and custom
+entries are preserved. The `opencode2`, `opencode-v2`, and `open-code2`
+spellings remain force-V2 compatibility aliases. A Docker
+container cannot inspect the host executable; use `setup-agent --agent opencode
+--opencode-dialect v1|v2` there to print the selected plugin and MCP artifacts.
 
 The hook-capable clients in the [README Support Matrix](../README.md#support-matrix)
 have automatic capture integrations (host-native commands for supported local
@@ -29,16 +62,25 @@ script bundles are compatibility fallbacks and do not enforce capture-policy
 v1. Grok and Zero capture lifecycle events, but both ignore
 SessionStart stdout, so ai-memory does not auto-inject handoffs for them.
 SessionStart handoff injection works only for clients that consume startup-hook
-stdout (or their equivalent context-injection result); Grok and Zero must call
+stdout (or their equivalent context-injection result). Grok's first-turn rule
+(`$GROK_HOME/rules/ai-memory-handoff.md`, installed with the Grok hooks and
+with global Grok skills) has the model call `memory_handoff_list` through
+`use_tool` with the qualified catalog key `ai-memory__memory_handoff_list`, so
+the first `PostToolUse` can claim the baton; Zero must call
+`memory_handoff_list` then
 `memory_handoff_accept` when resuming.
 
 Capture exclusions are separate from MCP registration. Native hook commands and
 generated OpenCode/OMP/Pi/OpenClaw integrations enforce `[capture]
 ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
-not. Reinstall/refresh an existing hook or plugin to gain it; see
+not. The Linux/macOS Docker wrapper's ordinary `install-hooks` command uses its
+checksum-verified native host client and is covered; this limitation applies to
+manual container/script extraction and explicit compatibility overrides.
+Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, VS Code Copilot, Zed, and Muse Code are **MCP-only** here:
+Claude Desktop's ordinary Chat surface, VS Code Copilot and Zed
+are **MCP-only** here:
 they expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
@@ -47,7 +89,7 @@ endpoint. The trade-off:
 | | What you get | What you don't get |
 |---|---|---|
 | **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries; no auto-handoff at session boundaries |
-| **MCP + hooks** | All of the above *plus* bounded sanitized prompt/tool-lifecycle observations captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Hook observations are not complete native transcripts. Grok delivers the handoff on the first `PostToolUse`. Zero discards SessionStart stdout; ask it to call `memory_handoff_accept`. |
+| **MCP + hooks** | All of the above *plus* bounded sanitized prompt/tool-lifecycle observations captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Hook observations are not complete native transcripts. Grok delivers the handoff on the first `PostToolUse`; its first-turn rule calls `memory_handoff_list` so that tool exists. Zero discards SessionStart stdout; ask it to call `memory_handoff_list` then `memory_handoff_accept`. |
 
 For MCP-only use, you can still cover the session-boundary gap by asking
 the LLM to call `memory_handoff_begin` manually before quitting.
@@ -135,7 +177,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed / muse
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh / prime-agent
 > ```
 
 ---
@@ -184,6 +226,18 @@ or switch identities behind Claude Code.
 `--session-aware` is Claude-Code-only. Other clients keep their documented
 native HTTP or generated bridge paths.
 
+**Marketplace plugin.** The ai-memory Claude Code plugin
+(`claude plugin install ai-memory@ai-memory`, see
+[install.md](install.md#marketplace-plugins)) registers this same
+session-aware bridge for you, as server `plugin:ai-memory:ai-memory`, so its
+tools appear as `mcp__plugin_ai-memory_ai-memory__<tool>`. The plugin passes
+its `server_url` option to `mcp-bridge --server-url`; left empty (the
+default), the bridge uses the server in your ai-memory config. While the
+plugin is enabled, `ai-memory setup` does not also write an `ai-memory`
+entry to `~/.claude.json`, and `ai-memory doctor` flags one that is already
+there. The Codex plugin likewise registers `ai-memory mcp-bridge
+--no-session-id`.
+
 ---
 
 ## Cursor
@@ -218,12 +272,114 @@ native HTTP or generated bridge paths.
 
 ---
 
+## GitHub Copilot CLI
+
+**Status:** MCP and lifecycle hooks are supported, the `SessionStart` hook
+injects the pending handoff (see below), and `ai-memory run copilot` launches
+Copilot CLI as a managed workstream harness (see
+[managed workstreams](managed-workstreams.md)).
+
+**Config files:** `$COPILOT_HOME/mcp-config.json` for MCP and
+`$COPILOT_HOME/hooks/ai-memory.json` for lifecycle hooks (`COPILOT_HOME`
+defaults to `~/.copilot`). Not to be confused with `--client vscode-copilot`
+(alias `copilot`), the VS Code agent-mode client below.
+
+```bash
+ai-memory install-mcp --client copilot-cli --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent copilot-cli --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+The MCP installer merges the documented remote entry into the root
+`mcpServers` map, preserving other servers (including your own `github`
+entry):
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+The equivalent interactive registration is `copilot mcp add --transport http
+ai-memory http://homelab:49374/mcp` (add `--header "Authorization: Bearer
+<token>"` when bearer auth is on). Copilot also reads project-level
+`.mcp.json` and `.github/mcp.json` files; pass that path via `--config-file` to
+write one, keeping in mind that `.github/mcp.json` is meant to be committed,
+so it should not carry a bearer token. `install-hooks --agent copilot-cli`
+run without `--server-url` reads the URL and token back from this entry.
+
+The hook installer wires Claude Code's nine events plus `PostToolUseFailure`
+with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
+payload; native installs spool events locally and enforce capture exclusions. The
+`SessionStart` hook delivers the prior session's handoff: Copilot reads a
+top-level `additionalContext` from `SessionStart` stdout (not Claude Code's
+`hookSpecificOutput` envelope), and the hook prints exactly that, or `{}` when
+nothing is pending.
+
+- Sources: <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers>,
+  <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>,
+  <https://docs.github.com/en/copilot/reference/hooks-reference>
+
+---
+
+## Factory Droid
+
+**Status:** MCP and lifecycle hooks are supported (#1240); the `SessionStart`
+hook injects the pending handoff and Droid's `SessionEnd` closes the session.
+No managed workstream.
+
+**Config files:** `~/.factory/mcp.json` for MCP and `~/.factory/hooks.json`
+for lifecycle hooks.
+
+```bash
+ai-memory install-mcp --client droid --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent droid --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+The MCP installer merges an HTTP entry into the root `mcpServers` map,
+preserving other servers. Droid expands `${NAME}` only in `headers`, so the
+URL stays literal and the bearer is a variable reference, never the token:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+Export `AI_MEMORY_AUTH_TOKEN` where you launch droid; an unset variable makes
+Droid fail the connection. Without a bearer the entry has no `headers`.
+`install-hooks --agent droid` run without `--server-url` reads the URL back
+from this entry (not the token, which is only a reference there). The hook
+installer, its native commands and the `settings.json` refusal are described
+in [`install.md`](install.md#factory-droid).
+
+- Sources: <https://docs.factory.com/cli/configuration/mcp>,
+  <https://docs.factory.com/harness/hooks>
+
+---
+
 ## VS Code GitHub Copilot
 
 **Status:** ✅ MCP supported (workspace-default). ❌ No lifecycle hooks
 (Copilot's agent mode does not expose `PreToolUse` / `PostToolUse` /
 `SessionStart` yet, so ai-memory's automatic capture is not active in
-VS Code — call `memory_query`, `memory_write_page`, etc. from chat).
+VS Code; call `memory_query`, `memory_write_page`, etc. from chat).
 
 **Config file:**
 - Workspace (recommended): `.vscode/mcp.json` in the repo root. Matches
@@ -288,13 +444,13 @@ Aliases: `copilot`, `github-copilot`.
   auto-reload `.vscode/mcp.json` while the window is focused on another
   tab.
 - Copilot Enterprise behaves the same as Copilot Individual/Business
-  for MCP — your org may restrict which MCP servers Copilot is allowed
+  for MCP. Your org may restrict which MCP servers Copilot is allowed
   to call; check **Settings → Copilot → MCP servers** if the server
   shows as blocked.
 - Lifecycle hooks aren't possible until VS Code Copilot adds an agent
   hook surface. Until then, the auto-handoff flow that other agents
   enjoy (SessionStart auto-fetches a "where you left off" block) does
-  not run here — ask the agent to call `memory_handoff_accept`
+  not run here. Ask the agent to call `memory_handoff_accept`
   manually if you want it.
 - Sources:
   <https://code.visualstudio.com/docs/copilot/customization/mcp-servers>,
@@ -354,55 +510,66 @@ Sources: <https://zed.dev/docs/ai/mcp>,
 
 ## Muse Code
 
-**Status:** MCP supported through Muse Code's native streamable-HTTP
-transport, including bearer authentication. No lifecycle-hook integration
-and no managed-workstream adapter.
+**Status:** MCP and lifecycle hooks are supported. The MCP entry is a
+session-aware stdio bridge, the `SessionStart` hook injects the pending
+handoff, and Muse's `SessionEnd` closes the session. No managed workstream.
 
-**Config file:** `~/.config/muse/settings.json`. Muse also reads
-`$XDG_CONFIG_HOME` for its skill roots; on a non-default XDG setup pass the
-concrete path with `--config-file`.
+**Config file:** `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, the same
+file `install-hooks --agent muse` writes its hooks into.
 
-Servers live under the top-level snake_case `mcp_servers` key. Note the
-casing: `mcpServers`, which most other clients use, is ignored here.
+```bash
+ai-memory install-mcp --client muse --apply
+ai-memory install-hooks --agent muse --apply
+```
+
+Muse gives its stdio MCP servers `MUSE_SESSION_ID`, while a streamable-HTTP
+entry carries no session id, so the entry runs the bridge, which forwards that
+id as the actor session:
 
 ```json
 {
   "schema_version": 1,
-  "mcp_servers": {
+  "mcpServers": {
     "ai-memory": {
-      "transport": "streamable_http",
-      "url": "http://127.0.0.1:49374/mcp",
-      "headers": {
-        "Authorization": "Bearer <token>"
-      },
-      "enabled": true,
+      "type": "stdio",
+      "command": "ai-memory",
+      "args": ["mcp-bridge", "--agent", "muse",
+               "--server-url", "http://127.0.0.1:49374/mcp",
+               "--data-dir", "/home/you/.local/share/ai-memory"],
       "mode": "optional"
     }
   }
 }
 ```
 
-Print or apply the configuration with:
+Muse starts stdio servers with a cleared environment, so the entry names the
+install's data dir and the bridge reads the server's token from there at
+launch. A token passed explicitly with `--auth-token` is written to the
+entry's `env` as `AI_MEMORY_AUTH_TOKEN`; treat the file as private then. The
+bridge reads only `MUSE_SESSION_ID` when started with `--agent muse` (and only
+`CLAUDE_CODE_SESSION_ID` for Claude Code), so an id inherited from another
+harness's terminal is never forwarded, and it refuses to start without its
+own id.
 
-```bash
-ai-memory install-mcp --client muse
-ai-memory install-mcp --client muse --apply \
-  --server-url "http://homelab:49374/mcp" \
-  --auth-token "$TOKEN"
-```
-
-Two details of Muse's schema are worth knowing before hand-editing the file:
+Three details of Muse's schema are worth knowing before hand-editing the file:
 
 - **`"schema_version": 1` is mandatory.** A settings file that omits it fails
-  *every* `muse` command at startup with `malformed settings file`. `--apply`
+  every `muse` command at startup with `malformed settings file`. `--apply`
   adds the key when it is missing and never rewrites an existing value, so a
   future schema is not silently downgraded.
+- **`mcpServers` or `mcp_servers`, never both.** Muse reads servers from
+  `mcpServers` (`"type": "stdio"`) or the legacy `mcp_servers`
+  (`"transport": "stdio"`), and ignores every MCP server when both maps are
+  present. `--apply` uses `mcp_servers` when the file already has it, else
+  `mcpServers`, and refuses a file that already holds both;
+  `ai-memory doctor` reports that state.
 - **`mode` defaults to `required`**, and a required server that fails to start
-  aborts the whole Muse run. ai-memory writes `"mode": "optional"` explicitly
-  so an unreachable memory server costs you recall rather than the session.
+  aborts the whole Muse run. ai-memory writes `"mode": "optional"`, so an
+  unreachable memory server only costs you recall and the session goes on.
 
-A non-default `framing` value is rejected on `streamable_http`, so the
-generated entry omits the key.
+`install-hooks --agent muse` run without `--server-url` reads the URL back
+from this entry. The hook installer and its events are described in
+[`install.md`](install.md#meta-muse-code).
 
 **Skills:** no extra step is needed. Muse Code loads user skills from
 `$XDG_CONFIG_HOME/muse/skills` and `~/.agents/skills`, and
@@ -410,20 +577,118 @@ generated entry omits the key.
 root, so the ai-memory routing skills are visible to Muse. Confirm with
 `muse skills list`.
 
-Muse Code documents a lifecycle hook surface, but the output contract of its
-`SessionStart` event is not specified, so automatic capture and automatic
-handoff injection are not claimed here. Ask the agent to call
-`memory_handoff_begin` before leaving and `memory_handoff_accept` when
-resuming when you need continuity.
-
 Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
 <https://dev.meta.ai/docs/muse-code/extending>.
 
 ---
 
+## DeepSeek Harness (DSH)
+
+**Status:** MCP supported (print-only). No lifecycle hooks or managed workstream claimed.
+
+DSH has no fixed JSON/TOML MCP config: the MCP client is a Cordis plugin entry
+(`@deepseek-ai/dsh-mcp-client`) inside a profile's `cordis.patch.yml`.
+`install-mcp` therefore prints a ready-to-merge patch fragment and refuses
+`--apply`:
+
+```bash
+ai-memory install-mcp --client dsh
+```
+
+Merge the printed `- insert:` item into
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml` (the `web` profile
+reloads its patch live), then reload or restart the profile. The fragment registers
+the default stateless HTTP endpoint and carries `Authorization: Bearer <token>`
+when `--auth-token` (or a configured server token) is present.
+
+DSH ships a bridge that runs an existing Claude Code `hooks.json` or settings
+file (`@deepseek-ai/dsh-hooks-claude-code`). Pointing it at ai-memory's Claude
+Code hooks is not a supported capture path: those hooks report every event as
+`agent=claude-code`, so DSH sessions would be stored as Claude Code sessions.
+ai-memory does not install or manage the bridge, and it delivers only seven Claude Code events
+(`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`Stop`, `SubagentStart`, `SubagentStop`). `PreCompact` and
+`SessionEnd` are not delivered, and its `SessionStart` injection runs
+detached. Treat DSH as MCP-only here and recover handoffs explicitly with
+`memory_handoff_list` then `memory_handoff_accept` when continuity matters.
+
+---
+
+## Prime Agent
+
+**Status:** MCP supported. No lifecycle hooks or managed workstream claimed.
+
+[Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) reads user MCP
+servers from the `mcpServers` map of its agent dir's `settings.json`:
+`$PRIME_AGENT_CODING_AGENT_DIR/settings.json`, default
+`~/.prime/agent/settings.json`. A project's `.prime/agent/settings.json`
+overrides it; pass that path with `--config-file`.
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"
+    }
+  }
+}
+```
+
+```bash
+ai-memory install-mcp --client prime-agent --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+export AI_MEMORY_AUTH_TOKEN="$TOKEN"   # in the shell you launch prime-agent from
+```
+
+How Prime Agent 0.10 treats the entry shapes the generated one:
+
+- **The token is referenced, not written.** Prime Agent counts a user HTTP
+  server as connected, and names it in the model's prompt
+  (`Enabled generic MCP servers: ai-memory`), only when the variable in
+  `bearerTokenEnvVar` is set or an OAuth grant exists. A literal
+  `headers.Authorization` still reaches the server but leaves it unlisted, so
+  `install-mcp` writes `"bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"` and the
+  token stays out of `settings.json`. If the variable is unset, Prime Agent
+  shows the server as disconnected and calls fail.
+- **Without a token** the entry is just `type` + `url`. Calls through
+  `mcp.call_tool("ai-memory", ...)` still work, but the server is not listed in
+  the prompt or shown as connected in `/mcp`. Run the server with
+  `AI_MEMORY_AUTH_TOKEN` and pass `--auth-token` to get it listed.
+- **Use the camelCase key.** Prime Agent 0.10.0's own
+  `prime-agent mcp add --bearer-token-env-var` writes `bearer_token_env_var`,
+  which its settings loader ignores. Use `install-mcp` or edit the file.
+
+Prime Agent does not expose MCP tools as native tools. The model calls them
+from its persistent Python REPL:
+`await mcp.list_tools("ai-memory")`, then
+`await mcp.call_tool("ai-memory", "memory_query", {...})`. Requests carry no
+session id or working directory, so Prime Agent is a static client: pass
+`workspace` and `project` on project-scoped calls (the routing snippet from
+`ai-memory install-instructions --target AGENTS.md` says so, and Prime Agent
+loads `AGENTS.md`).
+
+Prime Agent 0.10 is a Rust rewrite: the TypeScript extensions of its 0.9
+releases, which were built on Pi, are gone, and it has no lifecycle hook
+surface. Automatic capture and handoff
+injection are therefore not claimed, and `install-hooks --agent pi` does not
+apply. Ask the agent to call `memory_handoff_begin` before leaving and
+`memory_handoff_accept` when resuming.
+
+Verified against Prime Agent 0.10.0. Sources:
+<https://github.com/PrimeIntellect-ai/prime-agent> (`crates/pa-core/src/mcp/mod.rs`,
+`crates/pa-cli/src/mcp_command.rs`, `prime-agent-runtime/src/rlm/mcp.py`,
+`skills/mcp/SKILL.md`).
+
+---
+
 ## Claude Desktop
 
-**Status:** ✅ MCP supported (via stdio shim for HTTP). ❌ No lifecycle hooks.
+**Status:** ✅ MCP supported (via stdio shim for HTTP). ❌ No lifecycle hooks
+in the Chat tab. The Code tab runs Claude Code itself, so its local sessions
+are captured by the [Claude Code](#claude-code) hooks.
 
 **Config file:**
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
@@ -434,8 +699,10 @@ Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
   `Claude_*` package directories automatically and prefers one that
   already contains a config. If multiple candidates remain ambiguous,
   it stops and asks for an explicit `--config-file` instead of guessing.
-- Linux: not officially distributed by Anthropic. Use Claude Code
-  (terminal) instead.
+- Linux: `~/.config/Claude/claude_desktop_config.json`. Anthropic ships
+  Claude Desktop for Linux as a beta for Debian-based distributions
+  (Ubuntu 22.04+, Debian 12+). `install-mcp --client claude-desktop` writes
+  it there (`$XDG_CONFIG_HOME/Claude/` when that is set).
 
 **Important:** Claude Desktop's JSON config supports stdio MCP
 servers only. To talk to ai-memory's HTTP endpoint, bridge through
@@ -457,14 +724,29 @@ stdio shim. Requires Node.js installed on the same machine.
 - After editing the config, **fully quit and relaunch** Claude
   Desktop. "Check for Updates…" is not enough.
 - Claude Desktop also has account-level remote custom connectors and
-  `.mcpb` desktop extensions. The ai-memory CLI manages the local
+  `.mcpb` desktop extensions, which Anthropic now presents as the main way
+  to install local MCP servers. The ai-memory CLI manages the local
   JSON-config path because it works with localhost/LAN servers and does
   not require publishing an HTTPS connector.
-- Claude Desktop exposes MCP tools but no lifecycle hooks, so automatic
-  prompt/tool capture and session-boundary handoffs are not possible
-  unless Anthropic adds a desktop hook/plugin surface.
+- Servers in `claude_desktop_config.json` also reach the Code tab's local
+  sessions, alongside `~/.claude.json` and `.mcp.json`; when both define a
+  server with the same name, the Code tab uses the
+  `claude_desktop_config.json` entry.
+- Claude Desktop's ordinary Chat surface exposes MCP tools but does not run
+  lifecycle hooks, so ai-memory cannot automatically capture its
+  prompts/tools or inject session-boundary handoffs.
+- The Code tab reads the same `~/.claude/settings.json` as the CLI, so
+  `install-hooks --agent claude-code` already captures its local sessions
+  (as `claude-code`). A Code session started without a project folder runs
+  in a scratch directory under
+  `~/.config/Claude/scratch-workspaces/`, so each one lands in its own
+  auto-named project.
+- Cowork is a distinct surface whose capture ai-memory does not claim. On
+  Linux, Anthropic runs Cowork tasks inside a QEMU/KVM virtual machine;
+  whether your host hooks reach it has not been verified.
 - If the MCP indicator doesn't appear after restart, check the logs:
-  `~/Library/Logs/Claude/mcp*.log` (macOS). On Windows, check
+  `~/Library/Logs/Claude/mcp*.log` (macOS), `~/.config/Claude/logs/`
+  (Linux). On Windows, check
   `%APPDATA%\Claude\logs\` for an unpackaged install or the corresponding
   `LocalCache\Roaming\Claude\logs\` directory under the detected
   `%LOCALAPPDATA%\Packages\Claude_<id>\` package.
@@ -475,8 +757,11 @@ stdio shim. Requires Node.js installed on the same machine.
   `install-mcp --client claude-desktop --apply` detects this and writes
   to the packaged location automatically. On an older ai-memory build,
   pass `--config-file` pointed at the `LocalCache` path directly.
-- Sources: <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
+- Sources: <https://code.claude.com/docs/en/desktop-linux>,
+  <https://code.claude.com/docs/en/desktop#shared-configuration>,
+  <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
   <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>,
+  <https://support.claude.com/en/articles/13837440-use-plugins-in-claude>,
   <https://learn.microsoft.com/en-us/windows/msix/msix-containerization-overview>
 
 ---
@@ -682,19 +967,46 @@ which merges:
 
 Lifecycle capture is separate and script-free: `ai-memory install-hooks
 --agent zero --apply` merges exec-form entries (the native `ai-memory hook`
-command + args, JSON payload on stdin — no shell) into
+command + args, JSON payload on stdin, no shell) into
 `~/.config/zero/hooks.json`, covering `sessionStart`/`sessionEnd`/
 `beforeTool`/`afterTool` plus `specialistStart`/`specialistStop` (mapped to
 ai-memory's subagent events). Zero discards `sessionStart` hook stdout, so
 capture and session-end handoff *creation* work, but handoff *injection*
-does not — ask Zero to call `memory_handoff_accept` at the start of a
+does not. Ask Zero to call `memory_handoff_accept` at the start of a
 resumed session.
+
+Zero runs hook commands inside its execution sandbox. The default policy
+denies all network, loopback included (a separate network namespace on
+Linux, `(deny network*)` on macOS), mounts `/` read-only with writes limited
+to the workspace and temp, and kills a hook's detached children when the
+hook exits. Hooks therefore cannot reach `server_url`: events land in
+`<data_dir>/hook-spool/` and stay there. Zero only lets the user's global
+`~/.config/zero/config.json` relax this (a project config can only tighten
+it), and ai-memory does not edit that file. Either add
+
+```json
+"sandbox": {
+  "network": "allow",
+  "additionalWriteRoots": ["<ai-memory data dir>"]
+}
+```
+
+(network access is all-or-nothing and applies to every shell command Zero
+runs, not only hooks), or set `"sandbox": {"enabled": false}`. With network
+allowed, `sessionEnd` delivers the spool from the hook process itself within a
+fixed 10-second budget, because the sandbox would kill the detached drainer
+other agents use; whatever does not make it stays spooled. Without either, run `ai-memory hook-drain` from a normal shell to deliver the
+spooled events. A leftover empty `hook-spool/.drain.lock` does not block
+that drain: the lock is an OS file lock released when its holder exits.
 
 ## ZCode (z.ai)
 
-**Status:** MCP supported. Lifecycle hooks are not installed by this command;
-they are tracked in issue #512, so until then capture is not active and
-ai-memory only sees the sessions where an agent calls its MCP tools.
+**Status:** MCP supported. Lifecycle hooks are installed separately with
+`ai-memory install-hooks --agent zcode --apply` (see the
+[support matrix](support-matrix.md)). On a token-file install (every fresh
+`init`) `install-mcp --client zcode` is refused, because ZCode keeps only a
+literal header; add the entry by hand with the header read from
+`<data_dir>/auth-tokens/default`.
 
 **Config file:** ZCode keeps its user-scope config at
 `~/.zcode/cli/config.json`, with servers under the nested `mcp.servers` map
@@ -770,7 +1082,13 @@ that file and preserves all unrelated MCP servers.
 `ai-memory install-hooks --agent grok --apply`. Handoff injection is the
 first `PostToolUse` (`additionalContext` after the tool result). Grok
 ignores `SessionStart` stdout and discards an allowing `UserPromptSubmit`,
-so those events do not accept the handoff.
+so those events do not accept the handoff. `--apply` also writes
+`$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
+so the first turn calls `memory_handoff_list` through `use_tool` with the
+qualified catalog key `ai-memory__memory_handoff_list` (Grok exposes MCP tools
+only through that meta-tool), before any file read, and corrects the scope from
+`./.ai-memory.toml` only when that list is empty or a scope error; PostToolUse then claims the
+row.
 
 **Config file:** `install-mcp --client grok --apply` writes the user config at
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`). To use a project or
@@ -813,9 +1131,11 @@ mirror Claude Code's vocabulary (`SessionStart`, `UserPromptSubmit`,
 native `ai-memory hook --event … --agent grok` commands. Session-end
 handoff *creation* works. Injection is the first `PostToolUse`: JSON
 `additionalContext` with the pending handoff and an opted-in `[briefing]`.
-`memory_handoff_accept` is still the path when the session has not called
-a tool yet (skills live under `.grok/skills` / `$GROK_HOME/skills`, default
-`~/.grok/skills`).
+`memory_handoff_list` is the first-turn path when the managed Grok rule is
+installed (skills live under `.grok/skills` / `$GROK_HOME/skills`, default
+`~/.grok/skills`; the rule lives under `$GROK_HOME/rules`).
+`memory_handoff_accept` remains the recovery path when that rule is absent
+and the session has not called a tool yet.
 
 Grok can also load MCP from Claude Code / Cursor compat sources when those
 compat flags are enabled, but first-party `install-mcp --client grok` is
@@ -869,16 +1189,16 @@ available.
 Real Devin hook payloads may omit `session_id` and `cwd`; the installed hooks
 fill both in:
 
-- **cwd** — the payload's `cwd` wins when present, then the
+- **cwd**: the payload's `cwd` wins when present, then the
   `DEVIN_PROJECT_DIR` environment variable (when Devin's launcher provides
   it), then the hook process working directory.
-- **session id** — when the payload has none, the hook mints one at
+- **session id**: when the payload has none, the hook mints one at
   `SessionStart`, stores it in a single per-host slot
   (`<data-dir>/hook-state/devin-session-id`), reuses it for every later
   event, and clears it at `SessionEnd`. Set `AI_MEMORY_SESSION_ID` in the
   hook environment to pin an externally managed run id instead. Because the
   slot is per host+agent, two Devin sessions running *concurrently* on the
-  same machine share it — the newest `SessionStart` wins and earlier
+  same machine share it: the newest `SessionStart` wins and earlier
   sessions' remaining events are attributed to it (same graceful-degradation
   stance as the single-slot `/handoff` fallback). A payload that does carry
   its own `session_id` always wins over both.
@@ -916,14 +1236,14 @@ which merges:
 `install-mcp` appends the `?flavor=moonshot` query itself (idempotently, so
 re-runs don't duplicate it). The Moonshot API validates tool parameter
 schemas against a restricted dialect ("moonshot flavored json schema") that
-rejects root-level `anyOf`/`oneOf`/`allOf` combinators — including the
-`anyOf` on `memory_read_page` — and fails the whole session with a 400 at
+rejects root-level `anyOf`/`oneOf`/`allOf` combinators (including the
+`anyOf` on `memory_read_page`) and fails the whole session with a 400 at
 `tools/list`. The ai-memory server answers requests carrying this flavor
 with flat schemas; every other client keeps receiving the upstream schemas
 unchanged.
 
 > **Do not register ai-memory with Kimi's own `mcp add`.** Kimi Code's
-> documented command —
+> documented command,
 >
 > ```bash
 > kimi mcp add --transport http ai-memory http://127.0.0.1:49374/mcp
@@ -931,7 +1251,7 @@ unchanged.
 >
 > writes the plain URL, with no `?flavor=moonshot`. The server then serves
 > the upstream schemas, Moonshot rejects `memory_read_page`'s root-level
-> `anyOf`, and **every model turn fails with a 400** — including turns that
+> `anyOf`, and **every model turn fails with a 400**, including turns that
 > use no tools at all, because tool schemas ship with each request. Use
 > `ai-memory install-mcp --client kimi-code --apply` instead, which writes
 > the flavored URL for you.
@@ -948,7 +1268,7 @@ unchanged.
 > ```
 >
 > That serves the restricted dialect on every `tools/list` regardless of the
-> `?flavor=` marker, so any strict client that skips the marker is covered —
+> `?flavor=` marker, so it covers any strict client that skips the marker,
 > not just Kimi. A request's marker can only raise the dialect further, never
 > lower it. Reported in #474.
 
@@ -962,10 +1282,10 @@ ai-memory install-hooks --agent kimi-code --apply \
     --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-The installed entries cover 10 events — `SessionStart`, `SessionEnd`,
+The installed entries cover 10 events (`SessionStart`, `SessionEnd`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`
 (Kimi Code fires `PostToolUse` on successful calls only), `Stop`,
-`SubagentStart`, `SubagentStop`, and `PreCompact` — with a Kimi Code-specific
+`SubagentStart`, `SubagentStop`, and `PreCompact`) with a Kimi Code-specific
 script bundle /
 native `ai-memory hook --event … --agent kimi-code` commands (native is the
 default for local installs; the staged scripts under
@@ -1257,13 +1577,21 @@ Some model APIs validate MCP tool parameter schemas against a narrower dialect
 than JSON Schema and reject the whole `tools/list` with a 400. ai-memory can
 serve a relaxed dialect per request, via a `?flavor=` query on the MCP URL, or
 server-wide via config for clients that cannot carry one. Runtime argument
-validation is identical in every dialect — only the advertised schema changes.
+validation is identical in every dialect; only the advertised schema changes.
 
 | Marker | Config key | What it changes | Who needs it |
 | --- | --- | --- | --- |
-| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kimi Code (Moonshot); appended by `install-mcp` |
-| `?flavor=bedrock` | `strip_root_combinators` | Same as above | Kiro CLI (Bedrock); appended by `install-mcp` |
-| `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | The above, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
+| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus inlines every `#/$defs/*` reference and drops the emptied `$defs` table | Kimi Code (Moonshot); appended by `install-mcp`. The generated Pi extension's MCP bridge always asks for it, since Pi may run on Moonshot |
+| `?flavor=bedrock` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kiro CLI (Bedrock); appended by `install-mcp` |
+| `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
+
+Moonshot's validator never resolves `$ref`: any reference, at the root or
+nested, fails the request with "detected infinite recursion without termination
+condition". Inline combinators such as the nullable union on
+`Option<T>` arguments do pass. Codex forwards MCP input schemas into Responses
+`tools.function.parameters` verbatim, so it needs the Moonshot marker even
+though it is not Kimi Code. `?flavor=bedrock` and `?flavor=gemini` keep
+`$defs`/`$ref` pairs, which their upstreams resolve.
 
 `install-mcp` appends the first two itself for the clients whose upstream is
 fixed. For any other client, pass the dialect explicitly:
@@ -1301,7 +1629,7 @@ Unable to submit request because `ai-memory_memory_auto_improve` functionDeclara
 When using any_of, it must be the only field set.
 ```
 
-The dialect collapses it to `"type": "integer"` plus `nullable: true` — the same
+The dialect collapses it to `"type": "integer"` plus `nullable: true`, the same
 normalization Gemini CLI performs client-side, which is why Gemini CLI and
 Antigravity CLI work on Vertex without any marker and do not need this. Reach
 for it when a pass-through client fails at `tools/list` with that error.
@@ -1357,8 +1685,9 @@ managed routing package. The `memory_install_self_routing` tool is read-only:
 it returns the slim markered instruction block, marker strings, agent filename
 hints, managed skill payloads (`name`, `description`, `relative_path`,
 `content`), and authoritative project/global target hints for `.claude/skills`,
-`.agents/skills`, `.grok/skills`, and `$GROK_HOME/skills` (default
-`~/.grok/skills`), plus overwrite guidance. Agents should use their own file
+`.agents/skills`, `.grok/skills`, `$GROK_HOME/skills` (default
+`~/.grok/skills`), GitHub Copilot CLI's `.github/skills` and
+`$COPILOT_HOME/skills` (default `~/.copilot/skills`), plus overwrite guidance. Agents should use their own file
 editing tools to write those artifacts while preserving unrelated user content.
 
 If the model doesn't see any of those tools, the MCP registration
@@ -1391,7 +1720,7 @@ that *starts* the next one - to play nicely with ai-memory:
 | Side | What's needed | Covered by |
 |---|---|---|
 | **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, OpenCode 2 beta, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart; `install-hooks --agent grok --apply` also installs a first-turn `memory_handoff_list` user rule so that tool exists. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. The OpenCode 2 beta plugin subscribes to the same event name on the

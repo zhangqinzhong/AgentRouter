@@ -5,7 +5,7 @@
 //! Pending events remain on disk when delivery fails or their retry window
 //! expires; reaching a capacity limit rejects new input.
 //!
-//! Bodies retain their input values before server sanitization. Producers must
+//! New bodies are sanitized before enqueueing; stored retries stay exact. Producers must
 //! apply capture exclusions before enqueueing and protect the queue directory.
 
 pub mod ack;

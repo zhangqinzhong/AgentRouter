@@ -15,6 +15,9 @@
 #    when nothing is pending), but without the briefing params, so the
 #    server does not recompose the brief per prompt. The marker survives
 #    /clear, so re-briefing after a context clear is not supported in v1.
+# 4. Delivers the cross-project profile digest on the FIRST prompt only, the
+#    same way: later prompts send `profile_digest=0`. This gate is not tied
+#    to the [briefing] opt-in, because the digest is on by default.
 _lib_dir="$(dirname "$0")"
 [ -f "$_lib_dir/_lib.sh" ] || _lib_dir="$_lib_dir/.."
 . "$_lib_dir/_lib.sh"
@@ -41,14 +44,23 @@ if [ -n "$BRIEF_QS" ]; then
     [ -f "$BRIEF_FILE" ] && BRIEF_QS=""
 fi
 
+PROFILE_KEY="$SESSION_ID"
+if [ -z "$PROFILE_KEY" ]; then
+    PROFILE_KEY="kimi-code-$(printf '%s' "kimi-code:$CWD" | cksum | awk '{print $1}')"
+fi
+PROFILE_FILE=$(ai_memory_briefed_file "profile-$PROFILE_KEY")
+PROFILE_QS=""
+[ -f "$PROFILE_FILE" ] && PROFILE_QS="&profile_digest=0"
+
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=user-prompt&agent=kimi-code${QS}" >/dev/null 2>&1 || true
 
-HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=kimi-code${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
+HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=kimi-code${QS}${SESSION_QS}${BRIEF_QS}${PROFILE_QS}" 2>/dev/null || true)
 # Mark an opted-in session as briefed only AFTER the GET completed — success
 # or error. Fail-open on purpose: with the server down, re-sending the
 # brief-flagged request on every prompt would deliver nothing anyway, and the
 # one lost brief returns on the next session.
 [ -n "$BRIEF_FILE" ] && ai_memory_mark_briefed "$BRIEF_FILE"
+ai_memory_mark_briefed "$PROFILE_FILE"
 [ -n "$HANDOFF" ] && printf '%s\n' "$HANDOFF"
 exit 0

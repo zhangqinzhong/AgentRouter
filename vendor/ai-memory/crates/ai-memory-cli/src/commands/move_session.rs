@@ -66,6 +66,9 @@ pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
         create: args.create,
     };
     let report: serde_json::Value = post_json(&endpoint, "/admin/move-session", &request).await?;
+    if let Some(warning) = report["manifest_warning"].as_str() {
+        eprintln!("ai-memory: warning: {warning}");
+    }
 
     if request.session_id.is_some() {
         print_session_report(&report, args.confirm);

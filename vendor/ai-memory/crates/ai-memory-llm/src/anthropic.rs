@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::header::{HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,9 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
+use crate::types::{
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
+};
 
 /// Default Anthropic API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -48,6 +51,13 @@ pub struct AnthropicProvider {
     timeout: Duration,
     reasoning_effort: Option<ReasoningEffort>,
     extra_headers: ExtraHeaders,
+    client_headers: Option<ClientHeaders>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ClientHeaders {
+    user_agent: &'static str,
+    operation_id: &'static str,
 }
 
 impl AnthropicProvider {
@@ -66,6 +76,7 @@ impl AnthropicProvider {
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
             extra_headers: ExtraHeaders::default(),
+            client_headers: None,
         })
     }
 
@@ -88,6 +99,7 @@ impl AnthropicProvider {
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
             extra_headers: ExtraHeaders::default(),
+            client_headers: None,
         })
     }
 
@@ -120,6 +132,19 @@ impl AnthropicProvider {
     #[must_use]
     pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
         self.extra_headers = headers;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_client_headers(
+        mut self,
+        user_agent: &'static str,
+        operation_id: &'static str,
+    ) -> Self {
+        self.client_headers = Some(ClientHeaders {
+            user_agent,
+            operation_id,
+        });
         self
     }
 }
@@ -206,8 +231,17 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
+        self.complete_with_operation_id(request, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_with_operation_id(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
         let body = self.build_request(&request, None);
-        let response: AnthropicResponse = self.post(&body).await?;
+        let response: AnthropicResponse = self.post(&body, operation_id).await?;
         let text = response
             .content
             .iter()
@@ -232,8 +266,18 @@ impl LlmProvider for AnthropicProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
+        self.complete_structured_raw_with_operation_id(request, schema, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
         let body = self.build_request(&request, Some(schema));
-        let response: AnthropicResponse = self.post(&body).await?;
+        let response: AnthropicResponse = self.post(&body, operation_id).await?;
         for c in response.content {
             if let AnthropicContent::ToolUse { input, .. } = c {
                 return Ok(input);
@@ -298,7 +342,11 @@ impl AnthropicProvider {
         }
     }
 
-    async fn post<B: Serialize, R: DeserializeOwned>(&self, body: &B) -> LlmResult<R> {
+    async fn post<B: Serialize, R: DeserializeOwned>(
+        &self,
+        body: &B,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<R> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         debug!(url, "POST anthropic");
         let mut builder = self
@@ -312,7 +360,20 @@ impl AnthropicProvider {
         for (name, value) in self.auth_headers() {
             builder = builder.header(name, value);
         }
-        let resp = self.extra_headers.apply(builder).json(body).send().await?;
+        let mut headers = self.extra_headers.clone();
+        if let Some(client_headers) = self.client_headers {
+            headers.set_default(
+                HeaderName::from_static("user-agent"),
+                HeaderValue::from_static(client_headers.user_agent),
+            );
+            headers.set_default(
+                HeaderName::from_static(client_headers.operation_id),
+                HeaderValue::from_str(&operation_id.to_string()).map_err(|error| {
+                    LlmError::UnexpectedShape(format!("invalid operation ID header: {error}"))
+                })?,
+            );
+        }
+        let resp = headers.apply(builder).json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
@@ -379,7 +440,8 @@ impl ClaudeFamily {
             Self::Opus => Some((4, 5)),
             Self::Sonnet => Some((4, 6)),
             Self::Fable | Self::Mythos => Some((5, 0)),
-            Self::Haiku => None,
+            // Haiku 4.5 400s on `output_config.effort`; Haiku 5.5 accepts it.
+            Self::Haiku => Some((5, 5)),
         }
     }
 
@@ -387,7 +449,7 @@ impl ClaudeFamily {
         match self {
             Self::Opus | Self::Sonnet => Some((4, 6)),
             Self::Fable | Self::Mythos => Some((5, 0)),
-            Self::Haiku => None,
+            Self::Haiku => Some((5, 5)),
         }
     }
 }
@@ -691,6 +753,20 @@ mod tests {
     )]
     #[case::opus_5_disabled("claude-opus-5", ReasoningEffort::None, None, Some("disabled"))]
     #[case::haiku_45_omits("claude-haiku-4-5", ReasoningEffort::Low, None, None)]
+    #[case::haiku_45_none_omits("claude-haiku-4-5", ReasoningEffort::None, None, None)]
+    #[case::haiku_55_adaptive(
+        "claude-haiku-5-5",
+        ReasoningEffort::Low,
+        Some("low"),
+        Some("adaptive")
+    )]
+    #[case::haiku_55_disabled("claude-haiku-5-5", ReasoningEffort::None, None, Some("disabled"))]
+    #[case::haiku_55_xhigh_kept(
+        "claude-haiku-5-5",
+        ReasoningEffort::XHigh,
+        Some("xhigh"),
+        Some("adaptive")
+    )]
     #[case::opus_45_effort_only("claude-opus-4-5", ReasoningEffort::High, Some("high"), None)]
     #[case::mythos_preview_none_omits_disabled(
         "claude-mythos-preview",

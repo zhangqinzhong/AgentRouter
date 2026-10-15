@@ -140,6 +140,7 @@ pub async fn run_experience_review(
             proposals: Vec::new(),
             rejected_candidates: Vec::new(),
             warnings: Vec::new(),
+            eval_results: Vec::new(),
         });
     }
 
@@ -226,7 +227,7 @@ pub async fn run_experience_review(
     let (mut proposals, mut rejected_candidates, mut response_warnings) =
         crate::auto_improve::validate_response(raw, &cfg, &existing_index);
     warnings.append(&mut response_warnings);
-    apply_eval_gate(
+    let eval_results = apply_eval_gate(
         reader,
         workspace_id,
         project_id,
@@ -258,6 +259,7 @@ pub async fn run_experience_review(
         proposals,
         rejected_candidates,
         warnings,
+        eval_results,
     })
 }
 

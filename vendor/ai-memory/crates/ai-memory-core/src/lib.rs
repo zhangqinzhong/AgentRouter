@@ -7,21 +7,28 @@
 
 pub mod active_project;
 pub mod actor;
+pub mod agent_backup;
 pub mod error;
+pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
+pub mod latency;
+pub use latency::{LatencyHistogram, LatencySnapshot, LatencyTimer};
 pub mod log_ledger;
 pub mod message;
 pub mod observation;
 pub mod okf;
 pub mod page;
+pub mod profile;
 pub mod repository_identity;
 pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;
-pub use scaffolding::looks_like_scaffolding;
+pub use scaffolding::{
+    looks_like_codex_instructions, looks_like_markup_block, looks_like_scaffolding,
+};
 pub mod routing_snippet;
 pub mod sanitize;
 pub mod slots;
@@ -52,6 +59,10 @@ pub use actor::{
     ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey, OwnerFilter,
     SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
     skip_admission_chain_for,
+};
+pub use agent_backup::{
+    AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
+    AgentBackupManifest, HostInfo,
 };
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{
@@ -95,7 +106,8 @@ pub use user::{
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
     ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse,
-    ManagedRunStatus, ManagedWorkstreamSummary, NewWorkstreamEvent, PrepareManagedRunRequest,
-    PrepareManagedRunResponse, RenameManagedWorkstreamRequest, RenamedManagedWorkstream,
-    UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
+    ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity, NewWorkstreamEvent,
+    PrepareManagedRunRequest, PrepareManagedRunResponse, RenameManagedWorkstreamRequest,
+    RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent,
+    WorkstreamEventKind, scrub_workstream_provenance,
 };

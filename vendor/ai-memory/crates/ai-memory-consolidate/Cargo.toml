@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Karpathy-style ingest / query / lint consolidation pipeline."
@@ -32,13 +33,17 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 jiff.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 ai-memory-test-support.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
-tracing-subscriber.workspace = true
+# Test-only: asserts the fresh operation ids are UUID v7 in the
+# gateway-compatible 36-character form (same crate + features the
+# llm crate already uses to mint them).
+uuid.workspace = true
 
 [lints]
 workspace = true

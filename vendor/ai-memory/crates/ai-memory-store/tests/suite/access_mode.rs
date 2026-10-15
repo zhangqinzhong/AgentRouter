@@ -53,16 +53,18 @@ fn page(
     }
 }
 
-async fn user(store: &Store, name: &str, byte: u8) -> UserId {
+async fn user(store: &Store, name: &str) -> UserId {
     store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: name.to_owned(),
                 name: None,
                 email: None,
             },
-            [byte; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap()
@@ -91,9 +93,9 @@ async fn fixture() -> Fixture {
         .get_or_create_project(ws, "client-work", None)
         .await
         .unwrap();
-    let reader = user(&store, "ray", 1).await;
-    let writer = user(&store, "wren", 2).await;
-    let outsider = user(&store, "otto", 3).await;
+    let reader = user(&store, "ray").await;
+    let writer = user(&store, "wren").await;
+    let outsider = user(&store, "otto").await;
     store
         .writer
         .grant_memory(reader, project, GrantLevel::Read, None)
@@ -289,8 +291,15 @@ async fn new_projects_follow_the_server_default_and_admit_their_creator() {
             .await
             .unwrap();
         assert!(
-            admits(&f.store, f.ws, id, f.reader, ProjectAccess::Write).await,
+            admits(&f.store, f.ws, id, f.reader, ProjectAccess::Read).await,
             "{reserved} must stay open"
+        );
+        // The global scope reaches every user's reads, so its writes are
+        // gated even though it stays open (GHSA-7qj3-7wqw-m5w6).
+        assert_eq!(
+            admits(&f.store, f.ws, id, f.reader, ProjectAccess::Write).await,
+            reserved == ai_memory_core::DEFAULT_PROJECT_NAME,
+            "{reserved} write"
         );
     }
     // An existing project is not touched by the flag.

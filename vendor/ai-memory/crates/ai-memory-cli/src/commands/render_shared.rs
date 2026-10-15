@@ -19,8 +19,9 @@
 //! lives here is only the *data* both consume.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use ai_memory_hooks::capture_policy;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
@@ -76,6 +77,79 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
     ("SubagentStart", "subagent-start.sh"),
     ("SubagentStop", "subagent-stop.sh"),
 ];
+
+/// GitHub Copilot CLI's lifecycle events, configured with PascalCase event
+/// names so the payload comes in the Claude Code/VS-Code-compatible shape
+/// (`session_id`, `cwd`, `tool_name`, `tool_input`, `tool_result`) instead of
+/// its native camelCase one — this lets it free-ride on the same key-based
+/// payload extraction as Claude Code/Codex/Zcode (see `tool_observation_metadata`
+/// in `capture_policy.rs`) rather than needing a dedicated parser (#1040).
+/// Same vocabulary as `KIMI_CODE_EVENTS`: Claude Code's 9 events plus
+/// `PostToolUseFailure`, which Copilot (per
+/// <https://docs.github.com/en/copilot/reference/hooks-configuration>) fires
+/// instead of `PostToolUse` when a tool call errors — the server already
+/// aliases it to `PostToolUse` (`HookEvent::parse`), so it reuses that script.
+pub(crate) const COPILOT_CLI_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
+/// Factory Droid CLI lifecycle events ai-memory hooks (#1240). Each pair is
+/// `(event-name-in-~/.factory/hooks.json, native hook-event script stem)`;
+/// Droid has no script bundle, so the `.sh` name only carries the event
+/// token the native command is rendered with.
+///
+/// Droid's documented vocabulary is Claude Code's minus `SubagentStart`
+/// (0.240.0). `SubagentStop` is left out with it: without the start
+/// boundary there is no subagent session to forget, and its payload
+/// (`task_name`, `task_result`) is not Claude's. `Notification` carries no
+/// capture. Droid fires a real `SessionEnd`, so no `finalize-session` step is
+/// needed.
+pub(crate) const DROID_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
+/// Meta Muse Code lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-settings.json, native hook-event script stem)`; Muse has
+/// no script bundle, so the `.sh` name only carries the event token the
+/// native command is rendered with.
+///
+/// Claude Code's vocabulary plus `PostToolUseFailure`, which Muse fires
+/// instead of `PostToolUse` when a tool fails (the server aliases it to
+/// `post-tool-use` and reads the outcome from `error`). `SubagentStart` and
+/// `SubagentStop` are left out: Muse Code 1.4.7 fires them for its built-in
+/// reminder observers on every turn, each under its own session id, so wiring
+/// them would open several empty sessions per prompt. Muse fires a real
+/// `SessionEnd`, so no `finalize-session` step is needed.
+pub(crate) const MUSE_EVENTS: [(&str, &str); 8] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
+/// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
+/// seconds, like the Claude Code plugins it loads. The capture POST is
+/// fire-and-forget; `SessionStart` also fetches a handoff.
+pub(crate) const MUSE_HOOK_TIMEOUT_SECS: u64 = 30;
 
 /// Kiro CLI v2-engine lifecycle events. Each pair is
 /// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
@@ -214,14 +288,38 @@ const CAPTURE_MAX_PATTERN_CHARS = 1024;
 const CAPTURE_MAX_PATH_CHARS = 4096;
 const CAPTURE_MAX_CANDIDATES = 32;
 const CAPTURE_MAX_WORK = 1000000;
+const CAPTURE_MAX_SHELL_NESTING = 4;
 const CAPTURE_MAX_CALL_ID_CHARS = 128;
+// Generated from `capture_policy.rs` (`FILE_TOOL_NAMES` and its siblings, `MAX_SHELL_COMMAND_CHARS`) so the two front doors cannot drift; never edit them here.
+const CAPTURE_FILE_TOOLS: string[] = __AI_MEMORY_FILE_TOOLS__;
+const CAPTURE_SEARCH_TOOLS: string[] = __AI_MEMORY_SEARCH_TOOLS__;
+const CAPTURE_NON_FILE_TOOLS: string[] = __AI_MEMORY_NON_FILE_TOOLS__;
+const CAPTURE_INLINE_CODE_TOOLS: string[] = __AI_MEMORY_INLINE_CODE_TOOLS__;
+const CAPTURE_OUTPUT_READER_TOOLS: string[] = __AI_MEMORY_OUTPUT_READER_TOOLS__;
+const CAPTURE_MAX_COMMAND_CHARS = __AI_MEMORY_MAX_COMMAND_CHARS__;
+// Bounds on the other markers one call may make the policy read; mirror `capture_lookup_locations` and `foreign_capture_decision`.
+const CAPTURE_MAX_LOOKUP_LOCATIONS = 4096;
+const CAPTURE_MAX_FOREIGN_MARKERS = 16;
+const CAPTURE_MAX_GLOB_DIRECTORIES = 256;
+const CAPTURE_MAX_GLOB_ENTRIES = 32768;
+const CAPTURE_MAX_GLOB_MS = 50;
+const CAPTURE_MAX_LOOKUP_PROBES = 16384;
+// The clock the walk and lookup budget reads; a test stands in a slow filesystem with it.
+let captureNow: () => number = Date.now;
+// Readings of one glob whose `..` follows a `**`, and words of one brace expansion; mirror `MAX_GLOBSTAR_READINGS` and `MAX_BRACE_ALTERNATIVES`.
+const CAPTURE_MAX_GLOBSTAR_READINGS = 16;
+const CAPTURE_MAX_BRACE_ALTERNATIVES = 64;
+// macOS's default filesystem ignores case and Unicode composition, so `NOTES/X.md` reads `notes/x.md`; mirrors `fold_case`.
+let captureFoldCase = typeof process !== "undefined" && process.platform === "darwin";
+// A path as a case-folding host compares it: NFC, then the full lowercase mapping; mirrors `fold_path`.
+function captureFold(path: string): string { return captureFoldCase ? path.normalize("NFC").toLowerCase() : path; }
 
 type CaptureDisposition = "keep" | "drop" | "metadata-only";
 type CaptureProtocol = { version: 1; disposition: CaptureDisposition; policy_state: "inactive" | "active" | "invalid"; tool_family: "file" | "search-list" | "non-file" | "unknown"; path_count: number; extraction_state: "not-applicable" | "extracted" | "missing-or-malformed" | "unsupported-schema" };
 
-type CaptureConfig = { state: "inactive" | "active" | "invalid"; patterns: { path: string; windows: boolean; directory?: string; prefix: string }[]; base: string; windowsHost: boolean };
+type CaptureConfig = { state: "inactive" | "active" | "invalid"; patterns: { path: string; windows: boolean; directory?: string; prefix: string }[]; base: string; windowsHost: boolean; root?: string };
 function readFileSync(path: string, encoding?: "utf8"): any { if (encoding) return readMarkerText(path, encoding); const fd = openSync(path, "r"); try { const bytes = Buffer.allocUnsafe(CAPTURE_MARKER_MAX_BYTES + 1); const count = readSync(fd, bytes, 0, bytes.length, 0); if (count > CAPTURE_MARKER_MAX_BYTES) throw new Error("marker too large"); const result = bytes.subarray(0, count); new TextDecoder("utf-8", { fatal: true }).decode(result); return result; } finally { closeSync(fd); } }
-function captureTrimComment(line: string): string { let quote = ""; let escaped = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (escaped) { escaped = false; continue; } if (c === "\\" && quote === '"') { escaped = true; continue; } if ((c === '"' || c === "'") && (!quote || quote === c)) quote = quote ? "" : c; else if (c === "#" && !quote) { line = line.slice(0, i); break; } } if (line.trimStart().startsWith("[") && !/^\s*\[[^\]]+\]\s*$/.test(line)) throw new Error("invalid table header"); if (quote) throw new Error("unterminated string"); return line; }
+function captureTrimComment(line: string): string { let quote = ""; let escaped = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (escaped) { escaped = false; continue; } if (c === "\\" && quote === '"') { escaped = true; continue; } if ((c === '"' || c === "'") && (!quote || quote === c)) quote = quote ? "" : c; else if (c === "#" && !quote) { line = line.slice(0, i); break; } } if (quote) throw new Error("unterminated string"); return line; }
 // `windowsHost` is omitted for self-determining callers (the cwd/marker base,
 // and ignore_paths patterns, which are allowed an explicit UNC/drive form
 // regardless of host). It is passed explicitly, from the already-resolved
@@ -230,50 +328,105 @@ function captureTrimComment(line: string): string { let quote = ""; let escaped 
 // root, and must collapse before flavor detection or it escapes every POSIX
 // `ignore_paths` pattern via a flavor mismatch (GHSA-vh98).
 function captureNormalize(path: string, windowsHost?: boolean): { path: string; windows: boolean } | undefined { const raw = windowsHost === false && path.startsWith("//") ? `/${path.replace(/^\/+/, "")}` : path; const p = raw.replace(/\\/g, "/"); let root: string; let tail: string[]; if (p.startsWith("//")) { const x = p.slice(2).split("/").filter(Boolean); if (x.length < 2) return undefined; root = `//${x.shift()}/${x.shift()}`; tail = x; } else if (/^[A-Za-z]:\//.test(p)) { root = `${p[0].toUpperCase()}:/`; tail = p.slice(3).split("/"); } else if (p.startsWith("/")) { root = "/"; tail = p.slice(1).split("/"); } else return undefined; const out: string[] = []; for (const x of tail) { if (!x || x === ".") continue; if (x === "..") out.pop(); else out.push(x); } return { path: root + (out.length ? (root.endsWith("/") ? "" : "/") + out.join("/") : ""), windows: root !== "/" }; }
+// Every reading of a glob whose `..` steps back over a `**`, which matches no directory as well as many: the `..` then steps back from the segment before it, or the `**` stays; a directory segment an older bash can expand to `..` is read as `..` too. Undefined when the path is not usable, false past CAPTURE_MAX_GLOBSTAR_READINGS; mirrors `normalize_readings`.
+function captureReadings(path: string, windowsHost?: boolean): { path: string; windows: boolean }[] | undefined | false { const raw = windowsHost === false && path.startsWith("//") ? `/${path.replace(/^\/+/, "")}` : path; const p = raw.replace(/\\/g, "/"); let root: string; let tail: string[]; if (p.startsWith("//")) { const x = p.slice(2).split("/").filter(Boolean); if (x.length < 2) return undefined; root = `//${x.shift()}/${x.shift()}`; tail = x; } else if (/^[A-Za-z]:\//.test(p)) { root = `${p[0].toUpperCase()}:/`; tail = p.slice(3).split("/"); } else if (p.startsWith("/")) { root = "/"; tail = p.slice(1).split("/"); } else return undefined; let readings: string[][] = [[]]; let overflow = false; const segments = tail.filter((x) => x && x !== "."); segments.forEach((x, index) => { const parent = index + 1 < segments.length && x !== ".." && captureCouldNameParent(x); if (!parent && x !== "..") { for (const parts of readings) parts.push(x); return; } const next: string[][] = []; const push = (parts: string[]) => { if (!next.some((other) => other.length === parts.length && other.every((part, i) => part === parts[i]))) next.push(parts); }; for (const parts of readings) { if (parent) push(parts.slice(0, -1)); if (x !== "..") push([...parts, x]); else if (parts.length && parts[parts.length - 1].includes("**")) { push(parts.slice(0, -2)); push(parts); } else push(parts.slice(0, -1)); } if (next.length > CAPTURE_MAX_GLOBSTAR_READINGS) overflow = true; readings = next; }); if (overflow) return false; return readings.map((out) => ({ path: root + (out.length ? (root.endsWith("/") ? "" : "/") + out.join("/") : ""), windows: root !== "/" })); }
+// Whether a glob segment can match `..` where a leading-dot pattern matches the `.` and `..` entries (bash before 5.2): `.` then `*`, `?`, a class admitting `.` (`[[:punct:]]` too) or an extglob group with an alternative matching `.` (`.@(.)`, `.!(x)`); mirrors `could_name_parent`.
+function captureCouldNameParent(segment: string): boolean { if (!segment.startsWith(".")) return false; const rest = [...segment.slice(1)]; return /[*?\[(]/.test(segment.slice(1)) && captureClassGlob(rest, ["."]); }
+// A one-segment glob over `*`, `?`, `[…]` classes (`!`/`^` negates, ranges, a leading `]` is a member, `[:name:]`, `[=c=]`, `[.c.]`) and extglob groups (`@(…)`, `?(…)`, `*(…)`, `+(…)`, `!(…)`) matched against a short `text`; an unclosed `[` or `(` is literal. Mirrors `class_glob_matches`.
+function captureClassGlob(pattern: string[], text: string[]): boolean { if (!pattern.length) return !text.length; const head = pattern[0]; if ("@?*+!".includes(head) && pattern[1] === "(") { let depth = 0; let close = -1; for (let i = 1; i < pattern.length; i++) { if (pattern[i] === "(") depth++; else if (pattern[i] === ")" && --depth === 0) { close = i; break; } } if (close >= 0) { const alternatives: string[][] = []; let start = 2; depth = 0; for (let i = 2; i < close; i++) { if (pattern[i] === "(") depth++; else if (pattern[i] === ")") depth = Math.max(depth - 1, 0); else if (pattern[i] === "|" && depth === 0) { alternatives.push(pattern.slice(start, i)); start = i + 1; } } alternatives.push(pattern.slice(start, close)); const once = (t: string[]) => alternatives.some((alternative) => captureClassGlob(alternative, t)); const repeated = (t: string[]): boolean => { for (let split = 1; split <= t.length; split++) if (once(t.slice(0, split)) && (split === t.length || repeated(t.slice(split)))) return true; return false; }; const group = (t: string[]) => head === "@" ? once(t) : head === "?" ? !t.length || once(t) : head === "*" ? !t.length || repeated(t) : head === "+" ? repeated(t) : !once(t); for (let split = 0; split <= text.length; split++) if (group(text.slice(0, split)) && captureClassGlob(pattern.slice(close + 1), text.slice(split))) return true; return false; } } if (head === "*") { for (let skip = 0; skip <= text.length; skip++) if (captureClassGlob(pattern.slice(1), text.slice(skip))) return true; return false; } if (head === "?") return text.length > 0 && captureClassGlob(pattern.slice(1), text.slice(1)); if (head === "[") { const negated = pattern[1] === "!" || pattern[1] === "^"; const start = negated ? 2 : 1; const members: ((c: string) => boolean)[] = []; let i = start; if (pattern[i] === "]") { members.push((c) => c === "]"); i++; } let closed = false; while (i < pattern.length) { const c = pattern[i]; if (c === "]") { closed = true; break; } if (c === "[" && (pattern[i + 1] === ":" || pattern[i + 1] === "=" || pattern[i + 1] === ".")) { const kind = pattern[i + 1]; let end = -1; for (let at = i + 2; at + 1 < pattern.length; at++) if (pattern[at] === kind && pattern[at + 1] === "]") { end = at; break; } if (end >= 0) { const name = pattern.slice(i + 2, end).join(""); members.push(kind === ":" ? (x) => captureNamedClass(name, x) : (x) => [...name].length !== 1 || name === x); i = end + 2; continue; } members.push((x) => x === "["); i++; continue; } if (pattern[i + 1] === "-" && pattern[i + 2] !== undefined && pattern[i + 2] !== "]") { const low = c; const high = pattern[i + 2]; members.push((x) => low <= x && x <= high); i += 3; continue; } members.push((x) => x === c); i++; } if (!closed) return text[0] === "[" && captureClassGlob(pattern.slice(1), text.slice(1)); if (!text.length) return false; const found = members.some((member) => member(text[0])); return found !== negated && captureClassGlob(pattern.slice(i + 1), text.slice(1)); } return text[0] === head && captureClassGlob(pattern.slice(1), text.slice(1)); }
+// Whether the POSIX class `[:name:]` admits `c`; an unknown class may admit anything. Mirrors `ClassMember::admits`.
+function captureNamedClass(name: string, c: string): boolean { const code = c.codePointAt(0)!; const ascii = code < 128; switch (name) { case "alnum": return /[\p{L}\p{N}]/u.test(c); case "alpha": return /\p{L}/u.test(c); case "blank": return c === " " || c === "\t"; case "cntrl": return /\p{Cc}/u.test(c); case "digit": return /[0-9]/.test(c); case "lower": return /\p{Ll}/u.test(c); case "space": return /\s/.test(c); case "upper": return /\p{Lu}/u.test(c); case "word": return /[\p{L}\p{N}_]/u.test(c); case "xdigit": return /[0-9A-Fa-f]/.test(c); case "punct": return ascii && /[!-\/:-@\[-`{-~]/.test(c); case "graph": return code > 32 && code < 127; case "print": return code >= 32 && code < 127; case "ascii": return ascii; default: return true; } }
 function captureJoin(base: string, child: string): string { if (/^[^A-Za-z]?:|^[A-Za-z]:[^/\\]/.test(child)) return child; return `${base.replace(/[\\/]+$/, "")}/${child}`; }
+// Under a Windows host, every absolute path Windows can open for `path` from `base`, `/`-separated with its `.` and `..` still in place: the `\\?\`, `\\.\` and `\??\` prefixes and the local administrative share (`\\localhost\C$`) name the drive or share (any other device is no path), Git Bash/MSYS2/Cygwin `/c/x` and `/cygdrive/c/x` are `C:/x`, any other rooted path is on the base's drive or share, and each segment loses an alternate data stream suffix and its trailing dots and spaces. A native tool reads `/c/x` and `/cygdrive/c/x` from the root of the base's drive instead, so those give that path too. Undefined when it is not usable; mirrors `windows_spellings`.
+function captureWindowsSpellings(path: string, base: string): string[] | undefined { if (/^[\x00-\x7f]:/.test(path) && !/^[A-Za-z]:[\\/]/.test(path)) return undefined; const b = captureNormalize(base)?.path ?? ""; let p = path.replace(/\\/g, "/"); let alternate: string | undefined; if (/^(?:\/\/[?.]\/|\/\?\?\/)/.test(p)) { const rest = p.slice(4); if (/^unc\//i.test(rest)) p = `//${rest.slice(4)}`; else if (/^[A-Za-z]:/.test(rest)) p = rest; else return undefined; } if (/^[A-Za-z]:$/.test(p)) p += "/"; if (p.startsWith("//")) { const [server = "", share = "", ...rest] = p.slice(2).split("/"); if ((/^localhost$/i.test(server) || server === "127.0.0.1") && /^[A-Za-z]\$$/.test(share)) p = `${share[0]}:/${rest.join("/")}`; } else if (p.startsWith("/")) { const forward = path.startsWith("/"); const [first, ...after] = p.slice(1).split("/"); const driveRoot = /^[A-Za-z]:/.test(b) ? b.slice(0, 2) : /^\/\/[^/]+\/[^/]+/.exec(b)?.[0]; if (driveRoot === undefined) return undefined; const native = driveRoot + p; if (forward && /^[A-Za-z]$/.test(first)) { p = `${first.toUpperCase()}:/${after.join("/")}`; alternate = native; } else if (forward && first.toLowerCase() === "cygdrive" && /^[A-Za-z]$/.test(after[0] ?? "")) { p = `${after[0].toUpperCase()}:/${after.slice(1).join("/")}`; alternate = native; } else p = native; } else if (!/^[A-Za-z]:\//.test(p)) { if (!b) return undefined; p = `${b.replace(/\/+$/, "")}/${p}`; } const segments = (p: string): string | undefined => { let root: string; let tail: string[]; if (p.startsWith("//")) { const x = p.slice(2).split("/").filter(Boolean); if (x.length < 2) return undefined; root = `//${x.shift()}/${x.shift()}`; tail = x; } else if (/^[A-Za-z]:\//.test(p)) { root = `${p[0].toUpperCase()}:/`; tail = p.slice(3).split("/"); } else return undefined; const parts = tail.map(captureWindowsSegment).filter((x): x is string => x !== undefined); return root + (parts.length ? (root.endsWith("/") ? "" : "/") + parts.join("/") : ""); }; const spellings: string[] = []; for (const reading of alternate === undefined ? [p] : [p, alternate]) { const spelled = segments(reading); if (spelled === undefined) return undefined; spellings.push(spelled); } return spellings; }
+// The first of `captureWindowsSpellings`: Git Bash's reading of `/c/x`; mirrors `windows_spelling`.
+function captureWindowsSpelling(path: string, base: string): string | undefined { return captureWindowsSpellings(path, base)?.[0]; }
+// An absolute directory (cwd, marker directory) or pattern, normalized; a Windows one is read as Windows opens it, so it shares one spelling with every candidate compared with it (`\\?\C:\repo` is `C:/repo`); mirrors `normalize_root`.
+function captureRoot(path: string): { path: string; windows: boolean } | undefined { if (!captureHostWindows(path)) return captureNormalize(path); const spelled = captureWindowsSpelling(path, ""); return spelled === undefined ? undefined : captureNormalize(spelled); }
+// One segment as Windows reads it; undefined when nothing is left. Mirrors `windows_segment`.
+function captureWindowsSegment(segment: string): string | undefined { if (/[*?[\]{}()|]/.test(segment)) return segment; const name = segment.split(":")[0]; const unspaced = name.replace(/ +$/, ""); if (unspaced === "." || unspaced === "..") return unspaced; return name.replace(/[. ]+$/, "") || undefined; }
+// PowerShell opens `FileSystem::C:\x` and `Microsoft.PowerShell.Core\FileSystem::C:\x` (any case) as `C:\x`; read only on a Windows host. Mirrors `strip_powershell_provider`.
+function captureStripProvider(path: string): string { let rest = path; for (;;) { const prefix = /^(?:microsoft\.powershell\.core[\\/])?filesystem::/i.exec(rest); if (!prefix) return rest; rest = rest.slice(prefix[0].length); } }
+// A Windows shell word naming a file the matcher cannot place, so its command proves no miss: a drive-relative path (`C:docs\x`, a bare `C:`) or a device-namespace path naming no drive or share (`\\?\GLOBALROOT\...`, `\\.\HarddiskVolume3\...`). Mirrors `windows_unplaceable`.
+function captureWindowsUnplaceable(word: string, base: string): boolean { const w = captureStripProvider(word); if (/^[A-Za-z]:(?![\\/])/.test(w)) return true; return /^(?:[\\/]{2}[?.][\\/]|[\\/]\?\?[\\/])/.test(w) && captureWindowsSpellings(w, base) === undefined; }
+// Every path a candidate names from `base`, read as Windows reads it on a Windows host.
+function captureResolve(path: string, base: string, windowsHost: boolean): string[] | undefined { if (windowsHost) return captureWindowsSpellings(captureStripProvider(path), base); return [/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(path) ? path : captureJoin(base, path)]; }
+// Every reading (`captureReadings`) of every path `resolved` holds: undefined when one is unusable, false past CAPTURE_MAX_GLOBSTAR_READINGS in all.
+function captureAllReadings(resolved: string[] | undefined, windowsHost: boolean): { path: string; windows: boolean }[] | undefined | false { if (resolved === undefined) return undefined; const all: { path: string; windows: boolean }[] = []; for (const path of resolved) { const readings = captureReadings(path, windowsHost); if (!readings) return readings; all.push(...readings); if (all.length > CAPTURE_MAX_GLOBSTAR_READINGS) return false; } return all; }
+// Longer than CAPTURE_MAX_COMMAND_CHARS characters summed over its argv elements; mirrors `ShellCommand::oversized`.
+function captureCommandOversized(command: string | string[]): boolean { let total = 0; for (const item of typeof command === "string" ? [command] : command) for (const _c of item) if (++total > CAPTURE_MAX_COMMAND_CHARS) return true; return false; }
+// A TOML key (`a`, `"a"`, `'a'`, dotted `a . "b"`) at the start of `text`: its parts and the index past it and any blanks, or undefined. Enough of the key grammar to see every spelling of `capture`.
+function captureTomlKey(text: string): { parts: string[]; end: number } | undefined { const parts: string[] = []; let i = 0; for (;;) { while (text[i] === " " || text[i] === "\t") i++; if (text[i] === '"') { let j = i + 1; while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1; if (j >= text.length) return undefined; const decoded = captureParseArray(`[${text.slice(i, j + 1)}]`); if (!decoded) return undefined; parts.push(decoded[0]); i = j + 1; } else if (text[i] === "'") { const j = text.indexOf("'", i + 1); if (j < 0) return undefined; parts.push(text.slice(i + 1, j)); i = j + 1; } else { const bare = /^[A-Za-z0-9_-]+/.exec(text.slice(i)); if (!bare) return undefined; parts.push(bare[0]); i += bare[0].length; } while (text[i] === " " || text[i] === "\t") i++; if (text[i] !== ".") return { parts, end: i }; i++; } }
 function captureValidGlob(p: string): boolean { return !!p && [...p].length <= CAPTURE_MAX_PATTERN_CHARS && !/[!{}\[\]()|^$%]/.test(p) && !p.includes("${") && !p.includes("***") && !p.replace(/\\/g, "/").split("/").includes("..") && (!p.startsWith("~") || p.startsWith("~/")) && !/^[^A-Za-z]?:/.test(p) && !/^[A-Za-z]:[^/\\]/.test(p); }
 function captureParseArray(value: string): string[] | undefined { let i = 0; const out: string[] = []; const ws = () => { while (/\s/.test(value[i] ?? "")) i++; }; const basic = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" } as Record<string, string>; ws(); if (value[i++] !== "[") return undefined; for (;;) { ws(); if (value[i] === "]") { i++; ws(); return i === value.length ? out : undefined; } const quote = value[i++]; if (quote !== '"' && quote !== "'") return undefined; let s = ""; for (;;) { if (i >= value.length) return undefined; const c = value[i++]; if (c === quote) break; if (c === "\\" && quote === '"') { const e = value[i++]; if (e in basic) s += basic[e]; else if (e === "u" || e === "U") { const count = e === "u" ? 4 : 8; const hex = value.slice(i, i + count); if (!new RegExp(`^[0-9A-Fa-f]{${count}}$`).test(hex)) return undefined; const n = Number.parseInt(hex, 16); if (n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff)) return undefined; s += String.fromCodePoint(n); i += count; } else return undefined; } else if (c === "\n" || c === "\r") return undefined; else s += c; } out.push(s); ws(); if (value[i] === ",") { i++; continue; } if (value[i] === "]") continue; return undefined; } }
+// Follows the arrays and inline tables a TOML value leaves open across lines, each open `[` or `{` on `stack`. False when `text` cannot be (part of) a TOML 1.0 value: a close that matches nothing open, a `=` directly inside an array (a key line swallowed by one), text after the outermost close of a `continued` value, or an inline table still open at the end of the line.
+function captureValueScan(text: string, stack: string[], continued: boolean): boolean { let quote = ""; for (let i = 0; i < text.length; i++) { const c = text[i]; if (quote) { if (c === "\\" && quote === '"') i++; else if (c === quote) quote = ""; continue; } if (continued && !stack.length && !/\s/.test(c)) return false; if (c === '"' || c === "'") quote = c; else if (c === "[" || c === "{") stack.push(c); else if (c === "]" || c === "}") { if (stack.pop() !== (c === "]" ? "[" : "{")) return false; } else if (c === "=" && stack[stack.length - 1] === "[") return false; } return stack[stack.length - 1] !== "{"; }
 function captureHostWindows(path: string): boolean { return path.startsWith("\\\\") || path.startsWith("//") || /^[A-Za-z]:/.test(path); }
-function captureConfig(cwd: string | undefined): CaptureConfig {
-  const marker = findMarker(cwd);
-  const candidateBase = captureNormalize(cwd ? resolve(cwd) : "")?.path ?? "";
+function captureConfig(cwd: string | undefined): CaptureConfig { return captureConfigAt(findMarker(cwd), cwd); }
+// The policy one marker declares, for an event reported from `cwd`.
+function captureConfigAt(marker: string | undefined, cwd: string | undefined): CaptureConfig {
   // Host flavor comes from the cwd STRING itself, never from `resolve(cwd)`:
   // `resolve` re-roots a drive/UNC-shaped cwd through the real OS's own path
   // module, which only agrees on the OS that actually owns that path. The
   // cwd the hook reports is already absolute and already names its own host,
-  // exactly like the native hook's pure-string `flavor_of(cwd)`.
+  // exactly like the native hook's pure-string `flavor_of(cwd)`; a Windows
+  // cwd is normalized lexically for the same reason.
   const windowsHost = captureHostWindows(cwd ?? "");
+  const candidateBase = (windowsHost ? captureRoot(cwd ?? "") : captureNormalize(cwd ? resolve(cwd) : ""))?.path ?? "";
   if (!marker) return { state: "inactive", patterns: [], base: candidateBase, windowsHost };
   try {
     const bytes = readFileSync(marker);
-    const markerBase = captureNormalize(dirname(marker))?.path ?? candidateBase;
+    // A Windows marker's directory is cut lexically and spelled like the cwd.
+    const markerBase = (windowsHost ? captureRoot(marker.replace(/[\\/][^\\/]*$/, "")) : captureNormalize(dirname(marker)))?.path ?? candidateBase;
     if (bytes.byteLength > CAPTURE_MARKER_MAX_BYTES) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
-    let section = "";
+    // Every TOML spelling of the capture table the native parser honours
+    // (`[capture]`, `[ "capture" ]`, a top-level dotted `capture.ignore_paths`)
+    // is read; any other shape of a `capture` key (an inline table,
+    // `[[capture]]`, `[capture.x]`, a second definition) is invalid, as
+    // `read_capture_config` finds it.
+    // A value's arrays may span lines (`stack`), and a line inside one,
+    // `["docs"]` among them, is never a table header.
+    let section: "top" | "capture" | "other" = "top";
     let value = "";
     let collecting = false;
+    const stack: string[] = [];
     let seen = false;
+    let defined = false;
     for (const raw of bytes.toString("utf8").split(/\r?\n/)) {
       const line = captureTrimComment(raw).trim();
       if (!line) continue;
-      const table = /^\[([^\]]+)\]$/.exec(line);
-      if (table) {
-        if (collecting) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
-        section = table[1];
+      if (stack.length) {
+        if (!captureValueScan(line, stack, true)) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
+        if (collecting) value += ` ${line}`;
+        collecting &&= stack.length > 0;
         continue;
       }
-      if (section !== "capture") continue;
-      if (!seen) {
-        const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/.exec(line);
-        if (!kv || kv[1] !== "ignore_paths") return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
-        seen = true;
-        value = kv[2];
-        collecting = !value.includes("]");
-      } else if (collecting) {
-        value += ` ${line}`;
-        collecting = !value.includes("]");
-      } else return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
+      if (line.startsWith("[")) {
+        const array = line.startsWith("[[");
+        const close = array ? "]]" : "]";
+        const inner = line.slice(array ? 2 : 1, line.length - close.length);
+        const header = line.endsWith(close) ? captureTomlKey(inner) : undefined;
+        if (!header || header.end !== inner.length) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
+        if (header.parts[0] !== "capture") { section = "other"; continue; }
+        if (array || header.parts.length !== 1 || defined) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
+        section = "capture";
+        defined = true;
+        continue;
+      }
+      const key = captureTomlKey(line);
+      const kv = key && line[key.end] === "=" ? key : undefined;
+      // Neither a header nor a key/value line: not TOML, as toml_edit finds it.
+      if (!kv || !captureValueScan(line.slice(kv.end + 1), stack, false)) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
+      if (section === "other") continue;
+      if (section === "top" && kv.parts[0] !== "capture") continue;
+      const path = kv ? (section === "top" ? kv.parts.slice(1) : kv.parts) : [];
+      if (!kv || seen || path.length !== 1 || path[0] !== "ignore_paths") return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
+      seen = true;
+      defined = true;
+      value = line.slice(kv.end + 1).trim();
+      collecting = stack.length > 0;
     }
-    if (collecting) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
+    if (stack.length) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
     if (!seen) return { state: "inactive", patterns: [], base: candidateBase, windowsHost };
     const strings = captureParseArray(value);
     if (!strings || strings.length > CAPTURE_MAX_PATTERNS) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
@@ -285,19 +438,24 @@ function captureConfig(cwd: string | undefined): CaptureConfig {
         : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(source)
           ? source
           : captureJoin(markerBase, source);
-      const normalized = captureNormalize(expanded);
-      if (!normalized) return undefined;
+      const parsed = captureRoot(expanded);
+      // A Windows session's candidates are all Windows-flavored, so a POSIX pattern (`/c/repo/x/**`) would match nothing while the policy reports active; it fails closed, as `compile` rejects it.
+      if (!parsed || (windowsHost && !parsed.windows)) return undefined;
+      const normalized = { path: captureFold(parsed.path), windows: parsed.windows };
       return { path: normalized.path, windows: normalized.windows, directory: normalized.path.endsWith("/**") ? (normalized.path.slice(0, -3) || "/") : undefined, prefix: captureLiteralPrefix(normalized.path) };
     });
     if (patterns.some((p) => !p)) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
     return patterns.length
-      ? { state: "active", patterns: patterns as CaptureConfig["patterns"], base: candidateBase, windowsHost }
+      ? { state: "active", patterns: patterns as CaptureConfig["patterns"], base: candidateBase, windowsHost, root: markerBase }
       : { state: "inactive", patterns: [], base: candidateBase, windowsHost };
   } catch (_e) {
     return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
   }
 }
-function captureGlob(pattern: string, candidate: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const p = [...pattern]; const c = [...candidate]; const previous = new Array<boolean>(p.length + 1).fill(false); previous[0] = true; for (let j = 1; j <= p.length; j++) previous[j] = p[j - 1] === "*" && p[j] !== "*" && previous[j - 1]; for (const ch of c) { const current = new Array<boolean>(p.length + 1).fill(false); for (let j = 1; j <= p.length; j++) { if (++budget.work > CAPTURE_MAX_WORK) return undefined; const x = p[j - 1]; current[j] = x === "*" && p[j] === "*" ? false : x === "*" && j >= 2 && p[j - 2] === "*" ? current[j - 2] || previous[j] : x === "*" ? current[j - 1] || (ch !== "/" && previous[j]) : x === "?" ? ch !== "/" && previous[j - 1] : captureCharEq(x, ch, insensitive) && previous[j - 1]; } for (let j = 0; j <= p.length; j++) previous[j] = current[j]; } return previous[p.length]; }
+function captureGlob(pattern: string, candidate: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const states = captureGlobStates(pattern, candidate, insensitive, budget); return states && states[states.length - 1]; }
+// Whether `pattern` matches some path strictly below `directory`: a prefix still alive after `directory/` can always be completed.
+function captureGlobBelow(pattern: string, directory: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const states = captureGlobStates(pattern, directory.endsWith("/") ? directory : `${directory}/`, insensitive, budget); return states && states.some(Boolean); }
+function captureGlobStates(pattern: string, candidate: string, insensitive: boolean, budget: { work: number }): boolean[] | undefined { const p = [...pattern]; const c = [...candidate]; const previous = new Array<boolean>(p.length + 1).fill(false); previous[0] = true; for (let j = 1; j <= p.length; j++) previous[j] = p[j - 1] === "*" && p[j] !== "*" && previous[j - 1]; for (const ch of c) { const current = new Array<boolean>(p.length + 1).fill(false); for (let j = 1; j <= p.length; j++) { if (++budget.work > CAPTURE_MAX_WORK) return undefined; const x = p[j - 1]; current[j] = x === "*" && p[j] === "*" ? false : x === "*" && j >= 2 && p[j - 2] === "*" ? current[j - 2] || previous[j] : x === "*" ? current[j - 1] || (ch !== "/" && previous[j]) : x === "?" ? ch !== "/" && previous[j - 1] : captureCharEq(x, ch, insensitive) && previous[j - 1]; } for (let j = 0; j <= p.length; j++) previous[j] = current[j]; } return previous; }
 function captureCharEq(a: string, b: string, insensitive: boolean): boolean { return insensitive && a.charCodeAt(0) < 128 && b.charCodeAt(0) < 128 ? a.toLowerCase() === b.toLowerCase() : a === b; }
 function captureLiteralPrefix(path: string): string { const glob = path.search(/[*?]/); if (glob < 0) return path; const slash = path.lastIndexOf("/", glob); if (slash < 0) return ""; const head = path.slice(0, slash + 1); const trimmed = head.slice(0, -1); return trimmed && !trimmed.endsWith(":") ? trimmed : head; }
 function captureStartsWith(path: string, prefix: string, insensitive: boolean): boolean { const p = path[Symbol.iterator](); for (const x of prefix) { const c = p.next(); if (c.done || !captureCharEq(x, c.value, insensitive)) return false; } return true; }
@@ -306,15 +464,112 @@ function captureGlobReaches(glob: string, prefix: string, insensitive: boolean, 
 // (`bash -lc "<script>"`); joining elements would re-split paths with spaces.
 // Elements over 256 chars are scripts, so only their tokens count.
 function captureShellCommand(args: Record<string, unknown> | undefined): string | string[] | undefined { if (!args || typeof args !== "object" || Array.isArray(args)) return undefined; const value = "command" in args ? args.command : ("cmd" in args ? args.cmd : args.CommandLine); if (typeof value === "string") return value; if (Array.isArray(value) && value.every((x) => typeof x === "string")) return value as string[]; return undefined; }
-// Split only when a policy is active: this runs for every tool event.
-function captureShellWordList(command: string | string[]): string[] { if (typeof command === "string") return captureShellWords(command); return command.flatMap((item) => { const tokens = captureShellWords(item); return tokens.length === 1 && tokens[0] === item || [...item].length > 256 ? tokens : [item, ...tokens]; }); }
-function captureShellWords(command: string): string[] { const special = (c: string) => /\s/.test(c) || "|&;<>()".includes(c); const chars = [...command]; const words: string[] = []; let word = ""; let inWord = false; let quote = ""; for (let i = 0; i < chars.length; i++) { const c = chars[i]; const next = chars[i + 1]; if (quote) { if (c === quote) quote = ""; else if (quote === '"' && c === "\\" && (next === '"' || next === "\\")) { word += next; i++; } else word += c; } else if (c === "'" || c === '"') { quote = c; inWord = true; } else if (c === "\\" && next !== undefined && (special(next) || next === "'" || next === '"' || next === "\\")) { word += next; i++; inWord = true; } else if (special(c)) { if (inWord) words.push(word); word = ""; inWord = false; } else { word += c; inWord = true; } } if (inWord) words.push(word); return words; }
-function captureShellArguments(word: string): string[] { const out = word.startsWith("-") ? [] : [word]; const eq = word.indexOf("="); if (eq >= 0) out.push(word.slice(eq + 1)); return out.filter((argument) => argument.trim() !== ""); }
+// Split only when a policy is active: this runs for every tool event. Every
+// word, and again every word inside a word that holds more than one
+// (`bash -c 'cat x'`, `"$(cat x)"`), down to CAPTURE_MAX_SHELL_NESTING levels;
+// a script nested deeper is opaque. Mirrors `ShellCommand::split`.
+// `windows` also reads the command without PowerShell backquote and cmd caret
+// escapes. A `~-`, `~N` or `~name` prefix names a directory only the running
+// shell knows, which makes the command unprovable. Each word carries whether a
+// `~` in it was outside quotes: a quoted tilde, or one in an argv element or a
+// quoted message, is literal, except under PowerShell, which reads `~` itself.
+// `expanded` holds the words of each script with such syntax as the shell expands them where that changes the directory a path names (a zsh glob group kept in its word, ANSI-C numeric escapes decoded), for the marker lookup only; mirrors `ShellWords::expanded`.
+type CaptureSplit = { words: [string, boolean][]; opaque: boolean; expanded: [string, boolean][] };
+function captureShellSplit(command: string | string[], windows = false): CaptureSplit { const split: CaptureSplit = { words: [], opaque: false, expanded: [] }; const readings = (text: string): [string, boolean][] => { const texts = [text]; const plain = windows ? captureWithoutWindowsEscapes(text) : undefined; if (plain !== undefined) texts.push(plain); const out: [string, boolean][] = []; for (const t of texts) { out.push([t, false]); if (windows && t.includes("\\")) out.push([t, true]); } return out; }; if (typeof command === "string") { split.opaque = captureUnevaluatedExpansion(command); if (split.opaque) split.expanded.push(...captureMarkedWords(command, true)); for (const [text, literal] of readings(command)) captureNestedWords(captureMarkedWords(text, false, literal), CAPTURE_MAX_SHELL_NESTING, split, literal); } else { split.opaque = command.some((item) => captureUnevaluatedExpansion(item)) || captureInlineCode(command); for (const item of command) if (captureUnevaluatedExpansion(item)) split.expanded.push(...captureMarkedWords(item, true)); command.forEach((item, index) => { const script = captureShellScript(command, index); for (const [text, literal] of readings(item)) captureArgvItem(text, script, split, literal); }); } if (windows) for (const word of split.words) word[1] = true; if (split.words.some(([word, tilde]) => tilde && captureShellArguments(word).some(([argument]) => captureUnknownDirectory(argument)))) split.opaque = true; return split; }
+function captureArgvItem(item: string, script: boolean, split: CaptureSplit, literal = false): void { const tokens = captureMarkedWords(item, false, literal); if (tokens.length === 1 && tokens[0][0] === item) { capturePushWord(item, false, split); return; } if ([...item].length <= 256) split.words.push([item, false]); captureNestedWords(captureLiteralTildes(tokens, script), CAPTURE_MAX_SHELL_NESTING - 1, split, literal); }
+// Only a script a shell runs expands a tilde; mirrors `literal_tildes`.
+function captureLiteralTildes(tokens: [string, boolean][], script: boolean): [string, boolean][] { return script ? tokens : tokens.map(([token]) => [token, false] as [string, boolean]); }
+// PowerShell's backquote and cmd's caret each stand for the next character; mirrors `without_windows_escapes`.
+function captureWithoutWindowsEscapes(command: string): string | undefined { if (!/[`^]/.test(command)) return undefined; const chars = [...command]; let plain = ""; for (let i = 0; i < chars.length; i++) { if (chars[i] === "`" || chars[i] === "^") { i++; if (i < chars.length) plain += chars[i]; } else plain += chars[i]; } return plain; }
+function captureUnknownDirectory(argument: string): boolean { if (!argument.startsWith("~")) return false; const prefix = argument.slice(1).split(/[\/\\]/)[0]; return prefix !== "" && prefix !== "+"; }
+// Only a script a shell runs expands braces, classes and tildes; a quoted message or pattern does not.
+function captureNestedWords(words: [string, boolean][], depth: number, split: CaptureSplit, literal = false): void { const texts = words.map(([word]) => word); if (captureInlineCode(texts)) split.opaque = true; words.forEach(([word, tilde], index) => { capturePushWord(word, tilde, split); const tokens = captureMarkedWords(word, false, literal); if (tokens.length === 1 && tokens[0][0] === word) return; if (depth === 0) { split.opaque = true; return; } const script = word.includes("$(") || word.includes("`") || captureShellScript(texts, index); if (script && captureUnevaluatedExpansion(word)) { split.opaque = true; split.expanded.push(...captureMarkedWords(word, true)); } captureNestedWords(captureLiteralTildes(tokens, script), depth - 1, split, literal); }); }
+// Also adds the POSIX reading of a word with `\o` escapes, which the shell reads as `o`, and the reading of each with every parameter default (`${X:-docs/x.md}`) replaced by its operand; a default nested deeper than the matcher reads makes the command unprovable.
+function capturePushWord(word: string, tilde: boolean, split: CaptureSplit): void { capturePushReading(word, tilde, split); if (!word.includes("\\")) return; const chars = [...word]; let plain = ""; for (let i = 0; i < chars.length; i++) { if (chars[i] === "\\") { i++; if (i < chars.length) plain += chars[i]; } else plain += chars[i]; } if (plain !== word) capturePushReading(plain, tilde, split); }
+function capturePushReading(word: string, tilde: boolean, split: CaptureSplit): void { split.words.push([word, tilde]); const operands = captureParameterOperands(word); if (operands === undefined) return; split.words.push([operands[0], tilde]); if (operands[1]) split.opaque = true; }
+// Mirrors `parameter_operands`: `${NAME:-w}`, `${NAME:=w}`, `${NAME:+w}` (or without `:`) become `w`, nested down to CAPTURE_MAX_SHELL_NESTING levels; the flag is set when one is nested deeper still.
+function captureParameterOperands(word: string): [string, boolean] | undefined { let current = captureReplaceOperands(word); if (current === undefined) return undefined; for (let i = 1; i < CAPTURE_MAX_SHELL_NESTING; i++) { const next = captureReplaceOperands(current); if (next === undefined) return [current, false]; current = next; } return [current, captureReplaceOperands(current) !== undefined]; }
+function captureReplaceOperands(word: string): string | undefined { let output = ""; let rest = word; let changed = false; for (;;) { const start = rest.indexOf("${"); if (start < 0) break; output += rest.slice(0, start); const body = rest.slice(start + 2); const name = (/^[A-Za-z0-9_]*/.exec(body) ?? [""])[0].length; const after = body.slice(name); const operator = /^:[-=+]/.test(after) ? 2 : /^[-=+]/.test(after) ? 1 : 0; const operand = after.slice(operator); let depth = 0; let end = -1; for (let i = 0; i < operand.length; i++) { const c = operand[i]; if (c === "{") depth++; else if (c === "}") { if (depth === 0) { end = i; break; } depth--; } } if (end >= 0 && name > 0 && operator > 0) { output += operand.slice(0, end); changed = true; rest = operand.slice(end + 1); } else { output += "${"; rest = body; } } output += rest; return changed ? output : undefined; }
+function captureCommandName(word: string): string { const name = word.slice(Math.max(word.lastIndexOf("/"), word.lastIndexOf("\\")) + 1).replace(/[A-Z]/g, (c) => c.toLowerCase()); return name.endsWith(".exe") ? name.slice(0, -4) : name; }
+// Skips options and their values (`bash -o pipefail -c`); mirrors `is_shell_script`/`takes_shell_value`.
+function captureShellScript(words: string[], index: number): boolean { let flagged = false; for (let i = index - 1; i >= 0; i--) { const word = words[i]; if (word.startsWith("-")) { flagged ||= !word.startsWith("--") && word.slice(1).includes("c"); continue; } if (word.length > 1 && word.startsWith("+")) continue; if (i > 0 && captureShellValueOption(words[i - 1])) continue; const name = captureCommandName(word); return (flagged && ["sh","bash","zsh","dash","ksh","mksh","ash","yash","fish","su","script"].includes(name)) || (i + 1 === index && name === "eval"); } return false; }
+function captureShellValueOption(flag: string): boolean { return ["--rcfile","--init-file","--init-command","-C"].includes(flag) || (flag.length > 1 && (flag.startsWith("+") || (flag.startsWith("-") && !flag.startsWith("--"))) && /[oO]$/.test(flag)); }
+// Inline interpreter code (`python3 -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `lua -e`, `Rscript -e`, `osascript -e`, `deno eval`) builds paths at run time; mirrors `runs_inline_code`.
+function captureInlineCode(words: string[]): boolean { return words.some((word, index) => { const name = captureCommandName(word); const versioned = (prefix: string) => name.startsWith(prefix) && /^[0-9.]*$/.test(name.slice(prefix.length)); if (name === "deno") return words[index + 1] === "eval"; const spec: [string, string[]] | undefined = versioned("python") || versioned("pypy") || name === "py" ? ["c", ["-W","-X","--check-hash-based-pycs"]] : versioned("perl") ? ["eE", ["-I","-M","-m"]] : versioned("ruby") ? ["e", ["-I","-r","-C","-E"]] : ["node","nodejs","bun"].includes(name) ? ["ep", ["-r","--require","--import","--loader","--experimental-loader","-C","--conditions","--input-type","--title","--env-file"]] : versioned("php") ? ["r", ["-d","-c","-z"]] : ["lua","luajit","rscript","osascript"].includes(name) ? ["e", ["-l"]] : undefined; if (!spec) return false; const [letters, values] = spec; for (let i = index + 1; i < words.length; i++) { const flag = words[i]; if (!flag.startsWith("-")) return false; if (["--eval","--print"].includes(flag) || flag.startsWith("--eval=") || flag.startsWith("--print=") || (!flag.startsWith("--") && [...flag.slice(1)].some((c) => letters.includes(c)))) return true; if (values.includes(flag)) i++; } return false; }); }
+// Each word with whether it holds a `~` outside quotes and not after a backslash; mirrors `marked_shell_words`. With `expand`, a zsh glob group stays in its word and ANSI-C numeric and control escapes are decoded; mirrors `shell_tokens`. With `literal`, every backslash is an ordinary character, as PowerShell and cmd read it; mirrors `literal_shell_words`.
+function captureMarkedWords(command: string, expand = false, literal = false): [string, boolean][] { const special = (c: string) => /\s/.test(c) || "|&;<>()`".includes(c); const chars = [...command]; const words: [string, boolean][] = []; let word = ""; let tilde = false; let inWord = false; let quote = ""; for (let i = 0; i < chars.length; i++) { const c = chars[i]; const next = chars[i + 1]; if (quote === "$") { if (c === "'") quote = ""; else if (c === "\\" && next !== undefined && !literal) { const plain = captureAnsiEscape(next); const numeric = plain === undefined && expand ? captureAnsiNumeric(chars, i + 1) : undefined; if (plain !== undefined) { word += plain; i++; } else if (numeric) { word += numeric[0]; i = numeric[1]; } else { word += c + next; i++; } } else word += c; } else if (quote) { if (c === quote) quote = ""; else if (!literal && quote === '"' && c === "\\" && next === "\n") i++; else if (!literal && quote === '"' && c === "\\" && (next === '"' || next === "\\" || next === "$" || next === "`")) { word += next; i++; } else word += c; } else if (c === "'" || c === '"') { quote = c; inWord = true; } else if (c === "$" && (next === "'" || next === '"')) { quote = next === "'" ? "$" : '"'; i++; inWord = true; } else if (!literal && c === "\\" && next === "\n") { i++; } else if (!literal && c === "\\" && next !== undefined && (special(next) || next === "'" || next === '"' || next === "\\")) { word += next; i++; inWord = true; } else if (c === "(" && expand && (!inWord || !/[$=]$/.test(word)) && captureGlobGroup(chars, i, inWord) !== undefined) { const end = captureGlobGroup(chars, i, inWord)!; word += chars.slice(i, end + 1).join(""); i = end; inWord = true; } else if (special(c)) { if (inWord) words.push([word, tilde]); word = ""; tilde = false; inWord = false; } else { if (c === "~" && !word.endsWith("\\")) tilde = true; word += c; inWord = true; } } if (inWord) words.push([word, tilde]); return words; }
+// The index of the `)` closing the zsh glob group `(` opens at `open`: inside a word, or at a word's start when a word character follows; undefined for a subshell or when whitespace, a quote, an escape or another operator comes first. Mirrors `glob_group`.
+function captureGlobGroup(chars: string[], open: number, inWord: boolean): number | undefined { let depth = 0; for (let i = open; i < chars.length; i++) { const c = chars[i]; if (/\s/.test(c) || "'\"\\;&<>`".includes(c)) return undefined; if (c === "(") depth++; else if (c === ")" && --depth === 0) { const next = chars[i + 1]; return inWord || (next !== undefined && !/\s/.test(next) && !"|&;<>()`".includes(next)) ? i : undefined; } } return undefined; }
+// A numeric or control ANSI-C escape whose letter or first digit is at `at` (`\xHH`, `\uHHHH`, `\UHHHHHHHH`, `\NNN`, `\cX`): the character and the index of its last source character, or undefined. Mirrors `ansi_c_numeric_escape`.
+function captureAnsiNumeric(chars: string[], at: number): [string, number] | undefined { const escape = chars[at]; if (escape === "c") { const control = chars[at + 1]; return control !== undefined && control.charCodeAt(0) < 128 ? [String.fromCharCode(control.charCodeAt(0) & 0x1f), at + 1] : undefined; } const shape = escape === "x" ? [16, 2] : escape === "u" ? [16, 4] : escape === "U" ? [16, 8] : /^[0-7]$/.test(escape ?? "") ? [8, 2] : undefined; if (!shape) return undefined; const [radix, most] = shape; const digit = radix === 16 ? /^[0-9A-Fa-f]$/ : /^[0-7]$/; let value = radix === 8 ? Number(escape) : 0; let end = at; for (let n = 0; n < most && digit.test(chars[end + 1] ?? ""); n++) { end++; value = value * radix + parseInt(chars[end], radix); } if (radix === 16 && end === at) return undefined; return value <= 0x10ffff && !(value >= 0xd800 && value <= 0xdfff) ? [String.fromCodePoint(value), end] : undefined; }
+// `$'…'` escapes; numeric and control escapes stay as written. Mirrors `ansi_c_escape`.
+function captureAnsiEscape(escape: string): string | undefined { const decoded: Record<string, string> = { a: "\u0007", b: "\b", e: "\u001b", E: "\u001b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" }; return Object.prototype.hasOwnProperty.call(decoded, escape) ? decoded[escape] : undefined; }
+// Whether an unquoted word holds syntax lexical matching does not evaluate: a brace expansion (`{a,b}`, `{1..3}`), a bracket class (`[ab]`, `[]a]`), a zsh glob group or extglob (`docs/(a|b)`, `(a|b)/x`), or an ANSI-C numeric/control escape; mirrors `has_unevaluated_expansion`.
+function captureUnevaluatedExpansion(command: string): boolean { const operator = (c: string) => "|&;<>()`".includes(c); const isWord = (c: string | undefined) => c !== undefined && !/\s/.test(c) && !operator(c); const chars = [...command]; let quote = ""; let previous = ""; let inWord = false; let parameter = false; let brace: boolean | undefined; let klass: number | undefined; const groups: boolean[] = []; for (let i = 0; i < chars.length; i++) { const c = chars[i]; if (quote) { if (((quote === "$" || quote === "'") && c === "'") || (quote === '"' && c === '"')) quote = ""; else if (quote === "$" && c === "\\") { const escape = chars[++i]; if (escape !== undefined && /^[xuUc0-7]$/.test(escape)) return true; } else if (quote === '"' && c === "\\") i++; if (klass !== undefined) klass++; previous = ""; inWord = true; continue; } if (c === "'" && previous === "$") quote = "$"; else if (c === "'" || c === '"') quote = c; else if (c === "\\") { i++; if (klass !== undefined) klass++; previous = ""; inWord = true; continue; } else if (c === "(") { if (inWord && previous !== "$" && previous !== "=") return true; groups.push(!inWord && previous !== "<" && previous !== ">"); parameter = false; brace = undefined; klass = undefined; inWord = false; } else if (c === ")") { if (groups.pop() === true && isWord(chars[i + 1])) return true; parameter = false; brace = undefined; klass = undefined; inWord = false; } else if (c === "|" && groups[groups.length - 1] === true && inWord && isWord(chars[i + 1])) return true; else if (/\s/.test(c) || operator(c)) { parameter = false; brace = undefined; klass = undefined; inWord = false; } else if (c === "{" && previous === "$") parameter = true; else if (c === "}" && parameter) parameter = false; else if (parameter) { /* parameter expansion */ } else if (c === "{") brace = false; else if (c === "," && brace !== undefined) brace = true; else if (c === "." && brace !== undefined && previous === ".") brace = true; else if (c === "}" && brace !== undefined) { if (brace) return true; brace = undefined; } else if (c === "[" && klass === undefined) klass = 0; else if (c === "]" && klass === 0) klass = 1; else if (c === "]" && klass !== undefined) return true; else if (klass !== undefined) klass++; if (!/\s/.test(c) && !operator(c)) inWord = true; previous = c; } return false; }
+// Also a value glued to a short flag (`-fFILE`), the path of a git `REV:path` object name, flagged because git resolves it from the repository root, and the path of any of these that is a `file:` URL; mirrors `shell_arguments`.
+function captureShellArguments(word: string): [string, boolean][] { const flag = word.startsWith("-"); const out: [string, boolean][] = flag ? [] : [[word, false]]; const eq = word.indexOf("="); const colon = flag && eq < 0 ? word.indexOf(":") : -1; if (eq >= 0) out.push([word.slice(eq + 1), false]); else if (colon >= 0) out.push([word.slice(colon + 1), false]); if (flag && !word.startsWith("--")) { const glued = [...word.slice(1)].slice(1).join(""); if (glued) out.push([glued, false]); } const object = captureGitObjectPath(word); if (object !== undefined) out.push([object, true]); for (const [argument] of [...out]) { const url = captureFileUrlPath(argument); if (url !== undefined) out.push([url, false]); } return out.filter(([argument]) => argument.trim() !== ""); }
+// The local path of a `file:` URL in any case, cut at its query or fragment and then ASCII percent-escapes decoded; mirrors `file_url_path`.
+function captureFileUrlPath(argument: string): string | undefined { if (argument.slice(0, 5).toLowerCase() !== "file:") return undefined; const rest = argument.slice(5).split(/[?#]/)[0]; let path = rest; if (rest.startsWith("//")) { const slash = rest.indexOf("/", 2); if (slash < 0) return undefined; path = rest.slice(slash); } if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1); return path.replace(/%([0-7][0-9A-Fa-f])/g, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16))); }
+function captureGitObjectPath(word: string): string | undefined { if (word.startsWith("-")) return undefined; const colon = word.indexOf(":"); if (colon < 0) return undefined; const revision = word.slice(0, colon); let path = word.slice(colon + 1); if (!revision && /^[0-3]:/.test(path)) path = path.slice(2); return !/^[A-Za-z]$/.test(revision) && /^[A-Za-z0-9._\/~^@{}-]*$/.test(revision) && !path.startsWith("//") ? path : undefined; }
 // Lexical only, like the native hook: nothing is expanded or executed, so
 // variables, command substitution, and `cd` state are not followed. A tool's
-// own `workdir` replaces the event cwd for relative arguments.
-function captureMatchCommand(command: string | string[], config: CaptureConfig, workdir?: string): boolean | undefined { const budget = { work: 0 }; const home = homedir(); const base = workdir === undefined ? config.base : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(workdir) ? workdir : config.base && captureJoin(config.base, workdir); for (const word of captureShellWordList(command)) for (const argument of captureShellArguments(word)) { const expanded = argument.startsWith("~/") ? captureJoin(home, argument.slice(2)) : argument; if ([...expanded].length > CAPTURE_MAX_PATH_CHARS) continue; const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(expanded); if (!absolute && !base) continue; const candidate = captureNormalize(absolute ? expanded : captureJoin(base, expanded), config.windowsHost); if (!candidate) continue; const glob = /[*?]/.test(candidate.path); for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; const under = captureStartsWith(candidate.path, pattern.prefix, pattern.windows); if (!under && !glob) continue; if (under) { const directory = pattern.directory ? captureGlob(pattern.directory, candidate.path, pattern.windows, budget) : false; if (directory !== false) return directory; const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match !== false) return match; } if (glob) { const reaches = captureGlobReaches(candidate.path, pattern.prefix, pattern.windows, budget); if (reaches !== false) return reaches; } } } return false; }
-function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; workdir?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir","list_dir","grep_search","search_files","find_by_name"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","shell_command","exec","execute","run_command","web_search","search_web","manage_task","manage_subagents","terminal","execute_bash","execute_cmd"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", workdir: typeof args?.workdir === "string" && args.workdir.trim() ? args.workdir : undefined }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
+// own `workdir` replaces the event cwd for relative arguments. On a Windows host
+// a word the matcher cannot place (`captureWindowsUnplaceable`) proves no miss,
+// unless it is only a POSIX shell's reading of a placeable native path
+// (`C:\repo\x` read as `C:repox`); mirrors `match_command`.
+function captureMatchCommand(words: [string, boolean][], config: CaptureConfig, workdir?: string): { match: boolean | undefined; spool: boolean } { const budget = { work: 0 }; const home = homedir(); const base = captureBase(config, workdir); let spool = false; const driveRelative: string[] = []; const placed = new Set<string>(); for (const [word, tilde] of words) for (const [argument, fromRoot] of captureShellArguments(word)) { const expanded = captureExpandTilde(argument, tilde, home, base); if (config.windowsHost) { if (!captureWindowsUnplaceable(expanded, base)) { if (expanded.includes("\\")) placed.add(expanded.replace(/\\(.?)/gs, "$1")); } else if (/^[A-Za-z]:/.test(captureStripProvider(expanded))) driveRelative.push(expanded); else spool = true; } if ([...expanded].length > CAPTURE_MAX_PATH_CHARS) continue; const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(expanded); for (const root of fromRoot && !absolute && config.root ? [base, config.root] : [base]) { if (!absolute && !root) continue; const readings = captureAllReadings(captureResolve(expanded, root, config.windowsHost), config.windowsHost); if (readings === false) return { match: undefined, spool }; if (!readings) continue; for (const candidate of readings) { const spooled = captureOutputSpool(candidate.path, budget); if (spooled === undefined) return { match: undefined, spool }; if (spooled) spool = true; const match = captureMatchCandidate(candidate, false, config, budget); if (match !== false) return { match, spool }; } } } if (driveRelative.some((word) => !placed.has(word))) spool = true; return { match: false, spool }; }
+// The directory a shell tool's relative arguments resolve from; mirrors `command_base`.
+function captureBase(config: CaptureConfig, workdir?: string): string { const spelled = workdir !== undefined && config.windowsHost && config.base ? captureWindowsSpelling(captureStripProvider(workdir), config.base) : undefined; if (spelled !== undefined) return spelled; return workdir === undefined ? config.base : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(workdir) ? workdir : config.base && captureJoin(config.base, workdir); }
+// A leading unquoted `~/` (PowerShell `~\`) is home and `~+` the working directory; mirrors `expand_tilde`.
+function captureExpandTilde(argument: string, tilde: boolean, home: string, base: string): string { return !tilde ? argument : /^~[\/\\]/.test(argument) ? captureJoin(home, argument.slice(2)) : argument === "~+" ? base : argument.startsWith("~+/") && base ? captureJoin(base, argument.slice(3)) : argument; }
+// A harness's saved copy of an earlier tool's output, read back like `BashOutput`: Claude Code `~/.claude/projects/<project>/<session>/tool-results/<id>.txt` and `<tmp>/claude-<uid>/<project>/<session>/tasks/<id>.output`, OpenCode `<data>/opencode/tool-output/tool_<id>`, Pi `<tmp>/pi-bash-<id>.log`. A glob segment fits a named one when the two share a match, and at least one fitting segment must spell literal text. Each segment is fitted to each shape once and the work is charged to `budget`; undefined past CAPTURE_MAX_WORK. Mirrors `output_spool`.
+function captureOutputSpool(path: string, budget: { work: number }): boolean | undefined { const segments = path.split("/").filter(Boolean).map((segment) => [...segment.replace(/[A-Z]/g, (c) => c.toLowerCase())]); const file = segments.pop(); if (file === undefined) return false; const fits = (segment: string[], shape: string): boolean | undefined => { budget.work += (segment.length + 1) * ([...shape].length + 1); return budget.work > CAPTURE_MAX_WORK ? undefined : captureGlobsIntersect(segment, [...shape]); }; const spells = (segment: string[], word: string) => captureSpells(segment.join(""), word); const count = segments.length; let after: [boolean, boolean][] | undefined; let claudeResults = false; for (let index = 1; index < count; index++) { const claude = segments[index - 1]; const projects = segments[index]; const c = fits(claude, "*claude*"); if (c === undefined) return undefined; if (!c) continue; const p = fits(projects, "projects"); if (p === undefined) return undefined; if (!p) continue; if (!after) { after = new Array<[boolean, boolean]>(count); let seen: [boolean, boolean] = [false, false]; for (let at = count - 1; at >= 0; at--) { after[at] = seen; const results = fits(segments[at], "tool-results"); if (results === undefined) return undefined; if (results) seen = [true, seen[1] || spells(segments[at], "tool-results")]; } } const [fitting, spelled] = after[index]; if (spelled || (fitting && (spells(claude, "claude") || spells(projects, "projects")))) { claudeResults = true; break; } } let claudeTask = false; if (count > 0) { const parent = segments[count - 1]; const tasks = fits(parent, "tasks"); if (tasks === undefined) return undefined; if (tasks) { const output = fits(file, "*.output"); if (output === undefined) return undefined; if (output) { const named = spells(parent, "tasks") || spells(file, ".output"); for (const claude of segments) { const c = fits(claude, "claude*"); if (c === undefined) return undefined; if (c && (named || spells(claude, "claude"))) { claudeTask = true; break; } } } } } let opencode = false; if (count >= 2) { const data = fits(segments[count - 2], "opencode"); if (data === undefined) return undefined; if (data) { const output = fits(segments[count - 1], "tool-output"); if (output === undefined) return undefined; opencode = output && (spells(segments[count - 2], "opencode") || spells(segments[count - 1], "tool-output")); } } const pi = fits(file, "pi-bash-*.log"); if (pi === undefined) return undefined; return claudeResults || claudeTask || opencode || (pi && spells(file, "pi-bash-")); }
+// Whether a one-segment glob spells part of `word` in literal text: a run between wildcards sharing three characters in a row with it; mirrors `spells`.
+function captureSpells(segment: string, word: string): boolean { const needed = Math.min([...word].length, 3); return segment.split(/[*?]/).some((run) => { const chars = [...run]; for (let i = 0; i + needed <= chars.length; i++) if (word.includes(chars.slice(i, i + needed).join(""))) return true; return false; }); }
+// Whether two one-segment globs over `*` and `?` match a common string; mirrors `globs_intersect`.
+function captureGlobsIntersect(left: string[], right: string[]): boolean { const common = Array.from({ length: left.length + 1 }, () => new Array<boolean>(right.length + 1).fill(false)); common[left.length][right.length] = true; for (let i = left.length; i >= 0; i--) for (let j = right.length; j >= 0; j--) { if (i === left.length && j === right.length) continue; common[i][j] = left[i] === "*" ? common[i + 1][j] || (j < right.length && common[i][j + 1]) : right[j] === "*" ? common[i][j + 1] || (i < left.length && common[i + 1][j]) : i < left.length && j < right.length ? (left[i] === "?" || right[j] === "?" || left[i] === right[j]) && common[i + 1][j + 1] : false; } return common[0][0]; }
+// Gemini CLI `read_many_files` globs expand case-insensitively with `**`
+// recursing to any depth: a literal path matches like a file tool's, a glob
+// drops when it could expand into an ignored path, and glob syntax the matcher
+// cannot evaluate (classes, braces, extglobs, negation) fails closed.
+function captureMatchGlobs(paths: string[], config: CaptureConfig): boolean | undefined { const budget = { work: 0 }; for (const path of paths) { if (/[\[\]{}()!]/.test(path)) return undefined; const readings = captureAllReadings(captureResolve(path, config.base, config.windowsHost), config.windowsHost); if (!readings) return undefined; for (const candidate of readings) { const match = captureMatchCandidate(candidate, true, config, budget); if (match !== false) return match; } } return false; }
+function captureMatchCandidate(raw: { path: string; windows: boolean }, toolGlob: boolean, config: CaptureConfig, budget: { work: number }): boolean | undefined { const candidate = { path: captureFold(raw.path), windows: raw.windows }; const glob = /[*?]/.test(candidate.path); const directory = toolGlob && !glob; for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; const insensitive = toolGlob || pattern.windows || captureFoldCase; const under = captureStartsWith(candidate.path, pattern.prefix, insensitive); if (!under && !glob && !directory) continue; if (under) { const directory = pattern.directory ? captureGlob(pattern.directory, candidate.path, insensitive, budget) : false; if (directory !== false) return directory; const match = captureGlob(pattern.path, candidate.path, insensitive, budget); if (match !== false) return match; } if (glob) { const reaches = captureGlobstarReaches(candidate.path, pattern.prefix, insensitive, budget); if (reaches !== false) return reaches; } if (directory) { const below = captureGlobBelow(pattern.path, candidate.path, insensitive, budget); if (below !== false) return below; } } return false; }
+function captureGlobstarReaches(glob: string, prefix: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const star = glob.indexOf("**"); if (star < 0) return captureGlobReaches(glob, prefix, insensitive, budget); const slash = glob.lastIndexOf("/", star); const head = slash < 0 ? "" : glob.slice(0, slash); const depth = head.split("/").filter(Boolean).length; let seen = 0; let offset = 0; for (const part of prefix.split("/")) { if (seen === depth) break; offset += part.length; if (part) seen++; if (seen < depth) offset++; } if (seen < depth) return captureGlobReaches(glob, prefix, insensitive, budget); return captureGlob(head, prefix.slice(0, offset), insensitive, budget); }
+function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; powershell?: boolean; inline?: boolean; workdir?: string; globs?: boolean; reader?: boolean; search?: { roots: string[]; patterns: string[] }; patch?: string[] } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (CAPTURE_SEARCH_TOOLS.includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call, search: captureSearchScope(name, args) }; if (CAPTURE_NON_FILE_TOOLS.includes(name)) { const workdir = ["workdir","dir_path","directory"].map((k) => args?.[k]).find((v) => v !== undefined); return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", powershell: name === "powershell", inline: CAPTURE_INLINE_CODE_TOOLS.includes(name), workdir: typeof workdir === "string" && workdir.trim() ? workdir : undefined }; } if (!CAPTURE_FILE_TOOLS.includes(name)) return { family: "unknown", extraction: "extracted", callID: call, reader: CAPTURE_OUTPUT_READER_TOOLS.includes(name) }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (name === "read_many_files" && args && "include" in args) { const include = args.include; if (!Array.isArray(include) || include.some((x: unknown) => typeof x !== "string") || (paths?.length ?? 0) + include.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else paths = [...(paths ?? []), ...(include as string[])]; } if ((name === "read" || name === "fs_read") && args && "operations" in args) { const entries = args.operations; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || !paths.length || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call, patch: capturePatchPaths(name, payload.args) }; return { family: "file", paths, extraction: "extracted", callID: call, globs: name === "read_many_files" }; }
+// Where a search/list tool reads, for the cross-checkout lookup: its directory and file arguments, a glob tool's `pattern`, and a content search's file filters (a grep `pattern` is a regular expression). Undefined when one is not a string; mirrors `search_scope`.
+function captureSearchScope(name: string, args: unknown): { roots: string[]; patterns: string[] } | undefined { if (args === undefined || args === null) return { roots: [], patterns: [] }; if (typeof args !== "object" || Array.isArray(args)) return undefined; const o = args as Record<string, unknown>; const roots: string[] = []; const patterns: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile","dir_path","directory","DirectoryPath","SearchDirectory","SearchPath"]) if (k in o) { if (typeof o[k] !== "string") return undefined; roots.push(o[k] as string); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; roots.push(...(o.paths as string[])); } for (const k of [...(["glob","find","find_by_name"].includes(name) ? ["pattern","Pattern"] : []), "glob","include","file_pattern","file_glob","Includes"]) { if (!(k in o)) continue; const v = o[k]; if (typeof v === "string") patterns.push(v); else if (Array.isArray(v) && v.every((x) => typeof x === "string")) patterns.push(...(v as string[])); else return undefined; } return roots.length + patterns.length <= CAPTURE_MAX_CANDIDATES && [...roots, ...patterns].every((p) => p.trim() && [...p].length <= CAPTURE_MAX_PATH_CHARS) ? { roots, patterns } : undefined; }
+// The files an `apply_patch` patch names in its Add/Update/Delete File and Move to headers, for the cross-checkout lookup only; mirrors `patch_paths`.
+function capturePatchPaths(name: string, args: unknown): string[] | undefined { if (name !== "apply_patch" && name !== "patch") return undefined; const o = args as Record<string, unknown> | undefined; const text = typeof args === "string" ? args : o && typeof o === "object" ? ["command","patch","patchText","input"].map((k) => o[k]).find((v): v is string => typeof v === "string") : undefined; if (text === undefined) return undefined; const paths: string[] = []; for (const line of text.split(/\r?\n/)) { const trimmed = line.trimStart(); const header = ["*** Add File:","*** Update File:","*** Delete File:","*** Move to:"].find((h) => trimmed.startsWith(h)); if (!header) continue; const path = trimmed.slice(header.length).trim(); if (!path || [...path].length > CAPTURE_MAX_PATH_CHARS || paths.length === CAPTURE_MAX_CANDIDATES) return undefined; paths.push(path); } return paths.length ? paths : undefined; }
+// How to follow a lookup location with glob syntax: null when it has none (a parameter expansion's braces are not syntax; the shell split also reads each default in its place), undefined when a brace or group spans a separator or an alternative of `..` or `~…` leaves the root (one a brace expansion builds included), else its literal root and one step per remaining segment ("*" any child directory, "?<glob>" a child the `*`/`?` glob names without regard to ASCII case, "**" any depth, ending the walk; anything else that child); mirrors `glob_walk`.
+function captureGlobWalk(location: string): { root: string; steps: string[] } | null | undefined { if (location.includes("${") || !/[*?\[{(]/.test(location)) return null; const parsed = captureNormalize(location); if (!parsed) return null; const p = parsed.path; let root: string; let tail: string; if (p.startsWith("//")) { const parts = p.slice(2).split("/"); root = `//${parts[0]}/${parts[1]}`; tail = parts.slice(2).join("/"); } else if (/^[A-Za-z]:\//.test(p)) { root = p.slice(0, 3); tail = p.slice(3); } else { root = "/"; tail = p.slice(1); } const segments = tail.split("/").filter(Boolean); const syntax = (segment: string) => /[*?\[{(]/.test(segment); const first = segments.findIndex(syntax); if (first < 0) return null; const steps: string[] = []; for (let index = first; index < segments.length; index++) { const segment = segments[index]; if (!syntax(segment)) { steps.push(segment); continue; } const count = (c: string) => segment.split(c).length - 1; const leaves = (text: string) => text.split(/[{},()|@!+]/).some((piece) => piece === ".." || piece.startsWith("~")); const alternatives = segment.includes("{") ? captureBraceAlternatives(segment) : []; if (leaves(segment) || (alternatives === undefined ? captureBraceOverflowLeaves(segment) : alternatives.some((alternative) => /[\/\\]/.test(alternative) || leaves(alternative) || (index < segments.length - 1 && captureCouldNameParent(alternative)))) || count("{") !== count("}") || count("(") !== count(")")) return undefined; if (segment.includes("**")) { steps.push("**"); break; } steps.push(/[\[{(]/.test(segment) ? "*" : `?${segment}`); } for (const segment of segments.slice(0, first)) root += `${root.endsWith("/") ? "" : "/"}${segment}`; return { root: parsed.windows ? root.replace(/\//g, "\\") : root, steps }; }
+// Every word a brace expansion makes of `text` (a comma list or an integer or single-character sequence, nested and repeated); any other `{…}` stays. Undefined past CAPTURE_MAX_BRACE_ALTERNATIVES; mirrors `brace_alternatives`.
+function captureBraceAlternatives(text: string): string[] | undefined { if (text.split("{").length - 1 > CAPTURE_MAX_BRACE_ALTERNATIVES) return undefined; const words: string[] = []; const sequence = (body: string): string[] | null | undefined => { const parts = body.split(".."); if (parts.length < 2 || parts.length > 3) return null; let step = 1; if (parts.length === 3) { if (!/^[+-]?\d+$/.test(parts[2])) return null; step = Math.max(Math.abs(Number(parts[2])), 1); } const integer = (part: string) => /^[+-]?\d+$/.test(part); let from: number; let to: number; let numeric: boolean; if (integer(parts[0]) && integer(parts[1])) { from = Number(parts[0]); to = Number(parts[1]); numeric = true; } else { const a = [...parts[0]]; const b = [...parts[1]]; if (a.length !== 1 || b.length !== 1) return null; from = a[0].codePointAt(0)!; to = b[0].codePointAt(0)!; numeric = false; } const count = Math.floor(Math.abs(to - from) / step) + 1; if (count > CAPTURE_MAX_BRACE_ALTERNATIVES) return undefined; const out: string[] = []; for (let i = 0, value = from; i < count; i++, value += from <= to ? step : -step) out.push(numeric ? String(value) : String.fromCodePoint(value)); return out; }; const expand = (chars: string[]): boolean => { for (let open = 0; open < chars.length; open++) { if (chars[open] !== "{") continue; let depth = 0; let close = -1; const commas: number[] = []; for (let i = open; i < chars.length; i++) { if (chars[i] === "{") depth++; else if (chars[i] === "}") { depth--; if (depth === 0) { close = i; break; } } else if (chars[i] === "," && depth === 1) commas.push(i); } if (close < 0) continue; let pieces: string[][]; if (!commas.length) { const words = sequence(chars.slice(open + 1, close).join("")); if (words === undefined) return false; if (words === null) continue; pieces = words.map((word) => [...word]); } else { pieces = []; let start = open + 1; for (const end of [...commas, close]) { pieces.push(chars.slice(start, end)); start = end + 1; } } for (const piece of pieces) if (!expand([...chars.slice(0, open), ...piece, ...chars.slice(close + 1)])) return false; return true; } if (words.length === CAPTURE_MAX_BRACE_ALTERNATIVES) return false; words.push(chars.join("")); return true; }; return expand([...text]) ? words : undefined; }
+// The bounds of a brace sequence body (`1..3`, `a..e`, `x..y..n`): first and last value and whether they are integers (else code points); undefined when it is not one. Mirrors `brace_sequence_bounds`.
+function captureBraceSequenceBounds(body: string): [number, number, boolean] | undefined { const parts = body.split(".."); if (parts.length < 2 || parts.length > 3) return undefined; if (parts.length === 3 && !/^[+-]?\d+$/.test(parts[2])) return undefined; const integer = (part: string) => /^[+-]?\d+$/.test(part); if (integer(parts[0]) && integer(parts[1])) return [Number(parts[0]), Number(parts[1]), true]; const a = [...parts[0]]; const b = [...parts[1]]; if (a.length !== 1 || b.length !== 1) return undefined; return [a[0].codePointAt(0)!, b[0].codePointAt(0)!, false]; }
+// Whether a segment whose brace expansion is too large to list could still build a word that leaves the root (a separator, `~`, a group, `..` or a dot-glob an older bash expands to it): integer and letter sequences cannot, nor a `.` where every word also holds another literal character; a character sequence over a range with `.`, a separator, `~` or a group character can. Mirrors `brace_overflow_could_leave`.
+function captureBraceOverflowLeaves(segment: string): boolean { if (/[\/\\~()|]/.test(segment)) return true; const chars = [...segment]; const close: (number | undefined)[] = []; const comma: boolean[] = []; const open: number[] = []; chars.forEach((c, index) => { if (c === "{") open.push(index); else if (c === "}") { const start = open.pop(); if (start !== undefined) close[start] = index; } else if (c === "," && open.length) comma[open[open.length - 1]] = true; }); const glob = ".*?[]"; let dot = false; let anchor = false; const ends: number[] = []; for (let index = 0; index < chars.length;) { const c = chars[index]; if (ends.length && ends[ends.length - 1] === index) { ends.pop(); index++; continue; } const end = c === "{" ? close[index] : undefined; if (end !== undefined) { if (comma[index]) { ends.push(end); index++; continue; } const bounds = captureBraceSequenceBounds(chars.slice(index + 1, end).join("")); if (bounds) { const [from, to, numeric] = bounds; const holds = (set: string) => [...set].some((x) => { const code = x.codePointAt(0)!; return Math.min(from, to) <= code && code <= Math.max(from, to); }); if (!numeric && holds("./\\~()|")) return true; if (!ends.length && (numeric || !holds(glob))) anchor = true; index = end + 1; continue; } } if (c === "," && ends.length) { index++; continue; } if (c === ".") dot = true; if (!ends.length && !glob.includes(c)) anchor = true; index++; } return dot && !anchor; }
+// The marker files of every directory `steps` reach below `root` (root excluded), never following a symlink; nothing when `root` lies inside `checkout`, and a "**" lists nothing inside it. Each directory is read one entry at a time, so a huge one costs no more than the entry bound. Undefined past the directory or entry bounds (a "**" counts directories as it lists them) or the time budget; mirrors `GlobBudget::markers_below`.
+type CaptureGlobBudget = { dirs: number; entries: number; deadline: number; now: () => number; probes?: number };
+function captureMarkersBelow(root: string, steps: string[], checkout: string | undefined, budget: CaptureGlobBudget): string[] | undefined { const inside = (dir: string) => checkout !== undefined && dir.startsWith(checkout) && (dir.length === checkout.length || /[\\/]/.test(dir[checkout.length]) || /[\\/]$/.test(checkout)); if (inside(root)) return []; const children = (dir: string): string[] | undefined => { if (budget.now() > budget.deadline) return undefined; let handle: { readSync(): { name: string; isDirectory(): boolean } | null; closeSync(): void }; try { handle = opendirSync(dir); } catch (_e) { return []; } const out: string[] = []; try { for (let entry = handle.readSync(); entry; entry = handle.readSync()) { if (++budget.entries > CAPTURE_MAX_GLOB_ENTRIES) return undefined; if (entry.isDirectory()) out.push(join(dir, entry.name)); } } catch (_e) { /* the rest of an unreadable directory lists nothing */ } finally { handle.closeSync(); } return out; }; const found: string[] = []; let current = [root]; for (const step of steps) { const next: string[] = []; for (const dir of current) { if (step === "*" || step.startsWith("?")) { const more = children(dir); if (!more) return undefined; next.push(...(step === "*" ? more : more.filter((child) => captureGlob(step.slice(1), basename(child), true, { work: 0 }) !== false))); } else if (step === "**") { if (inside(dir)) continue; const listed = children(dir); if (!listed) return undefined; const pending = listed.filter((child) => !inside(child)); while (pending.length) { const below = pending.pop()!; if (++budget.dirs > CAPTURE_MAX_GLOB_DIRECTORIES) return undefined; const more = children(below); if (!more) return undefined; pending.push(...more.filter((child) => !inside(child))); next.push(below); } } else { const child = join(dir, step); try { if (statSync(child).isDirectory()) next.push(child); } catch (_e) { /* the glob matches nothing there */ } } } for (const dir of next) { if (step !== "**" && ++budget.dirs > CAPTURE_MAX_GLOB_DIRECTORIES) return undefined; const marker = join(dir, ".ai-memory.toml"); try { if (statSync(marker).isFile()) found.push(marker); } catch (_e) { /* no marker here */ } } if (!next.length) break; current = next; } return found; }
+// Whether a checkout root counts as the event's own for the no-walk rule and the lookup order: not the filesystem root, and not at or above the home directory (a dotfiles repository); mirrors `own_checkout`.
+function captureOwnCheckout(root: string): boolean { const home = homedir(); const above = !!home && (resolve(home) === root || resolve(home).startsWith(join(root, "x").slice(0, -1))); return dirname(root) !== root && !above; }
+// A missing path answers without an exception, which a deep tree's many misses would pay for.
+function captureExists(path: string): boolean { try { return statSync(path, { throwIfNoEntry: false }) !== undefined; } catch (_e) { return false; } }
+// `name` inside the resolved directory `dir`, without `join`'s normalizing pass over a long path.
+const captureSep = join("a", "b").charAt(1);
+function captureChild(dir: string, name: string): string { return dir.endsWith(captureSep) ? dir + name : dir + captureSep + name; }
+// Counts one filesystem probe of the marker lookup against the walk's budget; false past CAPTURE_MAX_LOOKUP_PROBES or the deadline. Mirrors `GlobBudget::probe`.
+function captureProbe(budget: CaptureGlobBudget): boolean { budget.probes = (budget.probes ?? 0) + 1; return budget.probes <= CAPTURE_MAX_LOOKUP_PROBES && budget.now() <= budget.deadline; }
+// `findMarker` for the many directories one call names: every directory a lookup passes keeps its answer and its checkout root, so a deep tree costs one probe per directory; each probe is counted. Null when there is none, undefined past the budget. Mirrors `MarkerMemo`.
+type CaptureMarkerMemo = { governing: Map<string, string | null>; checkouts: Map<string, string | null>; known?: Set<string> };
+// Records that `dir` exists, and with it every ancestor; mirrors `MarkerMemo::note_directory`.
+function captureMemoNote(dir: string, memo: CaptureMarkerMemo): void { memo.known ??= new Set(); for (let current = resolve(dir); !memo.known.has(current); current = dirname(current)) { memo.known.add(current); if (dirname(current) === current) break; } }
+function captureMemoCheckout(dir: string, memo: CaptureMarkerMemo, budget: CaptureGlobBudget): string | null | undefined { const chain: string[] = []; let current = dir; let found: string | null; for (;;) { const known = memo.checkouts.get(current); if (known !== undefined) { found = known; break; } if (dirname(current) === current) { found = null; break; } if (!captureProbe(budget)) return undefined; chain.push(current); if (captureExists(captureChild(current, ".git"))) { found = current; break; } current = dirname(current); } for (const d of chain) memo.checkouts.set(d, found); return found; }
+// Records the marker an earlier `findMarker` found from `dir` for every directory that walk passed: up to the marker's directory, or to its boundary when it found none (home inside it, else the checkout root, else `dir` alone). Mirrors `MarkerMemo::remember`.
+function captureMemoRemember(dir: string, marker: string | undefined, memo: CaptureMarkerMemo): void { const home = homedir(); const start = resolve(dir); const within = (d: string, stop: string) => d === stop || d.startsWith(join(stop, "x").slice(0, -1)); let stop: string | null; if (marker) stop = dirname(marker); else if (!home) stop = null; else if (within(start, home)) stop = home; else stop = memo.checkouts.get(start) ?? start; if (stop !== null && !within(start, stop)) stop = start; for (let current = start; ; current = dirname(current)) { memo.governing.set(current, marker ?? null); if (current === stop || dirname(current) === current) break; } }
+function captureMemoMarker(start: string, memo: CaptureMarkerMemo, budget: CaptureGlobBudget): string | null | undefined { const home = homedir(); const homePrefix = home ? join(home, "x").slice(0, -1) : ""; const chain: string[] = []; let current = resolve(start); let found: string | null; for (;;) { const known = memo.governing.get(current); if (known !== undefined) { found = known; break; } if (dirname(current) === current) { found = null; break; } if (!captureProbe(budget)) return undefined; chain.push(current); const marker = captureChild(current, ".ai-memory.toml"); if (captureExists(marker)) { found = marker; break; } let boundary = false; if (home && (current === home || current.startsWith(homePrefix))) boundary = current === home; else if (home) { if (memo.checkouts.get(dirname(current)) === null) boundary = true; else { const root = captureMemoCheckout(current, memo, budget); if (root === undefined) return undefined; boundary = root === null || root === current; } } if (boundary) { found = null; break; } current = dirname(current); } for (const d of chain) memo.governing.set(d, found); return found; }
+// The nearest existing directory at or above `path`, probing only what is not known already: null when there is none, undefined past the budget; mirrors `MarkerMemo::existing_dir`.
+function captureExistingDirWithin(path: string, memo: CaptureMarkerMemo, budget: CaptureGlobBudget): string | null | undefined { let probe = path; for (;;) { if (memo.known?.has(probe)) return probe; if (!captureProbe(budget)) return undefined; try { if (statSync(probe, { throwIfNoEntry: false })?.isDirectory()) { captureMemoNote(probe, memo); return probe; } } catch (_e) { /* not there yet */ } const parent = dirname(probe); if (parent === probe || parent === ".") return null; probe = parent; } }
 // An external lifecycle owner (`AI_MEMORY_CAPTURE_OWNER`, any value that is
 // non-empty after trimming) takes over capture for this process: the gate runs
 // before the capture-policy marker scan, so no disposition work, no marker read
@@ -330,9 +585,44 @@ function captureOwnedExternally(): boolean { const owner = typeof process === "u
 // home the walk stops at home, outside it continues past the checkout root to an
 // organisation-level marker; an unreadable marker counts as a selection.
 function captureServerRouted(cwd: string | undefined): boolean { let dir = resolve(cwd ?? process.cwd()); const home = homedir(); let boundary: string | undefined; for (let probe = dir; ; probe = dirname(probe)) { if (probe === home) { boundary = home; break; } if (probe === dirname(probe)) break; } for (;;) { try { if (/^\s*server\s*=/m.test(readFileSync(join(dir, ".ai-memory.toml"), "utf8"))) return true; } catch (e) { if (!["ENOENT", "ENOTDIR", "EISDIR"].includes((e as { code?: string })?.code ?? "")) return true; } if (dir === boundary || dir === dirname(dir)) return false; dir = dirname(dir); } }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && (tool.family === "file" || tool.shell)) disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p), config.windowsHost)); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } else if (config.state === "active" && tool.family === "non-file" && tool.command !== undefined && captureMatchCommand(tool.command, config, tool.workdir) !== false) disposition = "drop"; if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+type CaptureTool = ReturnType<typeof captureTool>;
+// One policy's disposition for one call, shared by the event's own marker and every other marker it reaches.
+function captureDecide(tool: CaptureTool, config: CaptureConfig): CaptureDisposition { if (config.state === "invalid" && (tool.family === "file" || tool.family === "search-list" || tool.shell || tool.reader)) return "metadata-only"; if (config.state !== "active") return "keep"; if (tool.reader) return "metadata-only"; if (tool.family === "search-list") return "drop"; if (tool.family === "file") { if (!tool.paths) return "metadata-only"; const parsed = tool.paths.map((p) => { const resolved = captureResolve(p, config.base, config.windowsHost); const normalized = resolved?.map((path) => captureNormalize(path, config.windowsHost)); return normalized?.every(Boolean) ? normalized as { path: string; windows: boolean }[] : undefined; }); if (parsed.some((p) => !p)) return "metadata-only"; const candidates = (parsed as { path: string; windows: boolean }[][]).flat(); const spoolBudget = { work: 0 }; if (tool.globs) { const match = captureMatchGlobs(tool.paths, config); if (match !== false) return match ? "drop" : "metadata-only"; for (const p of tool.paths) { const readings = captureAllReadings(captureResolve(p, config.base, config.windowsHost), config.windowsHost); if (!readings) continue; for (const candidate of readings) if (captureOutputSpool(candidate.path, spoolBudget) !== false) return "metadata-only"; } return "keep"; } const budget = { work: 0 }; for (const raw of candidates) { const candidate = { path: captureFold(raw.path), windows: raw.windows }; for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows || captureFoldCase, budget)) return "drop"; const match = captureGlob(pattern.path, candidate.path, pattern.windows || captureFoldCase, budget); if (match === undefined) return "metadata-only"; if (match) return "drop"; } } for (const candidate of candidates) if (captureOutputSpool(candidate.path, spoolBudget) !== false) return "metadata-only"; return "keep"; } if (tool.family === "non-file" && (tool.inline || (tool.command !== undefined && captureCommandOversized(tool.command)))) return "metadata-only"; if (tool.family === "non-file" && tool.command !== undefined) { const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); const matched = captureMatchCommand(split.words, config, tool.workdir); if (matched.match !== false) return "drop"; if (split.opaque || matched.spool || (config.windowsHost && tool.workdir !== undefined && captureWindowsUnplaceable(tool.workdir, config.base))) return "metadata-only"; } return "keep"; }
+const captureRank: Record<CaptureDisposition, number> = { keep: 0, "metadata-only": 1, drop: 2 };
+// Every other marker governing a path the call names (a file-tool target or the files an `apply_patch` names, a search/list directory, file or path-like glob argument, or a shell argument with a separator resolved from its workdir, plus that directory) inspects it too, so a checkout's `ignore_paths` hold for a call made from elsewhere. Lexical; each directory is looked up once and remembered for every lookup that passes it; a glob location is looked up from its literal root (before the walk, whose one listing may spend the time budget) and, when that root lies outside the event's own checkout, every directory it could pass through is checked for a marker of its own; a glob whose `..` follows a `**` is looked up in every reading. Locations outside the own checkout come first: there unreadable targets, glob syntax the walk cannot follow, and anything past the bounds are unprovable, while running out of budget inside the own checkout ends the lookup. Mirrors `capture_lookup_locations` and `foreign_capture_decision`.
+function captureForeignConfigs(tool: CaptureTool, config: CaptureConfig, cwd: string | undefined, own: string | undefined): CaptureConfig[] { const invalid: CaptureConfig[] = [{ state: "invalid", patterns: [], base: config.base, windowsHost: config.windowsHost }]; const locations = new Set<string>(); let overflow = false; const add = (path: string, base: string): string[] | undefined => { const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(path); if (!absolute && !base) return undefined; const readings = captureAllReadings(captureResolve(path, base, config.windowsHost), config.windowsHost); if (readings === false) { overflow = true; return undefined; } if (!readings) return undefined; return readings.map((candidate) => { const location = candidate.windows ? candidate.path.replace(/\//g, "\\") : candidate.path; locations.add(location); return location; }); }; if (tool.family === "file") { const paths = tool.paths ?? tool.patch; if (!paths) return invalid; for (const path of paths) if (add(path, config.base) === undefined) return invalid; } else if (tool.family === "search-list") { if (!tool.search) return invalid; const roots: string[] = []; for (const root of tool.search.roots) { const found = add(root, config.base); if (found === undefined) return invalid; roots.push(...found); } if (!roots.length) roots.push(config.base); for (const pattern of tool.search.patterns.filter((p) => /[\/\\]/.test(p))) for (const root of roots) if (add(pattern, root) === undefined) return invalid; } else if (tool.family === "non-file" && tool.command !== undefined) { if (captureCommandOversized(tool.command)) return invalid; const base = captureBase(config, tool.workdir); if (base) add(base, base); const home = homedir(); const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); for (const [word, tilde] of [...split.words, ...split.expanded]) for (const [argument] of captureShellArguments(word)) { const expanded = captureExpandTilde(argument, tilde, home, base); if (/[\/\\]/.test(expanded)) add(expanded, base); } } if (overflow || locations.size > CAPTURE_MAX_LOOKUP_LOCATIONS) return invalid; const markers: string[] = []; const memo: CaptureMarkerMemo = { governing: new Map(), checkouts: new Map() }; let checkout: string | undefined; if (cwd) { const root = captureMemoCheckout(resolve(cwd), memo, { dirs: 0, entries: 0, deadline: Infinity, now: Date.now, probes: -Infinity }); checkout = root && captureOwnCheckout(root) ? root : undefined; captureMemoRemember(cwd, own, memo); if (statSync(resolve(cwd), { throwIfNoEntry: false })?.isDirectory()) captureMemoNote(cwd, memo); } const budget: CaptureGlobBudget = { dirs: 0, entries: 0, deadline: captureNow() + CAPTURE_MAX_GLOB_MS, now: captureNow, probes: 0 }; const remember = (marker: string | undefined): boolean => { if (!marker || marker === own || markers.includes(marker)) return true; if (markers.length === CAPTURE_MAX_FOREIGN_MARKERS) return false; markers.push(marker); return true; }; const insideOwn = (location: string) => checkout !== undefined && (location === checkout || location.startsWith(join(checkout, "x").slice(0, -1))); const ordered = [...locations].filter((location) => !insideOwn(location)); const insideFrom = ordered.length; ordered.push(...[...locations].filter(insideOwn).sort((a, b) => a.split(/[\\/]/).length - b.split(/[\\/]/).length)); for (let index = 0; index < ordered.length; index++) { const location = ordered[index]; const walk = captureGlobWalk(location); if (walk === undefined) return invalid; const lookup = walk ? walk.root : location; const dir = captureExistingDirWithin(lookup, memo, budget); if (dir === undefined) { if (index >= insideFrom) break; return invalid; } const marker = dir === null ? null : captureMemoMarker(dir, memo, budget); if (marker === undefined) { if (index >= insideFrom) break; return invalid; } if (!remember(marker ?? undefined)) return invalid; if (walk) { const found = captureMarkersBelow(walk.root, walk.steps, checkout, budget); if (!found) return invalid; for (const marker of found) if (!remember(marker)) return invalid; } } return markers.map((marker) => captureConfigAt(marker, cwd)); }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
 "##;
-    TEMPLATE.replace("__AI_MEMORY_CAPTURE_MODE__", capture_mode)
+    let names = |names: &[&str]| {
+        let quoted: Vec<String> = names.iter().map(|name| ts_string_literal(name)).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    TEMPLATE
+        .replace("__AI_MEMORY_CAPTURE_MODE__", capture_mode)
+        .replace(
+            "__AI_MEMORY_FILE_TOOLS__",
+            &names(capture_policy::FILE_TOOL_NAMES),
+        )
+        .replace(
+            "__AI_MEMORY_SEARCH_TOOLS__",
+            &names(capture_policy::SEARCH_LIST_TOOL_NAMES),
+        )
+        .replace(
+            "__AI_MEMORY_NON_FILE_TOOLS__",
+            &names(capture_policy::NON_FILE_TOOL_NAMES),
+        )
+        .replace(
+            "__AI_MEMORY_INLINE_CODE_TOOLS__",
+            &names(capture_policy::INLINE_CODE_TOOL_NAMES),
+        )
+        .replace(
+            "__AI_MEMORY_OUTPUT_READER_TOOLS__",
+            &names(capture_policy::OUTPUT_READER_TOOL_NAMES),
+        )
+        .replace(
+            "__AI_MEMORY_MAX_COMMAND_CHARS__",
+            &capture_policy::MAX_SHELL_COMMAND_CHARS.to_string(),
+        )
 }
 
 /// Build the Claude Code `settings.json` fragment that wires the
@@ -483,9 +773,7 @@ pub(crate) fn build_zero_hooks_config(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "ai-memory".to_string());
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
     let hooks: Vec<serde_json::Value> = ZERO_EVENTS
         .iter()
         .map(|(zero_event, our_event)| {
@@ -571,9 +859,7 @@ pub(crate) fn build_zcode_hooks_config(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "ai-memory".to_string());
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
     let mut events = serde_json::Map::new();
     for (zcode_event, our_event) in ZCODE_EVENTS {
         let mut args: Vec<String> = Vec::new();
@@ -781,6 +1067,78 @@ pub(crate) fn build_devin_payload_with_data_dir(
     )
 }
 
+/// `{"hooks": <event map>}` for Factory Droid (#1240). `~/.factory/hooks.json`
+/// holds the event map itself, with no wrapper key, in Claude Code's nested
+/// shape (`"Event": [{"matcher": "", "hooks": [{"type": "command",
+/// "command": …}]}]`). Droid runs each `command` through
+/// a shell with the Claude Code-shaped event JSON on stdin, so every entry
+/// invokes the native `ai-memory hook` command; there is no script bundle to
+/// fall back to, so the platform is always a native one, whatever
+/// `AI_MEMORY_HOOK_PLATFORM` asks for. An empty matcher fires on every tool
+/// and every SessionStart source.
+pub(crate) fn build_droid_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &DROID_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "droid",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Meta Muse Code: the `hooks` key of
+/// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, in Claude Code's nested
+/// shape with an empty matcher (every tool, every `SessionStart` source).
+/// Muse runs each `command` through a shell with a cleared environment and
+/// the Claude Code-shaped event JSON on stdin, so every entry invokes the
+/// native `ai-memory hook` command with its server, data dir and agent baked
+/// in; there is no script bundle, whatever `AI_MEMORY_HOOK_PLATFORM` asks
+/// for. Each handler carries [`MUSE_HOOK_TIMEOUT_SECS`].
+pub(crate) fn build_muse_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    let mut payload = build_hook_payload_for_platform(
+        &MUSE_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "muse",
+            data_dir,
+            project_strategy,
+        ),
+    );
+    if let Some(events) = payload.get_mut("hooks").and_then(Value::as_object_mut) {
+        for groups in events.values_mut().filter_map(Value::as_array_mut) {
+            for handler in groups
+                .iter_mut()
+                .filter_map(|group| group.get_mut("hooks").and_then(Value::as_array_mut))
+                .flatten()
+                .filter_map(Value::as_object_mut)
+            {
+                handler.insert("timeout".into(), Value::from(MUSE_HOOK_TIMEOUT_SECS));
+            }
+        }
+    }
+    payload
+}
+
 /// Pool (Poolside Agent CLI) `.poolside/settings.yaml` `hooks:` block for
 /// install-hooks' print path. Pool's hook config is a project-scoped YAML
 /// file at the repo root — there is no user-global hook file for ai-memory
@@ -856,7 +1214,7 @@ fn build_pool_settings_yaml_for_platform(
 /// Emit a YAML single-quoted scalar: wrap in `'…'`, doubling any embedded
 /// `'`. Single-quote style is the only YAML form in which the POSIX shell
 /// quoting inside the hook command survives byte-for-byte.
-fn yaml_single_quote(s: &str) -> String {
+pub(crate) fn yaml_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -879,6 +1237,14 @@ pub(crate) enum HookShape {
     /// `hooks.json` also requires a sibling `version: 1` key at
     /// the top level — handled by the caller's apply path.
     Flat,
+    /// GitHub Copilot CLI: `"E": [ { "type":"command", "command":"..." } ]`.
+    /// Entries sit directly in the event array like Cursor's, but with no
+    /// `matcher`: Copilot rejects it on `sessionStart`/`sessionEnd`/
+    /// `userPromptSubmitted`/`agentStop`/`subagentStop`/`errorOccurred` and
+    /// treats it as an optional filter elsewhere, so omitting it everywhere
+    /// means "fire on every invocation". The file's top-level `version: 1` is
+    /// handled by the caller's apply path, as for Cursor.
+    FlatWithoutMatcher,
 }
 
 /// One hook profile = (event vocabulary, JSON shape). Each agent
@@ -965,6 +1331,13 @@ pub(crate) const CODEX_PROFILE: HookProfile = HookProfile {
 pub(crate) const COMMAND_CODE_PROFILE: HookProfile = HookProfile {
     events: &COMMAND_CODE_EVENTS,
     shape: HookShape::NestedWithoutMatcher,
+};
+/// Copilot keeps its flat entry shape even with PascalCase event names — only
+/// the payload sent to the script switches to snake_case — so this is
+/// `FlatWithoutMatcher`, not Claude's `Nested` (see the variant's doc).
+pub(crate) const COPILOT_CLI_PROFILE: HookProfile = HookProfile {
+    events: &COPILOT_CLI_EVENTS,
+    shape: HookShape::FlatWithoutMatcher,
 };
 pub(crate) const CURSOR_PROFILE: HookProfile = HookProfile {
     events: &CURSOR_EVENTS,
@@ -1438,6 +1811,17 @@ impl HookCommandPlatform {
         })
     }
 
+    /// The native binary command for this OS, ignoring any override: for an
+    /// agent with no script bundle a script platform would name files that
+    /// were never staged.
+    const fn native() -> Self {
+        if cfg!(windows) {
+            Self::WindowsNative
+        } else {
+            Self::PosixNative
+        }
+    }
+
     /// Script fallback for setup-agent / docker-host snippets. Respects an
     /// explicit override, but defaults to the shell command because setup-agent
     /// copies scripts, not a host-local native binary.
@@ -1504,6 +1888,7 @@ fn build_hook_payload_for_platform(
                 "hooks": [handler],
             }]),
             HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
+            HookShape::FlatWithoutMatcher => Value::Array(vec![handler]),
         };
         hooks_block.insert((*event).to_string(), entry);
     }
@@ -1582,6 +1967,58 @@ pub(crate) fn local_hook_policy_v1_supported() -> bool {
     )
 }
 
+/// Fallback when no usable executable path can be embedded: the bare command
+/// name, resolved through `PATH` when each hook runs.
+#[cfg(not(windows))]
+const FALLBACK_HOOK_EXE: &str = "ai-memory";
+#[cfg(windows)]
+const FALLBACK_HOOK_EXE: &str = "ai-memory.exe";
+
+/// Strip the ` (deleted)` marker the Linux kernel appends to the
+/// `/proc/<pid>/exe` readlink once the executable's inode has been unlinked or
+/// replaced (Rust std passes the marker through verbatim —
+/// rust-lang/rust#40284). A real executable may itself use that suffix, so
+/// callers must prefer the unmodified path when it still exists.
+fn strip_deleted_suffix(exe: PathBuf) -> PathBuf {
+    match exe.to_str() {
+        Some(text) => text
+            .strip_suffix(" (deleted)")
+            .map(PathBuf::from)
+            .unwrap_or(exe),
+        None => exe,
+    }
+}
+
+/// The executable path to embed in a rendered hook command, given what
+/// `current_exe()` produced.
+///
+/// The classic corrupting sequence is `ai-memory upgrade`: it replaces its own
+/// binary and then re-renders the staged hook configs from the same, now
+/// exe-deleted process, so `current_exe()` comes back as `<path> (deleted)`.
+/// Stripping the marker yields the path that now holds the freshly installed
+/// binary. A missing file or a failed resolution falls back to
+/// [`FALLBACK_HOOK_EXE`] instead of baking a dead absolute path into every
+/// hook command.
+fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
+    let Some(exe) = raw else {
+        return PathBuf::from(FALLBACK_HOOK_EXE);
+    };
+    if exe.is_file() {
+        return exe;
+    }
+    let stripped = strip_deleted_suffix(exe);
+    if stripped.is_file() {
+        stripped
+    } else {
+        PathBuf::from(FALLBACK_HOOK_EXE)
+    }
+}
+
+/// [`embedded_exe_from`] over this process's own executable.
+pub(crate) fn hook_embedded_exe_path() -> PathBuf {
+    embedded_exe_from(std::env::current_exe().ok())
+}
+
 fn hook_command(
     script: &Path,
     server_url: &str,
@@ -1651,9 +2088,7 @@ fn hook_command(
             // out; double quotes + the native Windows path work in cmd.exe and
             // Git Bash. The event name is a fixed slug with no shell
             // metacharacters, so it is left unquoted.
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "ai-memory".to_string());
+            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
             let event = script
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1697,9 +2132,7 @@ fn hook_command(
             // gets the local spool + OIDC fallback, instead of the `.sh` script
             // that POSTs via curl. Mirrors `WindowsNative` but with POSIX
             // single-quote quoting. The event name is the script stem.
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "ai-memory".to_string());
+            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
             let event = script
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1738,7 +2171,7 @@ fn windows_native_exec_spec(
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
 ) -> HookHandlerSpec {
-    let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("ai-memory.exe").to_path_buf());
+    let exe = hook_embedded_exe_path();
     windows_native_exec_spec_with_exe(&exe, script, server_url, auth_token, context)
 }
 
@@ -1976,7 +2409,7 @@ fn claude_code_windows_command_is_unchanged_by_the_codex_fix() {
 /// TypeScript runtime shared by every generated integration that must
 /// survive an unreachable server (#580): a spool writer emitting the CLI
 /// `hook-spool` on-disk contract (same filenames, same `SpoolEntry` JSON,
-/// same permissions) plus a self-drain. Callers only need `TOKEN`,
+/// same permissions) plus a self-drain. Callers only need `TOKEN`, `AGENT`,
 /// `timeoutSignal`, and the node `join`/`homedir`/fs imports in scope.
 /// Runtime credential fallback shared by every generated TypeScript
 /// integration. #552 moved the bearer out of generated files into a 0600
@@ -2014,6 +2447,25 @@ function resolveToken(): string | null {
     // Best effort: an unreadable token file leaves auth absent.
   }
   return null;
+}
+"#
+}
+
+/// `authHeaders()`, shared by every generated TypeScript integration: the
+/// headers every request to the server carries. Besides the bearer (resolved
+/// per request by `ts_resolve_token_fn`), that is
+/// [`ai_memory_hooks::CLIENT_MARKER_HEADER`] naming the integration: an
+/// unauthenticated server reached through a non-loopback host name refuses a
+/// handoff fetch without it. Needs `AGENT` and `resolveToken` in scope.
+pub(crate) fn ts_auth_headers_fn() -> &'static str {
+    r#"// Every request names this client: an unauthenticated server reached through
+// a non-loopback host name refuses a handoff fetch without X-AI-Memory-Client,
+// because a web page cannot add that header to a request it makes.
+function authHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "X-AI-Memory-Client": AGENT };
+  const token = resolveToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
 }
 "#
 }
@@ -2093,6 +2545,14 @@ function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): v
   }
 }
 
+// A 5xx, or one of the 4xx a saturated or momentarily unwilling server answers
+// with (408, 425, 429), asks for a retry: the event is fine and a later attempt
+// can land it. Any other 4xx rejects the event for good. The shell, PowerShell
+// and native drains classify the same way.
+function hookStatusRetryable(status: number): boolean {
+  return status >= 500 || status === 408 || status === 425 || status === 429;
+}
+
 let spoolDrainPromise: Promise<void> | undefined;
 
 function requestSpoolDrain(): void {
@@ -2120,7 +2580,10 @@ async function drainHookSpool(): Promise<void> {
     }
     if (!entry.url || typeof entry.body !== "string") continue;
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "X-AI-Memory-Client": AGENT,
+      };
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
       const resp = await fetch(entry.url, {
         method: "POST",
@@ -2129,11 +2592,11 @@ async function drainHookSpool(): Promise<void> {
         signal: timeoutSignal(2000),
       }).catch(() => undefined);
       if (!resp) return; // still unreachable; stop, keep the backlog
-      if (resp.ok || (resp.status >= 400 && resp.status < 500)) {
+      if (resp.ok || (resp.status >= 400 && resp.status < 500 && !hookStatusRetryable(resp.status))) {
         // Delivered, or permanently rejected - either way, done with it.
         try { unlinkSync(file); } catch (_e) {}
       } else {
-        return; // 5xx: server unhappy; retry a later drain
+        return; // 5xx or a transient 4xx: server unhappy; retry a later drain
       }
     } catch (_e) {
       return;
@@ -2197,6 +2660,66 @@ pub(crate) fn assert_shared_ts_delivery_runtime(name: &str, source: &str) {
         source.contains("anyFactory([hookAbort.signal, factory(ms)])"),
         "{name}: request deadlines must also honour hookAbort"
     );
+    assert!(
+        source.contains(
+            "return status >= 500 || status === 408 || status === 425 || status === 429;"
+        ),
+        "{name}: a transient 4xx must stay retryable like a 5xx"
+    );
+    assert!(
+        source.contains("resp.status < 500 && !hookStatusRetryable(resp.status)"),
+        "{name}: the drain must keep an entry the server only asked to retry"
+    );
+    assert_every_ts_request_carries_client_marker(name, source);
+}
+
+/// An unauthenticated server reached through a non-loopback host name refuses
+/// a handoff fetch without the client marker, so every `fetch` a generated
+/// integration makes must send it: through `authHeaders()` (hook POSTs, the
+/// handoff GET), `mcpHeaders()` (which spreads `authHeaders()`), or the spool
+/// drain's own header table.
+#[cfg(test)]
+fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
+    assert_eq!(
+        source.matches(ts_auth_headers_fn()).count(),
+        1,
+        "{name}: exactly one shared authHeaders()"
+    );
+    assert!(
+        source.contains(
+            "\"Content-Type\": \"application/json\",\n        \"X-AI-Memory-Client\": AGENT,"
+        ),
+        "{name}: the spool drain must send the client marker"
+    );
+    if source.contains("function mcpHeaders(") {
+        assert!(
+            source.contains("    ...authHeaders(),\n"),
+            "{name}: mcpHeaders"
+        );
+    }
+    let mut requests = 0;
+    for (at, _) in source.match_indices("fetch(") {
+        // Skip identifiers that merely end in `fetch(`, e.g. `prefetch(`.
+        if source[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        requests += 1;
+        let call: String = source[at..].chars().take(240).collect();
+        assert!(
+            call.contains("authHeaders()")
+                || call.contains("mcpHeaders(")
+                || call.contains("        headers,\n"),
+            "{name}: a fetch without the client marker:\n{call}"
+        );
+    }
+    assert!(
+        requests >= 3,
+        "{name}: expected the hook, handoff and drain requests"
+    );
 }
 
 #[cfg(test)]
@@ -2209,6 +2732,63 @@ mod tests {
     use std::process::Command;
     #[cfg(windows)]
     use std::process::Stdio;
+
+    #[test]
+    fn strip_deleted_suffix_removes_only_the_trailing_kernel_marker() {
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/opt/ai-memory/bin/ai-memory (deleted)")),
+            PathBuf::from("/opt/ai-memory/bin/ai-memory")
+        );
+        // A marker mid-path is a legitimate directory name, not the kernel's
+        // artifact; only the trailing suffix reads as one.
+        let mid = PathBuf::from("/opt/dir (deleted)/ai-memory");
+        assert_eq!(strip_deleted_suffix(mid.clone()), mid);
+        let clean = PathBuf::from("/opt/ai-memory/bin/ai-memory");
+        assert_eq!(strip_deleted_suffix(clean.clone()), clean);
+    }
+
+    #[test]
+    fn embedded_exe_strips_the_marker_when_the_stripped_path_exists() {
+        // The exact corruption window of `ai-memory upgrade`: the process is
+        // still executing the old inode after the rename-over replace, so
+        // `current_exe()` carries the marker while the stripped path already
+        // holds the freshly installed binary.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("ai-memory");
+        fs::write(&exe, b"binary").expect("write exe");
+        let deleted = PathBuf::from(format!("{} (deleted)", exe.display()));
+        assert_eq!(embedded_exe_from(Some(deleted)), exe);
+    }
+
+    #[test]
+    fn embedded_exe_preserves_a_real_file_whose_name_has_the_marker_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let literal = dir.path().join("ai-memory (deleted)");
+        let stripped = dir.path().join("ai-memory");
+        fs::write(&literal, b"literal binary").expect("write literal exe");
+        fs::write(&stripped, b"decoy binary").expect("write stripped decoy");
+
+        assert_eq!(embedded_exe_from(Some(literal.clone())), literal);
+    }
+
+    #[test]
+    fn embedded_exe_falls_back_when_the_resolved_path_is_missing() {
+        // A failed resolution or a dead path must not bake a broken absolute
+        // path into hook commands; the bare name resolves through PATH when
+        // each hook runs.
+        assert_eq!(embedded_exe_from(None), PathBuf::from(FALLBACK_HOOK_EXE));
+        assert_eq!(
+            embedded_exe_from(Some(PathBuf::from("/nonexistent/ai-memory (deleted)"))),
+            PathBuf::from(FALLBACK_HOOK_EXE)
+        );
+    }
+
+    #[test]
+    fn hook_embedded_exe_path_names_an_existing_file_without_marker() {
+        let exe = hook_embedded_exe_path();
+        assert!(exe.is_file(), "{} should exist", exe.display());
+        assert!(!exe.to_string_lossy().ends_with(" (deleted)"));
+    }
 
     fn decode_powershell_encoded_command(command: &str) -> String {
         let (_, encoded) = command
@@ -2286,10 +2866,17 @@ mod tests {
         let fixture = include_str!("../../../ai-memory-hooks/tests/fixtures/capture-policy.json");
         let fixture = serde_json::to_string(fixture).unwrap();
         let source = format!(
-            r#"import {{ closeSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, writeFileSync }} from "node:fs";
-import {{ dirname, join, resolve }} from "node:path";
+            r#"import {{ closeSync, mkdirSync, opendirSync as realOpendirSync, openSync as realOpenSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync }} from "node:fs";
+import {{ basename, dirname, join, resolve }} from "node:path";
 import {{ homedir }} from "node:os";
 
+// A marker spelled as a Windows path (`\\?\C:\repo\.ai-memory.toml`) is read from the real file it stands for, so its directory is the Windows one.
+const markerAliases = new Map<string, string>();
+function openSync(path: string, flags: string) {{ return realOpenSync(markerAliases.get(path) ?? path, flags); }}
+
+// Counts the entries the policy's directory walk reads.
+let opendirReads = 0;
+function opendirSync(path: string) {{ const dir = realOpendirSync(path); return {{ readSync() {{ opendirReads++; return dir.readSync(); }}, closeSync() {{ dir.closeSync(); }} }}; }}
 const fixtureText = {fixture};
 const markerRoot = process.argv[2]!;
 const markerFixtures = new Map<string, string>();
@@ -2297,6 +2884,8 @@ function findMarker(cwd: string | undefined): string | undefined {{ return cwd ?
 {policy}
 
 const fixture = JSON.parse(fixtureText);
+// Case-sensitive POSIX matching unless a check opts into a macOS-style host.
+captureFoldCase = false;
 const privatePath = "/PRIVATE_PATH_SENTINEL/item";
 const privatePattern = "/PRIVATE_PATTERN_SENTINEL/item";
 const privateBody = "PRIVATE_BODY_SENTINEL";
@@ -2321,7 +2910,7 @@ function expectDecision(payload: Record<string, unknown>, cwd: string, dispositi
 const active = '[capture]\nignore_paths = ["secret/**"]\n';
 for (const vector of fixture.decisions.filter((v: any) => ["open-code", "omp", "pi", "openclaw"].includes(v.agent))) {{
   const cwd = marker(active);
-  expectDecision(vector.payload, cwd, vector.disposition, vector.tool_family, vector.extraction_state, vector.path_count, `fixture-${{vector.agent}}`);
+  expectDecision(vector.payload, cwd, vector.disposition, vector.tool_family, vector.extraction_state, vector.path_count, `fixture-${{vector.agent}} ${{JSON.stringify(vector.payload)}}`);
 }}
 for (const vector of fixture.normalization) {{
   const cwd = marker(`[capture]\nignore_paths = [${{JSON.stringify(vector.pattern)}}]\n`);
@@ -2345,10 +2934,39 @@ for (const vector of fixture.shell.vectors) {{
   const cwd = vector.cwd ? join(shellRoot, vector.cwd) : shellRoot;
   markerFixtures.set(cwd, join(shellRoot, ".ai-memory.toml"));
   const payload = JSON.parse(JSON.stringify(vector.payload ?? {{ tool: "bash", args: {{ command: vector.command }} }}).replaceAll("{{root}}", shellRoot));
+  captureFoldCase = vector.fold_case === true;
   expectDecision(payload, cwd, vector.disposition, "non-file", "extracted", 0, `shell-${{vector.disposition}}: ${{JSON.stringify(vector)}}`);
+}}
+captureFoldCase = false;
+// Gemini reads a `read_many_files` directory entry as `entry/**` (shared vectors).
+const directoryRoot = marker(`[capture]\nignore_paths = ${{JSON.stringify(fixture.read_many_files_directories.ignore_paths)}}\n`);
+for (const vector of fixture.read_many_files_directories.vectors) {{
+  expectDecision({{ tool: "read_many_files", args: {{ include: vector.include }} }}, directoryRoot, vector.disposition, "file", "extracted", vector.include.length, `read-many-directory: ${{JSON.stringify(vector)}}`);
+}}
+// Output readers: stripped under a policy, untouched without one.
+const reader = {{ tool: "process", args: {{ action: "log" }}, output: privateBody }};
+check(capturePolicy(reader, "/no-marker").disposition === "keep", "reader-inactive-keep");
+for (const cwd of [marker(active), marker('[capture')]) {{
+  const result = capturePolicy(reader, cwd);
+  check(result.disposition === "metadata-only" && result.protocol?.tool_family === "unknown", "reader-metadata-only");
+  check(!JSON.stringify(result.payload).includes(privateBody), "reader-redaction");
 }}
 const bash = (command: string) => ({{ tool: "bash", args: {{ command }} }});
 check(capturePolicy(bash("cat docs/adr/x.md"), "/no-marker").disposition === "keep", "shell-inactive-keep");
+// A Windows host reads cmd caret and PowerShell backquote escapes out of any
+// shell tool; mirrors `windows_escape_characters_are_read_on_a_windows_host`.
+const windowsShell = "D:/shell"; markerFixtures.set(windowsShell, markerFixtures.get(marker('[capture]\nignore_paths = ["C:/Secret/**"]\n'))!);
+expectDecision(bash("type C:\\Secr^et\\x.md"), windowsShell, "drop", "non-file", "extracted", 0, "windows-host-caret");
+expectDecision(bash("Get-Content C:\\Secr`et\\x.md"), windowsShell, "drop", "non-file", "extracted", 0, "windows-host-backquote");
+expectDecision(bash("type C:\\Public\\x^.md"), windowsShell, "keep", "non-file", "extracted", 0, "windows-host-public");
+// A macOS host folds case for file tools too; mirrors `a_case_folding_host_matches_paths_without_regard_to_case`.
+captureFoldCase = true;
+expectDecision({{ tool: "edit", args: {{ path: "CASE/item" }} }}, marker('[capture]\nignore_paths = ["case/**"]\n'), "drop", "file", "extracted", 1, "fold-case-file");
+expectDecision({{ tool: "edit", args: {{ path: "PUBLIC/item" }} }}, marker('[capture]\nignore_paths = ["case/**"]\n'), "keep", "file", "extracted", 1, "fold-case-file-public");
+captureFoldCase = false;
+check(capturePolicy(bash("cat docs/{{adr,x}}/1.md"), "/no-marker").disposition === "keep", "shell-expansion-inactive-keep");
+const shellExpansion = capturePolicy({{ ...bash("cat docs/{{adr,x}}/1.md"), output: privateBody }}, shellRoot);
+check(shellExpansion.disposition === "metadata-only" && !JSON.stringify(shellExpansion.payload).includes(privateBody), "shell-expansion-redaction");
 const shellInvalid = capturePolicy({{ ...bash(`cat ${{privatePath}}`), output: privateBody }}, marker('[capture'));
 check(shellInvalid.disposition === "metadata-only" && shellInvalid.protocol?.policy_state === "invalid" && shellInvalid.protocol?.tool_family === "non-file", "shell-invalid-metadata-only");
 for (const forbidden of [privatePath, privateBody]) check(!JSON.stringify(shellInvalid.payload).includes(forbidden), "shell-invalid-redaction");
@@ -2366,6 +2984,79 @@ writeFileSync(nestedMarker, '[capture]\nignore_paths = ["private/**"]\n');
 markerFixtures.set(nestedCwd, nestedMarker);
 expectDecision({{ tool: "edit", args: {{ path: "../private/item" }} }}, nestedCwd, "drop", "file", "extracted", 1, "nested-cwd-parent-private");
 expectDecision({{ tool: "edit", args: {{ path: "private/item" }} }}, nestedCwd, "keep", "file", "extracted", 1, "nested-cwd-local-public");
+// Another checkout's exclusions hold for a call made from elsewhere, file tool or shell; mirrors `another_checkouts_exclusions_hold_for_a_call_made_elsewhere`.
+const crossA = join(markerRoot, "cross-a"); const crossB = join(markerRoot, "cross-b"); const crossBare = join(markerRoot, "cross-bare"); const crossBroken = join(markerRoot, "cross-broken");
+for (const dir of [crossA, crossB, crossBare, crossBroken]) mkdirSync(dir, {{ recursive: true }});
+for (const [dir, text] of [[crossA, '[capture]\nignore_paths = ["secrets.env"]\n'], [crossB, 'project = "b"\n'], [crossBroken, "[capture\n"]]) {{ writeFileSync(join(dir, ".ai-memory.toml"), text); markerFixtures.set(dir, join(dir, ".ai-memory.toml")); }}
+expectDecision({{ tool: "read", args: {{ path: "../cross-a/secrets.env" }} }}, crossB, "drop", "file", "extracted", 1, "cross-file-relative");
+expectDecision({{ tool: "read", args: {{ path: join(crossA, "secrets.env") }} }}, crossBare, "drop", "file", "extracted", 1, "cross-file-unmarked");
+expectDecision(bash("cat ../cross-a/secrets.env"), crossB, "drop", "non-file", "extracted", 0, "cross-shell-relative");
+expectDecision(bash(`cat ${{join(crossA, "secrets.env")}}`), crossBare, "drop", "non-file", "extracted", 0, "cross-shell-unmarked");
+expectDecision(bash("cat ../cross-a/*.env"), crossB, "drop", "non-file", "extracted", 0, "cross-shell-glob");
+expectDecision({{ tool: "bash", args: {{ command: "cat secrets.env", workdir: crossA }} }}, crossB, "drop", "non-file", "extracted", 0, "cross-shell-workdir");
+const crossBrokenResult = capturePolicy({{ ...bash("cat ../cross-broken/x.md"), output: privateBody }}, crossB);
+check(crossBrokenResult.disposition === "metadata-only" && crossBrokenResult.protocol?.policy_state === "invalid" && !JSON.stringify(crossBrokenResult.payload).includes(privateBody), "cross-broken-metadata-only");
+let crossMany = "cat"; for (let i = 0; i <= CAPTURE_MAX_FOREIGN_MARKERS; i++) {{ const dir = join(markerRoot, `cross-m${{i}}`); mkdirSync(dir, {{ recursive: true }}); writeFileSync(join(dir, ".ai-memory.toml"), 'project = "m"\n'); markerFixtures.set(dir, join(dir, ".ai-memory.toml")); crossMany += ` ../cross-m${{i}}/x.md`; }}
+check(capturePolicy(bash(crossMany), crossB).disposition === "metadata-only", "cross-too-many-markers");
+for (const [payload, cwd, label] of [[bash("cat ../cross-a/public.md README.md"), crossB, "cross-shell-public"], [{{ tool: "read", args: {{ path: "../cross-a/public.md" }} }}, crossB, "cross-file-public"], [bash("cat secrets.env"), crossB, "cross-own-file"], [bash("cat ../cross-m0/x.md ../cross-m1/x.md"), crossB, "cross-few-markers"]] as [Record<string, unknown>, string, string][]) check(capturePolicy(payload, cwd).disposition === "keep", label);
+// Globs in directory segments, search/list tools, patch headers and unreadable targets reach another checkout's policy; mirrors `globs_searches_and_unreadable_targets_answer_to_another_checkout`.
+const globParent = join(markerRoot, "glob-parent"); const globA = join(globParent, "a"); const globB = join(globParent, "b");
+for (const dir of [globA, join(globB, "src")]) mkdirSync(dir, {{ recursive: true }});
+writeFileSync(join(globA, ".ai-memory.toml"), '[capture]\nignore_paths = ["secrets.env"]\n'); markerFixtures.set(globA, join(globA, ".ai-memory.toml"));
+writeFileSync(join(globB, ".ai-memory.toml"), 'project = "b"\n'); markerFixtures.set(globB, join(globB, ".ai-memory.toml"));
+for (const [payload, cwd, label] of [[bash("cat ../*/secrets.env"), globB, "glob-sibling"], [bash("cat */secrets.env"), globParent, "glob-parent"], [bash("cat ../{{a,c}}/secrets.env"), globB, "glob-brace"], [bash("cat ../[a]/secrets.env"), globB, "glob-bracket"], [bash("cat ../**/secrets.env"), globB, "glob-globstar"], [bash("cat ../{{a/x,c}}/secrets.env"), globB, "glob-spanning"], [{{ tool: "grep", args: {{ pattern: "KEY", path: "../a/secrets.env" }} }}, globB, "search-path"], [{{ tool: "glob", args: {{ pattern: "../a/*.env" }} }}, globB, "search-pattern"], [{{ tool: "grep", args: {{ pattern: "KEY", include: "*/secrets.env" }} }}, globParent, "search-filter"], [{{ tool: "apply_patch", args: {{ patchText: "*** Begin Patch\n*** Update File: ../a/secrets.env\n*** End Patch" }} }}, globB, "patch-header"], [{{ tool: "read", args: {{}} }}, globParent, "unreadable-target"]] as [Record<string, unknown>, string, string][]) {{ const result = capturePolicy({{ ...payload, output: privateBody }}, cwd); check(result.disposition === "drop" || (result.disposition === "metadata-only" && !JSON.stringify(result.payload).includes(privateBody)), label); }}
+for (const [payload, cwd, label] of [[bash("cat ../*/public.md"), globB, "glob-public"], [bash("ls src/*"), globB, "glob-own"], [{{ tool: "grep", args: {{ pattern: "KEY", path: "src" }} }}, globB, "search-own"], [{{ tool: "glob", args: {{ pattern: "**/*.ts" }} }}, globB, "search-own-globstar"], [{{ tool: "grep", args: {{ pattern: "KEY", path: "b" }} }}, globParent, "search-public"], [{{ tool: "apply_patch", args: {{ patchText: "*** Begin Patch\n*** Add File: src/x.ts\n*** End Patch" }} }}, globB, "patch-own"]] as [Record<string, unknown>, string, string][]) check(capturePolicy(payload, cwd).disposition === "keep", label);
+// A glob rooted inside the event's own checkout is not walked, so a monorepo with more matching directories than the walk's bounds keeps its commands; the sibling attack still drops. Mirrors `a_monorepo_glob_inside_the_own_checkout_is_not_walked`.
+const mono = join(markerRoot, "mono-work", "mono"); const monoA = join(markerRoot, "mono-work", "a");
+for (const dir of [join(mono, ".git"), join(mono, "log"), monoA]) mkdirSync(dir, {{ recursive: true }});
+for (let i = 0; i < 300; i++) {{ mkdirSync(join(mono, "packages", `p${{i}}`, "src"), {{ recursive: true }}); writeFileSync(join(mono, "packages", `p${{i}}`, "package.json"), "{{}}"); mkdirSync(join(mono, "node_modules", `m${{i}}`), {{ recursive: true }}); }}
+writeFileSync(join(monoA, ".ai-memory.toml"), '[capture]\nignore_paths = ["secrets.env"]\n'); markerFixtures.set(monoA, join(monoA, ".ai-memory.toml"));
+for (const policy of [undefined, '[capture]\nignore_paths = ["private/**"]\n']) {{
+  if (policy) {{ writeFileSync(join(mono, ".ai-memory.toml"), policy); markerFixtures.set(mono, join(mono, ".ai-memory.toml")); }}
+  for (const command of ["cat packages/*/package.json", "ls packages/*/src", "du -sh packages/*", "ls node_modules/*/package.json", "for f in packages/*/package.json; do echo $f; done", "tail -n 50 log/*.log"]) check(capturePolicy(bash(command), mono).disposition === "keep", `monorepo-shell ${{!!policy}}: ${{command}}`);
+  for (const payload of [{{ tool: "glob", args: {{ pattern: "packages/*/package.json" }} }}, {{ tool: "grep", args: {{ pattern: "x", path: "packages", glob: "*/package.json" }} }}]) check(capturePolicy(payload, mono).disposition === (policy ? "drop" : "keep"), `monorepo-search ${{!!policy}}: ${{JSON.stringify(payload)}}`);
+  for (const command of ["cat ../*/secrets.env", "cat ../a/*.env"]) check(capturePolicy(bash(command), mono).disposition === "drop", `monorepo-sibling ${{!!policy}}: ${{command}}`);
+}}
+// A walk outside the checkout stops at its directory bound (counted as a "**" lists) and its time budget; mirrors `a_glob_walk_outside_the_checkout_stops_at_its_bounds`.
+const budgetRoot = join(markerRoot, "budget"); mkdirSync(join(budgetRoot, "x", "y"), {{ recursive: true }}); writeFileSync(join(budgetRoot, "x", ".ai-memory.toml"), "");
+const fastBudget = (): CaptureGlobBudget => ({{ dirs: 0, entries: 0, deadline: 50, now: () => 0 }});
+check(captureMarkersBelow(budgetRoot, ["**"], undefined, fastBudget())?.length === 1, "walk-in-time");
+check(captureMarkersBelow(budgetRoot, ["**"], budgetRoot, fastBudget())?.length === 0, "walk-inside-checkout");
+check(captureMarkersBelow(budgetRoot, ["**"], undefined, {{ dirs: 0, entries: 0, deadline: 50, now: () => 51 }}) === undefined, "walk-past-time");
+const deepRoot = join(markerRoot, "deep"); for (let o = 0; o < 64; o++) for (let i = 0; i < 64; i++) mkdirSync(join(deepRoot, `d${{o}}`, `e${{i}}`), {{ recursive: true }});
+const deepBudget = fastBudget(); check(captureMarkersBelow(deepRoot, ["**"], undefined, deepBudget) === undefined && deepBudget.entries < 1024, "walk-stops-early");
+// Syntax that builds a step out of the checkout reaches the other checkout's policy; mirrors `constructed_parent_steps_answer_to_another_checkout`.
+const conWork = join(markerRoot, "con-work"); const conA = join(conWork, "a"); const conB = join(conWork, "b");
+for (const dir of [conA, join(conB, ".git"), join(conB, "sub", "x")]) mkdirSync(dir, {{ recursive: true }});
+writeFileSync(join(conA, ".ai-memory.toml"), '[capture]\nignore_paths = ["secrets.env"]\n'); markerFixtures.set(conA, join(conA, ".ai-memory.toml"));
+for (const [payload, label] of [[bash("cat ./**/../a/secrets.env"), "con-globstar"], [{{ tool: "glob", args: {{ pattern: "./**/../a/secrets.env" }} }}, "con-globstar-tool"], [{{ tool: "grep", args: {{ pattern: "KEY", glob: "**/../a/secrets.env" }} }}, "con-globstar-filter"], [bash("cat .{{.,x}}/a/secrets.env"), "con-brace-dot"], [bash("cat {{.,}}./a/secrets.env"), "con-brace-empty"], [bash("cat .{{.,.}}/a/secrets.env"), "con-brace-twice"], [bash("cat .{{-..0}}/a/secrets.env"), "con-brace-sequence"], [bash("cat ../(a)/secrets.env"), "con-group"], [bash("cat ../(a|c)/secrets.env"), "con-group-alternation"], [bash("cat ..$'\\x2f'a/secrets.env"), "con-ansi-hex"], [bash("cat $'\\056\\056'/a/secrets.env"), "con-ansi-octal"], [bash("cat .*/a/secrets.env"), "con-dot-star"], [bash("cat ./.?/a/secrets.env"), "con-dot-question"], [{{ tool: "apply_patch", args: {{ patchText: "*** Begin Patch\n*** Add File: sub/y.rs\n+y\n  *** Update File: ../a/secrets.env\n+KEY\n*** End Patch" }} }}, "con-indented-patch"], [{{ tool: "grep", args: {{ pattern: "KEY", path: "..", file_glob: "a/*.env" }} }}, "con-file-glob"]] as [Record<string, unknown>, string][]) {{ const result = capturePolicy({{ ...payload, output: privateBody }}, conB); check(result.disposition === "drop" || (result.disposition === "metadata-only" && !JSON.stringify(result.payload).includes(privateBody)), label); }}
+for (const [payload, label] of [[bash("cat sub/**/../README.md"), "con-own-globstar"], [bash("cat {{sub,lib}}/README.md"), "con-own-brace"], [bash("cat v{{1..3}}/README.md"), "con-own-sequence"], [bash("(cd sub && ls)"), "con-subshell"], [bash("ls .*"), "con-dot-list"], [bash("cat .config/x"), "con-dot-directory"], [bash("cat .github/*.yml"), "con-dot-glob"], [bash("cat sub$'\\x2f'x/README.md"), "con-own-ansi"], [{{ tool: "apply_patch", args: {{ patchText: "*** Begin Patch\n  *** Add File: sub/x.rs\n+fn x() {{}}\n*** End Patch" }} }}, "con-own-patch"], [{{ tool: "grep", args: {{ pattern: "KEY", path: "sub", file_glob: "x/*.rs" }} }}, "con-own-file-glob"]] as [Record<string, unknown>, string][]) check(capturePolicy(payload, conB).disposition === "keep", label);
+// Double-quoted scripts, POSIX classes, extglobs, brace-built dot-globs and oversized expansions that could leave reach checkout A's policy; an oversized expansion that cannot leave is kept (v2.6.3 kept it). Mirrors the additions to `constructed_parent_steps_answer_to_another_checkout`.
+for (const [command, label] of [["bash -c \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\"", "con-dq-ansi"], ["eval \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\"", "con-dq-eval"], ["cat .[[:punct:]]/a/secrets.env", "con-posix-class"], ["cat .@(.)/a/secrets.env", "con-extglob-at"], ["cat .?(.)/a/secrets.env", "con-extglob-optional"], ["cat .*(.)/a/secrets.env", "con-extglob-star"], ["cat .+(.)/a/secrets.env", "con-extglob-plus"], ["cat .{{*,x}}/a/secrets.env", "con-brace-dot-glob"], ["cat .{{-..~}}/a/secrets.env", "con-oversized-leaves"]]) check(capturePolicy(bash(command), conB).disposition !== "keep", label);
+for (const [command, label] of [["bash -c \"echo \\$HOME && cat ../a/README.md\"", "con-dq-own"], ["ls .[[:alpha:]]*", "con-posix-own"], ["cat .[[:alpha:]]x/README.md", "con-posix-own-directory"], ["touch test/file{{1..200}}.txt", "con-oversized"], ["mkdir -p build/{{1..100}}/out", "con-oversized-directory"], ["rm -f logs/app.{{1..99}}.log", "con-oversized-dotted"], ["cat data/{{a..h}}{{1..9}}.csv", "con-oversized-product"]]) check(capturePolicy(bash(command), conB).disposition === "keep", label);
+// A "**" above the checkout skips the own subtree; mirrors `a_globstar_above_the_checkout_skips_the_own_subtree`.
+check(captureMarkersBelow(join(markerRoot, "mono-work"), ["**"], mono, fastBudget())?.includes(join(monoA, ".ai-memory.toml")) === true, "globstar-skips-own-subtree");
+check(captureMarkersBelow(join(markerRoot, "mono-work"), ["**"], undefined, fastBudget()) === undefined, "globstar-own-subtree-exceeds-bound");
+// Deep trees look each directory up once and share the budget; the other checkout's location comes first. Mirrors `marker_lookups_in_a_deep_tree_cost_one_probe_per_directory`.
+const deepLevels = 300; let deepDir = conB; const deepWords: string[] = []; for (let level = 1; level <= deepLevels; level++) {{ deepDir = join(deepDir, "d"); deepWords.push("d/".repeat(level) + "f"); }} mkdirSync(deepDir, {{ recursive: true }});
+check(capturePolicy(bash(`cat ${{deepWords.join(" ")}}`), conB).disposition === "keep", "deep-inside-kept");
+// A clock that advances one millisecond per reading runs out within the deep list: inside the own checkout that keeps the call, and the other checkout's location is looked up first.
+let readings = 0; captureNow = () => {{ readings++; return 0; }};
+try {{ check(capturePolicy(bash(`cat ${{deepWords.join(" ")}}`), conB).disposition === "keep" && readings < 5 * deepLevels, `deep-one-probe-per-directory ${{readings}}`); }} finally {{ captureNow = Date.now; }}
+let ticks = 0; captureNow = () => ticks++;
+try {{ check(capturePolicy(bash(`cat ${{deepWords.join(" ")}}`), conB).disposition === "keep", "deep-out-of-budget-inside-kept"); check(capturePolicy(bash(`cat ${{deepWords.join(" ")}} ../a/secrets.env`), conB).disposition === "drop", "deep-attack-first"); mkdirSync(join(conB, "vendor"), {{ recursive: true }}); writeFileSync(join(conB, "vendor", ".ai-memory.toml"), '[capture]\nignore_paths = ["secrets.env"]\n'); ticks = 0; check(capturePolicy(bash(`cat ${{deepWords.join(" ")}} vendor/secrets.env`), conB).disposition === "drop", "deep-nested-shallow-first"); check(capturePolicy(bash(`cat ${{join(markerRoot, "elsewhere", "d".repeat(1), ...deepWords.slice(0, 120).map(() => "d"))}}/f`), conB).disposition === "metadata-only", "deep-out-of-budget-outside-unprovable"); }} finally {{ captureNow = Date.now; }}
+const deepMemo: CaptureMarkerMemo = {{ governing: new Map(), checkouts: new Map() }}; const deepBudget2: CaptureGlobBudget = {{ dirs: 0, entries: 0, deadline: 50, now: () => 0, probes: 0 }}; let lookupDir = deepDir; for (let level = 0; level < deepLevels; level++, lookupDir = dirname(lookupDir)) check(captureMemoMarker(lookupDir, deepMemo, deepBudget2) === null, "deep-memo-answer");
+check((deepBudget2.probes ?? 0) < 3 * deepLevels, `deep-memo-probes ${{deepBudget2.probes}}`);
+check(captureMemoMarker(deepDir, {{ governing: new Map(), checkouts: new Map() }}, {{ dirs: 0, entries: 0, deadline: 50, now: () => 51, probes: 0 }}) === undefined, "deep-memo-past-budget");
+// A `.git` at home does not make every checkout under it the own one; mirrors `a_dotfiles_checkout_at_home_is_not_the_own_checkout`.
+const realHome = process.env.HOME; const dotHome = join(markerRoot, "dot-home"); const dotProjects = join(dotHome, "Projects"); for (const dir of [join(dotHome, ".git"), join(dotProjects, "a"), join(dotProjects, "b")]) mkdirSync(dir, {{ recursive: true }}); writeFileSync(join(dotProjects, "a", ".ai-memory.toml"), '[capture]\nignore_paths = ["secrets.env"]\n');
+process.env.HOME = dotHome;
+try {{ check(capturePolicy(bash("cat */secrets.env"), dotProjects).disposition === "drop", "dotfiles-home-glob"); check(capturePolicy(bash(`cat ${{dotProjects}}/*/secrets.env`), dotProjects).disposition === "drop", "dotfiles-home-absolute"); check(!captureOwnCheckout(dotHome), "dotfiles-home-not-own"); }} finally {{ process.env.HOME = realHome; }}
+// A macOS host folds case beyond ASCII and composes Unicode; mirrors `a_case_folding_host_matches_paths_without_regard_to_case`.
+captureFoldCase = true;
+for (const path of ["\u00e9crits/x.md", "\u00c9CRITS/x.md", "E\u0301crits/x.md"]) expectDecision({{ tool: "edit", args: {{ path }} }}, marker('[capture]\nignore_paths = ["\u00c9crits/**"]\n'), "drop", "file", "extracted", 1, `fold-unicode ${{JSON.stringify(path)}}`);
+expectDecision({{ tool: "edit", args: {{ path: "ecrits/x.md" }} }}, marker('[capture]\nignore_paths = ["\u00c9crits/**"]\n'), "keep", "file", "extracted", 1, "fold-unicode-control");
+captureFoldCase = false;
 expectDecision({{ tool: "edit", args: {{ path: `${{homedir()}}/home-private/item` }} }}, marker('[capture]\nignore_paths = ["~/home-private/**"]\n'), "drop", "file", "extracted", 1, "home-expansion");
 expectDecision({{ tool: "edit", args: {{ path: "case/item" }} }}, marker('[capture]\nignore_paths = ["Case/**"]\n'), "keep", "file", "extracted", 1, "posix-case");
 expectDecision({{ tool: "edit", args: {{ path: "c:/SECRET/item" }} }}, marker('[capture]\nignore_paths = ["C:/secret/**"]\n'), "drop", "file", "extracted", 1, "windows-drive-case");
@@ -2380,6 +3071,12 @@ expectDecision({{ tool: "edit", args: {{ path: "x" }} }}, marker(`[capture]\nign
 expectDecision({{ tool: "edit", args: {{ path: "literal#item" }} }}, marker("[capture]\nignore_paths = [\n  'literal#item',\n  \"basic#item\"\n]\n"), "drop", "file", "extracted", 1, "multiline-and-hash");
 expectDecision({{ tool: "edit", args: {{ path: "C:relative" }} }}, marker(active), "metadata-only", "file", "extracted", 1, "drive-relative");
 expectDecision({{ tool: "future-tool", args: {{ path: "secret/a" }} }}, marker(active), "keep", "unknown", "extracted", 0, "unknown-tool");
+// Gemini `read_many_files` glob syntax the matcher cannot evaluate fails closed;
+// an empty glob list proves nothing.
+expectDecision({{ tool: "read_many_files", args: {{ include: ["public/a", "secret/[ab]"] }} }}, marker(active), "metadata-only", "file", "extracted", 2, "read-many-unsupported-glob");
+expectDecision({{ tool: "read_many_files", args: {{ include: ["src/**/*.rs", "secret/{{a,b}}"] }} }}, marker(active), "metadata-only", "file", "extracted", 2, "read-many-brace-glob");
+expectDecision({{ tool: "read_many_files", args: {{ include: [] }} }}, marker(active), "metadata-only", "file", "missing-or-malformed", 0, "read-many-empty");
+expectDecision({{ tool: "read_many_files", args: {{ include: ["**/*.md"] }} }}, marker('[capture]\nignore_paths = ["docs/adr/**"]\n'), "drop", "file", "extracted", 1, "read-many-globstar");
 const adversarial = "a".repeat(4090);
 expectDecision({{ tool: "multi_edit", args: {{ edits: [{{ path: "secret/a" }}, {{ path: adversarial }}] }} }}, marker('[capture]\nignore_paths = ["secret/**", "*'.concat("a".repeat(1022), '"]\n')), "drop", "file", "extracted", 2, "first-drop-beats-budget");
 
@@ -2409,6 +3106,50 @@ const inactive = capturePolicy(inactivePayload, "/no-marker");
 check(inactive.disposition === "keep" && inactive.payload === inactivePayload && !inactive.protocol, "inactive-preserves-object");
 const activeKeep = capturePolicy({{ tool: "bash", args: {{ command: privateBody }} }}, gatedCwd);
 check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 && activeKeep.protocol.policy_state === "active", "active-keep-adds-protocol");
+// Windows spellings of an ignored file, and the POSIX sessions they must not touch (shared vectors; mirrors `windows_spelling_fixture_vectors`).
+for (const section of [fixture.windows, fixture.windows_posix_controls]) {{
+  markerFixtures.set(section.cwd, markerFixtures.get(marker(`[capture]\nignore_paths = ${{JSON.stringify(section.ignore_paths)}}\n`))!);
+  for (const vector of section.files) {{ const result = capturePolicy({{ tool: "edit", args: {{ path: vector.path }} }}, section.cwd); check(result.disposition === vector.disposition && result.protocol?.tool_family === "file", `windows-file ${{section.cwd}} ${{JSON.stringify(vector)}}: ${{result.disposition}}`); }}
+  for (const vector of section.shell ?? []) {{ const result = capturePolicy(vector.payload ?? bash(vector.command), section.cwd); check(result.disposition === vector.disposition, `windows-shell ${{JSON.stringify(vector)}}: ${{result.disposition}}`); }}
+}}
+// A Windows session whose cwd, marker directory or pattern is spelled with a device prefix, an administrative share or a UNC path; PowerShell's literal backslashes; both readings of `/a/x` (shared vectors; mirrors `windows_spelling_fixture_vectors`). The marker sits in the cwd itself, so relative patterns resolve from its Windows spelling.
+for (const section of fixture.windows_scopes) {{
+  const markerPath = `${{section.cwd}}\\.ai-memory.toml`;
+  markerAliases.set(markerPath, markerFixtures.get(marker(`[capture]\nignore_paths = ${{JSON.stringify(section.ignore_paths)}}\n`))!);
+  markerFixtures.set(section.cwd, markerPath);
+  for (const vector of section.files) {{ const result = capturePolicy({{ tool: "edit", args: {{ path: vector.path }} }}, section.cwd); check(result.disposition === vector.disposition && result.protocol?.tool_family === "file", `windows-file ${{section.cwd}} ${{JSON.stringify(vector)}}: ${{result.disposition}}`); }}
+  for (const vector of section.shell ?? []) {{ const result = capturePolicy(vector.payload ?? bash(vector.command), section.cwd); check(result.disposition === vector.disposition, `windows-shell ${{JSON.stringify(vector)}}: ${{result.disposition}}`); }}
+}}
+// Every TOML spelling of the capture table the native parser honours, and the ones it rejects (shared vectors; mirrors `capture_section_spellings_match_toml_semantics`).
+for (const text of fixture.marker_spellings.honoured) check(capturePolicy({{ tool: "edit", args: {{ path: "secret/x" }} }}, marker(text)).disposition === "drop", `marker-honoured ${{JSON.stringify(text)}}`);
+for (const text of fixture.marker_spellings.rejected) {{ const result = capturePolicy({{ tool: "edit", args: {{ path: "public/x" }} }}, marker(text)); check(result.disposition === "metadata-only" && result.protocol?.policy_state === "invalid", `marker-rejected ${{JSON.stringify(text)}}`); }}
+for (const text of fixture.marker_spellings.unrelated) check(capturePolicy({{ tool: "edit", args: {{ path: "secret/x" }} }}, marker(text)).disposition === "keep", `marker-unrelated ${{JSON.stringify(text)}}`);
+// The tool names each family covers come from the native constants (shared vectors; mirrors `tool_family_fixture_vectors`).
+for (const vector of fixture.tool_families) check(captureTool({{ tool: vector.name, args: {{}} }}).family === vector.family, `tool-family ${{vector.name}}`);
+// The harness-spool check is linear in the path and charged to the match budget; mirrors `output_spool_work_is_linear_and_budgeted`.
+const spoolPath = `/tmp/${{"*/".repeat(2040)}}x`; const spoolWork = {{ work: 0 }};
+check(captureOutputSpool(spoolPath, spoolWork) === false && spoolWork.work <= 64 * spoolPath.length, `spool-linear ${{spoolWork.work}}`);
+check(captureOutputSpool("/home/u/.claude/projects/p/s/tool-results/a.txt", {{ work: 0 }}) === true, "spool-still-found");
+check(captureOutputSpool(spoolPath, {{ work: CAPTURE_MAX_WORK }}) === undefined, "spool-past-budget-unproven");
+const spoolRoot = marker('[capture]\nignore_paths = ["/s"]\n');
+const spoolPaths = Array.from({{ length: 32 }}, (_, i) => `/tmp/${{i}}/${{"*/".repeat(2000)}}x`);
+check(capturePolicy({{ tool: "read", args: {{ paths: spoolPaths }} }}, spoolRoot).disposition === "metadata-only", "spool-budget-fails-closed");
+check(capturePolicy({{ tool: "read", args: {{ paths: spoolPaths.slice(0, 1) }} }}, spoolRoot).disposition === "keep", "spool-one-path-keep");
+// A command longer than the matcher splits is unprovable; mirrors `an_oversized_shell_command_is_unprovable`.
+const atLimit = `cat public.md${{" ".repeat(CAPTURE_MAX_COMMAND_CHARS - 13)}}`;
+check(capturePolicy(bash(atLimit), shellRoot).disposition === "keep", "command-at-limit-keep");
+check(capturePolicy(bash(`${{atLimit}} `), shellRoot).disposition === "metadata-only", "command-oversized-metadata-only");
+check(capturePolicy({{ tool: "shell", args: {{ command: ["bash", "-lc", atLimit] }} }}, shellRoot).disposition === "metadata-only", "argv-oversized-metadata-only");
+check(capturePolicy(bash(`${{atLimit}} `), "/no-marker").disposition === "metadata-only", "command-oversized-lookup-unprovable");
+// Inline program source (Hermes `execute_code`) is metadata-only under a policy, like `python3 -c`.
+const inlineCode = {{ tool: "execute_code", args: {{ code: "print(open('secret/a.txt').read())" }}, output: privateBody }};
+check(capturePolicy(inlineCode, "/no-marker").disposition === "keep", "inline-code-inactive-keep");
+const inlineResult = capturePolicy(inlineCode, marker(active));
+check(inlineResult.disposition === "metadata-only" && inlineResult.protocol?.tool_family === "non-file" && !JSON.stringify(inlineResult.payload).includes(privateBody), "inline-code-metadata-only");
+// A directory walk reads one entry at a time and stops at the entry bound instead of listing the whole directory first.
+const wide = join(markerRoot, "wide"); for (let i = 0; i < 100; i++) mkdirSync(join(wide, `d${{i}}`), {{ recursive: true }});
+opendirReads = 0;
+check(captureMarkersBelow(wide, ["*"], undefined, {{ dirs: 0, entries: CAPTURE_MAX_GLOB_ENTRIES - 5, deadline: 50, now: () => 0 }}) === undefined && opendirReads > 0 && opendirReads <= 6, `walk-reads-to-the-entry-bound ${{opendirReads}}`);
 // #992: only the native hook routes `server` profiles; these integrations
 // must drop rather than deliver a routed repository to the install default,
 // including under a nested marker that does not repeat the key.
@@ -2468,8 +3209,8 @@ check(capturePolicy(bash("echo hi"), routedChild).disposition === "drop", "serve
         // `config.state`, or this second case would be wrongly dropped.
         let allowlist_module = temp.path().join("capture-policy-allowlist-evidence.ts");
         let allowlist_source = format!(
-            r#"import {{ closeSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, writeFileSync }} from "node:fs";
-import {{ dirname, join, resolve }} from "node:path";
+            r#"import {{ closeSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync }} from "node:fs";
+import {{ basename, dirname, join, resolve }} from "node:path";
 import {{ homedir }} from "node:os";
 
 const markerRoot = process.argv[2]!;
@@ -2523,12 +3264,10 @@ check(markedButEmpty.disposition === "keep", "allowlist-marker-present-empty-cap
         let Some(()) = node_strip_types_available() else {
             return;
         };
-        // `keep()` cancels delete-on-drop: the emitted modules are the
-        // evidence, so they stay on disk for inspection after the run.
-        let temp = tempfile::tempdir().unwrap().keep();
-        eprintln!("capture-owner gate modules retained at {}", temp.display());
-        const HARNESS: &str = r#"import { closeSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+        let guard = tempfile::tempdir().unwrap();
+        let temp = guard.path().to_path_buf();
+        const HARNESS: &str = r#"import { closeSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 const markerRoot = process.argv[2]!;
@@ -2750,6 +3489,38 @@ if (inheritOnly) {
     /// outer level — which made Claude Code refuse to load
     /// settings.json with "hooks: Expected array, but received
     /// undefined" on every event.
+    /// Copilot CLI keeps its flat entry shape even when the event names are
+    /// PascalCase (only the payload sent to the script changes), and rejects
+    /// `matcher` on session/stop/subagent events — so every entry must be a
+    /// bare `{type, command}` handler: no nested `hooks`, no `matcher`.
+    #[test]
+    fn copilot_cli_payload_uses_flat_entries_without_matcher() {
+        let root = PathBuf::from("/host/hooks/copilot-cli");
+        let v = build_posix_hook_payload(
+            COPILOT_CLI_PROFILE.events,
+            &root,
+            "http://localhost:49374",
+            None,
+            COPILOT_CLI_PROFILE.shape,
+        );
+        let hooks = v.pointer("/hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), COPILOT_CLI_EVENTS.len());
+        for (event, _) in COPILOT_CLI_EVENTS {
+            let entry = v
+                .pointer(&format!("/hooks/{event}/0"))
+                .and_then(|e| e.as_object())
+                .unwrap_or_else(|| panic!("missing /hooks/{event}/0"));
+            assert_eq!(
+                entry.get("type").and_then(|t| t.as_str()),
+                Some("command"),
+                "{event}"
+            );
+            assert!(entry.contains_key("command"), "{event}: {entry:?}");
+            assert!(!entry.contains_key("hooks"), "{event}: {entry:?}");
+            assert!(!entry.contains_key("matcher"), "{event}: {entry:?}");
+        }
+    }
+
     #[test]
     fn cursor_payload_uses_flat_shape() {
         // Flat shape: no inner `hooks: [...]` array; each event
@@ -3166,7 +3937,9 @@ if (inheritOnly) {
                 HookShape::Nested | HookShape::NestedWithoutMatcher => {
                     v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone()
                 }
-                HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
+                HookShape::Flat | HookShape::FlatWithoutMatcher => {
+                    v.pointer("/hooks/SessionStart/0").unwrap().clone()
+                }
             }
         }
 
@@ -3212,6 +3985,7 @@ if (inheritOnly) {
             ("antigravity-cli", HookShape::Flat),
             ("grok", HookShape::Nested),
             ("devin", HookShape::Nested),
+            ("copilot-cli", HookShape::FlatWithoutMatcher),
         ] {
             let handler = handler_for(HookCommandPlatform::WindowsNative, agent, shape);
             assert!(

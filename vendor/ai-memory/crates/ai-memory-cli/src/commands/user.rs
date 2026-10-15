@@ -1,7 +1,9 @@
-//! `ai-memory user` — manage compatibility tokens and human password login.
+//! `ai-memory user` — manage human users, password login and project grants.
 //!
-//! Thin HTTP client over `/admin/users*`. The caller's bearer token must
-//! authenticate as root. Single-token commands remain deprecated 1.x shims.
+//! Thin HTTP client over `/admin/users*` and `/admin/human-users`. The
+//! caller's bearer token must authenticate as root. API keys, including the
+//! `legacy-user-token` rows left by the removed 1.x token commands, are
+//! managed by `ai-memory api-key`.
 
 use std::io::{self, BufRead, Write};
 
@@ -9,9 +11,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{
-    UserAddArgs, UserAddHumanArgs, UserArgs, UserCommand, UserDisableArgs, UserEnableArgs,
-    UserExpireArgs, UserListArgs, UserPatchArgs, UserResetPasswordArgs, UserReviveArgs,
-    UserRotateTokenArgs,
+    UserAddHumanArgs, UserArgs, UserCommand, UserDisableArgs, UserEnableArgs, UserListArgs,
+    UserPatchArgs, UserResetPasswordArgs,
 };
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, patch_json, post_json};
@@ -28,8 +29,6 @@ struct UserRow {
     #[serde(default)]
     last_seen_at: Option<i64>,
     #[serde(default)]
-    token_expired_at: Option<i64>,
-    #[serde(default)]
     role: String,
     #[serde(default)]
     must_change_password: bool,
@@ -45,20 +44,10 @@ impl UserRow {
             "disabled"
         } else if self.has_password && self.must_change_password {
             "must-change"
-        } else if self.has_password {
-            "active"
-        } else if self.token_expired_at.is_some() {
-            "expired"
         } else {
             "active"
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct UserWithToken {
-    user: UserRow,
-    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,12 +74,8 @@ struct UserList {
 pub async fn run(config: &Config, args: UserArgs) -> Result<()> {
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     match args.command {
-        UserCommand::Add(args) => add(&ep, args).await,
         UserCommand::AddHuman(args) => add_human(&ep, args).await,
         UserCommand::List(args) => list(&ep, args).await,
-        UserCommand::Expire(args) => expire(&ep, args).await,
-        UserCommand::Revive(args) => revive(&ep, args).await,
-        UserCommand::RotateToken(args) => rotate_token(&ep, args).await,
         UserCommand::ResetPassword(args) => reset_password(&ep, args).await,
         UserCommand::Disable(args) => disable(&ep, args).await,
         UserCommand::Enable(args) => enable(&ep, args).await,
@@ -110,27 +95,6 @@ struct CreateUserBody<'a> {
     email: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'a str>,
-}
-
-async fn add(ep: &ServerEndpoint, args: UserAddArgs) -> Result<()> {
-    let body = CreateUserBody {
-        username: args.username.trim(),
-        name: args
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-        email: args
-            .email
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-        role: None,
-    };
-    let resp: UserWithToken = post_json(ep, "/admin/users", &body)
-        .await
-        .context("creating compatibility user")?;
-    print_token(&resp, args.json, "created")
 }
 
 async fn add_human(ep: &ServerEndpoint, args: UserAddHumanArgs) -> Result<()> {
@@ -218,44 +182,6 @@ async fn list(ep: &ServerEndpoint, args: UserListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn expire(ep: &ServerEndpoint, args: UserExpireArgs) -> Result<()> {
-    if !args.yes {
-        confirm(&format!(
-            "Expire token for user '{}'? Their token stops authenticating immediately. (y/N) ",
-            args.username
-        ))?;
-    }
-    let path = format!("/admin/users/{}/expire", url_encode(&args.username));
-    let _: UserResponse = post_json(ep, &path, &serde_json::json!({}))
-        .await
-        .context("expiring user token")?;
-    println!("✓ expired token for user '{}'", args.username);
-    Ok(())
-}
-
-async fn revive(ep: &ServerEndpoint, args: UserReviveArgs) -> Result<()> {
-    let path = format!("/admin/users/{}/revive", url_encode(&args.username));
-    let _: UserResponse = post_json(ep, &path, &serde_json::json!({}))
-        .await
-        .context("reviving user token")?;
-    println!("✓ revived token for user '{}'", args.username);
-    Ok(())
-}
-
-async fn rotate_token(ep: &ServerEndpoint, args: UserRotateTokenArgs) -> Result<()> {
-    if !args.yes {
-        confirm(&format!(
-            "Rotate token for user '{}'? Existing clients will start getting 401 immediately. (y/N) ",
-            args.username
-        ))?;
-    }
-    let path = format!("/admin/users/{}/rotate-token", url_encode(&args.username));
-    let resp: UserWithToken = post_json(ep, &path, &serde_json::json!({}))
-        .await
-        .context("rotating user token")?;
-    print_token(&resp, args.json, "rotated token for")
-}
-
 async fn reset_password(ep: &ServerEndpoint, args: UserResetPasswordArgs) -> Result<()> {
     if !args.yes {
         confirm(&format!(
@@ -336,32 +262,21 @@ async fn patch(ep: &ServerEndpoint, args: UserPatchArgs) -> Result<()> {
     } else {
         println!(
             "✓ updated user '{}' ({})",
-            resp.user.username,
+            display_username(&resp.user.username),
             resp.user.status()
         );
     }
     Ok(())
 }
 
-fn print_token(resp: &UserWithToken, json: bool, verb: &str) -> Result<()> {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "user": &resp.user,
-                "token": &resp.token
-            }))?
-        );
-    } else {
-        let mut stderr = io::stderr().lock();
-        let _ = writeln!(
-            stderr,
-            "✓ {verb} user '{}'\n\nStore this token now — it will NOT be shown again.",
-            resp.user.username
-        );
-        println!("{}", resp.token);
-    }
-    Ok(())
+/// The one place a username reaches terminal output unchanged. CodeQL's
+/// sensitive-data heuristic reads any `username` as account information; a
+/// username is the operator-chosen login name, not a credential, and the
+/// `rust/cleartext-logging` barrier model
+/// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
+/// names this function so printing one here raises no alert.
+fn display_username(value: &str) -> &str {
+    value
 }
 
 fn print_temp_password(resp: &UserWithPassword, json: bool, verb: &str) -> Result<()> {

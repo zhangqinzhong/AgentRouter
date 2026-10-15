@@ -367,6 +367,11 @@ fn build_llm_provider(
             ProviderAuth::copilot(tf.to_path_buf(), None, None, base_url.map(str::to_string))
         }
         AuthRequirement::AnthropicOAuthToken => ProviderAuth::anthropic_oauth_token(api_key),
+        AuthRequirement::CursorCli => ProviderAuth::cursor(ai_memory_llm::CursorAuth::new(
+            "agent",
+            std::env::temp_dir(),
+            &std::env::vars_os().collect::<Vec<_>>(),
+        )),
     };
 
     let config = ProviderConfig {
@@ -375,6 +380,9 @@ fn build_llm_provider(
         auth,
         base_url: base_url.map(str::to_string),
         compat_strict: true,
+        // Comparisons must not differ by engine-side thinking behaviour;
+        // keep the product default (off) for every candidate.
+        compat_disable_thinking: false,
         request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
         reasoning_effort: None,
         extra_headers: ai_memory_llm::ExtraHeaders::default(),
@@ -480,6 +488,7 @@ mod tests {
             answer: None,
             latency: std::time::Duration::ZERO,
             context_tokens: 0,
+            raw_hits: 0,
         };
         let qa = engine
             .evaluate("What is the user's dog's name?", "Rex", &outcome)

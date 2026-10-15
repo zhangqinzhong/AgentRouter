@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "SQLite storage layer with single-writer actor and FTS5/sqlite-vec indices."

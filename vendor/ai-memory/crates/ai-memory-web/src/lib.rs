@@ -11,15 +11,21 @@
 //! - `GET /`                              → project list (cards)
 //! - `GET /w/:workspace/:project`         → page tree + recent activity
 //! - `GET /w/:workspace/:project/p/*path` → rendered markdown + metadata
-//! - `GET /search?q=…`                    → FTS5 hit list
+//! - `GET /w/:workspace/:project/h/*path` → version history + unified diff
+//! - `GET /w/:workspace/:project/s/:session` → session timeline, paged
+//! - `GET /search?q=…`                    → cross-project FTS5 hit list
+//! - `GET /search?q=…&workspace=…&project=…&explain=1` → project search
+//!   through `memory_query`'s hybrid ranker, with the recall trace
 //! - `GET /pending`                       → root-only pending-writes triage;
 //!   its buttons post to `/admin/pending-writes/*`, not to this crate
+//! - `GET /health`                        → root-only server health panel
 //! - `GET /login` / `GET /change-password` → public human-auth HTML forms
 //! - `GET /static/*`                      → embedded CSS + logo (public)
 //!
 //! The companion `api_router` exposes the same read-only data as JSON
 //! for custom frontends. It intentionally does not expose write/admin
-//! operations.
+//! operations. `clippy.toml` in this crate forbids the `Wiki` write and
+//! destructive methods, so read-only holds at lint time, not only by review.
 //!
 //! Theme follows `prefers-color-scheme` via the included Tailwind
 //! stylesheet; no JS toggle, no cookie.
@@ -30,9 +36,12 @@ use ai_memory_store::ReaderPool;
 use ai_memory_wiki::Wiki;
 use axum::Router;
 
+mod diff;
+pub mod health;
 mod html_auth;
 mod markdown;
 pub mod mount;
+pub mod recall;
 mod routes;
 mod state;
 mod templates;
@@ -42,6 +51,7 @@ pub use mount::{
     SplitWebRouters, WebMountSpec, inject_base_href, inject_base_path_meta, normalize_prefix,
     split_web_routers, web_base_href,
 };
+pub use recall::Recall;
 pub use state::WebState;
 
 /// Build the read-only web router. Call once at server startup and
@@ -54,9 +64,9 @@ pub fn router(reader: ReaderPool, wiki: Wiki) -> Router {
 
 /// Build the read-only JSON API router for third-party web UIs.
 ///
-/// The host should `nest("/api/v1", api_router(...))` alongside `/web`
-/// so custom frontends can browse memory without reading SQLite or wiki
-/// files directly.
+/// The host should `nest("/api/v1", api_router(...))` behind its normal auth
+/// boundary, with or without `/web`, so external clients can browse memory
+/// without reading SQLite or wiki files directly.
 pub fn api_router(reader: ReaderPool, wiki: Wiki) -> Router {
     let state = Arc::new(WebState::new(reader, wiki));
     routes::build_api(state)
@@ -76,6 +86,9 @@ pub fn favicon_router() -> Router {
 // public API; `extern crate self` lets them keep addressing it by crate name.
 #[cfg(test)]
 extern crate self as ai_memory_web;
+// The fixtures seed pages through `Wiki::write_page`, which `clippy.toml`
+// forbids in this crate's own code.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 #[path = "../tests/suite/mod.rs"]
 mod integration;

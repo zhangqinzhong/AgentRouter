@@ -166,6 +166,7 @@ async fn stage(store: &Store) -> (WorkspaceId, ProjectId, AutoImproveProposalId)
 fn admin_state(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {
     AdminState {
         ingest_metrics: Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,

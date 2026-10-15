@@ -5,6 +5,7 @@ import AIMemoryMenuCore
 struct MenuBarView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Text(model.headlineVersion)
@@ -12,6 +13,17 @@ struct MenuBarView: View {
             .onAppear {
                 Task { await model.poll() }
             }
+        if let error = model.lastError {
+            // Surface the server's own fatal error (e.g. "binding ... Address
+            // already in use") instead of leaving the reason only in
+            // ~/Library/Logs/ai-memory/stderr.log behind a red status item.
+            Text(error)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(12)
+                .frame(maxWidth: 460, alignment: .leading)
+                .disabled(true)
+        }
         ForEach(Array(model.statisticLines.enumerated()), id: \.offset) { _, line in
             Text(line)
                 .font(.system(.body, design: .monospaced))
@@ -46,8 +58,11 @@ struct MenuBarView: View {
             model.openLogs()
         }
         Divider()
-        SettingsLink {
-            Text("Settings…")
+        // An accessory app is never frontmost, so a bare SettingsLink opens the
+        // window behind every other app. Activate first, as "Show Status…" does.
+        Button("Settings…") {
+            NSApp.activate(ignoringOtherApps: true)
+            openSettings()
         }
         Button("Quit") {
             NSApp.terminate(nil)

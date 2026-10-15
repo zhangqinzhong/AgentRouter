@@ -2,6 +2,10 @@
 
 use askama::Template;
 
+/// Server version shown in the footer of every page. Workspace crates share
+/// one version, so this crate's version is the running server's.
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // URL helpers
 // ---------------------------------------------------------------------------
@@ -30,6 +34,34 @@ pub(crate) fn page_href(workspace: &str, project: &str, path: &str) -> String {
         project_href(workspace, project),
         encode_path(path)
     )
+}
+
+/// Build a page-history URL (`w/{ws}/{proj}/h/{path}`), percent-encoded.
+#[must_use]
+pub(crate) fn history_href(workspace: &str, project: &str, path: &str) -> String {
+    format!(
+        "{}/h/{}",
+        project_href(workspace, project),
+        encode_path(path)
+    )
+}
+
+/// Build a session-timeline URL (`w/{ws}/{proj}/s/{id}`), percent-encoded.
+#[must_use]
+pub(crate) fn session_href(workspace: &str, project: &str, session_id: &str) -> String {
+    format!(
+        "{}/s/{}",
+        project_href(workspace, project),
+        encode_segment(session_id)
+    )
+}
+
+/// The last eight characters of a UUID, for display. The ids here are
+/// UUIDv7, whose leading characters are a shared timestamp prefix.
+#[must_use]
+pub(crate) fn short_id(id: &str) -> String {
+    let skip = id.chars().count().saturating_sub(8);
+    id.chars().skip(skip).collect()
 }
 
 fn encode_path(path: &str) -> String {
@@ -108,8 +140,21 @@ pub(crate) struct ProjectCard {
     pub page_count: u64,
     /// Humanised timestamp (e.g. "3 hours ago"), or empty string.
     pub last_updated_relative: String,
+    /// Messages from other projects waiting for an agent here; `0` hides the
+    /// badge.
+    pub pending_inbox: u64,
     /// Link target (`w/{ws}/{proj}`, relative to `<base href>`).
     pub href: String,
+}
+
+/// One project named in the home page's pending-mail summary.
+pub(crate) struct MailSummaryItem {
+    /// `workspace/project`.
+    pub label: String,
+    /// Link target (`w/{ws}/{proj}`, relative to `<base href>`).
+    pub href: String,
+    /// Pending messages waiting there.
+    pub pending: u64,
 }
 
 /// The one-time 2.0 migration explainer dialog (docs/okf.md): shown
@@ -136,6 +181,13 @@ pub(crate) struct ProjectsView {
     /// Present whenever a migration receipt exists (dialog dismissal is
     /// client-side, per browser).
     pub okf_dialog: Option<OkfDialog>,
+    /// Pending messages across the projects listed in `projects`; `0` hides
+    /// the summary strip.
+    pub mail_total: u64,
+    /// Projects the strip names, most mail first, capped.
+    pub mail_projects: Vec<MailSummaryItem>,
+    /// Projects with mail beyond the ones `mail_projects` names.
+    pub mail_hidden: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,11 +208,32 @@ pub(crate) struct PageRow {
     pub updated_relative: String,
 }
 
+/// One pending inbox message on the project page.
+pub(crate) struct MailboxRow {
+    /// Subject line, or a placeholder when the sender gave none.
+    pub subject: String,
+    /// `workspace/project` of the sender, or a neutral label when the viewer
+    /// may not read it.
+    pub sender: String,
+    /// Link to the sender's project; `None` when the viewer may not read it.
+    pub sender_href: Option<String>,
+    /// Leading characters of the body. Untrusted cross-project text: the
+    /// template escapes it and never renders it as markup.
+    pub snippet: String,
+    /// Humanised creation timestamp.
+    pub created_relative: String,
+}
+
 /// A folder in the sidebar tree (groups pages by first path segment).
 pub(crate) struct Folder {
     /// Folder name (first path segment, without trailing slash).
     pub name: String,
-    /// Pages inside this folder.
+    /// Namespace listing for the folder; `None` for the `(root)` bucket,
+    /// which has no namespace URL.
+    pub href: Option<String>,
+    /// Pages in the folder, all of them.
+    pub total: usize,
+    /// The most recently updated pages, capped; every page for `(root)`.
     pub pages: Vec<PageRow>,
 }
 
@@ -179,6 +252,31 @@ pub(crate) struct ProjectView {
     pub system: Vec<Folder>,
     /// N most-recent knowledge pages for the right column.
     pub recent: Vec<PageRow>,
+    /// Pending inbox messages, oldest first, capped at the route's limit.
+    pub mailbox: Vec<MailboxRow>,
+    /// All pending messages for the project; exceeds `mailbox.len()` when the
+    /// list is capped.
+    pub mailbox_total: u64,
+    /// `mailbox` lists fewer messages than are pending.
+    pub mailbox_capped: bool,
+    /// The project's most recent sessions the viewer may see.
+    pub sessions: Vec<SessionRow>,
+}
+
+/// One recent session on the project page.
+pub(crate) struct SessionRow {
+    /// Link to the session timeline.
+    pub href: String,
+    /// Agent kind as stored (`claude-code`, `codex`, …).
+    pub agent_kind: String,
+    /// Last eight characters of the session id.
+    pub short_id: String,
+    /// Observations this session left in the project.
+    pub observation_count: u64,
+    /// Humanised start timestamp.
+    pub started_relative: String,
+    /// The session has not ended.
+    pub open: bool,
 }
 
 /// View-model for a namespace (directory) listing — `GET
@@ -195,13 +293,52 @@ pub(crate) struct NamespaceView {
     pub project_href: String,
     /// The namespace path (no trailing slash), e.g. `_lint` or `concepts`.
     pub namespace: String,
-    /// Pages under this namespace.
+    /// The current page of pages under this namespace.
     pub pages: Vec<PageRow>,
+    /// Pages in the whole namespace.
+    pub total: usize,
+    /// 1-based position of the first listed page.
+    pub first: usize,
+    /// 1-based position of the last listed page.
+    pub last: usize,
+    /// Sorting by title instead of recency.
+    pub sort_title: bool,
+    /// Namespace listing sorted by recency.
+    pub sort_updated_href: String,
+    /// Namespace listing sorted by title.
+    pub sort_title_href: String,
+    /// Link to the previous page of results, if any.
+    pub prev_href: Option<String>,
+    /// Link to the next page of results, if any.
+    pub next_href: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // page.html
 // ---------------------------------------------------------------------------
+
+/// How many backlinks or outgoing links the page sidebar lists per group.
+pub(crate) const RELATED_LIMIT: usize = 10;
+
+/// One entry of a page's "On this page" outline.
+pub(crate) struct OutlineItem {
+    /// Link to the heading, anchored on the page's own URL.
+    pub href: String,
+    /// Heading text.
+    pub text: String,
+    /// Whether the heading is an h3 (indented under its h2).
+    pub nested: bool,
+}
+
+/// One row of a page's "Cited by" or "Cites" group.
+pub(crate) struct RelatedRow {
+    /// Link to the related page.
+    pub href: String,
+    /// Title of the related page.
+    pub title: String,
+    /// `workspace/project` when the page lives in another project, else empty.
+    pub scope_hint: String,
+}
 
 /// View-model for `GET /w/:workspace/:project/p/*path`.
 #[derive(Template)]
@@ -233,6 +370,18 @@ pub(crate) struct PageView {
     pub supersedes_href: String,
     /// Rendered markdown body (HTML, trusted).
     pub body_html: String,
+    /// Link to this page's version history.
+    pub history_href: String,
+    /// h2/h3 headings of the body, empty with fewer than two.
+    pub outline: Vec<OutlineItem>,
+    /// Pages that link to this one, at most [`RELATED_LIMIT`].
+    pub cited_by: Vec<RelatedRow>,
+    /// Backlinks beyond [`RELATED_LIMIT`].
+    pub cited_by_more: usize,
+    /// Pages this one links to, at most [`RELATED_LIMIT`].
+    pub cites: Vec<RelatedRow>,
+    /// Outgoing links beyond [`RELATED_LIMIT`].
+    pub cites_more: usize,
     /// Username of the page's last author. Empty string when the page
     /// was authored anonymously / by root / pre-multi-user — the
     /// template uses the empty check to omit the "Last edited by"
@@ -248,10 +397,175 @@ pub(crate) struct PageView {
 }
 
 // ---------------------------------------------------------------------------
+// history.html
+// ---------------------------------------------------------------------------
+
+/// One stored version in the history list.
+pub(crate) struct HistoryVersionRow {
+    /// Full version id, submitted by the compare form.
+    pub id: String,
+    /// Last eight characters of the id.
+    pub short_id: String,
+    /// Short id of the version this one replaced, or empty.
+    pub supersedes_short: String,
+    /// The live version of the path.
+    pub is_latest: bool,
+    /// Title stored on this version.
+    pub title: String,
+    /// ISO-8601 write instant.
+    pub created_at: String,
+    /// Humanised write instant.
+    pub created_relative: String,
+    /// Username of an attributed write, or empty.
+    pub author: String,
+    /// Body length in characters.
+    pub body_chars: u64,
+    /// Selected as the older side of the diff.
+    pub is_from: bool,
+    /// Selected as the newer side of the diff.
+    pub is_to: bool,
+    /// Link diffing this version against the one it replaced, or empty.
+    pub compare_href: String,
+}
+
+/// One diff line; `text` is untrusted page content and is escaped.
+pub(crate) struct HistoryDiffLine {
+    /// `+`, `-` or a space.
+    pub sign: String,
+    /// The line itself.
+    pub text: String,
+}
+
+/// One diff hunk.
+pub(crate) struct HistoryHunk {
+    /// `@@ -a,b +c,d @@`.
+    pub header: String,
+    /// The hunk's lines.
+    pub lines: Vec<HistoryDiffLine>,
+}
+
+/// View-model for `GET /w/:workspace/:project/h/*path`.
+#[derive(Template)]
+#[template(path = "history.html")]
+pub(crate) struct HistoryView {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Link to the project.
+    pub project_href: String,
+    /// Link to the live page.
+    pub page_href: String,
+    /// This route, without a query string (the compare form's action).
+    pub history_href: String,
+    /// Wiki path.
+    pub path: String,
+    /// Every version stored at the path.
+    pub total: u64,
+    /// 1-based position of the first listed version (0 when none).
+    pub shown_start: usize,
+    /// 1-based position of the last listed version.
+    pub shown_end: usize,
+    /// Versions per listing page.
+    pub limit: usize,
+    /// Link to newer versions, or empty.
+    pub newer_href: String,
+    /// Link to older versions, or empty.
+    pub older_href: String,
+    /// The listed versions, newest first.
+    pub versions: Vec<HistoryVersionRow>,
+    /// Short id of the older side, or empty when the diff starts from nothing.
+    pub from_short: String,
+    /// Write instant of the older side, or empty.
+    pub from_created: String,
+    /// Title of the older side, or empty.
+    pub from_title: String,
+    /// Short id of the newer side.
+    pub to_short: String,
+    /// Write instant of the newer side.
+    pub to_created: String,
+    /// Title of the newer side.
+    pub to_title: String,
+    /// The two bodies are identical.
+    pub same: bool,
+    /// Why the diff was refused, or empty.
+    pub too_large: String,
+    /// The output line cap cut the diff short.
+    pub truncated: bool,
+    /// Diff hunks.
+    pub hunks: Vec<HistoryHunk>,
+}
+
+// ---------------------------------------------------------------------------
+// session.html
+// ---------------------------------------------------------------------------
+
+/// One observation on the session timeline; every text field is untrusted
+/// captured text and is escaped by the template.
+pub(crate) struct SessionObservationRow {
+    /// 1-based position in capture order within this project.
+    pub position: usize,
+    /// Observation kind.
+    pub kind: String,
+    /// Observation title.
+    pub title: String,
+    /// Body, capped like the API's default `body_max_chars`.
+    pub body: String,
+    /// ISO-8601 capture instant.
+    pub created_at: String,
+    /// Humanised capture instant.
+    pub created_relative: String,
+}
+
+/// View-model for `GET /w/:workspace/:project/s/:session_id`.
+#[derive(Template)]
+#[template(path = "session.html")]
+pub(crate) struct SessionView {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Link to the project.
+    pub project_href: String,
+    /// This route, without a query string (the jump form's action).
+    pub session_href: String,
+    /// Session id.
+    pub session_id: String,
+    /// Agent kind as stored.
+    pub agent_kind: String,
+    /// ISO-8601 start.
+    pub started_at: String,
+    /// ISO-8601 end, or empty while open.
+    pub ended_at: String,
+    /// Observations in this project.
+    pub total: u64,
+    /// Observations per page.
+    pub limit: usize,
+    /// 1-based position of the first shown observation (0 when none).
+    pub shown_start: usize,
+    /// 1-based position of the last shown observation.
+    pub shown_end: usize,
+    /// Rows the session left in other projects (not shown here).
+    pub elided_other_scope: u64,
+    /// Link to the first page, or empty on it.
+    pub first_href: String,
+    /// Link to the previous page, or empty.
+    pub prev_href: String,
+    /// Link to the next page, or empty.
+    pub next_href: String,
+    /// Link to the last page, or empty on it.
+    pub last_href: String,
+    /// Prefilled value of the jump field.
+    pub jump_value: usize,
+    /// This page's observations.
+    pub observations: Vec<SessionObservationRow>,
+}
+
+// ---------------------------------------------------------------------------
 // search.html
 // ---------------------------------------------------------------------------
 
-/// One FTS5 search hit.
+/// One search hit.
 pub(crate) struct SearchHit {
     /// Workspace name.
     pub workspace: String,
@@ -265,6 +579,69 @@ pub(crate) struct SearchHit {
     pub title: String,
     /// FTS5 snippet (HTML-marked with `<mark>` tags).
     pub snippet: String,
+    /// How the ranker placed this hit; set on an explained project search.
+    pub trace: Option<HitTrace>,
+}
+
+/// One hit's recall trace: what each stream saw and how the fused score
+/// became the final order. Every number is pre-formatted for display.
+pub(crate) struct HitTrace {
+    /// 1-based position in the result list.
+    pub position: usize,
+    /// The returned rank (lower is better).
+    pub rank: String,
+    /// Sum of the RRF contributions.
+    pub fused: String,
+    /// The bounded authority multiplier, or `—` when the page had none.
+    pub authority: String,
+    /// The query-intent boost, when routing applied one.
+    pub intent_boost: Option<String>,
+    /// Reranker relevance, when the reranker judged this hit.
+    pub rerank_score: Option<String>,
+    /// One row per stream that ran.
+    pub streams: Vec<StreamTraceRow>,
+    /// Entity names that matched the query, comma-separated.
+    pub matched_entities: String,
+    /// `seed path (direction[, edge])` when the graph stream pulled it in.
+    pub graph_via: Option<String>,
+}
+
+/// One stream's view of one hit.
+pub(crate) struct StreamTraceRow {
+    /// Stream name as `streams_active` reports it.
+    pub stream: &'static str,
+    /// 1-based rank in that stream, or `—` when the hit missed it.
+    pub rank: String,
+    /// The stream's raw score (bm25, cosine, entity weight), or `—`.
+    pub raw: String,
+    /// The stream's RRF contribution.
+    pub rrf: String,
+}
+
+/// One stream's wall time on an explained search.
+pub(crate) struct TimingRow {
+    /// `fts`, `entity`, `vector`, `graph`, `observation` or `rerank`.
+    pub stream: &'static str,
+    /// Milliseconds, formatted.
+    pub ms: String,
+}
+
+/// One project in the search page's "Search in" selector.
+pub(crate) struct ScopeOption {
+    /// `workspace/project`, the value the selector submits.
+    pub value: String,
+    /// Project name shown under its workspace's group.
+    pub label: String,
+    /// The current search is scoped to this project.
+    pub selected: bool,
+}
+
+/// The projects of one workspace in the "Search in" selector.
+pub(crate) struct ScopeGroup {
+    /// Workspace name, the group label.
+    pub workspace: String,
+    /// Readable projects of the workspace.
+    pub projects: Vec<ScopeOption>,
 }
 
 /// View-model for `GET /search?q=…`.
@@ -273,10 +650,41 @@ pub(crate) struct SearchHit {
 pub(crate) struct SearchView {
     /// The raw query string.
     pub query: String,
-    /// FTS5 search hits.
+    /// Search hits, best first.
     pub hits: Vec<SearchHit>,
     /// Pre-computed hit count for display (avoids needing `|length` filter).
     pub hit_count: usize,
+    /// Workspace of a project search; empty for a cross-project search.
+    pub workspace: String,
+    /// Project of a project search; empty for a cross-project search.
+    pub project: String,
+    /// The viewer asked for the recall trace.
+    pub explain: bool,
+    /// Streams that ran, comma-separated (explain only).
+    pub streams_active: String,
+    /// Per-stream wall time (explain only).
+    pub timings: Vec<TimingRow>,
+    /// `provider / model (dim N)` of the embedder, or `none`.
+    pub embedder: String,
+    /// `name / model` of the reranker, or `none`.
+    pub reranker: String,
+    /// More matches existed than `max_results`; the list is cut.
+    pub truncated: bool,
+    /// Most rows the page renders.
+    pub max_results: usize,
+    /// The same query across every project.
+    pub global_href: String,
+    /// Projects the viewer may read, grouped by workspace.
+    pub scope_groups: Vec<ScopeGroup>,
+    /// Link to the scoped project, for the breadcrumb.
+    pub project_href: String,
+}
+
+impl SearchView {
+    /// A project search (hybrid ranker) rather than a cross-project one.
+    pub(crate) fn scoped(&self) -> bool {
+        !self.workspace.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +757,50 @@ pub(crate) struct PendingView {
     pub limit: usize,
 }
 
+// ---------------------------------------------------------------------------
+// health.html
+// ---------------------------------------------------------------------------
+
+/// One failed health check.
+pub(crate) struct HealthCheckRow {
+    /// Stable check id.
+    pub id: &'static str,
+    /// `warn` or `error`.
+    pub status: &'static str,
+    /// What is wrong.
+    pub detail: String,
+    /// The exact command that fixes it, when there is one.
+    pub fix: Option<String>,
+}
+
+/// One label/value line on the health page.
+pub(crate) struct HealthRow {
+    /// Label.
+    pub label: &'static str,
+    /// Value.
+    pub value: String,
+}
+
+/// A titled group of health rows.
+pub(crate) struct HealthSection {
+    /// Section heading.
+    pub title: &'static str,
+    /// Its rows.
+    pub rows: Vec<HealthRow>,
+}
+
+/// View-model for the root-only `GET /health`.
+#[derive(Template)]
+#[template(path = "health.html")]
+pub(crate) struct HealthView {
+    /// The host wired the process-side sources (hook counters, spool…).
+    pub wired: bool,
+    /// Failed checks, most severe first.
+    pub checks: Vec<HealthCheckRow>,
+    /// Counter groups.
+    pub sections: Vec<HealthSection>,
+}
+
 /// View-model for a non-root session that opens a root-only page.
 #[derive(Template)]
 #[template(path = "admin_required.html")]
@@ -387,6 +839,32 @@ pub(crate) struct ChangePasswordView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_auth_pages_do_not_show_the_server_version() {
+        let version = format!("v{VERSION}");
+        let login = LoginView {
+            next: "/web/".into(),
+            change_password_href: "/web/change-password".into(),
+        }
+        .render()
+        .unwrap();
+        let change = ChangePasswordView {
+            next: "/web/".into(),
+        }
+        .render()
+        .unwrap();
+        let signed_in = NotFoundView {}.render().unwrap();
+        assert!(!login.contains(&version), "login page leaks {version}");
+        assert!(
+            !change.contains(&version),
+            "change-password page leaks {version}"
+        );
+        assert!(
+            signed_in.contains(&version),
+            "signed-in pages show {version}"
+        );
+    }
 
     #[test]
     fn href_helpers_percent_encode_segments() {

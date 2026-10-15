@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -158,6 +159,36 @@ test("MiMo JSONC installation preserves settings and comments and restores exact
     await assert.rejects(clients.change("xiaomi-mimo", "mcp", "install"), /JSONC/);
     writeFileSync(file, '{invalid');
     await assert.rejects(clients.change("xiaomi-mimo", "mcp", "install"), /JSONC/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("OpenCode stays on the version 1 plugin selector and OpenCode 2 does not probe", async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "ar-memory-opencode-select-"));
+  const data = path.join(home, "data");
+  const calls = [];
+  const clients = new MemoryClients(home, data, "http://127.0.0.1:49374", async (args, env) => {
+    calls.push({ args, env });
+    return "preview";
+  }, { PATH: "/usr/bin:/bin" });
+  try {
+    await clients.change("opencode", "hooks", "preview");
+    await clients.change("opencode", "mcp", "preview");
+    const selector = path.join(data, "client-shims", "opencode-v1");
+    for (const call of calls) {
+      assert.equal(call.env.PATH.split(path.delimiter)[0], selector);
+      assert.ok(call.env.PATH.includes(`${path.delimiter}/usr/bin`));
+      assert.equal(call.args.includes("opencode2"), false);
+    }
+    assert.deepEqual(calls[0].args.slice(0, 3), ["install-hooks", "--agent", "opencode"]);
+    assert.deepEqual(calls[1].args.slice(0, 3), ["install-mcp", "--client", "open-code"]);
+    const reporter = path.join(selector, process.platform === "win32" ? "opencode.cmd" : "opencode");
+    const version = spawnSync(reporter, ["--version"], { encoding: "utf8" });
+    assert.equal(version.status, 0);
+    assert.equal(version.stdout.trim(), "1.0.0");
+    calls.length = 0;
+    await clients.change("opencode2", "hooks", "preview");
+    assert.equal(calls[0].env, undefined);
+    assert.deepEqual(calls[0].args.slice(0, 3), ["install-hooks", "--agent", "opencode2"]);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 

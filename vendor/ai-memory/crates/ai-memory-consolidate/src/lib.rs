@@ -21,9 +21,12 @@ pub mod embed;
 pub mod entropy_filter;
 pub mod experience;
 pub mod keep_tokens;
+mod link_guard;
 pub mod lint;
 mod path_sanitize;
+pub mod profile;
 pub mod projection;
+mod prompt_template;
 pub mod sweep;
 pub mod types;
 
@@ -40,7 +43,7 @@ pub use auto_improve::{
     DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS, DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS,
     DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES, DEFAULT_AUTO_IMPROVE_PENDING_PATH,
     DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR, DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS,
-    default_auto_improve_eval_targets, run_auto_improve_review,
+    default_auto_improve_eval_targets, redacted_auto_improve_summary, run_auto_improve_review,
 };
 pub use auto_improve_schedule::{
     ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,
@@ -56,7 +59,7 @@ pub use bootstrap::{
     Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource,
     DEFAULT_CHUNK_INPUT_TOKENS, ProjectNameStrategy, SourceCounts, SourceKind, collect_sources,
     derive_project_name, discover_main_repo_root, discover_repo_root, effective_chunk_budget,
-    plan_bootstrap_chunks, prune_sources_to_budget, read_identity_remotes,
+    path_is_git_ignored, plan_bootstrap_chunks, prune_sources_to_budget, read_identity_remotes,
 };
 pub use cold_cluster::{adaptive_eps, cosine_distance, dbscan};
 pub use compaction::build_compacted_markdown;
@@ -64,7 +67,8 @@ pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
     DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN, DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
     DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS, MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
-    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request,
+    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request, disambiguate_colliding_session_title,
+    effective_input_chars, existing_session_page_titles, redacted_error_summary,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,

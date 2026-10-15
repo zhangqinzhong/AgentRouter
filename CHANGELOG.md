@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.10.2 - 2026-10-15
+
+### Features
+- Bundle ai-memory 3.0.0. An already running memory service stays on its current build until AgentRouter starts this version. Back up the memory directory before that restart.
+- Show a memory client preview as the current file plus the configuration that would be added, and allow that preview to be collapsed.
+- Price GPT-6.1 Sol, Cursor Composer 2.5, Gemini 4 Argon, and Grok 4.6/4.7, including Fast variants and the GPT-6.1 Sol long-context premium.
+
+### Fixes
+- Re-read Codex rollout files from the last 30 days when they grew past the saved offset.
+- Bill Antigravity turns from recorded usage when it is present, and keep the text estimate when it is not.
+- Ignore new CodeBuddy progress, usage, and metadata records so they are not added on top of message tokens.
+- Re-read session databases on refresh when the file timestamp did not change. Copilot, Cursor, and Hermes databases that exist but cannot be read keep their indexed sessions.
+- Start the Agent and project lists collapsed.
+- Connect the OpenCode memory client to the version 1 plugin. OpenCode 2 keeps its own plugin.
+
 ## 1.10.1 - 2026-10-14
 
 ### Fixes

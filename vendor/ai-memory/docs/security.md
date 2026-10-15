@@ -1,10 +1,26 @@
 # Security
 
-> The full security model. Moved verbatim from the README front page; the README keeps a summary.
+> The full security model. Moved from the README front page; the README keeps a summary.
 
-Loopback-only (`127.0.0.1:49374`) with no auth is the default because
-it is safe for a single-user laptop: no process outside the machine can
-reach the server.
+A new install requires a bearer token. `ai-memory init` on a fresh data
+dir writes a random root bearer to `<data_dir>/auth-tokens/default` (owner
+only) and records `[auth].bearer_token_file`; the server then refuses every
+route except `/healthz` without it. The hooks, the CLI and the
+`ai-memory mcp-bridge` stdio bridge read it from the data dir, so the token is
+never pasted into a harness config or passed on a command line. Claude Code
+and Meta Muse Code run the session-aware bridge, Codex, Prime Agent and Factory Droid reference
+the token as `$AI_MEMORY_AUTH_TOKEN`, and every other MCP client `install-mcp` supports
+runs `ai-memory mcp-bridge --no-session-id` as a local stdio server. ZCode,
+which takes only HTTP entries, is the exception and needs a manual entry.
+
+An install created before this default keeps its loopback-only
+(`127.0.0.1:49374`), no-auth behaviour. That stays safe from the network, but
+every local process and browser page can reach the server. `ai-memory status`
+and `ai-memory doctor` show `auth: none (loopback)` with the fix,
+`ai-memory auth enable`, which mints the token, records it in config, gives
+the hooks the token and re-registers every MCP client that points at this
+server. Restart
+the server afterwards.
 
 Unauthenticated non-loopback HTTP now fails closed. Set
 `AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
@@ -55,10 +71,65 @@ HTTPS-only. Close or redirect direct HTTP access to that hostname.
 Non-loopback binds should also set `AI_MEMORY_ALLOWED_HOSTS` to guard against
 DNS rebinding.
 
+With no token (the loopback default), a web page open in your browser can
+still address `127.0.0.1:49374`. The server refuses those requests on the
+machine and admin routes: a request the browser marks as cross-site
+(`Sec-Fetch-Site`), or one whose `Origin` is not the server's own host, gets a
+403. So does any browser request that is not a script `fetch()` call
+(`Sec-Fetch-Dest` other than `empty`): a link, image or navigation is refused
+even when it comes from the server's own pages or from another application.
+Hooks, the CLI and MCP clients never send those headers, and the web UI's own
+admin calls use `fetch()`.
+
+Browsers send that fetch metadata over plain HTTP only to `localhost`,
+`*.localhost`, `127.0.0.0/8` and `[::1]`. When an unauthenticated server is
+reached through any other name in the `Host` allowlist (a LAN address or name
+with `--allow-insecure-no-auth`, or `host.docker.internal` in the Docker
+image's default list), an image request carries neither fetch metadata nor
+`Origin`. There the session-start handoff fetch, the only state-changing `GET`,
+must also carry the `X-AI-Memory-Client` header that every ai-memory hook,
+CLI command and generated integration sends; a web page cannot add it without
+a CORS preflight, which these routes never answer. Hooks staged before this
+header existed get a 403 on such a server until you re-run
+`ai-memory install-hooks` (or `ai-memory upgrade`); on a loopback host they
+keep working unchanged. A request that carries a proxy's forwarding header
+(`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`,
+`X-Forwarded-Server`, `X-Forwarded-Port`, `X-Original-Forwarded-For`,
+`X-Real-IP`, `X-Client-IP`, `CF-Connecting-IP`, `True-Client-IP` or `Via`)
+counts as non-loopback here even when its `Host` is a loopback address,
+because a plain-HTTP reverse proxy may rewrite `Host` to the address it
+forwards to while the browser behind it saw a non-loopback origin. ai-memory's
+own clients connect directly and send none of these headers. The server cannot
+see a proxy that says nothing, though: nginx's default `proxy_pass` rewrites
+`Host` to the upstream address and adds no `Forwarded`, `X-Forwarded-*` or
+`Via` header, so its requests look like a local client's. A plain-HTTP proxy in
+front of an unauthenticated server must therefore add `X-Forwarded-For`
+(`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) or keep the
+browser's host (`proxy_set_header Host $host;`, which also needs that name in
+the `Host` allowlist). Better still, terminate TLS at the proxy or set a bearer
+token. A browser that sends no fetch metadata even to loopback
+(Safari before 16.4) only gets the `Origin` check there, which an image or link
+does not trigger; set a bearer token if you use one. The `Host`
+allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the
+content types a browser can send without a CORS preflight. The public sign-in
+routes (`POST /auth/login`, `POST /auth/recovery`) accept only
+`application/json` bodies too, so a page on another site cannot sign your
+browser in or try passwords. Images in wiki pages
+rendered by the web UI may only use relative paths that stay inside the UI, so
+viewing a stored page cannot make your browser call those routes either.
+
 Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per
 second per actor/session source) and optionally `AI_MEMORY_HOOK_RATE_BURST` to
 bound one runaway session without blocking unrelated hook sources. Unset or `0`
 rate leaves the limiter disabled.
+
+To stop the server from storing particular tool calls whatever the client
+sends, list them in `[ingest]`: `drop_tool_use_id_prefixes` (for example
+`["toolu_plugin_"]`, the id prefix Claude Code gives plugin tool calls) and
+`drop_tool_names` (exact names). The id and name are read from each
+harness's own fields, such as OpenCode's `callID`. A matching PreToolUse or
+PostToolUse event is acknowledged and discarded before it is sanitized,
+rate-limited or stored. The lists apply to every project on the server.
 
 For shared servers where each developer should authenticate their own hook
 writes, native Claude Code hooks can use a stored OIDC device token instead of
@@ -88,24 +159,23 @@ sessions. Shared servers that rely on `[auto_scope]` session isolation still
 need explicit `workspace` + `project` / `scopes`, or a bridge that forwards the
 real lifecycle-hook session id on MCP requests.
 
-**Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
-the right answer is a battle-tested reverse proxy in front of it.
+**HTTPS.** ai-memory deliberately does not terminate TLS itself; put a
+well-tested reverse proxy in front of it.
 [`docs/https-via-proxy.md`](https-via-proxy.md) is the deployment
 guide, with copy-paste docker compose templates in
 [`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) (Caddy
 with Let's Encrypt or internal CA) and
 [`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml)
-(Cloudflare Tunnel — no open ports). Both are recommended once you
-turn on multi-user or bind beyond loopback. The Quick Start happy
-path of single-user on loopback doesn't need TLS — that case is
-called out explicitly in the guide so you don't add ceremony where
-it doesn't earn its keep.
+(Cloudflare Tunnel, no open ports). Both are recommended once you
+turn on multi-user or bind beyond loopback. The Quick Start default
+of single-user on loopback doesn't need TLS; the guide says so
+explicitly so you don't add setup you don't need.
 
 **Multi-user attribution (v0.8, optional) plus human login.** When more
 than one human shares a server, ai-memory attributes each write to a
 named user. Humans sign in with username/password; agents and CLIs use
 `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN` for root automation, or
-an `aim_` key from `ai-memory api-key add`). Data stays single-tenant —
+an `aim_` key from `ai-memory api-key add`). Data stays single-tenant:
 there is no per-page RBAC. A
 `[auth].token_pepper` is required for DB-user authentication, but creating the
 first user row is what immediately switches every `/admin/*` endpoint to

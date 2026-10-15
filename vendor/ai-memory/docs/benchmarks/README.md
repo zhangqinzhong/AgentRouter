@@ -2,7 +2,7 @@
 
 Published retrieval-quality numbers for ai-memory, with full provenance
 (commit, dataset sha256, hardware, mode). Every number here was produced
-by the in-repo harness — see `evals/README.md` for how to reproduce:
+by the in-repo harness. `evals/README.md` explains how to reproduce them:
 
 ```bash
 cargo build --release -p ai-memory-cli
@@ -13,38 +13,67 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
-| **2026-09-21** | LongMemEval-S (v1) | **local embeddings (2.4 RC, current)** | **0.815** | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
+| **2026-10-13** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.0.0 release; on by default)** | **0.951** | [longmemeval-s-3.0.0-release.md](longmemeval-s-3.0.0-release.md) |
+| **2026-10-13** | LongMemEval-S (v1) | **local embeddings + observation stream (3.0.0 release; on by default)** | **0.945** | [longmemeval-s-3.0.0-release.md](longmemeval-s-3.0.0-release.md) |
+| 2026-09-21 | LongMemEval-S (v1) | local embeddings (2.4 RC, current release) | 0.815 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-21 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (2.4 RC) | 0.666 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
 
-The **2026-09-21 (2.4 RC)** re-run confirms no default-ranking regression: local
+The 2026-10-13 rows are the 3.0.0 release benchmark: all 470 questions on the
+release-candidate code, comparing the stream off and on with the same build
+([release report](longmemeval-s-3.0.0-release.md)). Zero-LLM FTS `hit@5` went
+0.662 → 0.951 (hit@1 0.511 → 0.857, hit@10 0.687 → 0.972; 139 questions
+gained, 3 lost) and local embeddings 0.800 → 0.945 (hit@1 0.543 → 0.766; 72
+gained, 4 lost). Context tokens for the top five hits rose 3.8% (FTS) and
+17.0% (local). Against the last published release numbers (2.4/2.6: 0.666 FTS,
+0.815 local), that is +0.285 and +0.130, and every slice improved. The
+stream-off local baseline (0.800 against 0.815) is tracked in
+[#1263](https://github.com/akitaonrails/ai-memory/issues/1263). These numbers come from
+the harness corrected on 2026-10-13, which replays each question's sessions
+under their own session ids; the first published stream figures (0.666 →
+0.868) came from a harness that reused them across questions and left a few
+sessions without a page. Details and commands are in the
+decomposition report below.
+
+The 2026-09-21 (2.4 RC) re-run shows no default-ranking regression: local
 `hit@5` 0.823 → 0.815 and FTS `hit@5` 0.668 → 0.666 are identical within
-run-to-run noise (2.4's aging/retrieval features are opt-in / off by default, so
-default retrieval is unchanged). Full triple + provenance in
+run-to-run noise. 2.4's aging/retrieval features are opt-in and off by default,
+so default retrieval is unchanged. The full triple and provenance are in
 [retrieval-ab-r2.md](retrieval-ab-r2.md).
 
-The 2.0 retrieval work moved overall hit@5 from **0.617 → 0.823**
+The 2.0 retrieval work moved overall hit@5 from 0.617 → 0.823
 (+20.6 points; hit@1 0.449 → 0.536, recall@5 0.472 → 0.680) in two
 measured steps: dropping stopwords from bare-query FTS OR-joins
 (+5.1 hit@5, +8.5 hit@1), then the in-process local embedder with
-correct masked-mean pooling — the pooling fix alone was worth ~6.6
-points over a padded-attention implementation, caught by the
-calibration tests. Every intermediate number was measured on this
-harness before the next change landed. For context, published
-embedding-based numbers on this dataset: agentmemory 0.967 R@5
-(hybrid + reranking), doobidoo/mcp-memory-service 0.804 R@5.
+correct masked-mean pooling. The pooling fix alone was worth ~6.6
+points over a padded-attention implementation, which the
+calibration tests caught. Every intermediate number was measured on this
+harness before the next change landed.
+
+## Decomposition: pipeline vs component
+
+[longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md)
+splits the pipeline number into capture cost, ranking quality and harness
+artifacts. With each raw session indexed whole (component mode, ranking
+only), zero-LLM FTS scores 0.972 `hit@5` on all 470 questions, against 0.662
+through the shipped capture path. The gap was not the 2 KB excerpt cap: pages
+holding exactly the text capture keeps score 0.968. It was the zero-LLM
+session page, which indexed only 80-character turn titles and no assistant
+text. The harness's per-turn date prefix used about half of each title, which
+is an artifact of the harness, not of production capture. The observation
+stream recovered nearly all of that FTS gap (0.662 → 0.951).
 
 ## A/B comparisons (R2)
 
 The harness can also A/B two configs over the same question set and report
-an **accuracy + latency + context-tokens** triple with a baseline→candidate
-delta — see [retrieval-ab-r2.md](retrieval-ab-r2.md). The full-dataset A/B
-(FTS baseline → local candidate, 470 scored) is published there as of the
-**2026-09-21 (2.4 RC)** run: local embeddings add **+0.149 hit@5 / +0.254
-recall@10** over zero-LLM FTS for ~90 ms p50 latency, with a clean
-baseline-vs-baseline determinism check (all accuracy/token deltas `0.000`).
+an accuracy + latency + context-tokens triple with a baseline→candidate
+delta (see [retrieval-ab-r2.md](retrieval-ab-r2.md)). That file publishes the
+full-dataset A/B (FTS baseline → local candidate, 470 scored) from the
+2026-09-21 (2.4 RC) run: local embeddings add +0.149 hit@5 / +0.254
+recall@10 over zero-LLM FTS for ~90 ms p50 latency, and the
+baseline-vs-baseline determinism check is clean (all accuracy/token deltas `0.000`).
 
 ## Reading the numbers
 
@@ -53,14 +82,24 @@ baseline-vs-baseline determinism check (all accuracy/token deltas `0.000`).
   graph. **mode: zero-llm** is the deterministic floor (`embedding_provider
   = "none"`, or any host where the model cannot load): FTS5 +
   entity/graph only.
-- **Comparability.** Published numbers from other systems on this dataset
-  (agentmemory 0.967 R@5, doobidoo/mcp-memory-service 0.804 R@5) are
-  embedding-based retrieval over raw chat logs. Our `hit@5` is the
-  comparable statistic, but our pipeline additionally pays for
-  production-shaped capture: excerpts are bounded at the 2 KB privacy
-  boundary, so evidence deep inside one long turn is genuinely out of
-  reach of the index. That cost is real and deliberate — the benchmark
-  measures the shipped system, not an idealised retriever.
+- **Comparability.** Our `hit@5` is the statistic other systems publish as
+  R@5 (any evidence session in the top 5). doobidoo/mcp-memory-service
+  publishes 0.804 R@5. agentmemory publishes 95.2% `recall_any@5` (April
+  2026), measured by indexing each whole raw session directly (BM25 plus
+  vectors, reranker disabled), which is a component measurement. Our
+  pipeline numbers also pay for capture, so they are not like-for-like with
+  a component number, and even our component numbers use a
+  different index and document construction. Our grep engine reproduces
+  agentmemory's grep adapter on all 470 questions, so the question set and
+  metric match, but no ranking between the two systems is claimed. The decomposition report has the
+  details. agentmemory's 2026-10-09 baseline adds 84.68% strict
+  recall-all@5 and 452/470 any-hit, which its authors say supports no
+  competitive claim. MemPalace publishes 96.6% R@5 raw and 98.4% on 450
+  held-out questions, also retrieval-only and from a different harness.
+  Mem0, Zep, Hindsight and EverOS publish end-to-end QA accuracy, where an
+  LLM answers from retrieved context and an LLM judges the answer; those are
+  a different metric from `hit@5`. [comparison.md](../comparison.md) lists
+  each setup.
 - **Regression gate.** Roadmap items 2-6 re-run this benchmark; a change
   that lowers a slice materially is a regression to fix, not a note to
   publish.

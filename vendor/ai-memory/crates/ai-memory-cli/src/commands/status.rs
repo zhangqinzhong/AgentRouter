@@ -4,6 +4,7 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+use ai_memory_core::fix_lines;
 use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,23 @@ use crate::http_client::{ServerEndpoint, get_json};
 #[derive(Debug, Deserialize, Serialize)]
 struct IngestReport {
     accepted: u64,
+    #[serde(default)]
+    dropped_unauthorized: u64,
+    #[serde(default)]
+    stored: u64,
+    #[serde(default)]
+    replayed: u64,
+    #[serde(default)]
+    resumed: u64,
+    #[serde(default)]
+    ignored_end: u64,
+    #[serde(default)]
+    dropped_collision: u64,
+    #[serde(default)]
+    dropped_invalid: u64,
+    #[serde(default)]
+    failed: u64,
+
     dropped_by_policy: u64,
     shed_saturated: u64,
     shed_rate_limited: u64,
@@ -98,15 +116,6 @@ struct Derived {
     stale_links_from_latest_pages: u64,
 }
 
-/// Suggest compaction only above this share of the file. Below it the
-/// exclusive lock costs more than the space is worth, and SQLite will reuse
-/// those pages on its own as the store grows.
-const RECLAIM_ADVICE_PCT: f64 = 20.0;
-
-/// …and only when the absolute figure is worth a stall. 20% of a 4 MiB
-/// database is not a reason to block every write.
-const RECLAIM_ADVICE_MIN_BYTES: u64 = 64 * 1024 * 1024;
-
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Storage {
     page_size: u64,
@@ -162,13 +171,43 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     eprintln!("  pending:    {}", spool.pending);
     eprintln!("  oldest:     {}", spool_age_line(spool.oldest_age_ms));
     eprintln!("  retries:    {}", spool.retries_total);
-    if spool.pending > 0 {
+    if spool.evicting() {
+        eprintln!(
+            "  The spool is full ({} events): each new event evicts the oldest \
+             undelivered one, which is lost. Bring the server back to stop the loss.",
+            spool.capacity
+        );
+    } else if spool.pending > 0 {
         eprintln!(
             "  {} event(s) are queued locally and will be delivered once the \
              server is reachable again.",
             spool.pending
         );
     }
+}
+
+/// One line pointing at `ai-memory recover` while the server is down, when
+/// there is actually something waiting: queued hook events or journaled
+/// outage runs. Goes to stderr like the spool block above, so `--json`
+/// consumers' stdout stays a single object.
+fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool) {
+    let (journal_pending, _, _, journal_error) = super::recovery::journal_summary(&config.data_dir);
+    if spool.pending == 0 && journal_pending == 0 && journal_error.is_none() {
+        return;
+    }
+    if json {
+        eprintln!(
+            "recovery hint (server unreachable): {{\"journal_pending\": {journal_pending},\
+             \"spool_pending\": {}}}",
+            spool.pending
+        );
+        return;
+    }
+    eprintln!(
+        "  run `{}` once the server is back to deliver queued events and \
+         repair unrecorded runs ({journal_pending} journaled)",
+        fix_lines::RECOVER
+    );
 }
 
 /// Which capture mode the hook would enforce for this install (#446).
@@ -204,32 +243,30 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         Ok(report) => report,
         Err(err) => {
             report_offline_spool(&spool, args.json);
+            report_offline_recovery_hint(config, &spool, args.json);
             return Err(err);
         }
     };
+    let (journal_pending, journal_degraded, journal_finish_failed, journal_error) =
+        super::recovery::journal_summary(&config.data_dir);
+    // `/admin/status` answered. Without a credential that can only mean the
+    // server does not require one.
+    let auth_posture = crate::local_auth::AuthPosture::classify(ep.auth_token.is_none(), &ep.url);
 
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "version": report.version,
-                "data_dir": report.data_dir,
-                "bind": report.bind,
-                "db_path": report.db_path,
-                "counts": {
-                    "pages_latest": report.counts.pages_latest,
-                    "pages_all": report.counts.pages_all,
-                    "sessions": report.counts.sessions,
-                    "observations": report.counts.observations,
-                },
-                "derived": report.derived,
-                "storage": report.storage,
-                "providers": report.providers,
-                "spool": spool,
-                "capture_mode": capture_mode,
-                "ingest": report.ingest,
-                "client": { "server_url": ep.url, "auth": ep.auth_token.is_some() },
-            }))?
+            serde_json::to_string_pretty(&json_report(
+                report,
+                spool,
+                journal_pending,
+                journal_degraded,
+                journal_finish_failed,
+                journal_error,
+                capture_mode,
+                &ep,
+                auth_posture,
+            ))?
         );
     } else {
         println!("ai-memory {} (server)", report.version);
@@ -237,6 +274,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         println!("  data-dir:     {}", report.data_dir);
         println!("  db:           {}", report.db_path);
         println!("  bind:         {}", report.bind);
+        println!("  auth:         {}", auth_posture.line());
         println!(
             "  pages:        {} (all versions: {})",
             report.counts.pages_latest, report.counts.pages_all
@@ -289,12 +327,13 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             if let Some(free) = report.storage.data_dir_free_bytes {
                 println!("    filesystem free: {}", super::compact::human_bytes(free));
             }
-            if pct >= RECLAIM_ADVICE_PCT
-                && report.storage.reclaimable_bytes >= RECLAIM_ADVICE_MIN_BYTES
-            {
+            if fix_lines::reclaim_advised(
+                report.storage.reclaimable_bytes,
+                report.storage.database_bytes,
+            ) {
                 println!(
-                    "    `ai-memory compact --confirm` would return it \
-                     (blocks writes while it runs)"
+                    "    `{}` would return it (blocks writes while it runs)",
+                    fix_lines::COMPACT
                 );
             }
         }
@@ -338,12 +377,30 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         println!("    pending:    {}", spool.pending);
         println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));
         println!("    retries:    {}", spool.retries_total);
+        if journal_pending > 0 || journal_error.is_some() {
+            println!("  recovery:");
+            println!(
+                "    journal:    {journal_pending} pending ({journal_degraded} degraded, {journal_finish_failed} finish-failed)"
+            );
+            if let Some(error) = &journal_error {
+                println!("    error:      {error}");
+            }
+            println!("    action:     run `{}`", fix_lines::RECOVER);
+        }
         if let Some(ingest) = &report.ingest {
             println!("  ingest (server, this process):");
             println!("    accepted:   {}", ingest.accepted);
             println!(
                 "    dropped:    {} (capture policy)",
                 ingest.dropped_by_policy
+            );
+            println!(
+                "    outcomes:   {} stored, {} replayed, {} resumed, {} ignored end, {} failed",
+                ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
+            );
+            println!(
+                "    drops:      {} unauthorized, {} collision, {} invalid",
+                ingest.dropped_unauthorized, ingest.dropped_collision, ingest.dropped_invalid
             );
             println!(
                 "    shed:       {} saturated, {} rate-limited",
@@ -412,7 +469,7 @@ fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String
 /// Render a spool age (ms) as a compact human duration, or `-` when the spool
 /// holds no events. Allowed to saturate: an operator reading a stuck-spool
 /// diagnosis wants the magnitude, not sub-second precision.
-fn spool_age_line(age_ms: Option<u64>) -> String {
+pub(super) fn spool_age_line(age_ms: Option<u64>) -> String {
     let Some(ms) = age_ms else {
         return "-".to_string();
     };
@@ -426,6 +483,46 @@ fn spool_age_line(age_ms: Option<u64>) -> String {
     } else {
         format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3600)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn json_report(
+    report: Report,
+    spool: SpoolHealth,
+    journal_pending: usize,
+    journal_degraded: usize,
+    journal_finish_failed: usize,
+    journal_error: Option<String>,
+    capture_mode: &str,
+    endpoint: &ServerEndpoint,
+    auth_posture: crate::local_auth::AuthPosture,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": report.version,
+        "data_dir": report.data_dir,
+        "bind": report.bind,
+        "db_path": report.db_path,
+        "counts": {
+            "pages_latest": report.counts.pages_latest,
+            "pages_all": report.counts.pages_all,
+            "sessions": report.counts.sessions,
+            "observations": report.counts.observations,
+        },
+        "derived": report.derived,
+        "storage": report.storage,
+        "providers": report.providers,
+        "spool": spool,
+        "recovery": {
+            "journal_pending": journal_pending,
+            "degraded_runs": journal_degraded,
+            "finish_failed_runs": journal_finish_failed,
+            "journal_error": journal_error,
+        },
+        "capture_mode": capture_mode,
+        "ingest": report.ingest,
+        "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
+        "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
+    })
 }
 
 fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
@@ -482,6 +579,89 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn status_json_keeps_existing_fields_and_adds_recovery_compatibly() {
+        let report: Report = serde_json::from_value(serde_json::json!({
+            "version": "2.6.0",
+            "data_dir": "/data",
+            "bind": "127.0.0.1:49374",
+            "db_path": "/data/db/memory.sqlite",
+            "counts": {"pages_latest": 1, "pages_all": 2, "sessions": 3, "observations": 4},
+            "derived": {
+                "pages_rows": 0, "pages_fts_rows": 0,
+                "observations_rows": 0, "observations_fts_rows": 0,
+                "latest_pages_missing_embeddings": 0,
+                "embedding_rows": 0, "embedding_triples": [],
+                "links_from_latest_pages": 0,
+                "unresolved_links_from_latest_pages": 0,
+                "stale_links_from_latest_pages": 0
+            },
+            "storage": {
+                "page_size": 0, "page_count": 0, "freelist_count": 0,
+                "database_bytes": 0, "reclaimable_bytes": 0
+            },
+            "providers": ProviderHealthSnapshot::default(),
+            "ingest": null,
+            "write_queue": null,
+            "wiki_format": null
+        }))
+        .unwrap();
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".into()), None);
+        let value = json_report(
+            report,
+            SpoolHealth::default(),
+            2,
+            1,
+            1,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+        );
+        assert_eq!(value["auth_posture"]["posture"], "none_loopback");
+        assert_eq!(value["auth_posture"]["fix"], "ai-memory auth enable");
+        for key in [
+            "version",
+            "data_dir",
+            "bind",
+            "db_path",
+            "counts",
+            "derived",
+            "storage",
+            "providers",
+            "spool",
+            "capture_mode",
+            "ingest",
+            "client",
+        ] {
+            assert!(value.get(key).is_some(), "missing legacy status key {key}");
+        }
+        assert_eq!(value["recovery"]["journal_pending"], 2);
+        assert_eq!(value["counts"]["observations"], 4);
+    }
+
+    #[test]
+    fn ingest_additions_default_for_older_servers_and_roundtrip() {
+        let old = serde_json::json!({"accepted": 2, "dropped_by_policy": 1, "shed_saturated": 0, "shed_rate_limited": 0, "last_persisted_ms": null});
+        let report: IngestReport = serde_json::from_value(old).unwrap();
+        let mut value = serde_json::to_value(report).unwrap();
+        for name in [
+            "stored",
+            "replayed",
+            "resumed",
+            "ignored_end",
+            "dropped_unauthorized",
+            "dropped_collision",
+            "dropped_invalid",
+            "failed",
+        ] {
+            assert_eq!(value[name], 0);
+            value[name] = serde_json::json!(7);
+        }
+        let current: IngestReport = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(current).unwrap(), value);
+    }
+
     /// #428's counters and #446's gate compose into a trap: under allowlist
     /// mode an unmarked repository never sends, so `accepted: 0` with an empty
     /// spool looks exactly like a broken install. `status` must be able to say
@@ -520,17 +700,21 @@ mod tests {
             pending: 2,
             oldest_age_ms: Some(900_000),
             retries_total: 4,
+            ..SpoolHealth::default()
         };
         let rendered = serde_json::to_string(&spool).expect("SpoolHealth serialises");
         assert_eq!(
             rendered,
-            r#"{"pending":2,"oldest_age_ms":900000,"retries_total":4}"#
+            r#"{"pending":2,"oldest_age_ms":900000,"retries_total":4,"capacity":3}"#
         );
         // The shape is the contract: counts and ages only. If a field
         // carrying captured text is ever added, this fails loudly.
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys, vec!["pending", "oldest_age_ms", "retries_total"]);
+        assert_eq!(
+            keys,
+            vec!["pending", "oldest_age_ms", "retries_total", "capacity"]
+        );
 
         // Both render paths must tolerate an empty spool.
         report_offline_spool(&SpoolHealth::default(), false);

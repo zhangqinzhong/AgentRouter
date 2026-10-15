@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "MCP server transport and tool router for ai-memory."
@@ -48,6 +49,9 @@ jiff.workspace = true
 ai-memory-core.workspace = true
 ai-memory-hooks.workspace = true
 ai-memory-store.workspace = true
+# The web search parity test drives `/web` and `/api/v1` next to
+# `memory_query`. Test-only: the server crate does not depend on the web UI.
+ai-memory-web.workspace = true
 ai-memory-wiki.workspace = true
 async-trait.workspace = true
 flate2.workspace = true

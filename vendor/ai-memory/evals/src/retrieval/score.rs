@@ -34,6 +34,13 @@ pub struct QuestionScore {
     /// Estimated context tokens the result would cost the agent (chars/4
     /// over returned hit titles + snippets).
     pub context_tokens: usize,
+    /// Wall clock of this question's ingest, milliseconds (0 for `grep`).
+    #[serde(default)]
+    pub ingest_ms: u128,
+    /// Raw observation hits the server returned (it falls back to them only
+    /// when page search finds nothing).
+    #[serde(default)]
+    pub raw_hits: usize,
     /// End-to-end QA outcome (R2b, opt-in): a candidate answer graded
     /// against the gold answer. `None` on the default zero-LLM path and for
     /// any question whose QA step failed (logged, left ungraded).
@@ -88,6 +95,8 @@ pub fn score_question(
         retrieved_sessions: ranked_sessions.len(),
         latency_ms,
         context_tokens,
+        ingest_ms: 0,
+        raw_hits: 0,
         // R2a scoring is answer-agnostic; the QA path attaches its outcome
         // afterward, keeping this function pure and deterministic.
         qa: None,
@@ -157,7 +166,7 @@ impl QaSliceMetrics {
 
 /// Nearest-rank percentile (`p` in 0.0..=1.0) over a copy-sorted slice.
 /// Empty input yields 0.
-fn percentile_u128(values: &[u128], p: f64) -> u128 {
+pub(crate) fn percentile_u128(values: &[u128], p: f64) -> u128 {
     if values.is_empty() {
         return 0;
     }

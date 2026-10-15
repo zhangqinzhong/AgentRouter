@@ -23,6 +23,7 @@ import http.client
 import http.server
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -48,6 +49,39 @@ EVENTS = ("session-start", "user-prompt-submit", "session-end")
 
 class SmokeFailure(RuntimeError):
     """An assertion or subprocess failed."""
+
+
+def subprocess_diagnostics(stderr: str) -> str:
+    """Expose bounded error markers, never arbitrary subprocess text or payloads."""
+    # Regex redaction cannot reliably distinguish unknown secrets from prose.
+    # Emit only fixed vocabulary and bounded numeric codes from captured stderr.
+    sample = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stderr[:65536])
+    markers = [
+        marker for marker in (
+            "open relay queue", "configure relay queue", "relay queue busy",
+            "database is locked", "database table is locked", "disk I/O error",
+            "unable to open database file", "database or disk is full",
+            "another flush already holds", "not a usable relay queue",
+            "hook batch transport failure: timeout",
+            "hook batch transport failure: connect",
+            "hook batch transport failure: redirect refused",
+            "hook batch transport failure: request",
+            "hook batch transport failure: io",
+            "hook batch transport failure: flush budget exhausted",
+            "unreadable ack", "inconsistent ack", "hook batch ack exceeded",
+        ) if marker in sample
+    ]
+    for pattern, prefix in (
+        (r"\bHTTP ([1-5][0-9]{2}) from /hook/batch\b", "HTTP "),
+        (r"\(os error ([0-9]{1,5})\)", "os error "),
+    ):
+        for code in re.findall(pattern, sample)[:4]:
+            marker = prefix + code
+            if marker not in markers:
+                markers.append(marker)
+    if not markers:
+        return "unrecognized stderr omitted" if stderr else "stderr empty"
+    return "stderr markers: " + "; ".join(markers)[:512]
 
 
 class DropFirstResponseProxy:
@@ -188,7 +222,7 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def parse_status(stdout: str, label: str) -> dict[str, int]:
+def parse_status(stdout: str, label: str) -> dict[str, Any]:
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -209,7 +243,17 @@ def parse_status(stdout: str, label: str) -> dict[str, int]:
         raise SmokeFailure(f"{label} status JSON has no integer pending_items")
     if type(receipts) is not int:
         raise SmokeFailure(f"{label} status JSON has no integer receipts")
-    return {"pending_items": pending_items, "receipts": receipts}
+    outcomes = parsed.get("receipt_outcomes")
+    expected = {
+        "stored", "replayed", "resumed", "ignored_end", "dropped_policy",
+        "dropped_subagent", "dropped_unauthorized", "dropped_collision", "dropped_invalid",
+        "unknown",
+    }
+    if not isinstance(outcomes, dict) or set(outcomes) != expected:
+        raise SmokeFailure(f"{label} status JSON has incomplete receipt outcomes")
+    if any(type(count) is not int or count < 0 for count in outcomes.values()):
+        raise SmokeFailure(f"{label} status JSON has invalid receipt counts")
+    return {"pending_items": pending_items, "receipts": receipts, "receipt_outcomes": outcomes}
 
 
 class Harness:
@@ -321,7 +365,10 @@ class Harness:
             },
         )
         if expect is not None and result.returncode != expect:
-            raise SmokeFailure(f"{label} exited {result.returncode}, expected {expect}")
+            raise SmokeFailure(
+                f"{label} exited {result.returncode}, expected {expect}; "
+                f"{subprocess_diagnostics(result.stderr)}"
+            )
         return result
 
     def relay(self, arguments: Iterable[str | Path], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -582,8 +629,10 @@ def run_smoke(harness: Harness) -> None:
 
     harness.start_server()
     harness.flush(main_queue, "flush-after-server-start")
-    _, flushed_pending = harness.status(main_queue, "status-after-flush")
+    flushed_status, flushed_pending = harness.status(main_queue, "status-after-flush")
     require(flushed_pending == 0, f"successful flush left {flushed_pending} pending")
+    require(flushed_status["receipt_outcomes"]["stored"] == 3, "canonical receipts did not record stored outcomes")
+    require(flushed_status["receipt_outcomes"]["unknown"] == 0, "real-server outcomes became unknown")
     main_rows = harness.observations(main_session)
     require([row[0] for row in main_rows] == ["session-start", "user-prompt", "session-end"], "canonical lifecycle order differs")
     require(all(row[1] == "producer-a" for row in main_rows), "canonical producer extension differs")
@@ -640,6 +689,7 @@ def run_smoke(harness: Harness) -> None:
     )
     collision_receipts_after = collision_status_after["receipts"]
     require(collision_pending == 0, "acknowledged SessionCollision remained pending")
+    require(collision_status_after["receipt_outcomes"]["dropped_collision"] == 1, "collision receipt did not preserve its outcome")
     require(
         collision_receipts_after == collision_receipts_before + 1,
         "SessionCollision acknowledgement did not create one relay receipt",
@@ -730,10 +780,11 @@ def run_smoke(harness: Harness) -> None:
     )
     proxy.forward_responses()
     harness.flush(lost_response_queue, "flush-lost-response-retry")
-    _, lost_response_retry_pending = harness.status(
+    lost_response_retry_status, lost_response_retry_pending = harness.status(
         lost_response_queue, "status-lost-response-retry"
     )
     require(lost_response_retry_pending == 0, "lost-response retry remained pending")
+    require(lost_response_retry_status["receipt_outcomes"]["replayed"] == 1, "lost-response retry did not record replayed outcome")
     require(
         len(harness.observations(lost_response_session)) == 1,
         "lost-response retry duplicated the real-server observation",

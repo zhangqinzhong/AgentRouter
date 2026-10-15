@@ -47,7 +47,8 @@ fn hook(root: &Path, agent: &str, event: &str, owner: Option<&str>, check: bool)
 #[test]
 fn external_capture_owner_suppresses_only_the_opted_in_process() {
     for owner in [None, Some(""), Some(" \t\n"), Some("orchestrator-a")] {
-        let tmp = tempfile::tempdir().unwrap().keep();
+        let guard = tempfile::tempdir().unwrap();
+        let tmp = guard.path().to_path_buf();
         let output = hook(
             tmp.as_path(),
             "claude-code",
@@ -75,7 +76,8 @@ fn external_capture_owner_suppresses_only_the_opted_in_process() {
 
 #[test]
 fn external_devin_end_still_clears_native_identity() {
-    let root = tempfile::tempdir().unwrap().keep();
+    let guard = tempfile::tempdir().unwrap();
+    let root = guard.path().to_path_buf();
     let state = root.join("data/hook-state/devin-session-id");
     std::fs::create_dir_all(state.parent().unwrap()).unwrap();
     std::fs::write(&state, "completed-execution").unwrap();
@@ -92,7 +94,13 @@ fn external_devin_end_still_clears_native_identity() {
 
 #[test]
 fn capture_inspection_reports_external_ownership_without_side_effects() {
-    let tmp = tempfile::tempdir().unwrap().keep();
+    let guard = tempfile::tempdir().unwrap();
+    let tmp = guard.path().to_path_buf();
+    std::fs::write(
+        tmp.join(".ai-memory.toml"),
+        "workspace = \"demo\"\nproject = \"app\"\n",
+    )
+    .unwrap();
     let output = hook(
         tmp.as_path(),
         "claude-code",
@@ -103,6 +111,11 @@ fn capture_inspection_reports_external_ownership_without_side_effects() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["external_capture"], true);
     assert_eq!(report["admits_capture"], false);
+    assert_eq!(report["policy_admits_capture"], true);
+    assert_eq!(report["scope"]["workspace"], "demo");
+    assert_eq!(report["scope"]["project"], "app");
+    assert_eq!(report["scope_resolution"], "explicit");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("orchestrator-a"));
     assert!(!tmp.as_path().join("data").exists());
 }
 
@@ -126,6 +139,8 @@ mod slow {
         root: PathBuf,
         client: reqwest::Client,
         base: String,
+        // Last field: drops after the server has stopped using the tree.
+        _guard: tempfile::TempDir,
     }
 
     fn command(root: &Path) -> Command {
@@ -153,7 +168,8 @@ mod slow {
 
     impl Fixture {
         async fn start() -> Self {
-            let root = tempfile::tempdir().unwrap().keep();
+            let guard = tempfile::tempdir().unwrap();
+            let root = guard.path().to_path_buf();
             for dir in ["home", "data", "project"] {
                 std::fs::create_dir(root.as_path().join(dir)).unwrap();
             }
@@ -191,6 +207,7 @@ mod slow {
                 root,
                 client,
                 base,
+                _guard: guard,
             }
         }
 
@@ -412,6 +429,52 @@ mod slow {
         );
     }
 
+    /// Post a batch the way a real spool drain does when the shared server is
+    /// saturated: a 429 (ingest shed) or a 200 with `failed_index` (fail-fast
+    /// on a transient processing error — the SessionEnd item writes the
+    /// session page, git checkpoint, and handoff inline, inside the response
+    /// window) acknowledges exactly the items that committed, so resend only
+    /// the rest, bounded. Ingest keys make resending an item an earlier
+    /// attempt did accept a replay, so the drain still converges to
+    /// exactly-once.
+    async fn post_batch_until_accepted(client: &reqwest::Client, endpoint: &str, items: &[Value]) {
+        let mut pending = items.to_vec();
+        let mut ack = Value::Null;
+        for attempt in 0..10u64 {
+            let response = client
+                .post(endpoint)
+                .bearer_auth(TOKEN)
+                .json(&pending)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            ack = response.json().await.unwrap();
+            assert!(
+                status.is_success() || status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "{status} {ack}"
+            );
+            // `accepted_indices` is present exactly when the acknowledged
+            // items are not the contiguous leading prefix, where the legacy
+            // `accepted` count would under-report.
+            let accepted: Vec<u64> = match ack["accepted_indices"].as_array() {
+                Some(indices) => indices.iter().filter_map(Value::as_u64).collect(),
+                None => (0..ack["accepted"].as_u64().unwrap()).collect(),
+            };
+            if accepted.len() == pending.len() {
+                return;
+            }
+            pending = pending
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !accepted.contains(&(*idx as u64)))
+                .map(|(_, item)| item.clone())
+                .collect();
+            tokio::time::sleep(Duration::from_millis(20 * (attempt + 1))).await;
+        }
+        panic!("batch never fully accepted after 10 attempts: {ack}");
+    }
+
     #[tokio::test]
     async fn fifteen_external_sessions_share_one_server_and_retry_completed_batches() {
         let fixture = Fixture::start().await;
@@ -428,16 +491,7 @@ mod slow {
             let endpoint = format!("{}/hook/batch", fixture.base);
             tasks.spawn(async move {
                 for _ in 0..2 {
-                    let response = client
-                        .post(&endpoint)
-                        .bearer_auth(TOKEN)
-                        .json(&items)
-                        .send()
-                        .await
-                        .unwrap();
-                    assert!(response.status().is_success(), "{}", response.status());
-                    let ack: Value = response.json().await.unwrap();
-                    assert_eq!(ack["accepted"], 3, "{ack}");
+                    post_batch_until_accepted(&client, &endpoint, &items).await;
                 }
                 sid
             });

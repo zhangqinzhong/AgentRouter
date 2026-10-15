@@ -1,10 +1,10 @@
 # ai-memory provenance
 
 - Upstream: https://github.com/akitaonrails/ai-memory
-- Release: v2.5.2
-- Commit: `7580b74d0fb9d14a6d949dc92f5ea8bb7feb3c83`
+- Release: v3.0.0
+- Commit: `dbe928e3b64414c619435df887ed344ff83887a5`
 - License: MIT, retained verbatim in `ai-memory/LICENSE`.
-- Import: complete GitHub source archive at the pinned v2.5.2 commit, without the upstream Git database.
+- Import: complete GitHub source archive at the pinned v3.0.0 commit, without the upstream Git database.
 
 The upstream source is unmodified. AgentRouter owns the TypeScript supervisor,
 native React interface, transport adapters, and client integration receipts.

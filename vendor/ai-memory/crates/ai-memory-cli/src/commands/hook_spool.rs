@@ -30,9 +30,24 @@ use serde::{Deserialize, Serialize};
 
 use super::hook_capture::{BatchOutcome, PostOutcome, build_client, post_batch, post_hook};
 
-/// Drop a spooled event after this many failed drain passes — bounds retries of
-/// a permanently-undeliverable event (e.g. a server URL that never comes back).
-const MAX_ATTEMPTS: u32 = 8;
+/// Default number of failed drain passes before dropping an event — bounds
+/// retries of an event a server keeps refusing or erroring on. An
+/// unreachable endpoint never charges attempts; a dead address is bounded
+/// by the spool's TTL and file cap instead.
+#[cfg(test)]
+const MAX_ATTEMPTS: u32 = crate::config::DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS;
+
+/// Failed drain-pass limit resolved at the hook command boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxAttempts(u32);
+
+impl MaxAttempts {
+    /// Preserve an explicitly configured limit, including zero (no attempt drop).
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+}
 /// Drop a spooled event older than this regardless of attempts (7 days), so a
 /// long-dead instance can't leave the spool growing without bound.
 const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -51,8 +66,26 @@ const MAX_BATCH_ITEMS: usize = 256;
 /// `DefaultBodyLimit` with margin for JSON framing. A chunk always carries at
 /// least one event even if that event alone exceeds this.
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const RECOVERY_DIR: &str = ".recovery";
+const RECOVERY_MATCH_FILE: &str = ".active";
+const RECOVERY_COMPLETED_FILE: &str = ".completed";
+const SPOOL_CAPACITY_LOCK_FILE: &str = ".capacity.lock";
+/// How long an enqueue waits for another enqueuer's capacity check. Bounded
+/// well inside the hook's ~200 ms budget; past it the event is spooled anyway
+/// (the cap is a soft bound), never discarded.
+const SPOOL_CAPACITY_LOCK_WAIT: Duration = Duration::from_millis(50);
+const MAX_SPOOL_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+const RECOVERY_TOMBSTONE_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_RECOVERY_TOMBSTONES: usize = 512;
+const MAX_RECOVERY_SWEEP_DIRS: usize = 1_024;
 
 static ENQUEUE_SEQ: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static PAUSE_ENQUEUE_AFTER_MAIN_RENAME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static ENQUEUE_REACHED_RECOVERY_WINDOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// How a spooled event authenticates to the server when drained.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,8 +116,10 @@ pub struct SpoolEntry {
     /// Static bearer, present only when `auth_mode == Static`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    /// Failed delivery attempts so far — incremented on each drain miss and used
-    /// (with `created_ms`) to drop a permanently-undeliverable event.
+    /// Failed delivery attempts so far — incremented only when a delivery
+    /// actually reached a server and missed (never for an endpoint-level
+    /// outage) and used (with `created_ms`) to drop a
+    /// permanently-undeliverable event.
     #[serde(default)]
     pub attempts: u32,
     /// Server profile this event was routed to by its repository's marker
@@ -117,7 +152,7 @@ pub fn spool_len(spool: &Path) -> usize {
 /// Deliberately content-free: counts, ages, and attempt sums only — never
 /// payload excerpts, URLs, or token material (the spool holds private capture
 /// until it drains).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SpoolHealth {
     /// Events queued locally awaiting delivery.
     pub pending: usize,
@@ -125,6 +160,28 @@ pub struct SpoolHealth {
     pub oldest_age_ms: Option<u64>,
     /// Sum of failed-delivery attempts across all queued events.
     pub retries_total: u64,
+    /// Most events the spool holds; past it the oldest undelivered ones are
+    /// evicted to make room.
+    pub capacity: usize,
+}
+
+impl Default for SpoolHealth {
+    fn default() -> Self {
+        Self {
+            pending: 0,
+            oldest_age_ms: None,
+            retries_total: 0,
+            capacity: MAX_SPOOL_FILES,
+        }
+    }
+}
+
+impl SpoolHealth {
+    /// The spool is full, so each new event evicts the oldest undelivered one.
+    #[must_use]
+    pub fn evicting(&self) -> bool {
+        self.pending >= self.capacity
+    }
 }
 
 /// Snapshot local spool health: queued count and oldest-event age from the
@@ -168,10 +225,10 @@ pub fn spool_health(spool: &Path) -> SpoolHealth {
     let mut health = SpoolHealth {
         pending: files.len(),
         oldest_age_ms: Some(now.saturating_sub(oldest_created)),
-        retries_total: 0,
+        ..SpoolHealth::default()
     };
     for (_, path) in &files {
-        if let Ok(bytes) = std::fs::read(path)
+        if let Ok(bytes) = read_spool_entry_bytes(path)
             && let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes)
         {
             health.retries_total += u64::from(entry.attempts);
@@ -190,12 +247,9 @@ pub fn spool_health(spool: &Path) -> SpoolHealth {
 /// entry enqueued at the Unix epoch — see [`spool_health`].
 fn created_ms_from_name(file_name: &str) -> Option<u64> {
     let (stamp, rest) = file_name.split_once('-')?;
-    // Require the full zero-padded width the writer emits, so a name that
-    // merely *starts* with digits is not accepted.
     if stamp.len() != 13 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    // And require the remainder to look like `{pid}-{seq}.json`.
     if !rest.ends_with(".json") || !rest.contains('-') {
         return None;
     }
@@ -218,11 +272,21 @@ fn now_ms() -> u64 {
 ///
 /// # Errors
 /// Returns an error only when the spool file cannot be written.
+#[cfg(test)]
 pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
+    enqueue_with_config(spool, entry, None)
+}
+
+pub fn enqueue_with_config(
+    spool: &Path,
+    entry: &SpoolEntry,
+    config: Option<&crate::config::Config>,
+) -> std::io::Result<()> {
     create_spool_dir(spool)?;
     let seq = ENQUEUE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let recovery_key = recovery_coordinate_key_for_entry(entry, config)?;
     let name = format!(
-        "{:013}-{}-{seq:016x}.json",
+        "{:013}-{}-{seq:016x}-{recovery_key}.json",
         entry.created_ms,
         std::process::id()
     );
@@ -230,8 +294,54 @@ pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
     let final_path = spool.join(&name);
     let bytes = serde_json::to_vec(entry)?;
     write_private(&tmp, &bytes)?;
+    // The capacity lock only serializes concurrent count-then-rename checks
+    // so a burst cannot overshoot the cap. If another enqueuer holds it past
+    // the wait, count without it: the worst case is a few entries over a soft
+    // cap, where giving up here silently lost a captured event.
+    let capacity_lock = open_spool_capacity_lock(spool)?;
+    let started = Instant::now();
+    loop {
+        match capacity_lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if is_drain_lock_busy_error(&error)
+                    && started.elapsed() < SPOOL_CAPACITY_LOCK_WAIT =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if is_drain_lock_busy_error(&error) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    if total_spool_entries(spool)? >= MAX_SPOOL_FILES {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!(
+            "ai-memory: hook-spool at capacity ({MAX_SPOOL_FILES}); dropping one new UNDELIVERED event"
+        );
+        return Ok(());
+    }
     std::fs::rename(&tmp, &final_path)?;
-    prune_spool_file_count(spool);
+    #[cfg(test)]
+    if PAUSE_ENQUEUE_AFTER_MAIN_RENAME.load(Ordering::SeqCst) {
+        ENQUEUE_REACHED_RECOVERY_WINDOW.store(true, Ordering::SeqCst);
+        while PAUSE_ENQUEUE_AFTER_MAIN_RENAME.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+    let coord_lock = open_recovery_coord_lock(spool)?;
+    if coord_lock.try_lock_exclusive().is_ok() {
+        match recovery_target_for_entry(spool, entry, config)? {
+            Some(RecoveryTarget::Active(dir)) => {
+                std::fs::rename(&final_path, dir.join(&name))?;
+            }
+            Some(RecoveryTarget::Completed(_)) => match std::fs::remove_file(&final_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            },
+            None => {}
+        }
+    }
     Ok(())
 }
 
@@ -241,6 +351,38 @@ pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
 /// capture until it drains; a world-readable directory would leak that.
 fn create_spool_dir(spool: &Path) -> std::io::Result<()> {
     super::path_util::create_private_dir(spool)
+}
+
+fn open_spool_capacity_lock(spool: &Path) -> std::io::Result<File> {
+    create_spool_dir(spool)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(spool.with_extension(SPOOL_CAPACITY_LOCK_FILE))
+}
+
+fn total_spool_entries(spool: &Path) -> std::io::Result<usize> {
+    let mut total = list_entries(spool).map_or(0, |(files, _)| files.len());
+    let recovery = spool.join(RECOVERY_DIR);
+    let directories = match std::fs::read_dir(recovery) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(total),
+        Err(error) => return Err(error),
+    };
+    for (index, directory) in directories.enumerate() {
+        if index >= MAX_RECOVERY_SWEEP_DIRS {
+            return Ok(MAX_SPOOL_FILES);
+        }
+        let directory = directory?;
+        if directory.file_type()?.is_dir() {
+            total = total.saturating_add(
+                list_entries(&directory.path()).map_or(0, |(files, _)| files.len()),
+            );
+        }
+    }
+    Ok(total)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -298,6 +440,8 @@ impl SpoolEntry {
 pub struct DrainResult {
     /// Events delivered (server answered 2xx) and removed from the spool.
     pub sent: usize,
+    /// Events whose modern per-item acknowledgement proves durable storage.
+    pub durable: usize,
     /// Events still queued (failed this pass, or skipped when the budget ran out).
     pub remaining: usize,
     /// Events discarded as undeliverable (too old or too many failed attempts).
@@ -316,6 +460,574 @@ pub enum DrainLockWait {
 /// An exclusive hook-spool drain lock. The OS releases it when dropped.
 pub struct DrainLock {
     _file: File,
+}
+
+/// Outcome of [`QuarantinedSpool::restore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// Quarantined events were moved back to the plain spool (or the
+    /// quarantine directory no longer existed).
+    Restored,
+    /// The interval was already completed, so its correlated evidence is
+    /// durably delivered and there is nothing left to restore or re-deliver.
+    AlreadyDelivered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryMatch {
+    journal_id: String,
+    coordinate_key: String,
+    interval_started_ms: u64,
+    interval_ended_ms: u64,
+    server_identity: String,
+    agent: String,
+    workspace: String,
+    project: String,
+    cwd: String,
+    native_session_id: String,
+}
+
+pub struct QuarantinedSpool {
+    dir: PathBuf,
+    spool: PathBuf,
+    config: crate::config::Config,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CorrelatedDrainResult {
+    pub durable: usize,
+    pub remaining: usize,
+    pub dropped: usize,
+}
+
+impl QuarantinedSpool {
+    pub fn len(&self) -> usize {
+        list_entries(&self.dir).map_or(0, |(files, _)| files.len())
+    }
+
+    pub fn complete(self) -> std::io::Result<()> {
+        if self.dir.exists() {
+            let lock = open_recovery_coord_lock(&self.spool)?;
+            lock.lock_exclusive()?;
+            let active = self.dir.join(RECOVERY_MATCH_FILE);
+            let completed = self.dir.join(RECOVERY_COMPLETED_FILE);
+            let spec = read_recovery_match(&active)?;
+            std::fs::rename(&active, &completed)?;
+            move_late_matching_entries(&self.spool, &self.dir, &self.config, &spec)?;
+            for item in std::fs::read_dir(&self.dir)? {
+                let item = item?;
+                if item.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                    std::fs::remove_file(item.path())?;
+                }
+            }
+            sweep_recovery_tombstones(&self.spool)?;
+        }
+        Ok(())
+    }
+
+    pub async fn drain_strict(
+        &self,
+        data_dir: &Path,
+        total_budget: Duration,
+        per_event_timeout: Duration,
+        max_attempts: MaxAttempts,
+    ) -> CorrelatedDrainResult {
+        let Ok((mut files, unreadable)) = list_entries(&self.dir) else {
+            return CorrelatedDrainResult {
+                remaining: 1,
+                ..CorrelatedDrainResult::default()
+            };
+        };
+        files.sort();
+        let client = build_client();
+        let started = Instant::now();
+        let mut oidc_cache = None;
+        let mut result = DrainResult {
+            remaining: unreadable,
+            ..DrainResult::default()
+        };
+        for path in files {
+            if started.elapsed() >= total_budget {
+                result.remaining += 1;
+                continue;
+            }
+            let Some(entry) = load_live_entry(&path, &mut result) else {
+                continue;
+            };
+            if body_is_malformed(&entry) {
+                bump_or_drop(&path, &entry, max_attempts.0, &mut result);
+                continue;
+            }
+            let bearer = entry_bearer(&entry, &client, data_dir, &mut oidc_cache).await;
+            let Some(payload) = batch_payload(&[(path.clone(), entry.clone())]) else {
+                bump_or_drop(&path, &entry, max_attempts.0, &mut result);
+                continue;
+            };
+            let remaining_budget = total_budget.saturating_sub(started.elapsed());
+            let timeout = per_event_timeout.min(remaining_budget);
+            match post_batch(
+                &client,
+                &batch_endpoint(&entry.url),
+                &payload,
+                bearer.as_deref(),
+                timeout,
+            )
+            .await
+            {
+                BatchOutcome::Detailed {
+                    outcomes,
+                    failed_index: None,
+                } if outcomes.len() == 1 => {
+                    settle_item(&path, &entry, &outcomes[0], max_attempts.0, &mut result);
+                }
+                _ => bump_or_drop(&path, &entry, max_attempts.0, &mut result),
+            }
+        }
+        CorrelatedDrainResult {
+            durable: result.durable,
+            remaining: result.remaining,
+            dropped: result.dropped,
+        }
+    }
+
+    pub fn complete_spool_only(&self) -> std::io::Result<bool> {
+        let lock = open_recovery_coord_lock(&self.spool)?;
+        lock.lock_exclusive()?;
+        let active = self.dir.join(RECOVERY_MATCH_FILE);
+        let completed = self.dir.join(RECOVERY_COMPLETED_FILE);
+        let spec = read_recovery_match(&active)?;
+        move_late_matching_entries(&self.spool, &self.dir, &self.config, &spec)?;
+        if self.len() != 0 {
+            return Ok(false);
+        }
+        std::fs::rename(active, completed)?;
+        Ok(true)
+    }
+
+    pub fn restore(self, spool: &Path) -> std::io::Result<RestoreOutcome> {
+        if !self.dir.exists() {
+            return Ok(RestoreOutcome::Restored);
+        }
+        let lock = open_recovery_coord_lock(spool)?;
+        lock.lock_exclusive()?;
+        let active = self.dir.join(RECOVERY_MATCH_FILE);
+        let completed = self.dir.join(RECOVERY_COMPLETED_FILE);
+        // Completion is terminal: a `.completed` marker is durable proof the
+        // interval's correlated evidence reached the server, so a restore has
+        // nothing to put back. A `.active` beside the tombstone is a rerun
+        // rewriting the same interval, not a re-opened one.
+        if completed.is_file() {
+            match std::fs::remove_file(&active) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            move_quarantined_entries_to_spool(&self.dir, spool)?;
+            return Ok(RestoreOutcome::AlreadyDelivered);
+        }
+        if !active.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "recovery interval {} has neither an active nor a completed marker",
+                    self.dir.display()
+                ),
+            ));
+        }
+        let spec = read_recovery_match(&active)?;
+        move_late_matching_entries(spool, &self.dir, &self.config, &spec)?;
+        let _ = std::fs::remove_file(active);
+        move_quarantined_entries_to_spool(&self.dir, spool)?;
+        std::fs::remove_dir(self.dir)?;
+        Ok(RestoreOutcome::Restored)
+    }
+}
+
+/// Move every quarantined `*.json` event back to the plain spool, leaving the
+/// marker files where they are.
+fn move_quarantined_entries_to_spool(dir: &Path, spool: &Path) -> std::io::Result<()> {
+    for item in std::fs::read_dir(dir)? {
+        let item = item?;
+        if item.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let destination = spool.join(item.file_name());
+        std::fs::rename(item.path(), destination)?;
+    }
+    Ok(())
+}
+
+fn read_recovery_match(path: &Path) -> std::io::Result<RecoveryMatch> {
+    serde_json::from_slice(&read_spool_entry_bytes(path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn move_late_matching_entries(
+    spool: &Path,
+    dir: &Path,
+    config: &crate::config::Config,
+    spec: &RecoveryMatch,
+) -> std::io::Result<()> {
+    let (files, _) = list_entries(spool)?;
+    for path in files {
+        let Ok(bytes) = read_spool_entry_bytes(&path) else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
+            continue;
+        };
+        if entry.created_ms >= spec.interval_started_ms
+            && entry.created_ms <= spec.interval_ended_ms
+            && spool_entry_matches_session(
+                &entry,
+                &spec.server_identity,
+                &spec.agent,
+                Some(config),
+                &spec.workspace,
+                &spec.project,
+                Path::new(&spec.cwd),
+                &spec.native_session_id,
+            )
+            && recovery_target_for_entry(spool, &entry, Some(config))?
+                .is_some_and(|target| target.dir() == dir)
+            && let Some(name) = path.file_name()
+        {
+            std::fs::rename(&path, dir.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn quarantine_session_entries(
+    config: &crate::config::Config,
+    spool: &Path,
+    journal_id: &str,
+    interval_started_ms: u64,
+    interval_ended_ms: u64,
+    server_identity: &str,
+    agent: &str,
+    workspace: &str,
+    project: &str,
+    cwd: &Path,
+    native_session_id: &str,
+) -> std::io::Result<QuarantinedSpool> {
+    let coord_lock = open_recovery_coord_lock(spool)?;
+    coord_lock.lock_exclusive()?;
+    sweep_recovery_tombstones(spool)?;
+    let coordinate_key = recovery_coordinate_key(
+        server_identity,
+        agent,
+        workspace,
+        project,
+        cwd.to_string_lossy().as_ref(),
+        native_session_id,
+    )?;
+    let dir = spool
+        .join(RECOVERY_DIR)
+        .join(recovery_interval_key(journal_id)?);
+    create_spool_dir(&dir)?;
+    let match_spec = RecoveryMatch {
+        journal_id: journal_id.to_owned(),
+        coordinate_key,
+        interval_started_ms,
+        interval_ended_ms,
+        server_identity: server_identity.to_owned(),
+        agent: agent.to_owned(),
+        workspace: workspace.to_owned(),
+        project: project.to_owned(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        native_session_id: native_session_id.to_owned(),
+    };
+    write_private(
+        &dir.join(RECOVERY_MATCH_FILE),
+        &serde_json::to_vec(&match_spec)?,
+    )?;
+    if let Err(error) = move_late_matching_entries(spool, &dir, config, &match_spec) {
+        let _ = std::fs::remove_file(dir.join(RECOVERY_MATCH_FILE));
+        return Err(error);
+    }
+    Ok(QuarantinedSpool {
+        dir,
+        spool: spool.to_path_buf(),
+        config: config.clone(),
+    })
+}
+
+fn open_recovery_coord_lock(spool: &Path) -> std::io::Result<File> {
+    create_spool_dir(spool)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(spool.with_extension("recovery.lock"))
+}
+
+fn sweep_recovery_tombstones(spool: &Path) -> std::io::Result<()> {
+    let recovery = spool.join(RECOVERY_DIR);
+    let entries = match std::fs::read_dir(&recovery) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let now = SystemTime::now();
+    let mut completed = Vec::new();
+    for entry in entries.take(MAX_RECOVERY_SWEEP_DIRS) {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let marker = entry.path().join(RECOVERY_COMPLETED_FILE);
+        let Ok(metadata) = marker.metadata() else {
+            continue;
+        };
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        if now.duration_since(modified).unwrap_or_default().as_millis() as u64
+            > RECOVERY_TOMBSTONE_AGE_MS
+        {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            completed.push((modified, entry.path()));
+        }
+    }
+    if completed.len() > MAX_RECOVERY_TOMBSTONES {
+        completed.sort_by_key(|(modified, _)| *modified);
+        let excess = completed.len() - MAX_RECOVERY_TOMBSTONES;
+        for (_, path) in completed.into_iter().take(excess) {
+            std::fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
+
+enum RecoveryTarget {
+    Active(PathBuf),
+    Completed(PathBuf),
+}
+
+impl RecoveryTarget {
+    fn dir(&self) -> &Path {
+        match self {
+            Self::Active(dir) | Self::Completed(dir) => dir,
+        }
+    }
+}
+
+fn recovery_target_for_entry(
+    spool: &Path,
+    entry: &SpoolEntry,
+    config: Option<&crate::config::Config>,
+) -> std::io::Result<Option<RecoveryTarget>> {
+    let coordinate_key = recovery_coordinate_key_for_entry(entry, config)?;
+    let recovery = spool.join(RECOVERY_DIR);
+    let directories = match std::fs::read_dir(recovery) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut matched = None;
+    for directory in directories.take(MAX_RECOVERY_SWEEP_DIRS) {
+        let directory = directory?;
+        if !directory.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = directory.path();
+        let marker = if dir.join(RECOVERY_MATCH_FILE).is_file() {
+            RECOVERY_MATCH_FILE
+        } else if dir.join(RECOVERY_COMPLETED_FILE).is_file() {
+            RECOVERY_COMPLETED_FILE
+        } else {
+            continue;
+        };
+        let Ok(spec) = read_recovery_match(&dir.join(marker)) else {
+            continue;
+        };
+        if spec.coordinate_key != coordinate_key
+            || entry.created_ms < spec.interval_started_ms
+            || entry.created_ms > spec.interval_ended_ms
+        {
+            continue;
+        }
+        let candidate = if marker == RECOVERY_MATCH_FILE {
+            RecoveryTarget::Active(dir)
+        } else {
+            RecoveryTarget::Completed(dir)
+        };
+        if matched.is_some() {
+            return Ok(None);
+        }
+        matched = Some(candidate);
+    }
+    Ok(matched)
+}
+
+fn recovery_coordinate_key_for_entry(
+    entry: &SpoolEntry,
+    config: Option<&crate::config::Config>,
+) -> std::io::Result<String> {
+    let url = reqwest::Url::parse(&entry.url)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut identity = url.clone();
+    identity.set_query(None);
+    if identity.path().ends_with("/hook") {
+        let path = identity.path().trim_end_matches("/hook").to_owned();
+        identity.set_path(&path);
+    }
+    let mut agent = None;
+    let mut workspace = None;
+    let mut project = None;
+    let mut session = None;
+    let mut cwd = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "agent" => agent = Some(value.into_owned()),
+            "workspace" => workspace = Some(value.into_owned()),
+            "project" => project = Some(value.into_owned()),
+            "session_id" => session = Some(value.into_owned()),
+            "cwd" => cwd = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(&entry.body) {
+        let context = ai_memory_hooks::hook_payload_context(&body);
+        session = context.session_id.or(session);
+        cwd = context.cwd.or(cwd);
+    }
+    let (workspace, project) = match (config, cwd.as_deref()) {
+        (Some(config), Some(cwd)) => super::resolve_scope_for_path_with_explicit(
+            config,
+            Path::new(cwd),
+            workspace.as_deref(),
+            project.as_deref(),
+        )
+        .unwrap_or_else(|_| {
+            (
+                workspace.clone().unwrap_or_default(),
+                project.clone().unwrap_or_default(),
+            )
+        }),
+        _ => (workspace.unwrap_or_default(), project.unwrap_or_default()),
+    };
+    recovery_coordinate_key(
+        identity.as_str().trim_end_matches('/'),
+        agent.as_deref().unwrap_or_default(),
+        &workspace,
+        &project,
+        cwd.as_deref().unwrap_or_default(),
+        session.as_deref().unwrap_or_default(),
+    )
+}
+
+fn recovery_interval_key(journal_id: &str) -> std::io::Result<String> {
+    if journal_id.is_empty()
+        || journal_id.len() > 128
+        || !journal_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid recovery journal interval id",
+        ));
+    }
+    use sha2::{Digest as _, Sha256};
+    Ok(format!("{:x}", Sha256::digest(journal_id.as_bytes())))
+}
+
+fn recovery_coordinate_key(
+    server_identity: &str,
+    agent: &str,
+    workspace: &str,
+    project: &str,
+    cwd: &str,
+    native_session_id: &str,
+) -> std::io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let cwd = crate::marker::absolute_normalized(Path::new(cwd));
+    let mut hasher = Sha256::new();
+    for value in [
+        server_identity,
+        agent,
+        workspace,
+        project,
+        cwd.to_string_lossy().as_ref(),
+        native_session_id,
+    ] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spool_entry_matches_session(
+    entry: &SpoolEntry,
+    server_identity: &str,
+    agent: &str,
+    config: Option<&crate::config::Config>,
+    workspace: &str,
+    project: &str,
+    cwd: &Path,
+    native_session_id: &str,
+) -> bool {
+    let Ok(url) = reqwest::Url::parse(&entry.url) else {
+        return false;
+    };
+    let mut identity = url.clone();
+    identity.set_query(None);
+    if identity.path().ends_with("/hook") {
+        let path = identity.path().trim_end_matches("/hook").to_owned();
+        identity.set_path(&path);
+    }
+    let identity = identity.as_str().trim_end_matches('/');
+    if identity != server_identity.trim_end_matches('/') {
+        return false;
+    }
+    let mut session = None;
+    let mut event_agent = None;
+    let mut ws = None;
+    let mut proj = None;
+    let mut event_cwd = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "agent" => event_agent = Some(value.into_owned()),
+            "session_id" => session = Some(value.into_owned()),
+            "workspace" => ws = Some(value.into_owned()),
+            "project" => proj = Some(value.into_owned()),
+            "cwd" => event_cwd = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(&entry.body) {
+        let context = ai_memory_hooks::hook_payload_context(&body);
+        session = context.session_id.or(session);
+        event_cwd = context.cwd.or(event_cwd);
+    }
+    let expected_cwd = crate::marker::absolute_normalized(cwd);
+    let same_cwd = event_cwd
+        .as_deref()
+        .is_some_and(|value| crate::marker::absolute_normalized(Path::new(value)) == expected_cwd);
+    let explicit_match = ws.as_deref() == Some(workspace) && proj.as_deref() == Some(project);
+    let scope_matches = if explicit_match {
+        true
+    } else if let (Some(config), Some(event_cwd)) = (config, event_cwd.as_deref()) {
+        super::resolve_scope_for_path_with_explicit(
+            config,
+            Path::new(event_cwd),
+            ws.as_deref(),
+            proj.as_deref(),
+        )
+        .is_ok_and(|resolved| resolved == (workspace.to_owned(), project.to_owned()))
+    } else {
+        ws.as_deref().is_none_or(|value| value == workspace)
+            && proj.as_deref().is_none_or(|value| value == project)
+            && ((ws.is_some() && proj.is_some()) || same_cwd)
+    };
+    event_agent.as_deref() == Some(agent)
+        && session.as_deref() == Some(native_session_id)
+        && scope_matches
+        && same_cwd
 }
 
 /// Windows can report a contended fs2 byte-range lock as this native OS code
@@ -347,7 +1059,17 @@ pub enum LockedDrainResult {
 
 /// Try to acquire the single-flight drain lock.
 pub fn acquire_drain_lock(spool: &Path, wait: DrainLockWait) -> std::io::Result<Option<DrainLock>> {
-    std::fs::create_dir_all(spool)?;
+    // A detached drainer that outlives `uninstall --purge-data` (or a test's
+    // temp dir) must not recreate the data dir it was started for; a missing
+    // data dir has nothing queued to drain. The spool dir is created private,
+    // like `enqueue` creates it.
+    if spool.parent().is_some_and(|data_dir| !data_dir.is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the hook spool's data directory no longer exists",
+        ));
+    }
+    create_spool_dir(spool)?;
     let path = spool.join(".drain.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -383,8 +1105,18 @@ pub async fn drain_exclusive(
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    max_attempts: MaxAttempts,
 ) -> Option<DrainResult> {
-    match drain_exclusive_result(spool, data_dir, total_budget, per_event_timeout, wait).await {
+    match drain_exclusive_result(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        max_attempts,
+    )
+    .await
+    {
         Ok(LockedDrainResult::Drained(result)) => Some(result),
         Ok(LockedDrainResult::LockBusy) | Err(_) => None,
     }
@@ -397,12 +1129,20 @@ pub async fn drain_exclusive_result(
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     let Some(_lock) = acquire_drain_lock(spool, wait)? else {
         return Ok(LockedDrainResult::LockBusy);
     };
     Ok(LockedDrainResult::Drained(
-        drain(spool, data_dir, total_budget, per_event_timeout).await,
+        drain_with_max_attempts(
+            spool,
+            data_dir,
+            total_budget,
+            per_event_timeout,
+            max_attempts,
+        )
+        .await,
     ))
 }
 
@@ -412,6 +1152,7 @@ pub async fn drain_exclusive_within_budget(
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     let started = Instant::now();
     let Some(_lock) = acquire_drain_lock(spool, DrainLockWait::Bounded(total_budget))? else {
@@ -430,7 +1171,14 @@ pub async fn drain_exclusive_within_budget(
         }));
     }
     Ok(LockedDrainResult::Drained(
-        drain(spool, data_dir, remaining_budget, per_event_timeout).await,
+        drain_with_max_attempts(
+            spool,
+            data_dir,
+            remaining_budget,
+            per_event_timeout,
+            max_attempts,
+        )
+        .await,
     ))
 }
 
@@ -441,36 +1189,88 @@ pub async fn drain_until_quiescent(
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    max_attempts: MaxAttempts,
+) -> std::io::Result<LockedDrainResult> {
+    drain_until_quiescent_with_live_token(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        live_static_token().as_deref(),
+        max_attempts,
+    )
+    .await
+}
+
+pub async fn drain_until_quiescent_with_live_token(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+    live_token: Option<&str>,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     let Some(_lock) = acquire_drain_lock(spool, wait)? else {
         return Ok(LockedDrainResult::LockBusy);
     };
+    Ok(LockedDrainResult::Drained(
+        drain_until_quiescent_locked_with_live_token(
+            spool,
+            data_dir,
+            total_budget,
+            per_event_timeout,
+            live_token,
+            max_attempts,
+        )
+        .await,
+    ))
+}
+
+pub async fn drain_until_quiescent_locked_with_live_token(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    live_token: Option<&str>,
+    max_attempts: MaxAttempts,
+) -> DrainResult {
     let started = Instant::now();
     let mut combined = DrainResult::default();
 
     loop {
         let Some(remaining_budget) = total_budget.checked_sub(started.elapsed()) else {
             combined.remaining = spool_len(spool);
-            return Ok(LockedDrainResult::Drained(combined));
+            return combined;
         };
         if remaining_budget.is_zero() {
             combined.remaining = spool_len(spool);
-            return Ok(LockedDrainResult::Drained(combined));
+            return combined;
         }
 
-        let result = drain(spool, data_dir, remaining_budget, per_event_timeout).await;
+        let result = drain_with_live_token(
+            spool,
+            data_dir,
+            remaining_budget,
+            per_event_timeout,
+            live_token,
+            max_attempts,
+        )
+        .await;
         combined.sent += result.sent;
+        combined.durable += result.durable;
         combined.dropped += result.dropped;
         combined.remaining = result.remaining;
 
         if result.remaining > 0 {
-            return Ok(LockedDrainResult::Drained(combined));
+            return combined;
         }
 
         let queued = spool_len(spool);
         if queued == 0 {
             combined.remaining = 0;
-            return Ok(LockedDrainResult::Drained(combined));
+            return combined;
         }
         combined.remaining = queued;
     }
@@ -488,18 +1288,36 @@ pub async fn drain_until_quiescent(
 /// drain transparently falls back to per-event `POST /hook`.
 ///
 /// A delivered event is deleted; a failed one is charged a retry attempt
-/// (dropped at `MAX_ATTEMPTS`); a `429` (saturation) deletes any accepted prefix
-/// the server reports, then retries the rest untouched so it never burns the
-/// retry budget. OIDC bearer is resolved + refreshed at most once per drain and
-/// cached.
+/// (dropped at the configured limit, unless it is zero); a `429` (saturation)
+/// deletes any accepted prefix the server reports, then retries the rest
+/// untouched so it never burns the retry budget. OIDC bearer is resolved and
+/// refreshed at most once per drain and cached.
 ///
 /// Best-effort: returns counts and never errors, so a session boundary is never
 /// blocked beyond the budget and never fails the agent.
-pub async fn drain(
+#[cfg(test)]
+async fn drain(
     spool: &Path,
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
+) -> DrainResult {
+    drain_with_max_attempts(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        MaxAttempts::new(MAX_ATTEMPTS),
+    )
+    .await
+}
+
+pub async fn drain_with_max_attempts(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    max_attempts: MaxAttempts,
 ) -> DrainResult {
     drain_with_live_token(
         spool,
@@ -507,22 +1325,23 @@ pub async fn drain(
         total_budget,
         per_event_timeout,
         live_static_token().as_deref(),
+        max_attempts,
     )
     .await
 }
 
-/// [`drain`] with the current static bearer supplied explicitly.
+/// [`drain_with_max_attempts`] with the current static bearer supplied explicitly.
 ///
-/// The environment is read once, at the boundary in [`drain`], and passed down
-/// as data. Tests drive this directly: mutating process-wide environment from a
-/// test would race every other test in the binary, and `set_var` is `unsafe` in
-/// this edition — which this workspace forbids outright.
+/// The live token and retry policy are resolved at the command boundary and
+/// passed down as data. Tests drive this directly, so drain behavior is isolated
+/// from ambient process configuration.
 pub async fn drain_with_live_token(
     spool: &Path,
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
     live_token: Option<&str>,
+    max_attempts: MaxAttempts,
 ) -> DrainResult {
     let (mut files, unreadable) = match list_entries(spool) {
         Ok(listed) => listed,
@@ -551,6 +1370,7 @@ pub async fn drain_with_live_token(
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut profile_tokens = ProfileTokens::new(data_dir);
     let mut result = DrainResult::default();
+    let max_attempts = max_attempts.0;
 
     let mut idx = 0;
     let mut batch_supported = true;
@@ -564,8 +1384,11 @@ pub async fn drain_with_live_token(
     //
     // Recording the dead endpoint lets the pass skip its entries (without
     // charging attempts they did not earn) and carry on to entries addressed
-    // somewhere that answers. A total outage is unchanged: every entry shares
-    // the one dead endpoint, so the pass still ends having burnt one attempt.
+    // somewhere that answers. A total outage keeps the same pass shape —
+    // every entry shares the one dead endpoint — but no longer costs an
+    // attempt: an endpoint-level miss never charges the entry's retry
+    // budget, so an outage is ridden out (bounded by the 10k file cap and
+    // the 7-day TTL) instead of deleting the oldest events.
     let mut unreachable_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // Resolved on first need only — a healthy drain never reads the config.
@@ -588,7 +1411,7 @@ pub async fn drain_with_live_token(
             continue;
         }
         if body_is_malformed(&entry) {
-            bump_or_drop(&path, &entry, &mut result);
+            bump_or_drop(&path, &entry, max_attempts, &mut result);
             continue;
         }
 
@@ -612,7 +1435,7 @@ pub async fn drain_with_live_token(
                     continue;
                 };
                 if body_is_malformed(&next_entry) {
-                    bump_or_drop(&next_path, &next_entry, &mut result);
+                    bump_or_drop(&next_path, &next_entry, max_attempts, &mut result);
                     continue;
                 }
                 // A profile entry never shares a request with another route,
@@ -640,7 +1463,7 @@ pub async fn drain_with_live_token(
             }
 
             let Some(payload) = batch_payload(&chunk) else {
-                bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                 result.remaining += chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                 break;
             };
@@ -651,6 +1474,34 @@ pub async fn drain_with_live_token(
             let batch_timeout =
                 batch_request_timeout(per_event_timeout, remaining_budget, chunk.len());
             match post_batch(&client, &base, &payload, bearer.as_deref(), batch_timeout).await {
+                BatchOutcome::Detailed {
+                    outcomes,
+                    failed_index,
+                } => {
+                    if outcomes.len() > chunk.len()
+                        || failed_index.is_some_and(|index| index >= chunk.len())
+                    {
+                        bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
+                        result.remaining +=
+                            chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
+                        break;
+                    }
+                    for ((path, entry), outcome) in chunk.iter().zip(&outcomes) {
+                        settle_item(path, entry, outcome, max_attempts, &mut result);
+                    }
+                    if let Some(failed_index) = failed_index {
+                        bump_or_drop(
+                            &chunk[failed_index].0,
+                            &chunk[failed_index].1,
+                            max_attempts,
+                            &mut result,
+                        );
+                    }
+                    result.remaining += chunk
+                        .len()
+                        .saturating_sub(outcomes.len())
+                        .saturating_sub(usize::from(failed_index.is_some()));
+                }
                 BatchOutcome::Accepted(k) => {
                     let k = k.min(chunk.len());
                     for (path, _) in &chunk[..k] {
@@ -662,7 +1513,7 @@ pub async fn drain_with_live_token(
                         // (fail-fast). Charge it a failed attempt and skip past it
                         // so a single bad event can't wedge the rest — the
                         // per-event loop also advances past a failed entry.
-                        bump_or_drop(&chunk[k].0, &chunk[k].1, &mut result);
+                        bump_or_drop(&chunk[k].0, &chunk[k].1, max_attempts, &mut result);
                         result.remaining +=
                             chunk.len().saturating_sub(k + 1) + files.len().saturating_sub(idx);
                         break;
@@ -675,7 +1526,12 @@ pub async fn drain_with_live_token(
                     let sent = delete_accepted_indices(&chunk, &indices);
                     result.sent += sent;
                     if let Some(failed_index) = failed_index.and_then(|i| chunk.get(i).map(|_| i)) {
-                        bump_or_drop(&chunk[failed_index].0, &chunk[failed_index].1, &mut result);
+                        bump_or_drop(
+                            &chunk[failed_index].0,
+                            &chunk[failed_index].1,
+                            max_attempts,
+                            &mut result,
+                        );
                         result.remaining += chunk.len().saturating_sub(sent).saturating_sub(1)
                             + files.len().saturating_sub(idx);
                         break;
@@ -734,7 +1590,7 @@ pub async fn drain_with_live_token(
                                 result.remaining += 1;
                             }
                             PostOutcome::Failed => {
-                                bump_or_drop(path, entry, &mut result);
+                                bump_or_drop(path, entry, max_attempts, &mut result);
                             }
                             PostOutcome::Refused => {
                                 // Never retried: see `PostOutcome::Refused`.
@@ -745,9 +1601,11 @@ pub async fn drain_with_live_token(
                             }
                             PostOutcome::Unreachable => {
                                 // Same reasoning as the batch arm: the address
-                                // is dead, not the entry. Charge it once, then
-                                // skip its siblings for the rest of the pass.
-                                bump_or_drop(path, entry, &mut result);
+                                // is dead, not the entry — an endpoint-level
+                                // outage never charges the retry budget. Leave
+                                // it queued and skip its siblings for the rest
+                                // of the pass.
+                                result.remaining += 1;
                                 unreachable_endpoints.insert(batch_endpoint(&entry.url));
                             }
                             PostOutcome::Unauthorized => {
@@ -777,7 +1635,7 @@ pub async fn drain_with_live_token(
                                     let _ = std::fs::remove_file(path);
                                     result.sent += 1;
                                 } else {
-                                    bump_or_drop(path, entry, &mut result);
+                                    bump_or_drop(path, entry, max_attempts, &mut result);
                                 }
                             }
                         }
@@ -814,6 +1672,10 @@ pub async fn drain_with_live_token(
                         (rerooted != base).then_some(rerooted)
                     });
 
+                    // Whether the configured-address retry reached a server
+                    // that answered — any HTTP status is post-connect and
+                    // keeps today's charging semantics for the entry tried.
+                    let mut reroot_answered = false;
                     if let Some(rerooted) = retry {
                         match post_batch(
                             &client,
@@ -824,6 +1686,10 @@ pub async fn drain_with_live_token(
                         )
                         .await
                         {
+                            BatchOutcome::Detailed { outcomes, .. } => {
+                                settle_retried_detailed(&chunk, &outcomes, &mut result);
+                                continue;
+                            }
                             BatchOutcome::Accepted(k) => {
                                 let k = k.min(chunk.len());
                                 for (path, _) in &chunk[..k] {
@@ -839,17 +1705,37 @@ pub async fn drain_with_live_token(
                                 result.remaining += chunk.len().saturating_sub(sent);
                                 continue;
                             }
-                            // The configured address is no better. Fall through
-                            // to the skip path below rather than trying again.
-                            _ => {}
+                            // The configured address is itself unreachable:
+                            // still an endpoint-level outage — fall through to
+                            // the no-charge skip path below.
+                            BatchOutcome::Unreachable => {}
+                            // The configured address answered but did not take
+                            // the batch: post-connect, charge conservatively as
+                            // before the outage fix.
+                            _ => {
+                                reroot_answered = true;
+                            }
                         }
                     }
 
-                    // Charge the entry actually tried so a permanently dead
-                    // address still ages out, mark the endpoint, and keep
-                    // going: entries addressed elsewhere are still deliverable.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
-                    result.remaining += chunk.len().saturating_sub(1);
+                    if reroot_answered {
+                        // A server answered and refused: charge the entry
+                        // actually tried, mark the endpoint, and keep going:
+                        // entries addressed elsewhere are still deliverable.
+                        bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
+                        result.remaining += chunk.len().saturating_sub(1);
+                    } else {
+                        // Endpoint-level outage: no server was ever reached,
+                        // so the entry did not fail delivery — leave the whole
+                        // chunk queued WITHOUT charging attempts. Charging
+                        // here burnt the queue head's budget once per pass,
+                        // deleting the OLDEST events at ~1 per `max_attempts`
+                        // passes while the server was down — structural data
+                        // loss ahead of the 7-day TTL. A permanently dead
+                        // address stays bounded by that TTL and the 10k file
+                        // cap instead.
+                        result.remaining += chunk.len();
+                    }
                     unreachable_endpoints.insert(base.clone());
                     continue;
                 }
@@ -873,6 +1759,10 @@ pub async fn drain_with_live_token(
                         match post_batch(&client, &base, &payload, Some(&token), batch_timeout)
                             .await
                         {
+                            BatchOutcome::Detailed { outcomes, .. } => {
+                                settle_retried_detailed(&chunk, &outcomes, &mut result);
+                                continue;
+                            }
                             BatchOutcome::Accepted(k) => {
                                 let k = k.min(chunk.len());
                                 for (path, _) in &chunk[..k] {
@@ -897,7 +1787,7 @@ pub async fn drain_with_live_token(
 
                     // Same conservative accounting as `Failed`: the server
                     // refused the whole batch, so nothing in it was processed.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                     result.remaining +=
                         chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                     break;
@@ -910,7 +1800,7 @@ pub async fn drain_with_live_token(
                     // conservatively and leave the rest queued for a future pass so
                     // a timeout cannot burn attempts for events that may never have
                     // been attempted.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                     result.remaining +=
                         chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                     break;
@@ -941,10 +1831,14 @@ pub async fn drain_with_live_token(
                     result.dropped += 1;
                 }
                 PostOutcome::Failed => {
-                    bump_or_drop(&path, &entry, &mut result);
+                    bump_or_drop(&path, &entry, max_attempts, &mut result);
                 }
                 PostOutcome::Unreachable => {
-                    bump_or_drop(&path, &entry, &mut result);
+                    // Endpoint-level outage: the address is dead, not the
+                    // entry — leave it queued without charging attempts (the
+                    // batch arm above explains why), and skip its siblings
+                    // for the rest of the pass.
+                    result.remaining += 1;
                     unreachable_endpoints.insert(batch_endpoint(&entry.url));
                 }
                 PostOutcome::Unauthorized => {
@@ -974,13 +1868,98 @@ pub async fn drain_with_live_token(
                         let _ = std::fs::remove_file(&path);
                         result.sent += 1;
                     } else {
-                        bump_or_drop(&path, &entry, &mut result);
+                        bump_or_drop(&path, &entry, max_attempts, &mut result);
                     }
                 }
             }
         }
     }
     result
+}
+
+/// What a drain does with one spooled entry once a modern server has answered
+/// it with a per-item batch outcome. Every drain path (correlated, batched,
+/// rerooted and token-retried) routes through this one table so they cannot
+/// disagree about which outcomes end an entry's life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemDisposition {
+    /// The server holds the event: delete it and count it durable.
+    Durable,
+    /// The server has decided never to store this event (capture policy,
+    /// disabled subagent capture, no write access, identity collision,
+    /// unstorable payload). Re-sending gets the same verdict forever, so
+    /// delete it and count it dropped.
+    Dropped,
+    /// Unknown outcome (a newer server): keep it and charge an attempt.
+    Retry,
+}
+
+fn item_disposition(outcome: &str, entry: &SpoolEntry) -> ItemDisposition {
+    match outcome {
+        // `resumed` is only returned after the server completed the keyed
+        // ingest of an observation an earlier delivery already stored, so a
+        // redelivery would come back `replayed`: the event is durable.
+        "stored" | "replayed" | "resumed" => ItemDisposition::Durable,
+        "ignored_end" if entry_event(entry).as_deref() == Some("session-end") => {
+            ItemDisposition::Durable
+        }
+        // The server only emits `ignored_end` for SessionEnd; any other
+        // carrier is a verdict that will not change on redelivery.
+        "ignored_end" => ItemDisposition::Dropped,
+        dropped if dropped.starts_with("dropped_") => ItemDisposition::Dropped,
+        _ => ItemDisposition::Retry,
+    }
+}
+
+/// Apply [`item_disposition`] to one entry of a first-attempt batch reply.
+fn settle_item(
+    path: &Path,
+    entry: &SpoolEntry,
+    outcome: &str,
+    max_attempts: u32,
+    result: &mut DrainResult,
+) {
+    match item_disposition(outcome, entry) {
+        ItemDisposition::Durable => {
+            let _ = std::fs::remove_file(path);
+            result.sent += 1;
+            result.durable += 1;
+        }
+        ItemDisposition::Dropped => {
+            let _ = std::fs::remove_file(path);
+            result.dropped += 1;
+        }
+        ItemDisposition::Retry => bump_or_drop(path, entry, max_attempts, result),
+    }
+}
+
+/// Settle a detailed reply to a retried request (rerooted address or live
+/// token). Durable and dropped entries leave the spool; anything else stays
+/// queued uncharged, because the first request already charged nothing for
+/// these entries and the retry path never charges.
+fn settle_retried_detailed(
+    chunk: &[(PathBuf, SpoolEntry)],
+    outcomes: &[String],
+    result: &mut DrainResult,
+) {
+    let mut settled = 0usize;
+    for ((path, entry), outcome) in chunk.iter().zip(outcomes) {
+        match item_disposition(outcome, entry) {
+            ItemDisposition::Durable => {
+                let _ = std::fs::remove_file(path);
+                result.sent += 1;
+                result.durable += 1;
+                settled += 1;
+            }
+            ItemDisposition::Dropped => {
+                let _ = std::fs::remove_file(path);
+                result.dropped += 1;
+                settled += 1;
+            }
+            ItemDisposition::Retry => {}
+        }
+    }
+    result.remaining += chunk.len().saturating_sub(settled);
 }
 
 fn delete_accepted_indices(chunk: &[(PathBuf, SpoolEntry)], indices: &[usize]) -> usize {
@@ -1006,8 +1985,71 @@ fn batch_request_timeout(
         .min(remaining_budget)
 }
 
+fn completed_tombstone_for_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".json") else {
+        return false;
+    };
+    let Some(coordinate_key) = stem.rsplit('-').next() else {
+        return false;
+    };
+    let Some(created_ms) = created_ms_from_name(name) else {
+        return false;
+    };
+    let Some(spool) = path.parent() else {
+        return false;
+    };
+    let Ok(directories) = std::fs::read_dir(spool.join(RECOVERY_DIR)) else {
+        return false;
+    };
+    let mut matches = 0usize;
+    for directory in directories.take(MAX_RECOVERY_SWEEP_DIRS).flatten() {
+        let marker = directory.path().join(RECOVERY_COMPLETED_FILE);
+        let Ok(spec) = read_recovery_match(&marker) else {
+            continue;
+        };
+        if spec.coordinate_key == coordinate_key
+            && created_ms >= spec.interval_started_ms
+            && created_ms <= spec.interval_ended_ms
+        {
+            matches += 1;
+            if matches > 1 {
+                return false;
+            }
+        }
+    }
+    matches == 1
+}
+
+fn read_spool_entry_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = File::open(path)?;
+    if file.metadata()?.len() > MAX_SPOOL_ENTRY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "spool entry exceeds its byte limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SPOOL_ENTRY_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SPOOL_ENTRY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "spool entry exceeds its byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> {
-    let Ok(bytes) = std::fs::read(path) else {
+    if completed_tombstone_for_path(path) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    let Ok(bytes) = read_spool_entry_bytes(path) else {
         result.remaining += 1;
         return None;
     };
@@ -1165,7 +2207,7 @@ impl<'a> ProfileTokens<'a> {
 /// a stale port in one is unambiguous — nothing else could have been meant. A
 /// remote host is left alone: re-pointing it would misdeliver a spool that was
 /// deliberately captured against another server.
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let rest = match url.split_once("://") {
         Some((_, rest)) => rest,
         None => url,
@@ -1208,6 +2250,13 @@ fn configured_server_url(data_dir: &Path) -> Option<String> {
 /// The `/hook/batch` URL for a spooled per-event URL: strip the `?…` query and
 /// append `/batch` (a spooled URL ends in `…/hook` before its query). Entries
 /// whose endpoint string matches can ride one batch request.
+fn entry_event(entry: &SpoolEntry) -> Option<String> {
+    reqwest::Url::parse(&entry.url)
+        .ok()?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "event").then(|| value.into_owned()))
+}
+
 fn batch_endpoint(url: &str) -> String {
     let path = url.split('?').next().unwrap_or(url);
     format!("{path}/batch")
@@ -1234,12 +2283,12 @@ fn batch_payload(items: &[(PathBuf, SpoolEntry)]) -> Option<String> {
 }
 
 /// Charge a spooled entry a failed delivery attempt: drop it once it reaches
-/// `MAX_ATTEMPTS`, else persist the bumped count for the next boundary. Updates
+/// the configured limit (unless zero), else persist the bumped count. Updates
 /// `result.dropped` / `result.remaining` accordingly.
-fn bump_or_drop(path: &Path, entry: &SpoolEntry, result: &mut DrainResult) {
+fn bump_or_drop(path: &Path, entry: &SpoolEntry, max_attempts: u32, result: &mut DrainResult) {
     let mut bumped = entry.clone();
     bumped.attempts = bumped.attempts.saturating_add(1);
-    if bumped.attempts >= MAX_ATTEMPTS {
+    if max_attempts != 0 && bumped.attempts >= max_attempts {
         let _ = std::fs::remove_file(path);
         result.dropped += 1;
     } else {
@@ -1286,28 +2335,6 @@ pub async fn resolve_bearer(
     crate::auth_bearer::resolve_bearer(client, &data_dir.join("auth.json"), auth_token).await
 }
 
-fn prune_spool_file_count(spool: &Path) {
-    let Ok((mut files, _)) = list_entries(spool) else {
-        return;
-    };
-    let excess = files.len().saturating_sub(MAX_SPOOL_FILES);
-    if excess == 0 {
-        return;
-    }
-    files.sort();
-    // The spool is at its hard cap: the oldest events are about to be deleted
-    // WITHOUT ever reaching the server — silent capture loss otherwise. Surface
-    // it on stderr (never stdout, which carries the hook's JSON protocol output)
-    // so a sustained backlog dropping events is visible, not invisible.
-    eprintln!(
-        "ai-memory: hook-spool at capacity ({} > {MAX_SPOOL_FILES}); evicting {excess} oldest UNDELIVERED event(s)",
-        files.len()
-    );
-    for path in files.into_iter().take(excess) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 /// List `*.json` spool files (ignoring in-flight `*.json.tmp`), or None when the
 /// directory doesn't exist yet.
 /// Spool files awaiting delivery, or the IO error that prevented listing them.
@@ -1332,6 +2359,9 @@ fn list_entries(spool: &Path) -> std::io::Result<(Vec<PathBuf>, usize)> {
                 let path = ent.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("json") {
                     out.push(path);
+                    if out.len() > MAX_SPOOL_FILES {
+                        break;
+                    }
                 }
             }
             Err(_) => unreadable += 1,
@@ -1343,6 +2373,495 @@ fn list_entries(spool: &Path) -> std::io::Result<(Vec<PathBuf>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correlated_session_entries_quarantine_and_restore_without_touching_others() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let matching = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project&session_id=native-1".into(),
+            body: r#"{"session_id":"native-1","cwd":"/repo","prompt":"same prompt"}"#.into(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let other = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&workspace=ws&project=project&session_id=native-2".into(),
+            body: r#"{"session_id":"native-2","cwd":"/repo","prompt":"other"}"#.into(),
+            ..matching.clone()
+        };
+        enqueue(&spool, &matching).unwrap();
+        enqueue(&spool, &other).unwrap();
+        let quarantine = quarantine_session_entries(
+            &crate::config::Config::default(),
+            &spool,
+            "journal-1",
+            matching.created_ms.saturating_sub(1),
+            matching.created_ms.saturating_add(1),
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            "native-1",
+        )
+        .unwrap();
+        assert_eq!(spool_len(&spool), 1);
+        quarantine.restore(&spool).unwrap();
+        assert_eq!(spool_len(&spool), 2);
+    }
+
+    /// A quarantine whose `.active` marker is gone because the interval
+    /// already completed restores as already-delivered instead of erroring —
+    /// including when a rerun rewrote a fresh `.active` over the completed
+    /// tombstone — while a directory with neither marker is still an error.
+    #[test]
+    fn restore_treats_a_completed_interval_as_already_delivered() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let quarantine = |journal: &str| {
+            quarantine_session_entries(
+                &crate::config::Config::default(),
+                &spool,
+                journal,
+                0,
+                u64::MAX,
+                "http://127.0.0.1:49374",
+                "claude-code",
+                "ws",
+                "project",
+                Path::new("/repo"),
+                "native-1",
+            )
+        };
+        let interval_dir = |journal: &str| {
+            spool
+                .join(RECOVERY_DIR)
+                .join(recovery_interval_key(journal).unwrap())
+        };
+        let completed = quarantine("journal-done").unwrap();
+        assert!(completed.complete_spool_only().unwrap());
+        assert_eq!(
+            completed.restore(&spool).unwrap(),
+            RestoreOutcome::AlreadyDelivered,
+            "a missing .active beside a completed marker means durable delivery"
+        );
+        let rerun = quarantine("journal-done").unwrap();
+        assert!(
+            interval_dir("journal-done")
+                .join(RECOVERY_MATCH_FILE)
+                .is_file(),
+            "the rerun rewrites .active over the completed tombstone"
+        );
+        assert_eq!(
+            rerun.restore(&spool).unwrap(),
+            RestoreOutcome::AlreadyDelivered,
+            "a rerun's rewritten .active never re-opens a completed interval"
+        );
+        assert!(
+            interval_dir("journal-done")
+                .join(RECOVERY_COMPLETED_FILE)
+                .is_file()
+        );
+        assert!(
+            !interval_dir("journal-done")
+                .join(RECOVERY_MATCH_FILE)
+                .is_file()
+        );
+
+        let broken = quarantine("journal-broken").unwrap();
+        std::fs::remove_file(interval_dir("journal-broken").join(RECOVERY_MATCH_FILE)).unwrap();
+        assert!(
+            broken.restore(&spool).is_err(),
+            "a directory with neither marker is still an error"
+        );
+    }
+
+    #[test]
+    fn quarantine_matching_reuses_every_canonical_nested_hook_context_shape() {
+        let base = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: String::new(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let matching = [
+            serde_json::json!({"info": {"id": "native-1", "directory": "/repo"}}),
+            serde_json::json!({"properties": {"session_id": "native-1", "cwd": "/repo"}}),
+            serde_json::json!({"properties": {"sessionID": "native-1", "cwd": "/repo"}}),
+            serde_json::json!({"properties": {"info": {"id": "native-1", "directory": "/repo"}}}),
+            serde_json::json!({"event": {"sessionId": "native-1", "working_dir": "/repo"}}),
+            serde_json::json!({"event": {"properties": {"sessionID": "native-1", "cwd": "/repo"}}}),
+            serde_json::json!({"event": {"properties": {"info": {"id": "native-1", "directory": "/repo"}}}}),
+            serde_json::json!({"payload": {"conversationId": "native-1", "directory": "/repo"}}),
+            serde_json::json!({"payload": {"path": {"session": "native-1", "cwd": "/repo"}}}),
+            serde_json::json!({"payload": {"info": {"id": "native-1", "directory": "/repo"}}}),
+            serde_json::json!({"payload": {"properties": {"sessionID": "native-1", "cwd": "/repo"}}}),
+            serde_json::json!({"payload": {"properties": {"info": {"id": "native-1", "directory": "/repo"}}}}),
+        ];
+        for body in matching {
+            let entry = SpoolEntry {
+                body: body.to_string(),
+                ..base.clone()
+            };
+            assert!(spool_entry_matches_session(
+                &entry,
+                "http://127.0.0.1:49374",
+                "claude-code",
+                None,
+                "ws",
+                "project",
+                Path::new("/repo"),
+                "native-1",
+            ));
+        }
+        for body in [
+            serde_json::json!({"payload": {"info": {"id": "other", "directory": "/repo"}}}),
+            serde_json::json!({"payload": {"info": {"id": "native-1", "directory": "/other"}}}),
+            serde_json::json!({"payload": {"info": {"id": "native-1"}}, "unrelated": {"cwd": "/repo"}}),
+        ] {
+            let entry = SpoolEntry {
+                body: body.to_string(),
+                ..base.clone()
+            };
+            assert!(!spool_entry_matches_session(
+                &entry,
+                "http://127.0.0.1:49374",
+                "claude-code",
+                None,
+                "ws",
+                "project",
+                Path::new("/repo"),
+                "native-1",
+            ));
+        }
+    }
+
+    #[test]
+    fn quarantine_matches_partial_scope_and_captures_late_enqueue() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("project");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"ws\"\nproject = \"project\"\n",
+        )
+        .unwrap();
+        let spool = temp.path().join("hook-spool");
+        let config = crate::config::Config::default();
+        let base = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws".into(),
+            body: serde_json::json!({"session_id":"native-1","cwd":repo,"prompt":"one"})
+                .to_string(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        enqueue_with_config(&spool, &base, Some(&config)).unwrap();
+        let quarantine = quarantine_session_entries(
+            &config,
+            &spool,
+            "journal-partial",
+            base.created_ms.saturating_sub(1),
+            base.created_ms.saturating_add(1),
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            &repo,
+            "native-1",
+        )
+        .unwrap();
+        assert_eq!(
+            quarantine.len(),
+            1,
+            "workspace-only event is correlated by cwd"
+        );
+        enqueue_with_config(
+            &spool,
+            &SpoolEntry {
+                url: "http://127.0.0.1:49374/hook?event=stop&agent=claude-code&project=project"
+                    .into(),
+                body: serde_json::json!({"session_id":"native-1","cwd":repo}).to_string(),
+                ..base.clone()
+            },
+            Some(&config),
+        )
+        .unwrap();
+        assert_eq!(
+            quarantine.len(),
+            2,
+            "late enqueue joins the active quarantine"
+        );
+        assert_eq!(spool_len(&spool), 0, "neither correlated event can drain");
+        quarantine.restore(&spool).unwrap();
+        assert_eq!(spool_len(&spool), 2);
+    }
+
+    #[test]
+    fn enqueue_is_bounded_when_recovery_coordination_lock_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let lock = open_recovery_coord_lock(&spool).unwrap();
+        lock.lock_exclusive().unwrap();
+        let entry = entry_for(
+            "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            r#"{"session_id":"native-1","cwd":"/repo","prompt":"late"}"#.into(),
+            None,
+            false,
+        );
+        let started = Instant::now();
+        enqueue(&spool, &entry).unwrap();
+        // The guard is against blocking on the held lock, which would hang;
+        // the bound leaves room for fsync on a loaded CI disk.
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(spool_len(&spool), 1, "content is retained for recovery");
+    }
+
+    #[test]
+    fn enqueue_keeps_the_event_when_the_capacity_lock_stays_held() {
+        // Another enqueuer stuck holding the capacity lock past the wait used
+        // to make this one delete its temp file and return Ok: a silent loss.
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let lock = open_spool_capacity_lock(&spool).unwrap();
+        lock.lock_exclusive().unwrap();
+        let entry = entry_for(
+            "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code".into(),
+            r#"{"session_id":"native-1","prompt":"contended"}"#.into(),
+            None,
+            false,
+        );
+        let started = Instant::now();
+        enqueue(&spool, &entry).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= SPOOL_CAPACITY_LOCK_WAIT,
+            "waits for the holder first"
+        );
+        // Generous for loaded CI and Windows sleep granularity; the point is
+        // that the wait is bounded, not an exact figure.
+        assert!(elapsed < Duration::from_secs(1), "the wait is bounded");
+        assert_eq!(spool_len(&spool), 1, "the contended event is spooled");
+
+        // A holder that lets go inside the wait is simply waited out.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(lock);
+        });
+        enqueue(&spool, &entry).unwrap();
+        releaser.join().unwrap();
+        assert_eq!(spool_len(&spool), 2);
+    }
+
+    #[test]
+    fn completion_race_leaves_contended_enqueue_safe_for_tombstone_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let config = crate::config::Config::default();
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: r#"{"session_id":"native-1","cwd":"/repo","prompt":"late"}"#.into(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let quarantine = quarantine_session_entries(
+            &config,
+            &spool,
+            "journal",
+            entry.created_ms.saturating_sub(1),
+            entry.created_ms.saturating_add(1),
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            "native-1",
+        )
+        .unwrap();
+        PAUSE_ENQUEUE_AFTER_MAIN_RENAME.store(true, Ordering::SeqCst);
+        ENQUEUE_REACHED_RECOVERY_WINDOW.store(false, Ordering::SeqCst);
+        let enqueue_spool = spool.clone();
+        let enqueue_config = config.clone();
+        let enqueue = std::thread::spawn(move || {
+            enqueue_with_config(&enqueue_spool, &entry, Some(&enqueue_config)).unwrap()
+        });
+        while !ENQUEUE_REACHED_RECOVERY_WINDOW.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        quarantine.complete().unwrap();
+        PAUSE_ENQUEUE_AFTER_MAIN_RENAME.store(false, Ordering::SeqCst);
+        enqueue.join().unwrap();
+        let mut result = DrainResult::default();
+        if let Some(path) = list_entries(&spool).unwrap().0.into_iter().next() {
+            assert!(load_live_entry(&path, &mut result).is_none());
+        }
+        assert_eq!(spool_len(&spool), 0, "completed tombstone removes overlap");
+    }
+
+    #[test]
+    fn completed_recovery_tombstone_retires_late_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: r#"{"session_id":"native-1","cwd":"/repo","prompt":"late"}"#.into(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let quarantine = quarantine_session_entries(
+            &crate::config::Config::default(),
+            &spool,
+            "journal",
+            entry.created_ms.saturating_sub(1),
+            entry.created_ms.saturating_add(1),
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            "native-1",
+        )
+        .unwrap();
+        quarantine.complete().unwrap();
+        enqueue(&spool, &entry).unwrap();
+        assert_eq!(spool_len(&spool), 0, "late overlap must not be delivered");
+    }
+
+    /// The completed tombstone is bounded by its interval: a hook from a
+    /// LATER resume of the same native session is fresh evidence and must be
+    /// delivered, never swallowed by the earlier interval's tombstone.
+    #[test]
+    fn completed_tombstone_keeps_a_later_resume_of_the_same_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let interval_ended = now_ms().saturating_sub(60_000);
+        let quarantine = quarantine_session_entries(
+            &crate::config::Config::default(),
+            &spool,
+            "journal",
+            interval_ended.saturating_sub(1_000),
+            interval_ended,
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            "native-1",
+        )
+        .unwrap();
+        quarantine.complete().unwrap();
+        let later_resume = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: r#"{"session_id":"native-1","cwd":"/repo","prompt":"from a later resume"}"#.into(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        enqueue(&spool, &later_resume).unwrap();
+        assert_eq!(
+            spool_len(&spool),
+            1,
+            "a hook from a later resume must stay queued for delivery"
+        );
+        let path = list_entries(&spool).unwrap().0.into_iter().next().unwrap();
+        let mut result = DrainResult::default();
+        assert!(
+            load_live_entry(&path, &mut result).is_some(),
+            "the drain path must deliver, not drop, post-interval evidence"
+        );
+        assert_eq!(result.dropped, 0);
+    }
+
+    /// Completing one interval only ever consumes its own correlated entries:
+    /// another interval's quarantine keeps its evidence, keeps capturing its
+    /// late hooks, and an entry attributable to two intervals at once fails
+    /// closed into the main spool instead of being attributed by guesswork.
+    #[test]
+    fn completing_one_recovery_interval_leaves_the_other_intervals_entries_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let config = crate::config::Config::default();
+        let first_ms = now_ms().saturating_sub(120_000);
+        let second_ms = first_ms + 60_000;
+        let entry = |created_ms: u64, prompt: &str| {
+            SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: format!(r#"{{"session_id":"native-1","cwd":"/repo","prompt":"{prompt}"}}"#),
+            created_ms,
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        }
+        };
+        let quarantine = |journal: &str, started: u64, ended: u64| {
+            quarantine_session_entries(
+                &config,
+                &spool,
+                journal,
+                started,
+                ended,
+                "http://127.0.0.1:49374",
+                "claude-code",
+                "ws",
+                "project",
+                Path::new("/repo"),
+                "native-1",
+            )
+        };
+        enqueue(&spool, &entry(first_ms, "first interval")).unwrap();
+        enqueue(&spool, &entry(second_ms, "second interval")).unwrap();
+        let first = quarantine("journal-a", first_ms - 1, first_ms + 1).unwrap();
+        let second = quarantine("journal-b", second_ms - 1, second_ms + 1).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(spool_len(&spool), 0);
+
+        first.complete().unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "completing one interval never deletes another interval's correlated entries"
+        );
+        enqueue(&spool, &entry(second_ms, "second interval late hook")).unwrap();
+        assert_eq!(
+            second.len(),
+            2,
+            "the still-active interval keeps capturing its own late hooks"
+        );
+        assert_eq!(spool_len(&spool), 0);
+
+        let overlapping = quarantine("journal-c", second_ms - 1, second_ms + 1).unwrap();
+        assert_eq!(
+            overlapping.len(),
+            0,
+            "the new interval claims nothing already attributed to journal-b"
+        );
+        enqueue(&spool, &entry(second_ms, "attributable to both")).unwrap();
+        assert_eq!(
+            spool_len(&spool),
+            1,
+            "an entry two intervals could own fails closed into the main spool"
+        );
+        second.restore(&spool).unwrap();
+        assert_eq!(spool_len(&spool), 3);
+    }
 
     #[test]
     fn entry_for_picks_auth_mode() {
@@ -1516,7 +3035,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_prunes_oldest_files_when_spool_exceeds_limit() {
+    fn enqueue_refuses_new_entries_when_spool_reaches_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
         for i in 0..(MAX_SPOOL_FILES + 2) {
@@ -1537,7 +3056,77 @@ mod tests {
             .iter()
             .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
             .collect();
-        assert!(bodies.iter().all(|entry| entry.created_ms >= 2));
+        assert!(
+            bodies
+                .iter()
+                .all(|entry| entry.created_ms < MAX_SPOOL_FILES as u64)
+        );
+    }
+
+    #[test]
+    fn capacity_tracks_current_global_occupancy_across_restart_and_quarantine() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(temp.path());
+        for cycle in 0..(MAX_SPOOL_FILES * 3) {
+            let entry = entry_for(
+                format!("https://x/hook?event={cycle}"),
+                "{}".into(),
+                None,
+                false,
+            );
+            enqueue(&spool, &entry).unwrap();
+            let path = list_entries(&spool).unwrap().0.into_iter().next().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+        let accepted = entry_for(
+            "https://x/hook?event=accepted".into(),
+            "{}".into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &accepted).unwrap();
+        assert_eq!(total_spool_entries(&spool).unwrap(), 1);
+        std::fs::remove_file(list_entries(&spool).unwrap().0[0].clone()).unwrap();
+
+        let quarantine = spool.join(RECOVERY_DIR).join("full");
+        std::fs::create_dir_all(&quarantine).unwrap();
+        for index in 0..MAX_SPOOL_FILES {
+            std::fs::write(quarantine.join(format!("{index}.json")), b"{}").unwrap();
+        }
+        enqueue(&spool, &accepted).unwrap();
+        assert_eq!(
+            spool_len(&spool),
+            0,
+            "active quarantines count toward the cap"
+        );
+    }
+
+    #[test]
+    fn oversized_spool_entry_is_refused_before_read_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.json");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SPOOL_ENTRY_BYTES + 1).unwrap();
+        let error = read_spool_entry_bytes(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn tombstone_sweep_is_global_and_bounded_by_age_and_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(temp.path());
+        let recovery = spool.join(RECOVERY_DIR);
+        std::fs::create_dir_all(&recovery).unwrap();
+        for index in 0..(MAX_RECOVERY_TOMBSTONES + 2) {
+            let dir = recovery.join(format!("done-{index:04}"));
+            std::fs::create_dir(&dir).unwrap();
+            write_private(&dir.join(RECOVERY_COMPLETED_FILE), b"done").unwrap();
+        }
+        sweep_recovery_tombstones(&spool).unwrap();
+        assert!(
+            std::fs::read_dir(&recovery).unwrap().count() <= MAX_RECOVERY_TOMBSTONES,
+            "completed tombstones are globally count-bounded"
+        );
     }
 
     #[tokio::test]
@@ -1565,6 +3154,202 @@ mod tests {
         assert_eq!(r.remaining, 2);
         // Files survive for the next boundary.
         assert_eq!(list_entries(&spool).unwrap().0.len(), 2);
+    }
+
+    /// Adversarial regression for the outage-charging defect: while the
+    /// server is totally down, every drain pass hits the queue head with an
+    /// endpoint-level unreachable (connect refused — nothing is listening).
+    /// With the default `max_attempts`, the pre-fix drain charged the head
+    /// once per pass, deleting the OLDEST events at ~1 per `max_attempts`
+    /// passes DURING the outage — structural data loss well inside the
+    /// 7-day TTL. An unreachable must not charge the attempt budget.
+    #[tokio::test]
+    async fn unreachable_outage_never_charges_attempt_budget() {
+        // A port with nothing on it: bind, read the address, then drop.
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{dead}/hook?event=e{i}"),
+            );
+        }
+
+        // Far more passes than the default MAX_ATTEMPTS: an outage, however
+        // long, must never consume retry budget.
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let r = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(200),
+                MaxAttempts::new(MAX_ATTEMPTS),
+            )
+            .await;
+            assert_eq!(r.sent, 0);
+            assert_eq!(r.dropped, 0, "an unreachable endpoint must not drop events");
+            assert_eq!(r.remaining, 3);
+        }
+
+        // ALL entries survive the outage untouched.
+        assert_eq!(
+            sorted_attempts(&spool),
+            vec![0, 0, 0],
+            "no entry may be charged while the server is unreachable"
+        );
+    }
+
+    /// The recovery half of the outage contract: once the server comes back
+    /// on the same port, the next pass delivers the entire backlog that
+    /// rode out the outage.
+    #[tokio::test]
+    async fn outage_then_recovery_delivers_the_entire_backlog() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Phase 1 — outage: nothing listens where the events were captured.
+        let dead_addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{dead_addr}/hook?event=e{i}"),
+            );
+        }
+
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let r = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(200),
+                MaxAttempts::new(MAX_ATTEMPTS),
+            )
+            .await;
+            assert_eq!(r.dropped, 0);
+            assert_eq!(r.remaining, 3);
+        }
+        assert_eq!(sorted_attempts(&spool), vec![0, 0, 0]);
+
+        // Phase 2 — recovery: the server restarts on the same port. The
+        // listener never accepted, so the port carries no TIME_WAIT and the
+        // rebind is immediate.
+        let listener = tokio::net::TcpListener::bind(dead_addr)
+            .await
+            .expect("restart on the same port after the outage");
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let (status, body) = if req
+                        .lines()
+                        .next()
+                        .is_some_and(|l| l.contains("/hook/batch"))
+                    {
+                        let payload = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let accepted = serde_json::from_str::<serde_json::Value>(payload)
+                            .ok()
+                            .and_then(|v| v.as_array().map(Vec::len))
+                            .unwrap_or(0);
+                        ("200 OK", format!("{{\"accepted\":{accepted}}}"))
+                    } else {
+                        ("202 Accepted", "queued".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let r = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 3, "the whole backlog is delivered after recovery");
+        assert_eq!(r.remaining, 0);
+        assert!(
+            list_entries(&spool).unwrap().0.is_empty(),
+            "spool emptied after the server came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_entry_when_first_response_is_408() {
+        // A 408 from the server is retryable, not a terminal refusal: the
+        // drain must keep the entry queued (charged one attempt) so a later
+        // pass can still deliver it, subject to the retry limit. Treating
+        // every 4xx as permanent deleted such events on the spot (#1092
+        // regression).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Answer every request (batch first) with 408 until the drain
+            // gives up on this pass.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        enqueue(
+            &spool,
+            &entry_for(
+                format!("http://{addr}/hook?event=e0"),
+                "{}".into(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let r = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 0);
+        assert_eq!(r.dropped, 0, "a 408 first response must not drop the entry");
+        let (files, _) = list_entries(&spool).unwrap();
+        assert_eq!(files.len(), 1, "the entry stays queued for the next pass");
+        let entry: SpoolEntry = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(
+            entry.attempts, 1,
+            "the retryable miss is charged one attempt"
+        );
     }
 
     /// #493: an unreadable spool must not read as an idle pass.
@@ -1607,6 +3392,33 @@ mod tests {
         )
         .await;
         assert_eq!(r, DrainResult::default());
+    }
+
+    #[test]
+    fn drain_lock_never_recreates_a_removed_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("purged");
+        let spool = spool_dir(&data_dir);
+
+        let err = acquire_drain_lock(&spool, DrainLockWait::NoWait)
+            .err()
+            .expect("a drain must not run against a missing data dir");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!data_dir.exists(), "the drain recreated a removed data dir");
+
+        std::fs::create_dir(&data_dir).unwrap();
+        assert!(
+            acquire_drain_lock(&spool, DrainLockWait::NoWait)
+                .unwrap()
+                .is_some(),
+            "a present data dir still gets its spool dir created"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&spool).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "a drain-created spool must be private");
+        }
     }
 
     #[test]
@@ -1673,6 +3485,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(100),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -1694,6 +3507,7 @@ mod tests {
             tmp.path(),
             Duration::ZERO,
             Duration::from_millis(100),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .unwrap();
@@ -1725,6 +3539,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(2),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .expect("lock acquired");
@@ -1750,6 +3565,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(100),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .unwrap_err();
@@ -1762,34 +3578,195 @@ mod tests {
 
     #[tokio::test]
     async fn drain_drops_event_after_max_attempts() {
+        // Control for the outage fix: a server that ANSWERS with 5xx is a
+        // post-connect failure and keeps today's charging semantics — one
+        // attempt per pass, drop at the limit. (An endpoint-level
+        // unreachable never charges; see
+        // `unreachable_outage_never_charges_attempt_budget`.)
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "500 Internal Server Error").await;
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
-        let e = entry_for(
-            "http://127.0.0.1:1/hook?event=dead".into(),
-            "{}".into(),
-            None,
-            false,
-        );
-        enqueue(&spool, &e).unwrap();
-        let mut dropped = 0;
-        for _ in 0..MAX_ATTEMPTS {
-            dropped += drain(
+        write_spool_entry(&spool, "evt-0.json", format!("http://{addr}/hook?event=e0"));
+        for pass in 1..=MAX_ATTEMPTS {
+            let r = drain_with_max_attempts(
                 &spool,
                 tmp.path(),
                 Duration::from_secs(2),
-                Duration::from_millis(100),
+                Duration::from_millis(500),
+                MaxAttempts::new(MAX_ATTEMPTS),
             )
-            .await
-            .dropped;
+            .await;
+            assert_eq!(
+                r.dropped,
+                usize::from(pass == MAX_ATTEMPTS),
+                "the erroring event is dropped exactly at MAX_ATTEMPTS"
+            );
+            if pass < MAX_ATTEMPTS {
+                assert_eq!(sorted_attempts(&spool), vec![pass]);
+            }
         }
         assert_eq!(
-            dropped, 1,
-            "the dead event is dropped once it hits MAX_ATTEMPTS"
+            req_count.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_ATTEMPTS as usize,
+            "the server answered every pass — post-connect, not an outage"
         );
         assert!(
             list_entries(&spool).unwrap().0.is_empty(),
             "spool is empty after the drop"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_max_attempts_keeps_failing_event_after_twenty_drains() {
+        // An explicit zero means "never drop for attempts": a server that
+        // keeps answering 5xx charges the entry on every pass (post-connect
+        // failures still bump attempts), and twenty charged passes later it
+        // is still queued. Uses the 5xx server because an unreachable
+        // endpoint no longer charges attempts at all.
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "500 Internal Server Error").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/hook?event=dead"),
+        );
+
+        for _ in 0..20 {
+            let result = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(500),
+                MaxAttempts::new(0),
+            )
+            .await;
+            assert_eq!(result.dropped, 0);
+            assert_eq!(result.remaining, 1);
+        }
+        let files = list_entries(&spool).unwrap().0;
+        assert_eq!(files.len(), 1);
+        let entry: SpoolEntry = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(entry.attempts, 20);
+    }
+
+    #[tokio::test]
+    async fn explicit_max_attempts_isolated_from_ambient_zero() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_HOOK_SPOOL_AMBIENT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert_eq!(
+                std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").as_deref(),
+                Ok("0")
+            );
+            // A 5xx server, not a dead port: an unreachable endpoint no
+            // longer charges attempts, and this test asserts a one-pass drop.
+            let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let addr = serve_counting_hook(req_count, "500 Internal Server Error").await;
+            let tmp = tempfile::tempdir().unwrap();
+            let spool = spool_dir(tmp.path());
+            write_spool_entry(
+                &spool,
+                "evt-0.json",
+                format!("http://{addr}/hook?event=dead"),
+            );
+
+            let result = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+                MaxAttempts::new(1),
+            )
+            .await;
+
+            assert_eq!(result.dropped, 1);
+            assert!(list_entries(&spool).unwrap().0.is_empty());
+            println!("ambient-zero-isolated");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("commands::hook_spool::tests::explicit_max_attempts_isolated_from_ambient_zero")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ambient-zero-isolated"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_max_attempts_drops_after_three_drains() {
+        // A 5xx server keeps charging one attempt per pass (post-connect),
+        // so an explicit limit of 3 drops the entry on the third pass.
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count, "500 Internal Server Error").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/hook?event=dead"),
+        );
+
+        for pass in 1..=3 {
+            let result = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+                MaxAttempts::new(3),
+            )
+            .await;
+            assert_eq!(result.dropped, usize::from(pass == 3));
+            assert_eq!(result.remaining, usize::from(pass < 3));
+        }
+        assert!(list_entries(&spool).unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_max_attempts_still_drops_stale_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        let mut entry = entry_for(
+            "http://127.0.0.1:1/hook?event=old".into(),
+            "{}".into(),
+            None,
+            false,
+        );
+        entry.created_ms = now_ms().saturating_sub(MAX_AGE_MS + 1);
+        std::fs::write(
+            spool.join("stale.json"),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let result = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+            MaxAttempts::new(0),
+        )
+        .await;
+
+        assert_eq!(result.dropped, 1);
+        assert!(list_entries(&spool).unwrap().0.is_empty());
     }
 
     #[tokio::test]
@@ -1945,8 +3922,8 @@ mod tests {
         let loaded: SpoolEntry =
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
         assert_eq!(
-            loaded.attempts, 1,
-            "the entry actually attempted is charged exactly once"
+            loaded.attempts, 0,
+            "an endpoint-level miss must not charge the entry actually attempted"
         );
     }
 
@@ -2178,6 +4155,106 @@ mod tests {
         );
     }
 
+    /// Serve every request with one fixed `200 OK` JSON body.
+    async fn serve_fixed_batch_reply(body: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let _ = s.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn batch_drain_deletes_server_dropped_items_instead_of_retrying() {
+        // A dropped_* verdict is final: re-POSTing it gets the same answer
+        // until max_attempts (forever with 0), as the correlated path knew.
+        let addr = serve_fixed_batch_reply(
+            r#"{"accepted":3,"results":[{"index":0,"outcome":"stored"},{"index":1,"outcome":"dropped_policy"},{"index":2,"outcome":"stored"}]}"#,
+        )
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{addr}/hook?event=e{i}"),
+            );
+        }
+
+        let r = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            MaxAttempts::new(0),
+        )
+        .await;
+
+        assert_eq!(r.sent, 2);
+        assert_eq!(r.durable, 2);
+        assert_eq!(r.dropped, 1);
+        assert_eq!(r.remaining, 0);
+        assert!(
+            list_entries(&spool).unwrap().0.is_empty(),
+            "a dropped_policy item must leave the spool after one drain"
+        );
+    }
+
+    #[test]
+    fn every_drain_path_shares_one_outcome_table() {
+        let entry = |event: &str| {
+            entry_for(
+                format!("http://127.0.0.1:1/hook?event={event}&agent=claude-code"),
+                "{}".into(),
+                None,
+                false,
+            )
+        };
+        let observation = entry("post-tool-use");
+        for outcome in ["stored", "replayed", "resumed"] {
+            assert_eq!(
+                item_disposition(outcome, &observation),
+                ItemDisposition::Durable,
+                "{outcome}"
+            );
+        }
+        for outcome in [
+            "dropped_policy",
+            "dropped_subagent",
+            "dropped_unauthorized",
+            "dropped_collision",
+            "dropped_invalid",
+        ] {
+            assert_eq!(
+                item_disposition(outcome, &observation),
+                ItemDisposition::Dropped,
+                "{outcome}"
+            );
+        }
+        assert_eq!(
+            item_disposition("ignored_end", &entry("session-end")),
+            ItemDisposition::Durable
+        );
+        assert_eq!(
+            item_disposition("some_future_outcome", &observation),
+            ItemDisposition::Retry
+        );
+    }
+
     #[tokio::test]
     async fn non_contiguous_batch_ack_deletes_only_accepted_indices() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2358,6 +4435,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("rotated-new"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2390,6 +4468,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             None,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2422,6 +4501,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("A-LIVE"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2463,6 +4543,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("A-LIVE"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -3213,15 +5294,18 @@ mod tests {
 
     #[tokio::test]
     async fn drain_stays_robust_when_retry_count_cannot_persist() {
+        // A 5xx server, not a dead port: the pass must actually attempt the
+        // bump-persist path this test blocks, and an unreachable endpoint no
+        // longer charges attempts at all.
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count, "500 Internal Server Error").await;
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
-        let e = entry_for(
-            "http://127.0.0.1:1/hook?event=stuck".into(),
-            "{}".into(),
-            None,
-            false,
+        write_spool_entry(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/hook?event=stuck"),
         );
-        enqueue(&spool, &e).unwrap();
 
         // Make the atomic rewrite fail in a way that survives root (the Docker gate
         // runs as root, so a chmod read-only dir wouldn't fault): occupy the entry's

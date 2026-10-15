@@ -16,8 +16,8 @@ export function useSessionCatalog(openSessions: () => void, sessionsVisible: boo
   const [project, setProject] = useState("all");
   const [agents, setAgents] = useState<SessionAgentRow[]>([]);
   const [projects, setProjects] = useState<SessionProjectRow[]>([]);
-  const [agentsOpen, setAgentsOpen] = useState(true);
-  const [projectsOpen, setProjectsOpen] = useState(true);
+  const [agentsOpen, setAgentsOpen] = useState(false);
+  const [projectsOpen, setProjectsOpen] = useState(false);
   const [scopeNonce, setScopeNonce] = useState(0);
   const retarget = () => setScopeNonce((nonce) => nonce + 1);
   const reload = useCallback(async (since?: number) => {

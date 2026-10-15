@@ -107,11 +107,17 @@ try {
 
   await b.hooks.get("session.prompt")({ sessionID: "root-b", messageID: "b1", prompt: { text: "beta" } });
   await b.hooks.get("session.context")({ sessionID: "root-b", system: [] });
-  await disposeA();
-  assert.ok(requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-a"));
-  assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-b"), "location cleanup must not close another instance");
+  // Deletion, not unload, is the end signal: a deleted child keeps ancestry
+  // so its close does not hand the next session a sub-task baton.
+  a.emit({ type: "session.deleted", data: { sessionID: "child" } });
+  await until(() => requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "child"), "deleted session must end");
   assert.equal(requests.find((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "child").payload.agent_id, "root-a", "child close must retain ancestry to suppress automatic handoffs");
-  console.log("PASS: resumed sessions, retained handoff, child isolation, terminal events, content-only output, per-location cleanup");
+  // #1074: OpenCode unloads the plugin when it evicts idle location services;
+  // the host and its sessions stay alive, so unload must not end them.
+  await disposeA();
+  assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-a"), "eviction unload must not end a live session");
+  assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-b"), "location cleanup must not close another instance");
+  console.log("PASS: resumed sessions, retained handoff, child isolation, terminal events, deletion ends, unload does not");
 } finally {
   await disposeB();
 }

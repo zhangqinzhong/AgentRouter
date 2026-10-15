@@ -111,10 +111,13 @@ fn real_dry_run(
         eprintln!("skipping: ai-jail is not usable here (absent, no sandbox backend, or Windows)");
         return None;
     };
+    let support = ai_jail_support(&ai_jail).expect("ai-jail --help");
+    if !support.supports("network") {
+        eprintln!("skipping: installed ai-jail does not support the required --network flag");
+        return None;
+    }
     let exe = std::env::current_exe().expect("test binary path");
-    let no_save_config = ai_jail_support(&ai_jail)
-        .expect("ai-jail --help")
-        .supports("no-save-config");
+    let no_save_config = support.supports("no-save-config");
     let argv = build_ai_jail_invocation(
         &exe,
         forwarded,

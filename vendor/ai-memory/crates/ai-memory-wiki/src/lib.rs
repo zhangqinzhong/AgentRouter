@@ -8,7 +8,9 @@
 pub mod admission;
 mod atomic;
 pub mod backup;
+mod confinement;
 mod error;
+mod frontmatter_yaml;
 mod git;
 mod ledger;
 mod markdown;
@@ -21,13 +23,20 @@ pub use admission::{
     MAX_RESPONSE_BYTES, WebhookConfig,
 };
 pub use atomic::write_atomic;
+pub use confinement::validate_wiki_tree;
 pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
 pub use ledger::is_rotated_event_ledger;
-pub use markdown::{Markdown, derive_title, emit, parse, rewrite_local_wikilinks};
+pub use markdown::{
+    Markdown, delink_wikilinks, derive_title, emit, extract_links, extract_relation_links, parse,
+    rewrite_local_wikilinks,
+};
 pub use migrations::run_pending as run_wiki_migrations;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
-pub use wiki::{MoveSessionOutcome, PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest};
+pub use wiki::{
+    ConditionalWrite, MoveSessionOutcome, PurgeSessionOutcome, SessionPageFile, Wiki,
+    WritePageRequest,
+};
 
 // Integration tests compile into this crate's test harness instead of a
 // separate binary: every test binary is another link and, on macOS and

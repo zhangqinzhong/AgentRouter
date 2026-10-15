@@ -1,5 +1,7 @@
-//! `ai-memory auth` — manage upstream LLM provider credentials.
+//! `ai-memory auth` — manage upstream LLM provider credentials, and require a
+//! bearer token on this install's own server (`auth enable`).
 
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ai_memory_llm::{
@@ -26,7 +28,7 @@ const POLLING_SAFETY_MARGIN_SECS: u64 = 3;
 ///
 /// # Errors
 /// Returns an error if token storage or provider auth requests fail.
-pub async fn run(config: &Config, args: AuthArgs) -> Result<()> {
+pub async fn run(config: &Config, args: AuthArgs, config_path: Option<&Path>) -> Result<()> {
     match args.command {
         AuthCommand::Login(args) => match args.provider {
             AuthProviderChoice::OpenaiOauth => {
@@ -63,6 +65,7 @@ pub async fn run(config: &Config, args: AuthArgs) -> Result<()> {
             AuthProviderChoice::OidcDevice => logout_oidc_device(config),
         },
         AuthCommand::Status(_) => status(config),
+        AuthCommand::Enable(args) => super::auth_enable::run(config, &args, config_path),
     }
 }
 

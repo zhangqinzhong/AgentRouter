@@ -46,11 +46,11 @@ what the project is and is not designed to defend against.
 
   **Inside a container this check warns instead of refusing.** Publishing a
   port with `-p` requires binding `0.0.0.0` in the namespace, so the bind
-  address says nothing about reachability there — that is decided by the
+  address says nothing about reachability there. Reachability is decided by the
   host-side publish spec, which the process cannot see. In a container the
   thing to check is your own `-p`: `-p 127.0.0.1:49374:49374` is loopback-only
   and safe without a token; anything broader needs `AI_MEMORY_AUTH_TOKEN`.
-  Note the `Host` allowlist is not a substitute — it defends against DNS
+  The `Host` allowlist is not a substitute: it defends against DNS
   rebinding, where a browser sets the header, and a client that can route to
   the port sets `Host` freely. Authentication does not encrypt
   bearer tokens, so use a TLS reverse proxy for traffic beyond loopback; see
@@ -78,7 +78,14 @@ what the project is and is not designed to defend against.
   `(workspace_id, project_id)`. A purge operation for project A cannot
   delete files that also belong to project B. Entity lookup filters at the
   project CTE and page boundaries; V38 triggers reject mismatched
-  workspace/project entities and cross-project entity/page links.
+  workspace/project entities and cross-project entity/page links. The wiki
+  directory is imported, operator-editable content and is therefore treated as
+  untrusted: symbolic links and filesystem reparse points at the wiki root,
+  workspace/project roots, or any descendant are refused for page reads,
+  writes, indexing, recovery, and lifecycle cleanup. These component checks
+  protect against links already present when an operation runs; they do not
+  claim descriptor-relative protection against a concurrently malicious process
+  running as the same operating-system user.
 
 - **Entity text remains bounded local data.** Consolidator output and
   hand-edited `entities:` frontmatter cross the same normalization boundary:
@@ -89,9 +96,9 @@ what the project is and is not designed to defend against.
 
 - **Assistant/Stop capture is opt-in and sanitized (#196).** The assistant's
   final turn is never persisted by default. Storing it requires a **double
-  opt-in** — `capture_assistant` on the server and `install-hooks
+  opt-in**: `capture_assistant` on the server and `install-hooks
   --capture-assistant` on the client. When enabled, be aware that:
-  - The excerpt is sanitized twice — the client scrubs with the built-in
+  - The excerpt is sanitized twice. The client scrubs with the built-in
     patterns *before* it reaches the spool or wire, and the server re-scrubs
     with its configured `[sanitize]` patterns before storing. Operator
     `extra_patterns` run only on the server side, so a secret matched only by an
@@ -100,7 +107,7 @@ what the project is and is not designed to defend against.
     server's `allowlist` cannot restore text the client already replaced with
     `[REDACTED]`.
   - Captured assistant text flows into the consolidation and reviewer prompts,
-    and — if you configure a cloud LLM provider — is sent to that provider.
+    and, if you configure a cloud LLM provider, is sent to that provider.
     The latest excerpt of a session also rides in its automatic handoff, so
     the next session that claims the baton receives it as startup context. It
     is not rendered into the git-tracked session page.

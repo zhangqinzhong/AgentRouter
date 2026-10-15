@@ -25,6 +25,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
