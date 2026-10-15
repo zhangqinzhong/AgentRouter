@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.10.3 - 2026-10-15
+
+### Fixes
+- Open the request-log JSON viewer across the window on the page surface, with the payload scrolling inside the viewer.
+
 ## 1.10.2 - 2026-10-15
 
 ### Features
