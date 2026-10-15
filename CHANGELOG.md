@@ -15,6 +15,7 @@
 - Ignore new CodeBuddy progress, usage, and metadata records so they are not added on top of message tokens.
 - Re-read session databases on refresh when the file timestamp did not change. Copilot, Cursor, and Hermes databases that exist but cannot be read keep their indexed sessions.
 - Start the Agent and project lists collapsed.
+- Connect the OpenCode memory client to the version 1 plugin. OpenCode 2 keeps its own plugin.
 
 ## 1.10.1 - 2026-10-14
 

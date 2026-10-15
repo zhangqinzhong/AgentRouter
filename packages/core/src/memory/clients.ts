@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { CONFIGDIR } from "@agentrouter/core/config/constants";
 import type { ProfileConfig } from "@agentrouter/core/contracts/app";
@@ -48,7 +48,7 @@ function regularRead(file: string): Buffer | null {
 }
 
 export class MemoryClients {
-  constructor(private readonly home: string, private readonly dataDir: string, private readonly endpoint: string, private readonly run: (args: string[]) => Promise<string>, private readonly environment: NodeJS.ProcessEnv = process.env, private readonly authToken: () => string = () => "", private readonly runtimeExecutable: () => string = () => { throw new Error("Memory runtime is unavailable."); }, private readonly configDir: string = CONFIGDIR) {}
+  constructor(private readonly home: string, private readonly dataDir: string, private readonly endpoint: string, private readonly run: (args: string[], env?: NodeJS.ProcessEnv) => Promise<string>, private readonly environment: NodeJS.ProcessEnv = process.env, private readonly authToken: () => string = () => "", private readonly runtimeExecutable: () => string = () => { throw new Error("Memory runtime is unavailable."); }, private readonly configDir: string = CONFIGDIR) {}
 
   private configPath(entry: Definition, kind: "mcp" | "hooks", profile?: ProfileConfig): string | undefined {
     if (!entry[kind]) return undefined;
@@ -187,8 +187,12 @@ export class MemoryClients {
       if (previous && before && digest(before) !== previous.afterSha256) throw new Error("Client configuration changed. Review and reconcile the previous integration before reinstalling.");
       args.push("--apply");
     }
+    // Upstream probes `opencode --version` and can retarget this client to the
+    // v2 plugin. The selector answers 1.0.0 so this row stays the v1 plugin.
+    // OpenCode 2 uses the opencode2 alias and does not probe.
+    const commandEnv = entry.id === "opencode" ? this.opencodeV1CommandEnv() : undefined;
     let output: string;
-    try { output = await this.run(args); }
+    try { output = await this.run(args, commandEnv); }
     catch (error) {
       // Upstream can finish a write and fail later. Record its postimage before
       // returning the failure so the user can remove exactly our write safely.
@@ -197,6 +201,22 @@ export class MemoryClients {
     }
     if (operation === "install") this.recordIfChanged(id, targetId, kind, file, before, previous);
     return operation === "preview" ? { output, path: file, before: this.shownBefore(before) } : { output, path: file };
+  }
+
+  private opencodeV1CommandEnv(): NodeJS.ProcessEnv {
+    const directory = path.join(this.dataDir, "client-shims", "opencode-v1");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const windows = process.platform === "win32";
+    const file = path.join(directory, windows ? "opencode.cmd" : "opencode");
+    const body = windows ? "@echo off\r\necho 1.0.0\r\n" : "#!/bin/sh\nprintf '%s\\n' '1.0.0'\n";
+    if (!existsSync(file) || readFileSync(file, "utf8") !== body) {
+      const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+      writeFileSync(temporary, body, { mode: windows ? 0o644 : 0o755, flag: "wx" });
+      renameSync(temporary, file);
+    }
+    if (!windows) chmodSync(file, 0o755);
+    const current = this.environment.PATH || "";
+    return { PATH: current ? `${directory}${path.delimiter}${current}` : directory };
   }
 
   private shownBefore(before: Buffer | null): string {
