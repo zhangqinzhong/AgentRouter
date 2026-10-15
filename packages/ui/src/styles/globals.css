@@ -818,36 +818,65 @@
 
   .network-table-scroll,
   .network-detail,
-  .network-json-fullscreen-panel,
-  .network-json-fullscreen-body,
   .network-pane-body {
     background: var(--network-panel);
     border-color: var(--network-border);
   }
 
   .network-json-fullscreen {
-    align-items: center;
-    background: rgba(0, 0, 0, .82);
-    color: var(--network-text);
-    justify-content: center;
-    padding: clamp(14px, 4.4vw, 56px) clamp(14px, 4.4vw, 84px);
+    align-items: stretch;
+    background: #fff;
+    color: var(--foreground);
+    justify-content: flex-start;
+    overscroll-behavior: contain;
+    padding: 0;
+  }
+
+  .network-json-fullscreen-panel,
+  .network-json-fullscreen-body,
+  .network-json-fullscreen-header {
+    background: #fff;
+    border-color: var(--border);
+    color: var(--foreground);
   }
 
   .network-json-fullscreen-panel {
-    border-color: var(--network-border);
-    border-radius: 24px;
-    box-shadow: 0 24px 72px rgba(0, 0, 0, .42);
-    height: 100%;
-    max-height: 100%;
-    max-width: 1760px;
+    border-radius: 0;
+    border-width: 0;
+    box-shadow: none;
+    flex: 1 1 auto;
+    height: auto;
+    max-height: none;
+    max-width: none;
+    min-height: 0;
     min-width: 0;
     width: 100%;
   }
 
+  .network-json-fullscreen-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+  }
+
   .network-json-fullscreen-header {
-    background: var(--network-panel-alt);
-    border-color: var(--network-border);
     box-shadow: none;
+  }
+
+  .network-json-fullscreen .network-code {
+    overscroll-behavior: contain;
+  }
+
+  .dark .network-json-fullscreen,
+  .dark .network-json-fullscreen-panel,
+  .dark .network-json-fullscreen-body,
+  .dark .network-json-fullscreen-header,
+  :root[data-theme="dark"] .network-json-fullscreen,
+  :root[data-theme="dark"] .network-json-fullscreen-panel,
+  :root[data-theme="dark"] .network-json-fullscreen-body,
+  :root[data-theme="dark"] .network-json-fullscreen-header {
+    background: #141414;
+    color: var(--foreground);
   }
 
   .network-table-header,
@@ -1057,19 +1086,6 @@
     background: color-mix(in oklab, var(--network-active-bg) 16%, var(--network-panel));
     border-color: color-mix(in oklab, var(--network-active-bg) 55%, var(--network-border));
     color: color-mix(in oklab, var(--network-active-bg) 70%, var(--network-text));
-  }
-
-  @media (max-width: 720px), (max-height: 520px) {
-    .network-json-fullscreen {
-      padding: 0;
-    }
-
-    .network-json-fullscreen-panel {
-      border-left: 0;
-      border-radius: 0;
-      border-right: 0;
-      max-width: none;
-    }
   }
 
   .onboarding-mascot-sprite {
@@ -1427,6 +1443,55 @@ html[data-window-active="false"] .status-heartbeat {
   --network-row-hover: color-mix(in srgb, var(--muted) 45%, transparent);
   --network-row-selected: color-mix(in srgb, #10b981 10%, transparent);
   --network-accent: var(--oai-brand);
+}
+
+/* Usage pages set --network-panel to transparent. Fullscreen JSON keeps an opaque page surface. */
+.network-json-fullscreen,
+.network-json-fullscreen-panel,
+.network-json-fullscreen-body,
+.network-json-fullscreen-header {
+  background: #fff;
+  color: var(--foreground);
+}
+
+.dark .network-json-fullscreen,
+.dark .network-json-fullscreen-panel,
+.dark .network-json-fullscreen-body,
+.dark .network-json-fullscreen-header,
+:root[data-theme="dark"] .network-json-fullscreen,
+:root[data-theme="dark"] .network-json-fullscreen-panel,
+:root[data-theme="dark"] .network-json-fullscreen-body,
+:root[data-theme="dark"] .network-json-fullscreen-header {
+  background: #141414;
+  color: var(--foreground);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .network-json-fullscreen,
+  :root:not([data-theme="light"]) .network-json-fullscreen-panel,
+  :root:not([data-theme="light"]) .network-json-fullscreen-body,
+  :root:not([data-theme="light"]) .network-json-fullscreen-header {
+    background: #141414;
+    color: var(--foreground);
+  }
+}
+
+.network-json-fullscreen {
+  align-items: stretch;
+  inset: 0;
+  justify-content: flex-start;
+  padding: 0;
+  position: fixed;
+  z-index: 200;
+}
+
+.network-json-fullscreen-panel {
+  border-radius: 0;
+  border-width: 0;
+  box-shadow: none;
+  height: auto;
+  max-height: none;
+  max-width: none;
 }
 
 /* Session reader: scoped typography, independent from the management tables. */
