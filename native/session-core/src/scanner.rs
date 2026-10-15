@@ -63,6 +63,18 @@ impl Drop for ScanFinale<'_> {
 /// 互代:按扫描粒度拿文件锁会与 GUI 的常驻持有自锁(同进程第二个文件描述是另一把 flock)
 static SCAN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 进扫描门。`reread` 为真时别家库的行缓存这一轮至少重读一次,不只看 mtime。
+/// 启动扫描本来就是空缓存;远程同步和换 roster 之后的增量扫描不重读。
+fn enter_scan_gate(reread: bool) -> std::sync::MutexGuard<'static, ()> {
+    let gate = SCAN_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reread {
+        crate::adapters::sqlite_ro::next_scan_epoch();
+    }
+    gate
+}
+
 /// `build_index` / `refresh_index` 的收场;措辞由 bin 翻。退让不是失败
 pub enum Outcome {
     /// 干完了,库里现在有这些
@@ -268,9 +280,7 @@ pub fn run_scan(
     events: &dyn ScanEvents,
     full: bool,
 ) -> Result<()> {
-    let gate = SCAN_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let gate = enter_scan_gate(full);
     let mut fin = ScanFinale {
         events,
         progress: ScanProgress {
@@ -348,9 +358,7 @@ fn maintain_index(store: &Store) {
 /// 串行——它收尾也对 memories 对账,两边别同时写同一组。阻塞执行,调用方放后台;
 /// 返回库里有没有改动
 pub fn run_memory_sync(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> bool {
-    let _gate = SCAN_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _gate = enter_scan_gate(true);
     sync_memories(adapters, store)
 }
 

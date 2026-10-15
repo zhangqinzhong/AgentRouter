@@ -67,8 +67,22 @@ impl CodebuddyAdapter {
     }
 }
 
-/// 已知的非消息行:静默跳过、不计 unknown。表外类型计数(漂移金丝雀)
-const KNOWN_SKIP: &[&str] = &["file-history-snapshot", "summary", "turn-metrics"];
+/// 已知的非消息行:静默跳过、不计 unknown。表外类型计数(漂移金丝雀)。照 CodeBuddy
+/// `isCustomInputItem` 的清单(标题行在解析循环里另处理)加它追加进转录的 `session-meta`
+/// 快照。`model-usage` 是用量没落到消息行上的那次调用的账,是否与消息行上的 rawUsage
+/// 互斥判不准,先不计 token。
+const KNOWN_SKIP: &[&str] = &[
+    "file-history-snapshot",
+    "summary",
+    "turn-metrics",
+    "goal-result",
+    "goal-progress",
+    "resend-fork-notice",
+    "acp-terminal-state",
+    "model-usage",
+    "credit-usage",
+    "session-meta",
+];
 
 /// CodeBuddy 的 isGeneratedPlaceholderTitle:自动标题没东西可总结时写的占位,
 /// 显示它比回退到首条用户消息更糟

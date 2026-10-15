@@ -122,7 +122,7 @@ function normalizeClaudeModel(model) {
 
 // Cursor decorates model ids with reasoning effort and sometimes places the
 // Claude version before the tier. Normalize those lookup-only aliases while
-// preserving Grok 4.5's distinct Fast SKU (its rate is not the base rate).
+// preserving Cursor Grok Fast SKUs (4.5/4.6/4.7 Fast rates are not the base rates).
 function normalizeCursorModel(model) {
   if (!model || typeof model !== "string") return model;
   let m = model
@@ -135,6 +135,12 @@ function normalizeCursorModel(model) {
   const parts = m.split("-");
   const isFast = parts.includes("fast");
 
+  if (/^(?:cursor-)?grok-4[.-]7(?:-|$)/.test(m)) {
+    return isFast ? "cursor-grok-4.7-fast" : "cursor-grok-4.7";
+  }
+  if (/^(?:cursor-)?grok-4[.-]6(?:-|$)/.test(m)) {
+    return isFast ? "cursor-grok-4.6-fast" : "cursor-grok-4.6";
+  }
   if (/^(?:cursor-)?grok-4[.-]5(?:-|$)/.test(m)) {
     return isFast ? "cursor-grok-4.5-fast" : "cursor-grok-4.5";
   }
@@ -143,7 +149,7 @@ function normalizeCursorModel(model) {
   // claude-opus-5-fast). Preserve it for the exact lookups below; when it is
   // merely a decoration, lookupPricing's later suffix-strip still falls back
   // to the base LiteLLM model.
-  const decorations = new Set(["thinking", "xhigh", "high", "medium", "low"]);
+  const decorations = new Set(["thinking", "xhigh", "high", "medium", "low", "minimal"]);
   m = parts.filter((part) => !decorations.has(part)).join("-");
   if (m.startsWith("claude-")) return normalizeClaudeModel(m);
   return m;

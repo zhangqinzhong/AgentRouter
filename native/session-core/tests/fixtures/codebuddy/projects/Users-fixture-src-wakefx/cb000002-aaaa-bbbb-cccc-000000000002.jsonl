@@ -2,3 +2,10 @@
 {"timestamp":1781100000100,"type":"topic","topic":"Weekly report draft","sessionId":"cb000002-aaaa-bbbb-cccc-000000000002"}
 {"id":"n-0002","timestamp":1781100001000,"type":"reasoning","providerData":{"conversationRequestId":"req-1001","model":"hy3","agent":"cli"},"content":[{"type":"text","text":"Collect merged PRs first, then group by area."}],"sessionId":"cb000002-aaaa-bbbb-cccc-000000000002","cwd":"/Users/fixture/src/wakefx"}
 {"id":"n-0003","timestamp":1781100001100,"type":"message","role":"assistant","providerData":{"conversationRequestId":"req-1001","model":"hy3","agent":"cli","rawUsage":{"prompt_tokens":900,"completion_tokens":120}},"status":"completed","content":[{"type":"text","text":"周报草稿如下:本周合并了 3 个 PR……"}],"sessionId":"cb000002-aaaa-bbbb-cccc-000000000002","cwd":"/Users/fixture/src/wakefx"}
+{"timestamp":1781100001200,"type":"goal-progress","sessionId":"cb000002-aaaa-bbbb-cccc-000000000002"}
+{"timestamp":1781100001300,"type":"goal-result","sessionId":"cb000002-aaaa-bbbb-cccc-000000000002"}
+{"timestamp":1781100001400,"type":"model-usage","providerData":{"rawUsage":{"prompt_tokens":99999,"completion_tokens":1}},"sessionId":"cb000002-aaaa-bbbb-cccc-000000000002"}
+{"timestamp":1781100001500,"type":"credit-usage","sessionId":"cb000002-aaaa-bbbb-cccc-000000000002"}
+{"timestamp":1781100001600,"type":"acp-terminal-state","sessionId":"cb000002-aaaa-bbbb-cccc-000000000002"}
+{"timestamp":1781100001700,"type":"resend-fork-notice","sessionId":"cb000002-aaaa-bbbb-cccc-000000000002"}
+{"timestamp":1781100001800,"type":"session-meta","sessionId":"cb000002-aaaa-bbbb-cccc-000000000002"}

@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::sqlite_ro::{open_sqlite_ro, strip_virtual_path, virtual_path, SqliteRo};
+use super::sqlite_ro::{has_table, open_sqlite_ro, strip_virtual_path, virtual_path, SqliteRo};
 use super::AgentAdapter;
 use crate::models::*;
 use anyhow::{anyhow, Result};
@@ -324,6 +324,10 @@ fn secs_to_ms(secs: f64) -> i64 {
 
 /// 全表聚合行(list/quick/parse 共用,经 MtimeCache 一轮只跑一次)
 fn query_rows(ro: &SqliteRo, db: &HermesDb) -> Option<Vec<HermesRow>> {
+    // 库在、表还没建 = 确实没有会话;读不出(None)才是不知道
+    if !(has_table(&ro.conn, "sessions").ok()? && has_table(&ro.conn, "messages").ok()?) {
+        return Some(Vec::new());
+    }
     let schema = *db.schema.get_or_init(|| HermesSchema::probe(&ro.conn));
     let col = |present: bool, name: &str| {
         if present {
@@ -431,8 +435,10 @@ impl AgentAdapter for HermesAdapter {
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
         let mut out = Vec::new();
-        for db in &self.dbs {
-            let Some(rows) = Self::rows(db) else { continue };
+        // 库不在 = 没有会话;库在却读不出报 Err,scanner 冻结这一家这一轮。
+        for db in self.dbs.iter().filter(|db| db.path.is_file()) {
+            let rows = Self::rows(db)
+                .ok_or_else(|| anyhow!("{} exists but could not be read", db.path.display()))?;
             out.extend(
                 rows.into_iter()
                     // 空会话(刚起就退)与 session_search 工具内部的检索会话不列

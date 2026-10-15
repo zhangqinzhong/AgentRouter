@@ -42,6 +42,14 @@ October 2026 targeted backports (base import remains unchanged):
 - `d9b30009`, `8318160f`: Kimi official regional credentials/endpoints and fixed credential filenames.
 - `dbcb0bfa`: prefer account-matched Claude Code usage cache. Retains AgentRouter's
   existing reset-boundary guard; does not import the upstream reset-notification state file.
+- `fdd7d60b`: stat Codex rollouts whose name-date is within 30 days and re-read any
+  that grew past the cursor. Older files still wait for the daily audit. Priority-tier
+  Fast pricing stays out.
+- `d7c7da40`: GPT-6.1 Sol standard rates, including the observed long-context premium.
+- `49584cc9`: Cursor prices for Composer 2.5, Gemini 4 Argon, and Grok 4.6/4.7.
+- `f13b084b`: Antigravity turns with sqlite usage metadata bill cached input, text
+  output, and reasoning tokens. Turns without that metadata stay on the text estimate.
+  Already-counted history is left in place.
 
 Adapted regression fixtures live in `tests/collector/upstream`. Kimi's TOML parser
 uses smol-toml 1.6.0 (MIT), bundled into the copied Kimi module at build time with

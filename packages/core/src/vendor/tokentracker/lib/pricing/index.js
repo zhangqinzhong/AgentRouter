@@ -254,7 +254,8 @@ function computeRowCost(row) {
 
   const model = String(row?.model || "").toLowerCase();
   const usesOpenAILongContextTier =
-    model === "gpt-5.6" || model.includes("gpt-5.6-sol") || model.includes("gpt-6-astra");
+    model === "gpt-5.6" || model.includes("gpt-5.6-sol") || model.includes("gpt-6-astra") ||
+    model.includes("gpt-6.1-sol");
   if (!usesOpenAILongContextTier) return baseCost;
 
   const bounded = (value, total) => Math.min(
