@@ -1,6 +1,6 @@
 import { defaultProviderAccountConfig, type ProviderPreset } from "@agentrouter/core/providers/presets/types";
 
-const xiaomiMimoDefaultModels = ["mimo-v2.5-pro", "mimo-v2.5"];
+const xiaomiMimoDefaultModels = ["mimo-v2.6-pro", "mimo-v2.6-flash"];
 const xiaomiMimoWebsiteUrl = "https://platform.xiaomimimo.com/";
 
 function createXiaomiMimoProviderPreset(input: {

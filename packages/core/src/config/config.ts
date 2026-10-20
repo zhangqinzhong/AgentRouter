@@ -1,3 +1,4 @@
+import { migrateXiaomiModels } from "@agentrouter/core/config/xiaomi-model-migration";
 import { normalizeProfileProviderName } from "@agentrouter/core/profiles/provider-display-name";
 import { CONFIGDIR, LEGACY_CONFIGDIR, PROVIDER_ICON_CACHE_DIR } from "@agentrouter/core/config/constants";
 import { normalizePageDefaultRanges } from "@agentrouter/core/config/page-default-ranges";
@@ -256,7 +257,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
     const loadedApiKeys = uniqueApiKeyConfigs([...persistedApiKeys, ...configFileApiKeys]);
     const apiKeys = ensureGatewayApiKeys(loadedApiKeys);
     const pluginMigration = migrateKnownGatewayPluginConfigs(picked.plugins ?? DEFAULT_CONFIG.plugins);
-    const config: AppConfig = withSingleEnabledGlobalProfiles({
+    const modelMigration = migrateXiaomiModels({
       ...DEFAULT_CONFIG,
       ...picked,
       APIKEY: apiKeys[0]?.key ?? "",
@@ -336,11 +337,15 @@ export async function loadAppConfig(): Promise<AppConfig> {
         mcpServers: picked.toolHub?.mcpServers ?? DEFAULT_CONFIG.toolHub.mcpServers
       }
     });
+    const config = withSingleEnabledGlobalProfiles(modelMigration.config);
     const shouldPersistApiKeys = loadedApiKeys.length === 0 || hasConfigFileApiKeys(rawValue) || configFileApiKeys.length > 0;
     const shouldRepairProviderCapabilities = hasUnsupportedNvidiaCapabilities(value.Providers);
     const shouldRepairKnownPlugins = pluginMigration.changed;
     if (loadedRawConfig.source !== "sqlite" || shouldPersistApiKeys || shouldRepairProviderCapabilities || shouldRepairKnownPlugins) {
       await replacePersistedConfigSnapshot(sanitizeConfigForDisk(config), apiKeys);
+    } else if (modelMigration.changed) {
+      // Model repairs do not own gateway credentials or replace their table.
+      await replacePersistedAppConfig(sanitizeConfigForDisk(config));
     }
     if (loadedRawConfig.source === "legacy-json" && loadedRawConfig.legacyJsonFile) {
       await archiveLegacyJsonConfigFiles([loadedRawConfig.legacyJsonFile]).catch((archiveError) => {
@@ -390,7 +395,7 @@ export async function saveAppThemePreference(theme: unknown): Promise<AppConfig[
 }
 
 async function saveAppConfigNow(config: AppConfig): Promise<AppConfig> {
-  const normalizedConfig = withSingleEnabledGlobalProfiles(config);
+  const normalizedConfig = withSingleEnabledGlobalProfiles(migrateXiaomiModels(config).config);
   assertProviderApiKeysAreSafe(normalizedConfig);
   validateProfileAliasFiles(normalizedConfig.profile.profiles, path.join(CONFIGDIR, "bin"));
   const pluginMigration = migrateKnownGatewayPluginConfigs(normalizedConfig.plugins);

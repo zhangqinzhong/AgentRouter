@@ -234,7 +234,7 @@ test("Xiaomi MiMo presets expose official Responses, Chat, and Anthropic endpoin
 
   for (const [preset, openAiBaseUrl, anthropicBaseUrl] of cases) {
     assert.equal(providerPresets.find((candidate) => candidate.id === preset.id), preset);
-    assert.deepEqual(preset.defaultModels, ["mimo-v2.5-pro", "mimo-v2.5"]);
+    assert.deepEqual(preset.defaultModels, ["mimo-v2.6-pro", "mimo-v2.6-flash"]);
     assert.deepEqual(preset.endpoints, [
       {
         baseUrl: openAiBaseUrl,
