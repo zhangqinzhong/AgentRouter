@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.10.4 - 2026-10-20
+
+### Fixes
+- Use MiMo v2.6 Pro and Flash in Xiaomi standard and regional Token Plan presets.
+- Migrate retired MiMo v2.5 models and safely identified saved references for official Xiaomi endpoints, preserving custom providers, metadata, and ambiguous selections.
+
 ## 1.10.3 - 2026-10-15
 
 ### Fixes
