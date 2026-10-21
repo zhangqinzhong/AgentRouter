@@ -1524,3 +1524,12 @@ html[data-window-active="false"] .status-heartbeat {
 .session-markdown .hljs-comment { color: #737373; }
 .dark .session-markdown .hljs-string { color: #6ee7b7; }
 .dark .session-markdown .hljs-title, .dark .session-markdown .hljs-attr { color: #93c5fd; }
+
+/* Scope the arrow to its own disclosure, including nested citation panels. */
+.session-disclosure > summary { display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer; list-style: none; }
+.session-disclosure > summary::-webkit-details-marker { display: none; }
+.session-disclosure > summary > svg:first-child { transition: transform 150ms ease; flex-shrink: 0; }
+.session-disclosure[open] > summary > svg:first-child { transform: rotate(90deg); }
+.session-disclosure > summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: 4px; }
+.session-markdown { min-width: 0; }
+.session-markdown pre { max-width: 100%; }

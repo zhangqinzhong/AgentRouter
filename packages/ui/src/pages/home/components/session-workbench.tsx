@@ -32,7 +32,10 @@ type MemoryCitation = { entries: MemoryEntry[]; rolloutIds: string[] };
 // Codex appends one memory citation to a final answer. The outer tag is HTML,
 // so skipHtml removes it; citation_entries and rollout_ids contain underscores
 // and stay on screen as literal tags. Parse the block before Markdown.
-function parseMemoryCitation(entriesText: string, rolloutText: string): MemoryCitation {
+function parseMemoryCitation(
+  entriesText: string,
+  rolloutText: string,
+): MemoryCitation {
   const entries = entriesText
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -51,7 +54,10 @@ function parseMemoryCitation(entriesText: string, rolloutText: string): MemoryCi
   };
 }
 
-function splitMemoryCitations(text: string): { body: string; citations: MemoryCitation[] } {
+function splitMemoryCitations(text: string): {
+  body: string;
+  citations: MemoryCitation[];
+} {
   const fences: string[] = [];
   const masked = text.replace(/```[\s\S]*?```/g, (fence) => {
     const token = `\u0000${fences.length}\u0000`;
@@ -63,7 +69,8 @@ function splitMemoryCitations(text: string): { body: string; citations: MemoryCi
     /<oai-mem-citation>\s*<citation_entries>([\s\S]*?)<\/citation_entries>\s*<rollout_ids>([\s\S]*?)<\/rollout_ids>\s*<\/oai-mem-citation>/g,
     (_match, entries, rollouts) => {
       const citation = parseMemoryCitation(entries, rollouts);
-      if (citation.entries.length === 0 && citation.rolloutIds.length === 0) return "";
+      if (citation.entries.length === 0 && citation.rolloutIds.length === 0)
+        return "";
       citations.push(citation);
       return "";
     },
@@ -71,24 +78,40 @@ function splitMemoryCitations(text: string): { body: string; citations: MemoryCi
   return {
     citations,
     body: stripped
-      .replace(/\u0000(\d+)\u0000/g, (_match, index) => fences[Number(index)] ?? "")
+      .replace(
+        /\u0000(\d+)\u0000/g,
+        (_match, index) => fences[Number(index)] ?? "",
+      )
       .replace(/\n{3,}/g, "\n\n")
       .replace(/^\n+|\n+$/g, ""),
   };
 }
 
-function MemoryCitations({ citations, zh }: { citations: MemoryCitation[]; zh: boolean }) {
+function MemoryCitations({
+  citations,
+  zh,
+}: {
+  citations: MemoryCitation[];
+  zh: boolean;
+}) {
   if (citations.length === 0) return null;
   return (
-    <div className="mt-3 border-t border-border/40 pt-3 text-xs leading-6 text-muted-foreground">
-      <div>{zh ? "记忆引用" : "Memory citation"}</div>
+    <details className="session-disclosure mt-3 text-xs leading-6 text-muted-foreground">
+      <summary>
+        <ChevronRight size={14} />
+        {zh ? "记忆引用" : "Memory citation"}
+      </summary>
       {citations.map((citation, index) => (
         <div key={index}>
           {citation.entries.map((entry, entryIndex) => (
             <div key={entryIndex} className="mt-1">
-              {entry.note ? <div className="break-words">{entry.note}</div> : null}
+              {entry.note ? (
+                <div className="break-words">{entry.note}</div>
+              ) : null}
               <div className="font-mono break-words">
-                {entry.start ? `${entry.path}:${entry.start}-${entry.end}` : entry.path}
+                {entry.start
+                  ? `${entry.path}:${entry.start}-${entry.end}`
+                  : entry.path}
               </div>
             </div>
           ))}
@@ -104,7 +127,7 @@ function MemoryCitations({ citations, zh }: { citations: MemoryCitation[]; zh: b
           )}
         </div>
       ))}
-    </div>
+    </details>
   );
 }
 
@@ -232,9 +255,9 @@ export function TranscriptMessage({
   );
   if (folded)
     return (
-      <details className="group mb-4 rounded-lg border border-border/40 bg-muted/15 px-3 py-2">
+      <details className="session-disclosure mb-3 rounded-lg border border-border/40 bg-muted/15 px-3 py-2">
         <summary className="flex cursor-pointer list-none items-center gap-2 text-xs text-muted-foreground [&::-webkit-details-marker]:hidden">
-          <ChevronRight className="h-3.5 w-3.5 shrink-0 transition-transform group-open:rotate-90" />
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 transition-transform " />
           {context
             ? zh
               ? "会话上下文"
@@ -252,11 +275,86 @@ export function TranscriptMessage({
     <div
       className={
         m.role === "user"
-          ? "mb-7 ml-auto w-fit max-w-[95%] rounded-2xl rounded-tr-sm bg-muted/70 px-5 py-3"
-          : "mb-7 px-1"
+          ? "mb-6 ml-auto w-fit min-w-0 max-w-[min(90%,540px)] rounded-2xl bg-muted/70 px-4 py-3"
+          : "mb-5 min-w-0 px-1"
       }
     >
       {content}
     </div>
+  );
+}
+
+type TranscriptTool = {
+  id: string;
+  name: string;
+  input?: string;
+  input_preview?: string;
+  output?: string;
+};
+export function TranscriptTools({
+  tools,
+  zh,
+  highlight,
+}: {
+  tools: TranscriptTool[];
+  zh: boolean;
+  highlight?: string;
+}) {
+  if (!tools.length) return null;
+  const first = tools[0];
+  const preview = (first.input_preview || first.input || "")
+    .replace(/\s+/g, " ")
+    .slice(0, 160);
+  return (
+    <details className="session-disclosure mb-5 min-w-0 rounded-lg border border-border/50 bg-muted/20">
+      <summary className="px-3 py-2.5 text-xs text-muted-foreground">
+        <ChevronRight size={14} className="shrink-0" />
+        <span className="shrink-0 font-medium text-foreground">
+          {first.name}
+        </span>
+        <span className="min-w-0 flex-1 truncate font-mono">{preview}</span>
+        <span className="shrink-0">
+          {tools.length} {zh ? "次调用" : "calls"}
+        </span>
+      </summary>
+      <div className="border-t border-border/50 p-3">
+        {tools.map((tool, i) => (
+          <div key={tool.id || i} className="min-w-0 [&+&]:mt-4">
+            <div className="mb-2 text-xs font-medium">{tool.name}</div>
+            {[
+              [zh ? "输入" : "Input", tool.input || tool.input_preview],
+              [zh ? "输出" : "Output", tool.output],
+            ].map(([label, value]) =>
+              value ? (
+                <div key={label} className="mb-3">
+                  <div className="mb-1 text-[11px] text-muted-foreground">
+                    {label}
+                  </div>
+                  <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-muted/40 p-3 font-mono text-xs leading-6 [overflow-wrap:anywhere]">
+                    {highlight &&
+                    value.toLowerCase().includes(highlight.toLowerCase())
+                      ? (() => {
+                          const at = value
+                            .toLowerCase()
+                            .indexOf(highlight.toLowerCase());
+                          return (
+                            <>
+                              {value.slice(0, at)}
+                              <mark className="bg-amber-200 text-black">
+                                {value.slice(at, at + highlight.length)}
+                              </mark>
+                              {value.slice(at + highlight.length)}
+                            </>
+                          );
+                        })()
+                      : value}
+                  </pre>
+                </div>
+              ) : null,
+            )}
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
