@@ -162,6 +162,8 @@ what "verbatim" means in the prompts. The scores, per fixture and run:
 |---|---|
 | `projection_loss` | share of `must_mention` absent from the prompt (zero-LLM) |
 | `llm_loss` | share of the prompt-reaching `must_mention` absent from the pages |
+| `error_line_observation_coverage` | share of observations carrying a mined error line whose error line reaches the request |
+| `file_error_line_share` | share of request-reaching error lines that came from file-shaped tool output |
 | `recall_prompt` / `recall_page` | keep-token recall (`mine_keep_tokens`) of the prompt and the pages; a broad secondary view |
 | `hallucinated_tokens` | keep-tokens on a page found in neither the request nor the batch's own paths |
 | `invented_wikilinks` | `[[links]]` to pages outside the batch; the prompt lists no existing pages, so each one is invented (#1207) |
@@ -201,6 +203,8 @@ Zero-LLM, no provider:
 
 ```bash
 cargo run -p ai-memory-eval -- projection --generated-seed 1215
+# compare the default projection with the opt-in residue, without a provider:
+cargo run -p ai-memory-eval -- projection --generated-seed 1215 --residue
 # also write every request and the generated session to a directory:
 cargo run -p ai-memory-eval -- projection --generated-seed 1215 --dump evals/runs/projection
 ```
@@ -208,6 +212,13 @@ cargo run -p ai-memory-eval -- projection --generated-seed 1215 --dump evals/run
 Point `--dump` and the fixtures at synthetic sessions only. A request
 holds every observation verbatim, and real sessions do not belong in
 files you may share.
+
+For the model half, `ab --residue` keeps the baseline request at the
+byte-compatible default and enables the residue only for the candidate. Use
+the same provider and model on both sides and `--runs 3`; the within-side
+spread is the noise band. The JSON report records the candidate projection
+separately and sets `verbatim_residue_ab` so published results cannot be
+mistaken for a provider comparison.
 
 ## Adding fixtures
 

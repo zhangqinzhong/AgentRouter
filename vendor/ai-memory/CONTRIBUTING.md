@@ -192,3 +192,12 @@ than the following major release.
   are not held for feature releases. Small additive features (a new
   agent harness, LLM provider, install client) ship in the next
   **minor**.
+- **Pick the base branch from that impact.** A fix targets `main`. A new
+  capability (flag, subcommand, MCP tool, config key, agent harness,
+  provider, companion) targets the standing feature branch, currently
+  `release/3.1`. A fix to code that exists only on the feature branch
+  targets that branch too.
+- **Check what already landed first.** Before opening a PR, look for the
+  issue's closing commit and search `git log origin/main origin/release/3.1`
+  for the feature or fix. A closed issue usually means the work shipped;
+  a PR that redoes it gets closed, however good it is.

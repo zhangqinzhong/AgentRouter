@@ -19,6 +19,12 @@ The command is split on whitespace and executed directly, not through a shell.
 Use a wrapper script if you need quoting, environment setup, or multiple
 commands.
 
+The eval policy is owned by the server process. `ai-memory auto-improve` and
+direct HTTP requests cannot replace the configured command, targets, timeout,
+or score threshold. When a CLI talks to a remote server, configure
+`[auto_improve.eval]` in that server's config; older clients that send an
+`eval` request field receive `422 Unprocessable Entity` and must be upgraded.
+
 ## Request contract
 
 The scorer receives one JSON object on stdin:

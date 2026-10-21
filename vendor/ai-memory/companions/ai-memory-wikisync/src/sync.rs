@@ -192,22 +192,28 @@ pub fn diff_summary(disk: Option<&[u8]>, server: Option<&[u8]>) -> String {
     };
     let local_lines = disk.iter().filter(|byte| **byte == b'\n').count();
     let server_lines = server.iter().filter(|byte| **byte == b'\n').count();
+    // Compare the first missing line too, even when the shared prefix is identical.
     let first_difference = disk
         .split(|byte| *byte == b'\n')
-        .zip(server.split(|byte| *byte == b'\n'))
+        .map(Some)
+        .chain(std::iter::once(None))
+        .zip(
+            server
+                .split(|byte| *byte == b'\n')
+                .map(Some)
+                .chain(std::iter::once(None)),
+        )
         .position(|(local, remote)| local != remote)
         .map_or(0, |index| index + 1);
     let local_line = disk
         .split(|byte| *byte == b'\n')
-        .nth(first_difference.saturating_sub(1))
-        .unwrap_or_default();
+        .nth(first_difference.saturating_sub(1));
     let server_line = server
         .split(|byte| *byte == b'\n')
-        .nth(first_difference.saturating_sub(1))
-        .unwrap_or_default();
+        .nth(first_difference.saturating_sub(1));
     format!(
         "local {} bytes/{} lines vs server {} bytes/{} lines; first difference at line \
-         {}: local {:?} vs server {:?}",
+         {}: local {} vs server {}",
         disk.len(),
         local_lines,
         server.len(),
@@ -218,8 +224,12 @@ pub fn diff_summary(disk: Option<&[u8]>, server: Option<&[u8]>) -> String {
     )
 }
 
-fn preview(line: &[u8]) -> String {
-    line.iter()
+fn preview(line: Option<&[u8]>) -> String {
+    let Some(line) = line else {
+        return "<end of file>".to_string();
+    };
+    let text: String = line
+        .iter()
         .take(60)
         .map(|byte| {
             if byte.is_ascii_graphic() || *byte == b' ' {
@@ -228,7 +238,8 @@ fn preview(line: &[u8]) -> String {
                 '?'
             }
         })
-        .collect()
+        .collect();
+    format!("{text:?}")
 }
 
 /// Atomic file replacement inside the destination: write a hidden tmp file
@@ -672,6 +683,47 @@ mod tests {
         assert!(summary.contains("local"), "{summary}");
         let revalidated = diff_summary(Some(disk), None);
         assert!(revalidated.contains("revalidated by ETag"), "{revalidated}");
+    }
+
+    #[test]
+    fn diff_summary_reports_appended_and_removed_lines() {
+        type Case<'a> = (&'a [u8], &'a [u8], usize, &'a str, &'a str);
+        let cases: &[Case<'_>] = &[
+            (b"one", b"one\nextra", 2, "<end of file>", "\"extra\""),
+            (b"one\nextra", b"one", 2, "\"extra\"", "<end of file>"),
+            (b"one\n", b"one\nextra\n", 2, "\"\"", "\"extra\""),
+            (b"one\nextra\n", b"one\n", 2, "\"extra\"", "\"\""),
+            (b"", b"extra", 1, "\"\"", "\"extra\""),
+            (b"extra", b"", 1, "\"extra\"", "\"\""),
+            (b"one", b"one\n", 2, "<end of file>", "\"\""),
+            (b"one\n", b"one", 2, "\"\"", "<end of file>"),
+            (b"", b"\n", 2, "<end of file>", "\"\""),
+            (b"\n", b"", 2, "\"\"", "<end of file>"),
+            (
+                b"one",
+                b"one\n<end of file>",
+                2,
+                "<end of file>",
+                "\"<end of file>\"",
+            ),
+        ];
+        for (disk, server, line, local_preview, server_preview) in cases {
+            let summary = diff_summary(Some(disk), Some(server));
+            let expected = format!(
+                "first difference at line {line}: local {local_preview} vs server {server_preview}"
+            );
+            assert!(summary.ends_with(&expected), "{summary}");
+        }
+    }
+
+    #[test]
+    fn diff_summary_keeps_previews_bounded_and_printable() {
+        let mut disk = vec![b'a'; 57];
+        disk.extend_from_slice("é\x1b[31mhidden".as_bytes());
+        let summary = diff_summary(Some(&disk), Some(b"changed"));
+        let expected = format!("local \"{}???\" vs server \"changed\"", "a".repeat(57));
+        assert!(summary.ends_with(&expected), "{summary}");
+        assert!(!summary.contains('\x1b'), "{summary}");
     }
 
     #[test]

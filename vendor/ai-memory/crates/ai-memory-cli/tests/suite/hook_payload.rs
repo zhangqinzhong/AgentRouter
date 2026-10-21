@@ -457,3 +457,84 @@ fn codex_capture_off_does_not_capture_assistant_message() {
     // Unrelated fields survive so the Codex Stop event is still ingested.
     assert!(body.contains("codex-off"), "session_id was dropped: {body}");
 }
+
+// --- Lone UTF-16 surrogate escapes -----------------------------------------
+//
+// A harness that cuts tool output in the middle of an emoji can send half of a
+// `\uD83D\uDE00` pair. `serde_json` rejects that escape, and so does the
+// server's JSON extractor, so the hook replaces only the unpaired half with
+// U+FFFD instead of dropping the whole event.
+
+fn spooled_stdout(tmp: &Path, payload: &[u8]) -> String {
+    let output = run_hook_event(tmp, "post-tool-use", payload);
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&spooled_body(tmp)).expect("spooled body is JSON");
+    body["tool_response"]["stdout"]
+        .as_str()
+        .expect("tool_response.stdout")
+        .to_owned()
+}
+
+#[test]
+fn lone_leading_surrogate_escape_is_spooled_as_replacement_character() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"lone-lead","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"echo"},"tool_response":{"stdout":"ok \ud83d\n... (truncated)"}}"#;
+    assert_eq!(
+        spooled_stdout(tmp.path(), payload),
+        "ok \u{FFFD}\n... (truncated)"
+    );
+}
+
+#[test]
+fn lone_trailing_surrogate_escape_is_spooled_as_replacement_character() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"lone-trail","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"echo"},"tool_response":{"stdout":"\ude00 tail"}}"#;
+    assert_eq!(spooled_stdout(tmp.path(), payload), "\u{FFFD} tail");
+}
+
+#[test]
+fn surrogate_repair_keeps_pairs_and_escaped_backslashes() {
+    // A lead followed by a full pair: only the first lead is unpaired. The
+    // `\\ud83d` is an escaped backslash followed by text, not an escape.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"mixed","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"echo"},"tool_response":{"stdout":"\ud83d\ud83d\ude00 \\ud83d \\\ude00"}}"#;
+    assert_eq!(
+        spooled_stdout(tmp.path(), payload),
+        "\u{FFFD}\u{1F600} \\ud83d \\\u{FFFD}"
+    );
+}
+
+#[test]
+fn payload_with_a_full_surrogate_pair_keeps_its_exact_bytes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"pair","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"echo"},"tool_response":{"stdout":"ok \ud83d\ude00"}}"#;
+    let output = run_hook_event(tmp.path(), "post-tool-use", payload);
+    assert!(output.status.success());
+    assert_eq!(spooled_body(tmp.path()).as_bytes(), payload);
+}
+
+#[test]
+fn malformed_payload_with_a_lone_surrogate_still_warns_without_spooling() {
+    // Invalid JSON stays invalid after the repair; a backslash before a
+    // multibyte character or at the end must not crash the hook.
+    for payload in [
+        r#"{"x":"\ud83d \é"#.as_bytes(),
+        r#"{"x":"\ud83d \"#.as_bytes(),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = run_hook(tmp.path(), payload);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{}\n");
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("stderr utf8"),
+            "ai-memory hook warning: could not parse event payload as JSON; nothing was captured\n"
+        );
+        assert!(!tmp.path().join("hook-spool").exists());
+    }
+}

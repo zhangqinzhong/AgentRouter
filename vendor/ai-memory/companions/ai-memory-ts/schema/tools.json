@@ -772,6 +772,40 @@
     },
     "required": []
   },
+  "memory_restore_page": {
+    "properties": {
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "path": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "rev": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "path"
+    ]
+  },
   "memory_status": {
     "properties": {
       "project": {

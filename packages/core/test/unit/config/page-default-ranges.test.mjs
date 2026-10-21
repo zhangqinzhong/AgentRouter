@@ -11,7 +11,8 @@ test("page defaults normalize independently and reject custom or unsupported ran
     overview: "custom", usage: "week", sessions: "90d", trend: "year", heatmap: 999
   }), { ...DEFAULT_PAGE_RANGES, usage: "week", sessions: "90d", trend: "year" });
   assert.equal("heatmap" in normalizePageDefaultRanges({ heatmap: 4 }), false);
-  assert.equal(DEFAULT_PAGE_RANGES.overview, "today");
+  assert.equal(DEFAULT_PAGE_RANGES.overview, "24h");
+  assert.equal(normalizePageDefaultRanges({overview: "today"}).overview, "24h");
   assert.equal(DEFAULT_PAGE_RANGES.sessions, "7d");
 });
 

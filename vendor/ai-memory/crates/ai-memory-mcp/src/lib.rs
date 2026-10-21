@@ -15,7 +15,9 @@ pub mod auth;
 pub mod human_auth;
 pub mod identity;
 pub mod metrics;
+pub mod self_service_keys;
 mod server;
+pub mod session_management;
 
 pub use actor::actor_from_headers;
 pub use admin::{

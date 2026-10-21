@@ -374,10 +374,7 @@ fn ensure_bundle_indexes(git: &crate::git::GitAdapter) -> WikiResult<()> {
                 })
                 .unwrap_or_default();
             families.sort();
-            let listing = families
-                .iter()
-                .map(|f| format!("- [{f}/]({f}/)\n"))
-                .collect::<String>();
+            let listing = crate::okf_directory_listing(&families);
             let body =
                 format!("# Bundle index\n\nConcept files live in these directories:\n\n{listing}");
             let content = format!("---\nokf_version: \"0.2\"\n---\n\n{body}");
@@ -643,6 +640,33 @@ mod tests {
         assert_eq!(
             md.body, "# Hand written\r\n\r\nBody.\r\n",
             "the body must not gain a second frontmatter block: {conformed:?}"
+        );
+    }
+
+    #[test]
+    fn bundle_index_escapes_directory_links_and_preserves_existing_index() {
+        let tmp = TempDir::new().unwrap();
+        for family in ["notes", "team notes", "c# 50%"] {
+            std::fs::create_dir_all(tmp.path().join("w/p").join(family)).unwrap();
+        }
+        let git = crate::git::GitAdapter::open_or_init(tmp.path()).unwrap();
+        ensure_bundle_indexes(&git).unwrap();
+        let index = tmp.path().join("w/p/index.md");
+        let content = std::fs::read_to_string(&index).unwrap();
+        assert!(content.contains("- [notes/](notes/)\n"), "{content}");
+        assert!(
+            content.contains("(team%20notes/)"),
+            "migration directory destination must be URL encoded: {content}"
+        );
+        assert!(
+            content.contains("(c%23%2050%25/)"),
+            "literal URL delimiters must stay in the directory name: {content}"
+        );
+        git.write_atomic(&index, b"operator-owned index\n").unwrap();
+        ensure_bundle_indexes(&git).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(index).unwrap(),
+            "operator-owned index\n"
         );
     }
 

@@ -37,6 +37,46 @@ use serde::{Deserialize, Serialize};
 use crate::error::WikiError;
 use crate::{Markdown, WikiResult};
 
+/// Why a `reject`-policy webhook stopped [`AdmissionChain::run`]. It travels
+/// as the source of the returned `WikiError::Io`, whose message is this
+/// one's, so callers that only log or display the error see no change.
+#[derive(Debug)]
+pub(crate) struct AdmissionFailure {
+    /// The webhook could not give a verdict (transport error, timeout, 5xx),
+    /// as opposed to answering with a refusal.
+    unavailable: bool,
+    message: String,
+}
+
+impl std::fmt::Display for AdmissionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AdmissionFailure {}
+
+impl AdmissionFailure {
+    fn into_error(unavailable: bool, message: String) -> WikiError {
+        WikiError::Io(std::io::Error::other(Self {
+            unavailable,
+            message,
+        }))
+    }
+}
+
+/// `true` when `err` came from [`AdmissionChain::run`] because a webhook was
+/// unreachable, timed out or answered 5xx, rather than refusing the page.
+pub(crate) fn is_admission_unavailable(err: &WikiError) -> bool {
+    match err {
+        WikiError::Io(io) => io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<AdmissionFailure>())
+            .is_some_and(|failure| failure.unavailable),
+        _ => false,
+    }
+}
+
 /// Lifecycle operation that triggered the chain. Webhooks subscribe via
 /// [`WebhookConfig::events`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -52,6 +92,13 @@ pub enum AdmissionOp {
     /// A single page is being deleted (`Wiki::delete_page`). Carries the
     /// page path; no body. Lets a mirror `git rm` the file.
     Delete,
+    /// A hook event ledger file (`log-YYYY-MM.md`) is being deleted by the
+    /// opt-in ledger retention pass of the forget sweep
+    /// (`Wiki::delete_event_ledger`). Carries the ledger file name in the
+    /// page path; no body, and no `pages` row to touch (ledgers are files,
+    /// not pages). Fired **before** the file is removed, so a `reject`-policy
+    /// webhook keeps it; a mirror subscribed to it can `git rm` the file.
+    DeleteEventLedger,
     /// A whole project is being purged (`Wiki::purge_project` →
     /// `remove_dir_all`). Carries the project (ctx), no page path. Lets a
     /// mirror remove the project's directory.
@@ -107,6 +154,7 @@ impl AdmissionOp {
             AdmissionOp::WritePage => "write_page",
             AdmissionOp::Consolidate => "consolidate",
             AdmissionOp::Delete => "delete",
+            AdmissionOp::DeleteEventLedger => "delete_event_ledger",
             AdmissionOp::PurgeProject => "purge_project",
             AdmissionOp::PurgeSession => "purge_session",
             AdmissionOp::PurgeWorkspace => "purge_workspace",
@@ -431,16 +479,22 @@ impl AdmissionChain {
                     );
                     tracing::warn!(webhook = %hook.name, status = %status, body = %body_txt, "admission error response");
                     if matches!(hook.failure_policy, FailurePolicy::Reject) {
-                        return Err(WikiError::Io(std::io::Error::other(err_msg)));
+                        let unavailable = status.is_server_error()
+                            || matches!(
+                                status,
+                                reqwest::StatusCode::REQUEST_TIMEOUT
+                                    | reqwest::StatusCode::TOO_MANY_REQUESTS
+                            );
+                        return Err(AdmissionFailure::into_error(unavailable, err_msg));
                     }
                 }
                 Err(e) => {
                     tracing::warn!(webhook = %hook.name, error = %e, "admission request failed");
                     if matches!(hook.failure_policy, FailurePolicy::Reject) {
-                        return Err(WikiError::Io(std::io::Error::other(format!(
-                            "admission webhook {} request failed: {}",
-                            hook.name, e
-                        ))));
+                        return Err(AdmissionFailure::into_error(
+                            true,
+                            format!("admission webhook {} request failed: {}", hook.name, e),
+                        ));
                     }
                 }
             }

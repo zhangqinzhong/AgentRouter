@@ -20,7 +20,7 @@ use crate::codex_responses::{CodexResponsesAuth, post_codex_responses};
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
-use crate::stored_token::{StoredOAuthToken, refresh_grant};
+use crate::stored_token::{StoredOAuthToken, credential_endpoint, refresh_grant};
 use crate::text::truncate_with_ellipsis;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
 
@@ -154,7 +154,10 @@ impl OpenAiOAuthProvider {
                 token_path.display()
             ))
         })?;
-        let client = reqwest::Client::builder().build().map_err(LlmError::from)?;
+        let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
+            .build()
+            .map_err(LlmError::from)?;
         Ok(Self {
             client,
             model: model.into(),
@@ -270,9 +273,11 @@ async fn refresh_access_token(
     client: &reqwest::Client,
     current: &OpenAiOAuthToken,
 ) -> LlmResult<OpenAiOAuthToken> {
+    let token_endpoint =
+        credential_endpoint("OpenAI OAuth token endpoint", OPENAI_OAUTH_TOKEN_URL)?;
     let token_response = refresh_grant::<OpenAiOAuthTokenResponse>(
         client,
-        OPENAI_OAUTH_TOKEN_URL,
+        &token_endpoint,
         current.refresh.expose_secret(),
         CODEX_CLIENT_ID,
         "openai-oauth refresh failed",

@@ -560,13 +560,15 @@ jobs:
             sha256sum ai-memory-claude-plugin.zip > ai-memory-claude-plugin.zip.sha256
           )
 
-      - name: Stage checksum-verified install script
+      - name: Stage checksum-verified install scripts
         run: |
           set -euo pipefail
           install -m 0755 install.sh artifacts/install.sh
+          install -m 0644 install.ps1 artifacts/install.ps1
           (
             cd artifacts
             sha256sum install.sh > install.sh.sha256
+            sha256sum install.ps1 > install.ps1.sha256
           )
 
       - name: Generate release body
@@ -594,8 +596,9 @@ jobs:
           echo "# macOS aarch64/x86_64 (no toolchain): download the matching ai-memory-macos-<arch>.tar.gz below," >> body.md
           echo "# extract it, and follow the bundled docs/macos.md." >> body.md
           echo "" >> body.md
-          echo "# Windows x86_64 (no toolchain): download ai-memory-windows-x86_64.zip below," >> body.md
-          echo "# extract it, and follow the bundled docs/windows.md." >> body.md
+          echo "# Windows x86_64, no admin (PowerShell): checksum-verified release under %LOCALAPPDATA%\\Programs, then one-step setup" >> body.md
+          echo "\$env:AI_MEMORY_VERSION='${{ needs.validate-version.outputs.version }}'; irm https://github.com/akitaonrails/ai-memory/releases/download/${GITHUB_REF_NAME}/install.ps1 | iex" >> body.md
+          echo "ai-memory setup" >> body.md
           echo "" >> body.md
           echo "# From source" >> body.md
           echo "cargo install --locked --git https://github.com/akitaonrails/ai-memory --tag ${GITHUB_REF_NAME}" >> body.md

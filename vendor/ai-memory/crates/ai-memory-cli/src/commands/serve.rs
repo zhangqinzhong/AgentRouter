@@ -1150,7 +1150,24 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let mut shutdown = ShutdownSignals::install();
 
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-management-ui requires --transport http");
+    }
+
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && args.enable_web && normalize_prefix(&args.web_slug) == "/manage"
+    {
+        anyhow::bail!("the management console reserves /manage; choose a different --web-slug");
+    }
+
     refuse_a_missing_token_file(&config.auth)?;
+    if args.enable_session_management && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-session-management requires --transport http");
+    }
+    if args.enable_self_service_keys && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-self-service-keys requires --transport http");
+    }
     config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -1360,6 +1377,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_ledger_retention(config.decay.ledger_retention())
         .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_contradiction_band(config.contradiction_band_min, config.contradiction_band_max)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
@@ -1453,6 +1471,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     }
                 }
             }
+            close_store(&store).await;
         }
         TransportKind::Http => {
             seed_active_project_fallback(&store.reader, &active_project).await;
@@ -1635,6 +1654,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
+                config.decay.ledger_retention(),
                 config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
@@ -1834,6 +1854,47 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
                 )));
+            #[cfg(not(feature = "management-ui"))]
+            let management_ui_enabled = false;
+            #[cfg(feature = "management-ui")]
+            let management_ui_enabled = args.enable_management_ui;
+            let router = if args.enable_session_management || management_ui_enabled {
+                router.merge(ai_memory_mcp::session_management::router(
+                    ai_memory_mcp::session_management::SessionManagementState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        wiki: wiki.clone(),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
+            let router = if args.enable_self_service_keys || management_ui_enabled {
+                router.merge(ai_memory_mcp::self_service_keys::router(
+                    ai_memory_mcp::self_service_keys::SelfServiceKeysState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        pepper: config
+                            .auth
+                            .token_pepper
+                            .clone()
+                            .filter(|p| !p.trim().is_empty())
+                            .map(TokenPepper::new),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
+            #[cfg(feature = "management-ui")]
+            let router = if management_ui_enabled {
+                // Delegate forms to the same already-authenticated engine routers.
+                let backend = router.clone();
+                router.merge(ai_memory_web::management::router(&base_path, backend))
+            } else {
+                router
+            };
             let router = apply_host_layer(router, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
@@ -1975,12 +2036,39 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     ),
                 }
             }
+            close_store(&store).await;
             if let Some(serve_result) = serve_result {
                 serve_result?;
             }
         }
     }
     Ok(())
+}
+
+/// Checkpoint the WAL and close the store's connections on the way out.
+///
+/// `main` ends the process without joining the store writer (detached tasks
+/// still hold clones of its handle), so the connection is never closed and the
+/// whole `-wal` is left for the next start to replay: 9 minutes for a 17.8 GB
+/// one after a `VACUUM`. Bounded by [`SHUTDOWN_GRACE`] because the close queues
+/// behind whatever the writer is running, and a stuck query must not turn a
+/// stop back into a SIGKILL.
+async fn close_store(store: &Store) {
+    close_store_within(store, SHUTDOWN_GRACE).await;
+}
+
+/// [`close_store`] with the deadline as a parameter, so a test can pin the
+/// bound without waiting out the real one. `true` when the store closed in
+/// time.
+async fn close_store_within(store: &Store, grace: Duration) -> bool {
+    if tokio::time::timeout(grace, store.close()).await.is_err() {
+        tracing::warn!(
+            grace_secs = grace.as_secs(),
+            "store did not close within the shutdown grace period; exiting anyway"
+        );
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2059,6 +2147,7 @@ async fn start_maintenance_scheduler(
                             &decay.decay_params(),
                             decay.breadth_weight,
                             decay.observation_retention(),
+                            decay.ledger_retention(),
                             decay.compact_cold_episodic,
                             decay.cold_cluster_dedup(dedup_embedding),
                         )
@@ -2077,6 +2166,9 @@ async fn start_maintenance_scheduler(
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
+                            ledgers_pruned = outcome.ledgers_pruned,
+                            ledger_bytes_pruned = outcome.ledger_bytes_pruned,
+                            ledgers_undeleted = outcome.ledgers_undeleted,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
                             "scheduled forget sweep completed"
@@ -2476,6 +2568,9 @@ struct ScheduledSweepTickOutcome {
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
+    ledgers_pruned: usize,
+    ledger_bytes_pruned: u64,
+    ledgers_undeleted: usize,
     errors: usize,
 }
 
@@ -2487,6 +2582,7 @@ async fn run_scheduled_sweep_tick(
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
     retention: ObservationRetention,
+    ledgers: ai_memory_consolidate::LedgerRetention,
     compact_cold_episodic: bool,
     dedup: ai_memory_consolidate::ColdClusterDedup,
 ) -> Result<ScheduledSweepTickOutcome> {
@@ -2497,7 +2593,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match ai_memory_consolidate::run_sweep_with_hygiene(
+        match ai_memory_consolidate::run_sweep_with_ledgers(
             reader,
             writer,
             Some(wiki),
@@ -2508,6 +2604,7 @@ async fn run_scheduled_sweep_tick(
             retention,
             compact_cold_episodic,
             dedup.clone(),
+            ledgers,
             false,
         )
         .await
@@ -2523,6 +2620,9 @@ async fn run_scheduled_sweep_tick(
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
+                outcome.ledgers_pruned += report.ledgers_pruned;
+                outcome.ledger_bytes_pruned += report.ledger_bytes_pruned;
+                outcome.ledgers_undeleted += report.ledgers_undeleted;
             }
             Err(e) => {
                 outcome.errors += 1;
@@ -2862,6 +2962,7 @@ fn configure_consolidator(
         model = llm.model(),
         max_input_tokens = config.consolidation.max_input_tokens,
         max_output_tokens = config.consolidation.max_output_tokens,
+        verbatim_residue = config.consolidation.verbatim_residue,
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
     let consolidator = Arc::new(
@@ -2874,6 +2975,7 @@ fn configure_consolidator(
             project_id,
         )
         .with_per_user_slots(config.slots.per_user)
+        .with_verbatim_residue(config.consolidation.verbatim_residue)
         .with_prompt_limits(
             config.consolidation.max_input_tokens,
             config.consolidation.max_output_tokens,
@@ -3316,6 +3418,41 @@ fn host_without_port(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "management-ui")]
+    #[tokio::test]
+    async fn management_ui_rejects_invalid_mounts_before_opening_the_store() {
+        use clap::Parser;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            data_dir: tmp.path().join("unopened"),
+            ..Default::default()
+        };
+        for args in [
+            vec!["ai-memory", "serve", "--enable-management-ui"],
+            vec![
+                "ai-memory",
+                "serve",
+                "--transport",
+                "http",
+                "--enable-management-ui",
+                "--enable-web",
+                "--web-slug",
+                "/manage/",
+            ],
+        ] {
+            let parsed = crate::cli::Cli::try_parse_from(args).unwrap();
+            let crate::cli::Command::Serve(args) = parsed.command else {
+                panic!("serve")
+            };
+            let error = super::run(&config, args).await.unwrap_err();
+            assert!(
+                error.to_string().contains("--transport http")
+                    || error.to_string().contains("reserves /manage")
+            );
+            assert!(!config.data_dir.exists());
+        }
+    }
+
     use super::*;
     use ai_memory_core::{
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
@@ -3330,6 +3467,35 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    /// The shutdown close queues behind whatever the writer is running, so the
+    /// deadline is what keeps a stuck query from turning a stop back into a
+    /// SIGKILL. The writer is made busy for real: another connection holds the
+    /// write lock, so the writer's next command (the close itself, or the
+    /// write queued before it) waits in SQLite's 5s busy handler.
+    #[tokio::test]
+    async fn close_store_returns_within_its_grace_while_the_writer_is_busy() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let blocker = rusqlite::Connection::open(store.db_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer = store.writer.clone();
+        let queued = tokio::spawn(async move { writer.get_or_create_workspace("blocked").await });
+
+        let started = std::time::Instant::now();
+        let closed = close_store_within(&store, Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        // Let the writer go before asserting, so a failure does not leave it
+        // parked for the rest of its busy timeout.
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let _ = queued.await;
+        assert!(!closed, "the close cannot finish while the writer is stuck");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "close_store waited {elapsed:?} for a stuck writer instead of giving up"
+        );
+    }
 
     /// An owner-check failure of the startup wiki baseline checkpoint must be
     /// classified as an ERROR-worthy `OwnerFailure`, not the WARN-only
@@ -5478,6 +5644,7 @@ mod tests {
             &decay,
             0.0,
             ObservationRetention::default(),
+            ai_memory_consolidate::LedgerRetention::default(),
             false,
             ai_memory_consolidate::ColdClusterDedup::default(),
         )

@@ -1,6 +1,6 @@
 import {
   Button, CircleAlert, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
-  formatCompactNumber, formatPercent, formatUsdCost, isGatewayProviderEnabled, LoaderCircle,
+  formatCompactNumber, formatPercent, formatUsdCost, LoaderCircle,
   GatewayProviderConfig, ProviderAccountSnapshot, Select, Trash2, UsageComparisonRow, usageRangeOptions,
   UsageDateRange, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useState, X
 } from "../shared/index";
@@ -8,7 +8,6 @@ import { useMemo } from "react";
 import { PeriodRangeTabs } from "@/vendor/tokentracker/ui/dashboard/components/PeriodRangeTabs";
 import { ProviderAccountsSection } from "./overview-accounts";
 import { OverviewBreakdowns } from "./overview-breakdown";
-import { SystemStatusStrip } from "./overview-status";
 import { UsageTrendSection } from "./overview-trend";
 
 export type OverviewUsageFilters = {
@@ -28,8 +27,8 @@ function formatDialogError(error: unknown): string {
 function StatCell({ label, sub, title, value }: { label: string; sub?: string; title?: string; value: string }) {
   return (
     <div className="flex min-w-0 flex-col items-start gap-1.5 text-left">
-      <span className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground">{label}</span>
-      <span className="text-xl font-semibold tabular-nums tracking-tight" title={title}>{value}</span>
+      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      <span className="text-3xl font-semibold tabular-nums tracking-tight" title={title}>{value}</span>
       {sub ? <span className="text-[10px] tabular-nums text-muted-foreground">{sub}</span> : null}
     </div>
   );
@@ -51,7 +50,7 @@ function OverviewRangeTabs({
   const t = useAppText();
   const [customOpen, setCustomOpen] = useState(false);
   const options = useMemo(
-    () => usageRangeOptions.map((option) => ({ key: option.value, label: t(option.label) })),
+    () => usageRangeOptions.filter(option => option.value !== "today").map((option) => ({ key: option.value, label: t(option.label) })),
     [t]
   );
 
@@ -74,43 +73,10 @@ function OverviewRangeTabs({
 
 function overviewStatCells(totals: UsageTotals, translate: (value: string) => string): Array<{ label: string; sub?: string; title?: string; value: string }> {
   return [
-    { label: translate("Requests"), value: formatCompactNumber(totals.requestCount) },
+    { label: translate("Recorded turns"), value: formatCompactNumber(totals.requestCount) },
     { label: translate("Total tokens"), title: totals.totalTokens.toLocaleString(), value: formatCompactNumber(totals.totalTokens) },
     { label: translate("Estimated cost"), value: formatUsdCost(totals.costUsd) },
     { label: translate("Cache ratio"), value: totals.totalTokens > 0 ? formatPercent(totals.cacheRatio) : "—" }
-  ];
-}
-
-function isLocalOverviewRow(row: UsageComparisonRow): boolean {
-  return row.key.startsWith("local:") || row.key.startsWith("local-");
-}
-
-function overviewProviderFilterOptions(
-  providers: GatewayProviderConfig[],
-  usageStats: UsageStatsSnapshot,
-  translate: (value: string) => string
-): Array<{ label: string; value: string }> {
-  const providerNames = new Set<string>();
-  for (const provider of providers) {
-    if (!isGatewayProviderEnabled(provider)) {
-      continue;
-    }
-    const name = provider.name.trim();
-    if (name) {
-      providerNames.add(name);
-    }
-  }
-  for (const row of usageStats.providerModels ?? []) {
-    if (isLocalOverviewRow(row) && row.provider) {
-      providerNames.add(row.provider);
-    }
-  }
-  return [
-    { label: translate("All providers"), value: "" },
-    ...Array.from(providerNames).map((provider) => ({
-      label: provider,
-      value: provider
-    }))
   ];
 }
 
@@ -151,19 +117,6 @@ function usageRowMatchesProviderFilter(
   return Boolean(providerId && (rowProvider === providerId || rowProvider.startsWith(`${providerId}::`)));
 }
 
-function overviewProviderHasModel(
-  providers: GatewayProviderConfig[],
-  providerFilter: string,
-  modelFilter: string,
-  usageStats: UsageStatsSnapshot
-): boolean {
-  const provider = providers.find((item) => item.name === providerFilter);
-  if (provider?.models.some((model) => model.trim() === modelFilter)) {
-    return true;
-  }
-  return (usageStats.models ?? []).some((row) => isLocalOverviewRow(row) && row.provider === providerFilter && row.model === modelFilter);
-}
-
 export function OverviewView({
   onConfigureProviderAccounts,
   providerAccounts,
@@ -198,7 +151,6 @@ export function OverviewView({
   const filterProviders = usageFilters?.providers ?? emptyOverviewProviders;
   const providerFilter = usageFilters?.providerFilter ?? "";
   const modelFilter = usageFilters?.modelFilter ?? "";
-  const providerOptions = overviewProviderFilterOptions(filterProviders, usageStats, t);
   const modelOptions = overviewModelFilterOptions(filterProviders, providerFilter, usageStats, t);
   const statCells = overviewStatCells(usageStats.totals, t);
   // The usage store labels providers by id; resolve them to the configured display names.
@@ -221,13 +173,6 @@ export function OverviewView({
       providerSeries: (usageStats.providerSeries ?? []).map((row) => ({ ...row, provider: resolve(row.provider) }))
     };
   }, [filterProviders, usageStats]);
-
-  function changeProviderFilter(provider: string) {
-    usageFilters?.setProviderFilter(provider);
-    if (modelFilter && provider && !overviewProviderHasModel(filterProviders, provider, modelFilter, usageStats)) {
-      usageFilters?.setModelFilter("");
-    }
-  }
 
   function changeModelFilter(model: string) {
     usageFilters?.setModelFilter(model);
@@ -260,7 +205,7 @@ export function OverviewView({
   }
 
   return (
-    <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
+    <div className="local-usage-page mx-auto w-full max-w-[1400px] px-5 py-6 sm:px-9 sm:py-8">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <h1 className="shrink-0 text-[24px] font-semibold tracking-[-0.025em]">{t("Overview")}</h1>
         {usageStats.localCollectionState === "loading" && (
@@ -283,53 +228,36 @@ export function OverviewView({
       </div>
       <div className="mb-6 flex flex-wrap items-center gap-2">
         <Select
-          aria-label={t("Provider")}
-          className="h-8 w-[160px] rounded-md bg-[length:14px] px-2.5 pr-7 text-[12px] shadow-none"
-          onValueChange={changeProviderFilter}
-          options={providerOptions}
-          value={providerFilter}
-        />
-        <Select
           aria-label={t("Model")}
           className="h-8 w-[200px] rounded-md bg-[length:14px] px-2.5 pr-7 text-[12px] shadow-none"
           onValueChange={changeModelFilter}
           options={modelOptions}
           value={modelFilter}
         />
-        <Button
-          aria-label={t("Reset gateway statistics")}
-          className="ml-auto text-muted-foreground hover:bg-muted/60 hover:text-destructive"
-          onClick={openResetDialog}
-          size="iconSm"
-          title={t("Reset gateway statistics")}
-          type="button"
-          variant="ghost"
-        >
-          <Trash2 className="h-3.5 w-3.5" />
-        </Button>
+
       </div>
 
-      <div className="mb-6 grid w-full grid-cols-2 gap-x-4 gap-y-5 border-y border-border/70 py-5 sm:flex sm:justify-between sm:gap-x-8">
+      <div className="mb-6 grid w-full grid-cols-2 gap-4 lg:grid-cols-4">
         {statCells.map((cell) => (
-          <div key={cell.label} className="min-w-0 even:justify-self-end last:[&>div]:items-end last:[&>div]:text-right">
+          <div key={cell.label} className="min-w-0 rounded-2xl border border-border/70 bg-card p-5 shadow-sm">
             <StatCell label={cell.label} sub={cell.sub} title={cell.title} value={cell.value} />
           </div>
         ))}
       </div>
-      <div className="space-y-10">
-        <SystemStatusStrip usageStats={displayUsageStats} />
-        <UsageTrendSection usageRange={usageRange} usageStats={usageStats} />
+      <div className="space-y-6">
+        <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-sm"><UsageTrendSection usageRange={usageRange} usageStats={usageStats} /></div>
         <OverviewBreakdowns providers={filterProviders} usageStats={displayUsageStats} />
-        <ProviderAccountsSection
+        <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-sm"><ProviderAccountsSection
           accounts={providerAccounts}
           onConfigure={onConfigureProviderAccounts}
           onRefresh={refreshProviderAccounts}
           providers={filterProviders}
           refreshing={providerAccountRefreshing}
           refreshingKeys={providerAccountRefreshingKeys}
-        />
+        /></div>
       </div>
 
+      <div className="mt-6 flex items-center justify-between rounded-xl border border-border/60 px-4 py-3 text-xs text-muted-foreground"><span>{t("Gateway requests")} · {t("Request success rate")} {usageStats.gatewayTotals?.requestCount ? formatPercent(usageStats.gatewayTotals.successRate) : "—"}</span><Button onClick={openResetDialog} variant="ghost" size="iconSm" title={t("Reset gateway statistics")} aria-label={t("Reset gateway statistics")}><Trash2 className="h-3.5 w-3.5" /></Button></div>
       <OverviewStatisticsResetDialog
         busy={resetBusy}
         error={resetError}

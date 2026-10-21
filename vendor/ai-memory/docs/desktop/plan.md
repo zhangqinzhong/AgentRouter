@@ -91,6 +91,13 @@ The research's best new target, ahead of the RFC's `.mcpb`:
   `server_profiles` inheritance, native-runner path stability, no PATH
   stomping).
 - Signing/notarization costs as in RFC #878 (unchanged).
+- Status (3.1, #1273): the installer half exists as
+  `companions/ai-memory-desktop`, on Tauri v2. It installs or reuses the
+  binary following these coexistence rules and shows `ai-memory setup --web`
+  in its window; detect-before-spawn and `server_profiles` come from `setup`
+  itself. CI builds unsigned installers on dispatch. Still open: signing and
+  notarization, and the tray (status light, start and stop) that would let it
+  replace the Swift companion.
 
 ## Explicitly deferred / rejected
 
@@ -115,8 +122,10 @@ The research's best new target, ahead of the RFC's `.mcpb`:
 5. Tray stack choice + Flatpak feasibility (Phase 4).
 6. Does the Claude Desktop Chat tab ever gain a local store/export? (No
    current path; re-check quarterly.)
-7. Antigravity's SessionStart mapping fires on every user turn
-   (`invocationNum` restarts per turn): keep, or gate per conversation?
+7. Antigravity's SessionStart mapping fired on every user turn
+   (`invocationNum` restarts per turn): resolved — gated per conversation by
+   a `briefed/agy-start-<conversationId>` marker in the native, shell and
+   PowerShell hooks.
 8. Cowork capture on Linux, where tasks run in a VM.
 9. Cursor runs the operator's Claude Code hooks by default, so a Cursor
    session reaches ai-memory twice when Cursor's own hooks are installed

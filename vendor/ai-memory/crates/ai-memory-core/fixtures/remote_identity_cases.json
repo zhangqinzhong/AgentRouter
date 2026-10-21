@@ -59,6 +59,7 @@
     { "value": "", "style": null }
   ],
   "marker_aliases": [
+    { "toml": "\ufeffaliases = [\"former-name\"]", "status": "valid", "aliases": ["former-name"] },
     { "toml": "aliases = [\" former-name \", \"legacy_name\", \"former-name\", \"V2.name\"]", "status": "valid", "aliases": ["former-name", "legacy_name", "V2.name"] },
     { "toml": "aliases = []", "status": "valid", "aliases": [] },
     { "toml": "aliases = [ ]", "status": "valid", "aliases": [] },

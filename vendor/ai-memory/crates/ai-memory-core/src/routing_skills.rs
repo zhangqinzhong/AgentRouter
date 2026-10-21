@@ -136,6 +136,7 @@ mod tests {
         ("memory_message_cancel", "ai-memory-messaging"),
         ("memory_write_page", "ai-memory-durable-pages"),
         ("memory_delete_page", "ai-memory-durable-pages"),
+        ("memory_restore_page", "ai-memory-durable-pages"),
         ("memory_consolidate", "ai-memory-learning-maintenance"),
         ("memory_auto_improve", "ai-memory-learning-maintenance"),
         ("memory_lint", "ai-memory-learning-maintenance"),

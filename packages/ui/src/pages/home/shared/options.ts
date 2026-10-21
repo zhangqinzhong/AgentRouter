@@ -70,7 +70,7 @@ import zaiGlobalGeneralProviderIconUrl from "@/assets/provider-icons/zai-global-
 import zhipuCnCodingProviderIconUrl from "@/assets/provider-icons/zhipu-cn-coding.png";
 import zhipuCnGeneralProviderIconUrl from "@/assets/provider-icons/zhipu-cn-general.png";
 
-type ViewId = "memory" | "onboarding" | "overview" | "usage" | "sessions" | "trend" | "heatmap" | "observability" | "api-keys" | "server" | "settings" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
+type ViewId = "monitor-center" | "memory" | "onboarding" | "overview" | "usage" | "sessions" | "trend" | "heatmap" | "observability" | "api-keys" | "server" | "settings" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
 type NavigationId = ViewId;
 type OnboardingStepId = "provider" | "profile" | "enter";
 type ProviderAccountDraftMode = "standard" | "http-json" | "browser" | "raw";
@@ -403,6 +403,7 @@ export const navigation: Array<{ icon: LucideIcon; id: NavigationId }> = [
   { icon: Boxes, id: "virtual-models" },
   { icon: KeyRound, id: "api-keys" },
   { icon: Box, id: "models" },
+  { icon: Activity, id: "monitor-center" },
   { icon: Activity, id: "observability" },
   { icon: Database, id: "logs" },
   { icon: Network, id: "networking" },

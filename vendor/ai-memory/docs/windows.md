@@ -180,17 +180,31 @@ the fast native hook path **without** installing a Rust toolchain or
 Docker. Each tagged release publishes
 `ai-memory-windows-x86_64.zip` (see the repo's Releases page).
 
-`install.sh` does not cover native Windows. `ai-memory setup` runs here, but it
-has no service step on Windows: it initialises the data dir and wires your
-agents, and says so when it skips the service. Start the server yourself, or
-register it with Scenario E. Inside WSL2 the Linux `install.sh` and `setup`
-path works unchanged.
+The quickest path is two commands in PowerShell, neither needing
+administrator rights:
 
 ```powershell
-# First-time install: download + extract into your user data dir (any stable
-# path works; the native hook exec-form command is rendered from wherever
-# ai-memory.exe lives).
-$Dest = "$env:LOCALAPPDATA\ai-memory"
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+ai-memory setup
+```
+
+`install.ps1` downloads the zip and its `.sha256` from the release, refuses a
+missing or mismatched checksum and any archive entry that is absolute or holds
+`..`, unpacks the release to `%LOCALAPPDATA%\Programs\ai-memory` and adds that
+directory to your user `PATH` (set `AI_MEMORY_NO_MODIFY_PATH=1` to skip that).
+`ai-memory setup` then initialises the data dir (`%LOCALAPPDATA%\ai-memory`),
+registers the server to start at logon (see
+[Scenario E](#scenario-e-keep-the-server-running-native-windows-service)),
+wires the agents it finds, and checks the result. Inside WSL2 the Linux
+`install.sh` and `setup` path works unchanged.
+
+To do the same by hand:
+
+```powershell
+# First-time install: download + extract into a stable per-user directory
+# (any stable path works; the native hook exec-form command is rendered from
+# wherever ai-memory.exe lives).
+$Dest = "$env:LOCALAPPDATA\Programs\ai-memory"
 New-Item -ItemType Directory -Force $Dest | Out-Null
 Invoke-WebRequest `
     -Uri "https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-windows-x86_64.zip" `
@@ -236,8 +250,8 @@ assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +
 the `ai-memory.exe` path from the running binary, keep the extracted `.exe`
 at a stable location (re-run `install-hooks` if you move it).
 
-This leaves the server running only while a terminal is open. To keep it
-up across logoff and reboot, continue to [Scenario
+Without `ai-memory setup`, the server runs only while a terminal is open. To
+keep it up, run `setup` or continue to [Scenario
 E](#scenario-e-keep-the-server-running-native-windows-service).
 
 ## Scenario D: Native Windows Source Build
@@ -326,10 +340,109 @@ Scenarios C and D both end at `ai-memory serve` in a foreground terminal.
 That works for a trial but not for daily use: when you close the window,
 log off, or reboot, the server stops.
 
-On Linux the packaged units in `packaging/systemd/` supply
-`Restart=on-failure` and `RestartSec=5s`. systemd performs those
-restarts, not ai-memory. Native Windows gets the same arrangement through
-a **service wrapper**. ai-memory does not
+### The logon entry `ai-memory setup` installs
+
+`ai-memory setup` keeps the server running for as long as you are signed in,
+with no administrator rights and no password stored anywhere:
+
+1. It writes an `ai-memory` value under
+   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, the per-user key
+   Windows runs at every logon:
+   `"<path>\ai-memory.exe" --data-dir "<data dir>" --config "<config>" service-host`.
+2. It starts that command once right away, so the server answers before your
+   next logon.
+3. `service-host` starts a copy of itself detached from any console and exits,
+   so the logon console closes at once. The copy runs
+   `serve --transport http --enable-web` with a hidden console, which the Git
+   CLI fallback and any provider CLI the server starts inherit instead of
+   opening windows of their own.
+4. When the server exits with an error, the host starts it again after five
+   seconds, the way the Linux unit's `Restart=on-failure` does. After five
+   failures within ten seconds of starting (another server already on the
+   port, a broken config) it stops trying; run
+   `ai-memory serve --transport http` in a terminal to see the error.
+
+The host records its own process id and the server's in
+`<data dir>\service-host.json`. A second `setup` leaves a current entry with a
+running host alone; a changed entry is rewritten and the host restarted.
+`ai-memory uninstall --apply` stops the host and deletes the value, but only
+when the value still has the shape `setup` writes (a quoted `ai-memory.exe`
+ending in `service-host`) and its `--data-dir` is the data dir being
+uninstalled; a value someone else put under the same name, or the entry of
+another install, is left in place.
+
+`setup` and `uninstall` read and write the value through the registry API
+rather than running `reg.exe`. Endpoint protection that watches for
+persistence (Bitdefender's Advanced Threat Control, for one) treats an
+unsigned program running `reg.exe add` on the `Run` key as malicious and
+quarantines it (#1280).
+
+Stopping the host avoids `taskkill` for the same reason. `setup` and
+`uninstall` write `<data dir>\service-host.stop`; the host checks for it
+four times a second, kills the server through the process handle it already
+holds, and exits. Only when the host has not exited after ten seconds (a host
+started by an older binary, or a hung one), or when the server outlived its
+host, do they fall back to `taskkill /T /F` on the recorded process ids,
+after checking that each id still belongs to the same ai-memory process.
+The cooperative stop (`Child::kill`) terminates only the server process
+itself, not its process tree, so a subprocess the server started (a CLI-based
+LLM provider in the middle of a consolidation, for one) can linger until it
+finishes on its own.
+
+The logon entry runs only while you are signed in, which matches a systemd
+user unit without lingering and a macOS LaunchAgent. For a server that runs
+before anyone signs in, or for other users of the machine, use a real Windows
+service through WinSW, below, and pass `--no-service` to `setup`.
+
+### Antivirus / EDR
+
+Behaviour-based endpoint protection watches for programs that make
+themselves start at logon, and `ai-memory.exe` is unsigned. Bitdefender's
+Advanced Threat Control has quarantined it after `setup` wrote the logon
+entry ([#1280](https://github.com/akitaonrails/ai-memory/issues/1280)).
+`setup` avoids the signals known to weigh in that decision:
+
+- It writes and reads the `Run` value through the registry API. It never
+  runs `reg.exe add` on the `Run` key.
+- The value holds plain paths, without the `\\?\` prefix a canonical path
+  carries.
+- Stopping the host is cooperative (#1300): the host stops the server through
+  a request file in the data dir, as described above, and `taskkill` runs
+  only as the fallback for a host that does not answer.
+
+That lowers the odds but guarantees nothing; a product can still flag an
+unsigned binary on its own rules.
+
+**How to tell.** A quarantine removes `ai-memory.exe` and leaves the `Run`
+value behind. The server then never starts at logon, and the hooks keep
+calling a path that is gone. `ai-memory doctor` and `ai-memory status` (from
+any copy of the binary that still exists) check the entry `setup` wrote for
+their data dir and warn with `logon_binary_missing` when the
+`ai-memory.exe` it names is no longer there. The warning is also in their
+`--json` output, and `status` prints it even when it cannot reach the
+server, which is the usual state once the binary is gone. Your antivirus
+console or quarantine list shows the detection itself.
+
+**What to do.** Restore the binary from quarantine, or put it back by
+reinstalling, and ask whoever runs the antivirus to allow it (on a managed
+machine that is an administrator change). Then re-run `ai-memory setup`,
+which points the entry at the binary you ran it from and starts the host.
+To stop using the logon entry instead, remove it: `ai-memory uninstall
+--apply` removes it along with the rest of ai-memory's wiring, or delete
+only the value:
+
+```powershell
+Remove-ItemProperty -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name ai-memory
+```
+
+`setup --no-service` skips writing the entry but does not remove one that
+already exists. Without the entry, run `ai-memory serve --transport http`
+in a terminal or use the WinSW service below.
+
+### A real Windows service
+
+A Windows service, unlike the logon entry, runs without anyone signed in. It
+needs a **service wrapper**, because ai-memory does not
 implement a Windows Service control-code dispatcher, so `sc create` or
 `New-Service` pointed straight at `ai-memory.exe` will not work: the SCM
 starts the process, waits for it to report in, never hears from it, and
@@ -461,17 +574,34 @@ as that user** rather than as `LocalSystem`. In the WinSW XML add a
 
 ```xml
   <serviceaccount>
-    <username>.\you</username>
+    <domain>.</domain>
+    <user>you</user>
     <password>your-account-password</password>
+    <allowservicelogon>true</allowservicelogon>
   </serviceaccount>
 ```
 
 (or set it from the service's **Log On** tab in `services.msc` after
-install, then `restart`). Use `.\you` for a local account or
-`DOMAIN\you` for a domain account. `LocalSystem` is only appropriate when
-the data directory is in a location that account owns outright (e.g. a
-dedicated `C:\ProgramData\ai-memory` created and owned by the service
-account).
+install, then `restart`). This is the WinSW v2.12.0 XML shape used by this
+guide. For a local account, keep `<domain>.</domain>`; for a domain account,
+put the domain in `<domain>` and the account name in `<user>`. WinSW v3 uses
+the combined `<username>DOMAIN\you</username>` form instead, so follow the
+schema for the release you pinned.
+
+Add the block before the first `install`. If the service is already installed,
+stop and uninstall it, update the XML, then install and start it again. Verify
+the account recorded by the Service Control Manager rather than relying only
+on the wrapper's running state:
+
+```powershell
+Get-CimInstance Win32_Service -Filter "Name='ai-memory'" |
+  Select-Object Name, StartName, State
+```
+
+`StartName` must name the intended account, not `LocalSystem`. `LocalSystem`
+is only appropriate when the data directory is in a location that account
+owns outright (e.g. a dedicated `C:\ProgramData\ai-memory` created and owned
+by the service account).
 
 > **WinSW error 1069 / stale password.** If `start` fails with *"The
 > service did not start due to a logon failure"* (error 1069), the

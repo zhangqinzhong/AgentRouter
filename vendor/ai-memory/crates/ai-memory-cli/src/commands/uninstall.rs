@@ -272,6 +272,14 @@ fn build_plan(
                 install_hooks::muse_settings_path(env)?,
                 HookConfigShape::NestedHooksKey,
             ),
+            (
+                install_hooks::codebuddy_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            (
+                install_hooks::ibm_bob_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
         ]);
         for (path, shape) in hook_files {
             if !path.exists() {
@@ -434,6 +442,7 @@ fn build_plan(
             KimiCode,
             KiroCli,
             CommandCode,
+            IbmBob,
             CopilotCli,
             Droid,
             Swival,
@@ -802,6 +811,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     stop_service_guarding_purge(
         service.as_ref(),
         args.purge_data,
+        &config.data_dir,
         &user_service::SystemRunner,
         crate::process_guard::sibling_processes,
         std::time::Duration::from_secs(5),
@@ -910,7 +920,15 @@ fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Remov
         .find(|(key, _)| key == "XDG_CONFIG_HOME")
         .map(|(_, value)| PathBuf::from(value));
     let path = user_service::unit_path(manager, &home, xdg_config_home.as_deref());
-    Some((manager, user_service::planned_removal(&path)))
+    Some((
+        manager,
+        user_service::planned_removal_for(
+            manager,
+            &path,
+            &config.data_dir,
+            &user_service::SystemRunner,
+        ),
+    ))
 }
 
 /// Stop the user service `setup` installed, refusing a data purge while any
@@ -926,6 +944,7 @@ fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Remov
 fn stop_service_guarding_purge(
     service: Option<&(ServiceManager, user_service::Removal)>,
     purge_data: bool,
+    data_dir: &Path,
     runner: &dyn user_service::CommandRunner,
     siblings: impl Fn() -> Vec<sysinfo::Pid>,
     exit_wait: std::time::Duration,
@@ -934,22 +953,24 @@ fn stop_service_guarding_purge(
         Some((manager, user_service::Removal::Removed(path))) => Some((*manager, path)),
         _ => None,
     };
-    let service_pid = if purge_data {
-        to_stop.and_then(|(manager, _)| service_main_pid(manager, runner))
+    let service_pids = if purge_data {
+        to_stop.map_or_else(Vec::new, |(manager, _)| {
+            service_pids(manager, data_dir, runner)
+        })
     } else {
-        None
+        Vec::new()
     };
     if purge_data {
         let others: Vec<sysinfo::Pid> = siblings()
             .into_iter()
-            .filter(|pid| Some(pid.as_u32()) != service_pid)
+            .filter(|pid| !service_pids.contains(&pid.as_u32()))
             .collect();
         if !others.is_empty() {
             anyhow::bail!(crate::process_guard::busy_message("purge data", &others));
         }
     }
     if let Some((manager, path)) = to_stop {
-        match user_service::remove(manager, path, runner)? {
+        match user_service::remove(manager, path, data_dir, runner)? {
             user_service::Removal::Removed(path) => {
                 println!("✓ stopped and removed the user service {}", path.display());
             }
@@ -961,9 +982,9 @@ fn stop_service_guarding_purge(
         // give the service's own process a bounded moment to go before the
         // recheck refuses on it.
         let mut alive = siblings();
-        if let Some(service_pid) = service_pid {
+        if !service_pids.is_empty() {
             let deadline = std::time::Instant::now() + exit_wait;
-            while alive.iter().any(|pid| pid.as_u32() == service_pid)
+            while alive.iter().any(|pid| service_pids.contains(&pid.as_u32()))
                 && std::time::Instant::now() < deadline
             {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -975,6 +996,22 @@ fn stop_service_guarding_purge(
         }
     }
     Ok(())
+}
+
+/// The running service's processes, as its manager reports them: the main
+/// process for systemd and launchd, and the host's supervisor and server on
+/// Windows. Empty when it is not running or the manager cannot say.
+fn service_pids(
+    manager: ServiceManager,
+    data_dir: &Path,
+    runner: &dyn user_service::CommandRunner,
+) -> Vec<u32> {
+    if manager == ServiceManager::WindowsRun {
+        return crate::commands::service_host::live_pids(
+            &crate::commands::service_host::state_file(data_dir),
+        );
+    }
+    service_main_pid(manager, runner).into_iter().collect()
 }
 
 /// The running service's main process, as its manager reports it; `None`
@@ -1017,6 +1054,7 @@ fn service_main_pid(
                     .ok()
             })?
         }
+        ServiceManager::WindowsRun => return None,
     };
     (pid != 0).then_some(pid)
 }
@@ -1501,6 +1539,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::IbmBob
         | McpClient::CopilotCli
         | McpClient::Droid
         | McpClient::Swival
@@ -1838,6 +1877,7 @@ mod tests {
         let error = stop_service_guarding_purge(
             Some(&service),
             true,
+            root.path(),
             &runner,
             || pids(&[4242, 777]),
             Duration::ZERO,
@@ -1855,6 +1895,7 @@ mod tests {
         stop_service_guarding_purge(
             Some(&service),
             true,
+            root.path(),
             &runner,
             || alive.replace(Vec::new()),
             Duration::ZERO,
@@ -1882,6 +1923,7 @@ mod tests {
         let error = stop_service_guarding_purge(
             Some(&service),
             true,
+            root.path(),
             &runner,
             || vec![sysinfo::Pid::from_u32(4242)],
             Duration::from_millis(120),
@@ -1907,6 +1949,7 @@ mod tests {
         stop_service_guarding_purge(
             Some(&service),
             true,
+            root.path(),
             &runner,
             || {
                 polls.set(polls.get() + 1);

@@ -339,6 +339,14 @@ fn parse_json_answer(text: &str) -> LlmResult<serde_json::Value> {
     {
         return Ok(value);
     }
+    // Prose around the answer can carry its own brackets (`for [the
+    // request]:`, `(see [schema])`), which throws the first/last slice off.
+    // Fall back to the first balanced, string-aware object.
+    if let Some(value) = crate::openai_compat::first_json_object(stripped)
+        .and_then(|slice| serde_json::from_str::<serde_json::Value>(slice).ok())
+    {
+        return Ok(value);
+    }
     Err(LlmError::UnexpectedShape(format!(
         "cursor agent did not return JSON: {}",
         truncate_chars(stripped, 200)

@@ -1,8 +1,12 @@
-import { cn, formatCompactNumber, formatUsdCost, GatewayProviderConfig, providerDisplayIcon, UsageComparisonRow, UsageStatsSnapshot, useAppText } from "../shared/index";
-import { isUsableProviderIconUrl } from "./overview-accounts";
-import type { LucideIcon } from "../shared/index";
-import { Boxes, Network, UserRound } from "lucide-react";
-import { useEffect, useState } from "react";
+import {
+  formatCompactNumber,
+  formatUsdCost,
+  GatewayProviderConfig,
+  UsageComparisonRow,
+  UsageStatsSnapshot,
+  useAppText,
+} from "../shared/index";
+import { useState } from "react";
 import { getModelColor } from "@/vendor/tokentracker/ui/dashboard/components/TrendMonitor";
 import openaiIconUrl from "@/assets/provider-icons/openai.png";
 import anthropicIconUrl from "@/assets/provider-icons/anthropic.png";
@@ -20,7 +24,6 @@ import claudeCodeIconUrl from "@/assets/agent-logos/claude-code.png";
 import zcodeIconUrl from "@/assets/agent-logos/zcode.png";
 import cursorIconUrl from "@/assets/agent-logos/cursor.svg";
 
-const breakdownRowLimit = 6;
 const breakdownOtherColor = "#8e8e93";
 
 // Model/brand detection by name fragment, mirroring the gateway provider presets.
@@ -39,97 +42,45 @@ const breakdownBrandIcons: Array<{ icon: string; match: RegExp }> = [
   { icon: moonshotIconUrl, match: /kimi|moonshot/i },
   { icon: bailianIconUrl, match: /qwen|qwq|bailian|tongyi/i },
   { icon: minimaxIconUrl, match: /minimax|abab/i },
-  { icon: openrouterIconUrl, match: /openrouter/i }
+  { icon: openrouterIconUrl, match: /openrouter/i },
 ];
 
 export function breakdownBrandIconUrl(label: string): string {
-  return breakdownBrandIcons.find((entry) => entry.match.test(label))?.icon ?? "";
+  return (
+    breakdownBrandIcons.find((entry) => entry.match.test(label))?.icon ?? ""
+  );
 }
 
-function breakdownProviderIconUrl(label: string, providers: GatewayProviderConfig[]): string {
-  const wanted = label.trim().toLowerCase();
-  if (wanted === "mimo") {
-    return xiaomiMimoIconUrl;
-  }
-  if (wanted === "zcode") {
-    return zcodeIconUrl;
-  }
-  const provider = providers.find((item) => {
-    const name = item.name.trim().toLowerCase();
-    const id = item.id?.trim().toLowerCase() || "";
-    return name === wanted || id === wanted || name.includes(wanted) || wanted.includes(name);
-  });
-  const url = provider ? providerDisplayIcon(provider) : "";
-  return url && isUsableProviderIconUrl(url) ? url : breakdownBrandIconUrl(label);
+function breakdownColor(
+  label: string,
+  translate: (value: string) => string,
+): string {
+  return label === translate("Other")
+    ? breakdownOtherColor
+    : getModelColor(label);
 }
 
-type BreakdownRow = {
-  cacheTokens: number;
+function BreakdownIconBadge({
+  color,
+  iconUrl,
+  label,
+}: {
   color: string;
-  costUsd: number;
-  inputTokens: number;
+  iconUrl: string;
   label: string;
-  outputTokens: number;
-  pct: number;
-  requests: number;
-  share: number;
-  tokens: number;
-};
-
-function breakdownColor(label: string, translate: (value: string) => string): string {
-  return label === translate("Other") ? breakdownOtherColor : getModelColor(label);
-}
-
-function breakdownRows(rows: UsageComparisonRow[], limit: number, translate: (value: string) => string): BreakdownRow[] {
-  const positive = rows.filter((row) => (row.totalTokens || 0) > 0 || (row.requestCount || 0) > 0);
-  const sorted = [...positive].sort((left, right) => (right.totalTokens || 0) - (left.totalTokens || 0));
-  const top = sorted.slice(0, limit);
-  const rest = sorted.slice(limit);
-  const otherTokens = rest.reduce((sum, row) => sum + (row.totalTokens || 0), 0);
-  const otherInput = rest.reduce((sum, row) => sum + (row.inputTokens || 0), 0);
-  const otherCache = rest.reduce((sum, row) => sum + (row.cacheTokens || 0), 0);
-  const all: Array<UsageComparisonRow> = otherTokens > 0
-    ? [...top, {
-      avgDurationMs: 0,
-      caption: "",
-      cacheRatio: otherInput + otherCache > 0 ? otherCache / (otherInput + otherCache) : 0,
-      cacheTokens: otherCache,
-      costUsd: rest.reduce((sum, row) => sum + (row.costUsd || 0), 0),
-      errorCount: 0,
-      inputTokens: otherInput,
-      key: `${translate("Other")}`,
-      label: translate("Other"),
-      maxShare: 0,
-      outputTokens: rest.reduce((sum, row) => sum + (row.outputTokens || 0), 0),
-      requestCount: rest.reduce((sum, row) => sum + (row.requestCount || 0), 0),
-      successRate: 0,
-      totalTokens: otherTokens
-    }]
-    : top;
-  const total = all.reduce((sum, row) => sum + (row.totalTokens || 0), 0) || 1;
-  const max = all.reduce((peak, row) => Math.max(peak, row.totalTokens || 0), 0) || 1;
-  return all.map((row) => ({
-    cacheTokens: row.cacheTokens || 0,
-    color: breakdownColor(row.label, translate),
-    costUsd: row.costUsd || 0,
-    inputTokens: row.inputTokens || 0,
-    label: row.label,
-    outputTokens: row.outputTokens || 0,
-    pct: Math.max(8, ((row.totalTokens || 0) / max) * 100),
-    requests: row.requestCount || 0,
-    share: (row.totalTokens || 0) / total,
-    tokens: row.totalTokens || 0
-  }));
-}
-
-function BreakdownIconBadge({ color, iconUrl, label }: { color: string; iconUrl: string; label: string }) {
+}) {
   if (iconUrl) {
     return (
       <span
         aria-hidden="true"
         className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-background p-1 transition-transform duration-150 group-hover:scale-105"
       >
-        <img alt="" className="h-full w-full object-contain" draggable={false} src={iconUrl} />
+        <img
+          alt=""
+          className="h-full w-full object-contain"
+          draggable={false}
+          src={iconUrl}
+        />
       </span>
     );
   }
@@ -144,142 +95,14 @@ function BreakdownIconBadge({ color, iconUrl, label }: { color: string; iconUrl:
   );
 }
 
-function BreakdownHoverCard({ row, translate }: { row: BreakdownRow; translate: (value: string) => string }) {
-  const tokenParts = [
-    { color: "#007aff", label: translate("Input"), value: row.inputTokens },
-    { color: "#34c759", label: translate("Output"), value: row.outputTokens },
-    { color: "#af52de", label: translate("Cache"), value: row.cacheTokens }
-  ];
-  const tokenBase = Math.max(row.inputTokens, row.outputTokens, row.cacheTokens, 1);
-  return (
-    <div className="pointer-events-none absolute bottom-full left-2 z-30 mb-1.5 hidden w-max min-w-[270px] rounded-xl border border-oai-gray-200/50 bg-white/95 p-3.5 text-left shadow-xl backdrop-blur-md group-hover:block dark:border-oai-gray-800/50 dark:bg-oai-gray-900/95">
-      <div className="border-b border-oai-gray-100 pb-1.5 text-[11px] font-semibold text-oai-gray-500 dark:border-oai-gray-800/80 dark:text-oai-gray-400">{row.label}</div>
-      <div className="mt-2 flex items-baseline gap-1">
-        <span className="text-lg font-bold leading-none text-oai-gray-900 dark:text-white" title={row.tokens.toLocaleString()}>{formatCompactNumber(row.tokens)}</span>
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-oai-gray-400">{translate("Token")}</span>
-        <span className="ml-auto text-[11px] font-semibold text-oai-gray-500 dark:text-oai-gray-400">{Math.round(row.share * 100)}%</span>
-      </div>
-      <div className="mt-2 flex items-center gap-3 text-[11px] text-oai-gray-500 dark:text-oai-gray-400">
-        <span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{row.requests.toLocaleString()}</span> {translate("Requests")}</span>
-        <span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{formatUsdCost(row.costUsd)}</span> {translate("Cost")}</span>
-      </div>
-      <div className="mt-2 flex flex-col gap-1 border-t border-oai-gray-100 pt-2 dark:border-oai-gray-800/60">
-        {tokenParts.map((part) => {
-          const partShare = row.tokens > 0 ? part.value / row.tokens : 0;
-          return (
-            <div className="flex items-center justify-between gap-3 text-[11px]" key={part.label}>
-              <span className="flex min-w-0 items-center gap-1.5">
-                <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: part.color }} />
-                <span className="text-oai-gray-500 dark:text-oai-gray-400">{part.label}</span>
-              </span>
-              <span className="flex min-w-[132px] items-center gap-2">
-                <span className="h-1 flex-1 overflow-hidden rounded-full bg-oai-gray-100 dark:bg-oai-gray-800/85">
-                  <span className="block h-full rounded-full" style={{ width: `${Math.max(2, (part.value / tokenBase) * 100)}%`, backgroundColor: part.color }} />
-                </span>
-                <span className="flex w-[86px] items-baseline justify-end gap-1 font-mono text-[10px] font-semibold text-oai-gray-700 dark:text-oai-gray-200" title={part.value.toLocaleString()}>
-                  <span>{formatCompactNumber(part.value)}</span>
-                  <span className="w-[30px] text-right font-sans text-[9px] font-medium text-oai-gray-400">{Math.round(partShare * 100)}%</span>
-                </span>
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function BreakdownRowLine({ iconUrl, index, row, translate }: { iconUrl: string; index: number; row: BreakdownRow; translate: (value: string) => string }) {
-  // CSS-driven mount animation: rows fade up one by one and their bars fill from
-  // zero; width stays transitioned so live data refreshes glide to new values.
-  const [entered, setEntered] = useState(false);
-  useEffect(() => {
-    const id = window.setTimeout(() => setEntered(true), 40 + index * 70);
-    return () => window.clearTimeout(id);
-  }, [index]);
-  return (
-    <div
-      className={cn(
-        "group relative grid grid-cols-[minmax(0,1fr)_104px] items-center gap-3 rounded-lg px-2 py-1.5 transition-[background-color,opacity,transform] duration-300 ease-out hover:bg-muted/45",
-        entered ? "translate-y-0 opacity-100" : "translate-y-1 opacity-0"
-      )}
-    >
-      <BreakdownHoverCard row={row} translate={translate} />
-      <div className="flex min-w-0 items-center gap-2.5">
-        <BreakdownIconBadge color={row.color} iconUrl={iconUrl} label={row.label} />
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium" title={row.label}>{row.label}</div>
-          <div className="truncate text-[10px] text-muted-foreground/80 transition-colors group-hover:text-muted-foreground">
-            {formatCompactNumber(row.requests)} {translate("Requests")}
-          </div>
-          <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
-            <div
-              className="h-full rounded-full transition-[width] duration-500 ease-out group-hover:brightness-110"
-              style={{ backgroundColor: row.color, width: entered ? `${row.pct}%` : "0%" }}
-            />
-          </div>
-        </div>
-      </div>
-      <div className="min-w-0 text-right">
-        <div className="text-sm font-semibold leading-tight tabular-nums" title={row.tokens.toLocaleString()}>{formatCompactNumber(row.tokens)}</div>
-        <div className="text-[10px] tabular-nums text-muted-foreground">{Math.round(row.share * 100)}%</div>
-      </div>
-    </div>
-  );
-}
-
-function BreakdownSection({
-  emptyLabel,
-  icon: Icon,
-  kind,
-  providers,
-  rows,
-  title,
-  trailing
-}: {
-  emptyLabel: string;
-  icon: LucideIcon;
-  kind: "client" | "model" | "provider";
-  providers: GatewayProviderConfig[];
-  rows: UsageComparisonRow[];
-  title: string;
-  trailing?: string;
-}) {
-  const t = useAppText();
-  const display = breakdownRows(rows, breakdownRowLimit, t);
-  return (
-    <section>
-      <div className="mb-2.5 flex min-w-0 items-center justify-between gap-3 px-2">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <span aria-hidden="true" className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-            <Icon className="h-4 w-4" />
-          </span>
-          <h2 className="text-sm font-medium">{title}</h2>
-        </div>
-        {trailing ? <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{trailing}</span> : null}
-      </div>
-      {display.length === 0 ? (
-        <p className="px-2 text-sm text-muted-foreground">{emptyLabel}</p>
-      ) : (
-        <div className="flex flex-col">
-          {display.map((row, index) => (
-            <BreakdownRowLine
-              iconUrl={kind === "provider" ? breakdownProviderIconUrl(row.label, providers) : breakdownBrandIconUrl(row.label)}
-              index={index}
-              key={row.label}
-              row={row}
-              translate={t}
-            />
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function analysisDisplayLabel(kind: "client" | "model" | "provider", row: UsageComparisonRow): string {
+function analysisDisplayLabel(
+  kind: "client" | "model" | "provider",
+  row: UsageComparisonRow,
+): string {
   if (kind === "provider") {
-    return row.provider && row.provider !== "unknown" ? row.provider : row.label;
+    return row.provider && row.provider !== "unknown"
+      ? row.provider
+      : row.label;
   }
   if (kind === "model") {
     return row.model && row.model !== "unknown" ? row.model : row.label;
@@ -300,7 +123,10 @@ function hasClientAttribution(row: UsageComparisonRow): boolean {
 // The store groups rows by (provider, model), so the same display name can
 // arrive several times — routed via different providers, connectors, or
 // credentials. Collapse onto one row per display label before ranking.
-function collapseAnalysisDisplayRows(kind: "client" | "model" | "provider", rows: UsageComparisonRow[]): UsageComparisonRow[] {
+function collapseAnalysisDisplayRows(
+  kind: "client" | "model" | "provider",
+  rows: UsageComparisonRow[],
+): UsageComparisonRow[] {
   const grouped = new Map<string, UsageComparisonRow>();
   for (const row of rows) {
     const label = analysisDisplayLabel(kind, row);
@@ -320,49 +146,136 @@ function collapseAnalysisDisplayRows(kind: "client" | "model" | "provider", rows
     }
     grouped.set(label, { ...row, key: `${kind}:${label}`, label });
   }
-  return [...grouped.values()].sort((left, right) => (right.totalTokens || 0) - (left.totalTokens || 0));
+  return [...grouped.values()].sort(
+    (left, right) => (right.totalTokens || 0) - (left.totalTokens || 0),
+  );
 }
 
-function breakdownTrailing(rows: UsageComparisonRow[], translate: (value: string) => string): string {
-  const tokens = rows.reduce((sum, row) => sum + (row.totalTokens || 0), 0);
-  const cost = rows.reduce((sum, row) => sum + (row.costUsd || 0), 0);
-  return `${translate("Token")} ${formatCompactNumber(tokens)} · ${translate("Cost")} ${formatUsdCost(cost)}`;
-}
-
-export function OverviewBreakdowns({ providers, usageStats }: { providers: GatewayProviderConfig[]; usageStats: UsageStatsSnapshot }) {
+export function OverviewBreakdowns({
+  usageStats,
+}: {
+  providers: GatewayProviderConfig[];
+  usageStats: UsageStatsSnapshot;
+}) {
   const t = useAppText();
-  const modelRows = collapseAnalysisDisplayRows("model", usageStats.models ?? []);
-  const clientRows = collapseAnalysisDisplayRows("client", (usageStats.clientModels ?? []).filter(hasClientAttribution));
-  const providerRows = collapseAnalysisDisplayRows("provider", usageStats.providerModels ?? []);
+  const [expanded, setExpanded] = useState(false);
+  const modelRows = collapseAnalysisDisplayRows(
+    "model",
+    usageStats.models ?? [],
+  );
+  const clients = collapseAnalysisDisplayRows(
+    "client",
+    (usageStats.clientModels ?? []).filter(hasClientAttribution),
+  );
+  const total = usageStats.totals.totalTokens;
   return (
-    <div className="space-y-10">
-      <BreakdownSection
-        emptyLabel={t("No model usage yet")}
-        icon={Boxes}
-        kind="model"
-        providers={providers}
-        rows={modelRows}
-        title={t("Models")}
-        trailing={breakdownTrailing(modelRows, t)}
-      />
-      <BreakdownSection
-        emptyLabel={t("No client usage yet")}
-        icon={UserRound}
-        kind="client"
-        providers={providers}
-        rows={clientRows}
-        title={t("Client Analysis")}
-        trailing={breakdownTrailing(clientRows, t)}
-      />
-      <BreakdownSection
-        emptyLabel={t("No provider usage yet")}
-        icon={Network}
-        kind="provider"
-        providers={providers}
-        rows={providerRows}
-        title={t("Provider Analysis")}
-        trailing={breakdownTrailing(providerRows, t)}
-      />
+    <div className="grid items-start gap-6 lg:grid-cols-[1.3fr_1fr]">
+      <section className="rounded-2xl border border-border/70 bg-card p-5 shadow-sm">
+        <div className="mb-5 flex items-center justify-between">
+          <h2 className="font-semibold">{t("Model usage")}</h2>
+          <span className="text-xs text-muted-foreground">
+            {modelRows.length} {t("Models")}
+          </span>
+        </div>
+        {modelRows.length ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-xs text-muted-foreground">
+                  <th className="pb-3 text-left font-normal">{t("Model")}</th>
+                  <th className="pb-3 text-right font-normal">Token</th>
+                  <th className="pb-3 text-right font-normal">
+                    {t("Estimated cost")}
+                  </th>
+                  <th className="pb-3 text-right font-normal">{t("Share")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(expanded ? modelRows : modelRows.slice(0, 5)).map((row) => (
+                  <tr key={row.key} className="border-t border-border/50">
+                    <td className="max-w-[220px] py-3 pr-3">
+                      <div className="flex items-center gap-2">
+                        <BreakdownIconBadge
+                          color={breakdownColor(row.label, t)}
+                          iconUrl={breakdownBrandIconUrl(row.label)}
+                          label={row.label}
+                        />
+                        <span className="truncate" title={row.label}>
+                          {row.label}
+                        </span>
+                      </div>
+                    </td>
+                    <td
+                      className="text-right tabular-nums"
+                      title={row.totalTokens.toLocaleString()}
+                    >
+                      {formatCompactNumber(row.totalTokens)}
+                    </td>
+                    <td className="text-right tabular-nums">
+                      {formatUsdCost(row.costUsd)}
+                    </td>
+                    <td className="text-right tabular-nums text-muted-foreground">
+                      {total ? ((row.totalTokens / total) * 100).toFixed(1) : 0}
+                      %
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {modelRows.length > 5 ? (
+              <button
+                onClick={() => setExpanded(!expanded)}
+                className="mt-3 text-xs text-primary"
+              >
+                {t(expanded ? "Show less" : "Show all")}
+              </button>
+            ) : null}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            {t("No model usage yet")}
+          </p>
+        )}
+      </section>
+      <section className="rounded-2xl border border-border/70 bg-card p-5 shadow-sm">
+        <h2 className="mb-5 font-semibold">{t("Client activity")}</h2>
+        <div className="space-y-4">
+          {clients.map((row) => (
+            <div key={row.key}>
+              <div className="flex items-center gap-3">
+                <BreakdownIconBadge
+                  color={breakdownColor(row.label, t)}
+                  iconUrl={breakdownBrandIconUrl(row.label)}
+                  label={row.label}
+                />
+                <span className="flex-1 text-sm font-medium">{row.label}</span>
+                <span
+                  className="text-sm font-semibold tabular-nums"
+                  title={row.totalTokens.toLocaleString()}
+                >
+                  {formatCompactNumber(row.totalTokens)}
+                </span>
+                <span className="w-12 text-right text-xs tabular-nums text-muted-foreground">
+                  {total ? ((row.totalTokens / total) * 100).toFixed(1) : 0}%
+                </span>
+              </div>
+              <div className="ml-10 mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
+                <div
+                  className="h-full rounded-full bg-blue-500"
+                  style={{
+                    width: `${total ? (row.totalTokens / total) * 100 : 0}%`,
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+          {!clients.length ? (
+            <p className="text-sm text-muted-foreground">
+              {t("No client usage yet")}
+            </p>
+          ) : null}
+        </div>
+      </section>
     </div>
   );
 }

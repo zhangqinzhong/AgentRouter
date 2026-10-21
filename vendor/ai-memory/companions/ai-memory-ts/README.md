@@ -158,6 +158,7 @@ Not wrapped (call them with `callTool`):
 - `memory_auto_improve`: maintenance job that needs the server's LLM; use callTool
 - `memory_forget_sweep`: changes retention for a whole project; use callTool
 - `memory_install_self_routing`: writes coding-agent instruction files; specific to harnesses
+- `memory_restore_page`: admin-only restore of one page from a git checkpoint; use callTool
 <!-- generated:methods:end -->
 
 `callTool(name, args)` calls any tool with wire-format arguments and returns

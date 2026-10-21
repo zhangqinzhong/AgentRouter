@@ -76,16 +76,25 @@ fn summary_line(fm: &serde_json::Map<String, serde_json::Value>, body: &str) -> 
             }
         }
     }
-    for paragraph in body.split("\n\n") {
-        let trimmed = paragraph.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+    // Read the first paragraph line by line. A heading line ends the paragraph
+    // above it and is never part of the summary, so a heading written straight
+    // above its text (no blank line) still yields that text. `lines()` also
+    // splits CRLF bodies, which a literal "\n\n" does not.
+    let mut paragraph: Vec<&str> = Vec::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            if paragraph.is_empty() {
+                continue;
+            }
+            break;
         }
-        // Collapse internal newlines so a wrapped first paragraph stays one line.
-        let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !collapsed.is_empty() {
-            return Some(truncate(&collapsed));
-        }
+        paragraph.push(line);
+    }
+    // Collapse internal newlines so a wrapped first paragraph stays one line.
+    let collapsed = paragraph.join(" ");
+    let collapsed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !collapsed.is_empty() {
+        return Some(truncate(&collapsed));
     }
     None
 }
@@ -159,5 +168,26 @@ mod tests {
         assert!(out.contains("we talked and agreed to revisit"), "{out}");
         assert!(!out.contains("## Retained facts"), "{out}");
         assert!(out.contains("A2 tier-down"), "{out}");
+    }
+
+    #[test]
+    fn a_heading_directly_above_the_text_does_not_hide_it() {
+        let fm = serde_json::json!({});
+        let body = "# Fix flaky sweep\nThe sweep raced the writer actor.\n\nLater prose.";
+        let (_fm, out) = build_compacted_markdown(&fm, body);
+        assert!(
+            out.starts_with("The sweep raced the writer actor."),
+            "{out}"
+        );
+        assert!(!out.contains("Later prose."), "{out}");
+    }
+
+    #[test]
+    fn a_crlf_body_summarises_only_its_first_paragraph() {
+        let fm = serde_json::json!({});
+        let body = "First paragraph.\r\n\r\nSecond paragraph.";
+        let (_fm, out) = build_compacted_markdown(&fm, body);
+        assert!(out.starts_with("First paragraph.\n\n"), "{out}");
+        assert!(!out.contains("Second paragraph."), "{out}");
     }
 }

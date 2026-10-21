@@ -112,7 +112,14 @@ ai-jail --network --agent-state --no-save-config \
   minimal allowlist, so `AI_MEMORY_*`, `CLAUDE_CONFIG_DIR`, and provider tokens
   are **not** inherited. ai-memory forwards the ones it set (server/hook URL,
   the token vars it already threads) with `--env NAME`. Only names that are
-  actually set in the current environment are forwarded.
+  actually set in the current environment are forwarded, plus routing values
+  the outer run resolved from config: an explicit or bind-derived `server_url`
+  and a non-empty `base_path`. A bearer read from `config.toml` or
+  `[auth].bearer_token_file` is different: copying it into the environment
+  would expose server-root authority to the harness. The jailed launch refuses
+  that case and asks for a least-privilege `AI_MEMORY_AUTH_TOKEN` or an
+  unjailed run. An operator-supplied environment token was already inside the
+  child-process boundary and is forwarded unchanged.
 - **`--no-save-config`** so ai-jail never writes these flags into the
   project `.ai-jail` (§5).
 - **`--agent-state`** so the harness's own login/credentials persist across the
@@ -354,8 +361,9 @@ directly.
   or unchecking opts out.
 - `docker` grants effective root on the host; it is never on by default and
   its note says so.
-- The re-exec still forwards only environment names already set (§2), and
-  the toggle flags carry no values or secrets.
+- The re-exec forwards only environment names already set plus resolved
+  routing values (§2). It never turns a config-file bearer into an environment
+  variable, and the toggle flags carry no values or secrets.
 
 ## OS support matrix
 
@@ -391,8 +399,9 @@ directly.
 - The warning/offer are **TTY-gated**; no new prompt reaches hook, CI,
   detached, or piped paths (mirrors the interactive-lock and native-picker
   gates).
-- Re-exec forwards only environment names that are already set; it introduces
-  no new secret surface and does not log token values.
+- Re-exec forwards only environment names that are already set and non-secret
+  routing values resolved from config. It introduces no new secret surface and
+  does not log token values.
 - true-yolo is off by default, Claude-only, and documented as sandbox-first.
 - Detection failure fails *open* to the safe side: if we cannot tell we are
   jailed, we show the warning (never silently skip it).

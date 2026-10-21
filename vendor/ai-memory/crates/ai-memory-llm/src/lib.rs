@@ -11,8 +11,9 @@
 //! Structured-output strategies:
 //!
 //! * **Anthropic**: `tools[0]` is set to a single tool whose input
-//!   schema we want filled, with `tool_choice = "tool"`. The
-//!   model's `tool_use` content block is the structured payload.
+//!   schema we want filled. Models that accept a forced tool get
+//!   `tool_choice = "tool"`; models that reject it keep the default `auto`
+//!   and may return either a `tool_use` block or the JSON object as text.
 //! * **OpenAI**: `response_format = { type: "json_schema", strict: true }`.
 //! * **OpenAI OAuth/Codex**: ChatGPT/Codex Responses API with
 //!   `text.format = { type: "json_schema", strict: true }`.
@@ -97,6 +98,7 @@ pub mod types;
 
 mod auth_file;
 mod codex_responses;
+mod redirect;
 mod response;
 mod stored_token;
 mod text;
@@ -150,6 +152,7 @@ pub use opencode::{
 };
 pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, RerankStage, Reranker};
+pub use response::provider_error_body;
 pub use stored_token::StoredOAuthToken;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Role,

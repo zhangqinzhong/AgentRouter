@@ -29,6 +29,7 @@ mod logging;
 mod marker;
 mod process_guard;
 mod server_profiles;
+mod terminal;
 
 use cli::{Cli, Command};
 use config::Config;
@@ -88,6 +89,9 @@ pub async fn run() -> Result<()> {
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
         Command::Setup(args) => commands::setup::run(&config, args, config_path.as_deref()).await,
+        Command::ServiceHost(args) => {
+            commands::service_host::run(&config, args, config_path.as_deref()).await
+        }
         Command::Status(args) => commands::status::run(&config, args).await,
         Command::ListProjects(args) => commands::list_projects::run(&config, args).await,
         Command::Doctor(args) => commands::doctor::run(&config, args).await,

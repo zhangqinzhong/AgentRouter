@@ -7,3 +7,6 @@ mod history_replay;
 mod pending;
 mod recall_trace;
 mod routes;
+
+#[cfg(feature = "management-ui")]
+mod management;

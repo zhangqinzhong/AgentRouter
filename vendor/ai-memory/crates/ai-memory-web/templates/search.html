@@ -47,6 +47,28 @@
     </optgroup>
     {% endfor %}
   </select>
+  <label for="search-kind" class="sr-only">Kind</label>
+  <select
+    id="search-kind"
+    name="kind"
+    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+  >
+    <option value="">Any kind</option>
+    {% for option in kind_options %}
+    <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+    {% endfor %}
+  </select>
+  <label for="search-tier" class="sr-only">Tier</label>
+  <select
+    id="search-tier"
+    name="tier"
+    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+  >
+    <option value="">Any tier</option>
+    {% for option in tier_options %}
+    <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+    {% endfor %}
+  </select>
   <label for="search-q" class="sr-only">Search pages</label>
   <input
     id="search-q"
@@ -90,7 +112,8 @@
 {% if query == "" %}
 <p class="text-sm text-slate-500 dark:text-slate-400">Enter a search term above.</p>
 {% else if hits.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">No results for <strong>{{ query }}</strong>.
+<p class="text-sm text-slate-500 dark:text-slate-400">No results for <strong>{{ query }}</strong>{% if filtered %} with these filters{% endif %}.
+  {% if unknown_kind != "" %}<code>{{ unknown_kind }}</code> is not a standard page kind; check the spelling.{% endif %}
   {% if self.scoped() %}
   <a href="{{ global_href }}" class="ml-2 inline-block rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900">Search all projects</a>
   {% endif %}

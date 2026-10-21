@@ -16,6 +16,41 @@ use crate::auth_file::{load_entry, now_ms, save_entry};
 use crate::error::{LlmError, LlmResult};
 use crate::response::{provider_error_body, response_json_limited};
 
+/// A credential-bearing HTTP endpoint validated as TLS-protected, except for
+/// explicit loopback development servers. Keeping the parsed URL behind this
+/// type prevents a new grant caller from reaching the request sink with an
+/// unchecked string.
+pub(crate) struct CredentialEndpoint(reqwest::Url);
+
+impl CredentialEndpoint {
+    pub(crate) fn as_url(&self) -> &reqwest::Url {
+        &self.0
+    }
+}
+
+pub(crate) fn credential_endpoint(context: &str, url: &str) -> LlmResult<CredentialEndpoint> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| LlmError::Auth(format!("{context} {url:?} is not a valid URL: {e}")))?;
+    let loopback = parsed.host_str().is_some_and(|host| {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    match parsed.scheme() {
+        "https" => Ok(CredentialEndpoint(parsed)),
+        "http" if loopback => Ok(CredentialEndpoint(parsed)),
+        _ => Err(LlmError::Auth(format!(
+            "{context} {url:?} must use https (plain http is accepted only on \
+             localhost, 127.0.0.1 or ::1)"
+        ))),
+    }
+}
+
 /// Refresh once the access token is within this margin of expiry.
 const REFRESH_MARGIN_MS: u64 = 60_000;
 
@@ -116,7 +151,7 @@ impl<E> StoredOAuthToken<E> {
 /// failed" and the matching re-login hint).
 pub(crate) async fn refresh_grant<T>(
     client: &reqwest::Client,
-    token_endpoint: &str,
+    token_endpoint: &CredentialEndpoint,
     refresh_token: &str,
     client_id: &str,
     failure_label: &str,
@@ -126,7 +161,7 @@ where
     T: DeserializeOwned,
 {
     let resp = client
-        .post(token_endpoint)
+        .post(token_endpoint.as_url().clone())
         // Bounded here because callers hand us their shared client, whose
         // global timeout was removed in favour of per-request timeouts —
         // a token exchange is quick, so the default ceiling is plenty.
@@ -185,6 +220,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_grant_parses_success_body() {
         let endpoint = serve_once("200 OK", r#"{"access_token":"fresh-access"}"#).await;
+        let endpoint = credential_endpoint("test token endpoint", &endpoint).unwrap();
         let client = reqwest::Client::new();
 
         let parsed = refresh_grant::<TestResponse>(
@@ -204,6 +240,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_grant_surfaces_status_body_and_relogin_hint() {
         let endpoint = serve_once("401 Unauthorized", r#"{"error":"invalid_grant"}"#).await;
+        let endpoint = credential_endpoint("test token endpoint", &endpoint).unwrap();
         let client = reqwest::Client::new();
 
         let err = refresh_grant::<TestResponse>(

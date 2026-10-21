@@ -137,6 +137,161 @@ is a bounded, best-effort signal, not a durable queue, processing acknowledgment
 or automatic agent wakeup. Consumers still need their own deduplication and
 recovery policy. This does not add a notification for raw Stop observations.
 
+## Operator decisions, by subject and body
+
+An orchestrator that must stop for a person (accept a test exception, pick a
+design, confirm a merge) uses this same mailbox. The server already stores an
+optional one-line `subject` and a `body` on every message. This section is the
+convention both sides share so a companion and every orchestrator encode a
+decision the same way. The tools stay `memory_message_send` and
+`memory_message_list`. [#1281](https://github.com/akitaonrails/ai-memory/issues/1281)
+
+The server stores that text as opaque message content. Correlation, options,
+and who may answer live in the text plus the provenance the list already
+returns. A reply is an ordinary send back to the project that asked.
+
+### Asking
+
+Send the question to the project where the operator, or the companion that
+serves them, reads mail. That project is an ordinary one: it must already
+exist, and the send needs write on it, the same as any other message. Agree on
+the coordinate out of band (for example `default/operator`). The server has no
+separate operator-mailbox flag.
+
+`memory_message_send`:
+
+- `to_workspace` and `to_project`: that mailbox.
+- `from_workspace` and `from_project`: the project that should receive the
+  answer. Static clients name these; a guessed sender is refused, so the
+  reply has a real return address.
+- `subject`: `decision: <short question>`, one line, within 200 characters.
+  The inbox listing and `/web` show this line. `decision-reply:` does not
+  share the prefix, so a reply never matches a question filter.
+- `body`: the question, the options, and the project the answer goes back to.
+  Compose it as a complete prompt. The recipient has no other context. Keep
+  it within 8,000 characters; a longer body is truncated on send. Secrets are
+  scrubbed on the way in.
+
+The call returns `message_id`. Keep it. The reply names that id.
+
+```
+question: Accept the known-flake exception on the export test?
+requires_root: false
+reply_project: default/orchestrator
+options:
+- id: accept
+  label: Accept the exception
+  description: Land the change with the flake written down.
+  recommended: true
+- id: reject
+  label: Send it back
+  description: The test has to be stable first.
+details: Failed once in forty CI runs. The flake is timed in the export suite.
+links:
+- https://example.test/pull/12
+```
+
+`reply_project` is `workspace/project` of the asker, the same names passed as
+`from_workspace` and `from_project`. The answerer sends there. The option
+`id` values are the asker's. The asker keeps, locally, the action each id
+maps to, and the message carries the labels a person chooses from.
+
+`requires_root: true` marks a risky decision (merge, deploy, delete) for
+whoever answers and for the asker. Write access is the only rule the server
+enforces: posting the question needs write on the mailbox project, and posting
+the reply needs write on the asking project
+([per-project grants](design-per-project-authz.md)). The server does not check
+who may answer a risky question. `from_owner_user` on the reply is attribution,
+not a role: it is empty on an anonymous server, for a root bearer without
+`[auth].root_username`, and on a single-operator server. An asker that gates a
+risky option therefore compares it with a root identity it was configured with
+and treats an empty value as not root. A server-enforced rule for who may
+answer is part of the primitive proposed in #1281, not something that exists
+today. See [users](users.md).
+
+The same text works from the terminal:
+
+```
+ai-memory message send --to-workspace default --to-project operator \
+    --from-workspace default --from-project orchestrator \
+    --subject "decision: Accept the known-flake exception?" \
+    "$(cat <<'EOF'
+question: Accept the known-flake exception on the export test?
+requires_root: false
+reply_project: default/orchestrator
+options:
+- id: accept
+  label: Accept the exception
+  description: Land the change with the flake written down.
+  recommended: true
+- id: reject
+  label: Send it back
+  description: The test has to be stable first.
+EOF
+)"
+```
+
+### Answering
+
+List the mailbox with `memory_message_list` (`box` `inbox`) and read pending
+rows whose subject starts with `decision: `. `/web` shows the same rows
+(subject, sender, a 160-character snippet) and leaves them pending. Reading
+stays a list. Popping the question would claim it, so other readers would no
+longer see it.
+
+The answer is `memory_message_send` to `reply_project`:
+
+- `subject`: `decision-reply: <message_id>`, exact, with the question's `id`
+  from the list. The id is a UUID, so the subject stays inside 200 characters.
+- `body`: the chosen option id, then any free text.
+
+```
+question_id: 018f1a2b-3c4d-7e5f-8a9b-0c1d2e3f4a5b
+option: accept
+comment: Accepting the exception; the flake is already written down.
+```
+
+`comment` is untrusted input, the same as any popped body. The asker weighs it
+with the user. It does not authorize a command on its own.
+
+A companion could serve a page for this (open questions, options, answer
+buttons, the audit trail) through the public MCP or admin message routes; none
+ships today. The built-in `/web` mailbox stays read-only. See
+[companion crates](companion-crates.md).
+
+### How the asker sees the answer
+
+Poll `memory_message_list` on the asking project's inbox. Take the oldest
+pending row whose subject is exactly `decision-reply: ` plus the saved
+`message_id`. List is oldest-first and returns pending rows only, at most
+`limit` of them (default 50, maximum 200), with no offset. A reply that sits
+behind more than `limit` older pending rows is outside that page, so keep this
+inbox drained: pop mail you have finished with, and cancel questions you have
+given up on. A project used only for these replies stays inside the window.
+
+Each row includes `id`, `subject`, `body`, `state` (`pending`),
+`from_owner_user`, `from_workspace_id`, `from_project_id`, and `from_agent`.
+Judge who answered from `from_owner_user` (the sender credential, when the
+call authenticated as a user) and from the sender project. A message sent
+through MCP or `ai-memory message send` records `from_agent` as `other`; the
+credential and the sender project are the provenance.
+
+Pop that reply with its `message_id` when you accept it. A pop claims it
+once. Leave it listed until then so a retry still sees it. Then
+`memory_message_cancel` the question, so the mailbox drops the stale ask.
+Cancelling the question leaves the reply where it is: the reply was sent by
+the answerer and sits in the asker's inbox.
+
+Further replies to the same id can still arrive. The convention is that the
+oldest pending match is the answer; pop or leave the rest as ordinary mail.
+The server accepts every send that has write on the destination.
+
+The poll is the caller's own loop, with its own backoff. An observer webhook
+on `message_send` can wake a companion: the notification carries the recipient
+scope and the actor, and the companion then lists that inbox. It is the
+best-effort signal described above, not a queue and not a wakeup for the
+orchestrator. Each inbox still holds at most 256 pending messages.
+
 ## In the web UI
 
 The `/web` UI is read-only here too. A project card shows an amber `N inbox`
@@ -187,8 +342,9 @@ hook (or, for clients that discard SessionStart output like Kimi, its first
 user-prompt hook) fetches `GET /handoff`, which returns any pending single-use
 **handoff** plus, when the project's `.ai-memory.toml` opts in with
 `[briefing] inject_on_session_start = true`, a compiled **project brief** of
-pinned / `_rules/` / `_slots/` pages and recent-page pointers. That block is
-prepended to the new session's context automatically.
+pinned / `_rules/` / `_slots/` pages (an excerpt of each, whole bodies while
+the budget lasts) and recent-page pointers. That block is prepended to the new
+session's context automatically.
 
 As of 2.3, that same on-start block appends a **non-consuming inbox notice**
 when the project has pending mail:

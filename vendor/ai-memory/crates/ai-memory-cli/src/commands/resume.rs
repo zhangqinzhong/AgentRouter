@@ -99,6 +99,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             env: Vec::new(),
             env_file: None,
             harness,
+            claude_wrapper: None,
             native_args: Vec::new(),
         },
         &target,

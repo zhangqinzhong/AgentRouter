@@ -11,11 +11,17 @@
 //! - **Cross-project search** (no scope): FTS5 over every repository the
 //!   viewer may read, as `memory_query(global=true)` does. Its trace is the
 //!   FTS time alone; there are no per-hit streams to show.
+//!
+//! `kind` and `tier` narrow either mode inside each stream's SQL, so a rare
+//! kind is never crowded out by other kinds. Survivors are ranked among
+//! themselves, so their order can differ slightly from the unfiltered hits of
+//! the same query, and graph expansion seeds only from pages the filter keeps.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ai_memory_store::{SearchExplain, StreamTimings};
+use ai_memory_core::Tier;
+use ai_memory_store::{PAGE_KINDS, PageFilter, SearchExplain, StreamTimings};
 use askama::Template;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -25,8 +31,8 @@ use serde::Deserialize;
 use crate::markdown;
 use crate::state::WebState;
 use crate::templates::{
-    HitTrace, ScopeGroup, ScopeOption, SearchHit, SearchView, StreamTraceRow, TimingRow,
-    encode_segment, page_href, project_href,
+    FilterOption, HitTrace, ScopeGroup, ScopeOption, SearchHit, SearchView, StreamTraceRow,
+    TimingRow, encode_segment, page_href, project_href,
 };
 
 /// Hits a cross-project search returns when the request names no `limit`.
@@ -52,6 +58,12 @@ pub(crate) struct SearchParams {
     /// project. Wins over `workspace` + `project` when both are sent.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Keep only pages of this kind; empty keeps every kind.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Keep only pages of this tier; empty keeps every tier.
+    #[serde(default)]
+    pub tier: Option<String>,
     /// Most hits to show, clamped to `1..=100`.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -109,6 +121,30 @@ pub(crate) async fn handler(
             }
         },
     };
+    let kind = non_empty(params.kind.as_deref()).map(str::to_owned);
+    // Matched like `kind`, ignoring ASCII case; the canonical name is what
+    // the SQL compares.
+    let tier = match non_empty(params.tier.as_deref()) {
+        Some(value) => match Tier::ALL
+            .iter()
+            .find(|t| t.as_str().eq_ignore_ascii_case(value))
+        {
+            Some(t) => Some(t.as_str()),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "tier must be working, episodic, semantic or procedural",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    let filtered = kind.is_some() || tier.is_some();
+    let filter = PageFilter {
+        kind: kind.as_deref(),
+        tier,
+    };
     let internal = |error: ai_memory_store::StoreError| {
         tracing::error!(%error, "web search failed");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -141,6 +177,7 @@ pub(crate) async fn handler(
                     limit + 1,
                     explain,
                     &super::api::owner_filter_for(actor),
+                    filter,
                 )
                 .await
                 {
@@ -150,6 +187,7 @@ pub(crate) async fn handler(
                 timings = result.timings;
                 streams_active = result.streams_active;
                 truncated = result.hits.len() > limit;
+                // The trace position is the rank among the hits shown.
                 for (position, (hit, details)) in result.hits.into_iter().take(limit).enumerate() {
                     let path = hit.path.as_str().to_owned();
                     hits.push(SearchHit {
@@ -175,7 +213,7 @@ pub(crate) async fn handler(
             let started = explain.then(std::time::Instant::now);
             let raw = match state
                 .reader
-                .search_pages_with_meta(query.clone(), limit + 1, None, viewer)
+                .search_pages_with_meta(query.clone(), limit + 1, None, viewer, filter)
                 .await
             {
                 Ok(raw) => raw,
@@ -237,7 +275,22 @@ pub(crate) async fn handler(
         })
         .collect();
     let hit_count = hits.len();
-    let global_href = format!("search?q={}", encode_segment(&query));
+    let unknown_kind = kind
+        .as_deref()
+        .filter(|k| !PAGE_KINDS.iter().any(|known| known.eq_ignore_ascii_case(k)))
+        .unwrap_or_default()
+        .to_owned();
+    let kind_options = filter_options(&PAGE_KINDS, kind.as_deref());
+    let tiers = Tier::ALL.map(|t| t.as_str());
+    let tier_options = filter_options(&tiers, tier);
+    // Leaving the project keeps the filters, so an empty filtered result here
+    // is compared with the same filters everywhere.
+    let mut global_href = format!("search?q={}", encode_segment(&query));
+    for (name, value) in [("kind", kind.as_deref()), ("tier", tier)] {
+        if let Some(value) = value {
+            global_href.push_str(&format!("&{name}={}", encode_segment(value)));
+        }
+    }
     let view = SearchView {
         global_href,
         project_href: project_href(&workspace, &project),
@@ -245,6 +298,10 @@ pub(crate) async fn handler(
         query,
         hits,
         hit_count,
+        filtered,
+        unknown_kind,
+        kind_options,
+        tier_options,
         workspace,
         project,
         explain,
@@ -265,6 +322,22 @@ pub(crate) async fn handler(
         Ok(html) => Html(html).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// The options of one filter select, with the current value marked. A value
+/// outside `known` (a custom frontmatter kind) is kept so the form round-trips.
+fn filter_options(known: &[&str], current: Option<&str>) -> Vec<FilterOption> {
+    let mut values: Vec<&str> = known.to_vec();
+    if let Some(current) = current.filter(|c| !known.iter().any(|k| k.eq_ignore_ascii_case(c))) {
+        values.push(current);
+    }
+    values
+        .into_iter()
+        .map(|value| FilterOption {
+            value: value.to_owned(),
+            selected: current.is_some_and(|c| c.eq_ignore_ascii_case(value)),
+        })
+        .collect()
 }
 
 fn dash() -> String {

@@ -4,6 +4,15 @@ use crate::error::{StoreError, StoreResult};
 
 refinery::embed_migrations!("migrations");
 
+/// Checksum recorded by refinery for the V62 SQL shipped in v2.2.1.
+///
+/// The historical SQL is pinned in
+/// `testdata/V62__page_ingestion_windows.pre776.sql`; a regression test
+/// derives this value through refinery's own checksum implementation.
+const ORIGINAL_V62_CHECKSUM: u64 = 16_518_128_245_137_964_566;
+const V62_VERSION: u32 = 62;
+const V62_NAME: &str = "page_ingestion_windows";
+
 /// Run all pending migrations against an open connection.
 ///
 /// # Errors
@@ -14,26 +23,53 @@ refinery::embed_migrations!("migrations");
 /// is remapped to [`StoreError::DataSchemaAhead`], which names the offending
 /// migration and points the operator at the fix.
 pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
+    repair_original_v62_checksum(conn)?;
     migrations::runner()
-        // Tolerate a divergent checksum on an already-applied migration.
-        //
-        // V62 was reshaped in place (#776) from an in-migration backfill to
-        // DDL-only + a chunked boot-path backfill (`ops::backfill_page_windows`).
-        // A store that applied the ORIGINAL V62 recorded that migration's
-        // checksum in `refinery_schema_history`; the embedded V62 now hashes
-        // differently, which refinery's default `abort_divergent = true` would
-        // reject as `DivergentVersion`, refusing to open a correctly-migrated
-        // store. Those stores already have the columns fully backfilled, so the
-        // boot step is inert for them — opening is safe. Relaxing divergence is
-        // the intentional cost of an in-place migration reshape.
-        //
-        // `abort_missing` stays TRUE: a store whose applied version is *ahead*
-        // of this binary must still fail closed with the actionable
-        // `DataSchemaAhead` error (the schema-version pin), not open silently.
-        .set_abort_divergent(false)
+        .set_abort_divergent(true)
         .set_abort_missing(true)
         .run(conn)
         .map_err(classify_run_error)?;
+    Ok(())
+}
+
+/// Rewrite only the known V62 checksum produced by v2.2.1. The replacement
+/// SQL moved an equivalent backfill to the bounded boot path (#776); stores
+/// that applied the original migration are already in the same end state.
+/// Every other checksum mismatch remains a hard refinery error.
+fn repair_original_v62_checksum(conn: &rusqlite::Connection) -> StoreResult<()> {
+    let has_history: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'refinery_schema_history')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_history {
+        return Ok(());
+    }
+    let Some(current_checksum) = migrations::runner()
+        .get_migrations()
+        .iter()
+        .find(|migration| migration.version() == V62_VERSION)
+        .map(refinery::Migration::checksum)
+    else {
+        return Ok(());
+    };
+    let repaired = conn.execute(
+        "UPDATE refinery_schema_history SET checksum = ?1 \
+         WHERE version = ?2 AND name = ?3 AND checksum = ?4",
+        rusqlite::params![
+            current_checksum.to_string(),
+            V62_VERSION,
+            V62_NAME,
+            ORIGINAL_V62_CHECKSUM.to_string()
+        ],
+    )?;
+    if repaired == 1 {
+        tracing::info!(
+            version = V62_VERSION,
+            "repaired known V62 migration checksum from the v2.2.1 layout"
+        );
+    }
     Ok(())
 }
 
@@ -1282,25 +1318,349 @@ mod tests {
         }
     }
 
-    /// V62 was reshaped in place (#776) from an in-migration backfill to
-    /// DDL-only + a boot-path backfill, changing its checksum. A store that
-    /// applied the ORIGINAL V62 recorded the old checksum; `run` must still
-    /// open it (divergence tolerated) rather than aborting with
-    /// `DivergentVersion` — while a strict runner would reject it, proving
-    /// the relaxation is load-bearing. `abort_missing` stays true, so a
-    /// schema that is genuinely *ahead* still fails closed (covered by
-    /// `data_ahead_of_binary_reports_schema_ahead_not_raw_refinery`).
+    /// V81 rebuilds `sessions` again, for CodeBuddy Code: rows, the ingest
+    /// keys and observations that reference them, and the scope-pairing
+    /// triggers all survive, and a `codebuddy` session is accepted afterwards.
     #[test]
-    fn reshaped_migration_divergent_checksum_is_tolerated() {
+    fn v80_to_v81_preserves_sessions_ingest_keys_and_observations_and_accepts_codebuddy() {
         let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 80).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user) \
+             VALUES (?1, ?2, ?3, 'muse', '/repo', 1, 2, 7, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        // V80 cannot store a CodeBuddy session yet.
+        assert!(
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, started_at) \
+                 VALUES (?1, ?2, ?3, 'codebuddy', 1)",
+                params![
+                    SessionId::new().as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+            )
+            .is_err(),
+            "the V80 CHECK must reject codebuddy"
+        );
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, session_id, agent_kind) \
+             VALUES (?1, 'k1', 1, ?2, 'muse')",
+            params![project_id.as_bytes(), existing.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'prompt', 'kept', 'kept body', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("muse".into(), "/repo".into(), 7, Some("user:alice".into()))
+        );
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![existing.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 1, "the session's observations survive");
+        for table in ["ingest_keys", "observations"] {
+            let dangling: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{table}')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(dangling, 0, "{table} must still reference sessions");
+        }
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::CodeBuddy,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    /// V83 expands the sessions enum for IBM Bob. Existing sessions and
+    /// dependent observations survive the table rebuild, while the old V82
+    /// constraint rejects the new value and the migrated schema accepts it.
+    #[test]
+    fn v82_to_v83_preserves_sessions_and_observations_and_accepts_ibm_bob() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 82).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
+             VALUES (?1, ?2, ?3, 'codebuddy', '/repo', 1, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, started_at) \
+                 VALUES (?1, ?2, ?3, 'ibm-bob', 1)",
+                params![
+                    SessionId::new().as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+            )
+            .is_err(),
+            "the V82 CHECK must reject ibm-bob"
+        );
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'prompt', 'kept', 'kept body', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, actor_user FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "codebuddy".into(),
+                "/repo".into(),
+                Some("user:alice".into())
+            )
+        );
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![existing.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 1, "the session's observations survive");
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::IbmBob,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    #[test]
+    fn v81_to_v82_preserves_managed_runs_and_adds_previous_session_identity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 81).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project =
+            crate::ops::get_or_create_project(&mut conn, &workspace, "project", None).unwrap();
+        let workstream = ai_memory_core::WorkstreamId::new();
+        let run_id = ai_memory_core::ManagedRunId::new();
+        conn.execute(
+            "INSERT INTO workstreams \
+             (id, workspace_id, project_id, repo_fingerprint, worktree_fingerprint, name, cwd, \
+              created_at, selected_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'repo', 'tree', 'default', '/repo', 1, 1, 1)",
+            params![
+                workstream.as_bytes(),
+                workspace.as_bytes(),
+                project.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO managed_runs \
+             (id, workstream_id, agent_kind, lease_owner, state, sync_after, sync_through, \
+              context_delivered, lease_expires_at, started_at) \
+             VALUES (?1, ?2, 'codex', 'host:1', 'finished', 3, 7, 1, 10, 1)",
+            params![run_id.as_bytes(), workstream.as_bytes()],
+        )
+        .unwrap();
+
         run(&mut conn).unwrap();
 
-        // Simulate the original V62's recorded checksum by rewriting the
-        // stored value so it no longer matches the embedded migration.
+        let preserved: (String, i64, i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, sync_after, sync_through, previous_agent_kind, \
+                        previous_native_session_id \
+                 FROM managed_runs WHERE id = ?1",
+                params![run_id.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, ("codex".into(), 3, 7, None, None));
+        conn.execute(
+            "UPDATE managed_runs SET previous_agent_kind = 'claude-code', \
+             previous_native_session_id = 'native-1' WHERE id = ?1",
+            params![run_id.as_bytes()],
+        )
+        .unwrap();
+        let previous: (String, String) = conn
+            .query_row(
+                "SELECT previous_agent_kind, previous_native_session_id \
+                 FROM managed_runs WHERE id = ?1",
+                params![run_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(previous, ("claude-code".into(), "native-1".into()));
+    }
+
+    /// The repair constant comes from the released SQL, not a remembered
+    /// value that could silently drift from its provenance.
+    #[test]
+    fn original_v62_checksum_matches_the_released_sql() {
+        let released_sql = include_str!("testdata/V62__page_ingestion_windows.pre776.sql");
+        let checksum = refinery::Migration::unapplied("V62__page_ingestion_windows", released_sql)
+            .expect("the released V62 fixture must remain a valid migration")
+            .checksum();
+
+        assert_eq!(checksum, ORIGINAL_V62_CHECKSUM);
+        let embedded = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.version() == V62_VERSION)
+            .expect("V62 must remain embedded")
+            .checksum();
+        assert_ne!(
+            embedded, checksum,
+            "the V62 repair is unnecessary if the embedded SQL matches v2.2.1"
+        );
+    }
+
+    /// The one known V62 checksum is repaired before the strict runner sees
+    /// it. An arbitrary mismatch still fails closed.
+    #[test]
+    fn only_the_original_v62_checksum_is_repaired() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        let current_checksum = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.version() == V62_VERSION)
+            .unwrap()
+            .checksum();
+        assert_ne!(current_checksum, ORIGINAL_V62_CHECKSUM);
+
         let rewritten = conn
             .execute(
-                "UPDATE refinery_schema_history SET checksum = '0' WHERE version = 62",
-                [],
+                "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = ?2",
+                params![ORIGINAL_V62_CHECKSUM.to_string(), V62_VERSION],
             )
             .unwrap();
         assert_eq!(rewritten, 1, "V62 history row must exist to diverge");
@@ -1315,10 +1675,34 @@ mod tests {
             Ok(_) => panic!("strict runner should reject a divergent checksum"),
         }
 
-        // The production path tolerates it: the already-migrated store opens.
-        run(&mut conn).expect("divergence must be tolerated so migrated stores open");
+        run(&mut conn).expect("the released V62 checksum must be repaired");
+        let repaired: String = conn
+            .query_row(
+                "SELECT checksum FROM refinery_schema_history WHERE version = ?1",
+                [V62_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired, current_checksum.to_string());
 
-        // And the boot backfill is inert on such a store (no NULL windows).
+        conn.execute(
+            "UPDATE refinery_schema_history SET checksum = '0' WHERE version = ?1",
+            [V62_VERSION],
+        )
+        .unwrap();
+        match run(&mut conn).unwrap_err() {
+            StoreError::Migration(err) => assert!(matches!(
+                err.kind(),
+                refinery::error::Kind::DivergentVersion(_, _)
+            )),
+            other => panic!("unknown divergence must remain fatal: {other:?}"),
+        }
+
+        conn.execute(
+            "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = ?2",
+            params![current_checksum.to_string(), V62_VERSION],
+        )
+        .unwrap();
         let summary = crate::ops::backfill_page_windows(&mut conn).unwrap();
         assert_eq!(summary, crate::ops::PageWindowBackfillSummary::default());
     }

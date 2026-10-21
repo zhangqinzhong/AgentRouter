@@ -15,19 +15,19 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use ai_memory_core::{PagePath, WorkspaceId};
+use ai_memory_core::{PagePath, ProjectId, WorkspaceId};
 use ai_memory_store::{ReaderPool, ScopeResolutionError, lookup_existing_scope};
 use tracing::warn;
 
 /// A normalised link key as `ai_memory_wiki::extract_links` yields it:
 /// `(workspace, project, path)`, with `workspace`/`project` `None` for a
-/// same-project link. Only project-qualified keys ever enter the sets this
-/// module handles.
+/// same-project link.
 pub(crate) type LinkKey = (Option<String>, Option<String>, String);
 
-/// Collect the cross-scope link targets across `pages` — body wikilinks and
-/// typed `relations:` frontmatter entries — that do NOT resolve to an
-/// existing latest page in the store.
+/// Collect generated links that do not resolve to an existing latest page.
+/// Cross-scope body links and every typed relation are checked. Same-project
+/// body links remain deliberately unchecked, while same-project relations may
+/// also target another page proposed in this atomic batch.
 ///
 /// Lookups are no-create and batched: each named scope is resolved once via
 /// [`lookup_existing_scope`], then every path under it is checked in a
@@ -40,24 +40,77 @@ pub(crate) type LinkKey = (Option<String>, Option<String>, String);
 /// `source_workspace_id` supplies the workspace name for project-only
 /// `[[project:path]]` links, exactly as the write-path link resolver treats
 /// a missing workspace qualifier as "the source page's workspace".
-pub(crate) async fn unresolved_cross_scope_links(
+#[derive(Debug, Default)]
+pub(crate) struct UnresolvedGeneratedLinks {
+    pub body: BTreeSet<LinkKey>,
+    pub relations: BTreeSet<LinkKey>,
+}
+
+impl UnresolvedGeneratedLinks {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.body.is_empty() && self.relations.is_empty()
+    }
+}
+
+pub(crate) async fn unresolved_generated_links(
     reader: &ReaderPool,
     source_workspace_id: WorkspaceId,
+    source_project_id: ProjectId,
     pages: &[(&PagePath, &str, &serde_json::Value)],
-) -> Result<BTreeSet<LinkKey>, ScopeResolutionError> {
-    let mut targets: BTreeSet<LinkKey> = BTreeSet::new();
+) -> Result<UnresolvedGeneratedLinks, ScopeResolutionError> {
+    let proposed_paths: BTreeSet<String> = pages
+        .iter()
+        .map(|(path, _, _)| path.as_str().to_string())
+        .collect();
+    let mut body_targets: BTreeSet<LinkKey> = BTreeSet::new();
+    let mut relation_targets: BTreeSet<LinkKey> = BTreeSet::new();
     for (page_path, body, frontmatter) in pages {
-        let links = ai_memory_wiki::extract_links(body, page_path)
-            .into_iter()
-            .chain(ai_memory_wiki::extract_relation_links(frontmatter));
-        for link in links {
+        for link in ai_memory_wiki::extract_links(body, page_path) {
             if link.project.is_some() {
-                targets.insert((link.workspace, link.project, link.path.as_str().to_string()));
+                body_targets.insert((link.workspace, link.project, link.path.as_str().to_string()));
             }
         }
+        relation_targets.extend(
+            ai_memory_wiki::extract_relation_links(frontmatter)
+                .into_iter()
+                .map(|link| (link.workspace, link.project, link.path.as_str().to_string())),
+        );
     }
-    if targets.is_empty() {
-        return Ok(BTreeSet::new());
+    if body_targets.is_empty() && relation_targets.is_empty() {
+        return Ok(UnresolvedGeneratedLinks::default());
+    }
+
+    let mut result = UnresolvedGeneratedLinks::default();
+    let local_relations: Vec<LinkKey> = relation_targets
+        .iter()
+        .filter(|(workspace, project, _)| workspace.is_none() && project.is_none())
+        .cloned()
+        .collect();
+    let local_paths: Vec<String> = local_relations
+        .iter()
+        .map(|(_, _, path)| path.clone())
+        .filter(|path| !proposed_paths.contains(path))
+        .collect();
+    let existing_local: BTreeSet<String> = reader
+        .existing_latest_paths(source_workspace_id, source_project_id, local_paths)
+        .await?
+        .into_iter()
+        .collect();
+    for key in local_relations {
+        if !proposed_paths.contains(&key.2) && !existing_local.contains(&key.2) {
+            warn!(target = %key.2, "dropping same-project relation: no such page");
+            result.relations.insert(key);
+        }
+    }
+
+    let cross_targets: BTreeSet<LinkKey> = body_targets
+        .iter()
+        .chain(relation_targets.iter())
+        .filter(|(_, project, _)| project.is_some())
+        .cloned()
+        .collect();
+    if cross_targets.is_empty() {
+        return Ok(result);
     }
 
     // The source workspace exists by construction — the session's
@@ -71,13 +124,12 @@ pub(crate) async fn unresolved_cross_scope_links(
         })?;
 
     let mut by_scope: BTreeMap<(String, String), Vec<LinkKey>> = BTreeMap::new();
-    for key in targets {
+    for key in cross_targets {
         let workspace = key.0.clone().unwrap_or_else(|| source_workspace.clone());
         let project = key.1.clone().unwrap_or_default();
         by_scope.entry((workspace, project)).or_default().push(key);
     }
 
-    let mut unresolved = BTreeSet::new();
     for ((workspace, project), keys) in by_scope {
         let scope = match lookup_existing_scope(reader, &workspace, &project).await {
             Ok(scope) => scope,
@@ -91,7 +143,14 @@ pub(crate) async fn unresolved_cross_scope_links(
                     error = %error,
                     "de-linking cross-scope wikilinks: the named scope does not resolve",
                 );
-                unresolved.extend(keys);
+                for key in keys {
+                    if body_targets.contains(&key) {
+                        result.body.insert(key.clone());
+                    }
+                    if relation_targets.contains(&key) {
+                        result.relations.insert(key);
+                    }
+                }
                 continue;
             }
             Err(error) => return Err(error),
@@ -108,11 +167,16 @@ pub(crate) async fn unresolved_cross_scope_links(
                     target = %format!("{}:{}", key.1.as_deref().unwrap_or_default(), key.2),
                     "de-linking cross-scope wikilink: no such page in the target project",
                 );
-                unresolved.insert(key);
+                if body_targets.contains(&key) {
+                    result.body.insert(key.clone());
+                }
+                if relation_targets.contains(&key) {
+                    result.relations.insert(key);
+                }
             }
         }
     }
-    Ok(unresolved)
+    Ok(result)
 }
 
 /// Rewrite `body`, replacing every wikilink whose key is in `unresolved`
@@ -150,9 +214,9 @@ pub(crate) fn prune_relations(frontmatter: &mut serde_json::Value, unresolved: &
         };
         list.retain(|entry| {
             let probe = serde_json::json!({ "relations": { relation.as_str(): [entry] } });
-            ai_memory_wiki::extract_relation_links(&probe)
-                .into_iter()
-                .all(|link| {
+            let links = ai_memory_wiki::extract_relation_links(&probe);
+            !links.is_empty()
+                && links.into_iter().all(|link| {
                     !unresolved.contains(&(
                         link.workspace,
                         link.project,
@@ -210,5 +274,67 @@ mod tests {
         let mut fm = original;
         prune_relations(&mut fm, &BTreeSet::from([key("ghost", "x.md")]));
         assert!(fm.get("relations").is_none());
+    }
+
+    #[test]
+    fn prune_relations_drops_unparseable_entries() {
+        let mut fm = serde_json::json!({
+            "relations": {
+                "contradicts": [
+                    "upgrade 3.0.0 to 3.1.0 with residue",
+                    "notes/",
+                    "notes/.md",
+                    "local/valid.md"
+                ]
+            }
+        });
+        prune_relations(&mut fm, &BTreeSet::from([key("ghost", "x.md")]));
+        assert_eq!(
+            fm["relations"]["contradicts"],
+            serde_json::json!(["local/valid.md"])
+        );
+    }
+
+    #[tokio::test]
+    async fn same_project_relations_require_existing_or_same_batch_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let source = PagePath::new("notes/source.md").unwrap();
+        let peer = PagePath::new("notes/peer.md").unwrap();
+        let source_frontmatter = serde_json::json!({
+            "relations": {"causes": ["notes/peer.md", "notes/missing.md"]}
+        });
+        let peer_frontmatter = serde_json::json!({});
+        let unresolved = unresolved_generated_links(
+            &store.reader,
+            ws,
+            proj,
+            &[
+                (
+                    &source,
+                    "A pending [[notes/missing.md]] body link stays valid.",
+                    &source_frontmatter,
+                ),
+                (&peer, "Peer", &peer_frontmatter),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert!(unresolved.body.is_empty(), "local body links may dangle");
+        assert_eq!(
+            unresolved.relations,
+            BTreeSet::from([(None, None, "notes/missing.md".to_string())])
+        );
     }
 }

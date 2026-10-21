@@ -10,13 +10,13 @@
 //! Each calendar month gets its own file: `log-YYYY-MM.md` under the
 //! project root. The filename is derived from the event timestamp, so
 //! events written across a month boundary land in their respective
-//! month's file. Old months never grow once closed — perfect for git's
-//! per-blob storage (one terminal blob per month per project). The
+//! month's file. Old months never grow once closed. Wiki checkpoints
+//! leave ledgers out of git (every append would otherwise store a new
+//! full-size blob), so the files on disk are their only copy. The
 //! watcher's reserved-name check (`is_reserved_filename`) covers the
 //! `log-*.md` pattern so rotated files are not indexed as wiki pages.
 //!
-//! No explicit retention sweep yet — git history bounds growth
-//! sub-linearly and old monthly blobs are tiny. A future
+//! No explicit retention sweep yet. A future
 //! `forget-sweep --logs --older-than 12m` could delete cold files if
 //! it becomes worthwhile.
 

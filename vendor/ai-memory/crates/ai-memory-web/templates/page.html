@@ -30,11 +30,16 @@
       pinned
     </span>
     {% endif %}
-    <span class="ml-1">Updated {{ updated_relative }}</span>
+    {% if expired %}
+    <span class="inline-flex items-center rounded px-2 py-0.5 font-medium bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+      expired
+    </span>
+    {% endif %}
+    <span class="ml-1">Updated <time datetime="{{ updated_at }}" title="{{ updated_at }}">{{ updated_relative }}</time></span>
     <span>·</span>
     <a href="{{ history_href }}" class="text-blue-600 dark:text-blue-400 underline">History</a>
     <span>·</span>
-    <span>Created {{ created_relative }}</span>
+    <span>Created <time datetime="{{ created_at }}" title="{{ created_at }}">{{ created_relative }}</time></span>
     {% if supersedes_path != "" %}
     <span>·</span>
     <span>Supersedes <a href="{{ supersedes_href }}" class="text-blue-600 dark:text-blue-400 underline">{{ supersedes_path }}</a></span>

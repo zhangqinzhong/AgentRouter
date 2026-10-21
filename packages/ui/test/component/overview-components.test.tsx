@@ -42,45 +42,21 @@ function renderOverview(patch: {
   );
 }
 
-test("OverviewView renders the flat page shell with sections in order", () => {
+test("OverviewView separates local usage from gateway monitoring", () => {
   const html = renderOverview();
-
-  assert.match(html, /<h1[^>]*>Overview<\/h1>/);
-  assert.match(html, /local-usage-page/);
-  assert.match(html, /All providers/);
-  assert.match(html, /All models/);
-  assert.match(html, /System status/);
-  assert.match(html, /API Service/);
-  assert.match(html, /Usage Trend/);
-  assert.match(html, /Client Analysis/);
-  assert.match(html, /Provider Analysis/);
-  assert.match(html, /Account Balance/);
-  assert.ok(html.indexOf("System status") < html.indexOf("Usage Trend"));
-  assert.ok(html.indexOf("Usage Trend") < html.indexOf("Client Analysis"));
-  assert.ok(html.indexOf("Client Analysis") < html.indexOf("Account Balance"));
-});
-
-test("OverviewView renders four flat stat cells in a bordered grid", () => {
-  const html = renderOverview();
-
-  assert.match(html, /border-y border-border\/70/);
-  const statLabels = html.match(/text-\[9px\] font-bold uppercase tracking-widest/g) ?? [];
-  assert.equal(statLabels.length, 4);
-  assert.match(html, />Requests</);
-  assert.match(html, />Estimated cost</);
-  assert.match(html, />Request success rate</);
-  assert.match(html, /text-xl font-semibold tabular-nums tracking-tight/);
+  for (const label of ["Overview", "Model usage", "Client activity", "Account Balance", "Gateway requests"]) assert.ok(html.includes(label));
+  assert.doesNotMatch(html, /All providers|Provider Analysis|System status/);
+  assert.ok(html.indexOf("Usage Trend") < html.indexOf("Model usage"));
+  assert.ok(html.indexOf("Client activity") < html.indexOf("Account Balance"));
+  for (const label of ["Recorded turns", "Total tokens", "Estimated cost", "Cache ratio"]) assert.ok(html.includes(label));
   assert.match(html, /128/);
   assert.match(html, /\$1\.23/);
-  assert.match(html, /98%/);
-  assert.match(html, /grid w-full grid-cols-2[^"]*sm:flex sm:justify-between sm:gap-x-8/);
-  assert.equal((html.match(/flex min-w-0 flex-col items-start gap-1\.5 text-left/g) ?? []).length, 4);
 });
 
 test("OverviewView renders the range filter as flat tabs with one active option", () => {
   const html = renderOverview({ usageRange: "7d" });
 
-  assert.match(html, />Today</);
+  assert.doesNotMatch(html, />Today</);
   assert.match(html, />24h</);
   assert.match(html, />7d</);
   assert.match(html, />30d</);
@@ -163,10 +139,10 @@ test("OverviewView shows the empty state without usage data", () => {
     totalTokens: 0
   } }) });
 
-  assert.match(html, /No requests yet/);
+  assert.match(html, /Recorded turns/);
   assert.match(html, /No model usage yet/);
   assert.match(html, /No client usage yet/);
-  assert.match(html, /No provider usage yet/);
+  assert.doesNotMatch(html, /Provider Analysis/);
   assert.doesNotMatch(html, /border-l-2 border-emerald-500/);
 });
 
@@ -183,7 +159,7 @@ test("OverviewBreakdowns translates empty model usage in Chinese", () => {
   assert.match(html, /暂无模型用量/);
   assert.doesNotMatch(html, /No model usage yet/);
   assert.match(html, /暂无客户端用量/);
-  assert.match(html, /暂无供应商用量/);
+  assert.doesNotMatch(html, /供应商分析/);
 });
 
 test("OverviewView keeps Chinese token copy as Token", () => {
@@ -484,7 +460,7 @@ test("OverviewBreakdowns merges model rows that share a display name", () => {
 
   const occurrences = html.match(/title="glm-5\.3-flash"/g) ?? [];
   assert.equal(occurrences.length, 1, "duplicate display names must collapse to one row");
-  assert.match(html, /912/);
+  assert.match(html, /243,623,957/);
 });
 
 test("overview breakdown resolves the Cursor brand icon for local Cursor rows", () => {
@@ -509,12 +485,12 @@ test("OverviewBreakdowns hides client rows without client attribution", () => {
     </AppI18nContext.Provider>
   );
 
-  const clientSection = html.slice(html.indexOf("Client Analysis"), html.indexOf("Provider Analysis"));
+  const clientSection = html.slice(html.indexOf("Client activity"));
   assert.match(clientSection, /Claude/);
   assert.doesNotMatch(clientSection, /Unknown client/, "unattributed rows must not render as an unknown bucket");
   assert.doesNotMatch(clientSection, /公司API/, "client rows must not borrow provider names");
   assert.doesNotMatch(clientSection, /WorkOpenAI/, "client rows must not borrow provider names");
-  assert.match(html.slice(html.indexOf("Provider Analysis")), /公司API/);
+  assert.doesNotMatch(html, /Provider Analysis/);
 });
 
 test("Overview keeps statistics visible while local collection refreshes", () => {

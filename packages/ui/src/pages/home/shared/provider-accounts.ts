@@ -161,6 +161,7 @@ export function formatProviderAccountMeterValue(
   meter: ProviderAccountMeter,
   translate: (value: string) => string = (value) => value
 ): string {
+  if (meter.displayMode === "used-share") return `${formatProviderAccountNumber(meter.used ?? 0)}% · ${translate("Shared pool used")}`;
   const value = meter.remaining ?? meter.used ?? meter.limit;
   if (value === undefined) {
     return "-";

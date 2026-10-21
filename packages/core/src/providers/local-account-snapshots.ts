@@ -36,6 +36,15 @@ export function localQuotaSnapshots(raw: unknown): ProviderAccountSnapshot[] {
     for (const [i,w] of (Array.isArray(p.weekly_scoped) ? p.weekly_scoped : []).entries()) {
       const meter = quotaMeter(`weekly_${i}`, String(record(w).label || 'Weekly'), w); if(meter) meters.push(meter);
     }
+    if (key === 'grok' && Array.isArray(p.products)) {
+      for (const entry of p.products) {
+        const product = record(entry), window = record(product.window);
+        const used = window.used_percent;
+        if (typeof used !== 'number' || !Number.isFinite(used) || used <= 0) continue;
+        meters.push({id: `product_${String(product.product)}`, label: String(product.label || product.product),
+          kind: 'quota', unit: '%', used, displayMode: 'used-share', source: 'standard'});
+      }
+    }
     const resets = record(p.reset_credits);
     if (typeof resets.available_count === 'number') meters.push({ id:'manual_reset_remaining',label:'Manual resets',kind:'requests',unit:'requests',remaining:resets.available_count,
       details:(Array.isArray(resets.credits)?resets.credits:[]).map((c,i)=>({id:String(i),label:`Reset ${i+1}`,effectiveAt:timestamp(record(c).granted_at),expiresAt:timestamp(record(c).expires_at),status:String(record(c).status || '')})) });

@@ -761,10 +761,12 @@ fn repository_identity(
 const NATIVE_HOOK_CLIENT_KIND: &str = "hook";
 
 /// Build a reqwest client for the hook's one-shot requests. `no_proxy`
-/// skips Windows proxy auto-detection (registry / WinINET lookups), which
-/// is pure overhead for a loopback/LAN POST. Built once per invocation and
-/// reused for both the event POST and the handoff GET. Default root certs
-/// are kept so HTTPS targets (e.g. a TLS proxy) still work.
+/// ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, which have no
+/// business on a loopback/LAN POST; reqwest is built without its
+/// `system-proxy` feature, so no OS proxy setting is read either way.
+/// Built once per invocation and reused for both the event POST and the
+/// handoff GET. Default root certs are kept so HTTPS targets (e.g. a TLS
+/// proxy) still work.
 pub fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()

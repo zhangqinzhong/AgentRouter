@@ -470,7 +470,7 @@ mod tests {
         let fx = session(DEFAULT_SEED);
         let observations = crate::ab::synthesise_observations(&fx);
         let sid = SessionId::new();
-        let request = build_batch_request(sid, &observations);
+        let request = build_batch_request(sid, &observations, false);
         let scorer = Scorer::new(sid, &observations, &request, &fx.must_mention, &[]);
         let prompt = scorer.prompt(observations.len());
 

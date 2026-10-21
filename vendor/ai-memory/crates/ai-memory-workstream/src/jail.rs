@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 /// otherwise be invisible inside the jail.
 pub const FORWARDED_ENV_NAMES: &[&str] = &[
     "AI_MEMORY_SERVER_URL",
+    "AI_MEMORY_BASE_PATH",
     "AI_MEMORY_HOOK_URL",
     "AI_MEMORY_DATA_DIR",
     "AI_MEMORY_AUTH_TOKEN",

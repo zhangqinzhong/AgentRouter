@@ -19,7 +19,8 @@ yay -S ai-memory-bin    # prebuilt binary, fastest on x86_64/aarch64
 yay -S ai-memory        # builds from source, supports x86_64/aarch64
 ```
 
-Then follow the native Linux service instructions in `docs/install.md`.
+Then run `ai-memory setup` on a single-user machine, or follow the system
+service instructions in `docs/install.md`.
 
 ## Local Integration Test
 

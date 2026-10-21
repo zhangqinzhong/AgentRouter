@@ -18,6 +18,16 @@ standardized. The files are greppable, open in Obsidian, and import into
 anything OKF-aware. Nothing is locked in: the export is a validated copy of
 the files ai-memory already stores its memory in.
 
+Local wikilink labels containing brackets or backslashes remain ordinary
+Markdown links in an exported bundle. Reindexing the extracted concept files
+preserves their link targets.
+
+Backup and OKF export downloads replace their output only after the whole
+response arrives. An interrupted download keeps the previous archive intact.
+New files and replacement symlinks are private; existing regular files keep
+their permissions and still require write access. Read-only files and
+directory destinations are refused. A symlink target is never changed.
+
 The rest of this page is the design: how conformance is enforced and
 how existing stores migrate.
 
@@ -48,6 +58,11 @@ families. Summary of what conformance requires:
   fields are spec-safe as-is.
 
 ## Field mapping
+
+Ordinary Markdown links use URL path encoding: `notes/my%20note.md` points
+to `notes/my note.md`. Import and the web UI decode that path once before
+resolving it. A literal percent sequence in a filename uses `%25` in a
+Markdown URL, while `[[wikilinks]]` continue to name literal page paths.
 
 | OKF key | ai-memory source |
 |---|---|

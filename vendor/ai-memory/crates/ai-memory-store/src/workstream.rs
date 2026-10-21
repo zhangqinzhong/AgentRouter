@@ -3,8 +3,9 @@
 use std::str::FromStr as _;
 
 use ai_memory_core::{
-    AgentKind, ManagedRunId, NativeSessionIdentity, NewWorkstreamEvent, ProjectId, Sanitizer,
-    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, WorkstreamId, scrub_workstream_provenance,
+    AgentKind, ManagedNativeSessionReference, ManagedRunId, NativeSessionIdentity,
+    NewWorkstreamEvent, ProjectId, Sanitizer, WorkspaceId, WorkstreamEvent, WorkstreamEventKind,
+    WorkstreamId, scrub_workstream_provenance,
 };
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -188,6 +189,9 @@ pub struct PreparedWorkstreamRun {
     pub native_session_id: Option<String>,
     /// Last adapter cursor for that native session.
     pub source_cursor: Option<String>,
+    /// Newest current session when this launch switches away from another
+    /// harness.
+    pub previous_native_session: Option<ManagedNativeSessionReference>,
     /// Last sequence already delivered to that native session.
     pub sync_after: i64,
     /// Workstream high-water mark assigned to the launch.
@@ -295,6 +299,9 @@ pub struct ManagedRunContext {
     pub agent: AgentKind,
     /// Linked native session when SessionStart has already reported it.
     pub native_session_id: Option<String>,
+    /// Newest current session from another harness when this run represents a
+    /// harness switch.
+    pub previous_native_session: Option<ManagedNativeSessionReference>,
     /// Lower delivery cursor.
     pub sync_after: i64,
     /// Assigned high-water mark.
@@ -526,6 +533,22 @@ pub(crate) fn prepare_run(
         .map_or((None, None, 0), |(session, cursor, delivery)| {
             (Some(session), cursor, delivery)
         });
+    let previous_native_session = tx
+        .query_row(
+            "SELECT agent_kind, native_session_id FROM workstream_native_sessions \
+             WHERE workstream_id = ?1 AND is_current = 1 \
+             ORDER BY updated_at DESC, agent_kind ASC LIMIT 1",
+            params![workstream_id.as_bytes()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .and_then(|(previous_agent, previous_session)| {
+            let previous_agent = AgentKind::from_wire(&previous_agent);
+            (previous_agent != agent).then_some(ManagedNativeSessionReference {
+                agent: previous_agent,
+                native_session_id: previous_session,
+            })
+        });
     let established: i64 = tx.query_row(
         "SELECT CASE WHEN \
              EXISTS(SELECT 1 FROM workstream_native_sessions WHERE workstream_id = ?1) \
@@ -541,8 +564,9 @@ pub(crate) fn prepare_run(
     tx.execute(
         "INSERT INTO managed_runs( \
              id, workstream_id, agent_kind, lease_owner, native_session_id, owner_user, state, \
-             sync_after, sync_through, context_delivered, lease_expires_at, started_at \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10)",
+             sync_after, sync_through, context_delivered, lease_expires_at, started_at, \
+             previous_agent_kind, previous_native_session_id \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10, ?11, ?12)",
         params![
             run_id.as_bytes(),
             workstream_id.as_bytes(),
@@ -554,6 +578,12 @@ pub(crate) fn prepare_run(
             latest_sequence,
             now + LEASE_MICROS,
             now,
+            previous_native_session
+                .as_ref()
+                .map(|source| source.agent.as_str()),
+            previous_native_session
+                .as_ref()
+                .map(|source| source.native_session_id.as_str()),
         ],
     )?;
     tx.execute(
@@ -569,6 +599,7 @@ pub(crate) fn prepare_run(
         agent,
         native_session_id,
         source_cursor,
+        previous_native_session,
         sync_after,
         sync_through: latest_sequence,
         may_adopt_existing_session: established == 0,
@@ -1668,7 +1699,8 @@ pub(crate) fn run_context(
     let row = conn
         .query_row(
             "SELECT mr.workstream_id, w.name, mr.agent_kind, mr.native_session_id, \
-                    mr.sync_after, mr.sync_through, mr.context_delivered \
+                    mr.sync_after, mr.sync_through, mr.context_delivered, \
+                    mr.previous_agent_kind, mr.previous_native_session_id \
              FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
              WHERE mr.id = ?1 AND mr.state = 'active'",
             params![run_id.as_bytes()],
@@ -1681,13 +1713,33 @@ pub(crate) fn run_context(
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, bool>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((workstream, name, agent, native, after, through, delivered)) = row else {
+    let Some((
+        workstream,
+        name,
+        agent,
+        native,
+        after,
+        through,
+        delivered,
+        previous_agent,
+        previous_native,
+    )) = row
+    else {
         return Ok(None);
     };
+    let previous_native_session =
+        previous_agent
+            .zip(previous_native)
+            .map(|(agent, native_session_id)| ManagedNativeSessionReference {
+                agent: AgentKind::from_wire(&agent),
+                native_session_id,
+            });
     let workstream_id = WorkstreamId::from_slice(&workstream)?;
     let mut stmt = conn.prepare(
         "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at \
@@ -1738,6 +1790,7 @@ pub(crate) fn run_context(
         workstream_name: name,
         agent: AgentKind::from_wire(&agent),
         native_session_id: native,
+        previous_native_session,
         sync_after: after,
         sync_through: through,
         context_delivered: delivered,
@@ -1755,10 +1808,7 @@ pub(crate) fn search_events(
     sanitizer: &Sanitizer,
 ) -> StoreResult<Vec<WorkstreamEvent>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
-    let free_text = query
-        .replace("title:", "")
-        .replace("body:", "")
-        .replace("content:", "");
+    let free_text = strip_column_prefixes(query);
     let fts_query = crate::prepare_fts5_query(&free_text, stopwords);
     let sql = if fts_query.is_empty() {
         "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at, \
@@ -1789,6 +1839,29 @@ pub(crate) fn search_events(
         }
     }
     Ok(events)
+}
+
+/// Drop the `title:` / `body:` / `content:` column prefixes the search
+/// surface accepts: the ledger's FTS table has only a `content` column, so a
+/// kept `title:` would fail with "no such column". Only a prefix that starts
+/// a word is a column filter; `subtitle:` or `somebody:` keeps its text.
+fn strip_column_prefixes(query: &str) -> String {
+    const PREFIXES: [&str; 3] = ["title:", "body:", "content:"];
+    let mut out = String::with_capacity(query.len());
+    let mut rest = query;
+    let mut prev: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        let starts_word = prev.is_none_or(|p| !(p.is_alphanumeric() || p == '_' || p == '/'));
+        if starts_word && let Some(prefix) = PREFIXES.iter().find(|p| rest.starts_with(**p)) {
+            rest = &rest[prefix.len()..];
+            prev = Some(':');
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 type EventRow = (
@@ -1852,4 +1925,26 @@ fn stored_event(row: EventRow, sanitizer: &Sanitizer) -> StoreResult<WorkstreamE
         content,
         occurred_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_column_prefixes;
+
+    #[test]
+    fn column_prefixes_are_stripped_only_at_word_starts() {
+        assert_eq!(strip_column_prefixes("title:zebra"), "zebra");
+        assert_eq!(strip_column_prefixes("body:a content:b"), "a b");
+        assert_eq!(strip_column_prefixes("(title:a OR -body:b)"), "(a OR -b)");
+        assert_eq!(
+            strip_column_prefixes("subtitle:rendering"),
+            "subtitle:rendering"
+        );
+        assert_eq!(strip_column_prefixes("somebody: help"), "somebody: help");
+        assert_eq!(
+            strip_column_prefixes("café_title:x a/body:y"),
+            "café_title:x a/body:y"
+        );
+        assert_eq!(strip_column_prefixes("título:x"), "título:x");
+    }
 }

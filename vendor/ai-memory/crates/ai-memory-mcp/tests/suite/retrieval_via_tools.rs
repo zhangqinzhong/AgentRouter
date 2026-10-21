@@ -16,6 +16,9 @@
 //!    `page_evidence` reaches explain output (P2 / V63).
 //! 4. `memory_briefing(settled_first=true)` — standing rule/decision pages,
 //!    ordered by evidence then recency (P4).
+//! 5. `memory_query` input bounds — a NUL byte and a document-sized query
+//!    stay inside the FTS5 parser's contract instead of surfacing an
+//!    internal SQLite error or parsing term by term.
 //!
 //! The `[retrieval] query_intent` / `abstract_vectors` opt-in ranking signals
 //! are deliberately NOT retested here: they are driven by process-level
@@ -467,5 +470,65 @@ async fn memory_briefing_settled_first_orders_by_evidence_then_recency() {
     assert_eq!(
         settled[2].get("kind").and_then(|k| k.as_str()),
         Some("rule")
+    );
+}
+
+/// 5. Pathological query text stays bounded at the tool boundary. A NUL byte
+/// used to reach FTS5's phrase parser as end-of-input and come back as
+/// `sqlite: unterminated string` (an internal error), and a document-sized
+/// query was parsed term by term — the parser is superlinear, so 100k terms
+/// spent ~17 s in preparation alone. Both are input bounds, not retrieval
+/// features, but only the tool call proves the surface actually reaches them.
+#[tokio::test]
+async fn memory_query_bounds_pathological_queries() {
+    let h = harness().await;
+    h.store
+        .writer
+        .upsert_page(page(
+            h.ws,
+            h.proj,
+            "notes/bounded.md",
+            "Bounded",
+            "sendable marker",
+        ))
+        .await
+        .unwrap();
+
+    // Control: the seeded term answers through the same path.
+    let control = call(&h.router, "memory_query", query_args("sendable", json!({}))).await;
+    assert!(
+        hit_for(&control, "notes/bounded.md").is_some(),
+        "control query must hit the seeded page: {control}"
+    );
+
+    // A NUL is neutralised, not returned as an internal error. The rest of
+    // the token stays searchable, so the page still answers.
+    let nul = call(
+        &h.router,
+        "memory_query",
+        query_args("\u{0}sendable", json!({})),
+    )
+    .await;
+    assert!(
+        hit_for(&nul, "notes/bounded.md").is_some(),
+        "a NUL must not break the query: {nul}"
+    );
+
+    // 100k distinct terms is far past any real query. Unbounded, this took
+    // tens of seconds; bounded, the tool answers promptly. The timeout is the
+    // assertion: pre-fix it expires, post-fix the work is microseconds.
+    let oversized = (0..100_000)
+        .map(|i| format!("w{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        call(&h.router, "memory_query", query_args(&oversized, json!({}))),
+    )
+    .await
+    .expect("an oversized query must be bounded, not parsed for tens of seconds");
+    assert!(
+        hits(&answer).is_empty(),
+        "no page contains those terms: {answer}"
     );
 }

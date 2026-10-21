@@ -6,9 +6,10 @@
 
 use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_core::{ActorContext, AuthLevel, NewPage, NewUser, PagePath, Tier};
+use ai_memory_llm::SyntheticEmbedder;
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{AccessMode, DecayParams, GrantLevel, Store};
-use ai_memory_wiki::Wiki;
+use ai_memory_wiki::{Wiki, WritePageRequest};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tempfile::TempDir;
@@ -46,14 +47,25 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
 }
 
 async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
+    seed_page_in(store, "default", "scratch", title, path, body).await;
+}
+
+async fn seed_page_in(
+    store: &Store,
+    workspace: &str,
+    project: &str,
+    title: &str,
+    path: &str,
+    body: &str,
+) -> ai_memory_core::ProjectId {
     let ws = store
         .writer
-        .get_or_create_workspace("default".to_string())
+        .get_or_create_workspace(workspace.to_string())
         .await
         .unwrap();
     let proj = store
         .writer
-        .get_or_create_project(ws, "scratch".to_string(), None)
+        .get_or_create_project(ws, project.to_string(), None)
         .await
         .unwrap();
     let page = NewPage {
@@ -72,6 +84,7 @@ async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
         evidence: Vec::new(),
     };
     store.writer.upsert_page(page).await.unwrap();
+    proj
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
@@ -141,6 +154,103 @@ async fn status_returns_counts_and_paths() {
             .as_u64()
             .unwrap(),
         1
+    );
+}
+
+/// After an embedding-model switch, `/admin/status` counts a page whose
+/// only vector was stored under the old triple as pending — status must
+/// match the embedder's stored identity the way `handle_embed` writes it —
+/// and reports it covered again once a vector for the configured triple
+/// exists.
+#[tokio::test]
+async fn status_counts_missing_embeddings_against_configured_triple() {
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_admin_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+    // One page, written while the OLD model (8-dim synthetic) was
+    // configured: its only vector is stale once the model switches.
+    let old_model_wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_embedder(std::sync::Arc::new(SyntheticEmbedder::new(8)));
+    old_model_wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/old-model.md").unwrap(),
+            frontmatter: serde_json::json!({ "title": "Old model page" }),
+            body: "embedded under the old model".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Old model page".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    // The server now runs the NEW model (16-dim synthetic): the same
+    // provider/model identity, a different dimension.
+    state.embedder = Some(std::sync::Arc::new(SyntheticEmbedder::new(16)));
+
+    let missing_count = |state: AdminState| async move {
+        let app = admin_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        body["derived"]["latest_pages_missing_embeddings"]
+            .as_u64()
+            .unwrap()
+    };
+
+    assert_eq!(
+        missing_count(state.clone()).await,
+        1,
+        "a page whose only vector is from the old triple counts as pending"
+    );
+
+    // Legitimate control: re-embedded under the configured model, the
+    // page is covered again.
+    old_model_wiki
+        .with_embedder(std::sync::Arc::new(SyntheticEmbedder::new(16)))
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/old-model.md").unwrap(),
+            frontmatter: serde_json::json!({ "title": "Old model page" }),
+            body: "re-embedded under the new model".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Old model page".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_count(state).await,
+        0,
+        "a vector under the configured triple covers the page"
     );
 }
 
@@ -538,6 +648,175 @@ async fn search_returns_matching_hits() {
     assert_eq!(hits.len(), 1, "only the storage page mentions sqlite");
     assert_eq!(hits[0]["path"].as_str().unwrap(), "concepts/storage.md");
     assert_eq!(hits[0]["title"].as_str().unwrap(), "Storage architecture");
+}
+
+async fn get(app: axum::Router, uri: &str, level: Option<&str>) -> (StatusCode, Vec<u8>) {
+    let mut request = Request::builder().uri(uri);
+    if let Some(level) = level {
+        request = request.header("x-level", level);
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    (response.status(), body_bytes(response).await)
+}
+
+/// A search with no scope (`ai-memory search --global`, #1253) covers every
+/// project and says where each hit lives; a scoped search is unchanged.
+#[tokio::test]
+async fn global_search_tags_each_hit_with_its_workspace_and_project() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_admin_state(&tmp).await;
+    seed_page_in(
+        &store,
+        "default",
+        "alpha",
+        "Alpha notes",
+        "notes/alpha.md",
+        "zephyrine storage notes for alpha",
+    )
+    .await;
+    seed_page_in(
+        &store,
+        "acme",
+        "beta",
+        "Beta notes",
+        "notes/beta.md",
+        "zephyrine storage notes for beta",
+    )
+    .await;
+    let app = admin_router(state);
+
+    let (status, body) = get(app.clone(), "/admin/search?q=zephyrine", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    let mut tagged: Vec<(String, String, String)> = hits
+        .iter()
+        .map(|hit| {
+            assert!(hit["id"].is_string(), "global hits keep their id: {hit}");
+            assert!(hit["title"].is_string() && hit["snippet"].is_string());
+            assert!(hit["rank"].is_number());
+            (
+                hit["workspace"].as_str().unwrap().to_owned(),
+                hit["project"].as_str().unwrap().to_owned(),
+                hit["path"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    tagged.sort();
+    assert_eq!(
+        tagged,
+        [
+            ("acme".into(), "beta".into(), "notes/beta.md".into()),
+            ("default".into(), "alpha".into(), "notes/alpha.md".into()),
+        ]
+    );
+
+    let (status, body) = get(
+        app,
+        "/admin/search?q=zephyrine&workspace=acme&project=beta",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(hits.len(), 1, "a scoped search stays in its project");
+    assert_eq!(hits[0]["path"], "notes/beta.md");
+    assert!(hits[0].get("workspace").is_none() && hits[0].get("project").is_none());
+}
+
+/// The global search reads every project as the operator, so it must stay
+/// behind the root-only admin gate once the deployment distinguishes
+/// operators: a DB user or proxy-asserted user who could reach it would read a
+/// restricted project they hold no grant on. Root (the control) still sees it.
+#[tokio::test]
+async fn global_search_never_reaches_a_non_root_caller() {
+    for trusted_proxy in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, store) = make_admin_state(&tmp).await;
+        state.trusted_proxy_identity = trusted_proxy;
+        seed_page_in(
+            &store,
+            "default",
+            "open",
+            "Open notes",
+            "notes/open.md",
+            "zephyrine open notes",
+        )
+        .await;
+        let secret = seed_page_in(
+            &store,
+            "default",
+            "secret",
+            "Secret notes",
+            "notes/secret-sentinel.md",
+            "zephyrine restricted notes",
+        )
+        .await;
+        store
+            .writer
+            .set_access_mode(secret, AccessMode::Restricted)
+            .await
+            .unwrap();
+        if !trusted_proxy {
+            // A DB user exists (no grant on `secret`): the store-level
+            // multi-user switch. The proxy case has no `users` rows at all.
+            store
+                .writer
+                .create_human_user(
+                    NewUser {
+                        username: "alice".into(),
+                        name: None,
+                        email: None,
+                    },
+                    ai_memory_core::UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let app = admin_router(state).layer(axum::middleware::from_fn(
+            |mut request: Request<Body>, next: axum::middleware::Next| async move {
+                let level = match request
+                    .headers()
+                    .get("x-level")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some("root") => AuthLevel::Root,
+                    Some("user") => AuthLevel::User,
+                    _ => AuthLevel::Anonymous,
+                };
+                request.extensions_mut().insert(level);
+                request.extensions_mut().insert(ActorContext::anonymous());
+                next.run(request).await
+            },
+        ));
+
+        for (level, expected) in [
+            (Some("user"), StatusCode::FORBIDDEN),
+            (None, StatusCode::UNAUTHORIZED),
+        ] {
+            let (status, body) = get(app.clone(), "/admin/search?q=zephyrine", level).await;
+            assert_eq!(status, expected, "proxy={trusted_proxy} level={level:?}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("secret-sentinel") && !body.contains("zephyrine"),
+                "proxy={trusted_proxy} level={level:?} leaked a hit: {body}"
+            );
+        }
+
+        let (status, body) = get(app, "/admin/search?q=zephyrine", Some("root")).await;
+        assert_eq!(status, StatusCode::OK, "proxy={trusted_proxy}");
+        let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let mut projects: Vec<&str> = hits
+            .iter()
+            .map(|hit| hit["project"].as_str().unwrap())
+            .collect();
+        projects.sort_unstable();
+        assert_eq!(projects, ["open", "secret"], "proxy={trusted_proxy}");
+    }
 }
 
 #[tokio::test]

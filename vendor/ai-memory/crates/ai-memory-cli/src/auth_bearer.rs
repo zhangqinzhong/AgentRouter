@@ -27,10 +27,10 @@ pub async fn resolve_bearer(
 /// Returns the access token, or `None` when there is no token. Refresh failures
 /// fall back to the existing token because it may still be inside the provider's
 /// accepted clock-skew window.
-pub async fn resolve_oidc(client: &reqwest::Client, auth_path: &Path) -> Option<String> {
+pub async fn resolve_oidc(_client: &reqwest::Client, auth_path: &Path) -> Option<String> {
     let mut token = OidcToken::load(auth_path).ok().flatten()?;
     if token.needs_refresh() {
-        let Ok(refreshed) = refresh_access_token(client, &token).await else {
+        let Ok(refreshed) = refresh_access_token(&token).await else {
             return Some(token.access.expose_secret().to_string());
         };
         if refreshed.save(auth_path).is_err() {

@@ -102,6 +102,21 @@ fn ignore_marker_env_restores_the_default_workspace() {
     );
 }
 
+/// `search --global` spans every project, so it resolves no scope: the
+/// marker that `marker_workspace_is_used_and_announced` sees from the same
+/// tree is never read, and no scope notice is printed (#1253).
+#[test]
+fn global_search_resolves_no_scope() {
+    let (cwd, data) = marker_tree("workspace = \"acme\"\n");
+
+    let stderr = search_stderr(&real_path(&cwd), &real_path(&data), &[], &["--global"]);
+
+    assert!(
+        !stderr.contains("scope acme/") && !stderr.contains(".ai-memory.toml"),
+        "a global search must not resolve or announce a scope: {stderr}"
+    );
+}
+
 #[test]
 fn explicit_workspace_flag_beats_the_marker() {
     let (cwd, data) = marker_tree("workspace = \"acme\"\n");

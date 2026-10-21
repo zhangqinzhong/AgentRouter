@@ -579,13 +579,12 @@ matchers `install-hooks` writes today:
 }
 ```
 
-No `timeout` is set, matching `install-hooks`. The native hook returns after
-a local spool write. `SessionEnd` has a 1.5 s budget in Claude, and a
-plugin's own `timeout` cannot raise it ("Timeouts set on plugin-provided
-hooks don't raise the budget"); the native `session-end` already fits it,
-because it hands the drain to a detached process. `async: true` on the tool
-events is worth measuring later, but it changes how Claude reports output, so
-3.0 keeps parity with the settings hooks.
+No `timeout` is set. Unlike the settings entry written by `install-hooks`, a
+plugin's own timeout cannot raise Claude's 1.5-second SessionEnd budget. The
+native hook normally returns after a local spool write and hands draining to a
+detached process; if it is killed during an unusually slow fsync, a later drain
+adopts the complete old `*.json.tmp` entry. `async: true` on the tool events is
+worth measuring later, but it changes how Claude reports output.
 
 `plugins/claude-code/.mcp.json`:
 

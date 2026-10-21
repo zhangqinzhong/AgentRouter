@@ -121,6 +121,28 @@ async fn fenced_json_is_parsed() {
     assert_eq!(value["answer"], 1);
 }
 
+/// Ask mode often wraps the answer in prose. Brackets in that prose must not
+/// hide a well-formed JSON object from the parser.
+#[tokio::test]
+async fn json_wrapped_in_bracketed_prose_is_parsed() {
+    for stdout in [
+        "Here is the result for [the request]:\n{\"answer\":1}",
+        "{\"answer\":1}\n(see [schema])",
+    ] {
+        let dir = TempDir::new();
+        let sink = dir.0.join("argv");
+        let executable = fake_agent(&dir.0, &sink, stdout);
+        let value = provider(executable, "default")
+            .complete_structured_raw(
+                ChatRequest::user_prompt("status"),
+                serde_json::json!({"type": "object"}),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{stdout:?}: {err}"));
+        assert_eq!(value["answer"], 1, "{stdout:?}");
+    }
+}
+
 fn script_agent(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("agent");
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();

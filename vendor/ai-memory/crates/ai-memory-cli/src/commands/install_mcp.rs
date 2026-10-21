@@ -26,7 +26,9 @@ use serde_json::json;
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
-use crate::commands::render_shared::{bearer_header_value, yaml_single_quote};
+use crate::commands::render_shared::{
+    bearer_header_value, hook_embedded_exe_path, shell_quote, yaml_single_quote,
+};
 use crate::config::{Config, DEFAULT_MCP_URL};
 
 const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
@@ -99,7 +101,7 @@ pub(crate) fn run_with_opencode_dialect(
         effective_mcp_server_url(config, &args)
     } else {
         inferred.as_ref().map_or_else(
-            || DEFAULT_MCP_URL.to_string(),
+            || effective_mcp_server_url(config, &args),
             |entry| entry.mcp_url.clone(),
         )
     };
@@ -157,6 +159,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::CommandCode => render_command_code(&args)?,
+        McpClient::IbmBob => render_ibm_bob(&args)?,
         McpClient::CopilotCli => render_copilot_cli(&args)?,
         McpClient::Droid => render_droid(&args)?,
         McpClient::Swival => render_swival(&args)?,
@@ -205,10 +208,41 @@ fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> 
     Ok(())
 }
 
-/// The command a stdio bridge entry runs. Resolved through `PATH` like the
-/// Claude Code entry, so the Docker wrapper (which intercepts `mcp-bridge`)
-/// and a native install both answer to it.
+/// The bare command name, resolved through `PATH`. Inside a container the
+/// Docker wrapper on the host intercepts `mcp-bridge`, so the entry must name
+/// the wrapper rather than the container's own binary.
 const BRIDGE_COMMAND: &str = "ai-memory";
+
+/// The command a stdio bridge entry runs: this binary's absolute path, the
+/// same one hook commands embed, because clients often start MCP servers
+/// without the login shell's `PATH` and a bare `ai-memory` then fails to
+/// spawn. Inside a container, or when the path cannot be trusted to survive
+/// (see [`hook_embedded_exe_path`]), the bare [`BRIDGE_COMMAND`].
+fn bridge_command() -> String {
+    bridge_command_for(
+        ai_memory_wiki::backup::running_in_container(),
+        hook_embedded_exe_path(),
+    )
+}
+
+fn bridge_command_for(in_container: bool, exe: PathBuf) -> String {
+    if in_container {
+        BRIDGE_COMMAND.to_owned()
+    } else {
+        exe.to_string_lossy().into_owned()
+    }
+}
+
+/// Whether `command` runs ai-memory: the bare name, what [`bridge_command`]
+/// writes from this binary, or an absolute path to a binary named `ai-memory`
+/// that an earlier install wrote.
+fn is_bridge_command(command: &str) -> bool {
+    if command == BRIDGE_COMMAND || command == bridge_command() {
+        return true;
+    }
+    let path = Path::new(command);
+    path.is_absolute() && path.file_stem().and_then(|stem| stem.to_str()) == Some(BRIDGE_COMMAND)
+}
 
 /// Arguments of the session-less bridge for `args`: the URL carries the
 /// client's schema-flavor marker, because the bridge forwards `tools/list`
@@ -223,12 +257,12 @@ fn session_less_bridge_args(args: &InstallMcpArgs) -> Vec<String> {
     ]
 }
 
-/// The upstream URL of an ai-memory bridge entry: `command: "ai-memory"` with
+/// The upstream URL of an ai-memory bridge entry: an ai-memory `command` with
 /// `args`, or OpenCode's single `command` array, running `mcp-bridge` with a
 /// `--server-url`. `None` for any other entry.
 pub(crate) fn bridge_entry_url(entry: &serde_json::Value) -> Option<&str> {
     let argv: Vec<&str> = match entry.get("command")? {
-        serde_json::Value::String(command) if command == BRIDGE_COMMAND => entry
+        serde_json::Value::String(command) if is_bridge_command(command) => entry
             .get("args")?
             .as_array()?
             .iter()
@@ -236,7 +270,7 @@ pub(crate) fn bridge_entry_url(entry: &serde_json::Value) -> Option<&str> {
             .collect(),
         serde_json::Value::Array(command) => {
             let mut words = command.iter().filter_map(serde_json::Value::as_str);
-            if words.next() != Some(BRIDGE_COMMAND) {
+            if !words.next().is_some_and(is_bridge_command) {
                 return None;
             }
             words.collect()
@@ -339,10 +373,10 @@ pub(crate) fn existing_entry_endpoint(
 /// take no stdio entry here.
 fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
     let bridge = session_less_bridge_args(args);
-    let plain = || json!({"command": BRIDGE_COMMAND, "args": bridge.clone()});
-    let typed =
-        |kind: &str| json!({"type": kind, "command": BRIDGE_COMMAND, "args": bridge.clone()});
-    let mut opencode_argv = vec![BRIDGE_COMMAND.to_owned()];
+    let command = bridge_command();
+    let plain = || json!({"command": command, "args": bridge.clone()});
+    let typed = |kind: &str| json!({"type": kind, "command": command, "args": bridge.clone()});
+    let mut opencode_argv = vec![command.clone()];
     opencode_argv.extend(bridge.iter().cloned());
     Some(match args.client {
         McpClient::ClaudeDesktop
@@ -350,9 +384,10 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         | McpClient::Devin
         | McpClient::KimiCode
         | McpClient::KiroCli
-        | McpClient::Openclaw => plain(),
+        | McpClient::Openclaw
+        | McpClient::IbmBob => plain(),
         McpClient::GeminiCli | McpClient::AntigravityCli => json!({
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
             "timeout": GEMINI_MCP_TIMEOUT_MS,
         }),
@@ -361,20 +396,20 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         }
         McpClient::Omp => json!({
             "type": "stdio",
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
             "enabled": true,
         }),
         McpClient::CopilotCli => json!({
             "type": "local",
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
             "tools": ["*"],
         }),
         McpClient::CommandCode => json!({
             "transport": "stdio",
             "enabled": true,
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
         }),
         McpClient::OpenCode => json!({"type": "local", "command": opencode_argv, "enabled": true}),
@@ -393,7 +428,10 @@ fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
         // so callers who already pass the endpoint are unchanged.
         return mcp_server_url_from_base(url);
     }
-    if config.server_url_configured() {
+    // A URL derived from `bind` counts here too: with nothing configured and no
+    // existing entry to infer from, the client should reach the server this
+    // config starts (#1269).
+    if config.server_url_configured() || config.server_url_derived_from_bind {
         return mcp_server_url_from_base(&config.server_url);
     }
     DEFAULT_MCP_URL.to_string()
@@ -606,6 +644,7 @@ pub(crate) fn mcp_config_path_with(
             .join("settings")
             .join("mcp.json"),
         McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
+        McpClient::IbmBob => home()?.join(".bob").join("settings").join("mcp.json"),
         // Copilot CLI keeps its whole config dir at $COPILOT_HOME when set,
         // falling back to ~/.copilot; user-level MCP servers live in
         // mcp-config.json there (project `.mcp.json` / `.github/mcp.json`
@@ -1048,6 +1087,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::IbmBob
         | McpClient::CopilotCli
         | McpClient::Droid
         | McpClient::Swival
@@ -1534,7 +1574,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::ClaudeCode => {
             if args.session_aware {
                 entry.insert("type".into(), json!("stdio"));
-                entry.insert("command".into(), json!("ai-memory"));
+                entry.insert("command".into(), json!(bridge_command()));
                 entry.insert(
                     "args".into(),
                     json!(["mcp-bridge", "--server-url", base_url]),
@@ -1616,6 +1656,17 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             entry.insert("transport".into(), json!("http"));
             entry.insert("enabled".into(), json!(true));
             entry.insert("url".into(), json!(server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::IbmBob => {
+            // Bob's HTTP client sends a non-standard `server/discover` probe
+            // in automatic mode. ai-memory implements the MCP initialize
+            // handshake, so pin Bob to its documented legacy negotiation path.
+            entry.insert("type".into(), json!("streamable-http"));
+            entry.insert("url".into(), json!(server_url));
+            entry.insert("protocolNegotiation".into(), json!("legacy"));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -1786,7 +1837,7 @@ fn build_mcp_entry_muse(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("stdio"));
-    entry.insert("command".into(), json!(BRIDGE_COMMAND));
+    entry.insert("command".into(), json!(bridge_command()));
     let mut argv = vec![
         json!("mcp-bridge"),
         json!("--agent"),
@@ -1934,7 +1985,7 @@ fn grok_upsert_mcp_server(
     let mut server = Table::new();
     if args.stdio_bridge {
         // Grok picks stdio from `command` (and HTTP from `url`).
-        server["command"] = value(BRIDGE_COMMAND);
+        server["command"] = value(bridge_command());
         server["args"] = value(
             session_less_bridge_args(args)
                 .iter()
@@ -1995,8 +2046,9 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
             .map(|token| format!(" --env \"AI_MEMORY_AUTH_TOKEN={token}\""))
             .unwrap_or_default();
         format!(
-            "claude mcp add --transport stdio{env} {name} -- \\\n    ai-memory mcp-bridge --server-url {url}",
+            "claude mcp add --transport stdio{env} {name} -- \\\n    {command} mcp-bridge --server-url {url}",
             name = args.name,
+            command = shell_quote(&bridge_command()),
             url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
         )
     } else if let Some(b) = &bearer {
@@ -2307,7 +2359,7 @@ fn render_dsh_snippet(args: &InstallMcpArgs) -> String {
         out.push_str("        transport: stdio\n");
         out.push_str(&format!(
             "        command: {}\n",
-            yaml_single_quote(BRIDGE_COMMAND)
+            yaml_single_quote(&bridge_command())
         ));
         out.push_str("        args:\n");
         for arg in session_less_bridge_args(args) {
@@ -2352,7 +2404,9 @@ fn pi_mcp_render_guidance(args: &InstallMcpArgs) -> String {
          # Install ai-memory's generated Pi extension instead; it includes\n\
          # lifecycle capture and an HTTP MCP bridge that registers tools in Pi.\n\
          ai-memory install-hooks --agent pi --apply --server-url {}{}\n\
-         # Restart Pi after installing ~/.pi/agent/extensions/ai-memory.ts.\n",
+         # The extension is installed at ~/.pi/agent/extensions/ai-memory-pi.ts by default.\n\
+         # If PI_CODING_AGENT_DIR is set, it is at $PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts instead.\n\
+         # Restart Pi after installing the extension.\n",
         hook_server_url_from_mcp_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL)),
         if args.auth_token.is_some() {
             " --auth-token <token>"
@@ -2455,6 +2509,20 @@ fn render_command_code(args: &InstallMcpArgs) -> Result<String> {
          {snippet}\n",
         name = args.name,
         url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_ibm_bob(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# IBM Bob IDE — merge into ~/.bob/settings/mcp.json, or re-run with\n\
+         # --apply to merge it in place preserving other servers. Bob also\n\
+         # supports project-level .bob/mcp.json via --config-file.\n\
+         # protocolNegotiation is set to legacy because Bob's automatic mode\n\
+         # probes server/discover before the standard MCP initialize handshake.\n\
+         # Pair with `ai-memory install-hooks --agent ibm-bob --apply` for\n\
+         # lifecycle capture and automatic handoff delivery.\n\
+         {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
 }
@@ -2660,6 +2728,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ibm_bob_entry_uses_documented_legacy_streamable_http_shape() {
+        assert_eq!(
+            build_json_mcp_entry(&args_with_token(McpClient::IbmBob)).unwrap(),
+            json!({
+                "type": "streamable-http",
+                "url": "http://127.0.0.1:49374/mcp",
+                "protocolNegotiation": "legacy",
+                "headers": {"Authorization": "Bearer test-token-deadbeef"},
+            })
+        );
+        assert_eq!(
+            build_json_mcp_entry(&args_for(McpClient::IbmBob)).unwrap(),
+            json!({
+                "type": "streamable-http",
+                "url": "http://127.0.0.1:49374/mcp",
+                "protocolNegotiation": "legacy",
+            })
+        );
+        let path = mcp_config_path_with(McpClient::IbmBob, &|_| None).unwrap();
+        assert!(
+            path.ends_with(Path::new(".bob/settings/mcp.json")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn ibm_bob_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("mcp.json");
+        fs::write(
+            &file,
+            json!({
+                "mcpServers": {"other": {"type": "stdio", "command": "other"}},
+                "keep": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::IbmBob);
+        args.config_file = Some(file.clone());
+        args.server_url = Some("https://memory.example/mcp".into());
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        assert_eq!(first, fs::read_to_string(&file).unwrap());
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["keep"], true);
+        assert_eq!(root["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            root["mcpServers"]["ai-memory"],
+            json!({
+                "type": "streamable-http",
+                "url": "https://memory.example/mcp",
+                "protocolNegotiation": "legacy",
+            })
+        );
+        assert_eq!(
+            existing_entry_endpoint(McpClient::IbmBob, &file, "ai-memory").unwrap(),
+            Some("https://memory.example/mcp".into())
+        );
+    }
+
     /// Muse's entry is the session-aware stdio bridge for `--agent muse`, so
     /// Muse forwards `MUSE_SESSION_ID`; a streamable-HTTP entry would carry no
     /// session id. `mode` is `optional` because Muse's default `required`
@@ -2672,7 +2804,7 @@ mod tests {
             entry,
             json!({
                 "type": "stdio",
-                "command": "ai-memory",
+                "command": bridge_command(),
                 "args": ["mcp-bridge", "--agent", "muse", "--server-url", "http://127.0.0.1:49374/mcp"],
                 "mode": "optional",
             })
@@ -3725,6 +3857,42 @@ mod tests {
     }
 
     #[test]
+    fn bridge_command_names_the_binary_by_absolute_path_outside_a_container() {
+        let exe = PathBuf::from("/opt/ai-memory/ai-memory");
+        assert_eq!(
+            bridge_command_for(false, exe.clone()),
+            "/opt/ai-memory/ai-memory"
+        );
+        assert_eq!(bridge_command_for(true, exe), BRIDGE_COMMAND);
+    }
+
+    #[test]
+    fn bridge_entries_are_recognized_by_bare_name_or_absolute_path() {
+        #[cfg(windows)]
+        let absolute_command = r"C:\opt\ai-memory.exe";
+        #[cfg(not(windows))]
+        let absolute_command = "/opt/ai-memory/ai-memory";
+
+        for command in ["ai-memory", absolute_command] {
+            let entry =
+                json!({"command": command, "args": ["mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(bridge_entry_url(&entry), Some("http://h/mcp"), "{command}");
+            let opencode =
+                json!({"command": [command, "mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(
+                bridge_entry_url(&opencode),
+                Some("http://h/mcp"),
+                "{command}"
+            );
+        }
+        for command in ["other", "/usr/bin/other", "bin/ai-memory"] {
+            let entry =
+                json!({"command": command, "args": ["mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(bridge_entry_url(&entry), None, "{command}");
+        }
+    }
+
+    #[test]
     fn claude_code_session_aware_entry_uses_owned_stdio_bridge() {
         let mut args = args_with_token(McpClient::ClaudeCode);
         args.server_url = Some("https://memory.example/mcp".into());
@@ -3733,7 +3901,7 @@ mod tests {
         let entry = build_mcp_entry(&args).unwrap();
 
         assert_eq!(entry["type"], "stdio");
-        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(entry["command"], bridge_command());
         assert_eq!(
             entry["args"],
             json!(["mcp-bridge", "--server-url", "https://memory.example/mcp"])
@@ -3744,7 +3912,10 @@ mod tests {
 
         let rendered = render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap();
         assert!(rendered.contains("claude mcp add --transport stdio"));
-        assert!(rendered.contains("ai-memory mcp-bridge --server-url"));
+        assert!(rendered.contains(&format!(
+            "{} mcp-bridge --server-url",
+            shell_quote(&bridge_command())
+        )));
     }
 
     #[test]
@@ -3812,6 +3983,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::IbmBob => render_ibm_bob(&args).unwrap(),
             McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Droid => render_droid(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
@@ -3845,6 +4017,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::IbmBob,
             McpClient::CopilotCli,
             McpClient::Swival,
             McpClient::VsCodeCopilot,
@@ -3887,6 +4060,7 @@ mod tests {
             McpClient::Zcode,
             McpClient::Devin,
             McpClient::KimiCode,
+            McpClient::IbmBob,
             McpClient::KiroCli,
             McpClient::CommandCode,
             McpClient::CopilotCli,
@@ -3929,6 +4103,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::IbmBob => render_ibm_bob(&args).unwrap(),
             McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Droid => render_droid(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
@@ -4045,7 +4220,7 @@ mod tests {
         };
         let opencode = entry(McpClient::OpenCode);
         assert_eq!(opencode["type"], "local");
-        assert_eq!(opencode["command"][0], "ai-memory");
+        assert_eq!(opencode["command"][0], bridge_command());
         assert_eq!(opencode["command"][1], "mcp-bridge");
         assert_eq!(opencode["enabled"], true);
         assert!(entry(McpClient::OpenCode2).get("enabled").is_none());
@@ -4065,7 +4240,12 @@ mod tests {
         let mut doc = toml_edit::DocumentMut::new();
         grok_upsert_mcp_server(&mut doc, &grok).unwrap();
         let text = doc.to_string();
-        assert!(text.contains("command = \"ai-memory\""), "{text}");
+        let expected_command = bridge_command();
+        assert_eq!(
+            doc["mcp_servers"]["ai-memory"]["command"].as_str(),
+            Some(expected_command.as_str()),
+            "{text}"
+        );
         assert!(!text.contains("url ="), "{text}");
 
         let mut dsh = args_for(McpClient::Dsh);
@@ -4210,6 +4390,27 @@ mod tests {
         );
     }
 
+    /// #1269: with only a custom `bind`, the MCP entry points at the server
+    /// that bind starts rather than the compiled default; a plain default
+    /// config is unchanged.
+    #[test]
+    fn mcp_server_url_uses_a_bind_derived_url() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49921".into(),
+            server_url_derived_from_bind: true,
+            ..Config::default()
+        };
+        let args = args_for(McpClient::OpenCode);
+        assert_eq!(
+            effective_mcp_server_url(&config, &args),
+            "http://127.0.0.1:49921/mcp"
+        );
+        assert_eq!(
+            effective_mcp_server_url(&Config::default(), &args),
+            DEFAULT_MCP_URL
+        );
+    }
+
     /// Specific shape checks — each client has a distinguishing key
     /// in its JSON snippet. This catches accidental cross-pollination
     /// between renderers (e.g. Gemini's `httpUrl` showing up under
@@ -4248,7 +4449,9 @@ mod tests {
         let pi = render_pi(&args_for(McpClient::Pi)).unwrap();
         assert!(pi.contains("Pi has no native mcp.json"));
         assert!(pi.contains("install-hooks --agent pi --apply"));
-        assert!(pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
+        assert!(pi.contains("~/.pi/agent/extensions/ai-memory-pi.ts"));
+        assert!(pi.contains("$PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts"));
+        assert!(!pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
         assert!(!pi.contains("~/.omp"));
         assert!(render_for_test(McpClient::AntigravityCli).contains("\"serverUrl\""));
         // The snippet must point at the documented global config, not the

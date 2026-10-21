@@ -1,3 +1,5 @@
+import { readMonitorReport, monitorWindow, normalizeMonitorQuery } from "./monitor-report";
+import { readGatewayMonitor } from "./monitor";
 import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
@@ -351,7 +353,8 @@ export class UsageStore {
     const since = custom && normalizedRange === "custom" ? custom.since : getRangeSince(normalizedRange, now);
     const statusSince = floorDay(new Date(now));
     statusSince.setDate(statusSince.getDate() - (providerStatusDays - 1));
-    this.backfillFromRequestLogs(database, statusSince < since ? statusSince : since);
+    const monitorSince = filter?.scope === "gateway" && filter.monitorQuery ? new Date(monitorWindow(normalizeMonitorQuery(filter.monitorQuery), now.getTime()).previousFrom) : since;
+    this.backfillFromRequestLogs(database, new Date(Math.min(statusSince.getTime(), since.getTime(), monitorSince.getTime())));
     const query = buildUsageWhereClause(since, filter);
     if (custom && normalizedRange === "custom") {
       query.where += " AND created_at < ?";
@@ -362,6 +365,8 @@ export class UsageStore {
     const statusQuery = buildUsageWhereClause(statusSince, filter);
 
     return {
+      ...(filter?.scope === "gateway" && filter.monitorQuery ? {monitorReport: readMonitorReport(database, REQUEST_LOGS_DB_FILE, filter.monitorQuery)} : {}),
+      ...(filter?.scope === "gateway" && !filter.monitorQuery ? { monitor: readGatewayMonitor(database, query, since, custom && normalizedRange === "custom" ? custom.until : now, REQUEST_LOGS_DB_FILE) } : {}),
       clientModels: readClientModelRows(database, query),
       generatedAt: now.toISOString(),
       models: readModelRows(database, query),
@@ -638,6 +643,7 @@ export async function getUsageStats(
 ): Promise<UsageStatsSnapshot> {
   try {
     const snapshot = await usageStore.getStats(range, filter, customRange);
+    if (filter?.scope === "gateway") return snapshot;
     try {
       const normalizedRange = normalizeUsageRange(range);
       const now = new Date();

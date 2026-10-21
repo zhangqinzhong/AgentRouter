@@ -15,6 +15,8 @@
 /// already rejects a literal backslash anywhere in the raw path (it reads as
 /// a separator), so a component containing one must be cleaned before
 /// `PagePath::new` ever sees it, not after.
+use ai_memory_core::ids::is_dos_device_name;
+
 pub(crate) const PATH_ILLEGAL_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*', '\\'];
 
 /// Clean a model-produced page path so it survives `PagePath::new` and
@@ -53,6 +55,7 @@ pub(crate) fn slugify_page_path(raw: &str) -> String {
                 })
                 .collect::<String>()
         })
+        .map(make_component_portable)
         .collect();
     // Append the `.md` extension when the model omitted it on the filename
     // component (#885). The check is case-insensitive so `NAME.MD` is not
@@ -72,9 +75,53 @@ pub(crate) fn slugify_page_path(raw: &str) -> String {
     segments.join("/")
 }
 
+/// Fix the two component shapes `ensure_portable` refuses that character
+/// replacement alone cannot: a trailing dot or space (Windows strips it on
+/// create) is trimmed, and a DOS device stem (`CON`, `aux`, `nul.md`) gets a
+/// `-` appended to the stem so it no longer names a device. Components that
+/// are nothing but dots or spaces are left for `PagePath::new` to reject.
+fn make_component_portable(segment: String) -> String {
+    let trimmed = segment.trim_end_matches(['.', ' ']);
+    let segment = if trimmed.is_empty() {
+        segment
+    } else {
+        trimmed.to_string()
+    };
+    let stem_len = segment.split('.').next().map_or(0, str::len);
+    if is_dos_device_name(&segment[..stem_len]) {
+        let mut renamed = segment;
+        renamed.insert(stem_len, '-');
+        return renamed;
+    }
+    segment
+}
+
 #[cfg(test)]
 mod tests {
     use super::slugify_page_path;
+    use ai_memory_core::ids::PagePath;
+
+    #[test]
+    fn slugify_page_path_repairs_trailing_and_dos_device_components() {
+        // Each of these is one of the component shapes repaired here. Other
+        // portability checks (for example the 255-byte component limit) stay
+        // fail-closed in `ensure_portable` instead of silently rewriting a
+        // model path beyond recognition.
+        for (raw, expected) in [
+            ("notes/v2./roadmap.md", "notes/v2/roadmap.md"),
+            ("notes/q3 plan /roadmap.md", "notes/q3 plan/roadmap.md"),
+            ("decisions/why? /x", "decisions/why-/x.md"),
+            ("concepts/aux.md", "concepts/aux-.md"),
+            ("CON/notes.md", "CON-/notes.md"),
+            ("decisions/nul", "decisions/nul-.md"),
+        ] {
+            let slug = slugify_page_path(raw);
+            assert_eq!(slug, expected, "{raw:?}");
+            PagePath::new(&slug)
+                .and_then(|path| path.ensure_portable())
+                .unwrap_or_else(|err| panic!("{raw:?} -> {slug:?} still not portable: {err}"));
+        }
+    }
 
     #[test]
     fn slugify_page_path_replaces_illegal_chars_and_keeps_slashes() {

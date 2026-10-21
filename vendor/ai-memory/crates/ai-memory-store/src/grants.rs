@@ -693,9 +693,15 @@ mod tests {
                     |h| h.path.as_str(),
                 ),
                 paths(
-                    &r.search_pages_with_meta("rate".into(), 10, None, viewer)
-                        .await
-                        .unwrap(),
+                    &r.search_pages_with_meta(
+                        "rate".into(),
+                        10,
+                        None,
+                        viewer,
+                        crate::PageFilter::default(),
+                    )
+                    .await
+                    .unwrap(),
                     |h| h.path.as_str(),
                 ),
                 paths(&r.recent_pages_global(10, viewer).await.unwrap(), |h| {
@@ -796,7 +802,13 @@ mod tests {
         assert!(hits.iter().all(|h| h.path.as_str().starts_with("visible/")));
 
         let hits = r
-            .search_pages_with_meta("needle".into(), 10, None, Some(f.bob))
+            .search_pages_with_meta(
+                "needle".into(),
+                10,
+                None,
+                Some(f.bob),
+                crate::PageFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(hits.len(), 10);

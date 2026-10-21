@@ -358,6 +358,74 @@ async fn health_page_renders_each_failing_check_with_its_fix_line() {
     assert!(!body.contains("data-check=\"none\""), "{body}");
 }
 
+/// A page whose only vector was made under another triple must fire
+/// `missing_vectors` now that the count is computed against the configured
+/// embedder's triple: before the count knew the triple, such a page read
+/// as covered and the check stayed silent.
+#[tokio::test]
+async fn missing_vectors_fires_when_the_only_vector_is_from_another_triple() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "models", None)
+        .await
+        .unwrap();
+    // A single page; its only vector is the old model's (8-dim synthetic)
+    // triple.
+    let embedding_wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_embedder(Arc::new(SyntheticEmbedder::new(8)));
+    embedding_wiki
+        .write_page(page(
+            ws,
+            proj,
+            "notes/old-model.md",
+            "the only vector here is stale",
+        ))
+        .await
+        .unwrap();
+    let wiki = embedding_wiki.without_embedder();
+    let f = Fixture {
+        _tmp: tmp,
+        store,
+        wiki,
+    };
+    let sources = HealthSources {
+        ingest: Arc::new(IngestMetrics::default()),
+        providers: ProviderHealth::default(),
+        probe: Arc::new(FixedProbe(ProcessState {
+            write_queue: Some((0, 100)),
+            spool: Some(SpoolState {
+                capacity: 500,
+                ..SpoolState::default()
+            }),
+            journal: Some(JournalState::default()),
+        })),
+    };
+    // The configured embedder is the new model (16-dim synthetic).
+    let (status, _, body) = get(
+        app(&f, AuthLevel::Root, Some(sources), configured_embedder()),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_check(&body, "missing_vectors", Some("ai-memory embed"));
+    // The counter behind it: one latest page without a 16-dim vector.
+    assert!(body.contains("1 latest pages missing"), "{body}");
+    // The row still shows up as a stored triple — the page is not
+    // silently dropped from the index picture.
+    assert!(
+        body.contains("synthetic/bag-of-words-v1 dim 8: 1 rows"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn health_page_renders_pending_spool_and_journal_checks() {
     let f = fixture().await;

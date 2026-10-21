@@ -60,3 +60,16 @@ its license, including in desktop and CLI outputs.
   vendor directory. AgentRouter keeps its session list, extra client sources,
   managed-profile resume actions and date filters. Sidecar version is 16 here
   (upstream 14) to invalidate AgentRouter's existing version-15 records.
+
+October 20, 2026 targeted backports:
+- `750809bf35ceca9346eed6765db2c16485fa8e54`: Codex Zstandard rollouts,
+  compressed snapshot cursors, archive/live transcript grouping. Adapted to
+  AgentRouter's existing model-attribution state (no service-tier schema change).
+- `1a7e14a364990796f082f9ba8d3bcc7fd00ca72d`: Grok shared-pool product
+  attribution and duplicate Cursor pool suppression. Product shares are shown
+  as consumed shares, never as separate remaining quotas.
+- `6b96ca64f917231d27c86dd056ee6fd531cc5526`: OpenCode `-free` pricing.
+- Reviewed `656367e6a5eb519e98594023a15c44c611bbe19a` (ZCode prune-window
+  migrations): AgentRouter does not use upstream's `commands/sync.js` wipe/
+  rebuild migration path. Its native DB parser and persisted aggregate queue
+  retain collected history; no destructive upstream migration was imported.

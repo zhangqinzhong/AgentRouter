@@ -46,7 +46,7 @@ pub struct SpoolState {
     pub oldest_age_ms: Option<u64>,
     /// Failed delivery attempts summed over the queued events.
     pub retries_total: u64,
-    /// Most events the spool holds before it evicts the oldest.
+    /// Most events the spool holds before it drops newly captured events.
     pub capacity: usize,
 }
 
@@ -138,6 +138,21 @@ pub struct HealthCheck {
     pub fix: Option<String>,
 }
 
+/// How old the oldest spooled event may get before the spool counts as stuck.
+/// A healthy session drains at its next boundary (session start, stop,
+/// pre-compact, session end) or at the threshold catch-up, well inside this.
+/// An unreachable endpoint never charges an attempt, so for it age is the
+/// only signal.
+const SPOOL_STUCK_AFTER_MS: u64 = 15 * 60 * 1000;
+
+fn spool_is_stuck(spool: &SpoolState) -> bool {
+    spool.pending > 0
+        && (spool.retries_total > 0
+            || spool
+                .oldest_age_ms
+                .is_none_or(|age| age >= SPOOL_STUCK_AFTER_MS))
+}
+
 /// The checks that fail for `s`, most severe first. An empty list is a
 /// healthy server.
 #[must_use]
@@ -193,17 +208,26 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
                 "spool_evicting",
                 CheckStatus::Error,
                 format!(
-                    "The hook spool is full ({} events): each new event evicts the oldest \
-                     undelivered one.",
+                    "The hook spool is full ({} events): newly captured events are dropped \
+                     until space is available.",
                     spool.pending
                 ),
                 Some(fix_lines::RECOVER),
             );
-        } else if spool.pending > 0 {
+        } else if spool_is_stuck(&spool) {
             push(
                 "spool_pending",
                 CheckStatus::Warn,
-                format!("{} hook event(s) wait in the local spool.", spool.pending),
+                format!(
+                    "{} hook event(s) wait in the local spool and delivery looks stuck \
+                     (oldest {}, {} failed attempt(s)).",
+                    spool.pending,
+                    spool.oldest_age_ms.map_or_else(
+                        || "age unknown".to_owned(),
+                        |ms| format!("{} min", ms / 60_000)
+                    ),
+                    spool.retries_total
+                ),
                 Some(fix_lines::RECOVER),
             );
         }
@@ -406,10 +430,39 @@ mod tests {
     }
 
     #[test]
+    fn a_young_spool_awaiting_its_boundary_drain_is_healthy() {
+        let mut snapshot = healthy();
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: Some(SPOOL_STUCK_AFTER_MS - 1),
+            retries_total: 0,
+            capacity: 500,
+        });
+        assert!(checks(&snapshot).is_empty());
+
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: Some(1_000),
+            retries_total: 1,
+            capacity: 500,
+        });
+        assert_eq!(only(&snapshot).id, "spool_pending");
+
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: None,
+            retries_total: 0,
+            capacity: 500,
+        });
+        assert_eq!(only(&snapshot).id, "spool_pending");
+    }
+
+    #[test]
     fn spool_and_journal_point_at_recover() {
         let mut snapshot = healthy();
         snapshot.process.spool = Some(SpoolState {
             pending: 3,
+            oldest_age_ms: Some(SPOOL_STUCK_AFTER_MS),
             capacity: 500,
             ..SpoolState::default()
         });

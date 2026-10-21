@@ -467,3 +467,21 @@ toolchain, 8 vCPU / 8 GB, Defender disabled).
   provisioning + runs via the QEMU monitor (3), and prefer focused per-crate invocations.
 - **Option D (`windows.yml`) stays** the authoritative, licence-clean, fork-safe pre-tag gate
   regardless. The VM is the belt; `windows.yml` remains the suspenders.
+
+## Windows transient file errors
+
+Where a Windows file operation can race with an antivirus scan, the indexer
+or another process, the code treats the specific error as transient. Each site
+has its own bound (invariant 10 in [ARCHITECTURE.md](ARCHITECTURE.md)):
+
+| Site | Operation | Windows error | Policy |
+|---|---|---|---|
+| `crates/ai-memory-wiki/src/atomic.rs` `persist_with_retry` | atomic rename of a page write | `ERROR_SHARING_VIOLATION` (32), `ERROR_LOCK_VIOLATION` (33) | up to 5 attempts, 10 ms base backoff |
+| `crates/ai-memory-wiki/src/confinement.rs` `is_transient_churn` | stat of an entry during a confinement walk | sharing violation (`PermissionDenied`), `ERROR_DELETE_PENDING` (303) | skip the entry, as for `NotFound`; an entry that does stat still faces the link checks |
+| `crates/ai-memory-cli/src/commands/hook_spool.rs` `is_drain_lock_busy_error` | spool drain lock | `ERROR_LOCK_VIOLATION` (33) | treated as "lock busy", like `WouldBlock`; the drain runs later |
+| `crates/ai-memory-cli/src/commands/hook_drain_process.rs` `should_retry_without_breakaway` | spawning the detached drain process | `ERROR_ACCESS_DENIED` (5) | retry once without `CREATE_BREAKAWAY_FROM_JOB` |
+| `companions/ai-memory-relay/src/fsguard.rs` `read_settled` | metadata read of a queue file (SQLite deletes its rollback journal at each commit) | access denied (delete pending) | up to 5 retries, 20 ms apart, then refused |
+
+The relay is a separate workspace, so the policy is not shared code. A new
+site follows the same rules: name the exact error, bound the retry, keep
+refusing a file that stays inaccessible, and test it with an injected error.

@@ -991,6 +991,20 @@ function Invoke-AiMemoryHook {
         [Console]::Out.Write("{}")
         return
     }
+    # invocationNum restarts at 0 on every user turn: only a conversation's
+    # first turn may post session-start and claim a handoff.
+    if ($AntigravityPreInvocationOutput) {
+        $Conversation = $null
+        try { $Conversation = [string](($Payload | ConvertFrom-Json).conversationId) } catch { }
+        if ($Conversation -and $Conversation.Trim()) {
+            $StartMarker = Get-AiMemoryBriefedFile -Key ("agy-start-" + $Conversation.Trim())
+            if (Test-Path -LiteralPath $StartMarker) {
+                [Console]::Out.Write("{}")
+                return
+            }
+            Set-AiMemoryBriefed -Path $StartMarker
+        }
+    }
     # Assistant/Stop capture (#196) is native-only. Scoped to claude-code + stop
     # so a PostToolUse whose tool output legitimately contains the literal string
     # is unaffected. If a Stop payload still carries the raw field, drop the whole
@@ -1065,7 +1079,13 @@ function Invoke-AiMemoryHook {
         Clear-AiMemorySessionId -Agent $Agent
     }
 
-    if ($FetchHandoff) {
+    # `GET /handoff` claims the newest open baton in whatever project the
+    # server resolves. A payload that names no directory would send no `cwd`,
+    # the server would fall back to its default or the caller's last active
+    # project, and the claim could consume another repository's handoff.
+    # Without a directory the handoff stays open for memory_handoff_accept
+    # (parity with the native hook and `ai_memory_get_handoff`).
+    if ($FetchHandoff -and $Cwd) {
         $NativeSessionQS = ""
         $NativeSessionId = $null
         try {
@@ -1197,7 +1217,7 @@ function Invoke-AiMemoryHook {
         if ($ProfileFile) {
             Set-AiMemoryBriefed -Path $ProfileFile
         }
-    } elseif ($AntigravityPreInvocationOutput) {
+    } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
         [Console]::Out.Write("{}")
     }
 }

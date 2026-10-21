@@ -198,7 +198,9 @@ pub fn parse_marker_aliases(text: &str) -> Result<Option<MarkerAliases>, MarkerA
     let mut found = None;
     let mut in_table = false;
     for line in text.lines() {
-        let trimmed = line.trim();
+        // A UTF-8 BOM is not whitespace to `trim`, but a marker saved as
+        // "UTF-8 with BOM" still declares its first-line aliases.
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
         if trimmed.starts_with('[') {
             in_table = true;
         }

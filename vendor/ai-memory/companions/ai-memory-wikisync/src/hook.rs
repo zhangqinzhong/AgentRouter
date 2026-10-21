@@ -467,11 +467,12 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(
+            text.contains(&format!(
                 "( command -v ai-memory-wikisync >/dev/null && ai-memory-wikisync sync \
-                 --workspace 'demo' --project 'app' --dest 'docs/wiki' --include 'decisions' ) \
-                 || true"
-            ),
+                 --workspace 'demo' --project 'app' --dest '{}' --include 'decisions' ) \
+                 || true",
+                Path::new("docs").join("wiki").display()
+            )),
             "{text}"
         );
         for flag in [
@@ -616,7 +617,13 @@ mod tests {
 
         install(&install_args(&worktree.join("docs/wiki"))).unwrap();
         let text = fs::read_to_string(hook_of(&root)).unwrap();
-        assert!(text.contains("--dest 'docs/wiki'"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "--dest '{}'",
+                Path::new("docs").join("wiki").display()
+            )),
+            "{text}"
+        );
 
         // A worktree config can set hooksPath too.
         fs::write(wt_gitdir.join("config.worktree"), "[core]\nhooksPath = x\n").unwrap();

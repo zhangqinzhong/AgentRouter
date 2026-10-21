@@ -6,7 +6,8 @@
 #      from a local binary and served over local HTTP;
 #   2. `ai-memory setup --yes`, with a stand-in service manager first on PATH
 #      (`systemctl` on Linux, `launchctl` on macOS) that runs the rendered
-#      unit's command in the background and never reaches a real session;
+#      unit's command in the background and never reaches a real session; its
+#      output must end on the question to ask the restarted agent;
 #   3. one synthetic hook event, as the installed Claude Code hook sends it;
 #   4. `memory_query` over `ai-memory mcp-bridge` until it returns the event.
 #
@@ -166,8 +167,12 @@ clean sh -c "curl -fsSL '$base/latest/download/install.sh' | sh"
 
 echo "== 2. ai-memory setup --yes"
 commands=$((commands + 1))
-(cd "$home" && clean ai-memory setup --yes)
+setup_log="$work/setup.log"
+(cd "$home" && clean ai-memory setup --yes) | tee "$setup_log"
 installed="$(now)"
+# setup ends on the question to ask the restarted agent, not a health check.
+grep -Fq "What do you remember about this project?" "$setup_log" ||
+    { echo "setup did not end with the question for the restarted agent" >&2; exit 1; }
 
 echo "== hook event + memory_query"
 marker="onboarding-acceptance-$(date +%s)-$$"

@@ -71,6 +71,10 @@ Human password login is **not** a bearer rung. A browser session cookie never
 authenticates `/mcp`, `/hook`, `/handoff`, or `/workstream/*`, and a password
 never authenticates as `Authorization: Bearer`.
 
+The optional [management console](management-ui.md) exposes existing user
+administration and adds authorized self-service session deletion and personal
+API-key management in the browser.
+
 ## Human login (password + web session)
 
 The console signs in with username and password. The engine issues an
@@ -803,3 +807,21 @@ ones who should keep access; nothing is granted automatically.
   authenticates as, like any other. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
   session id; session auto-scope needs the lifecycle-hook session id or explicit
   `workspace` + `project` / `scopes`.
+- **Self-issued keys outlive a password reset or a disable.** A key a user
+  issued through the self-service routes is an ordinary native key. Resetting
+  that user's password or disabling the account ends their browser sessions
+  but leaves every key they issued active; revoke those keys separately
+  (`ai-memory api-key revoke`, or the self-service revoke route while the user
+  can still sign in).
+
+### Opt-in browser surfaces
+
+Two HTTP surfaces reuse the browser sign-in and are off unless `serve` is
+started with their runtime flag. Both need `--transport http`; machine bearers
+and sessions that still owe a password change are refused, and every mutation
+needs the CSRF cookie/header pair.
+
+| Flag | Environment variable | What it serves |
+|---|---|---|
+| `--enable-session-management` | `AI_MEMORY_ENABLE_SESSION_MANAGEMENT=true` | Session inspection and purging of sessions the user owns. See [session-management.md](session-management.md). |
+| `--enable-self-service-keys` | `AI_MEMORY_ENABLE_SELF_SERVICE_KEYS=true` | Each user issues, lists and revokes their own `aim_` keys, up to 20 active keys, labels of 1 to 128 characters. See [self-service-keys.md](self-service-keys.md). |

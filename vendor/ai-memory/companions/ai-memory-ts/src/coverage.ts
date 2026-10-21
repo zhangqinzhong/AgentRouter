@@ -191,6 +191,10 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "not_exposed",
     reason: "writes coding-agent instruction files; specific to harnesses",
   },
+  memory_restore_page: {
+    status: "not_exposed",
+    reason: "admin-only restore of one page from a git checkpoint; use callTool",
+  },
 };
 
 /** Convert a wire name to the SDK's camelCase argument name. */

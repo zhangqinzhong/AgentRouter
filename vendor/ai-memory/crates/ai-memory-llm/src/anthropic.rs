@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
+use crate::openai_compat::{first_json_object, strip_reasoning_blocks};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
 use crate::types::{
@@ -67,7 +68,9 @@ impl AnthropicProvider {
     /// Returns a `reqwest::Error` if the underlying HTTP client cannot
     /// be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        let client = reqwest::Client::builder().build()?;
+        let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
+            .build()?;
         Ok(Self {
             client,
             auth: AnthropicAuth::ApiKey(api_key),
@@ -90,7 +93,9 @@ impl AnthropicProvider {
     /// Returns a `reqwest::Error` if the underlying HTTP client cannot
     /// be built.
     pub fn new_oauth(token: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        let client = reqwest::Client::builder().build()?;
+        let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
+            .build()?;
         Ok(Self {
             client,
             auth: AnthropicAuth::OAuth(token),
@@ -178,6 +183,9 @@ struct AnthropicOutputConfig {
 enum AnthropicThinking {
     Adaptive,
     Disabled,
+    /// Sonnet 5.5's lowest setting, no extended thinking: the model's way to
+    /// turn thinking off, since it answers `disabled` with a 400.
+    BetweenTools,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,8 +218,19 @@ struct AnthropicResponse {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContent {
-    Text { text: String },
-    ToolUse { input: serde_json::Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        input: serde_json::Value,
+    },
+    /// A block this provider does not read, such as `thinking` or
+    /// `redacted_thinking`. Models that think by default (Opus 5 and later,
+    /// Sonnet 5 and later, Haiku 5.5, Fable, Mythos), and every model sent
+    /// adaptive thinking for a configured effort, can start a response with
+    /// such blocks. Without this variant one of them fails the whole parse.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,7 +266,7 @@ impl LlmProvider for AnthropicProvider {
             .iter()
             .filter_map(|c| match c {
                 AnthropicContent::Text { text } => Some(text.as_str()),
-                AnthropicContent::ToolUse { .. } => None,
+                AnthropicContent::ToolUse { .. } | AnthropicContent::Other => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -278,10 +297,19 @@ impl LlmProvider for AnthropicProvider {
     ) -> LlmResult<serde_json::Value> {
         let body = self.build_request(&request, Some(schema));
         let response: AnthropicResponse = self.post(&body, operation_id).await?;
+        let forced = self.forces_result_tool();
+        let mut text = Vec::new();
         for c in response.content {
-            if let AnthropicContent::ToolUse { input, .. } = c {
-                return Ok(input);
+            match c {
+                AnthropicContent::ToolUse { input, .. } => return Ok(input),
+                // Under `auto` the model can reply with the JSON itself
+                // instead of calling the tool.
+                AnthropicContent::Text { text: part } if !forced => text.push(part),
+                _ => {}
             }
+        }
+        if let Some(value) = json_object_in(&text.join("\n")) {
+            return Ok(value);
         }
         Err(LlmError::UnexpectedShape(
             "anthropic response had no tool_use block".into(),
@@ -289,10 +317,19 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+/// The JSON object in a text reply, bare, fenced, or set in prose.
+fn json_object_in(text: &str) -> Option<serde_json::Value> {
+    let cleaned = strip_reasoning_blocks(text);
+    serde_json::from_str::<serde_json::Value>(&cleaned)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .or_else(|| serde_json::from_str(first_json_object(&cleaned)?).ok())
+}
+
 impl AnthropicProvider {
     /// Build the `/v1/messages` body shared by `complete` and
     /// `complete_structured_raw`. Passing a schema turns the call into the
-    /// forced-tool structured-output shape. Both paths go through here so the
+    /// `result`-tool structured-output shape. Both paths go through here so the
     /// temperature rule below can't apply to one and silently miss the other.
     fn build_request<'a>(
         &'a self,
@@ -307,14 +344,22 @@ impl AnthropicProvider {
                 content: &m.content,
             })
             .collect();
+        let forced = self.forces_result_tool();
+        // Without a forced `tool_choice`, the description is what asks for
+        // the call.
+        let description = if forced {
+            "Emit the structured result."
+        } else {
+            "Emit the structured result. Call this tool once instead of replying in text."
+        };
         let (tools, tool_choice) = match schema {
             Some(input_schema) => (
                 Some(vec![AnthropicTool {
                     name: "result".into(),
-                    description: "Emit the structured result.".into(),
+                    description: description.into(),
                     input_schema,
                 }]),
-                Some(AnthropicToolChoice::Tool {
+                forced.then(|| AnthropicToolChoice::Tool {
                     name: "result".into(),
                 }),
             ),
@@ -340,6 +385,14 @@ impl AnthropicProvider {
             output_config,
             thinking,
         }
+    }
+
+    /// Whether the structured path pins `tool_choice` to the `result` tool.
+    /// The models that answer a forced `tool_choice` with a 400 keep the
+    /// default `auto`.
+    fn forces_result_tool(&self) -> bool {
+        let claude = ClaudeId::parse(&self.model);
+        !claude.is_some_and(ClaudeId::rejects_forced_tool_choice)
     }
 
     async fn post<B: Serialize, R: DeserializeOwned>(
@@ -511,6 +564,25 @@ impl ClaudeId {
         self.meets(Some((4, 7)))
     }
 
+    /// Opus 5.5, Sonnet 5.5, Fable 5.1, and Mythos 5.1 400 on a forced
+    /// `tool_choice` (`any` or a named tool). Haiku 5.5, Opus 5, Sonnet 5,
+    /// and Fable 5 still accept one.
+    fn rejects_forced_tool_choice(self) -> bool {
+        match self {
+            Self::Released {
+                family: ClaudeFamily::Opus | ClaudeFamily::Sonnet,
+                major,
+                minor,
+            } => (major, minor) >= (5, 5),
+            Self::Released {
+                family: ClaudeFamily::Fable | ClaudeFamily::Mythos,
+                major,
+                minor,
+            } => (major, minor) >= (5, 1),
+            _ => false,
+        }
+    }
+
     fn supports_effort(self) -> bool {
         self.meets(self.family().effort_since())
     }
@@ -519,7 +591,8 @@ impl ClaudeId {
         self.meets(self.family().adaptive_since())
     }
 
-    /// Fable 5, Mythos 5, and Mythos Preview reject `thinking.type=disabled`.
+    /// Fable 5, Mythos 5, Mythos Preview, and Opus 5.5 reject
+    /// `thinking.type=disabled` at every effort.
     fn thinking_always_on(self) -> bool {
         match self {
             Self::MythosPreview => true,
@@ -528,8 +601,26 @@ impl ClaudeId {
                 major,
                 ..
             } => major >= 5,
+            Self::Released {
+                family: ClaudeFamily::Opus,
+                major,
+                minor,
+            } => (major, minor) >= (5, 5),
             _ => false,
         }
+    }
+
+    /// Sonnet 5.5 rejects `thinking.type=disabled` too, but turns thinking
+    /// off with `between_tools`.
+    fn turns_thinking_off_between_tools(self) -> bool {
+        matches!(
+            self,
+            Self::Released {
+                family: ClaudeFamily::Sonnet,
+                major,
+                minor,
+            } if (major, minor) >= (5, 5)
+        )
     }
 
     fn accepts_thinking_disabled(self) -> bool {
@@ -568,6 +659,9 @@ impl ClaudeId {
         effort: ReasoningEffort,
     ) -> (Option<AnthropicOutputConfig>, Option<AnthropicThinking>) {
         match effort {
+            ReasoningEffort::None if self.turns_thinking_off_between_tools() => {
+                (None, Some(AnthropicThinking::BetweenTools))
+            }
             ReasoningEffort::None => (
                 None,
                 self.accepts_thinking_disabled()
@@ -593,6 +687,8 @@ fn version_segment(s: &str) -> Option<u32> {
 mod tests {
     use secrecy::SecretString;
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::types::{ChatMessage, ReasoningEffort};
     use rstest::rstest;
@@ -737,6 +833,46 @@ mod tests {
         assert!(plain.get("thinking").is_none());
     }
 
+    /// A model that thinks opens its response with `thinking` blocks, empty
+    /// under the default `display: "omitted"`, and may return
+    /// `redacted_thinking`. Both completion paths must read past them.
+    #[tokio::test]
+    async fn thinking_blocks_do_not_fail_either_completion_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "claude-opus-5",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "OK"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "result",
+                        "input": {"answer": "OK"}
+                    }
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 5}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), "claude-opus-5")
+            .unwrap()
+            .with_base_url(server.uri());
+
+        let response = provider.complete(chat_request()).await.unwrap();
+        assert_eq!(response.text, "OK");
+
+        let value = provider
+            .complete_structured_raw(chat_request(), json!({"type": "object"}))
+            .await
+            .unwrap();
+        assert_eq!(value, json!({"answer": "OK"}));
+    }
+
     fn body_for_effort(model: &str, effort: ReasoningEffort) -> serde_json::Value {
         let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), model)
             .unwrap()
@@ -775,6 +911,26 @@ mod tests {
         None
     )]
     #[case::fable_5_none_omits_disabled("claude-fable-5", ReasoningEffort::None, None, None)]
+    #[case::opus_55_none_omits_disabled("claude-opus-5-5", ReasoningEffort::None, None, None)]
+    #[case::bedrock_opus_55_none_omits_disabled(
+        "anthropic.claude-opus-5-5",
+        ReasoningEffort::None,
+        None,
+        None
+    )]
+    #[case::sonnet_5_disabled("claude-sonnet-5", ReasoningEffort::None, None, Some("disabled"))]
+    #[case::sonnet_55_none_between_tools(
+        "claude-sonnet-5-5",
+        ReasoningEffort::None,
+        None,
+        Some("between_tools")
+    )]
+    #[case::sonnet_55_low_adaptive(
+        "claude-sonnet-5-5",
+        ReasoningEffort::Low,
+        Some("low"),
+        Some("adaptive")
+    )]
     #[case::sonnet_46_xhigh_clamps_max(
         "claude-sonnet-4-6",
         ReasoningEffort::XHigh,

@@ -583,3 +583,20 @@ for (const foreignFirst of [false,true]) test('exact owner survives persisted ow
  for(let i=0;i<2;i++) {cursors=JSON.parse(JSON.stringify(cursors));const r=await parseOpencodeDbIncremental({dbMessages:[self],cursors,queuePath,source:'opencode'});assert.equal(r.eventsAggregated,0);assert.equal(await fs.readFile(queuePath,'utf8'),before);}
  });
 });
+
+test('ZCode retained aggregates survive a pruned DB and newly collected history is not counted twice',async()=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'ar-zcode-prune-'));
+ try{
+  const queuePath=path.join(dir,'queue.jsonl'),dbPath=path.join(dir,'db.sqlite');
+  let cursors={};
+  const old=msg({id:'old',sessionID:'s',created:Date.parse(HOUR),input:100,output:20});
+  const fresh=msg({id:'fresh',sessionID:'s',created:Date.parse(HOUR)+60000,input:200,output:30});
+  const sync=rows=>parseOpencodeDbIncremental({dbMessages:rows,dbPath,cursors,queuePath,source:'zcode',cursorKey:'zcode'});
+  await sync([old]);const first=await queueTotals(queuePath);
+  cursors=JSON.parse(JSON.stringify(cursors));
+  await sync([]);assert.deepEqual(await queueTotals(queuePath),first);
+  await sync([fresh]);const next=await queueTotals(queuePath);
+  assert.equal(next.total_tokens,350);
+  await sync([fresh]);assert.deepEqual(await queueTotals(queuePath),next);
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});

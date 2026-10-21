@@ -23,6 +23,8 @@
 //! or a guideline block in a rules file) with the line to fix by hand; see
 //! [`super::agentmemory_residue`]. That check only reads.
 
+mod presentation;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -177,7 +179,7 @@ struct DoctorReport {
     /// established convention are simply absent from this list.
     native_memory: Vec<NativeMemoryReport>,
     /// The local hook spool: events waiting for the server, and whether it is
-    /// full and evicting undelivered ones.
+    /// full and dropping newly captured events.
     spool: super::hook_spool::SpoolHealth,
     /// Nothing answered at the server URL; capture counts are unavailable and
     /// hook events are being spooled.
@@ -195,6 +197,11 @@ struct DoctorReport {
     /// Meta Muse Code's settings file, when there is one: whether ai-memory's
     /// hooks and MCP entry are in it, and the two shapes that break Muse.
     muse: Option<MuseReport>,
+    /// Set when the Windows logon entry `setup` wrote for this data dir names
+    /// an `ai-memory.exe` that is no longer on disk (#1280). Omitted
+    /// otherwise, so the JSON shape is unchanged when there is nothing to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    windows_logon: Option<super::user_service::MissingLogonBinary>,
 }
 
 /// One installed ai-memory marketplace plugin and what else wires the same
@@ -652,6 +659,9 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         .ok()
         .and_then(|path| muse_report(&path));
 
+    // Local, like the spool: a quarantined binary leaves no server to ask.
+    let windows_logon = super::user_service::check_logon_binary(&config.data_dir);
+
     let auth_posture = identity.as_ref().map(|identity| {
         crate::local_auth::AuthPosture::classify(identity.level == "anonymous", &ep.url)
     });
@@ -675,12 +685,16 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         agentmemory_residue,
         plugins,
         muse,
+        windows_logon,
     };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        render_human(&report);
+        presentation::render(
+            &report,
+            &crate::terminal::Terminal::stdout(&config.runtime_env),
+        );
     }
     Ok(())
 }
@@ -688,7 +702,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
 /// The trust state of the installed ai-memory Codex hooks, when there are
 /// any: asking Codex starts it, so a machine without ai-memory's Codex hooks
 /// is left alone.
-async fn codex_hook_trust(
+pub(super) async fn codex_hook_trust(
     env: &crate::config::RuntimeEnv,
     cwd: &Path,
 ) -> Option<super::codex_hook_trust::CodexHookTrust> {
@@ -973,10 +987,10 @@ fn render_capture_health(report: &DoctorReport) -> String {
         ));
     }
     let spool = &report.spool;
-    if spool.evicting() {
+    if spool.at_capacity() {
         out.push_str(&format!(
-            "⚠ The hook spool is full ({} events, oldest {}): each new event evicts the \
-             oldest undelivered one, which is lost until the server is back.\n",
+            "⚠ The hook spool is full ({} events, oldest {}): newly captured events are \
+             dropped until space is available.\n",
             spool.pending,
             spool_age(spool.oldest_age_ms),
         ));
@@ -1076,142 +1090,6 @@ fn render_project_coordinate(coordinate: &ProjectCoordinateReport) -> String {
     output
 }
 
-fn render_human(report: &DoctorReport) {
-    println!(
-        "Capture coverage for {}/{} (server {})",
-        report.workspace, report.project, report.server
-    );
-    if let Some(identity) = &report.identity {
-        println!(
-            "  identity: {} ({}, server {})",
-            identity.operator.as_deref().unwrap_or("anonymous"),
-            identity.level,
-            identity.version
-        );
-    } else {
-        println!("  identity: unavailable");
-    }
-    if let Some(posture) = report.auth_posture {
-        println!("  auth: {}", posture.line());
-    }
-    if report.capture_owner_active {
-        println!(
-            "  AI_MEMORY_CAPTURE_OWNER is active: native capture is suppressed in this process.\n  \
-             Confirm the external producer is delivering events."
-        );
-    }
-    if let Some(coordinate) = &report.project_coordinate {
-        print!("{}", render_project_coordinate(coordinate));
-    }
-    if let Some(problem) = &report.capture_coverage_problem {
-        println!("  capture coverage: unavailable ({})", problem.reason);
-    }
-    print!("{}", render_capture_health(report));
-    print!("{}", render_plugins(&report.plugins));
-    print!("{}", render_muse(report.muse.as_ref()));
-    print!(
-        "{}",
-        super::agentmemory_residue::render(&report.agentmemory_residue)
-    );
-    if report.since_days == 0 {
-        println!("  recent window: all on-disk sessions\n");
-    } else {
-        println!("  recent window: last {} days\n", report.since_days);
-    }
-
-    if let Some(problem) = &report.marker_capture_problem {
-        println!(
-            "⚠ {}: the settings marker has an invalid `[capture]` section.\n  \
-             It fails closed — file and shell tool content is reduced to metadata there, \
-             nothing leaks — but its `ignore_paths` exclusions are NOT applying while it stays \
-             invalid. Fix the TOML and re-run `ai-memory doctor` to confirm.\n",
-            problem.classification
-        );
-    }
-
-    if !report.native_memory.is_empty() {
-        println!(
-            "Note: a shell/PowerShell hook install (the Docker-wrapper default) does not \
-             enforce capture-policy v1 — \"excluded\" below only holds on a native hook \
-             install or a generated integration. Check the configured hook command; a dry-run \
-             `ai-memory install-hooks` reports the selected install path, not the active one.\n"
-        );
-    }
-
-    if report.rows.is_empty() {
-        if report.capture_coverage_problem.is_some() {
-            println!(
-                "  No local harness sessions found for this project; server capture counts are unavailable."
-            );
-        } else {
-            println!(
-                "  No local harness sessions found for this project and nothing captured yet."
-            );
-        }
-        return;
-    }
-
-    for row in &report.rows {
-        let mark = match row.uncaptured {
-            Some(true) => "⚠",
-            Some(false) => "✓",
-            None => "?",
-        };
-        let captured = row
-            .captured
-            .map_or_else(|| "unavailable".to_owned(), |count| count.to_string());
-        println!(
-            "  {mark} {:<14} {:>4} local ({} recent) → {:>11} captured",
-            row.agent, row.local_total, row.local_recent, captured
-        );
-        if row.uncaptured == Some(true) {
-            if report.capture_owner_active {
-                println!(
-                    "      No captured session: check the external producer and repository policy."
-                );
-            } else {
-                println!(
-                    "      └ ran here but nothing was captured — install its hook:\n        \
-                     ai-memory install-hooks --agent {} --apply",
-                    row.agent
-                );
-            }
-        }
-        if let Some(count) = row.mixed_capture_sessions.filter(|count| *count > 0) {
-            println!(
-                "      {count} session(s) contain events from multiple capture sources.\n      \
-                 Backfill can also mix source metadata; this does not prove duplicate capture."
-            );
-        }
-        if let Some(memory) = report.native_memory.iter().find(|m| m.agent == row.agent) {
-            println!(
-                "      native memory: {} ({} file{})",
-                memory.path,
-                memory.file_count,
-                if memory.file_count == 1 { "" } else { "s" }
-            );
-            println!("      capture: {}", memory.status);
-        }
-    }
-
-    if report.capture_coverage_problem.is_some() {
-        println!("\nCapture verdict unavailable: server capture counts could not be resolved.");
-    } else if report.uncaptured.is_empty() {
-        println!("\n✓ Every harness that ran in this project recently is captured on the server.");
-    } else {
-        let remedy = if report.capture_owner_active {
-            "Check the external producer and repository policy, then re-run `ai-memory doctor`."
-        } else {
-            "Install the hook(s) above, then re-run `ai-memory doctor` to confirm."
-        };
-        println!(
-            "\n⚠ {} harness(es) ran here recently with no captured sessions: {}.\n  {remedy}",
-            report.uncaptured.len(),
-            report.uncaptured.join(", ")
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,7 +1119,35 @@ mod tests {
             agentmemory_residue: Vec::new(),
             plugins: Vec::new(),
             muse: None,
+            windows_logon: None,
         }
+    }
+
+    /// The logon-binary warning is a key of its own in doctor's JSON, and
+    /// absent when there is nothing to report.
+    #[test]
+    fn doctor_json_carries_a_missing_logon_binary_only_when_there_is_one() {
+        let quiet = health_report(
+            super::super::hook_spool::SpoolHealth::default(),
+            false,
+            None,
+        );
+        let json = serde_json::to_value(&quiet).unwrap();
+        assert!(json.get("windows_logon").is_none(), "{json}");
+
+        let mut report = quiet;
+        report.windows_logon = Some(super::super::user_service::MissingLogonBinary {
+            classification: super::super::user_service::LOGON_BINARY_MISSING,
+            executable: r"C:\bin\ai-memory.exe".into(),
+            detail: "gone".into(),
+            fix: "restore it",
+        });
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["windows_logon"]["classification"],
+            "logon_binary_missing"
+        );
+        assert_eq!(json["windows_logon"]["executable"], r"C:\bin\ai-memory.exe");
     }
 
     /// Doctor reads Muse's settings file: the wiring it finds, and the two

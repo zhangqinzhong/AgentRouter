@@ -142,8 +142,11 @@ pub(crate) async fn handler(
         kind: meta.kind,
         tier: meta.tier,
         pinned: meta.pinned,
+        expired: meta.expired,
         updated_relative: humanize(&meta.updated_at),
         created_relative: humanize(&meta.created_at),
+        updated_at: meta.updated_at,
+        created_at: meta.created_at,
         supersedes_path,
         supersedes_href,
         body_html: rendered.html,
@@ -203,7 +206,7 @@ async fn namespace_or_not_found(
         return not_found_response();
     }
     let prefix = format!("{namespace}/");
-    let all = match state.reader.list_pages(workspace, project).await {
+    let all = match state.reader.list_unexpired_pages(workspace, project).await {
         Ok(p) => p,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };

@@ -57,6 +57,16 @@ Webhooks fire on these `op` values today (extensible enum):
   **before** the file is removed so a mirror can `git rm` the same path. The
   SQLite index is deleted directly by the writer actor; the watcher does not
   reconcile delete events.
+- `delete_event_ledger`: a hook event ledger file (`log-YYYY-MM.md`) is
+  removed by the forget sweep's opt-in ledger retention pass
+  (`Wiki::delete_event_ledger`, enabled by `[decay] ledger_retention_months`).
+  Carries the ledger file name in `page.path`, no body, and no `pages` row to
+  touch (ledgers are files, not pages). Fired **before** the file is removed,
+  so a `reject`-policy webhook keeps it: the sweep then counts the file in the
+  report's `ledgers_undeleted` and retries it on the next run, and keeps the
+  rest of the sweep going. Non-blocking observers are dispatched again after
+  the removal is durable. (Per-event *appends* to ledgers still never fire
+  the chain — see below — this is the one ledger path that does.)
 - `purge_project`: a whole project is purged (`Wiki::purge_project` →
   `remove_dir_all`, routed from `/admin/purge-project`). Carries the
   project in `ctx`, **no** page path; fired before the directory is
@@ -175,7 +185,11 @@ terminal `purge_project` notification is unchanged.
   (per prompt/tool-call). Routing each through the chain would mean an
   HTTP POST per observation, violating the fire-and-forget hook budget. The
   per-event log is a local audit artifact; back it up out-of-band (batched
-  rsync), not per-line.
+  rsync), not per-line. The one ledger path that DOES fire the chain is the
+  forget sweep's opt-in aged removal (`[decay] ledger_retention_months`):
+  each ledger file it deletes emits a blocking `delete_event_ledger`
+  notification before the unlink, so a `reject`-policy webhook can keep an
+  audit file the sweep would otherwise remove.
 - **The page bodies behind a handoff**: the `handoff_*` ops above carry only
   the scope and the acting operator. A handoff is SQLite rows, so a file mirror
   has no file change to reconcile from one; what it gets is the lifecycle
@@ -202,12 +216,13 @@ terminal `purge_project` notification is unchanged.
 ```http
 POST <webhook.url>
 Content-Type: application/json
-X-Memory-Op: write_page | consolidate | delete | purge_project | purge_workspace | move_project
+X-Memory-Op: write_page | consolidate | delete | delete_event_ledger | purge_project | purge_workspace | move_project
              | move_session | handoff_begin | handoff_accept | handoff_cancel
 ```
 
-(The header is one of those ten values; the second line is a continuation of
-the list, not a second header.)
+(The header carries one of the `AdmissionOp` values shown above — the source
+enum is the full catalog; the second line is a continuation of the list, not
+a second header.)
 
 ```jsonc
 {

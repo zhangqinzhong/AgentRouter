@@ -17,7 +17,9 @@
 
 use std::collections::BTreeSet;
 
-use ai_memory_consolidate::{ConsolidatedBatch, build_batch_request, mine_keep_tokens};
+use ai_memory_consolidate::{
+    ConsolidatedBatch, build_batch_request, mine_keep_tokens, mine_residue_tokens,
+};
 use ai_memory_core::{Observation, SessionId};
 use ai_memory_llm::ChatRequest;
 use serde::Serialize;
@@ -37,6 +39,12 @@ pub struct PromptFidelity {
     pub projection_loss: Option<f64>,
     /// Keep-token recall of the prompt (secondary, see the module docs).
     pub recall_prompt: Option<f64>,
+    /// Forbidden fixture strings that reached the prompt.
+    pub must_not_mention_hits: Vec<String>,
+    /// Omitted/truncated-observation error-line coverage by the whole request.
+    pub error_line_observation_coverage: Option<f64>,
+    /// Share of recalled error-line tokens originating in file-family tools.
+    pub file_error_line_share: Option<f64>,
 }
 
 /// What the model carried from the prompt onto its pages.
@@ -63,6 +71,10 @@ pub struct Scorer<'a> {
     request_text: String,
     observation_text: String,
     tokens: BTreeSet<String>,
+    error_observations_total: usize,
+    error_observations_recalled: usize,
+    error_tokens_recalled: usize,
+    file_error_tokens_recalled: usize,
 }
 
 impl<'a> Scorer<'a> {
@@ -75,7 +87,7 @@ impl<'a> Scorer<'a> {
     ) -> Self {
         // Tokens the scaffold always carries would count as recalled whatever
         // the projection did, so they are not part of the denominator.
-        let scaffold = request_text(&build_batch_request(session_id, &[]));
+        let scaffold = request_text(&build_batch_request(session_id, &[], false));
         let mut observation_text = String::new();
         let mut tokens = BTreeSet::new();
         for obs in observations {
@@ -87,12 +99,47 @@ impl<'a> Scorer<'a> {
             );
             observation_text.push_str(&text);
         }
+        let request_text = request_text(request);
+        let mut error_observations_total = 0usize;
+        let mut error_observations_recalled = 0usize;
+        let mut error_tokens_recalled = 0usize;
+        let mut file_error_tokens_recalled = 0usize;
+        for observation in observations {
+            let error_tokens: Vec<String> = mine_residue_tokens(&observation.body, usize::MAX)
+                .into_iter()
+                .filter(|token| looks_like_error_line(token))
+                .collect();
+            if error_tokens.is_empty() {
+                continue;
+            }
+            error_observations_total += 1;
+            let recalled: Vec<&String> = error_tokens
+                .iter()
+                .filter(|token| request_text.contains(token.as_str()))
+                .collect();
+            if !recalled.is_empty() {
+                error_observations_recalled += 1;
+            }
+            error_tokens_recalled += recalled.len();
+            if observation
+                .body
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim() == "tool_family: file")
+            {
+                file_error_tokens_recalled += recalled.len();
+            }
+        }
         Self {
             must_mention,
             must_not_mention,
-            request_text: request_text(request),
+            request_text,
             observation_text,
             tokens,
+            error_observations_total,
+            error_observations_recalled,
+            error_tokens_recalled,
+            file_error_tokens_recalled,
         }
     }
 
@@ -114,6 +161,20 @@ impl<'a> Scorer<'a> {
             projection_loss: share(lost.len(), self.must_mention.len()),
             lost_in_projection: lost,
             recall_prompt: recall(&self.tokens, &self.request_text),
+            must_not_mention_hits: self
+                .must_not_mention
+                .iter()
+                .filter(|value| self.request_text.contains(value.as_str()))
+                .cloned()
+                .collect(),
+            error_line_observation_coverage: share(
+                self.error_observations_recalled,
+                self.error_observations_total,
+            ),
+            file_error_line_share: share(
+                self.file_error_tokens_recalled,
+                self.error_tokens_recalled,
+            ),
         }
     }
 
@@ -165,6 +226,29 @@ impl<'a> Scorer<'a> {
                 .collect(),
         }
     }
+}
+
+fn looks_like_error_line(token: &str) -> bool {
+    let first = token.split_whitespace().next().unwrap_or_default();
+    [
+        "error",
+        "ERROR:",
+        "ERRO:",
+        "Erro:",
+        "ERR!",
+        "panicked at ",
+        "FAILED",
+        "fatal:",
+        "FATAL:",
+        "Traceback (most recent call last)",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix))
+        || first.trim_end_matches(':').strip_suffix("Error").is_some()
+        || first
+            .trim_end_matches(':')
+            .strip_suffix("Exception")
+            .is_some()
 }
 
 /// System prompt plus every message, as the provider receives them.
@@ -267,7 +351,7 @@ mod tests {
         // The fact sits past the 3,000-character excerpt cap.
         let body = format!("{} run backfill-verify.sh at the end", "x".repeat(3_100));
         let observations = vec![obs(sid, "keep 97 MB/s"), obs(sid, &body)];
-        let request = build_batch_request(sid, &observations);
+        let request = build_batch_request(sid, &observations, false);
         let facts = vec!["97 MB/s".to_string(), "backfill-verify.sh".to_string()];
         let scorer = Scorer::new(sid, &observations, &request, &facts, &[]);
 
@@ -293,9 +377,15 @@ mod tests {
     fn invented_tokens_links_and_forbidden_strings_are_reported() {
         let sid = SessionId::new();
         let observations = vec![obs(sid, "edited crates/store/src/fence.rs")];
-        let request = build_batch_request(sid, &observations);
+        let request = build_batch_request(sid, &observations, false);
         let forbidden = vec!["ghp_FAKE0123456789ABCDEFGHIJ".to_string()];
         let scorer = Scorer::new(sid, &observations, &request, &[], &forbidden);
+        assert!(
+            scorer
+                .prompt(observations.len())
+                .must_not_mention_hits
+                .is_empty()
+        );
         let page = scorer.page(&batch(vec![
             update(
                 "concepts/fence.md",
@@ -315,7 +405,7 @@ mod tests {
         let sid = SessionId::new();
         // `body_markdown` is in the batch scaffold, so it can never be lost.
         let observations = vec![obs(sid, "body_markdown and fence_epoch")];
-        let request = build_batch_request(sid, &observations);
+        let request = build_batch_request(sid, &observations, false);
         let scorer = Scorer::new(sid, &observations, &request, &[], &[]);
         assert_eq!(scorer.tokens, BTreeSet::from(["fence_epoch".to_string()]));
         let page = scorer.page(&batch(vec![update("sessions/x.md", "nothing")]));

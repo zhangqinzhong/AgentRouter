@@ -33,6 +33,14 @@
 //! visible to its predicate: a session whose summary page was evicted or
 //! hard-deleted by the passes above keeps its raw capture, because that capture
 //! is now the only surviving copy.
+//!
+//! Event ledger pass (opt-in, disabled unless `LedgerRetention::months > 0`)
+//! deletes old hook event ledgers (`log-YYYY-MM.md`, one per project per
+//! month) once their month ended at least that many whole calendar months ago.
+//! Ledgers are files, not pages: the pass runs through the wiki's dedicated
+//! ledger delete (confined, under the mutation guard, re-checking the
+//! content gate) and never touches the store. The current and the previous
+//! month are never deleted whatever the setting.
 
 use std::collections::{HashMap, HashSet};
 
@@ -231,6 +239,26 @@ pub struct SweepReport {
     pub observation_prune_sessions: usize,
     /// Transactions the prune spent. Makes the batching bound observable.
     pub observation_prune_batches: usize,
+    /// Old hook event ledgers (`log-YYYY-MM.md`) the ledger pass matched.
+    /// Reported in both modes; `0` when ledger retention is disabled (the
+    /// default) or the caller has no wiki handle.
+    pub ledgers_prunable: usize,
+    /// Bytes on disk of the ledgers counted in [`Self::ledgers_prunable`].
+    pub ledger_bytes_prunable: u64,
+    /// Ledger files actually deleted. Always `0` on `dry_run`.
+    pub ledgers_pruned: usize,
+    /// Bytes freed by the deleted ledgers. Always `0` on `dry_run`.
+    pub ledger_bytes_pruned: u64,
+    /// Matched ledgers the pass could not delete: an admission webhook with a
+    /// `reject` policy refused the removal, or the delete itself failed. The
+    /// file is preserved and retried on the next sweep — the ledger answer
+    /// to a page delete that a webhook refused (kept, `deleted: false`,
+    /// retried). Always `0` on `dry_run`.
+    pub ledgers_undeleted: usize,
+    /// Matched ledgers that still have a legacy `pages` row (indexed before
+    /// #660). The pass deletes the file only and leaves the row alone;
+    /// `reclaim-ledger-versions` is the tool that cleans those rows.
+    pub ledger_page_rows_left: usize,
 }
 
 /// Opt-in bound on how long raw observations outlive their consolidation.
@@ -270,6 +298,27 @@ impl ObservationRetention {
 /// Default rows per prune transaction.
 pub const DEFAULT_OBSERVATION_PRUNE_BATCH: usize = 5_000;
 
+/// Opt-in age bound for the hook event ledgers (`log-YYYY-MM.md`).
+///
+/// A type of its own for the same reason as [`ObservationRetention`]: the
+/// sweep entry points are public and widening an existing struct would break
+/// downstream callers that build it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LedgerRetention {
+    /// A ledger is deletable once this many whole calendar months (UTC) have
+    /// passed after its own month ended. `0` disables the pass entirely — the
+    /// default, so an existing install keeps every ledger.
+    pub months: i64,
+}
+
+impl LedgerRetention {
+    /// `true` when the pass is enabled and can delete something.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        self.months > 0
+    }
+}
+
 /// Errors raised by the sweep.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -283,6 +332,9 @@ pub enum SweepError {
     /// The opt-in observation retention age was negative.
     #[error("decay observation_retention_days must be greater than or equal to zero")]
     InvalidObservationRetention,
+    /// The opt-in ledger retention age was negative.
+    #[error("decay ledger_retention_months must be greater than or equal to zero")]
+    InvalidLedgerRetention,
 }
 
 const US_PER_DAY: f64 = 86_400_000_000.0;
@@ -468,16 +520,111 @@ pub async fn run_sweep_with_hygiene(
     dedup: ColdClusterDedup,
     dry_run: bool,
 ) -> Result<SweepReport, SweepError> {
+    run_sweep_with_ledgers(
+        reader,
+        writer,
+        wiki,
+        workspace_id,
+        project_id,
+        params,
+        breadth_weight,
+        retention,
+        compact_cold_episodic,
+        dedup,
+        LedgerRetention::default(),
+        dry_run,
+    )
+    .await
+}
+
+/// Run a sweep with everything [`run_sweep_with_hygiene`] does plus the opt-in
+/// event ledger pass, at `Timestamp::now()`.
+///
+/// The ledger pass runs after the observation prune and, like the other
+/// wiki-routed passes, needs a `wiki` handle (without one it is skipped). With
+/// `ledgers.months == 0` (the default everywhere) it does nothing and this is
+/// byte-identical to [`run_sweep_with_hygiene`]. A dry run lists the files and
+/// bytes it would delete and deletes nothing.
+///
+/// # Errors
+/// Returns [`SweepError::InvalidLedgerRetention`] for a negative age, in
+/// addition to the errors documented by [`run_sweep_with_hygiene`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sweep_with_ledgers(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: Option<&Wiki>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    params: &DecayParams,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+    compact_cold_episodic: bool,
+    dedup: ColdClusterDedup,
+    ledgers: LedgerRetention,
+    dry_run: bool,
+) -> Result<SweepReport, SweepError> {
+    run_sweep_at(
+        reader,
+        writer,
+        wiki,
+        workspace_id,
+        project_id,
+        params,
+        breadth_weight,
+        retention,
+        compact_cold_episodic,
+        dedup,
+        ledgers,
+        Timestamp::now(),
+        dry_run,
+    )
+    .await
+}
+
+/// The full-knob sweep run with its caller-supplied instant: the scoring,
+/// TTL and observation cutoffs and the ledger pass's month arithmetic all
+/// read `now`, so the passes that were already evaluated at sweep start keep
+/// one consistent instant. (The aged-tombstone cutoff stays a fresh
+/// `Timestamp::now()`, because it has to sit after this run's own eviction
+/// stamps — see the inline note.)
+///
+/// Production callers go through [`run_sweep_with_ledgers`] (which passes
+/// `Timestamp::now()`), so this changes no production behaviour. The seam
+/// exists so the integration tests can hold the pass at a fixed UTC instant,
+/// away from the real month boundary a wall-clock run could cross mid-test.
+///
+/// # Errors
+/// Same as [`run_sweep_with_ledgers`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_sweep_at(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: Option<&Wiki>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    params: &DecayParams,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+    compact_cold_episodic: bool,
+    dedup: ColdClusterDedup,
+    ledgers: LedgerRetention,
+    now: Timestamp,
+    dry_run: bool,
+) -> Result<SweepReport, SweepError> {
     if !breadth_weight.is_finite() || breadth_weight < 0.0 {
         return Err(SweepError::InvalidBreadthWeight);
     }
     if retention.days < 0 {
         return Err(SweepError::InvalidObservationRetention);
     }
+    if ledgers.months < 0 {
+        return Err(SweepError::InvalidLedgerRetention);
+    }
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
     let breadth =
         access_breadth_for_scoring(reader, workspace_id, project_id, breadth_weight).await?;
-    let now_us = Timestamp::now().as_microsecond();
+    let now_us = now.as_microsecond();
 
     let mut evicted = Vec::new();
     let mut compacted: Vec<CompactedPage> = Vec::new();
@@ -557,7 +704,7 @@ pub async fn run_sweep_with_hygiene(
     let mut observations_pruned = 0usize;
     let mut observation_prune_sessions = 0usize;
     let mut observation_prune_batches = 0usize;
-    let observation_cutoff_us = Timestamp::now()
+    let observation_cutoff_us = now
         .as_microsecond()
         .saturating_sub(retention.days.saturating_mul(US_PER_DAY_I64));
     if retention.is_enabled() {
@@ -722,6 +869,12 @@ pub async fn run_sweep_with_hygiene(
 
         if let Some(wiki) = wiki {
             let grace_days = params.hard_delete_after_days.max(0);
+            // A FRESH clock read, deliberately not the caller's `now`: the
+            // evictions above stamp their tombstones' `superseded_at` as they
+            // go, and the grace-0 case hard-deletes exactly those. The cutoff
+            // has to sit after this run's own stamps, or a tombstone the run
+            // just wrote is not "older than itself" and the grace-0 purge
+            // silently skips it.
             let cutoff_us = Timestamp::now()
                 .as_microsecond()
                 .saturating_sub(grace_days.saturating_mul(US_PER_DAY_I64));
@@ -781,6 +934,24 @@ pub async fn run_sweep_with_hygiene(
         }
     }
 
+    // Event ledger pass, last: files, not pages, so nothing above depends on it
+    // and it depends on nothing above. Both modes list; only a real run deletes.
+    let ledger_outcome = match wiki {
+        Some(wiki) if ledgers.is_enabled() => {
+            sweep_event_ledgers(
+                reader,
+                wiki,
+                workspace_id,
+                project_id,
+                ledgers,
+                now,
+                dry_run,
+            )
+            .await
+        }
+        _ => LedgerSweepOutcome::default(),
+    };
+
     Ok(SweepReport {
         dry_run,
         candidates_evaluated: candidates.len(),
@@ -793,7 +964,148 @@ pub async fn run_sweep_with_hygiene(
         observations_pruned,
         observation_prune_sessions,
         observation_prune_batches,
+        ledgers_prunable: ledger_outcome.matched,
+        ledger_bytes_prunable: ledger_outcome.matched_bytes,
+        ledgers_pruned: ledger_outcome.deleted,
+        ledger_bytes_pruned: ledger_outcome.deleted_bytes,
+        ledgers_undeleted: ledger_outcome.undeleted,
+        ledger_page_rows_left: ledger_outcome.page_rows_left,
     })
+}
+
+/// What the ledger pass found and did, folded into the [`SweepReport`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LedgerSweepOutcome {
+    pub(crate) matched: usize,
+    pub(crate) matched_bytes: u64,
+    pub(crate) deleted: usize,
+    pub(crate) deleted_bytes: u64,
+    /// Matched ledgers whose removal failed (a refusing admission webhook or
+    /// an IO error). Kept and retried by the next sweep.
+    pub(crate) undeleted: usize,
+    pub(crate) page_rows_left: usize,
+}
+
+/// Position of a calendar month on one line: `year * 12 + (month - 1)`.
+fn month_index(year: i64, month: i64) -> i64 {
+    year.saturating_mul(12).saturating_add(month - 1)
+}
+
+/// Month index of a `log-YYYY-MM.md` file name, or `None` when the name is not
+/// that shape or the month is not 1..=12 (a shape the content gate cannot
+/// vouch for is never an age decision).
+fn ledger_month_index(file_name: &str) -> Option<i64> {
+    if !ai_memory_core::log_ledger::is_rotated_log_ledger_path(file_name) {
+        return None;
+    }
+    let stem = file_name.strip_prefix("log-")?.strip_suffix(".md")?;
+    let year: i64 = stem.get(..4)?.parse().ok()?;
+    let month: i64 = stem.get(5..)?.parse().ok()?;
+    (1..=12).contains(&month).then(|| month_index(year, month))
+}
+
+/// Whether a ledger whose month sits at `ledger_idx` may be deleted when the
+/// current month sits at `now_idx`, with `months` as the retention age.
+///
+/// Two independent rules, both required:
+///
+/// - the writer guard: the current and the previous month are never
+///   deletable. The hook appender may still write to them (the previous month
+///   takes late-delivered events), so no setting can make them eligible;
+/// - the age rule: at least `months` whole calendar months have passed since
+///   the ledger's month ended (`ledger_idx + 1 + months <= now_idx`).
+///
+/// For a positive `months` the age rule already implies the guard; the guard
+/// stays a separate line so the protection does not depend on that arithmetic
+/// or on the caller's gate (it is exercised directly with `months == 0`).
+fn ledger_is_expired(ledger_idx: i64, now_idx: i64, months: i64) -> bool {
+    if ledger_idx >= now_idx.saturating_sub(1) {
+        return false;
+    }
+    ledger_idx.saturating_add(months).saturating_add(1) <= now_idx
+}
+
+/// The ledger pass: list the project's event ledgers, pick the expired ones
+/// and, unless `dry_run`, delete them through [`Wiki::delete_event_ledger`],
+/// which consults the blocking admission chain (a `reject`-policy webhook
+/// keeps the file).
+///
+/// Best-effort like the other wiki-routed passes: a listing or per-file
+/// failure (an admission refusal, an IO error) is logged and counted in
+/// [`LedgerSweepOutcome::undeleted`], the file is kept, and the pass keeps
+/// going — the same answer a refused page delete gets, which the sweep
+/// retries on the next run. The store is only read (to say how many matched
+/// ledgers still have a legacy page row); those rows are left alone.
+async fn sweep_event_ledgers(
+    reader: &ReaderPool,
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    ledgers: LedgerRetention,
+    now: Timestamp,
+    dry_run: bool,
+) -> LedgerSweepOutcome {
+    let mut outcome = LedgerSweepOutcome::default();
+    let found = match wiki.list_event_ledgers(workspace_id, project_id) {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "forget sweep: listing event ledgers failed; retrying on next sweep"
+            );
+            return outcome;
+        }
+    };
+    let now_utc = now.to_zoned(jiff::tz::TimeZone::UTC);
+    let now_idx = month_index(i64::from(now_utc.year()), i64::from(now_utc.month()));
+    for ledger in found {
+        let Some(idx) = ledger_month_index(&ledger.file_name) else {
+            continue;
+        };
+        if !ledger_is_expired(idx, now_idx, ledgers.months) {
+            continue;
+        }
+        outcome.matched += 1;
+        outcome.matched_bytes = outcome.matched_bytes.saturating_add(ledger.bytes);
+        match reader
+            .latest_page_id_by_ids(workspace_id, project_id, ledger.file_name.clone())
+            .await
+        {
+            Ok(Some(_)) => outcome.page_rows_left += 1,
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                file = %ledger.file_name,
+                %error,
+                "forget sweep: could not check a ledger for a legacy page row"
+            ),
+        }
+        if dry_run {
+            continue;
+        }
+        match wiki
+            .delete_event_ledger(workspace_id, project_id, &ledger.file_name)
+            .await
+        {
+            Ok(Some(bytes)) => {
+                outcome.deleted += 1;
+                outcome.deleted_bytes = outcome.deleted_bytes.saturating_add(bytes);
+            }
+            // Gone or no longer a ledger since the listing: nothing to delete.
+            Ok(None) => {}
+            Err(error) => {
+                // A refusing webhook (or a failed delete): the file stays,
+                // the pass keeps going, the next sweep retries it — the same
+                // shape as a refused page delete above.
+                outcome.undeleted += 1;
+                tracing::warn!(
+                    file = %ledger.file_name,
+                    %error,
+                    "forget sweep: event ledger delete refused or failed; retrying on next sweep"
+                );
+            }
+        }
+    }
+    outcome
 }
 
 /// A cold page (scored below `cold_threshold`) captured once so the A3 dedup
@@ -1281,5 +1593,83 @@ mod tests {
     fn elapsed_days_clamps_future_timestamps() {
         assert_eq!(elapsed_days(1_000, 2_000), 0.0);
         assert!(elapsed_days(US_PER_DAY as i64, 0) >= 1.0);
+    }
+
+    #[test]
+    fn ledger_month_index_reads_only_real_months() {
+        assert_eq!(
+            ledger_month_index("log-2026-07.md"),
+            Some(month_index(2026, 7))
+        );
+        assert_eq!(
+            ledger_month_index("log-2026-12.md"),
+            Some(month_index(2026, 12))
+        );
+        for name in [
+            "log.md",
+            "log-2026-13.md",
+            "log-2026-00.md",
+            "log-2026-7.md",
+            "log-2026-07-15.md",
+            "notes/log-2026-07.md",
+            "LOG-2026-07.md",
+        ] {
+            assert_eq!(
+                ledger_month_index(name),
+                None,
+                "{name} must not date a ledger"
+            );
+        }
+        // Consecutive months, across a year boundary, are consecutive indices.
+        assert_eq!(
+            month_index(2027, 1) - month_index(2026, 12),
+            1,
+            "december to january is one month"
+        );
+    }
+
+    /// The age rule: a ledger is deletable once `months` whole calendar months
+    /// passed after its own month ended, and not a month earlier.
+    #[test]
+    fn ledger_age_rule_counts_whole_months_after_the_month_ended() {
+        let now = month_index(2026, 10);
+        // N = 3: June ended Jul 1; Jul, Aug and Sep are the three whole months
+        // after it, so June is deletable in October. July has only Aug and Sep
+        // behind it (October is not over), so it is one month short.
+        assert!(ledger_is_expired(month_index(2026, 5), now, 3));
+        assert!(ledger_is_expired(month_index(2026, 6), now, 3));
+        assert!(!ledger_is_expired(month_index(2026, 7), now, 3));
+        assert!(!ledger_is_expired(month_index(2026, 8), now, 3));
+        assert!(!ledger_is_expired(month_index(2026, 9), now, 3));
+        assert!(!ledger_is_expired(month_index(2026, 10), now, 3));
+        // N = 1 across a year boundary.
+        let jan = month_index(2027, 1);
+        assert!(ledger_is_expired(month_index(2026, 11), jan, 1));
+        assert!(!ledger_is_expired(month_index(2026, 12), jan, 1));
+    }
+
+    /// The writer guard holds whatever the age: the current and the previous
+    /// month are never deletable, even with `months == 0` (which the sweep never
+    /// passes, but which makes the age rule alone delete last month) or a
+    /// retention so large the arithmetic saturates. Mutation captured: dropping
+    /// the guard line makes the `months == 0` case delete the previous month.
+    #[test]
+    fn ledger_guard_protects_the_current_and_previous_month_regardless_of_age() {
+        let now = month_index(2026, 10);
+        for months in [0, 1, 2, 12, i64::MAX] {
+            assert!(
+                !ledger_is_expired(now, now, months),
+                "the current month must be kept at months={months}"
+            );
+            assert!(
+                !ledger_is_expired(now - 1, now, months),
+                "the previous month must be kept at months={months}"
+            );
+        }
+        // Control: with no retention the age rule alone reaches two months back,
+        // so the cases above are the guard's doing.
+        assert!(ledger_is_expired(now - 2, now, 0));
+        // A retention too large to ever elapse deletes nothing, without panic.
+        assert!(!ledger_is_expired(now - 2, now, i64::MAX));
     }
 }

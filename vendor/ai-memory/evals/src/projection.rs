@@ -29,6 +29,11 @@ pub struct ProjectionArgs {
     /// session into this directory.
     #[arg(long)]
     dump: Option<PathBuf>,
+
+    /// Also render and score the opt-in verbatim-residue request beside the
+    /// byte-compatible default request.
+    #[arg(long)]
+    residue: bool,
 }
 
 pub fn run(args: ProjectionArgs) -> Result<()> {
@@ -49,7 +54,7 @@ pub fn run(args: ProjectionArgs) -> Result<()> {
     for (path, fx) in &fixtures {
         let observations = synthesise_observations(fx);
         let session_id = SessionId::new();
-        let request = build_batch_request(session_id, &observations);
+        let request = build_batch_request(session_id, &observations, false);
         let scorer = Scorer::new(
             session_id,
             &observations,
@@ -68,6 +73,32 @@ pub fn run(args: ProjectionArgs) -> Result<()> {
                 dir.join(format!("{stem}.request.txt")),
                 request_text(&request),
             )?;
+        }
+        if args.residue {
+            let request = build_batch_request(session_id, &observations, true);
+            let scorer = Scorer::new(
+                session_id,
+                &observations,
+                &request,
+                &fx.must_mention,
+                &fx.must_not_mention,
+            );
+            let projection = scorer.prompt(observations.len());
+            println!(
+                "{:<28} {}",
+                format!("{} + residue", fx.name),
+                describe_projection(&projection)
+            );
+            if let Some(dir) = &args.dump {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&fx.name);
+                std::fs::write(
+                    dir.join(format!("{stem}.residue.request.txt")),
+                    request_text(&request),
+                )?;
+            }
         }
     }
     Ok(())

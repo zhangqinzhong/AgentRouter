@@ -34,7 +34,6 @@ struct AutoImproveRequest {
     include_raw_fallback: bool,
     proposal_actor: String,
     pending_path: String,
-    eval: ai_memory_consolidate::AutoImproveEvalConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -98,13 +97,6 @@ pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
         include_raw_fallback: args.include_raw_fallback || settings.include_raw_fallback,
         proposal_actor: settings.proposal_actor.clone(),
         pending_path: settings.pending_path.clone(),
-        eval: ai_memory_consolidate::AutoImproveEvalConfig {
-            enabled: settings.eval.enabled,
-            command: settings.eval.command.clone(),
-            timeout_secs: settings.eval.timeout_secs,
-            targets: settings.eval.targets.clone(),
-            min_delta: settings.eval.min_delta,
-        },
     };
 
     let response: StageResponse = post_json(&endpoint, "/admin/auto-improve", &request).await?;

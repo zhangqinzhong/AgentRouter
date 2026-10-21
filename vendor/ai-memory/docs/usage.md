@@ -151,6 +151,53 @@ consolidation. Checkpoints and superseding versions therefore keep the same
 origin. Manual `memory_write_page` and `ai-memory write-page` calls do not
 infer an agent.
 
+### Reload context after a compaction
+
+A compaction keeps a model-written summary of the conversation, and the
+summary can drop or soften what you asked. Start a prompt with
+`reload context` to put the stretch it dropped back in front of the agent:
+
+```
+reload context after last compaction, then finish the screenshots for guide 12
+```
+
+The hooks see the phrase at the start of the prompt (any case; a sentence
+that only mentions it does not count) and inject a **compaction recap** built
+from what ai-memory captured for this session between its latest compaction
+and the one before it (or the session start):
+
+- your prompts in that stretch, verbatim, oldest first; harness markup and
+  task notifications are left out. When they do not all fit, the newest stay
+  whole, the next older one is cut to the room left, and older ones are
+  dropped with a note;
+- the agent's last reply before the compaction. Replies are captured only
+  with the assistant-capture double opt-in (`install-hooks --capture-assistant`
+  plus `capture_assistant` on the server); without it the recap says so;
+- the project's open handoffs, listed and never claimed, this session's own
+  first.
+
+The rest of the prompt runs as usual with the recap in context. Serving the
+recap writes nothing: no handoff is claimed and no page or extra observation
+is added (the prompt itself is captured like any other).
+
+Fetching the recap holds the prompt until it arrives. On a healthy local
+server that takes milliseconds. When the server is slow or unreachable, the
+hook first spends up to 3 seconds sending queued events and then waits up to
+3 seconds for the recap, so the prompt can take about 6 seconds to reach the
+agent, which then runs it without a recap. Prompts that do not start with
+`reload context` never wait for this.
+
+| Harness | When the agent sees the recap |
+|---|---|
+| Claude Code | With that prompt (`UserPromptSubmit` `additionalContext`, up to 8,000 chars) |
+| Codex | With that prompt (developer context, up to 6,000 chars to stay under Codex's hook-output preview limit) |
+| OpenCode V1 / V2 | With that prompt and later model calls, until the next compaction |
+| Grok Build | After the first tool result of that turn: Grok discards `UserPromptSubmit` output. The recap shares that field with a handoff delivered at the same time and is sized to fit; when the handoff leaves too little room, it comes with the next tool result. A request with no tool call expires after 30 minutes or at session end |
+
+A session that has not been compacted yet answers with a one-line notice. The
+full record stays available through `memory_read_session_observations` with
+the session id and `kinds: ["user-prompt", "stop"]`.
+
 ## Proactive memory queries
 
 Hooks handle capture without prompting. Proactive querying depends on
@@ -173,10 +220,11 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Write this session's page yourself" / an in-session "consolidate this session" | `memory_read_session_observations`, then `memory_write_page` with `session_id` and `path: sessions/<id>.md` | The agent compiles the session page with its own model instead of the server's provider. To match the server's multi-page layout it may also write up to four more pages with the same `session_id`: `concepts/<slug>.md` (`tier: semantic`, `kind: fact`), `decisions/<short>.md` (`kind: decision`), `gotchas/<slug>.md` (`kind: gotcha`) and `_rules/<slug>.md` (`kind: rule`); the session page is `tier: episodic`, `kind: fact`. The session must belong to the project the page is written to; the page records it as evidence, gets the same session-page frontmatter (plus `consolidated_by: agent`) and duplicate-title suffix, and the session's queued SessionEnd job is marked completed. The write uses the `write_page` admission op, so a webhook that filters on `consolidate` does not see it. A pinned page is never overwritten this way. SessionEnd keeps the page: neither the rule-based summary nor the opt-in SessionEnd worker replaces it, even when the session went on after the write, and a PreCompact or PostCompaction checkpoint leaves it alone too. |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Without a session ID, reviews the newest completed session with no persisted auto-improvement run, advancing past preflight skips on repeated calls; pass an ID for a targeted rerun. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
-| "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it. TTL outranks `pinned`. |
+| "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it; a `memory_read_page` by exact path still returns it, marked `expired: true`. TTL outranks `pinned`. |
 | "Search expired notes for X" | `memory_query` with `include_expired: true` | Opts an explicit project, sibling-scope, or global search into expired historical pages; ordinary searches exclude them. |
 | "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits, plus a top-level `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`; streams that did not run are left out). A global query reports only its distinct FTS stream and `fts_ms`. |
 | Improve top project/scopes search relevance | Set `AI_MEMORY_RERANKER=llm` on a server with an LLM provider | Sends the bounded query plus up to 30 bounded titles/snippets to the provider for at most one final relevance pass. Invalid, partial, failed, timed-out, or concurrency-saturated requests preserve the normal order; `global=true` and supplemental global-preference hits are unchanged. |
+| "Undo that change" / "bring back the page I deleted" | `memory_restore_page` | Call it without `rev` to list the page's checkpoints, then with the chosen `rev` to write that version back as the current one. The replaced version stays reachable. Admin only on a multi-user server; see [lifecycle-ops](lifecycle-ops.md#mcp-memory_restore_page). |
 | "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
 | "That recalled page helped" / "this page is stale" | `memory_feedback` | Records `helpful`, `not_helpful`, `stale`, or `wrong` for the exact path. Retention weight affects sweep-eligible episodic pages; stale/wrong also flag any current page for lint review. Retrieved content never authorizes feedback by itself. |
 | "Audit the wiki" / "any contradictions?" | `memory_lint` | Runs stale-page, contradiction, and rule-suggestion checks. |
@@ -199,6 +247,33 @@ close. `semantic` / `procedural` tiers, `pinned: true`, and the tags
 a page: a query aimed at a session-specific term can still return that session.
 `pinned` remains primarily a retention and automation-mutation control, not an
 unconditional search override.
+
+## Search from the terminal
+
+`ai-memory search` runs an FTS5 query against the wiki from a shell. It skips
+the entity, vector and graph streams and the raw-observation fallback that the
+agent's hybrid `memory_query` uses.
+
+```bash
+ai-memory search "wal mode"                           # current project (cwd / marker)
+ai-memory search "wal mode" --workspace acme --project api
+ai-memory search "wal mode" --global                  # every project
+ai-memory search "wal mode" --global --json -n 20
+```
+
+Without a flag the scope comes from the current directory, the same way as
+every other client command (see [marker-file.md](marker-file.md)).
+`--global` sends no scope and searches the wiki pages of every project; each
+hit is printed with its `workspace/project`, and `--json` adds `workspace` and
+`project` fields to each hit. `--global` cannot be combined with `--workspace`
+or `--project`. It covers compiled wiki pages only, not raw observations.
+
+The command calls `GET /admin/search`, so on a multi-user server only the root
+operator can run it. A DB user searches across the projects they may read with
+`memory_query(global=true)` or the web search page instead. A repository's
+`[recall] default_global` marker setting changes what an agent's unscoped
+`memory_query` reads; it does not change this command, which stays
+project-scoped unless you pass `--global`.
 
 ## Historical memory and live code intelligence
 
@@ -367,13 +442,26 @@ Agent, `--skills-agent hermes`
 installs under `.hermes/skills` (project) or `~/.hermes/skills` (global).
 
 When a project keeps `AGENTS.md` as its canonical instruction file, give it a
-`CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code loads
-`CLAUDE.md` and does not read `AGENTS.md`, so without that import a block
-installed with `--target AGENTS.md`, along with every project rule in the same
-file, is absent from context at session start. A prose "read AGENTS.md" pointer
-does not load the file; it asks the agent to open it, which leaves adherence to
-whether the agent does. See
+`CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code 2.1.277
+and later reads `AGENTS.md` only when no `CLAUDE.md`, `.claude/CLAUDE.md`, or
+`CLAUDE.local.md` exists in the working directory or any directory above it.
+Without that import, sessions that read only `CLAUDE.md` (older Claude Code, the
+AGENTS.md plugin disabled, the `claude-md` Project instructions setting, or a
+developer's own `CLAUDE.local.md`) start without a block installed with
+`--target AGENTS.md`, or any other project rule in that file. A prose "read
+AGENTS.md" pointer does not load the file; it asks the agent to open it, which
+leaves adherence to whether the agent does. See
 [Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+`install-instructions` prints a note when it writes only `AGENTS.md` while a
+`CLAUDE.local.md`, `.claude/CLAUDE.md` or `CLAUDE.md` in the directory or above
+it would make Claude Code read that file instead, unless one of them imports
+the `AGENTS.md` being written. Claude Code's user-level
+`~/.claude/CLAUDE.md` does not count, including when `$HOME` reaches that
+directory through a symlink. The import is resolved from the file that contains
+it (`@AGENTS.md` in `.claude/CLAUDE.md` points at `.claude/AGENTS.md`; that file
+needs `@../AGENTS.md`), `~/` expands from the home directory, and an `@path`
+inside a code span or fenced block does not count. Imports are followed through
+other imported files up to four hops, as Claude Code follows them.
 
 To refresh only the managed Agent Skills:
 
@@ -545,9 +633,12 @@ breadcrumbs, rendered markdown, metadata, and search. On a project, page,
 namespace, history or session view the header search box searches that project;
 elsewhere it searches every project with FTS5, like
 `memory_query(global=true)`, and the search page's "Search in" selector picks
-a project. A page shows an outline of its headings, the pages that cite it and
+a project, and its "Kind" and "Tier" selects (`kind=` and `tier=`) keep only
+the pages of that kind or tier. A page shows an outline of its headings, an `expired` badge once its `expires_at` TTL has passed, the pages that cite it and
 the pages it cites; a folder's namespace listing sorts by recent update or by
-title and shows 25 pages at a time. The search on a project page ranks with
+title and shows 25 pages at a time. The tree, the recent-activity list and a
+namespace listing leave out a page whose `expires_at` TTL has passed, as search
+does; its own URL still opens it. The search on a project page ranks with
 the same hybrid ranker as `memory_query` for that project, and its "Explain
 ranking" box shows each hit's stream ranks, RRF contributions, authority and rerank score, plus the per-stream timings.
 Root also gets `/web/health`: hook counters (429s included), the writer queue,

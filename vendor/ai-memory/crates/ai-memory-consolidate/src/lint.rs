@@ -375,6 +375,9 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
         std::collections::HashMap::new();
 
     for c in candidates {
+        if candidate_is_expired(c, now_us) {
+            continue;
+        }
         // Stale: episodic, older than the lambda-derived threshold, zero accesses.
         #[allow(clippy::cast_precision_loss)]
         let age_days = (now_us - c.updated_at_us) as f64 / US_PER_DAY;
@@ -471,6 +474,10 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
     }
 
     out
+}
+
+fn candidate_is_expired(candidate: &DecayCandidate, now_us: i64) -> bool {
+    candidate.expires_at_us.is_some_and(|us| us <= now_us)
 }
 
 // ── A5: zero-LLM contradiction detection (cosine-similarity band) ──────────
@@ -594,10 +601,12 @@ async fn detected_contradiction_pass(
     // knowledge pages a user compounds (semantic / procedural), not session
     // logs or the lint report itself. "Coldest first" = fewest accesses, then
     // oldest update, so a large corpus is trimmed to its most-stale knowledge.
+    let now_us = Timestamp::now().as_microsecond();
     let mut eligible: Vec<&DecayCandidate> = candidates
         .iter()
         .filter(|c| matches!(c.tier, Tier::Semantic | Tier::Procedural))
         .filter(|c| !c.path.as_str().starts_with("_lint/"))
+        .filter(|c| !candidate_is_expired(c, now_us))
         .collect();
     eligible.sort_by(|a, b| {
         a.access_count
@@ -660,9 +669,13 @@ async fn contradiction_pass(
 ) -> Result<Vec<LintFinding>, LintError> {
     // Focus on semantic / procedural pages — those are the ones the
     // user actually compounds knowledge on.
+    let now_us = Timestamp::now().as_microsecond();
     let mut subset: Vec<&DecayCandidate> = candidates
         .iter()
         .filter(|c| matches!(c.tier, Tier::Semantic | Tier::Procedural))
+        // The previous report is the lint's own output, not knowledge.
+        .filter(|c| !c.path.as_str().starts_with("_lint/"))
+        .filter(|c| !candidate_is_expired(c, now_us))
         .collect();
     if subset.len() < 2 {
         return Ok(Vec::new());
@@ -1084,6 +1097,104 @@ mod tests {
             findings.iter().all(|f| f.kind != "rule_suggestion"),
             "non-rule page must not produce a rule_suggestion finding",
         );
+    }
+
+    #[test]
+    fn rule_pass_skips_expired_pages() {
+        let past = Timestamp::now().as_microsecond() - 1_000_000;
+        let very_old = Timestamp::now().as_microsecond() - (90 * 86_400_000_000i64);
+        let expired_episodic = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("sessions/old.md").unwrap(),
+            tier: Tier::Episodic,
+            pinned: false,
+            updated_at_us: very_old,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: "{}".into(),
+            expires_at_us: Some(past),
+            salience: None,
+            compacted_at_us: None,
+        };
+        let expired_rule = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("_rules/expired.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: very_old,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"kind": "rule"}"#.into(),
+            expires_at_us: Some(past),
+            salience: None,
+            compacted_at_us: None,
+        };
+        let live_page = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/live.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 1,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Shared Title"}"#.into(),
+            expires_at_us: None,
+            salience: None,
+            compacted_at_us: None,
+        };
+        let expired_duplicate = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/expired-dupe.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: very_old,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Shared Title"}"#.into(),
+            expires_at_us: Some(past),
+            salience: None,
+            compacted_at_us: None,
+        };
+        let candidates = vec![expired_episodic, expired_rule, live_page, expired_duplicate];
+        let findings = rule_based_findings(&candidates, STALE_DAYS);
+        assert!(
+            findings.is_empty(),
+            "expired pages must not produce stale, rule_suggestion, or duplicate findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn expiry_filter_keeps_future_ttl_and_excludes_the_boundary() {
+        let now_us = Timestamp::now().as_microsecond();
+        let candidate = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/ttl.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: now_us,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: "{}".into(),
+            expires_at_us: None,
+            salience: None,
+            compacted_at_us: None,
+        };
+
+        assert!(!candidate_is_expired(&candidate, now_us));
+        assert!(!candidate_is_expired(
+            &DecayCandidate {
+                expires_at_us: Some(now_us + 1),
+                ..candidate.clone()
+            },
+            now_us
+        ));
+        assert!(candidate_is_expired(
+            &DecayCandidate {
+                expires_at_us: Some(now_us),
+                ..candidate
+            },
+            now_us
+        ));
     }
 
     // ── LintFinding tolerant deserialization ─────────────────────────────

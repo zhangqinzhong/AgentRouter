@@ -14,6 +14,7 @@ use ai_memory_core::{
     LinkTarget, NewPage, PageEvidence, PageEvidenceKind, PagePath, Relation, Tier,
 };
 use ai_memory_store::{RetrievalTuning, Store};
+use jiff::Timestamp;
 
 #[allow(clippy::too_many_arguments)]
 fn page(
@@ -56,6 +57,19 @@ fn belief_tuning(weight: f64) -> RetrievalTuning {
         belief_authority_weight: weight,
         ..RetrievalTuning::default()
     }
+}
+
+fn expired_at() -> Timestamp {
+    "2020-01-01T00:00:00Z".parse().unwrap()
+}
+
+fn future_at() -> Timestamp {
+    "2099-01-01T00:00:00Z".parse().unwrap()
+}
+
+fn with_expiry(mut page: NewPage, expires_at: Timestamp) -> NewPage {
+    page.expires_at = Some(expires_at);
+    page
 }
 
 async fn store_with_scope() -> (
@@ -355,6 +369,162 @@ async fn a_live_contradiction_lowers_confidence() {
     );
     // Same evidence count; only the contradiction differs.
     assert_eq!(disputed.1.evidence_count, clean.1.evidence_count);
+}
+
+/// A contradiction edge targeting an expired or missing page is stale and must
+/// NOT count as an unresolved contradiction in `page_belief_inputs` or weaken
+/// confidence. Only a latest, unexpired target page lowers confidence.
+#[tokio::test]
+async fn contradiction_to_expired_target_does_not_lower_confidence() {
+    let (_tmp, mut store, ws, proj) = store_with_scope().await;
+
+    // Target that has already expired past its TTL.
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page(
+                ws,
+                proj,
+                "notes/expired_target.md",
+                "expired target body",
+                vec![],
+                vec![],
+            ),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    // Target that is live and unexpired (future TTL).
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page(
+                ws,
+                proj,
+                "notes/live_target.md",
+                "live target body",
+                vec![],
+                vec![],
+            ),
+            future_at(),
+        ))
+        .await
+        .unwrap();
+
+    // Baseline page with 5 sessions of evidence and no contradictions.
+    let clean_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            proj,
+            "notes/clean.md",
+            "widgetquux shared",
+            sessions(5),
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    // Page contradicting the expired target: contradiction is stale, so it must
+    // not weaken belief.
+    let disputed_expired_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            proj,
+            "notes/disputed_expired.md",
+            "widgetquux shared",
+            sessions(5),
+            vec![LinkTarget {
+                workspace: None,
+                project: None,
+                path: PagePath::new("notes/expired_target.md").unwrap(),
+                relation: Some(Relation::Contradicts),
+            }],
+        ))
+        .await
+        .unwrap();
+
+    // Page contradicting the live target: contradiction is active, so it weakens belief.
+    let disputed_live_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            proj,
+            "notes/disputed_live.md",
+            "widgetquux shared",
+            sessions(5),
+            vec![LinkTarget {
+                workspace: None,
+                project: None,
+                path: PagePath::new("notes/live_target.md").unwrap(),
+                relation: Some(Relation::Contradicts),
+            }],
+        ))
+        .await
+        .unwrap();
+
+    // Verify page_belief_inputs directly:
+    let inputs = store
+        .reader
+        .page_belief_inputs(&[clean_id, disputed_expired_id, disputed_live_id])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inputs[&clean_id].unresolved_contradictions, 0,
+        "clean page has no contradictions"
+    );
+    assert_eq!(
+        inputs[&disputed_expired_id].unresolved_contradictions, 0,
+        "contradiction to expired target is stale and must not count"
+    );
+    assert_eq!(
+        inputs[&disputed_live_id].unresolved_contradictions, 1,
+        "contradiction to live target must count as unresolved"
+    );
+
+    // Verify through search ranking and explain output:
+    store.reader.set_retrieval_tuning(belief_tuning(0.5));
+    let hits = store
+        .reader
+        .hybrid_search_explained(
+            ws,
+            proj,
+            "widgetquux".to_string(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            10,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let clean = hits
+        .iter()
+        .find(|(h, _)| h.path.as_str() == "notes/clean.md")
+        .unwrap();
+    let disputed_expired = hits
+        .iter()
+        .find(|(h, _)| h.path.as_str() == "notes/disputed_expired.md")
+        .unwrap();
+    let disputed_live = hits
+        .iter()
+        .find(|(h, _)| h.path.as_str() == "notes/disputed_live.md")
+        .unwrap();
+
+    assert!(
+        (disputed_expired.1.confidence.unwrap() - clean.1.confidence.unwrap()).abs() < 1e-4,
+        "expired target contradiction must not lower confidence"
+    );
+    assert!(
+        disputed_live.1.confidence.unwrap() < clean.1.confidence.unwrap(),
+        "live target contradiction must lower confidence"
+    );
 }
 
 /// The anti-entrenchment guarantee: a superseding correction always takes and

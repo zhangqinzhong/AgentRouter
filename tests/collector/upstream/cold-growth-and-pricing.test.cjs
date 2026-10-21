@@ -84,3 +84,8 @@ test("Antigravity usage metadata bills cached, text, and reasoning tokens", () =
   assert.equal(info.reasoningOutput, 11);
   assert.equal(extractAntigravityGenInfo(Buffer.from([0xff])), null);
 });
+
+test('OpenCode free variants never inherit the paid base model price',()=>{
+ assert.deepEqual(getModelPricing('gpt-5-free',{source:'opencode'}),{input:0,output:0,cache_read:0,cache_write:0});
+ assert.ok(getModelPricing('gpt-5',{source:'opencode'}).input>0);
+});

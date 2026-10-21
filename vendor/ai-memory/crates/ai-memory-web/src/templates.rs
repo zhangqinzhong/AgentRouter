@@ -360,10 +360,18 @@ pub(crate) struct PageView {
     pub tier: String,
     /// Whether the page is pinned.
     pub pinned: bool,
+    /// Whether the page's `expires_at` TTL has passed. Search and the
+    /// listings already leave such a page out; its own URL still opens it,
+    /// so the view says so.
+    pub expired: bool,
     /// Humanised updated timestamp.
     pub updated_relative: String,
     /// Humanised created timestamp.
     pub created_relative: String,
+    /// Exact updated timestamp (ISO 8601), shown on hover.
+    pub updated_at: String,
+    /// Exact created timestamp (ISO 8601), shown on hover.
+    pub created_at: String,
     /// Path of the page this supersedes, or empty string.
     pub supersedes_path: String,
     /// Link target for the superseded page, or empty string.
@@ -626,6 +634,14 @@ pub(crate) struct TimingRow {
     pub ms: String,
 }
 
+/// One option of the search page's kind or tier filter.
+pub(crate) struct FilterOption {
+    /// The value the select submits and shows.
+    pub value: String,
+    /// The current search filters on this value.
+    pub selected: bool,
+}
+
 /// One project in the search page's "Search in" selector.
 pub(crate) struct ScopeOption {
     /// `workspace/project`, the value the selector submits.
@@ -678,6 +694,15 @@ pub(crate) struct SearchView {
     pub scope_groups: Vec<ScopeGroup>,
     /// Link to the scoped project, for the breadcrumb.
     pub project_href: String,
+    /// A kind or tier filter narrowed the hits.
+    pub filtered: bool,
+    /// The kind filter names no standard kind (empty when it does, or when
+    /// there is none); a custom frontmatter kind or a typo.
+    pub unknown_kind: String,
+    /// Kinds the filter offers.
+    pub kind_options: Vec<FilterOption>,
+    /// Tiers the filter offers.
+    pub tier_options: Vec<FilterOption>,
 }
 
 impl SearchView {
@@ -725,6 +750,15 @@ pub(crate) struct PendingRow {
     pub is_rule: bool,
     /// The proposal rewrites an existing page.
     pub rewrites_existing: bool,
+    /// `ai-memory pending-writes approve` for this row, quoted for a POSIX
+    /// shell and shown to a browser that can only read the page.
+    pub posix_cli_approve: String,
+    /// The matching POSIX-shell `reject` command.
+    pub posix_cli_reject: String,
+    /// The matching command quoted for PowerShell.
+    pub powershell_cli_approve: String,
+    /// The matching PowerShell `reject` command.
+    pub powershell_cli_reject: String,
 }
 
 /// One `<option>` in a triage-page filter.
@@ -755,6 +789,9 @@ pub(crate) struct PendingView {
     pub truncated: bool,
     /// The read cap, shown when `truncated`.
     pub limit: usize,
+    /// The browser signed in with the legacy Basic credential, which admits
+    /// GET only: the decision buttons give way to the CLI commands.
+    pub read_only: bool,
 }
 
 // ---------------------------------------------------------------------------

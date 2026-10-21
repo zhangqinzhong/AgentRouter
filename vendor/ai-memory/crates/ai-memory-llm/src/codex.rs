@@ -74,7 +74,10 @@ impl CodexProvider {
     pub fn new(auth: CodexAuth, model: impl Into<String>) -> LlmResult<Self> {
         read_credentials(&auth.auth_file)?;
         Ok(Self {
-            client: reqwest::Client::builder().build().map_err(LlmError::from)?,
+            client: reqwest::Client::builder()
+                .redirect(crate::redirect::same_origin_redirects())
+                .build()
+                .map_err(LlmError::from)?,
             model: model.into(),
             auth,
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),

@@ -18,7 +18,7 @@ mod pending;
 mod project;
 mod search;
 mod session;
-mod statics;
+pub(crate) mod statics;
 
 /// Whether the viewer may read `workspace/project` (#708).
 ///

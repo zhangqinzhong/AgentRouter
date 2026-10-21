@@ -180,6 +180,41 @@ pub fn lexical_absolute(path: &Path) -> PathBuf {
     normalized
 }
 
+#[cfg(not(windows))]
+fn destination_paths_match(canonical: &Path, lexical: &Path) -> bool {
+    canonical == lexical
+}
+
+#[cfg(windows)]
+fn destination_paths_match(canonical: &Path, lexical: &Path) -> bool {
+    use std::path::Prefix;
+
+    // Windows canonicalization adds a verbatim prefix even when no link was
+    // followed. Compare the remaining components without resolving lexical:
+    // resolving both paths would hide junctions and ancestor symlinks.
+    let mut canonical = canonical.components();
+    let mut lexical = lexical.components();
+    let same_prefix = match (canonical.next(), lexical.next()) {
+        (Some(Component::Prefix(left)), Some(Component::Prefix(right))) => {
+            match (left.kind(), right.kind()) {
+                (
+                    Prefix::Disk(left) | Prefix::VerbatimDisk(left),
+                    Prefix::Disk(right) | Prefix::VerbatimDisk(right),
+                ) => left.eq_ignore_ascii_case(&right),
+                (
+                    Prefix::UNC(left_server, left_share)
+                    | Prefix::VerbatimUNC(left_server, left_share),
+                    Prefix::UNC(right_server, right_share)
+                    | Prefix::VerbatimUNC(right_server, right_share),
+                ) => left_server == right_server && left_share == right_share,
+                (left, right) => left == right,
+            }
+        }
+        (left, right) => left == right,
+    };
+    same_prefix && canonical.eq(lexical)
+}
+
 /// Prepare the destination directory: create it when missing, then refuse
 /// symlinked destinations (including any symlinked component on the way —
 /// on Windows this also catches junction/reparse targets via the
@@ -207,7 +242,7 @@ pub fn prepare_dest(dest: &Path) -> Result<PathBuf> {
     let lexical = lexical_absolute(dest);
     let canonical = fs::canonicalize(dest)
         .with_context(|| format!("cannot canonicalize --dest {}", dest.display()))?;
-    if canonical != lexical {
+    if !destination_paths_match(&canonical, &lexical) {
         bail!(
             "--dest reaches through a symlink ({} -> {}); pass the resolved path instead",
             lexical.display(),
@@ -339,6 +374,102 @@ mod tests {
         let dest = tmp.path().canonicalize().unwrap().join("a/b/c");
         let made = prepare_dest(&dest).unwrap();
         assert!(made.is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepare_dest_accepts_plain_windows_absolute_paths() {
+        // Windows TEMP may use an 8.3 alias, which exercises a different
+        // canonicalization change from the verbatim prefix under test.
+        let tmp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let dest = tmp.path().join("wiki").join("nested");
+        assert_eq!(prepare_dest(&dest).unwrap(), dest.canonicalize().unwrap());
+        assert_eq!(
+            prepare_dest(tmp.path()).unwrap(),
+            tmp.path().canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepare_dest_accepts_windows_relative_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = tmp.path().strip_prefix(&cwd).unwrap().join("wiki");
+        assert!(!relative.is_absolute());
+        assert_eq!(
+            prepare_dest(&relative).unwrap(),
+            tmp.path().join("wiki").canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_destination_prefixes_do_not_hide_different_paths() {
+        for (canonical, lexical) in [
+            (r"\\?\C:\wiki", r"C:\wiki"),
+            (r"\\?\C:\wiki", r"c:\wiki"),
+            (r"\\?\UNC\server\share\wiki", r"\\server\share\wiki"),
+            (r"\\?\C:\wiki", r"\\?\C:\wiki"),
+        ] {
+            assert!(destination_paths_match(
+                Path::new(canonical),
+                Path::new(lexical)
+            ));
+        }
+        for (canonical, lexical) in [
+            (r"\\?\C:\outside", r"C:\wiki"),
+            (r"\\?\C:\wiki", r"D:\wiki"),
+            (r"\\?\UNC\server\share\wiki", r"\\server\other\wiki"),
+            (r"\\?\UNC\server\share\wiki", r"\\other\share\wiki"),
+            (r"\\?\Volume{one}\wiki", r"\\?\Volume{two}\wiki"),
+        ] {
+            assert!(!destination_paths_match(
+                Path::new(canonical),
+                Path::new(lexical)
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepare_dest_refuses_windows_junctions_without_touching_the_target() {
+        let tmp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let outside = tmp.path().join("outside");
+        let child = outside.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let canary = child.join("canary.md");
+        fs::write(&canary, b"untouched").unwrap();
+        assert_eq!(prepare_dest(&child).unwrap(), child.canonicalize().unwrap());
+
+        let junction = tmp.path().join("junction");
+        // A junction needs no symlink privilege. Paths stay data in the
+        // child environment, including shell metacharacters in a temp root.
+        let output = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:WIKISYNC_TEST_LINK -Target $env:WIKISYNC_TEST_TARGET | Out-Null",
+            ])
+            .env("WIKISYNC_TEST_LINK", &junction)
+            .env("WIKISYNC_TEST_TARGET", &outside)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        for dest in [&junction, &junction.join("child")] {
+            let err = prepare_dest(dest).unwrap_err().to_string();
+            assert!(err.contains("symlink"), "{err}");
+        }
+        assert_eq!(fs::read(&canary).unwrap(), b"untouched");
+        assert_eq!(fs::read_dir(&child).unwrap().count(), 1);
+        fs::remove_dir(&junction).unwrap();
+        assert!(canary.is_file());
     }
 
     #[test]

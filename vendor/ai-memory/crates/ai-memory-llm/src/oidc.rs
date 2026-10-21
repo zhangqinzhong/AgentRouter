@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use crate::auth_file::now_ms;
 use crate::error::{LlmError, LlmResult};
 use crate::response::{provider_error_body, response_json_limited};
-use crate::stored_token::{StoredOAuthToken, refresh_grant};
+use crate::stored_token::{
+    CredentialEndpoint, StoredOAuthToken, credential_endpoint, refresh_grant,
+};
 
 /// Default device-flow scopes: `openid` (ID token), `profile` (so the access
 /// token carries `preferred_username` → `X-Memory-Actor-User` on the server),
@@ -171,16 +173,31 @@ pub enum PollOutcome {
     Other(String),
 }
 
+/// Refuse an OIDC URL that would carry the device code or tokens in clear
+/// text. OIDC requires an `https` issuer and OAuth requires TLS at the token
+/// endpoint; plain `http` stays usable on loopback for local test issuers.
+fn require_tls(what: &str, url: &str) -> LlmResult<CredentialEndpoint> {
+    credential_endpoint(&format!("OIDC {what}"), url)
+}
+
 /// Resolve the device + token endpoints from the issuer's discovery document.
 ///
 /// # Errors
-/// Returns [`LlmError`] on transport failure or a non-success status.
+/// Returns [`LlmError`] on transport failure or a non-success status, and
+/// [`LlmError::Auth`] when the issuer or a discovered endpoint is not `https`
+/// outside loopback.
 pub async fn discover(client: &reqwest::Client, issuer: &str) -> LlmResult<OidcDiscovery> {
+    require_tls("issuer", issuer)?;
     let url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    let resp = client.get(&url).send().await.map_err(LlmError::from)?;
+    let endpoint = require_tls("discovery endpoint", &url)?;
+    let resp = client
+        .get(endpoint.as_url().clone())
+        .send()
+        .await
+        .map_err(LlmError::from)?;
     let status = resp.status();
     if !status.is_success() {
         let body = provider_error_body(resp).await;
@@ -188,7 +205,13 @@ pub async fn discover(client: &reqwest::Client, issuer: &str) -> LlmResult<OidcD
             "OIDC discovery failed ({status}) for {url}: {body}"
         )));
     }
-    response_json_limited::<OidcDiscovery>(resp).await
+    let discovery = response_json_limited::<OidcDiscovery>(resp).await?;
+    require_tls(
+        "device_authorization_endpoint",
+        &discovery.device_authorization_endpoint,
+    )?;
+    require_tls("token_endpoint", &discovery.token_endpoint)?;
+    Ok(discovery)
 }
 
 /// Start the device-authorization grant for a public client.
@@ -201,8 +224,12 @@ pub async fn request_device_code(
     client_id: &str,
     scope: &str,
 ) -> LlmResult<DeviceAuthorizationResponse> {
+    let endpoint = require_tls(
+        "device_authorization_endpoint",
+        &discovery.device_authorization_endpoint,
+    )?;
     let resp = client
-        .post(&discovery.device_authorization_endpoint)
+        .post(endpoint.as_url().clone())
         .form(&[("client_id", client_id), ("scope", scope)])
         .send()
         .await
@@ -228,8 +255,9 @@ pub async fn poll_token_once(
     client_id: &str,
     device_code: &str,
 ) -> LlmResult<PollOutcome> {
+    let endpoint = require_tls("token_endpoint", &discovery.token_endpoint)?;
     let resp = client
-        .post(&discovery.token_endpoint)
+        .post(endpoint.as_url().clone())
         .form(&[
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ("device_code", device_code),
@@ -261,13 +289,14 @@ pub async fn poll_token_once(
 /// # Errors
 /// Returns [`LlmError::Auth`] when the refresh grant is rejected (the caller
 /// should fall back to the stale token or prompt a re-login).
-pub async fn refresh_access_token(
-    client: &reqwest::Client,
-    token: &OidcToken,
-) -> LlmResult<OidcToken> {
+pub async fn refresh_access_token(token: &OidcToken) -> LlmResult<OidcToken> {
+    let token_endpoint = require_tls("token_endpoint", &token.extra.token_endpoint)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     let token_response = refresh_grant::<OidcTokenResponse>(
-        client,
-        &token.extra.token_endpoint,
+        &client,
+        &token_endpoint,
         token.refresh.expose_secret(),
         &token.extra.client_id,
         "OIDC refresh failed",
@@ -366,5 +395,238 @@ mod tests {
         // ...unless a previous refresh token is carried forward.
         let ok = OidcToken::from_token_response(&resp, "iss", "cid", "tok", Some("old-refresh"));
         assert_eq!(ok.unwrap().refresh.expose_secret(), "old-refresh");
+    }
+
+    #[test]
+    fn require_tls_accepts_https_and_loopback_http_only() {
+        for (url, accepted) in [
+            ("https://idp.example.com/realms/team", true),
+            ("http://localhost:8080/realms/team", true),
+            ("http://LOCALHOST:8080/realms/team", true),
+            ("http://127.0.0.1:8080/realms/team", true),
+            ("http://[::1]:8080/realms/team", true),
+            ("http://idp.example.com/realms/team", false),
+            ("http://localhost.example.com/realms/team", false),
+            ("http://192.168.1.10:8080/realms/team", false),
+            ("ftp://idp.example.com/realms/team", false),
+            ("idp.example.com/realms/team", false),
+        ] {
+            assert_eq!(require_tls("issuer", url).is_ok(), accepted, "{url}");
+        }
+    }
+
+    fn discovery_json(device: &str, token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "device_authorization_endpoint": device,
+            "token_endpoint": token,
+        })
+    }
+
+    #[tokio::test]
+    async fn discover_refuses_plain_http_issuer_before_any_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The mock stands in for the remote issuer through an HTTP proxy, so
+        // without the guard discovery would succeed instead of failing on DNS.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/realms/team/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(discovery_json(
+                "https://idp.example.com/device",
+                "https://idp.example.com/token",
+            )))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(server.uri()).unwrap())
+            .build()
+            .unwrap();
+
+        let err = discover(&client, "http://idp.example.com/realms/team")
+            .await
+            .expect_err("plain-http issuer off loopback must be refused");
+        assert!(
+            matches!(&err, LlmError::Auth(msg) if msg.contains("must use https")),
+            "{err:?}"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests.is_empty(), "discovery must not be fetched");
+    }
+
+    #[tokio::test]
+    async fn discover_refuses_plain_http_endpoints_from_the_document() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (device, token) in [
+            (
+                "https://idp.example.com/device",
+                "http://idp.example.com/token",
+            ),
+            (
+                "http://idp.example.com/device",
+                "https://idp.example.com/token",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(discovery_json(device, token)),
+                )
+                .mount(&server)
+                .await;
+
+            let err = discover(&reqwest::Client::new(), &server.uri())
+                .await
+                .expect_err("plain-http endpoint off loopback must be refused");
+            assert!(
+                matches!(&err, LlmError::Auth(msg) if msg.contains("must use https")),
+                "{device} {token}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_accepts_a_loopback_issuer_and_endpoints() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let device = format!("{}/device", server.uri());
+        let token = format!("{}/token", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(discovery_json(&device, &token)))
+            .mount(&server)
+            .await;
+
+        let found = discover(&reqwest::Client::new(), &server.uri())
+            .await
+            .unwrap();
+        assert_eq!(found.token_endpoint, token);
+        assert_eq!(found.device_authorization_endpoint, device);
+    }
+
+    #[tokio::test]
+    async fn credential_sinks_revalidate_mutated_discovery_endpoints() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // OidcDiscovery has public fields, so login-time validation is not a
+        // sufficient boundary: another caller can construct or mutate one.
+        // Route remote names through a local proxy to prove the guards reject
+        // before either credential-bearing request reaches the wire.
+        let proxy = MockServer::start().await;
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(proxy.uri()).unwrap())
+            .build()
+            .unwrap();
+        let remote = OidcDiscovery {
+            device_authorization_endpoint: "http://idp.example.com/device".into(),
+            token_endpoint: "http://idp.example.com/token".into(),
+        };
+        let device_error = request_device_code(&client, &remote, "client", OIDC_DEFAULT_SCOPE)
+            .await
+            .expect_err("a mutated remote HTTP device endpoint must be refused");
+        let token_error = poll_token_once(&client, &remote, "client", "device-code")
+            .await
+            .expect_err("a mutated remote HTTP token endpoint must be refused");
+        for error in [device_error, token_error] {
+            assert!(matches!(error, LlmError::Auth(message) if message.contains("must use https")));
+        }
+        assert!(
+            proxy
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "a rejected endpoint reached the proxy"
+        );
+
+        // Plain HTTP remains supported for an explicitly loopback test IdP.
+        let local = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "device-code",
+                "user_code": "ABCD",
+                "verification_uri": "https://idp.example.com/verify"
+            })))
+            .mount(&local)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "authorization_pending"
+            })))
+            .mount(&local)
+            .await;
+        let loopback = OidcDiscovery {
+            device_authorization_endpoint: format!("{}/device", local.uri()),
+            token_endpoint: format!("{}/token", local.uri()),
+        };
+        request_device_code(
+            &reqwest::Client::new(),
+            &loopback,
+            "client",
+            OIDC_DEFAULT_SCOPE,
+        )
+        .await
+        .expect("loopback device endpoint remains supported");
+        assert!(matches!(
+            poll_token_once(&reqwest::Client::new(), &loopback, "client", "device-code")
+                .await
+                .unwrap(),
+            PollOutcome::Pending
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_a_persisted_plain_http_remote_endpoint() {
+        let mut token = sample();
+        token.extra.token_endpoint = "http://idp.example.com/token".into();
+
+        let err = refresh_access_token(&token)
+            .await
+            .expect_err("a persisted remote http endpoint must fail before a request");
+
+        assert!(
+            matches!(&err, LlmError::Auth(message) if message.contains("must use https")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_does_not_forward_the_refresh_token_through_redirects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        let source = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/received", target.uri())),
+            )
+            .mount(&source)
+            .await;
+        let mut token = sample();
+        token.extra.token_endpoint = format!("{}/token", source.uri());
+
+        refresh_access_token(&token)
+            .await
+            .expect_err("a token endpoint redirect is not followed");
+
+        assert!(
+            target
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the persisted refresh token reached the redirect target"
+        );
     }
 }

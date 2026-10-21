@@ -1,14 +1,14 @@
 import type { PageDefaultRanges } from "@agentrouter/core/contracts/app";
 
 export const PAGE_DEFAULT_RANGE_OPTIONS = {
-  overview: ["today", "24h", "7d", "30d", "all"],
+  overview: [ "24h", "7d", "30d", "all"],
   usage: ["day", "week", "month", "total"],
   sessions: ["7d", "30d", "90d", "all"],
   trend: ["day", "week", "month", "year", "total"]
 } as const;
 
 export const DEFAULT_PAGE_RANGES: PageDefaultRanges = {
-  overview: "today",
+  overview: "24h",
   usage: "day",
   sessions: "7d",
   trend: "month"

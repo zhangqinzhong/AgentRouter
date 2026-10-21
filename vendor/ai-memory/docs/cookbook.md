@@ -49,7 +49,9 @@ automatically, and (with an LLM) consolidation compiles them into pages.
 Your agent calls `memory_write_page` and it lands as a durable wiki page (routed
 under `_rules/` when it's a rule). Next session, `memory_query` surfaces it, and
 if the project's `.ai-memory.toml` opts into the on-start brief, rules are
-prepended to the agent's context automatically. To make it apply to **all** your
+prepended to the agent's context automatically: an excerpt of every rule first,
+whole bodies while the budget lasts, and `memory_read_page` for the rest. Pin
+the rule to have it shown in full before the others. To make it apply to **all** your
 projects, ask for it as a standing preference. It goes to your cross-project
 profile (see the next recipe), or to the shared `_global` scope with
 `scope: "global"`. On a multi-user
@@ -299,6 +301,38 @@ compacted or merged stays in git and the supersession chain, recoverable with
   add the export endpoint" (`memory_message_send`), and over there "check my
   inbox" (`memory_message_pop`). See [`agent-messaging.md`](agent-messaging.md).
 
+## Recipe: ask an operator to decide
+
+When an orchestrator has to stop for a person, send a normal cross-project
+message and poll for a normal reply. The subject lines are the shared
+convention; `memory_message_send` and `memory_message_list` are the tools.
+
+1. Send to the project the operator reads. `subject` is
+   `decision: <short question>`. The body names the question, each option's
+   `id` and label, and `reply_project: <your workspace>/<your project>`.
+   Save the returned `message_id`. You need write on that mailbox project,
+   and it must already exist.
+2. The operator, or a companion, answers with `memory_message_send` back to
+   `reply_project`. `subject` is `decision-reply: <message_id>`. The body
+   carries `option: <id>`. Sending the reply needs write on your project.
+3. Poll `memory_message_list` on your inbox until a pending row's subject is
+   that exact `decision-reply:` line. The oldest match is the answer. Pop it
+   when you take it, then `memory_message_cancel` the question.
+
+Before you act on a `requires_root: true` decision, compare `from_owner_user`
+on the reply with the root identity you were configured with. It is
+attribution, not a role, and it is empty on anonymous and single-operator
+servers, so treat an empty value as not root. The server itself does not check
+who answers. `/web` shows the mailbox and leaves every message pending.
+
+The list is oldest-first, 50 rows by default and 200 at most, so keep the
+inbox you poll from drained. A companion can wake on the `message_send`
+observer webhook, then list; the webhook carries scope and actor, and the
+orchestrator still polls.
+
+Full layout and limits:
+[`agent-messaging.md`](agent-messaging.md#operator-decisions-by-subject-and-body).
+
 ## Recipe: several accounts or an external launcher
 
 Give each account or provider its own config home and pass it with `--env`, so
@@ -384,6 +418,14 @@ ai-memory run --yolo claude
   flags on purpose: they would collide with the harness's own flags (Claude
   Code has a `--worktree`). The credential mounts need ai-jail 2.5.0; toggles
   your installed ai-jail lacks are hidden, and naming one is an error.
+- **Connecting back to ai-memory.** The jailed process automatically receives
+  the resolved server URL and URL base path, including a remote server from
+  `config.toml`. A root bearer read from `config.toml` or
+  `bearer_token_file` is not exposed to the managed harness; the launch stops
+  instead. For an authenticated server, give the launch a least-privilege API
+  token with `AI_MEMORY_AUTH_TOKEN=... ai-memory run --jail ...`, or run
+  without the jail. An explicitly supplied environment token already belongs
+  to the child-process boundary and is forwarded.
 - **A project `.ai-jail` wins.** If the directory you launch from has its own
   `.ai-jail`, ai-jail loads it as-is: no checklist, and a bare `--jail` adds
   no toggles; `--jail=…` still applies its list on top. A project file cannot
@@ -508,6 +550,11 @@ ai-memory export-okf …               # export the wiki as an OKF bundle
 ai-memory serve                      # run the server
 ```
 
+On an interactive terminal, `status` and `doctor` group and wrap their output
+for readability. Redirected output, JSON, `NO_COLOR`, and `TERM=dumb` remain
+plain; see [Diagnostic report presentation](diagnostics.md) for the exact
+contract.
+
 ## When it isn't doing what you expect
 
 - **Server/homelab down**: `ai-memory run` does not need the server to start a
@@ -569,11 +616,11 @@ ai-memory serve                      # run the server
   exclusions.
 - **Nothing new is being remembered at all**: run `ai-memory doctor`. It works
   with the server down and says so; it reports the local hook spool (events
-  waiting for the server, and a warning once it is full and each new event
-  evicts the oldest undelivered one); and when ai-memory's Codex hooks are
-  installed, it asks Codex whether it will run them. Codex skips a hook you
-  have not trusted, and skips it again after its command changes, without
-  telling you: open Codex, run `/hooks`, and trust them.
+  waiting for the server, and a warning once it is full and newly captured
+  events are dropped until space is available); and when ai-memory's Codex
+  hooks are installed, it asks Codex whether it will run them. Codex skips a
+  hook you have not trusted, and skips it again after its command changes,
+  without telling you: open Codex, run `/hooks`, and trust them.
 - **Agents keep calling `memory_recall`, `memory_save` or other tools ai-memory
   does not have**: agentmemory's MCP entry or its rules-file guideline block is
   still there. `ai-memory doctor` names each one with the fix (see

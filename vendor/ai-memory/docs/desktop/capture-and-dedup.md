@@ -138,6 +138,5 @@ never invent capture from it; treat it as metadata only.
    product gains traction with users; no docs.
 5. Scope for scratch-workspace sessions: single `desktop/claude-scratch`
    pool vs per-scratch projects (product decision; affects auto-scope).
-6. Antigravity `invocationNum` restarts at 0 on every user turn, so
-   ai-memory's SessionStart mapping runs per turn: acceptable, or gate it
-   per conversation? (product decision after measuring the server effect)
+6. Resolved (#1306): Antigravity `invocationNum` restarts at 0 on every user
+   turn, so SessionStart is now gated per conversation (`conversationId`).
