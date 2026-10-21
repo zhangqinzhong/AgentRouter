@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { TranscriptMessage } from "../../src/pages/home/components/session-workbench";
+import { TranscriptMessage, TranscriptTools } from "../../src/pages/home/components/session-workbench";
 test("transcripts render untrusted source text inertly and tools collapsed", () => {
   const html = renderToStaticMarkup(
     <TranscriptMessage
@@ -142,4 +142,15 @@ test('code highlighting escapes transcript HTML and unknown language remains rea
 test('a code-search hit highlights literal characters inside folded tool output', () => {
  const html=renderToStaticMarkup(<TranscriptMessage zh highlight="useEffect(" message={{id:1,role:'tool',text:'before useEffect( after <script>x</script>'}}/>);
  assert.match(html,/<mark[^>]*>useEffect\(<\/mark>/);assert.doesNotMatch(html,/<script>/);assert.match(html,/工具输出/);
+});
+
+
+test("tool clusters expose inputs and outputs with one disclosure and escape source HTML", () => {
+  const html = renderToStaticMarkup(<TranscriptTools zh highlight="needle" tools={[{id:"tool-1",name:"Read",input:'<script>needle</script>',output:'done'}]} />);
+  assert.equal((html.match(/<details/g) || []).length, 1);
+  assert.doesNotMatch(html, /<details[^>]*open|<script>/);
+  assert.match(html, /输入/);
+  assert.match(html, /输出/);
+  assert.match(html, /<mark[^>]*>needle<\/mark>/);
+  assert.match(html, /done/);
 });

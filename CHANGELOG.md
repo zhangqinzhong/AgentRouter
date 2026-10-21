@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.10.6 - 2026-10-21
+
+### Fixes
+- Simplify session tool calls to one disclosure with readable input/output sections and compact argument previews.
+- Constrain user-message width, collapse memory citations, and correct nested disclosure arrows.
+
 ## 1.10.5 - 2026-10-21
 
 ### Features

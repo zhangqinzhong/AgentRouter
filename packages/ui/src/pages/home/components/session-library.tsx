@@ -27,7 +27,7 @@ import {
   LoaderCircle,
 } from "lucide-react";
 import { Select } from "@/components/ui/select";
-import { TranscriptMessage } from "./session-workbench";
+import { TranscriptMessage, TranscriptTools } from "./session-workbench";
 import { SessionDetailModal } from "@/vendor/tokentracker/ui/dashboard/components/SessionDetailModal";
 import { ProviderIcon } from "@/vendor/tokentracker/ui/dashboard/components/ProviderIcon";
 type Row = {
@@ -999,32 +999,7 @@ export function SessionLibrary({
                           ),
                       )}
                       {!!m.tools?.length && (
-                        <details className="mb-5 rounded-lg border border-border/50 px-4 py-2">
-                          <summary className="cursor-pointer text-xs text-muted-foreground">
-                            {say("\u5DE5\u5177\u8C03\u7528 \u00B7")}
-                            {m.tools.length} ·{" "}
-                            {Array.from(
-                              new Set(m.tools.map((t) => t.name)),
-                            ).join(" · ")}
-                          </summary>
-                          <div className="mt-3">
-                            {m.tools.map((t) => (
-                              <TranscriptMessage
-                                key={t.id}
-                                zh={zh}
-                                highlight={
-                                  m.seq === anchor ? debounced : undefined
-                                }
-                                message={{
-                                  id: m.id,
-                                  role: "tool",
-                                  name: t.name,
-                                  text: `${t.input || t.input_preview}${t.output ? `\n\n${t.output}` : ""}`,
-                                }}
-                              />
-                            ))}
-                          </div>
-                        </details>
+                        <TranscriptTools tools={m.tools} zh={zh} highlight={m.seq === anchor ? debounced : undefined} />
                       )}
                     </div>
                   ))}
