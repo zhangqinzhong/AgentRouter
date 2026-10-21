@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.10.5 - 2026-10-21
+
+### Features
+- Add a complete gateway monitor with timezone-aware ranges, refresh controls, latency and failure analysis, model/channel/client rankings, flow and activity heatmaps.
+- Restructure Overview around local usage trends, model costs, client activity and compact gateway status.
+- Bundle ai-memory 3.1.2.
+
+### Fixes
+- Read compressed Codex rollouts and group archived/live session records without duplicate usage.
+- Correct Grok shared-pool attribution and OpenCode free-model pricing.
+- Keep monitoring charts mounted during range changes; coalesce rapid switches and preserve chart zoom on refresh.
+- Match percentile sparklines to their headline metrics and label missing observations explicitly.
+
 ## 1.10.4 - 2026-10-20
 
 ### Fixes
