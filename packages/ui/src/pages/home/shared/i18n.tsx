@@ -2,7 +2,7 @@ import { createContext, useContext, useMemo } from "react";
 import { memoryCopyZh } from "./memory-copy";
 import { translateErrorMessage } from "@agentrouter/core/contracts/i18n";
 
-type NavigationId = "memory" | "onboarding" | "overview" | "usage" | "sessions" | "trend" | "heatmap" | "observability" | "api-keys" | "server" | "settings" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
+type NavigationId = "monitor-center" | "memory" | "onboarding" | "overview" | "usage" | "sessions" | "trend" | "heatmap" | "observability" | "api-keys" | "server" | "settings" | "profile" | "networking" | "logs" | "providers" | "models" | "routing" | "virtual-models" | "extensions";
 type ResolvedLanguage = "en" | "zh";
 
 export type AppCopy = {
@@ -113,6 +113,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       memory: "Memory",
       logs: "Logs",
       networking: "Networking",
+      "monitor-center": "Monitor center",
       observability: "Observability",
       overview: "Overview",
       usage: "Usage",
@@ -780,6 +781,7 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       memory: "记忆",
       logs: "日志",
       networking: "网络",
+      "monitor-center": "监控中心",
       observability: "观测",
       overview: "概览",
       usage: "用量",
@@ -1936,6 +1938,35 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       "Usage database": "用量数据库",
       "Trend": "趋势",
       "Usage Trend": "用量趋势",
+      "Recorded turns": "记录回合",
+      "Model usage": "模型用量",
+      "Client activity": "客户端活动",
+      "Share": "占比",
+      "Show less": "收起",
+      "Show all": "查看全部",
+      "Average": "平均",
+  "Loading…": "加载中…",
+  "Shared pool used": "共享额度已用占比",
+  "Monitor center": "监控中心",
+      "Gateway requests": "网关请求",
+      "Refreshes every 15 seconds": "每 15 秒更新",
+      "Request health": "请求健康",
+      "Score based on request success rate": "按所选时段请求成功率计算",
+      "Live traffic": "实时流量",
+      "Last 60 minutes": "最近 60 分钟",
+      "Peak RPM": "峰值 RPM",
+      "5-min success rate": "5 分钟成功率",
+      "5-min latency": "5 分钟平均耗时",
+      "P95 latency": "P95 耗时",
+      "Time to first token P50": "首字时间 P50",
+      "Measured samples": "实测样本",
+      "Measured from streaming responses": "取自流式响应的首字时间记录",
+      "Average latency trend": "平均耗时趋势",
+      "Recent failures": "最近失败请求",
+      "No failed requests in this period": "该时段暂无失败请求",
+      "Unable to load monitoring data": "监控数据加载失败",
+      "Interrupted": "中断",
+
       "Usage trend appears after your first AI session": "首次 AI 会话后会显示使用趋势",
       "Cumulative tokens": "累计 Token 数",
       "Peak tokens": "峰值 Token 数",

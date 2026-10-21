@@ -982,6 +982,51 @@ async fn purge_project_without_confirm_returns_400() {
     );
 }
 
+/// Omitting `confirm` entirely is the same refusal as `confirm: false`: the
+/// documented 400 that names the flag, not the JSON extractor's bare 422 that
+/// operators read as a malformed request. Every route whose docs promise that
+/// 400 is listed here.
+#[tokio::test]
+async fn omitted_confirm_is_the_documented_400_on_every_guarded_route() {
+    let cases = [
+        (
+            "/admin/handoffs/expire",
+            json!({ "workspace": "default", "project": "any" }),
+        ),
+        (
+            "/admin/purge-session",
+            json!({
+                "workspace": "default",
+                "project": "any",
+                "session_id": "00000000-0000-0000-0000-000000000000",
+            }),
+        ),
+        (
+            "/admin/purge-project",
+            json!({ "workspace": "default", "project": "any" }),
+        ),
+        ("/admin/compact", json!({})),
+        ("/admin/reclaim-ledger-versions", json!({})),
+        (
+            "/admin/move-project",
+            json!({ "from_workspace": "default", "project": "any", "to_workspace": "other" }),
+        ),
+    ];
+    for (uri, body) in cases {
+        let tmp = TempDir::new().unwrap();
+        let (state, _store) = make_state(&tmp).await;
+
+        let resp = post(state, uri, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+
+        let body = body_json(resp).await;
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("confirm"),
+            "{uri}: the refusal must name the flag: {body}"
+        );
+    }
+}
+
 /// Non-existent project must return 404.
 #[tokio::test]
 async fn purge_project_nonexistent_returns_404() {

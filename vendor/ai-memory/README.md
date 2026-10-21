@@ -33,6 +33,14 @@ ai-memory removes those limits.
   off, what failed, and what is still open. Handoffs are a typed protocol:
   each one has an owner and is claimed exactly once.
 
+- **It can carry the session, not just a summary.** Start agents with
+  `ai-memory run`: quit Claude Code, run `ai-memory run codex`, and Codex gets
+  the shared workstream plus a private, temporary local projection of Claude's
+  visible native history for exact details the bounded startup packet omitted.
+  The remote server receives only the harness and session identity, never the
+  local transcript path or body. Direct harness launches behave exactly as
+  before.
+
 - **It follows you across projects.** A small profile of how you usually
   work (your package manager, test layout, architecture habits) reaches
   every new repository at session start, so you stop re-explaining yourself.
@@ -106,6 +114,11 @@ into one ranking. Cross-agent handoffs pass the baton explicitly.
 The full design, including the invariants that keep multi-user and
 multi-session use safe, is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+An optional [server-rendered management console](docs/management-ui.md) provides
+user administration, session inspection and deletion, and personal MCP API keys.
+Build with `--features management-ui` and start `serve --transport http
+--enable-management-ui`; both compile-time and runtime opt-ins are required.
+
 ## Support matrix
 
 Every row below is a first-party integration (MCP registration, lifecycle
@@ -144,6 +157,8 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | GitHub Copilot CLI | Supported |
 | Factory Droid | Supported |
 | Meta Muse Code | Supported |
+| CodeBuddy Code | Hooks-only |
+| IBM Bob | Supported |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | DeepSeek Harness (DSH) | MCP-only |
@@ -211,8 +226,12 @@ and links `~/.local/bin/ai-memory`. `ai-memory setup` then creates the data
 directory with a bearer token in an owner-only file, starts a per-user service
 (systemd `--user` or a launchd LaunchAgent), and wires MCP, hooks and Agent
 Skills for every agent it finds, or the ones you name with `--agent`. It shows
-the plan and asks first; `--yes` skips the question, and running it again
-changes nothing. Restart your agents afterwards. Details, the environment
+the plan, with where it found each agent, and asks first: answer `y`, or type
+the numbers of the agents to wire. `--plan` prints the plan and changes
+nothing, `--web` shows the plan as a page in your browser and applies the agents
+you tick there, `--yes` skips the question, and running it again changes nothing.
+Afterwards, restart your agents and ask one of them "What do you remember
+about this project?" to see it answer through ai-memory. Details, the environment
 variables and how to verify the script before running it are in
 [`docs/install.md`](docs/install.md#one-step-native-install-installsh--ai-memory-setup).
 An AI agent installing ai-memory for you can follow
@@ -229,6 +248,23 @@ codex plugin marketplace add akitaonrails/ai-memory && codex plugin add ai-memor
 Codex then asks you to trust the hooks in `/hooks`. See
 [Marketplace plugins](docs/install.md#marketplace-plugins).
 
+### Windows (two commands, no admin)
+
+In PowerShell:
+
+```powershell
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+ai-memory setup
+```
+
+`install.ps1` checks the release zip against its published SHA-256 checksum,
+unpacks it under `%LOCALAPPDATA%\Programs\ai-memory` and adds that directory
+to your user `PATH`. `ai-memory setup` then does what it does on Linux and
+macOS, with a logon entry in place of the service: the server starts when you
+sign in, with no console window, and restarts if it fails. Details and the
+other Windows setups (WSL2, Docker Desktop, a real Windows service) are in
+[`docs/windows.md`](docs/windows.md).
+
 ### Arch Linux (AUR)
 
 For native Arch installs, use the AUR packages. They install
@@ -238,6 +274,7 @@ user-level systemd units.
 ```bash
 yay -S ai-memory-bin    # prebuilt Linux x86_64/aarch64 binary
 yay -S ai-memory        # builds from source
+ai-memory setup         # data dir, user service, agents, self-check
 ```
 
 ### Fedora (RPM)
@@ -250,17 +287,12 @@ then install it:
 sudo dnf install ./ai-memory-*.rpm
 ```
 
-Then follow the native Linux service instructions in [`docs/install.md`](docs/install.md).
-
-Single-user workstation:
+On a single-user workstation, `ai-memory setup` then does the rest, as on the
+two-command path above: data dir and token, a user service, the agents it
+finds, and a self-check.
 
 ```bash
-mkdir -p ~/.config/ai-memory ~/.local/share/ai-memory
-ai-memory --data-dir ~/.local/share/ai-memory \
-  --config ~/.config/ai-memory/config.toml init
-systemctl --user enable --now ai-memory.service
-ai-memory install-mcp --client claude-code --apply
-ai-memory install-hooks --agent claude-code --apply
+ai-memory setup
 ```
 
 System service installs use `/var/lib/ai-memory` and `/etc/ai-memory/` via the
@@ -287,12 +319,12 @@ open "companions/ai-memory-macos/dist/AI Memory.app"
 Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
 from the menu extra (no Dock icon). The app reads the bearer token `init`
 wrote into its data dir, so the status item turns green on its own. Then wire
-an agent with the bundled binary:
+your agents with the bundled binary; `--no-service` leaves the app's
+LaunchAgent in charge:
 
 ```bash
 BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
-"$BIN" install-mcp --client claude-code --apply
-"$BIN" install-hooks --agent claude-code --apply
+"$BIN" setup --no-service
 ```
 
 Prebuilt tarball and launchd-without-the-app paths:
@@ -419,7 +451,7 @@ Pass `--require-server` to fail closed instead.
 
 ```bash
 ai-memory run claude
-ai-memory run codex --yolo   # later: same workstream, different harness
+ai-memory run codex --yolo   # same workstream + local Claude history dossier
 ai-memory run --profile work claude  # reusable config.toml env/account preset
 ai-memory continue           # resume the newest managed checkout
 # after a dead launcher left its lease behind (same operator only)
@@ -434,6 +466,24 @@ use it only when you know the previous launcher is gone. It does not kill a
 native process, and it cannot evict another authenticated operator's run. See
 the [managed-workstream recovery notes](docs/managed-workstreams.md#lease-recovery)
 for the full safety contract.
+
+On a real harness switch, the receiving managed agent is told to consult
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY` when you ask to continue and the bounded
+portable packet lacks a detail. The variable names a private temporary
+Markdown projection created from the previous harness's checkout-validated,
+read-only adapter; the file disappears when the managed child exits. It is
+local to the launcher machine. This covers quota exhaustion and other abrupt
+exits where the old harness cannot write a handoff: refreshed ai-memory routing
+also tells the new agent that "continue", "resume", and "pick up where we left
+off" mean to read that file first when the three managed-run variables are
+present. A switch on another machine still gets the server's portable ledger
+and handoff, but cannot read a native transcript that exists only on the first
+machine.
+
+If that variable is absent on a real same-machine switch, run
+`type -a ai-memory` and `ai-memory --version` in the launching shell. This path
+requires the 3.1.0 or newer host client; a stale Cargo or package-manager binary
+earlier in `PATH` can shadow an updated wrapper.
 
 In `resume`, type to search, use Up/Down to select a workstream, and Left/Right
 to choose its harness. Enter launches the selection; Escape clears a search,
@@ -520,6 +570,14 @@ All options and defaults are in [`nix/nixos-module.nix`](nix/nixos-module.nix).
 The module is entirely opt-in: `nix build`, `nix run`, `nix develop`, and the CLI are
 unchanged if you don't import it.
 
+`git` is a runtime dependency. Hook capture and `ai-memory doctor` run it to
+read the repository a session works in. The module puts `pkgs.git` on the
+service's `PATH`. The package itself leaves the binary unwrapped, because a
+wrapper renames the running process and the live-process guard in `reset`,
+`restore`, `reindex` and `uninstall --purge-data` looks for a process named
+`ai-memory`. If you install the package without the module (`nix profile
+install`, `home.packages`), install `git` next to it.
+
 ## Everyday use
 
 Day to day, you mostly do not think about ai-memory. Hooks capture
@@ -555,6 +613,13 @@ Start with [`docs/users.md`](docs/users.md) for accounts and ownership,
 and [`docs/deploy.md`](docs/deploy.md) for the server itself. It includes
 measured capacity numbers and the one rule you must follow: one server per
 data directory, never two.
+
+Two opt-in HTTP surfaces build on the same browser sign-in, and both are off
+by default. `serve --enable-session-management` lets signed-in users inspect
+sessions and purge the ones they own
+([`docs/session-management.md`](docs/session-management.md)).
+`serve --enable-self-service-keys` lets them issue and revoke their own `aim_`
+API keys ([`docs/self-service-keys.md`](docs/self-service-keys.md)).
 
 ## Security
 
@@ -631,6 +696,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/programmatic-memory.md`](docs/programmatic-memory.md) | Use ai-memory from any tool: MCP write/query/handoff calls, scope rules and incremental reads. |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield migration. |
+| [`docs/management-ui.md`](docs/management-ui.md) | Optional server-rendered console: feature gates, user and session management, MCP keys, public deployment, and frontend checks. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS and when you don't, with copy-paste Caddy / nginx / Cloudflare Tunnel templates and the "secure when you're not" failure modes. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix, per-project disk layout, checkpoint page recovery, and operator workflows. |
 | [`docs/backup.md`](docs/backup.md) | Backing up the wiki + data dir to a remote git repository: what to include, what to exclude, scheduled push pattern, restore, and security posture. Companion to `docs/lifecycle-ops.md` (which covers the on-box `ai-memory backup` snapshot). |
@@ -654,7 +720,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |
-| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), [team-wiki sync](companions/ai-memory-wikisync) and the [TypeScript client SDK](companions/ai-memory-ts). |
+| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), [team-wiki sync](companions/ai-memory-wikisync), the [TypeScript client SDK](companions/ai-memory-ts) and the [desktop installer](companions/ai-memory-desktop) (unsigned preview). |
 | [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 

@@ -1,28 +1,49 @@
 //! Rule-based session-page synthesis (no LLM).
 //!
-//! At `SessionEnd` we already have N observation rows for the session.
-//! We turn them into a single markdown page under `wiki/sessions/<id>.md`
-//! using only deterministic heuristics: first-prompt as title, files
-//! touched, tool-call counts. Once the LLM provider lands in M6 we'll
-//! add an opt-in path that re-narrates the page.
+//! At `SessionEnd` we turn a session's observations into a single markdown
+//! page under `wiki/sessions/<id>.md` using only deterministic heuristics:
+//! first-prompt as title, files touched, tool-call counts. Once the LLM
+//! provider lands in M6 we'll add an opt-in path that re-narrates the page.
+//!
+//! The page is rendered from a [`SessionDigest`], not from the observation
+//! rows. A session can hold hundreds of thousands of rows, and everything the
+//! page and the auto-handoff print is either a count, a "last of a kind"
+//! marker, the head and tail the raw-observation list shows, or the first or
+//! last row that passes a predicate. [`SessionDigest::load`] reads exactly
+//! those with bounded queries, so the memory a SessionEnd spends does not grow
+//! with the session, and the output is the one the full row list produced —
+//! the one exception being the `## Prompts` list, which is capped like the
+//! raw-observation list.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ai_memory_core::{
     AgentKind, NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier,
     WorkspaceId, looks_like_markup_block, looks_like_scaffolding, truncate_for_title,
 };
+use ai_memory_store::{
+    ObservationOrder, ReaderPool, SessionKindSummary, SessionLine, SessionObservationSnapshot,
+    StoreError, StoreResult,
+};
+use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::capture_policy::ToolFamily;
-use crate::payload::is_safe_tool_title;
+use crate::payload::{is_safe_tool_title, tool_family_from_title};
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
 const RAW_OBSERVATION_TAIL_LINES: usize = RAW_OBSERVATION_MAX_LINES - RAW_OBSERVATION_HEAD_LINES;
+/// The `## Prompts` list is capped the way the raw-observation list is: a
+/// session with more prompts than this prints its first and last slice and
+/// an omission line between them. The values are the same bound, so the page
+/// never holds more prompt titles than raw-observation lines.
+pub(crate) const PROMPT_TITLES_MAX: usize = RAW_OBSERVATION_MAX_LINES;
+pub(crate) const PROMPT_TITLES_HEAD: usize = RAW_OBSERVATION_HEAD_LINES;
+pub(crate) const PROMPT_TITLES_TAIL: usize = PROMPT_TITLES_MAX - PROMPT_TITLES_HEAD;
 const SUBAGENT_PROMPT_PREAMBLE: &str = "You are a subagent spawned by another session.";
 
-/// Build a [`NewPage`] from the observations collected during a session.
+/// Build a [`NewPage`] from the digest of a session's observations.
 ///
 /// The returned page is *always* under `sessions/<session-id>.md` so each
 /// session has a stable URL the user can bookmark.
@@ -32,13 +53,12 @@ pub fn synthesize_session_page(
     project_id: ProjectId,
     session_id: SessionId,
     agent_kind: AgentKind,
-    observations: &[Observation],
+    digest: &SessionDigest,
 ) -> NewPage {
-    // One tally for the whole page: the body renderer and the summary builder
-    // describe the same session and must not scan it twice to do so.
-    let tally = tally_session(observations);
-    let title = derive_title(observations, session_id);
-    let body = render_body(session_id, observations, &title, &tally);
+    // The body renderer and the summary builder describe the same session and
+    // read the same digest, so they cannot describe it differently.
+    let title = digest.title.clone();
+    let body = render_body(session_id, digest, &title);
     let mut frontmatter_json = serde_json::json!({
         "title": title,
         "session_id": session_id.to_string(),
@@ -48,7 +68,7 @@ pub fn synthesize_session_page(
         "agent": agent_kind.as_str(),
         "tier": "episodic",
     });
-    let summary = session_summary(&tally);
+    let summary = session_summary(digest);
     if !summary.is_empty() {
         // Insert only when there is something to say. The store's hit
         // descriptor prefers `summary` over the body, so writing a blank one
@@ -72,6 +92,374 @@ pub fn synthesize_session_page(
         entities: Vec::new(),
         evidence: Vec::new(),
     }
+}
+
+/// A user prompt's text for the handoff and the abrupt-ending check: the body
+/// when there is one, the title otherwise.
+fn prompt_text(obs: &Observation) -> &str {
+    if obs.body.is_empty() {
+        obs.title.as_str()
+    } else {
+        obs.body.as_str()
+    }
+}
+
+/// One user prompt, as far as the open-question heuristics read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptFact {
+    pub(crate) title: String,
+    pub(crate) body: String,
+}
+
+/// The terminal `SessionEnd` observation, as far as the page reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionEndFact {
+    created_at: Timestamp,
+    body: String,
+}
+
+/// Everything the auto-handoff and the abrupt-ending note read from a
+/// session's observations, besides what [`SessionDigest`] already counts.
+///
+/// Each field is the answer to a question the full row list used to answer by
+/// walking it; the `*_prompt*` and `latest_assistant` fields hold the first or
+/// last row that passes the same predicate, found by an early-exit scan.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct HandoffFacts {
+    /// First user prompt with usable text (not a harness markup block).
+    pub(crate) first_prompt: Option<String>,
+    /// Last user prompt with usable text.
+    pub(crate) last_prompt: Option<String>,
+    /// Last user prompt that is not a markup block, even when its text is
+    /// empty: the one the open-question heuristics test for a question.
+    pub(crate) question_prompt: Option<PromptFact>,
+    /// Title of the last completed tool call.
+    pub(crate) last_tool_title: Option<String>,
+    /// Body of the last `Stop` that carries assistant text.
+    pub(crate) latest_assistant: Option<String>,
+    /// The session recorded a `Stop`.
+    pub(crate) has_stop: bool,
+    /// The session recorded a `SessionEnd`.
+    pub(crate) has_session_end: bool,
+    /// Tool names worth listing in the baton: a harness's own tool name, not
+    /// a `tool <family>` label.
+    pub(crate) tools: BTreeSet<String>,
+}
+
+/// What a session's page and handoff are rendered from.
+///
+/// Built by [`Self::load`] with bounded reads in one read transaction, so a
+/// session of any size costs the same memory apart from what the output
+/// itself lists: the first and last prompt-title slice the page prints, at
+/// most [`PROMPT_TITLES_MAX`] titles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDigest {
+    /// Rows the session holds.
+    total: usize,
+    /// At least one prompt or tool use (the page is not lifecycle-only).
+    substantive: bool,
+    /// The first raw-observation lines the page shows (all of them when the
+    /// session fits in [`RAW_OBSERVATION_MAX_LINES`]).
+    first_lines: Vec<SessionLine>,
+    /// The last lines, only for a session longer than the cap.
+    last_lines: Vec<SessionLine>,
+    /// When the newest `SessionStart` happened.
+    start_at: Option<Timestamp>,
+    /// The newest `SessionEnd`.
+    end: Option<SessionEndFact>,
+    /// The prompt titles the page lists: all of them when the session holds
+    /// at most [`PROMPT_TITLES_MAX`], otherwise the first
+    /// [`PROMPT_TITLES_HEAD`] and the last [`PROMPT_TITLES_TAIL`], each in
+    /// capture order.
+    prompt_titles: Vec<String>,
+    /// User prompts the session holds (the true total; the list above is
+    /// bounded).
+    prompt_count: usize,
+    /// Completed calls per tool name, keyed for stable ordering.
+    tool_counts: BTreeMap<String, usize>,
+    /// The page title.
+    title: String,
+    /// What the handoff and the abrupt-ending note read.
+    handoff: HandoffFacts,
+}
+
+/// What loading a [`SessionDigest`] cost, for a bound test and for debugging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DigestLoadStats {
+    /// Rows deserialized: the raw-observation lines plus every row an
+    /// early-exit scan visited (one resident at a time).
+    pub rows_read: usize,
+    /// User prompts the session holds (the digest keeps at most the bounded
+    /// slice of their titles).
+    pub prompt_titles: usize,
+    /// Prompt bodies read to settle the page title (one resident at a time).
+    pub prompt_bodies_read: usize,
+}
+
+impl SessionDigest {
+    /// Read a session's digest with bounded queries.
+    ///
+    /// # Errors
+    /// Propagates any store error.
+    pub async fn load(
+        reader: &ReaderPool,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<Self> {
+        Ok(
+            Self::load_with_stats(reader, workspace_id, project_id, session_id)
+                .await?
+                .0,
+        )
+    }
+
+    /// [`Self::load`], also reporting what the load read.
+    ///
+    /// # Errors
+    /// Propagates any store error.
+    pub(crate) async fn load_with_stats(
+        reader: &ReaderPool,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<(Self, DigestLoadStats)> {
+        reader
+            .read_session_observations(workspace_id, project_id, session_id, move |snapshot| {
+                build_digest(snapshot, session_id)
+            })
+            .await
+    }
+
+    /// Whether the session recorded real work (a prompt or a tool use).
+    #[must_use]
+    pub fn is_substantive(&self) -> bool {
+        self.substantive
+    }
+
+    /// Rows the session holds.
+    #[must_use]
+    pub fn observation_count(&self) -> usize {
+        self.total
+    }
+
+    pub(crate) fn handoff_facts(&self) -> &HandoffFacts {
+        &self.handoff
+    }
+}
+
+fn micros_to_timestamp(micros: i64) -> StoreResult<Timestamp> {
+    Timestamp::from_microsecond(micros).map_err(|e| {
+        StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+            "bad timestamp: {e}"
+        )))
+    })
+}
+
+/// The handoff prompt predicate: a user prompt whose text is not empty and not
+/// a harness block delivered as a user turn (`<task-notification>`).
+fn handoff_prompt(obs: &Observation) -> Option<String> {
+    if obs.kind != ObservationKind::UserPrompt {
+        return None;
+    }
+    let text = prompt_text(obs);
+    (!text.is_empty() && !looks_like_markup_block(text)).then(|| text.to_string())
+}
+
+/// The open-question prompt predicate: a user prompt that is not a harness
+/// block. An empty text still counts, as it always did.
+fn question_prompt(obs: &Observation) -> Option<PromptFact> {
+    if obs.kind != ObservationKind::UserPrompt || looks_like_markup_block(prompt_text(obs)) {
+        return None;
+    }
+    Some(PromptFact {
+        title: obs.title.clone(),
+        body: obs.body.clone(),
+    })
+}
+
+/// Stop bodies exist only after the assistant-capture double opt-in.
+fn assistant_response(obs: &Observation) -> Option<String> {
+    (obs.kind == ObservationKind::Stop && !obs.body.trim().is_empty()).then(|| obs.body.clone())
+}
+
+#[cfg(test)]
+fn session_line(obs: &Observation) -> SessionLine {
+    SessionLine {
+        kind: obs.kind,
+        extension: obs.extension.clone(),
+        source_event: obs.source_event.clone(),
+        title: obs
+            .title
+            .chars()
+            .take(ai_memory_store::SESSION_LINE_TITLE_CHARS)
+            .collect(),
+        created_at: obs.created_at,
+    }
+}
+
+/// Tool names worth listing: a harness's own tool name. Skip `tool <family>` /
+/// bare-`<family>` labels: a family is a partition of the calls, not a name
+/// for a tool, so "Tools used: tool file, tool non-file" tells the receiver
+/// nothing.
+fn is_listable_tool_title(title: &str) -> bool {
+    !title.is_empty() && tool_family_from_title(title).is_none()
+}
+
+fn build_digest(
+    snapshot: &SessionObservationSnapshot<'_>,
+    session_id: SessionId,
+) -> StoreResult<(SessionDigest, DigestLoadStats)> {
+    let summary: SessionKindSummary = snapshot.kind_summary()?;
+    let total = summary.total;
+
+    // The raw-observation list: everything when it fits, else the head and the
+    // tail the page prints around its "omitted" marker.
+    let (first_lines, last_lines) = if total <= RAW_OBSERVATION_MAX_LINES {
+        (snapshot.first_lines(RAW_OBSERVATION_MAX_LINES)?, Vec::new())
+    } else {
+        (
+            snapshot.first_lines(RAW_OBSERVATION_HEAD_LINES)?,
+            snapshot.last_lines(RAW_OBSERVATION_TAIL_LINES)?,
+        )
+    };
+
+    let start_at = summary
+        .last_session_start_at
+        .map(micros_to_timestamp)
+        .transpose()?;
+    let end = match summary.last_session_end_at {
+        Some(at) => snapshot.scan(
+            ObservationOrder::Desc,
+            &[ObservationKind::SessionEnd],
+            Some(at),
+            |obs| {
+                Some(SessionEndFact {
+                    created_at: obs.created_at,
+                    body: obs.body.clone(),
+                })
+            },
+        )?,
+        None => None,
+    };
+
+    // The prompt titles the page lists: bounded the way the raw-observation
+    // list is, with the true prompt count beside them.
+    let prompts = snapshot.prompt_titles(PROMPT_TITLES_HEAD, PROMPT_TITLES_TAIL)?;
+    let mut prompt_titles = prompts.first;
+    prompt_titles.extend(prompts.last);
+
+    // Bodies only for a title that could be the subagent preamble: the title
+    // rule is the one reader of a prompt body, and the walk stops once the
+    // title is settled.
+    let mut title_scan = PromptTitleScan::default();
+    let mut prompt_bodies_read = 0;
+    snapshot.scan_prompts(SUBAGENT_PROMPT_PREAMBLE, |title, body| {
+        prompt_bodies_read += usize::from(body.is_some());
+        title_scan.push(title, body.unwrap_or(""))
+    })?;
+    let title = match title_scan.finish() {
+        PromptTitle::Found(title) => title,
+        PromptTitle::RejectedPreamble => format!("Session {session_id}"),
+        PromptTitle::Unusable => snapshot
+            .scan(ObservationOrder::Asc, &[], None, fallback_title)?
+            .unwrap_or_else(|| title_without_candidate(session_id, total)),
+    };
+
+    let tools = snapshot.tool_titles()?;
+    let tool_counts: BTreeMap<String, usize> = tools.completed.into_iter().collect();
+
+    let handoff = HandoffFacts {
+        first_prompt: if summary.prompts > 0 {
+            snapshot.scan(
+                ObservationOrder::Asc,
+                &[ObservationKind::UserPrompt],
+                None,
+                handoff_prompt,
+            )?
+        } else {
+            None
+        },
+        last_prompt: snapshot.scan(
+            ObservationOrder::Desc,
+            &[ObservationKind::UserPrompt],
+            summary.last_prompt_at,
+            handoff_prompt,
+        )?,
+        question_prompt: snapshot.scan(
+            ObservationOrder::Desc,
+            &[ObservationKind::UserPrompt],
+            summary.last_prompt_at,
+            question_prompt,
+        )?,
+        last_tool_title: snapshot.scan(
+            ObservationOrder::Desc,
+            &[ObservationKind::PostToolUse],
+            summary.last_post_tool_at,
+            |obs| Some(obs.title.clone()),
+        )?,
+        latest_assistant: match summary.last_stop_with_body_at {
+            Some(at) => snapshot.scan(
+                ObservationOrder::Desc,
+                &[ObservationKind::Stop],
+                Some(at),
+                assistant_response,
+            )?,
+            None => None,
+        },
+        has_stop: summary.last_stop_at.is_some(),
+        has_session_end: summary.last_session_end_at.is_some(),
+        tools: tools
+            .titles
+            .into_iter()
+            .filter(|title| is_listable_tool_title(title))
+            .collect(),
+    };
+
+    let stats = DigestLoadStats {
+        rows_read: snapshot.rows_read(),
+        prompt_titles: prompts.total,
+        prompt_bodies_read,
+    };
+    Ok((
+        SessionDigest {
+            total,
+            substantive: summary.substantive,
+            first_lines,
+            last_lines,
+            start_at,
+            end,
+            prompt_titles,
+            prompt_count: prompts.total,
+            tool_counts,
+            title,
+            handoff,
+        },
+        stats,
+    ))
+}
+
+/// What the prompts alone say about the title.
+enum PromptTitle {
+    /// A usable prompt (or the body of a subagent preamble) named the page.
+    Found(String),
+    /// No prompt was usable, and at least one was the subagent preamble.
+    RejectedPreamble,
+    /// No prompt was usable: fall back to the other observations.
+    Unusable,
+}
+
+/// [`PromptTitleScan`] over a whole prompt list: the row-list form the
+/// test-only digest builder walks.
+#[cfg(test)]
+fn title_from_prompts<'a>(prompts: impl Iterator<Item = (&'a str, &'a str)>) -> PromptTitle {
+    let mut scan = PromptTitleScan::default();
+    for (title, body) in prompts {
+        if !scan.push(title, body) {
+            break;
+        }
+    }
+    scan.finish()
 }
 
 /// Title for a synthesised session page.
@@ -105,53 +493,70 @@ pub fn synthesize_session_page(
 /// any other usable observation title, then the session's own path. The
 /// literal "session" remains only for the case where there is nothing else
 /// at all.
-fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
-    let mut rejected_subagent_preamble = false;
-    for obs in observations {
-        if obs.kind != ObservationKind::UserPrompt {
-            continue;
-        }
-        if obs.title.trim() == SUBAGENT_PROMPT_PREAMBLE {
-            rejected_subagent_preamble = true;
-            if let Some(title) = obs
-                .body
+///
+/// Fed one prompt at a time, so a caller streaming prompts from the store
+/// holds one body at most and stops reading bodies once the title is settled.
+#[derive(Default)]
+struct PromptTitleScan {
+    found: Option<String>,
+    rejected_subagent_preamble: bool,
+}
+
+impl PromptTitleScan {
+    /// Feed the next prompt in capture order. Returns `false` once the title
+    /// is found: later prompts cannot change it.
+    fn push(&mut self, title: &str, body: &str) -> bool {
+        if title.trim() == SUBAGENT_PROMPT_PREAMBLE {
+            self.rejected_subagent_preamble = true;
+            if let Some(line) = body
                 .lines()
                 .map(str::trim)
                 .find(|line| !line.is_empty() && !looks_like_title_scaffolding(line))
             {
-                return truncate_for_title(title);
+                self.found = Some(truncate_for_title(line));
+                return false;
             }
-            continue;
+            return true;
         }
-        if !obs.title.is_empty() && !looks_like_scaffolding(&obs.title) {
-            return obs.title.clone();
+        if !title.is_empty() && !looks_like_scaffolding(title) {
+            self.found = Some(title.to_string());
+            return false;
+        }
+        true
+    }
+
+    fn finish(self) -> PromptTitle {
+        match self.found {
+            Some(title) => PromptTitle::Found(title),
+            None if self.rejected_subagent_preamble => PromptTitle::RejectedPreamble,
+            None => PromptTitle::Unusable,
         }
     }
-    if rejected_subagent_preamble {
-        return format!("Session {session_id}");
+}
+
+/// The title a non-prompt observation can lend the page, in capture order.
+fn fallback_title(obs: &Observation) -> Option<String> {
+    // The router titles an untitled lifecycle event with its kind name
+    // (`stop`, `session-end`): a string every such page would share, and
+    // what this loop reached once tool-family labels were skipped (#895).
+    if obs.kind == ObservationKind::SessionStart || obs.title == obs.kind.as_str() {
+        return None;
     }
-    for obs in observations {
-        // The router titles an untitled lifecycle event with its kind name
-        // (`stop`, `session-end`): a string every such page would share, and
-        // what this loop reached once tool-family labels were skipped (#895).
-        if obs.kind == ObservationKind::SessionStart || obs.title == obs.kind.as_str() {
-            continue;
-        }
-        // A `tool <family>` label is a partition of the calls, not a title:
-        // `looks_like_scaffolding` does not catch it, so reject it here or a
-        // session whose only non-prompt observation is a closed-tool call
-        // ("tool non-file") would take the label as its page title.
-        if !obs.title.is_empty()
-            && !looks_like_title_scaffolding(&obs.title)
-            && !is_safe_tool_title(&obs.title)
-        {
-            return obs.title.clone();
-        }
-    }
-    // Every candidate was scaffolding. The page still needs a title, and its
-    // own identity is more use to a reader than the word "session" repeated
-    // across every such page.
-    if observations.is_empty() {
+    // A `tool <family>` label is a partition of the calls, not a title:
+    // `looks_like_scaffolding` does not catch it, so reject it here or a
+    // session whose only non-prompt observation is a closed-tool call
+    // ("tool non-file") would take the label as its page title.
+    (!obs.title.is_empty()
+        && !looks_like_title_scaffolding(&obs.title)
+        && !is_safe_tool_title(&obs.title))
+    .then(|| obs.title.clone())
+}
+
+/// Every candidate was scaffolding. The page still needs a title, and its
+/// own identity is more use to a reader than the word "session" repeated
+/// across every such page.
+fn title_without_candidate(session_id: SessionId, total: usize) -> String {
+    if total == 0 {
         return "session".to_string();
     }
     format!("Session {session_id}")
@@ -159,54 +564,6 @@ fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
 
 fn looks_like_title_scaffolding(candidate: &str) -> bool {
     candidate.trim() == SUBAGENT_PROMPT_PREAMBLE || looks_like_scaffolding(candidate)
-}
-
-/// The per-session counts that both the rendered body and the frontmatter
-/// summary are built from.
-struct SessionTally<'a> {
-    /// Completed calls per tool name, keyed for stable ordering.
-    tool_counts: BTreeMap<&'a str, usize>,
-    /// User prompts in arrival order.
-    prompts: Vec<&'a Observation>,
-    /// First `SessionStart`, if the session recorded one.
-    start: Option<&'a Observation>,
-    /// Last `SessionEnd`, if the session recorded one.
-    end: Option<&'a Observation>,
-}
-
-/// Tally a session's observations once.
-///
-/// [`render_body`] and [`session_summary`] both need these counts, and
-/// [`synthesize_session_page`] computes them once and lends them to both — so
-/// a page costs one pass over its observations, not two, and the body and the
-/// summary cannot describe the same session differently. It also keeps the
-/// summary from having to parse the counts back out of the markdown the body
-/// just rendered them into.
-fn tally_session(observations: &[Observation]) -> SessionTally<'_> {
-    let mut tally = SessionTally {
-        tool_counts: BTreeMap::new(),
-        prompts: Vec::new(),
-        start: None,
-        end: None,
-    };
-    for obs in observations {
-        match obs.kind {
-            ObservationKind::SessionStart => tally.start = Some(obs),
-            ObservationKind::SessionEnd => tally.end = Some(obs),
-            ObservationKind::UserPrompt => tally.prompts.push(obs),
-            // Count only PostToolUse — each tool call produces both a
-            // PreToolUse and a PostToolUse observation, so counting both
-            // doubles every reported number ("Bash: 4" for two real calls).
-            // PostToolUse is the "completed call" event; pre-only calls
-            // that never produced a post (cancellations) are intentionally
-            // excluded.
-            ObservationKind::PostToolUse if !obs.title.is_empty() => {
-                *tally.tool_counts.entry(obs.title.as_str()).or_insert(0) += 1;
-            }
-            _ => {}
-        }
-    }
-    tally
 }
 
 /// How many tools to name individually before summarising the rest as a count.
@@ -226,23 +583,26 @@ const SUMMARY_MAX_NAMED_TOOLS: usize = 3;
 /// silently and with no error anywhere.
 ///
 /// Hence: one line, plain prose, no leading marker.
-fn session_summary(tally: &SessionTally<'_>) -> String {
+fn session_summary(digest: &SessionDigest) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    if !tally.prompts.is_empty() {
+    if digest.prompt_count > 0 {
         parts.push(format!(
             "{} prompt{}",
-            tally.prompts.len(),
-            plural(tally.prompts.len())
+            digest.prompt_count,
+            plural(digest.prompt_count)
         ));
     }
 
-    let calls: usize = tally.tool_counts.values().sum();
+    let calls: usize = digest.tool_counts.values().sum();
     if calls > 0 {
         // Name the busiest tools first; ties fall back to the map's
         // alphabetical order so the same session always renders the same way.
-        let mut by_calls: Vec<(&str, usize)> =
-            tally.tool_counts.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut by_calls: Vec<(&str, usize)> = digest
+            .tool_counts
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
         by_calls.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         // A `tool <family>` title is what `safe_tool_title` writes when the
         // harness's own tool name is not carried through: a partition of the
@@ -279,9 +639,8 @@ fn session_summary(tally: &SessionTally<'_>) -> String {
         });
     }
 
-    if let (Some(start), Some(end)) = (tally.start, tally.end)
-        && let Some(spent) =
-            format_duration(end.created_at.as_second() - start.created_at.as_second())
+    if let (Some(start), Some(end)) = (digest.start_at, digest.end.as_ref())
+        && let Some(spent) = format_duration(end.created_at.as_second() - start.as_second())
     {
         parts.push(format!("over {spent}"));
     }
@@ -289,8 +648,9 @@ fn session_summary(tally: &SessionTally<'_>) -> String {
     // The harness's own word for why the session ended (#1225), when the
     // SessionEnd observation carried one. Display-bounded: a summary line
     // is no place for a long free-text field.
-    if let Some(reason) = tally
+    if let Some(reason) = digest
         .end
+        .as_ref()
         .and_then(|end| end.body.strip_prefix("reason: "))
         .map(str::trim)
         .filter(|reason| !reason.is_empty())
@@ -340,54 +700,59 @@ fn format_duration(seconds: i64) -> Option<String> {
     })
 }
 
-fn render_body(
-    session_id: SessionId,
-    observations: &[Observation],
-    title: &str,
-    tally: &SessionTally<'_>,
-) -> String {
-    let SessionTally {
-        tool_counts,
-        prompts,
-        start,
-        end,
-    } = tally;
-
+fn render_body(session_id: SessionId, digest: &SessionDigest, title: &str) -> String {
     let mut buf = String::with_capacity(2048);
     buf.push_str(&format!("# {title}\n\n"));
 
     buf.push_str("## Session metadata\n\n");
     buf.push_str(&format!("- **session_id:** `{session_id}`\n"));
-    if let Some(s) = start {
-        buf.push_str(&format!("- **started_at:** {}\n", human_ts(&s.created_at),));
+    if let Some(s) = &digest.start_at {
+        buf.push_str(&format!("- **started_at:** {}\n", human_ts(s)));
     }
-    if let Some(e) = end {
-        buf.push_str(&format!("- **ended_at:** {}\n", human_ts(&e.created_at),));
+    if let Some(e) = &digest.end {
+        buf.push_str(&format!("- **ended_at:** {}\n", human_ts(&e.created_at)));
     }
-    buf.push_str(&format!("- **observations:** {}\n\n", observations.len()));
+    buf.push_str(&format!("- **observations:** {}\n\n", digest.total));
 
-    if let Some(note) = abrupt_ending_note(observations) {
+    if let Some(note) = abrupt_ending_note(&digest.handoff) {
         buf.push_str(&format!("{note}\n\n"));
     }
 
-    if !prompts.is_empty() {
+    if digest.prompt_count > 0 {
         buf.push_str("## Prompts\n\n");
-        for (i, p) in prompts.iter().enumerate() {
-            buf.push_str(&format!("{}. {}\n", i + 1, p.title));
+        if digest.prompt_count <= PROMPT_TITLES_MAX {
+            for (i, title) in digest.prompt_titles.iter().enumerate() {
+                buf.push_str(&format!("{}. {title}\n", i + 1));
+            }
+        } else {
+            let (head, tail) = digest.prompt_titles.split_at(PROMPT_TITLES_HEAD);
+            for (i, title) in head.iter().enumerate() {
+                buf.push_str(&format!("{}. {title}\n", i + 1));
+            }
+            let omitted = digest.prompt_count - PROMPT_TITLES_HEAD - PROMPT_TITLES_TAIL;
+            buf.push_str(&format!(
+                "\n_... {omitted} prompts omitted from the middle (showing first {PROMPT_TITLES_HEAD} and last {PROMPT_TITLES_TAIL})._\n\n",
+            ));
+            for (i, title) in tail.iter().enumerate() {
+                buf.push_str(&format!(
+                    "{}. {title}\n",
+                    digest.prompt_count - PROMPT_TITLES_TAIL + i + 1
+                ));
+            }
         }
         buf.push('\n');
     }
 
-    if !tool_counts.is_empty() {
+    if !digest.tool_counts.is_empty() {
         buf.push_str("## Tool calls\n\n");
-        for (name, count) in tool_counts {
+        for (name, count) in &digest.tool_counts {
             buf.push_str(&format!("- `{name}`: {count}\n"));
         }
         buf.push('\n');
     }
 
     buf.push_str("## Raw observations\n\n");
-    render_raw_observations(&mut buf, observations);
+    render_raw_observations(&mut buf, digest);
 
     buf.push_str("\n_Synthesised by ai-memory (M3, no-LLM heuristic)._\n");
     buf
@@ -407,20 +772,9 @@ fn render_body(
 /// 3. A Stop was recorded but no SessionEnd — a mid-task exit (or a
 ///    checkpoint page rendered while the session is still running; the
 ///    wording only claims what the log shows).
-fn abrupt_ending_note(observations: &[Observation]) -> Option<&'static str> {
-    let last_of_kind = |kind: ObservationKind| observations.iter().rev().find(|o| o.kind == kind);
-    let last_stop = last_of_kind(ObservationKind::Stop);
-    let has_session_end = observations
-        .iter()
-        .any(|o| o.kind == ObservationKind::SessionEnd);
-    // Harness blocks delivered as a user turn are not the user's question.
-    let last_prompt = observations.iter().rev().find(|o| {
-        let text = if o.body.is_empty() { &o.title } else { &o.body };
-        o.kind == ObservationKind::UserPrompt && !looks_like_markup_block(text)
-    });
-
-    if last_stop.is_none()
-        && let Some(prompt) = last_prompt
+fn abrupt_ending_note(facts: &HandoffFacts) -> Option<&'static str> {
+    if !facts.has_stop
+        && let Some(prompt) = &facts.question_prompt
     {
         let text = if prompt.body.is_empty() {
             prompt.title.trim()
@@ -434,9 +788,9 @@ fn abrupt_ending_note(observations: &[Observation]) -> Option<&'static str> {
         }
     }
 
-    if last_stop.is_none()
-        && let Some(tool) = last_of_kind(ObservationKind::PostToolUse)
-        && crate::payload::tool_family_from_title(&tool.title) == Some(ToolFamily::File)
+    if !facts.has_stop
+        && let Some(tool) = &facts.last_tool_title
+        && tool_family_from_title(tool) == Some(ToolFamily::File)
     {
         return Some(
             "Session ended without a normal stop while working with files; \
@@ -444,7 +798,7 @@ fn abrupt_ending_note(observations: &[Observation]) -> Option<&'static str> {
         );
     }
 
-    if last_stop.is_some() && !has_session_end {
+    if facts.has_stop && !facts.has_session_end {
         return Some(
             "A stop was recorded but no session end; the session may have exited mid-task.",
         );
@@ -453,42 +807,38 @@ fn abrupt_ending_note(observations: &[Observation]) -> Option<&'static str> {
     None
 }
 
-fn render_raw_observations(buf: &mut String, observations: &[Observation]) {
-    if observations.len() <= RAW_OBSERVATION_MAX_LINES {
-        for obs in observations {
-            render_raw_observation(buf, obs);
-        }
+fn render_raw_observations(buf: &mut String, digest: &SessionDigest) {
+    for line in &digest.first_lines {
+        render_raw_observation(buf, line);
+    }
+    if digest.total <= RAW_OBSERVATION_MAX_LINES {
         return;
     }
-
-    for obs in &observations[..RAW_OBSERVATION_HEAD_LINES] {
-        render_raw_observation(buf, obs);
-    }
-    let omitted = observations.len() - RAW_OBSERVATION_HEAD_LINES - RAW_OBSERVATION_TAIL_LINES;
+    let omitted = digest.total - RAW_OBSERVATION_HEAD_LINES - RAW_OBSERVATION_TAIL_LINES;
     buf.push_str(&format!(
         "\n_... {omitted} raw observations omitted from the middle (showing first {RAW_OBSERVATION_HEAD_LINES} and last {RAW_OBSERVATION_TAIL_LINES})._\n\n",
     ));
-    for obs in &observations[observations.len() - RAW_OBSERVATION_TAIL_LINES..] {
-        render_raw_observation(buf, obs);
+    for line in &digest.last_lines {
+        render_raw_observation(buf, line);
     }
 }
 
-fn render_raw_observation(buf: &mut String, obs: &Observation) {
-    let kind = observation_kind_label(obs);
+fn render_raw_observation(buf: &mut String, line: &SessionLine) {
+    let kind = observation_kind_label(line);
     buf.push_str(&format!(
         "- `{}` @ {} — {}\n",
         kind,
-        human_ts(&obs.created_at),
-        obs.title.chars().take(80).collect::<String>(),
+        human_ts(&line.created_at),
+        line.title,
     ));
 }
 
-fn observation_kind_label(obs: &Observation) -> String {
-    match (&obs.extension, &obs.source_event) {
+fn observation_kind_label(line: &SessionLine) -> String {
+    match (&line.extension, &line.source_event) {
         (Some(extension), Some(source_event)) => {
-            format!("{} [{}:{}]", obs.kind.as_str(), extension, source_event)
+            format!("{} [{}:{}]", line.kind.as_str(), extension, source_event)
         }
-        _ => obs.kind.as_str().to_string(),
+        _ => line.kind.as_str().to_string(),
     }
 }
 
@@ -496,6 +846,124 @@ fn human_ts(ts: &jiff::Timestamp) -> String {
     ts.to_zoned(TimeZone::UTC)
         .strftime("%Y-%m-%dT%H:%M:%SZ")
         .to_string()
+}
+
+/// The digest a full row list gives, computed by walking it with the same
+/// predicates the bounded queries apply. Test-only: production reads the
+/// database, and the equivalence tests pin this walk and the queries together.
+#[cfg(test)]
+impl SessionDigest {
+    pub(crate) fn from_observations(session_id: SessionId, observations: &[Observation]) -> Self {
+        let total = observations.len();
+        let (first_lines, last_lines) = if total <= RAW_OBSERVATION_MAX_LINES {
+            (observations.iter().map(session_line).collect(), Vec::new())
+        } else {
+            (
+                observations[..RAW_OBSERVATION_HEAD_LINES]
+                    .iter()
+                    .map(session_line)
+                    .collect(),
+                observations[total - RAW_OBSERVATION_TAIL_LINES..]
+                    .iter()
+                    .map(session_line)
+                    .collect(),
+            )
+        };
+        let last_of = |kind: ObservationKind| observations.iter().rev().find(|o| o.kind == kind);
+        let title = match title_from_prompts(
+            observations
+                .iter()
+                .filter(|o| o.kind == ObservationKind::UserPrompt)
+                .map(|o| (o.title.as_str(), o.body.as_str())),
+        ) {
+            PromptTitle::Found(title) => title,
+            PromptTitle::RejectedPreamble => format!("Session {session_id}"),
+            PromptTitle::Unusable => observations
+                .iter()
+                .find_map(fallback_title)
+                .unwrap_or_else(|| title_without_candidate(session_id, total)),
+        };
+        let mut tool_counts = BTreeMap::new();
+        for obs in observations {
+            if obs.kind == ObservationKind::PostToolUse && !obs.title.is_empty() {
+                *tool_counts.entry(obs.title.clone()).or_insert(0) += 1;
+            }
+        }
+        let prompt_titles_all: Vec<String> = observations
+            .iter()
+            .filter(|o| o.kind == ObservationKind::UserPrompt)
+            .map(|o| o.title.clone())
+            .collect();
+        // The store's bounded read keeps every title when the session fits in
+        // the cap and the first/last slice when it does not; mirror that here
+        // so the row-list digest and the database digest stay equal.
+        let (prompt_count, prompt_titles) = if prompt_titles_all.len() <= PROMPT_TITLES_MAX {
+            (prompt_titles_all.len(), prompt_titles_all)
+        } else {
+            (
+                prompt_titles_all.len(),
+                prompt_titles_all[..PROMPT_TITLES_HEAD]
+                    .iter()
+                    .chain(prompt_titles_all[prompt_titles_all.len() - PROMPT_TITLES_TAIL..].iter())
+                    .cloned()
+                    .collect(),
+            )
+        };
+        Self {
+            total,
+            substantive: observations.iter().any(|o| {
+                matches!(
+                    o.kind,
+                    ObservationKind::UserPrompt
+                        | ObservationKind::PreToolUse
+                        | ObservationKind::PostToolUse
+                )
+            }),
+            first_lines,
+            last_lines,
+            start_at: last_of(ObservationKind::SessionStart).map(|o| o.created_at),
+            end: last_of(ObservationKind::SessionEnd).map(|o| SessionEndFact {
+                created_at: o.created_at,
+                body: o.body.clone(),
+            }),
+            prompt_titles,
+            prompt_count,
+            tool_counts,
+            title,
+            handoff: HandoffFacts::from_observations(observations),
+        }
+    }
+}
+
+#[cfg(test)]
+impl HandoffFacts {
+    pub(crate) fn from_observations(observations: &[Observation]) -> Self {
+        Self {
+            first_prompt: observations.iter().find_map(handoff_prompt),
+            last_prompt: observations.iter().rev().find_map(handoff_prompt),
+            question_prompt: observations.iter().rev().find_map(question_prompt),
+            last_tool_title: observations
+                .iter()
+                .rev()
+                .find(|o| o.kind == ObservationKind::PostToolUse)
+                .map(|o| o.title.clone()),
+            latest_assistant: observations.iter().rev().find_map(assistant_response),
+            has_stop: observations.iter().any(|o| o.kind == ObservationKind::Stop),
+            has_session_end: observations
+                .iter()
+                .any(|o| o.kind == ObservationKind::SessionEnd),
+            tools: observations
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o.kind,
+                        ObservationKind::PostToolUse | ObservationKind::PreToolUse
+                    ) && is_listable_tool_title(&o.title)
+                })
+                .map(|o| o.title.clone())
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +977,34 @@ mod tests {
     }
     use ai_memory_core::{ObservationId, SessionId};
     use jiff::Timestamp;
+
+    // The renderers take a digest of the session. These tests describe a
+    // session as the row list it is made of, so each shim digests that list
+    // the way the database queries do (`SessionDigest::from_observations`),
+    // and the assertions below read as they always did.
+    fn synthesize_session_page(
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        observations: &[Observation],
+    ) -> NewPage {
+        super::synthesize_session_page(
+            workspace_id,
+            project_id,
+            session_id,
+            agent_kind,
+            &SessionDigest::from_observations(session_id, observations),
+        )
+    }
+
+    fn tally_session(observations: &[Observation]) -> SessionDigest {
+        SessionDigest::from_observations(SessionId::new(), observations)
+    }
+
+    fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
+        SessionDigest::from_observations(session_id, observations).title
+    }
 
     fn obs(kind: ObservationKind, title: &str) -> Observation {
         Observation {
@@ -982,7 +1478,7 @@ mod tests {
         ];
         let title = derive_title(&obs, test_session_id());
         let tally = tally_session(&obs);
-        let body = render_body(test_session_id(), &obs, &title, &tally);
+        let body = render_body(test_session_id(), &tally, &title);
         assert!(
             body.contains("Make the backpressure test deterministic"),
             "the promoted prompt must still appear in the body: {body}"

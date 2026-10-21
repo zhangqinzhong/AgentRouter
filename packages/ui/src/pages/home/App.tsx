@@ -385,7 +385,7 @@ function App() {
       .then((finished) => {
         setOnboardingFinished(finished);
         setOnboardingProfileConfirmed(finished);
-        setActiveView(finished ? "overview" : "onboarding");
+        setActiveView(finished ? (new URLSearchParams(window.location.search).has("monitorRange") ? "monitor-center" : "overview") : "onboarding");
       })
       .catch(() => setActiveView("onboarding"))
       .finally(() => setOnboardingStatusLoaded(true));

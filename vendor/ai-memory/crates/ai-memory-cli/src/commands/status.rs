@@ -4,6 +4,8 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+mod presentation;
+
 use ai_memory_core::fix_lines;
 use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
@@ -171,10 +173,10 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     eprintln!("  pending:    {}", spool.pending);
     eprintln!("  oldest:     {}", spool_age_line(spool.oldest_age_ms));
     eprintln!("  retries:    {}", spool.retries_total);
-    if spool.evicting() {
+    if spool.at_capacity() {
         eprintln!(
-            "  The spool is full ({} events): each new event evicts the oldest \
-             undelivered one, which is lost. Bring the server back to stop the loss.",
+            "  The spool is full ({} events): newly captured events are dropped until \
+             space is available. Bring the server back to stop the loss.",
             spool.capacity
         );
     } else if spool.pending > 0 {
@@ -210,6 +212,24 @@ fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool
     );
 }
 
+/// The missing logon binary while the server is down, on stderr like the
+/// spool block, so `--json` consumers' stdout stays a single object.
+fn report_offline_logon_binary(
+    problem: Option<&super::user_service::MissingLogonBinary>,
+    json: bool,
+) {
+    let Some(problem) = problem else {
+        return;
+    };
+    if json {
+        if let Ok(rendered) = serde_json::to_string(problem) {
+            eprintln!("windows logon (server unreachable): {rendered}");
+        }
+        return;
+    }
+    eprint!("{}", problem.render_human());
+}
+
 /// Which capture mode the hook would enforce for this install (#446).
 ///
 /// Reads the same file the hook reads rather than keeping a second source of
@@ -238,12 +258,16 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     // the one question this section exists for could not be asked in the one
     // situation that prompts it.
     let spool = spool_health(&spool_dir(&config.data_dir));
+    // Also local, and for the same reason: a quarantined binary (#1280)
+    // usually means nothing is listening.
+    let windows_logon = super::user_service::check_logon_binary(&config.data_dir);
 
     let report: Report = match get_json::<Report>(&ep, "/admin/status", &[]).await {
         Ok(report) => report,
         Err(err) => {
             report_offline_spool(&spool, args.json);
             report_offline_recovery_hint(config, &spool, args.json);
+            report_offline_logon_binary(windows_logon.as_ref(), args.json);
             return Err(err);
         }
     };
@@ -266,184 +290,25 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 capture_mode,
                 &ep,
                 auth_posture,
+                windows_logon.as_ref(),
             ))?
         );
     } else {
-        println!("ai-memory {} (server)", report.version);
-        println!("  server:       {}", ep.url);
-        println!("  data-dir:     {}", report.data_dir);
-        println!("  db:           {}", report.db_path);
-        println!("  bind:         {}", report.bind);
-        println!("  auth:         {}", auth_posture.line());
-        println!(
-            "  pages:        {} (all versions: {})",
-            report.counts.pages_latest, report.counts.pages_all
+        presentation::render(
+            &crate::terminal::Terminal::stdout(&config.runtime_env),
+            presentation::View {
+                report: &report,
+                ep: &ep,
+                spool: &spool,
+                journal_pending,
+                journal_degraded,
+                journal_finish_failed,
+                journal_error: journal_error.as_deref(),
+                capture_mode,
+                auth_posture,
+                windows_logon: windows_logon.as_ref(),
+            },
         );
-        println!("  sessions:     {}", report.counts.sessions);
-        println!("  observations: {}", report.counts.observations);
-        println!(
-            "  fts:          pages {}/{}; observations {}/{}",
-            report.derived.pages_fts_rows,
-            report.derived.pages_rows,
-            report.derived.observations_fts_rows,
-            report.derived.observations_rows
-        );
-        println!(
-            "  embeddings:   {} rows; {} latest pages missing",
-            report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
-        );
-        if report.derived.latest_pages_unembeddable > 0 {
-            println!(
-                "    unembeddable: {} (empty body; no embedder can cover these)",
-                report.derived.latest_pages_unembeddable
-            );
-        }
-        for triple in &report.derived.embedding_triples {
-            println!(
-                "    {}/{} dim {}: {} rows",
-                triple.provider, triple.model, triple.dim, triple.count
-            );
-        }
-        // Only shown when there is something to act on. A recovered count with
-        // no outstanding failures is history, not a problem.
-        if report.derived.embed_failures_unresolved > 0 {
-            println!(
-                "    embed failures: {} unresolved ({} recovered since)",
-                report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
-            );
-        }
-        // The figure that makes a `compact` decision possible. Reported
-        // always, so "should I VACUUM?" has an answer other than a guess; the
-        // advisory line only appears once it is worth the exclusive lock.
-        if report.storage.database_bytes > 0 {
-            let pct = (report.storage.reclaimable_bytes as f64
-                / report.storage.database_bytes as f64)
-                * 100.0;
-            println!(
-                "  storage:      {} on disk, {} reclaimable ({pct:.1}%)",
-                super::compact::human_bytes(report.storage.database_bytes),
-                super::compact::human_bytes(report.storage.reclaimable_bytes),
-            );
-            if let Some(free) = report.storage.data_dir_free_bytes {
-                println!("    filesystem free: {}", super::compact::human_bytes(free));
-            }
-            if fix_lines::reclaim_advised(
-                report.storage.reclaimable_bytes,
-                report.storage.database_bytes,
-            ) {
-                println!(
-                    "    `{}` would return it (blocks writes while it runs)",
-                    fix_lines::COMPACT
-                );
-            }
-        }
-        println!(
-            "  links:        {} latest-page links (unresolved: {}, stale: {})",
-            report.derived.links_from_latest_pages,
-            report.derived.unresolved_links_from_latest_pages,
-            report.derived.stale_links_from_latest_pages
-        );
-        if !report.derived.typed_links_from_latest_pages.is_empty() {
-            let typed: Vec<String> = report
-                .derived
-                .typed_links_from_latest_pages
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .collect();
-            println!("    typed edges: {}", typed.join(", "));
-        }
-        if let Some(wiki) = &report.wiki_format {
-            let migrated = if wiki.okf_migrated {
-                "OKF v0.2 (migrated)"
-            } else {
-                "OKF v0.2 (native, no migration needed)"
-            };
-            match (&wiki.backup_archive, wiki.backup_archive_bytes) {
-                (Some(path), Some(bytes)) => println!(
-                    "  wiki format:  {migrated}; pre-migration backup still on disk: \
-                     {path} ({})",
-                    super::compact::human_bytes(bytes)
-                ),
-                _ => println!("  wiki format:  {migrated}"),
-            }
-        }
-        if let Some((queued, capacity)) = report.write_queue {
-            // A queue pinned near capacity is the wedged-writer signal.
-            if queued > 0 {
-                println!("  write queue:  {queued}/{capacity}");
-            }
-        }
-        println!("  spool:");
-        println!("    pending:    {}", spool.pending);
-        println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));
-        println!("    retries:    {}", spool.retries_total);
-        if journal_pending > 0 || journal_error.is_some() {
-            println!("  recovery:");
-            println!(
-                "    journal:    {journal_pending} pending ({journal_degraded} degraded, {journal_finish_failed} finish-failed)"
-            );
-            if let Some(error) = &journal_error {
-                println!("    error:      {error}");
-            }
-            println!("    action:     run `{}`", fix_lines::RECOVER);
-        }
-        if let Some(ingest) = &report.ingest {
-            println!("  ingest (server, this process):");
-            println!("    accepted:   {}", ingest.accepted);
-            println!(
-                "    dropped:    {} (capture policy)",
-                ingest.dropped_by_policy
-            );
-            println!(
-                "    outcomes:   {} stored, {} replayed, {} resumed, {} ignored end, {} failed",
-                ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
-            );
-            println!(
-                "    drops:      {} unauthorized, {} collision, {} invalid",
-                ingest.dropped_unauthorized, ingest.dropped_collision, ingest.dropped_invalid
-            );
-            println!(
-                "    shed:       {} saturated, {} rate-limited",
-                ingest.shed_saturated, ingest.shed_rate_limited
-            );
-            println!(
-                "    last write: {}",
-                last_write_line(ingest.last_persisted_ms)
-            );
-        }
-        // #446 + #428 interact here: under allowlist mode an unmarked
-        // repository never sends, so zero counters read exactly like a broken
-        // install. Deliberately outside the ingest block above: the mode is a
-        // client-side fact, and an older server returns no ingest section at
-        // all — which is precisely a case where the operator needs telling.
-        if capture_mode == "allowlist" {
-            println!(
-                "  capture mode: allowlist — repositories without a \
-                 .ai-memory.toml marker send nothing"
-            );
-        }
-        println!("  providers:");
-        println!(
-            "    llm:       {}",
-            provider_health_line(&report.providers.llm)
-        );
-        println!(
-            "    embedding: {}",
-            provider_health_line(&report.providers.embedding)
-        );
-        if report.providers.llm.status == ProviderHealthStatus::Error
-            && let Some(hint) = &report.providers.llm.retry_hint
-        {
-            println!("    retry:     {hint}");
-        }
-        // Only present when `llm_fallbacks` is configured — an older server
-        // or a plain single-provider setup reports an empty list.
-        if !report.providers.llm_candidates.is_empty() {
-            println!("    fallback chain:");
-            for candidate in &report.providers.llm_candidates {
-                println!("      {}", fallback_candidate_line(candidate));
-            }
-        }
     }
     Ok(())
 }
@@ -496,8 +361,9 @@ fn json_report(
     capture_mode: &str,
     endpoint: &ServerEndpoint,
     auth_posture: crate::local_auth::AuthPosture,
+    windows_logon: Option<&super::user_service::MissingLogonBinary>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "version": report.version,
         "data_dir": report.data_dir,
         "bind": report.bind,
@@ -522,7 +388,13 @@ fn json_report(
         "ingest": report.ingest,
         "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
         "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
-    })
+    });
+    // Absent when there is nothing to say, so the shape consumers read is
+    // unchanged.
+    if let Some(problem) = windows_logon {
+        value["windows_logon"] = serde_json::json!(problem);
+    }
+    value
 }
 
 fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
@@ -581,7 +453,7 @@ mod tests {
 
     #[test]
     fn status_json_keeps_existing_fields_and_adds_recovery_compatibly() {
-        let report: Report = serde_json::from_value(serde_json::json!({
+        let report_json = serde_json::json!({
             "version": "2.6.0",
             "data_dir": "/data",
             "bind": "127.0.0.1:49374",
@@ -604,8 +476,8 @@ mod tests {
             "ingest": null,
             "write_queue": null,
             "wiki_format": null
-        }))
-        .unwrap();
+        });
+        let report: Report = serde_json::from_value(report_json.clone()).unwrap();
         let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".into()), None);
         let value = json_report(
             report,
@@ -617,7 +489,9 @@ mod tests {
             "denylist",
             &endpoint,
             crate::local_auth::AuthPosture::NoneLoopback,
+            None,
         );
+        assert!(value.get("windows_logon").is_none(), "{value}");
         assert_eq!(value["auth_posture"]["posture"], "none_loopback");
         assert_eq!(value["auth_posture"]["fix"], "ai-memory auth enable");
         for key in [
@@ -638,6 +512,38 @@ mod tests {
         }
         assert_eq!(value["recovery"]["journal_pending"], 2);
         assert_eq!(value["counts"]["observations"], 4);
+
+        // A missing logon binary (#1280) adds one key and changes no other.
+        let problem = super::super::user_service::MissingLogonBinary {
+            classification: super::super::user_service::LOGON_BINARY_MISSING,
+            executable: r"C:\bin\ai-memory.exe".into(),
+            detail: "gone".into(),
+            fix: "restore it",
+        };
+        let warned = json_report(
+            serde_json::from_value(report_json).unwrap(),
+            SpoolHealth::default(),
+            2,
+            1,
+            1,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            Some(&problem),
+        );
+        assert_eq!(
+            warned["windows_logon"]["classification"],
+            "logon_binary_missing"
+        );
+        assert_eq!(
+            warned["windows_logon"]["executable"],
+            r"C:\bin\ai-memory.exe"
+        );
+        assert_eq!(warned["windows_logon"]["fix"], "restore it");
+        let mut without = warned.clone();
+        without.as_object_mut().unwrap().remove("windows_logon");
+        assert_eq!(without, value);
     }
 
     #[test]

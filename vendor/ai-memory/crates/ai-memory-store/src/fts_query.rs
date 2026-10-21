@@ -6,6 +6,7 @@
 //! exist on the FTS tables. Unknown bare column syntax is neutralised without
 //! discarding deliberate FTS operators such as `OR`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -113,8 +114,14 @@ impl Default for FtsStopwords {
 ///
 /// `stopwords` is the operator-configured set (default: [`FtsStopwords::default`],
 /// the built-in English list; `FtsStopwords::none()` disables filtering).
+///
+/// The input is bounded first: a NUL byte is folded to a space, and anything
+/// past the 4 KiB cap is dropped, because FTS5's parser is superlinear in the
+/// expression it is handed (see `bounded_query_text`).
 #[must_use]
 pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
+    let bounded = bounded_query_text(raw);
+    let raw = bounded.as_ref();
     let explicit_syntax = raw.contains('"')
         || raw.contains('(')
         || raw.contains(')')
@@ -178,6 +185,34 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         .join(" OR ")
 }
 
+/// Upper bound (bytes) on the untrusted search text this module tokenises.
+///
+/// FTS5's query parser is superlinear in the expression it is handed:
+/// measured here, 10k distinct terms spent ~60 ms inside
+/// [`prepare_fts5_query`], 40k ~1.9 s and 100k ~17.5 s — before the real
+/// `MATCH` ran. Search text is a phrase, not a document, so the tail of
+/// anything longer is dropped instead of parsed.
+const MAX_FTS_QUERY_BYTES: usize = 4_096;
+
+/// Bound untrusted search text before anything parses it.
+///
+/// A NUL cannot appear in indexed text, but it used to reach the FTS5 parser,
+/// which reads a quoted phrase as a C string: `"\0"` fails as an unterminated
+/// string, so `memory_query` surfaced `sqlite: unterminated string` as an
+/// internal error instead of a result. Folding NUL to a space keeps the rest
+/// of the token searchable. Past [`MAX_FTS_QUERY_BYTES`] the text is cut on a
+/// UTF-8 boundary; a cut that lands inside a phrase or paren leaves invalid
+/// FTS5 syntax, which [`fts5_query_parses`] already degrades to the quoted
+/// bag of words. Borrows when neither applies, so the common query path
+/// allocates nothing.
+fn bounded_query_text(raw: &str) -> Cow<'_, str> {
+    let bounded = &raw[..raw.floor_char_boundary(MAX_FTS_QUERY_BYTES)];
+    if !bounded.contains('\0') {
+        return Cow::Borrowed(bounded);
+    }
+    Cow::Owned(bounded.replace('\0', " "))
+}
+
 /// Whether FTS5's own parser accepts `query`. Uses a throwaway in-memory
 /// table (microseconds; search-path frequency, not ingest-path) so the
 /// judgement is the engine's, not a re-implementation of its grammar.
@@ -211,12 +246,39 @@ fn fts5_query_parses(query: &str) -> bool {
 }
 
 fn prepare_fts5_token(token: &str) -> Vec<String> {
+    // Group parens hug the token (`(title:handoff`, `body:deploy)`), so peel
+    // them before the column checks below, which look at the token's start.
+    let open = token.len() - token.trim_start_matches('(').len();
+    let close = token.len() - token.trim_end_matches(')').len();
+    if (open > 0 || close > 0) && open + close < token.len() {
+        let mut parts = prepare_fts5_token(&token[open..token.len() - close]);
+        if let Some(first) = parts.first_mut() {
+            first.insert_str(0, &token[..open]);
+        }
+        if let Some(last) = parts.last_mut() {
+            last.push_str(&token[token.len() - close..]);
+        }
+        return parts;
+    }
+
     if has_unknown_bare_column(token) {
         return token
             .replace(':', " ")
             .split_whitespace()
             .map(quote_fts5_token)
             .collect();
+    }
+
+    // A known column filter keeps its column when its term needs quoting:
+    // `title:ai-memory` becomes `title:("ai-memory" OR "ai memory")`, not a
+    // quoted phrase that also searches for the literal word `title`.
+    if !token.contains('"')
+        && let Some((column, term)) = token.split_once(':')
+        && matches!(column, "title" | "body")
+        && !term.is_empty()
+        && should_quote_fts5_token(term)
+    {
+        return vec![format!("{column}:{}", quote_fts5_token(term))];
     }
 
     if should_quote_fts5_token(token) {
@@ -269,15 +331,24 @@ fn quote_fts5_token(token: &str) -> String {
     // punctuation that would otherwise be FTS5 query grammar — the original
     // `current.md` → `syntax error` bug.) With no punctuation the two coincide
     // and we emit a single phrase.
+    //
+    // A trailing `*` is the FTS5 prefix operator. Inside a quoted string it is
+    // only a separator, so it moves outside each closing quote instead:
+    // `ai-mem*` becomes `("ai-mem"* OR "ai mem"*)`, which FTS5 reads as a
+    // prefix match on the phrase's last token.
+    let (token, prefix) = match token.strip_suffix('*') {
+        Some(core) if core.chars().any(char::is_alphanumeric) => (core, "*"),
+        _ => (token, ""),
+    };
     let split = token
         .chars()
         .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
         .collect::<String>();
     let split = split.split_whitespace().collect::<Vec<_>>().join(" ");
     if split.is_empty() || split == token {
-        format!("\"{token}\"")
+        format!("\"{token}\"{prefix}")
     } else {
-        format!("(\"{token}\" OR \"{split}\")")
+        format!("(\"{token}\"{prefix} OR \"{split}\"{prefix})")
     }
 }
 
@@ -321,6 +392,70 @@ mod tests {
         // and the degraded form still carries the searchable words
         assert!(prepared.contains("MoMA"));
         assert!(prepared.contains("Civilizations"));
+    }
+
+    /// A NUL byte cannot appear in indexed text, but it used to reach the
+    /// FTS5 query parser: a token that starts with one is quoted (`"\0x"`),
+    /// and the parser reads the phrase as end-of-input — `sqlite:
+    /// unterminated string` came back from `memory_query` as an internal
+    /// error. This module's contract is that MATCH never errors on user text.
+    #[test]
+    fn nul_bytes_never_reach_the_match_expression() {
+        for raw in ["\0", "\0x", "x\0", "\0 \0", "(\0)", "a\0b", "title:\0x"] {
+            let prepared = prepare_fts5_query(raw);
+            assert!(!prepared.contains('\0'), "NUL survived into {prepared:?}");
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
+    }
+
+    /// The FTS5 query parser is superlinear in the number of terms: 100k
+    /// distinct terms spent ~17 s inside `prepare_fts5_query` alone, before
+    /// the real MATCH ran. Search text is a phrase, not a document, so the
+    /// tail of an oversized query must be dropped before the parser sees it.
+    #[test]
+    fn oversized_query_text_is_bounded_before_parsing() {
+        let raw = (0..100_000)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let prepared = prepare_fts5_query(&raw);
+        assert!(
+            prepared.len() <= 32 * 1024,
+            "prepared expression is not bounded: {} bytes",
+            prepared.len()
+        );
+        assert_parses(&prepared);
+    }
+
+    /// The bound must not touch an ordinary query: this is the exact
+    /// expression every search has produced since the OR-join landed.
+    #[test]
+    fn ordinary_query_text_is_untouched_by_the_bound() {
+        assert_eq!(
+            prepare_fts5_query("cross project search strategy"),
+            "cross OR project OR search OR strategy"
+        );
+    }
+
+    /// 4 KiB lands mid-character for a 3-byte code point (4096 % 3 != 0); the
+    /// cut has to move back to a UTF-8 boundary instead of panicking.
+    #[test]
+    fn the_bound_cuts_on_a_character_boundary() {
+        let raw = "日".repeat(2_000);
+        assert!(raw.len() > MAX_FTS_QUERY_BYTES);
+        let prepared = prepare_fts5_query(&raw);
+        assert_parses(&prepared);
+    }
+
+    /// Truncation can land inside a quoted phrase; whatever the cut leaves,
+    /// the prepared expression must still parse and MATCH without error.
+    #[test]
+    fn truncated_explicit_syntax_stays_parseable() {
+        let raw = format!("\"unclosed {}", "w ".repeat(3_000));
+        let prepared = prepare_fts5_query(&raw);
+        assert_parses(&prepared);
     }
 
     #[test]
@@ -437,6 +572,28 @@ mod tests {
         assert_eq!(prepare_fts5_query("curr*"), "curr*");
     }
 
+    /// A punctuated token is quoted, and inside an FTS5 string `*` is only a
+    /// separator. The prefix operator has to follow each closing quote, or
+    /// `ai-mem*` silently becomes an exact search for `ai-mem`.
+    #[test]
+    fn prefix_star_survives_quoting_of_punctuated_tokens() {
+        assert_eq!(prepare_fts5_query("ai-mem*"), r#"("ai-mem"* OR "ai mem"*)"#);
+        assert_eq!(
+            prepare_fts5_query("current.m*"),
+            r#"("current.m"* OR "current m"*)"#
+        );
+        // Unknown column syntax is split, and the prefix stays on its term.
+        assert_eq!(prepare_fts5_query("pick:hand*"), r#""pick" OR "hand"*"#);
+        // A token of punctuation alone has no term to prefix-match.
+        assert_eq!(quote_fts5_token("-*"), r#""-*""#);
+        for raw in ["ai-mem*", "current.m*", "pick:hand*", "a-* b", "-*", "x.*"] {
+            let prepared = prepare_fts5_query(raw);
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
+    }
+
     #[test]
     fn empty_yields_empty() {
         assert_eq!(prepare_fts5_query("   "), "");
@@ -512,6 +669,55 @@ mod tests {
     #[test]
     fn known_columns_are_preserved() {
         assert_eq!(prepare_fts5_query("title:handoff"), "title:handoff");
+    }
+
+    /// A known column filter whose term carries punctuation keeps the filter
+    /// on the quoted term, instead of quoting `title:` into the phrase and
+    /// searching every column for the word "title".
+    #[test]
+    fn known_column_filter_survives_quoting_of_its_term() {
+        assert_eq!(
+            prepare_fts5_query("title:ai-memory"),
+            r#"title:("ai-memory" OR "ai memory")"#
+        );
+        assert_eq!(
+            prepare_fts5_query("body:current.md OR title:handoff"),
+            r#"body:("current.md" OR "current md") OR title:handoff"#
+        );
+        for raw in ["title:ai-memory", "body:a.b c", "title:-", "title:a:b"] {
+            let prepared = prepare_fts5_query(raw);
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
+    }
+
+    /// A column filter inside a group keeps its column: the paren attached
+    /// to `title:` must not turn it into an unknown column whose name is
+    /// then searched as the literal word "title".
+    #[test]
+    fn grouped_known_column_filter_keeps_its_column() {
+        assert_eq!(prepare_fts5_query("(title:handoff)"), "(title:handoff)");
+        assert_eq!(
+            prepare_fts5_query("(title:handoff OR body:deploy)"),
+            "(title:handoff OR body:deploy)"
+        );
+        assert_eq!(
+            prepare_fts5_query("(title:ai-memory) AND deploy"),
+            r#"(title:("ai-memory" OR "ai memory")) AND deploy"#
+        );
+        for raw in [
+            "(title:handoff)",
+            "((title:a)",
+            "(pick: handoff)",
+            "(",
+            "(title:)",
+        ] {
+            let prepared = prepare_fts5_query(raw);
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
     }
 
     // --- issue #953: configurable stopword list -----------------------

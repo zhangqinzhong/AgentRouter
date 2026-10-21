@@ -35,7 +35,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "3.0.0"
+version = "3.1.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -45,16 +45,16 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "3.0.0" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "3.0.0" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.0.0" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.0.0" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.0.0" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.0.0" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.0.0" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "3.0.0" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.0.0" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.0.0" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "3.1.2" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "3.1.2" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.1.2" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.1.2" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.1.2" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.1.2" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.1.2" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "3.1.2" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.1.2" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.1.2" }
 
 # (Workspace shared deps follow below)
 
@@ -188,6 +188,13 @@ async-trait = "0.1"
 # Testing.
 tempfile = "3"
 rstest = "0.26"
+
+# Candle 0.11 requires `zip ^8.6`, but crates.io yanked every compatible 8.x
+# release after publishing zip 9. Pin the upstream v8.6.0 release commit so a
+# fresh `cargo install --path` can still resolve the graph. Remove this patch
+# when Candle publishes a release compatible with zip 9.
+[patch.crates-io]
+zip = { git = "https://github.com/zip-rs/zip2", rev = "771dfc534d2614158af5497ea3dff4d4208d7db1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

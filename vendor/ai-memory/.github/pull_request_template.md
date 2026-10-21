@@ -31,6 +31,11 @@
 - [ ] **Major (breaking)**: on-disk format, removed/renamed surface, or
       breaking MCP schema change, called out in "What changed" above
 
+- [ ] The base branch matches: `main` for a patch, the standing feature
+      branch (currently `release/3.2`) for minor or major work.
+- [ ] I checked that this does not redo something already on `main` or the
+      feature branch, or fixed by a closed issue.
+
 ## CHANGELOG (merge gate)
 
 - [ ] I added a `CHANGELOG.md` `[Unreleased]` entry. It is **required** for any

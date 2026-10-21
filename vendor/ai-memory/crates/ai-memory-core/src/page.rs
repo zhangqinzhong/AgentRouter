@@ -606,6 +606,14 @@ pub struct Page {
 }
 
 impl Tier {
+    /// Every tier, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::Working,
+        Self::Episodic,
+        Self::Semantic,
+        Self::Procedural,
+    ];
+
     /// Canonical short string for storage and serialisation.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -878,6 +886,21 @@ mod tests {
             Tier::Procedural,
         ] {
             assert_eq!(t.as_str().parse::<Tier>().unwrap(), t);
+        }
+    }
+
+    #[test]
+    fn tier_all_lists_every_variant() {
+        // An exhaustive match: a new variant fails to compile here until it is
+        // added to `ALL`, which the web search's tier filter offers.
+        for (index, tier) in Tier::ALL.into_iter().enumerate() {
+            let expected = match tier {
+                Tier::Working => 0,
+                Tier::Episodic => 1,
+                Tier::Semantic => 2,
+                Tier::Procedural => 3,
+            };
+            assert_eq!(index, expected);
         }
     }
 

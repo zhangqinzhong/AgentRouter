@@ -246,6 +246,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             env: Vec::new(),
             env_file: None,
             harness: Some(harness),
+            claude_wrapper: None,
             native_args: args.native_args,
         },
         &target,

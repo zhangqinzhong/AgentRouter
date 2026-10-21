@@ -175,7 +175,7 @@ async fn pages_handler(
     let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let pages = state
         .reader
-        .list_pages(&workspace, &project)
+        .list_unexpired_pages(&workspace, &project)
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -406,7 +406,8 @@ async fn search_with_request(
                 .iter()
                 .map(|scope| (scope.workspace_id, scope.project_id))
                 .collect();
-            crate::recall::search_scopes(state, &scopes, &term, limit, false, owner)
+            let filter = ai_memory_store::PageFilter::default();
+            crate::recall::search_scopes(state, &scopes, &term, limit, false, owner, filter)
                 .await
                 .map(|result| result.hits.into_iter().map(|(hit, _)| hit).collect())
         }
@@ -583,7 +584,7 @@ async fn recent_handler(
     if query.updated_since.is_none() && query.cursor.is_none() {
         let mut pages = state
             .reader
-            .list_pages(&workspace, &project)
+            .list_unexpired_pages(&workspace, &project)
             .await
             .map_err(internal_error)?;
         pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));

@@ -507,6 +507,14 @@ pub fn parse_agent(s: &str) -> AgentKind {
     AgentKind::from_wire(s)
 }
 
+/// The prompt text of a `UserPromptSubmit`-style payload, from the same keys
+/// the router reads (`prompt`, `message`, `text`), flattened when a harness
+/// sends content blocks.
+#[must_use]
+pub fn user_prompt_text(raw: &serde_json::Value) -> Option<String> {
+    extract_content(raw, &["prompt", "message", "text"])
+}
+
 /// Identify the harness from the payload itself when it carries an
 /// unambiguous vendor marker, overriding the `?agent=` the hook command
 /// declared.
@@ -589,7 +597,7 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
@@ -653,9 +661,11 @@ impl HookEnvelope {
         } else {
             None
         };
-        if agent == AgentKind::AntigravityCli {
-            crate::antigravity::enrich_antigravity_step_output(&mut raw, event, None);
-        }
+        // Antigravity step output is read from `output.txt` by the client-side
+        // hook (`ai-memory hook`), on the machine that ran the tool. The server
+        // must never open a path a hook payload names: `artifactDirectoryPath`
+        // and `transcriptPath` are caller-controlled, so reading them here would
+        // turn any capture credential into a read of the server's own disk.
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
@@ -833,6 +843,11 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Grizzybot
             | AgentKind::Droid
             | AgentKind::Muse
+            // CodeBuddy Code sends Claude Code's snake_case tool fields
+            // (#1299). Unknown values stay `Other` and keep the capture-only
+            // path.
+            | AgentKind::CodeBuddy
+            | AgentKind::IbmBob
     )
 }
 
@@ -2180,6 +2195,8 @@ mod tests {
         assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
         assert_eq!(parse_agent("pool"), AgentKind::Pool);
         assert_eq!(parse_agent("poolside"), AgentKind::Pool);
+        assert_eq!(parse_agent("codebuddy"), AgentKind::CodeBuddy);
+        assert_eq!(parse_agent("code-buddy"), AgentKind::CodeBuddy);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -2239,6 +2256,96 @@ mod tests {
         );
         assert_eq!(unknown.agent, AgentKind::Other);
         assert!(unknown.title_hint.is_none());
+    }
+
+    /// CodeBuddy posts Claude Code's tool payload. The same body under
+    /// `agent=codebuddy` is a closed tool observation; under an unknown
+    /// agent it stays capture-only (`title` empty, no tool family).
+    #[test]
+    fn codebuddy_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_codebuddy",
+            "tool_input": {"file_path": "src/lib.rs"},
+            "tool_response": "file contents"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("codebuddy".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::CodeBuddy);
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("outcome: unknown"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_codebuddy"), "{body}");
+        assert!(body.contains("\n---\nfile contents"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("codebuddy-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
+    }
+
+    /// IBM Bob documents the same snake_case tool fields as Claude Code. A
+    /// recognized Bob payload becomes a closed tool observation while an
+    /// unknown agent carrying identical JSON stays on the capture-only path.
+    #[test]
+    fn ibm_bob_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_bob",
+            "tool_input": {"file_path": "src/lib.rs"},
+            "tool_response": "file contents"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("ibm-bob".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::IbmBob);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_bob"), "{body}");
+        assert!(body.contains("\n---\nfile contents"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("ibm-bob-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
     }
 
     /// Hermes 3.x puts the tool result inside `extra.result` and mirrors the
@@ -3727,16 +3834,8 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_post_tool_use_extracts_output_txt_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let step_dir = dir
-            .path()
-            .join(".system_generated")
-            .join("steps")
-            .join("42");
-        std::fs::create_dir_all(&step_dir).unwrap();
-        std::fs::write(step_dir.join("output.txt"), "cargo test: 10 passed\n").unwrap();
-
+    fn antigravity_post_tool_use_renders_client_enriched_output() {
+        // The client hook reads `output.txt` and sends it as `tool_response`.
         let env = HookEnvelope::from_query_and_body(
             HookQuery {
                 event: "post-tool-use".into(),
@@ -3750,12 +3849,64 @@ mod tests {
                     "args": {"CommandLine": "cargo test"}
                 },
                 "stepIdx": 42,
-                "artifactDirectoryPath": dir.path().to_str().unwrap()
+                "tool_response": "cargo test: 10 passed"
             }),
         );
         let body = env.body_excerpt.expect("body excerpt should be present");
         assert!(body.contains("tool_family: non-file"));
         assert!(body.contains("cargo test: 10 passed"));
+    }
+
+    /// Parsing a hook payload never opens a file the payload names.
+    ///
+    /// `artifactDirectoryPath` and `transcriptPath` come from the caller. If
+    /// envelope parsing (which runs on the server for every `/hook` and
+    /// `/hook/batch` item) followed them, any capture credential could copy
+    /// `<any dir>/.system_generated/steps/<n>/output.txt` from the server's
+    /// disk into a project it can read back.
+    #[test]
+    fn envelope_parsing_never_reads_a_payload_named_antigravity_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join(".system_generated").join("logs");
+        let step_dir = dir
+            .path()
+            .join(".system_generated")
+            .join("steps")
+            .join("42");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "SERVER_DISK_SENTINEL\n").unwrap();
+        let transcript = logs.join("transcript.jsonl");
+
+        for locator in [
+            serde_json::json!({ "artifactDirectoryPath": dir.path().to_str().unwrap() }),
+            serde_json::json!({ "transcriptPath": transcript.to_str().unwrap() }),
+        ] {
+            let mut raw = serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "cat secrets"}
+                },
+                "stepIdx": 42
+            });
+            raw.as_object_mut()
+                .unwrap()
+                .extend(locator.as_object().unwrap().clone());
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            let body = env.body_excerpt.unwrap_or_default();
+            assert!(
+                !body.contains("SERVER_DISK_SENTINEL"),
+                "envelope parsing read a file named by the payload ({locator}): {body}"
+            );
+        }
     }
 
     #[test]

@@ -166,6 +166,7 @@ assert_managed_leg() {
   local expect_context=$5
   local log=$6
   local before_observations=${7:-0}
+  local expect_new_observation=${8:-1}
   local native_id delivery sync_after sync_through context_delivered after_observations
 
   if [ "$expected_agent" = antigravity-cli ]; then
@@ -179,13 +180,15 @@ assert_managed_leg() {
       tail -120 "$log" >&2
       return 1
     }
-    after_observations=$(agent_observation_count "$expected_agent")
-    [ "$after_observations" -gt "$before_observations" ] || {
-      printf '%s did not persist a startup-hook observation (before: %s, after: %s)\n' \
-        "$expected_agent" "$before_observations" "$after_observations" >&2
-      tail -120 "$log" >&2
-      return 1
-    }
+    if [ "$expect_new_observation" = 1 ]; then
+      after_observations=$(agent_observation_count "$expected_agent")
+      [ "$after_observations" -gt "$before_observations" ] || {
+        printf '%s did not persist a startup-hook observation (before: %s, after: %s)\n' \
+          "$expected_agent" "$before_observations" "$after_observations" >&2
+        tail -120 "$log" >&2
+        return 1
+      }
+    fi
   else
     native_id=$(sqlite3 "$DATA/db/memory.sqlite" \
       "SELECT native_session_id FROM workstream_events
@@ -390,6 +393,15 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
     ;;
   grok)
     printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    if [ -n "${AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_ENV_LOG:-}" ]; then
+      printf '%s\n' "${AI_MEMORY_PREVIOUS_SESSION_HISTORY:-}" \
+        >"$AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_ENV_LOG"
+    fi
+    if [ -n "${AI_MEMORY_PREVIOUS_SESSION_HISTORY:-}" ] && \
+       [ -n "${AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_COPY:-}" ]; then
+      cp "$AI_MEMORY_PREVIOUS_SESSION_HISTORY" \
+        "$AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_COPY"
+    fi
     # Honor the wrapper-owned `--session-id <id>` (fresh) and `--resume <id>`
     # (returning) selectors the way the real CLI does.
     session_id=""
@@ -1045,7 +1057,7 @@ diff -u <(printf '%s\n' --conversation "$ANTIGRAVITY_FAKE_ID") \
   "$TMP/antigravity-second-argv.log"
 returned_antigravity=$(assert_managed_leg "$antigravity_ws_hex" antigravity-cli \
   "$antigravity_second_before" "$antigravity_second_delivery" 0 \
-  "$LOGS/edge-antigravity-second.log" "$antigravity_second_observations")
+  "$LOGS/edge-antigravity-second.log" "$antigravity_second_observations" 0)
 [ "$returned_antigravity" = "$ANTIGRAVITY_FAKE_ID" ] || {
   printf 'returning Antigravity launch did not resume %s\n' "$ANTIGRAVITY_FAKE_ID" >&2
   exit 1
@@ -1139,6 +1151,8 @@ jq -e --arg id "$grok_session_id" \
   GROK_HOME="$GROK_FAKE_HOME" \
   AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
   AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-second-argv.log" \
+  AI_MEMORY_PREVIOUS_SESSION_HISTORY="$TMP/stale-history-must-not-reach-child" \
+  AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_ENV_LOG="$TMP/grok-second-history-env.log" \
   AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-TWO" \
     "$BIN" --data-dir "$DATA" run --workstream edge-grok --executable "$FAKE" \
       grok-build >"$LOGS/edge-grok-second.log" 2>&1
@@ -1146,6 +1160,11 @@ jq -e --arg id "$grok_session_id" \
 grep -A1 -x -- '--resume' "$TMP/grok-second-argv.log" | grep -qx "$grok_session_id" || {
   printf 'returning grok launch did not resume the linked session\n' >&2
   cat "$TMP/grok-second-argv.log" >&2
+  exit 1
+}
+[ -z "$(cat "$TMP/grok-second-history-env.log")" ] || {
+  printf 'same-harness grok inherited a stale previous-session dossier path\n' >&2
+  cat "$TMP/grok-second-history-env.log" >&2
   exit 1
 }
 if grep -qx -- '--rules' "$TMP/grok-second-argv.log"; then
@@ -1163,18 +1182,21 @@ jq -e \
   exit 1
 }
 
-# A fresh grok session joining the established edge-kimi workstream must
-# receive that workstream's history through `--rules`, with historical tool
-# activity labelled as completed evidence.
-grok_cross_before=$(latest_workstream_sequence "$kimi_ws_hex")
-grok_cross_delivery=$(current_delivery_cursor "$kimi_ws_hex" grok)
+# A fresh grok session joining the untouched Command Code workstream must
+# receive both its portable history through `--rules` and its readable native
+# history through the local dossier. Other cross-harness checks mutate the
+# Kimi workstream before this point, so it is not an exact two-harness switch.
+grok_cross_before=$(latest_workstream_sequence "$command_code_ws_hex")
+grok_cross_delivery=$(current_delivery_cursor "$command_code_ws_hex" grok)
 (
   cd "$REPO"
   GROK_HOME="$GROK_FAKE_HOME" \
   AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
   AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-cross-argv.log" \
+  AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_ENV_LOG="$TMP/grok-cross-history-env.log" \
+  AI_MEMORY_ACCEPTANCE_PREVIOUS_HISTORY_COPY="$TMP/grok-cross-history.md" \
   AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-CROSS" \
-    "$BIN" --data-dir "$DATA" run --workstream edge-kimi --executable "$FAKE" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-command-code --executable "$FAKE" \
       grok >"$LOGS/edge-grok-cross.log" 2>&1
 )
 grep -qx -- '--session-id' "$TMP/grok-cross-argv.log" || {
@@ -1187,11 +1209,25 @@ grep -qx -- '--rules' "$TMP/grok-cross-argv.log" || {
   cat "$TMP/grok-cross-argv.log" >&2
   exit 1
 }
-grep -q 'AMWS-FAKE-KIMI' "$TMP/grok-cross-argv.log" || {
+grep -q 'AMWS-FAKE-COMMAND-CODE' "$TMP/grok-cross-argv.log" || {
   printf 'the grok --rules packet did not carry the prior harness history\n' >&2
   exit 1
 }
-assert_managed_leg "$kimi_ws_hex" grok "$grok_cross_before" \
+grep -q 'AMWS-FAKE-COMMAND-CODE' "$TMP/grok-cross-history.md" || {
+  printf 'the local previous-session dossier did not carry Command Code history\n' >&2
+  exit 1
+}
+grep -q 'untrusted local history' "$TMP/grok-cross-history.md" || {
+  printf 'the local previous-session dossier lacked its security boundary\n' >&2
+  exit 1
+}
+grok_cross_history_path=$(cat "$TMP/grok-cross-history-env.log")
+[ -n "$grok_cross_history_path" ] && [ ! -e "$grok_cross_history_path" ] || {
+  printf 'the local previous-session dossier survived the managed child\n' >&2
+  printf '%s\n' "$grok_cross_history_path" >&2
+  exit 1
+}
+assert_managed_leg "$command_code_ws_hex" grok "$grok_cross_before" \
   "$grok_cross_delivery" 1 \
   "$LOGS/edge-grok-cross.log" >/dev/null
 

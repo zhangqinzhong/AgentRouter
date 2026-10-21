@@ -1088,6 +1088,8 @@ pub async fn require_dual_auth(
         match crate::auth::authenticate_token(&state, &mut req, &provided, false).await {
             Ok(crate::auth::BearerAuth::Authenticated) => {
                 req.extensions_mut().insert(state.clone());
+                req.extensions_mut()
+                    .insert(ai_memory_core::LegacyBrowserAuth);
                 return next.run(req).await;
             }
             Err(response) => return response,
@@ -1601,6 +1603,74 @@ mod tests {
             StatusCode::OK,
             "the bearer API still works"
         );
+    }
+
+    /// Only the legacy browser path is marked read-only, so `/web/pending`
+    /// can hide controls that would post and fail. The marker never widens
+    /// that path: a Basic POST is still refused. Control: the root bearer is
+    /// not marked, because a POST with it succeeds.
+    #[tokio::test]
+    async fn only_a_legacy_browser_credential_is_marked_read_only() {
+        async fn echo_marker(
+            marker: Option<axum::Extension<ai_memory_core::LegacyBrowserAuth>>,
+        ) -> &'static str {
+            if marker.is_some() {
+                "legacy"
+            } else {
+                "unmarked"
+            }
+        }
+        let (_tmp, state, _writer) = legacy_transition_fixture().await;
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(echo_marker).post(echo_marker))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state,
+                require_dual_auth,
+            ));
+        let send = |method: Method, header: (&'static str, String)| {
+            let router = router.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri("/probe")
+                            .header(header.0, header.1)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+
+        let basic = ("authorization", legacy_basic("legacy-root-token"));
+        let cookie = ("cookie", format!("{LEGACY_AUTH_COOKIE}=legacy-root-token"));
+        let bearer = ("authorization", "Bearer legacy-root-token".to_owned());
+
+        assert_eq!(
+            send(Method::GET, basic.clone()).await,
+            (StatusCode::OK, "legacy".into())
+        );
+        assert_eq!(
+            send(Method::GET, cookie).await,
+            (StatusCode::OK, "legacy".into())
+        );
+        assert_eq!(
+            send(Method::GET, bearer.clone()).await,
+            (StatusCode::OK, "unmarked".into())
+        );
+        assert_eq!(
+            send(Method::POST, bearer).await,
+            (StatusCode::OK, "unmarked".into())
+        );
+        let (status, _) = send(Method::POST, basic).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "Basic stays GET-only");
     }
 
     #[tokio::test]

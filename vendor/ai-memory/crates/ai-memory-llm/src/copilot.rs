@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use crate::auth::CopilotAuth;
 use crate::auth_file::{load_entry, now_ms, save_entry};
 use crate::embedding::{
-    Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values,
+    Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values, retry_delay,
 };
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
@@ -210,6 +210,7 @@ impl CopilotAuthState {
             )));
         }
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .user_agent(COPILOT_USER_AGENT)
             .build()
             .map_err(LlmError::from)?;
@@ -579,6 +580,7 @@ impl Embedder for CopilotEmbedder {
             model: &self.model,
         };
         let mut attempt = 0u32;
+        let mut waited = Duration::ZERO;
         loop {
             let resp = self
                 .state
@@ -592,10 +594,16 @@ impl Embedder for CopilotEmbedder {
                 .await
                 .map_err(LlmError::from)?;
             let status = resp.status();
-            if status.as_u16() == 429 && attempt < 5 {
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+            if let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) {
                 attempt += 1;
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
-                debug!(attempt, ?delay, "copilot embeddings rate-limited; retrying");
+                waited += delay;
+                debug!(
+                    attempt,
+                    ?delay,
+                    status = status.as_u16(),
+                    "copilot embeddings 429/503; retrying"
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }

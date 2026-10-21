@@ -104,6 +104,11 @@ pub enum StoreError {
     #[error("writer actor is no longer running")]
     WriterClosed,
 
+    /// The read connection pool was closed at shutdown; no new read opens a
+    /// connection.
+    #[error("read connection pool is closed")]
+    ReaderClosed,
+
     /// A hook tried to reuse a session id that belongs to another immutable
     /// session tuple or operator. Deliberately carries no row details.
     #[error("session collision")]
@@ -140,7 +145,7 @@ pub enum StoreError {
     /// caller-invariant violation).
     #[error("not found: {0}")]
     NotFound(String),
-    /// A late-arriving event named a session that `purge_session` removed.
+    /// An event or disk reindex named a session that `purge_session` removed.
     /// Recreating it would silently undo a deletion the operator already
     /// performed and an application may already have reported to a user, so
     /// ingest refuses instead (#387).

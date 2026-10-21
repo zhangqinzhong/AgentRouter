@@ -94,7 +94,7 @@
         <input id="okf-dialog-dismiss" type="checkbox" class="rounded border-slate-300 dark:border-slate-600">
         Do not show me again
       </label>
-      <button id="okf-dialog-close" class="rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-sm font-medium px-4 py-2 hover:bg-slate-700 dark:hover:bg-slate-300">Got it</button>
+      <button id="okf-dialog-close" type="button" class="rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-sm font-medium px-4 py-2 hover:bg-slate-700 dark:hover:bg-slate-300">Got it</button>
     </div>
   </div>
 </div>
@@ -106,13 +106,41 @@
     try {
       if (localStorage.getItem(key) === "1") return;
     } catch (e) { /* storage blocked: still show the dialog */ }
-    overlay.classList.remove("hidden");
-    document.getElementById("okf-dialog-close").addEventListener("click", function () {
-      if (document.getElementById("okf-dialog-dismiss").checked) {
+    var closeBtn = document.getElementById("okf-dialog-close");
+    var dismiss = document.getElementById("okf-dialog-dismiss");
+    // aria-modal alone moves no focus: remember the opener to hand it back.
+    var opener = document.activeElement;
+    function close() {
+      if (dismiss.checked) {
         try { localStorage.setItem(key, "1"); } catch (e) { /* best effort */ }
       }
       overlay.classList.add("hidden");
-    });
+      document.removeEventListener("keydown", onKey);
+      if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus();
+    }
+    // Only two focusables, so Tab wraps by hand to keep focus inside the modal.
+    function onKey(e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      } else if (e.key === "Tab") {
+        var active = document.activeElement;
+        if (e.shiftKey && active === dismiss) {
+          e.preventDefault();
+          closeBtn.focus();
+        } else if (!e.shiftKey && active === closeBtn) {
+          e.preventDefault();
+          dismiss.focus();
+        } else if (active !== dismiss && active !== closeBtn) {
+          e.preventDefault();
+          dismiss.focus();
+        }
+      }
+    }
+    overlay.classList.remove("hidden");
+    closeBtn.addEventListener("click", close);
+    document.addEventListener("keydown", onKey);
+    closeBtn.focus();
   })();
 </script>
 {% endif %}

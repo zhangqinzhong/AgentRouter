@@ -36,6 +36,12 @@ static REASONING_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+// The first closing reasoning tag. Chat templates that open the reasoning
+// block themselves (DeepSeek-R1, QwQ, Qwen3 thinking models) return the
+// reasoning followed by a bare `</think>`, with no opening tag to pair it.
+static REASONING_CLOSE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)</(?:think|thinking|analysis|reasoning)>").unwrap());
+
 // Matches an outermost ```json ... ``` or ``` ... ``` markdown fence.
 static CODE_FENCE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)\A\s*```(?:json)?\s*\n(.*?)\n\s*```\s*\z").unwrap());
@@ -46,6 +52,20 @@ static CODE_FENCE_RE: LazyLock<Regex> =
 /// between the cleaned and the raw form.
 pub(crate) fn strip_reasoning_blocks(s: &str) -> String {
     let stripped = REASONING_BLOCK_RE.replace_all(s, "");
+    // A closing tag left after the paired blocks are gone ends a reasoning
+    // section whose opening tag the chat template supplied. Drop that
+    // section too, unless the text before it already looks like the JSON
+    // answer (a literal closing tag inside a JSON string must survive).
+    let stripped = match REASONING_CLOSE_RE.find(stripped.as_ref()) {
+        Some(close)
+            if !stripped[..close.start()]
+                .trim_start()
+                .starts_with(['{', '[', '`']) =>
+        {
+            std::borrow::Cow::Owned(stripped[close.end()..].to_string())
+        }
+        _ => stripped,
+    };
     // If the entire remaining payload is wrapped in a code fence, unwrap it
     // so `serde_json::from_str` can see the bare JSON directly.
     if let Some(caps) = CODE_FENCE_RE.captures(stripped.as_ref()) {
@@ -386,7 +406,7 @@ fn is_response_format_rejection(err: &LlmError) -> bool {
 /// either truncates the object early or never closes it. This
 /// version tracks whether we're inside a `"..."` literal and
 /// honours backslash escapes the JSON spec defines.
-fn first_json_object(s: &str) -> Option<&str> {
+pub(crate) fn first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let mut depth = 0_i32;
     let mut in_string = false;
@@ -698,6 +718,35 @@ mod tests {
             serde_json::from_str(&cleaned).expect("should parse to the real JSON object");
         assert!(v.is_object());
         assert_eq!(v["findings"], serde_json::json!([]));
+    }
+
+    /// A chat template that opens the reasoning block itself leaves the
+    /// completion with reasoning text and a bare `</think>`. Without the
+    /// opening tag the paired-block regex never matched, and the brace
+    /// extractor took a draft object out of the reasoning instead of the
+    /// answer.
+    #[test]
+    fn strip_reasoning_without_its_opening_tag() {
+        let input = "Okay, the schema wants {\"findings\":[\"draft\"]} roughly.\n</think>\n\n{\"findings\":[]}";
+        let cleaned = strip_reasoning_blocks(input);
+        let v: serde_json::Value = serde_json::from_str(&cleaned).expect("the real answer");
+        assert_eq!(v["findings"], serde_json::json!([]));
+
+        let upper = strip_reasoning_blocks("Let me think.</THINKING>```json\n{\"a\":1}\n```");
+        assert_eq!(upper, "{\"a\":1}");
+    }
+
+    /// A JSON answer that merely mentions a closing tag in a string value is
+    /// not reasoning and must come through intact.
+    #[test]
+    fn closing_tag_inside_the_json_answer_is_kept() {
+        let input = "{\"body\":\"models end reasoning with </think>\"}";
+        assert_eq!(strip_reasoning_blocks(input), input);
+        let fenced = "```json\n{\"body\":\"a </think> tag\"}\n```";
+        assert_eq!(
+            strip_reasoning_blocks(fenced),
+            "{\"body\":\"a </think> tag\"}"
+        );
     }
 
     /// `<analysis>` prefix is also stripped.

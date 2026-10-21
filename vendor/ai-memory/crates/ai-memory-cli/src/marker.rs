@@ -1242,7 +1242,8 @@ fn declares_more_than_capture(text: &str) -> bool {
             .any(|key| parse_flag_in(text, key).is_some())
         || server_selection_in(text).is_some()
         || text.lines().any(|line| {
-            line.trim_start()
+            line.trim_start_matches('\u{feff}')
+                .trim_start()
                 .strip_prefix("aliases")
                 .is_some_and(|rest| rest.trim_start().starts_with('='))
         })
@@ -1399,7 +1400,8 @@ pub(crate) fn parse_toml_key(file: &Path, key: &str) -> Option<String> {
 /// several keys pays for one read.
 fn parse_key_in(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
-        let trimmed = line.trim_start();
+        // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
+        let trimmed = line.trim_start_matches('\u{feff}').trim_start();
         let Some(after_key) = trimmed.strip_prefix(key) else {
             continue;
         };
@@ -1439,7 +1441,8 @@ pub(crate) fn parse_toml_flag(file: &Path, key: &str) -> Option<String> {
 /// for one read per key instead of re-opening the file.
 fn parse_flag_in(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
-        let trimmed = line.trim_start();
+        // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
+        let trimmed = line.trim_start_matches('\u{feff}').trim_start();
         let Some(after_key) = trimmed.strip_prefix(key) else {
             continue;
         };
@@ -2515,6 +2518,20 @@ project = "infra" # this is fine
     }
 
     /// A BOM or a non-UTF-8 byte must not hide the key.
+    /// The same BOM that could hide a first-line `server` key could hide a
+    /// first-line scope key or flag: a marker saved as "UTF-8 with BOM"
+    /// routed capture to the fallback workspace.
+    #[test]
+    fn a_bom_cannot_hide_a_first_line_scope_key_or_flag() {
+        let routing = RoutingFields::from_text("\u{feff}workspace = \"acme\"\nproject = \"api\"\n");
+        assert_eq!(routing.workspace.as_deref(), Some("acme"));
+        assert_eq!(routing.project.as_deref(), Some("api"));
+        assert_eq!(
+            parse_flag_in("\u{feff}default_global = true\n", "default_global").as_deref(),
+            Some("true")
+        );
+    }
+
     #[test]
     fn encoding_noise_cannot_hide_a_server_key() {
         let tmp = TempDir::new().unwrap();

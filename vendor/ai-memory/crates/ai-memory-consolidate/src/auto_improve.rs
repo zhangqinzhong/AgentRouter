@@ -11,19 +11,25 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
-use ai_memory_core::{Observation, PagePath, ProjectId, Sanitizer, SessionId, WorkspaceId};
+use ai_memory_core::{PagePath, ProjectId, Sanitizer, SessionId, WorkspaceId};
 use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
     complete_structured_with_operation_id,
 };
-use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
+use ai_memory_store::{
+    AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoreError, StoredPageBody,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::code_fence::CodeFence;
 use crate::path_sanitize::slugify_page_path;
-use crate::projection::{ObservationProjectionConfig, cap_text_with_marker, project_observations};
+use crate::projection::{
+    ObservationProjectionConfig, ProjectedObservations, cap_text_with_marker, project_observations,
+    project_session_observations,
+};
 
 const CHARS_PER_TOKEN: usize = 4;
 const PROMPT_RESERVE_TOKENS: usize = 1_000;
@@ -73,7 +79,7 @@ const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
 // persisted at up to 2 KB, but the reviewer only ever sees its first 1500 chars
 // here (head-biased). A late correction inside a long Stop body must fall within
 // this window to influence the reviewer.
-const MAX_OBSERVATION_BODY_CHARS: usize = 1_500;
+pub(crate) const MAX_OBSERVATION_BODY_CHARS: usize = 1_500;
 const PROMPT_SCAFFOLD_RESERVE_CHARS: usize = 4_000;
 pub(crate) const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
 const MAX_REJECTION_PATH_CHARS: usize = 256;
@@ -560,27 +566,6 @@ pub async fn run_auto_improve_review(
         None => return Err(AutoImproveError::SessionNotFound(session_id)),
     }
 
-    let observations = reader.observations_for_session(session_id).await?;
-    let duration = session_duration_secs(&observations);
-    if let Some(rejection) = preflight_rejection(&observations, duration, &cfg) {
-        return Ok(AutoImproveReport {
-            session_id: session_id.to_string(),
-            observations_considered: observations.len(),
-            session_duration_secs: duration,
-            estimated_input_tokens: 0,
-            provider: "none".into(),
-            model: "none".into(),
-            min_confidence: cfg.min_confidence,
-            proposal_actor: cfg.proposal_actor,
-            pending_path: cfg.pending_path,
-            summary: "session skipped by preflight filters".into(),
-            proposals: Vec::new(),
-            rejected_candidates: vec![rejection],
-            warnings: Vec::new(),
-            eval_results: Vec::new(),
-        });
-    }
-
     let briefing = reader
         .briefing_for_project(
             workspace_id,
@@ -618,78 +603,203 @@ pub async fn run_auto_improve_review(
     )
     .await?;
     let rejection_context = load_rejection_context(reader, workspace_id, project_id, &cfg).await?;
-    let prompt_input = build_prompt_input(
-        session_id,
-        &observations,
-        duration,
+    // The prompt sections and the observation budget are knowable before
+    // any row is read; the single snapshot read below is the only read that
+    // touches the session's rows — totals, the preflight decision and the
+    // projection all come out of one transaction, so the report, the
+    // refusal and the prompt's "Observation count" and dump describe the
+    // same generation of the session.
+    let sections = auto_improve_prompt_sections(
         session_page.as_ref(),
         &reviewer_recent_pages,
         &patchable_pages,
         &rejection_context,
         &cfg,
     );
-    let prompt_patchable_pages: Vec<_> = patchable_pages
-        .iter()
-        .filter(|page| prompt_input.patchable_paths.contains(&page.path))
-        .cloned()
-        .collect();
-    let existing_index =
-        ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
-    let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
-    let request = ChatRequest {
-        system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
-        messages: vec![ChatMessage {
-            role: Role::User,
-            content: prompt_input.prompt,
-        }],
-        max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
-        temperature: Some(0.1),
-    };
-    // One review call is one LLM operation: a fresh identity, never the
-    // agent's session id — two reviews of the same session must not look
-    // like one operation on the provider side.
-    let operation_id = LlmOperationId::new();
-    let raw: AutoImproveLlmResponse =
-        complete_structured_with_operation_id(llm, request, operation_id).await?;
-    let (mut proposals, mut rejected_candidates, mut warnings) =
-        validate_response(raw, &cfg, &existing_index);
-    rejected_candidates.extend(prompt_input.rejected_candidates);
-    warnings.extend(prompt_input.warnings);
-    let eval_results = apply_eval_gate(
-        reader,
-        workspace_id,
-        project_id,
-        &cfg.eval,
-        &mut proposals,
-        &mut rejected_candidates,
-        &mut warnings,
+    let projection_cfg = ObservationProjectionConfig::new(
+        sections.observation_budget,
+        sections.selected_limit,
+        MAX_OBSERVATION_BODY_CHARS,
     )
-    .await?;
-
-    Ok(AutoImproveReport {
-        session_id: session_id.to_string(),
-        observations_considered: observations.len(),
-        session_duration_secs: duration,
-        estimated_input_tokens,
-        provider: llm.name().to_string(),
-        model: llm.model().to_string(),
-        min_confidence: cfg.min_confidence,
-        proposal_actor: cfg.proposal_actor,
-        pending_path: cfg.pending_path,
-        summary: if proposals.is_empty() {
-            "review completed; no validated proposals".into()
-        } else {
-            format!(
-                "review completed; {} proposal(s) validated",
-                proposals.len()
+    .with_context_label("auto-improve");
+    let closure_cfg = cfg.clone();
+    let outcome = reader
+        .read_session_observations(workspace_id, project_id, session_id, move |snap| {
+            let totals = snap.projection_totals()?;
+            let duration =
+                session_duration_from_span(totals.first_created_at, totals.last_created_at);
+            // Test-only seam (S37d): runs after the totals read and before
+            // the preflight decision or any row read. Production builds
+            // never carry it.
+            #[cfg(test)]
+            {
+                let seam = {
+                    let mut seams = REVIEW_INTERPOSE.lock().unwrap();
+                    seams
+                        .iter()
+                        .position(|(owner, _)| *owner == session_id)
+                        .map(|at| seams.swap_remove(at).1)
+                };
+                if let Some(seam) = seam {
+                    seam();
+                }
+            }
+            if let Some(rejection) = preflight_rejection(totals.total, duration, &closure_cfg) {
+                // Rejected before a single row is read.
+                return Ok(ReviewOutcome::Rejected {
+                    total: totals.total,
+                    duration,
+                    rejection,
+                });
+            }
+            let projected = if totals.total == 0 {
+                // A present session with no observations and no preflight
+                // minimums still gets reviewed with the empty `(none)`
+                // projection, exactly as the full-load path did.
+                project_observations(&[], &projection_cfg)
+            } else {
+                project_session_observations(snap, &projection_cfg)?
+                    .map(|(projected, _stats)| projected)
+                    .ok_or(StoreError::SessionCollision)?
+            };
+            Ok(ReviewOutcome::Reviewed {
+                total: totals.total,
+                duration,
+                projected,
+            })
+        })
+        .await?;
+    match outcome {
+        // Preflight rejected the session from its own generation's totals:
+        // same report the old path returned, no LLM call.
+        ReviewOutcome::Rejected {
+            total,
+            duration,
+            rejection,
+        } => Ok(AutoImproveReport {
+            session_id: session_id.to_string(),
+            observations_considered: total,
+            session_duration_secs: duration,
+            estimated_input_tokens: 0,
+            provider: "none".into(),
+            model: "none".into(),
+            min_confidence: cfg.min_confidence,
+            proposal_actor: cfg.proposal_actor,
+            pending_path: cfg.pending_path,
+            summary: "session skipped by preflight filters".into(),
+            proposals: Vec::new(),
+            rejected_candidates: vec![rejection],
+            warnings: Vec::new(),
+            eval_results: Vec::new(),
+        }),
+        ReviewOutcome::Reviewed {
+            total,
+            duration,
+            projected,
+        } => {
+            let prompt_input = build_prompt_input(
+                session_id,
+                &projected,
+                projected.total_count,
+                duration,
+                sections,
+                &cfg,
+            );
+            let prompt_patchable_pages: Vec<_> = patchable_pages
+                .iter()
+                .filter(|page| prompt_input.patchable_paths.contains(&page.path))
+                .cloned()
+                .collect();
+            let existing_index =
+                ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
+            let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
+            let request = ChatRequest {
+                system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
+                messages: vec![ChatMessage {
+                    role: Role::User,
+                    content: prompt_input.prompt,
+                }],
+                max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
+                temperature: Some(0.1),
+            };
+            // One review call is one LLM operation: a fresh identity, never
+            // the agent's session id — two reviews of the same session must
+            // not look like one operation on the provider side.
+            let operation_id = LlmOperationId::new();
+            let raw: AutoImproveLlmResponse =
+                complete_structured_with_operation_id(llm, request, operation_id).await?;
+            let (mut proposals, mut rejected_candidates, mut warnings) =
+                validate_response(raw, &cfg, &existing_index);
+            rejected_candidates.extend(prompt_input.rejected_candidates);
+            warnings.extend(prompt_input.warnings);
+            let eval_results = apply_eval_gate(
+                reader,
+                workspace_id,
+                project_id,
+                &cfg.eval,
+                &mut proposals,
+                &mut rejected_candidates,
+                &mut warnings,
             )
-        },
-        proposals,
-        rejected_candidates,
-        warnings,
-        eval_results,
-    })
+            .await?;
+
+            Ok(AutoImproveReport {
+                session_id: session_id.to_string(),
+                observations_considered: total,
+                session_duration_secs: duration,
+                estimated_input_tokens,
+                provider: llm.name().to_string(),
+                model: llm.model().to_string(),
+                min_confidence: cfg.min_confidence,
+                proposal_actor: cfg.proposal_actor,
+                pending_path: cfg.pending_path,
+                summary: if proposals.is_empty() {
+                    "review completed; no validated proposals".into()
+                } else {
+                    format!(
+                        "review completed; {} proposal(s) validated",
+                        proposals.len()
+                    )
+                },
+                proposals,
+                rejected_candidates,
+                warnings,
+                eval_results,
+            })
+        }
+    }
 }
+
+/// What the review's single snapshot read produced: the preflight's
+/// refusal (decided from the same totals, no row read) or the session's
+/// one-generation totals plus its bounded projection.
+enum ReviewOutcome {
+    Rejected {
+        total: usize,
+        duration: u64,
+        rejection: AutoImproveRejectedCandidate,
+    },
+    Reviewed {
+        total: usize,
+        duration: u64,
+        projected: ProjectedObservations,
+    },
+}
+
+/// Test-only seam for the review's single-snapshot read: push the session
+/// under test with a callback, and that session's review removes and runs
+/// the callback once, right after the totals aggregate, before the
+/// preflight decision and before any row is read. A test deletes rows
+/// through a second connection there and proves the report, the preflight
+/// and the prompt still describe one generation. Keyed by session so a
+/// review that another test runs in parallel never consumes it. Never
+/// compiled in.
+#[cfg(test)]
+pub(crate) type ReviewInterpose = (SessionId, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+pub(crate) static REVIEW_INTERPOSE: std::sync::Mutex<Vec<ReviewInterpose>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[derive(Debug, Serialize)]
 struct AutoImproveEvalRequest<'a> {
@@ -1216,18 +1326,28 @@ pub(crate) async fn load_rejection_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_prompt_input(
-    session_id: SessionId,
-    observations: &[Observation],
-    duration_secs: u64,
+/// The reviewer prompt's pre-rendered sections and the character budget
+/// the observation dump may consume, computed once before the session's
+/// rows are read: the bounded read needs the budget up front, and the
+/// prompt assembly must reuse exactly these renders.
+pub(crate) struct PromptSections {
+    recent: String,
+    patchable: RenderedPatchablePages,
+    session_page_section: String,
+    rejection_text: String,
+    pub(crate) observation_budget: usize,
+    pub(crate) selected_limit: usize,
+    warnings: Vec<String>,
+}
+
+pub(crate) fn auto_improve_prompt_sections(
     session_page: Option<&StoredPageBody>,
     recent_pages: &[BriefingPage],
     patchable_pages: &[PatchablePageContext],
     rejection_context: &[AutoImproveRejectionSummary],
     cfg: &AutoImproveReviewConfig,
-) -> PromptInput {
+) -> PromptSections {
     let mut warnings = Vec::new();
-    let mut rejected_candidates = Vec::new();
     let usable_tokens = cfg.max_input_tokens.saturating_sub(PROMPT_RESERVE_TOKENS);
     let usable_chars = usable_tokens.saturating_mul(CHARS_PER_TOKEN);
 
@@ -1258,26 +1378,86 @@ fn build_prompt_input(
     } else {
         SAMPLE_LIMIT_WITHOUT_SESSION_PAGE
     };
-    let projected_observations = project_observations(
+    PromptSections {
+        recent,
+        patchable,
+        session_page_section,
+        rejection_text,
+        observation_budget,
+        selected_limit,
+        warnings,
+    }
+}
+
+/// Test-only entry point keeping the old `build_prompt_input` signature: it
+/// projects an already-materialised slice in memory, then delegates to the
+/// production builder. Lets the unit tests below pin the prompt without a
+/// store.
+#[cfg(test)]
+// The signature mirrors the pre-change production builder verbatim, which
+// took eight arguments; the lint is waived rather than reshaped.
+#[allow(clippy::too_many_arguments)]
+fn test_prompt_input(
+    session_id: SessionId,
+    observations: &[ai_memory_core::Observation],
+    duration_secs: u64,
+    session_page: Option<&StoredPageBody>,
+    recent_pages: &[BriefingPage],
+    patchable_pages: &[PatchablePageContext],
+    rejection_context: &[AutoImproveRejectionSummary],
+    cfg: &AutoImproveReviewConfig,
+) -> PromptInput {
+    let sections = auto_improve_prompt_sections(
+        session_page,
+        recent_pages,
+        patchable_pages,
+        rejection_context,
+        cfg,
+    );
+    let projected = crate::projection::project_observations(
         observations,
         &ObservationProjectionConfig::new(
-            observation_budget,
-            selected_limit,
+            sections.observation_budget,
+            sections.selected_limit,
             MAX_OBSERVATION_BODY_CHARS,
         )
         .with_context_label("auto-improve"),
     );
-    warnings.extend(projected_observations.warnings.iter().cloned());
-    let rendered_observations = projected_observations.text;
-    let selected_count = projected_observations.selected_count;
+    build_prompt_input(
+        session_id,
+        &projected,
+        observations.len(),
+        duration_secs,
+        sections,
+        cfg,
+    )
+}
+
+fn build_prompt_input(
+    session_id: SessionId,
+    projected: &ProjectedObservations,
+    total: usize,
+    duration_secs: u64,
+    sections: PromptSections,
+    cfg: &AutoImproveReviewConfig,
+) -> PromptInput {
+    let mut warnings = sections.warnings;
+    let mut rejected_candidates = Vec::new();
+    let recent = sections.recent;
+    let session_page_section = sections.session_page_section;
+    let rejection_text = sections.rejection_text;
+    let patchable = sections.patchable;
+
+    warnings.extend(projected.warnings.iter().cloned());
+    let rendered_observations = projected.text.clone();
+    let selected_count = projected.selected_count;
     let patchable_text = &patchable.text;
 
-    if selected_count < observations.len() {
+    if selected_count < total {
         rejected_candidates.push(AutoImproveRejectedCandidate {
             reason: "input_budget_sampled".into(),
             evidence: format!(
-                "selected {selected_count} of {} observations for scalable review",
-                observations.len()
+                "selected {selected_count} of {total} observations for scalable review",
             ),
             target_path: None,
             kind: None,
@@ -1301,7 +1481,7 @@ fn build_prompt_input(
          Consolidated session page, primary source when present:\n{session_page_section}\n\n\
          Selected observations, sampled for scale and supporting evidence:\n{rendered_observations}\n\n\
          Return proposals only for durable lessons. Prefer gotchas/, decisions/, concepts/, procedures/, _rules/, _slots/current-focus.md, or notes/. Use _rules/ exactly for rules; never rules/. Full-page proposal body markdown must begin with '# <title>'; patch proposals use edits and are materialized by validation. Full-page and materialized patch final bodies for _rules/ and procedures/ must stay within their page token budgets. Reject no-activity sessions, smoke tests, release markers, one-off task narratives, transient failures, generic routing snippets, and agent instruction text unless the session explicitly changed project policy.",
-        observations.len(),
+        total,
         cfg.min_confidence,
         cfg.max_proposals_per_run,
         cfg.include_raw_fallback,
@@ -1510,22 +1690,17 @@ fn parse_markdown_sections(body: &str) -> Vec<MarkdownSection> {
 fn heading_positions(body: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let mut offset = 0;
-    let mut in_fence = false;
+    let mut fence = None;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if is_fence_line(trimmed) {
-            in_fence = !in_fence;
-        } else if !in_fence && let Some(level) = heading_level(trimmed) {
+        let (next_fence, is_code) = CodeFence::step(fence, trimmed);
+        fence = next_fence;
+        if !is_code && let Some(level) = heading_level(trimmed) {
             out.push((offset, level, trimmed.to_string()));
         }
         offset += line.len();
     }
     out
-}
-
-fn is_fence_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 fn heading_level(line: &str) -> Option<usize> {
@@ -1590,17 +1765,16 @@ fn truncate_to_budget(input: &str, max_bytes: usize, marker: &str) -> String {
 }
 
 fn preflight_rejection(
-    observations: &[Observation],
+    total: usize,
     duration_secs: u64,
     cfg: &AutoImproveReviewConfig,
 ) -> Option<AutoImproveRejectedCandidate> {
-    if observations.len() < cfg.min_observations {
+    if total < cfg.min_observations {
         return Some(AutoImproveRejectedCandidate {
             reason: "too_few_observations".into(),
             evidence: format!(
                 "{} observations below configured minimum {}",
-                observations.len(),
-                cfg.min_observations
+                total, cfg.min_observations
             ),
             target_path: None,
             kind: None,
@@ -2076,14 +2250,14 @@ fn kind_matches_path(kind: &str, path: &str) -> bool {
     }
 }
 
-fn session_duration_secs(observations: &[Observation]) -> u64 {
-    let (Some(first), Some(last)) = (observations.first(), observations.last()) else {
+/// Session duration in whole seconds from the snapshot's aggregate
+/// `created_at` span: same arithmetic as the materialised load used to give,
+/// no rows read.
+fn session_duration_from_span(first: Option<i64>, last: Option<i64>) -> u64 {
+    let (Some(first), Some(last)) = (first, last) else {
         return 0;
     };
-    let diff_us = last
-        .created_at
-        .as_microsecond()
-        .saturating_sub(first.created_at.as_microsecond());
+    let diff_us = last.saturating_sub(first);
     u64::try_from(diff_us / 1_000_000).unwrap_or(0)
 }
 
@@ -2113,7 +2287,8 @@ Every proposal must include bounded evidence quotes, confidence, rationale, and 
 mod tests {
     use super::*;
     use ai_memory_core::{
-        AgentKind, NewObservation, NewSession, ObservationId, ObservationKind, Sanitized, Sanitizer,
+        AgentKind, NewObservation, NewSession, Observation, ObservationId, ObservationKind,
+        Sanitized, Sanitizer,
     };
     use ai_memory_llm::{ChatResponse, LlmError, LlmResult};
     use ai_memory_store::Store;
@@ -3383,7 +3558,7 @@ mod tests {
             pinned: false,
         };
 
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             session_id,
             &observations,
             3_600,
@@ -3430,7 +3605,7 @@ mod tests {
             ),
         ];
         assert!(observations.len() < 48);
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             SessionId::new(),
             &observations,
             3_600,
@@ -3470,7 +3645,7 @@ mod tests {
             sections: parse_markdown_sections(&body),
             body,
         }];
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             session_id,
             &observations,
             3_600,
@@ -3527,7 +3702,7 @@ mod tests {
             created_at: 1,
         }];
 
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             session_id,
             &observations,
             3_600,
@@ -3585,7 +3760,7 @@ mod tests {
             ..cfg()
         };
 
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             session_id,
             &observations,
             3_600,
@@ -4288,6 +4463,42 @@ mod tests {
     }
 
     #[test]
+    fn heading_parser_closes_a_fence_only_on_its_own_glyph_and_length() {
+        // A lone ``` inside a ~~~ block is code, not the end of the block.
+        let body = "# Release\n\n## Steps\n~~~sh\ncat <<'EOF'\n```\nEOF\n~~~\n\n## Verify\nTwo\n";
+        let sections = parse_markdown_sections(body);
+        let verify = sections
+            .iter()
+            .find(|s| s.anchor == "## Verify")
+            .expect("the heading after the block is found");
+        let steps = sections.iter().find(|s| s.anchor == "## Steps").unwrap();
+        assert_eq!(
+            steps.end, verify.start,
+            "## Steps ends where ## Verify starts"
+        );
+
+        // A shorter run does not close a longer fence.
+        let body = "# Release\n\n````md\n```\n## Not Anchor\n```\n````\n\n## Steps\nOne\n";
+        let sections = parse_markdown_sections(body);
+        assert!(!sections.iter().any(|s| s.anchor == "## Not Anchor"));
+        assert!(sections.iter().any(|s| s.anchor == "## Steps"));
+    }
+
+    #[test]
+    fn heading_parser_ignores_headings_after_an_indented_pseudo_closer() {
+        let body = "# Release\n\n````md\n    ````\n## Injected Anchor\n````\n\n## Verify\nTwo\n";
+        let sections = parse_markdown_sections(body);
+        assert!(
+            !sections.iter().any(|s| s.anchor == "## Injected Anchor"),
+            "the four-space pseudo-closer must remain code"
+        );
+        assert!(
+            sections.iter().any(|s| s.anchor == "## Verify"),
+            "the real closer must expose the following heading"
+        );
+    }
+
+    #[test]
     fn patch_rejects_duplicate_headings_and_extra_h1_introduced_by_edits() {
         let body = "# Release\n\n## Steps\nOne\n";
         let duplicate = patch_proposal("append", "## Steps", "## Steps\nAgain");
@@ -4434,3 +4645,7 @@ mod edit_mode_normalization_tests {
         assert_eq!(parsed.edit_mode, "full");
     }
 }
+
+#[cfg(test)]
+#[path = "auto_improve_oracle.rs"]
+pub(crate) mod auto_improve_oracle;

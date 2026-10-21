@@ -56,7 +56,7 @@ detect_target() {
         Linux) os=linux ;;
         Darwin) os=macos ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
-            die "Windows is not supported by this script; download ai-memory-windows-x86_64.zip from the release page and follow docs/windows.md"
+            die "Windows is not supported by this script; in PowerShell run: irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex"
             ;;
         *) die "unsupported operating system: $os" ;;
     esac
@@ -217,11 +217,15 @@ main() {
 
     say "installed $("$link" --version 2>/dev/null || echo ai-memory) to $lib_dir"
     say "linked $link"
+    # Off PATH, a bare `ai-memory setup` would fail with "command not found",
+    # so the next step names the link itself.
     case ":${PATH:-}:" in
-        *":$bin_dir:"*) ;;
-        *) say "$bin_dir is not on PATH; add it, e.g. export PATH=\"$bin_dir:\$PATH\"" ;;
+        *":$bin_dir:"*) say "next: ai-memory setup" ;;
+        *)
+            say "$bin_dir is not on PATH; add it, e.g. export PATH=\"$bin_dir:\$PATH\""
+            say "next: $link setup"
+            ;;
     esac
-    say "next: ai-memory setup"
 }
 
 main "$@"

@@ -2,9 +2,9 @@
 
 Managed-workstream support is narrower than MCP or lifecycle-hook support. This
 release can manage Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command
-Code, Kiro CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI. Gemini CLI,
-Devin CLI, Cursor, and the other integrations in the README support matrix do
-not become managed merely because ai-memory can capture their hooks.
+Code, Kiro CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI. IBM Bob,
+Gemini CLI, Devin CLI, Cursor, and the other integrations in the README support
+matrix do not become managed merely because ai-memory can capture their hooks.
 
 A managed adapter must preserve a harness's real native session, deliver the
 portable workstream delta exactly once, and import only visible history without
@@ -96,6 +96,15 @@ The adapter must:
   and compaction summaries; and
 - exclude system/developer prompts, hidden reasoning, binary payloads,
   credentials, provider metadata, and unsupported records.
+
+The same exporter is used to build the local previous-session dossier during a
+cross-harness switch. It must therefore support a bounded full-session read
+from a `None` cursor, validate the native session against the exact checkout
+before returning any event, and remain safe when the native store is shared by
+many projects. The server must receive only the typed harness/session identity:
+never add a workstation path or dossier content to a request, run row, event,
+page, or raw segment. A contributor should add a switch test proving a foreign
+checkout's session cannot produce a dossier, alongside a legitimate control.
 
 Extraction gaps should become bounded loss annotations. If the conversation
 payload is opaque or undocumented, return such an annotation and rely on

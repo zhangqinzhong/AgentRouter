@@ -33,6 +33,7 @@ const {
   finalizeExecRows,
   buildSkillStatsEntry,
   isCodexResumeInvalidated,
+  isRecoverableGroupedReadError,
 } = require("./codex-rollout-parser");
 
 // ---------------------------------------------------------------------------
@@ -471,6 +472,7 @@ async function computeCodexContextBreakdown({
       PARSED_GROUP_CACHE.delete(parsedCacheKey);
       PARSED_GROUP_CACHE.set(parsedCacheKey, cachedGroup);
     } else {
+      try {
       let captured = null;
       const singleEntry = entries.length === 1 ? entries[0] : null;
       const appendHashEligible = Boolean(
@@ -536,7 +538,7 @@ async function computeCodexContextBreakdown({
             diagnostics.incremental_parse_fallbacks += 1;
           }
         } catch (error) {
-          if (!isCodexResumeInvalidated(error)) throw error;
+          if (!isCodexResumeInvalidated(error) && !isRecoverableGroupedReadError(error)) throw error;
           diagnostics.incremental_parse_fallbacks += 1;
         } finally {
           await resumeHandle.close();
@@ -584,6 +586,11 @@ async function computeCodexContextBreakdown({
           filePath: singleEntry?.filePath || null,
           stat: singleEntry?.stat || null,
         });
+      }
+      } catch (error) {
+        // One unreadable archive/session must not fail the whole breakdown.
+        if (!isRecoverableGroupedReadError(error)) throw error;
+        continue;
       }
     }
     if (!parsed || !parsed.totals || !parsed.totals.total_tokens) continue;

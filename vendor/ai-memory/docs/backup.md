@@ -12,7 +12,10 @@ writes a checkpoint through libgit2 (see cross-cutting invariant #10 in
 [`AGENTS.md`](../AGENTS.md) and the wiki design notes in
 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)). That means half of a remote-backup
 setup is already done for you: the wiki has its own commit history and can be
-pushed to any git remote you own. The rest of this doc is about wiring that
+pushed to any git remote you own. The hook event ledgers (`log.md` and
+`log-YYYY-MM.md`) are not committed, so a mirror that pushes only the wiki's
+git history leaves them out; copy those files as well, as the snapshot
+example below does. The rest of this doc is about wiring that
 up, what else to include, what to exclude, and how to schedule it.
 
 ## What the data dir contains, and what to back up

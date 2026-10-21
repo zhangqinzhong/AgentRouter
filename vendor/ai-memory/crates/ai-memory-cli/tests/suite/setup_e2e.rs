@@ -17,8 +17,6 @@ const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
 /// A temp root holding the operator's home and a directory of fake tools.
 struct Sandbox {
     _tmp: tempfile::TempDir,
-    // Only the Linux service test reads it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     root: PathBuf,
     home: PathBuf,
 }
@@ -114,7 +112,12 @@ fn setup_without_yes_and_without_a_terminal_changes_nothing() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("ai-memory setup will:"), "{}", text(&out));
     assert!(
-        stdout.contains("wire claude-code (detected)"),
+        stdout.contains("1. claude-code: MCP + hooks + skills (found its session store at"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stdout.contains("not in this plan (add with --agent <name>):") && stdout.contains("cursor"),
         "{}",
         text(&out)
     );
@@ -127,6 +130,313 @@ fn setup_without_yes_and_without_a_terminal_changes_nothing() {
     assert!(!sandbox.data_dir().join("config.toml").exists());
     assert!(!sandbox.data_dir().join("auth-tokens").exists());
     assert_eq!(sandbox.snapshot(), before, "setup wrote without --yes");
+}
+
+/// `--plan --json` prints a parseable plan naming the detected agent and its
+/// evidence, exits zero, and writes nothing, with no terminal and no `--yes`.
+#[test]
+fn setup_plan_json_prints_the_plan_and_changes_nothing() {
+    let sandbox = Sandbox::new();
+    let store = sandbox.home.join(".claude/projects");
+    std::fs::create_dir_all(&store).unwrap();
+    let before = sandbox.snapshot();
+    let port = crate::e2e_support::free_port();
+    let out = sandbox
+        .cmd(Some(port))
+        .args(["setup", "--plan", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON plan");
+    assert_eq!(plan["format"], 1, "{plan}");
+    assert_eq!(plan["fresh"], true, "{plan}");
+    assert_eq!(plan["agents"][0]["agent"], "claude-code", "{plan}");
+    assert_eq!(
+        plan["agents"][0]["found"]["kind"], "session_store",
+        "{plan}"
+    );
+    assert_eq!(
+        plan["agents"][0]["found"]["path"],
+        store.display().to_string(),
+        "{plan}"
+    );
+    assert!(!sandbox.data_dir().join("config.toml").exists());
+    assert_eq!(sandbox.snapshot(), before, "setup --plan wrote");
+
+    // `--plan` cannot be combined with `--yes`, and `--json` needs `--plan`.
+    for args in [&["setup", "--plan", "--yes"][..], &["setup", "--json"][..]] {
+        let refused = sandbox.cmd(Some(port)).args(args).output().unwrap();
+        assert!(!refused.status.success(), "{args:?}: {}", text(&refused));
+    }
+    assert_eq!(sandbox.snapshot(), before, "a refused setup wrote");
+}
+
+/// The generic `opencode` agent, named or found by the session store both
+/// majors share, is wired in the major `opencode --version` reports: OpenCode
+/// 2 gets the `{ id, setup }` plugin and the nested `mcp.servers` entry, not
+/// the V1 function plugin and direct `mcp` entry. No server answers here, so
+/// each run still exits non-zero on its self-check.
+#[test]
+fn setup_wires_the_opencode_major_the_version_probe_reports() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for (version, named, plugin, stale, v2) in [
+        (
+            "2.0.31",
+            true,
+            "ai-memory-opencode2.ts",
+            "ai-memory.ts",
+            true,
+        ),
+        (
+            "2.0.31",
+            false,
+            "ai-memory-opencode2.ts",
+            "ai-memory.ts",
+            true,
+        ),
+        (
+            "1.18.34",
+            true,
+            "ai-memory.ts",
+            "ai-memory-opencode2.ts",
+            false,
+        ),
+    ] {
+        let sandbox = Sandbox::new();
+        let bin = sandbox.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        std::fs::write(&opencode, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+        std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(sandbox.home.join(".local/share/opencode")).unwrap();
+        let mut cmd = sandbox.cmd(Some(crate::e2e_support::free_port()));
+        cmd.env("PATH", &bin)
+            .args(["setup", "--yes", "--no-service"]);
+        if named {
+            cmd.args(["--agent", "opencode"]);
+        }
+        let out = cmd.output().unwrap();
+        let case = format!("{version} named={named}\n{}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("== open-code"),
+            "{case}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("problem: open-code"),
+            "{case}"
+        );
+
+        let config = sandbox.home.join(".config/opencode");
+        assert!(config.join("plugins").join(plugin).is_file(), "{case}");
+        assert!(!config.join("plugins").join(stale).exists(), "{case}");
+        let mcp: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.join("opencode.json")).unwrap()).unwrap();
+        assert_eq!(
+            mcp["mcp"]["servers"]["ai-memory"].is_object(),
+            v2,
+            "{case}\n{mcp}"
+        );
+        assert_eq!(mcp["mcp"]["ai-memory"].is_object(), !v2, "{case}\n{mcp}");
+    }
+}
+
+/// With no `opencode` to probe, setup does not guess a major: it writes no
+/// OpenCode plugin or MCP entry and names the problem.
+#[test]
+fn setup_without_an_opencode_to_probe_writes_no_opencode_wiring() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.root.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = sandbox
+        .cmd(Some(crate::e2e_support::free_port()))
+        .env("PATH", &empty)
+        .args(["setup", "--yes", "--no-service", "--agent", "opencode"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("problem: open-code: skipped install-mcp and install-hooks")
+            && stderr.contains("was not found"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !sandbox.home.join(".config/opencode").exists(),
+        "{}",
+        text(&out)
+    );
+}
+
+/// `setup --web` through the binary: the printed address serves the page and
+/// plan, a foreign Host is refused, Apply runs `setup --yes --agent
+/// claude-code` (which writes Claude Code's hooks), and Finish stops the
+/// process. No server runs here, so that setup reports its failed self-check
+/// and the wizard exits non-zero after Finish.
+#[test]
+fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::net::TcpStream;
+
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.home.join(".claude/projects")).unwrap();
+    let port = crate::e2e_support::free_port();
+    let mut child = sandbox
+        .cmd(Some(port))
+        .args(["setup", "--web", "--no-open", "--no-service"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let stdout = child.stdout.take().unwrap();
+    let mut child = Kill(child);
+    let mut url = String::new();
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        if let Some(found) = line.trim().strip_prefix("http://127.0.0.1:") {
+            url = format!("http://127.0.0.1:{found}");
+            break;
+        }
+    }
+    assert!(url.ends_with('/'), "no address printed: {url:?}");
+    let authority = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let path = url
+        .trim_start_matches(&format!("http://{authority}"))
+        .to_owned();
+
+    let request = |method: &str, rest: &str, host: &str, extra: &str, body: &str| -> String {
+        let mut stream = TcpStream::connect(&authority).unwrap();
+        write!(
+            stream,
+            "{method} {path}{rest} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer
+    };
+    let page = request("GET", "", &authority, "", "");
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.contains("ai-memory setup"), "{page}");
+    let rebound = request("GET", "", "attacker.example", "", "");
+    assert!(rebound.starts_with("HTTP/1.1 403"), "{rebound}");
+
+    let plan = request("GET", "plan", &authority, "", "");
+    let json: serde_json::Value =
+        serde_json::from_str(plan.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(json["plan"]["agents"][0]["agent"], "claude-code", "{json}");
+    let csrf = json["csrf"].as_str().unwrap().to_owned();
+    let headers = format!("Origin: http://{authority}\r\nx-ai-memory-setup: {csrf}\r\n");
+
+    let applied = request(
+        "POST",
+        "apply",
+        &authority,
+        &headers,
+        r#"{"agents":["claude-code"]}"#,
+    );
+    assert!(applied.starts_with("HTTP/1.1 202"), "{applied}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let progress = loop {
+        let answer = request("GET", "progress?from=0", &authority, "", "");
+        let json: serde_json::Value =
+            serde_json::from_str(answer.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        if json["done"] == true {
+            break json;
+        }
+        assert!(std::time::Instant::now() < deadline, "setup never finished");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let lines = progress["lines"].to_string();
+    assert!(lines.contains("== claude-code"), "{lines}");
+    assert!(
+        sandbox.home.join(".claude/settings.json").is_file(),
+        "{lines}"
+    );
+
+    let finished = request("POST", "finish", &authority, &headers, "{}");
+    assert!(finished.starts_with("HTTP/1.1 204"), "{finished}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the wizard did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(progress["ok"] == true, status.success(), "{lines}");
+}
+
+/// `setup --web --stop-on-stdin-eof` stops on its own once the process that
+/// started it closes its stdin (the desktop installer going away), with no
+/// Finish and no signal; without the flag, closing stdin does not stop it.
+#[test]
+fn setup_web_stops_when_its_stdin_closes_only_when_asked() {
+    use std::io::BufRead as _;
+    let sandbox = Sandbox::new();
+    let port = crate::e2e_support::free_port();
+    let start = |flag: Option<&str>| {
+        let mut cmd = sandbox.cmd(Some(port));
+        cmd.args(["setup", "--web", "--no-open", "--no-service"]);
+        if let Some(flag) = flag {
+            cmd.arg(flag);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        for line in std::io::BufReader::new(stdout).lines() {
+            if line.unwrap().trim().starts_with("http://127.0.0.1:") {
+                break;
+            }
+        }
+        child
+    };
+    let wait = |child: &mut std::process::Child, within: std::time::Duration| {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    };
+
+    let mut watched = start(Some("--stop-on-stdin-eof"));
+    drop(watched.stdin.take());
+    assert!(
+        wait(&mut watched, std::time::Duration::from_secs(20)),
+        "the page outlived its parent"
+    );
+
+    let mut unwatched = start(None);
+    drop(unwatched.stdin.take());
+    let stopped = wait(&mut unwatched, std::time::Duration::from_secs(2));
+    let _ = unwatched.kill();
+    let _ = unwatched.wait();
+    assert!(!stopped, "without the flag, closing stdin must not stop it");
 }
 
 /// Spawns a server through the fake service manager: the slow tier.
@@ -270,6 +580,11 @@ esac
         let stdout = String::from_utf8_lossy(&first.stdout);
         assert!(stdout.contains("healthz: ok"), "{}", text(&first));
         assert!(stdout.contains("memory_status: ok"), "{}", text(&first));
+        assert!(
+            stdout.contains("What do you remember about this project?"),
+            "{}",
+            text(&first)
+        );
 
         let data_dir = sandbox.data_dir();
         let token = std::fs::read_to_string(data_dir.join("auth-tokens/default"))
@@ -436,6 +751,54 @@ esac
             service.calls().len(),
             calls_before,
             "a second uninstall called systemctl"
+        );
+    }
+
+    /// Codex skips hooks the user has not trusted in `/hooks`. A `setup` that
+    /// wired Codex while Codex reports its hooks untrusted names the `/hooks`
+    /// approval instead of claiming everything is set up, and still exits 0:
+    /// only the user can grant that trust. Codex's `hooks/list` answer comes
+    /// from a fake `codex` first on `PATH`; the operator's Codex never runs.
+    #[tokio::test]
+    async fn setup_names_pending_codex_hook_trust_instead_of_claiming_ready() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sandbox = Sandbox::new();
+        let service = Service::new(&sandbox.root);
+        let hooks = sandbox.home.join(".codex/hooks.json");
+        let reply = json!({"jsonrpc": "2.0", "id": 2, "result": {"data": [{"hooks": [{
+            "eventName": "sessionStart", "trustStatus": "untrusted", "sourcePath": hooks,
+            "command": "ai-memory hook --event session-start --agent codex"
+        }]}]}})
+        .to_string();
+        let fake = service.bin.join("codex");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"id\":2'*) \
+                 printf '%s\\n' '{reply}' ;;\nesac\ndone\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let port = crate::e2e_support::free_port();
+
+        let out = setup(&sandbox, &service, port, &["--yes", "--agent", "codex"]);
+        assert!(out.status.success(), "{}", text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            std::fs::read_to_string(&hooks)
+                .unwrap()
+                .contains("ai-memory"),
+            "{}",
+            text(&out)
+        );
+        assert!(!stdout.contains("ai-memory is set up."), "{}", text(&out));
+        assert!(
+            stdout.contains("Codex has not approved its 1 ai-memory hook(s)")
+                && stdout.contains("sessionStart (untrusted)")
+                && stdout.contains("run /hooks"),
+            "{}",
+            text(&out)
         );
     }
 

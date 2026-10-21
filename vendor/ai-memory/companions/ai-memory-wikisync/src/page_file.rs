@@ -91,6 +91,8 @@ pub fn parse(bytes: &[u8]) -> Result<(PageMeta, String)> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         bail!("file is not valid UTF-8");
     };
+    // An editor's "UTF-8 with BOM" marks the encoding, not the content.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.split_inclusive('\n');
     let opening = lines.next().unwrap_or_default();
     if trim_eol(opening) != FENCE {
@@ -226,6 +228,17 @@ mod tests {
         assert_eq!(meta.title.as_deref(), Some("Plain title"));
         assert_eq!(meta.tier, None, "the default tier normalises away");
         assert!(meta.tags.is_empty() && !meta.pinned);
+        assert_eq!(body, "body\r\n");
+    }
+
+    /// An editor that saves "UTF-8 with BOM" puts U+FEFF before the
+    /// opening fence. The mark says how the file is encoded; it is not
+    /// content, and the frontmatter after it is still the frontmatter.
+    #[test]
+    fn a_bom_before_the_frontmatter_is_accepted() {
+        let file = "\u{feff}---\r\ntitle: \"T\"\r\n---\r\nbody\r\n";
+        let (meta, body) = parse(file.as_bytes()).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("T"));
         assert_eq!(body, "body\r\n");
     }
 

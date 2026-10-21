@@ -85,6 +85,7 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 // Bare mode: `run` resolves the harness that owns the newest
                 // usable session for this workstream.
                 harness: None,
+                claude_wrapper: None,
                 native_args: Vec::new(),
             },
             &target,

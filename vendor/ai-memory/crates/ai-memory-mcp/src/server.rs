@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, ObservationRetention, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep_with_compaction,
+    AutoImproveReviewConfig, ColdClusterDedup, Consolidator, LedgerRetention, ObservationRetention,
+    projection::cap_text_with_marker, run_auto_improve_review, run_lint, run_sweep_with_ledgers,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -390,6 +390,12 @@ should be proposed from a completed session, or at explicit wrap-up \
   project-scope rule above; missing explicit sibling scopes fail closed \
   instead of falling back. Pass `expected_page_id` to delete only the \
   version you read.\n\
+- `memory_restore_page` — when the user asks to undo a page change or \
+  bring back a deleted page. Admin only (implicit on a single-operator \
+  server); project pages only, not `scope: \"profile\"` pages. Without \
+  `rev` it lists the page's checkpoints; with `rev` it writes that version, \
+  frontmatter included, back through the `memory_write_page` path. Follow \
+  the client-aware project-scope rule above.\n\
 - `memory_feedback` — right after a `memory_query` / `memory_read_page` \
   hit proves useful or misleading, and whenever the user says a recalled \
   page is out of date or wrong. Pass the exact `path` from the hit plus \
@@ -403,9 +409,15 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
-  pages. Three passes: expired pages are hard-deleted even when \
+  pages. Five passes: expired pages are hard-deleted even when \
   pinned, cold episodic pages decay to tombstones (pinned exempt), \
-  old tombstones are purged (idempotent, supports dry-run).\n\
+  old tombstones are purged, old raw observations are pruned, and \
+  old hook event ledgers (log-YYYY-MM.md) are deleted — the last two \
+  only when their opt-in retention is configured (decay \
+  `observation_retention_days` / `ledger_retention_months`), and the \
+  ledger pass never touches the current or previous month. \
+  Idempotent; `dry_run=true` reports what every pass would delete \
+  without deleting anything.\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
@@ -497,6 +509,9 @@ pub struct AiMemoryServer {
     /// Opt-in bound on how long raw observations outlive their consolidation.
     /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
     observation_retention: ObservationRetention,
+    /// Opt-in age bound for the hook event ledgers. Default is disabled, so
+    /// `memory_forget_sweep` deletes no ledger file.
+    ledger_retention: LedgerRetention,
     /// A2 opt-in: compact cold episodic pages (tier-down) instead of evicting
     /// them. Default `false`, so the sweep evicts exactly as before.
     compact_cold_episodic: bool,
@@ -1668,6 +1683,59 @@ struct DeletePageArgs {
     expected_page_id: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct RestorePageArgs {
+    /// Exact wiki path to restore or inspect (e.g. `notes/foo.md`).
+    path: String,
+    /// Checkpoint commit to restore from, as listed by a call without `rev`
+    /// (the newest one is the change being undone). Omit it to
+    /// list the checkpoints that changed this page.
+    #[serde(default)]
+    rev: Option<String>,
+    /// Maximum checkpoints to list when `rev` is omitted (default 20, max 100).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Project of the page. Static MCP clients must pass it together with
+    /// `workspace` on every project-scoped call.
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace of the page, together with `project`.
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+/// The page metadata a checkpoint's frontmatter carries, in the shape
+/// `memory_write_page` takes, so a restore keeps `kind`, `entities`,
+/// `abstract`, `relations` and the profile fields instead of clearing them.
+/// The write path validates them again with the same bounds as any write.
+fn checkpoint_write_metadata(
+    frontmatter: &serde_json::Value,
+) -> Result<ai_memory_core::page::PageWriteMetadata, McpError> {
+    const KEYS: [&str; 6] = [
+        "kind",
+        "entities",
+        "abstract",
+        "relations",
+        "applies_to",
+        "enforced_by",
+    ];
+    let picked: serde_json::Map<String, serde_json::Value> = KEYS
+        .iter()
+        .filter_map(|key| {
+            frontmatter
+                .get(*key)
+                .filter(|value| !value.is_null())
+                .map(|value| ((*key).to_owned(), value.clone()))
+        })
+        .collect();
+    serde_json::from_value(serde_json::Value::Object(picked)).map_err(|e| {
+        McpError::invalid_params(
+            format!("the checkpoint's page metadata cannot be restored as written: {e}"),
+            None,
+        )
+    })
+}
+
 /// Write one durable wiki page. Optional metadata (`kind`, `entities`,
 /// `abstract`, `relations`) replaces the page's previous metadata; omitted
 /// fields are cleared, not inherited.
@@ -1830,6 +1898,7 @@ impl AiMemoryServer {
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
             observation_retention: ObservationRetention::default(),
+            ledger_retention: LedgerRetention::default(),
             compact_cold_episodic: false,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
@@ -2437,6 +2506,7 @@ impl AiMemoryServer {
                     include_superseded: options.include_superseded,
                     explain: options.explain,
                     owner: options.owner,
+                    filter: ai_memory_store::PageFilter::default(),
                 },
             )
             .await
@@ -2563,8 +2633,19 @@ impl AiMemoryServer {
         self
     }
 
-    /// Attach the wiki handle. Without this, `memory_forget_sweep`
-    /// and `memory_lint` cannot write their report pages.
+    /// Set the opt-in event ledger age bound used by `memory_forget_sweep`.
+    /// Unset, the sweep never deletes a ledger file.
+    #[must_use]
+    pub fn with_ledger_retention(mut self, retention: LedgerRetention) -> Self {
+        self.ledger_retention = retention;
+        self
+    }
+
+    /// Attach the wiki handle. Without this, `memory_lint` returns an
+    /// error, and `memory_forget_sweep` refuses every pass that
+    /// deletes or rewrites a page (TTL, decay eviction, compaction,
+    /// cold-cluster dedup) and skips tombstone cleanup and the event-ledger
+    /// pass; only the observation prune still runs.
     #[must_use]
     pub fn with_wiki(mut self, wiki: Wiki) -> Self {
         self.wiki = Some(wiki);
@@ -2612,6 +2693,9 @@ impl AiMemoryServer {
         followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
+        Query text is folded (a NUL becomes a space) and bounded to the \
+        first 4 KiB before parsing, so pasting a whole document searches \
+        only its opening. \
         Set `explain=true` to attach per-stream ranks, matched entities, raw \
         scores, RRF contributions, graph provenance, and the authority multiplier to \
         project/scopes hits; it also returns `streams_active` and per-stream \
@@ -2664,7 +2748,7 @@ impl AiMemoryServer {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty())
             {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "global cannot be combined with workspace/project/scopes",
                     None,
                 ));
@@ -2677,6 +2761,7 @@ impl AiMemoryServer {
                     limit,
                     include_expired.then_some(i64::MIN),
                     Self::viewer_from_parts(Some(&parts)),
+                    ai_memory_store::PageFilter::default(),
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2708,7 +2793,7 @@ impl AiMemoryServer {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty()))
         {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "scopes cannot be combined with workspace/project",
                 None,
             ));
@@ -2721,13 +2806,13 @@ impl AiMemoryServer {
         // of audit mode.
         if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
             if args.global.unwrap_or(false) || !args.scopes.is_empty() {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "as_of cannot be combined with global or scopes",
                     None,
                 ));
             }
             let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
-                McpError::internal_error(format!("as_of must be an ISO-8601 instant: {e}"), None)
+                McpError::invalid_params(format!("as_of must be an ISO-8601 instant: {e}"), None)
             })?;
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
@@ -3540,7 +3625,7 @@ impl AiMemoryServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "Run the retention sweep. FOUR passes, and they \
+        description = "Run the retention sweep. FIVE passes, and they \
         differ on what they will delete. (1) TTL: pages whose frontmatter \
         expires_at is in the past are hard-deleted (file + rows) REGARDLESS \
         OF TIER OR PIN — an explicit expiry overrides a pin, so a pinned \
@@ -3557,9 +3642,15 @@ impl AiMemoryServer {
         page that is still live — an unconsolidated session, or one whose \
         page pass 2 or 3 just removed, keeps every row. This pass is DISABLED \
         by default (observation_retention_days = 0) and deletes nothing until \
-        an operator opts in; when off, observations_pruned is 0. The report's \
-        expired / hard_deleted / observations_pruned counts come from passes \
-        1, 3 and 4. Pass dry_run=true to preview."
+        an operator opts in; when off, observations_pruned is 0. (5) Event \
+        ledgers: hook event ledger files (log-YYYY-MM.md) whose month ended \
+        at least decay.ledger_retention_months whole months ago are deleted \
+        from disk permanently (never the current or previous month, never a \
+        file that does not open like a ledger). DISABLED by default \
+        (ledger_retention_months = 0); when off, ledgers_pruned is 0. The \
+        report's expired / hard_deleted / observations_pruned counts come \
+        from passes 1, 3 and 4; ledgers_prunable / ledgers_pruned and their \
+        byte counts from pass 5. Pass dry_run=true to preview."
     )]
     async fn memory_forget_sweep(
         &self,
@@ -3579,7 +3670,7 @@ impl AiMemoryServer {
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        let report = run_sweep_with_compaction(
+        let report = run_sweep_with_ledgers(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -3589,6 +3680,8 @@ impl AiMemoryServer {
             self.decay_breadth_weight,
             self.observation_retention,
             self.compact_cold_episodic,
+            ColdClusterDedup::default(),
+            self.ledger_retention,
             args.dry_run.unwrap_or(false),
         )
         .await
@@ -3991,7 +4084,13 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let session_id = match args.session_id.as_deref() {
+        // Blank means omitted, as in `memory_consolidate`.
+        let session_id = match args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
             Some(raw) => SessionId::from_str(raw)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
             None => self
@@ -4284,6 +4383,18 @@ impl AiMemoryServer {
         Parameters(args): Parameters<WritePageArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        self.write_page_in_scope(args, parts, None).await
+    }
+
+    /// The body of [`Self::memory_write_page`]. `resolved` is a scope the
+    /// caller already resolved and authorized (`memory_restore_page` resolves
+    /// once and must write where it read); `None` resolves from `args`.
+    async fn write_page_in_scope(
+        &self,
+        args: WritePageArgs,
+        parts: axum::http::request::Parts,
+        resolved: Option<ai_memory_store::ResolvedWriteScope>,
+    ) -> Result<CallToolResult, McpError> {
         let metadata = args
             .metadata
             .into_frontmatter()
@@ -4307,9 +4418,9 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let precondition = page_precondition(args.expected_page_id.as_deref(), args.create_only)?;
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         path.ensure_portable()
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let scope = args.scope.as_deref().map(str::trim);
         let profile_scope = scope == Some("profile");
@@ -4340,7 +4451,7 @@ impl AiMemoryServer {
                 .unwrap_or(if session_page { "episodic" } else { "semantic" });
         let tier: Tier = tier_name
             .parse()
-            .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
+            .map_err(|_| McpError::invalid_params(format!("unknown tier '{tier_name}'"), None))?;
         if let Some(expires_at) = args
             .expires_at
             .as_deref()
@@ -4359,74 +4470,77 @@ impl AiMemoryServer {
                 None,
             ));
         }
-        let resolved_scope = match args.scope.as_deref().map(str::trim) {
-            None | Some("") => {
-                self.resolve_write_target_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?
-            }
-            Some("global") => {
-                if args
-                    .workspace
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || args
-                        .project
+        let resolved_scope = match resolved {
+            Some(resolved) => resolved,
+            None => match args.scope.as_deref().map(str::trim) {
+                None | Some("") => {
+                    self.resolve_write_target_with_actor(
+                        args.workspace.as_deref(),
+                        args.project.as_deref(),
+                        &aps_actor,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
+                    .await?
+                }
+                Some("global") => {
+                    if args
+                        .workspace
                         .as_deref()
                         .is_some_and(|s| !s.trim().is_empty())
-                {
-                    return Err(McpError::internal_error(
-                        "scope: \"global\" cannot be combined with workspace/project",
+                        || args
+                            .project
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Err(McpError::invalid_params(
+                            "scope: \"global\" cannot be combined with workspace/project",
+                            None,
+                        ));
+                    }
+                    // The same resolver and choke point as an explicit
+                    // `default/_global` write, so both spellings are gated alike.
+                    self.resolve_write_target_with_actor(
+                        Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
+                        Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
+                        &aps_actor,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
+                    .await?
+                }
+                Some("profile") => {
+                    if args
+                        .workspace
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                        || args
+                            .project
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Err(McpError::invalid_params(
+                            "scope: \"profile\" cannot be combined with workspace/project",
+                            None,
+                        ));
+                    }
+                    let (workspace_id, project_id) =
+                        self.profile_target_ids(&parts, &aps_actor, true).await?;
+                    ai_memory_store::ResolvedWriteScope {
+                        scope: ai_memory_store::ResolvedScope {
+                            workspace_id,
+                            project_id,
+                        },
+                        promoted_from: None,
+                    }
+                }
+                Some(other) => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "unknown scope '{other}': the supported values are \"global\" and \"profile\""
+                        ),
                         None,
                     ));
                 }
-                // The same resolver and choke point as an explicit
-                // `default/_global` write, so both spellings are gated alike.
-                self.resolve_write_target_with_actor(
-                    Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
-                    Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?
-            }
-            Some("profile") => {
-                if args
-                    .workspace
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || args
-                        .project
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty())
-                {
-                    return Err(McpError::internal_error(
-                        "scope: \"profile\" cannot be combined with workspace/project",
-                        None,
-                    ));
-                }
-                let (workspace_id, project_id) =
-                    self.profile_target_ids(&parts, &aps_actor, true).await?;
-                ai_memory_store::ResolvedWriteScope {
-                    scope: ai_memory_store::ResolvedScope {
-                        workspace_id,
-                        project_id,
-                    },
-                    promoted_from: None,
-                }
-            }
-            Some(other) => {
-                return Err(McpError::internal_error(
-                    format!(
-                        "unknown scope '{other}': the supported values are \"global\" and \"profile\""
-                    ),
-                    None,
-                ));
-            }
+            },
         };
         let (ws, proj) = resolved_scope.scope.as_tuple();
         let manifest_warning = self.refresh_promoted_scope(&resolved_scope).await;
@@ -4604,7 +4718,9 @@ impl AiMemoryServer {
         this when the user asks to read, open, or show a specific page by \
         name or topic — not just snippets. Returns `{ path, title, body, \
         frontmatter }` (plus `served_from` when a missing markdown file is \
-        served from the DB fallback). \
+        served from the DB fallback, and `expired: true` when the page's \
+        `expires_at` TTL has passed: an exact-path read still returns such a \
+        page, which `memory_query` and `memory_recent` no longer surface). \
         \
         Set `include_related: true` to also walk the link graph outward from \
         this page and get a `related` array of the reachable pages, each with \
@@ -4649,7 +4765,7 @@ impl AiMemoryServer {
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
-                .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?
+                .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?
         } else if let Some(query) = args.query {
             let hits = self
                 .reader
@@ -4685,8 +4801,8 @@ impl AiMemoryServer {
         //
         // Opt-in related-pages walk. Computed once against the resolved scope so
         // both the disk and DB-fallback branches attach the same `related`
-        // block; default off → `attach_related` is a no-op and the response
-        // stays byte-identical to a plain single-page read.
+        // block; default off → `annotate` adds nothing and the response stays
+        // byte-identical to a plain single-page read.
         let related = if args.include_related {
             let depth = args.related_depth.unwrap_or(1);
             Some(
@@ -4704,12 +4820,27 @@ impl AiMemoryServer {
         } else {
             None
         };
-        let attach_related = |mut value: serde_json::Value| {
-            if let (Some(nodes), Some(map)) = (&related, value.as_object_mut()) {
-                map.insert(
-                    "related".into(),
-                    serde_json::to_value(nodes).unwrap_or(serde_json::Value::Null),
-                );
+        // An expired page is still returned (an explicit read is not a search)
+        // but says so: `memory_query`, `memory_recent` and the briefing hide
+        // it, so this flag is how a caller learns the page is only waiting for
+        // the forget sweep. Omitted while the page is live.
+        let expired = self
+            .reader
+            .page_expired_by_ids(ws, proj, page_path.as_str())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .unwrap_or(false);
+        let annotate = |mut value: serde_json::Value| {
+            if let Some(map) = value.as_object_mut() {
+                if let Some(nodes) = &related {
+                    map.insert(
+                        "related".into(),
+                        serde_json::to_value(nodes).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                if expired {
+                    map.insert("expired".into(), serde_json::Value::Bool(true));
+                }
             }
             value
         };
@@ -4744,7 +4875,7 @@ impl AiMemoryServer {
                 // frontmatter title was never filled otherwise read back
                 // titleless despite a proper `# Heading` (#599).
                 let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
-                ok_json(&attach_related(serde_json::json!({
+                ok_json(&annotate(serde_json::json!({
                     "path": page_path.to_string(),
                     "page_id": page_id.map(|id| id.to_string()),
                     "title": title,
@@ -4768,7 +4899,7 @@ impl AiMemoryServer {
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                             .or(Some(stored.title));
-                        ok_json(&attach_related(serde_json::json!({
+                        ok_json(&annotate(serde_json::json!({
                             "path": page_path.to_string(),
                             "page_id": page_id.map(|id| id.to_string()),
                             "title": title,
@@ -4986,6 +5117,151 @@ impl AiMemoryServer {
         }))
     }
 
+    /// List a page's checkpoints, or restore it from one through the
+    /// normal write path.
+    #[tool(
+        annotations(
+            title = "Restore memory page",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "Bring back an earlier version of a wiki page, \
+        including a deleted one. Admin only: the same authority as \
+        `/admin/restore-page`, because a checkpoint can hold text a root \
+        deleted, purged or let expire (implicit on a single-operator \
+        server). Without `rev`, lists the checkpoints that changed `path` \
+        (newest first): `{ path, checkpoints: [{ rev, summary, time }] }`. \
+        With `rev` (a listed checkpoint, or the checkpoint before a \
+        `memory_delete_page`), writes that version back, frontmatter \
+        included, as a new current version through the `memory_write_page` \
+        path, so sanitization, admission, attribution and supersession \
+        apply; the version it replaces stays reachable. Project pages only: \
+        `scope: \"profile\"` pages cannot be restored here. Pass \
+        `workspace` + `project` together on static clients. Use only when \
+        the user asks to restore or undo a page change."
+    )]
+    async fn memory_restore_page(
+        &self,
+        Parameters(args): Parameters<RestorePageArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        // Git history keeps every version the live wiki dropped: pages a root
+        // deleted, purge-session removed or the forget sweep expired. Listing
+        // names those versions and restoring resurrects them, so both need
+        // `/admin/restore-page`'s authority, not a reader's or writer's grant.
+        self.require_admin_capability(&parts).await?;
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Err(McpError::internal_error(
+                "memory_restore_page requires the server to be built with a wiki handle",
+                None,
+            ));
+        };
+        let path = PagePath::new(args.path.clone())
+            .and_then(|p| p.ensure_portable().map(|()| p))
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
+        // Resolved once, no-create, for writing: the listing, the checkpoint
+        // read and the write all address this one project, so a moving
+        // active-project pointer cannot read from one project and write into
+        // another.
+        let (ws, proj) = self
+            .effective_ids_for_mutation_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
+            )
+            .await?;
+
+        let Some(rev) = args.rev.as_deref().map(str::trim).filter(|r| !r.is_empty()) else {
+            let limit = args.limit.unwrap_or(20).clamp(1, 100);
+            let checkpoints = wiki
+                .page_checkpoints(ws, proj, &path, limit)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let checkpoints: Vec<_> = checkpoints
+                .into_iter()
+                .map(|c| serde_json::json!({ "rev": c.oid, "summary": c.summary, "time": c.time }))
+                .collect();
+            return ok_json(&serde_json::json!({
+                "path": path.to_string(),
+                "checkpoints": checkpoints,
+            }));
+        };
+
+        let md = wiki
+            .page_at_checkpoint(ws, proj, &path, rev)
+            .await
+            .map_err(|e| {
+                McpError::invalid_params(format!("cannot read {path} at {rev}: {e}"), None)
+            })?;
+        let fm = &md.frontmatter;
+        let metadata = checkpoint_write_metadata(fm)?;
+        let text = |key: &str| {
+            fm.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let tags = fm
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let write = WritePageArgs {
+            metadata,
+            path: path.to_string(),
+            body: md.body,
+            title: text("title"),
+            tier: text("tier"),
+            tags,
+            pinned: fm
+                .get("pinned")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            project: args.project,
+            workspace: args.workspace,
+            scope: None,
+            expires_at: text("expires_at"),
+            session_id: None,
+            expected_page_id: None,
+            create_only: false,
+        };
+        let resolved = ai_memory_store::ResolvedWriteScope {
+            scope: ai_memory_store::ResolvedScope {
+                workspace_id: ws,
+                project_id: proj,
+            },
+            promoted_from: None,
+        };
+        let result = self
+            .write_page_in_scope(write, parts, Some(resolved))
+            .await?;
+        if result.is_error.unwrap_or(false) {
+            return Ok(result);
+        }
+        let written = serde_json::to_value(&result.content)
+            .ok()
+            .and_then(|content| content.get(0)?.get("text")?.as_str().map(str::to_owned))
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        match written {
+            Some(serde_json::Value::Object(mut map)) => {
+                map.insert(
+                    "restored_from".into(),
+                    serde_json::Value::String(rev.to_owned()),
+                );
+                ok_json(&map)
+            }
+            _ => Ok(result),
+        }
+    }
+
     /// Delete a single wiki page by exact path.
     #[tool(
         annotations(
@@ -5022,7 +5298,7 @@ impl AiMemoryServer {
             _ => None,
         };
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let (path, (ws, proj)) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => (
                 self.place_slot_delete(path, &parts).await?,
@@ -5395,7 +5671,7 @@ impl AiMemoryServer {
             .filter(|id| !id.is_empty())
             .map(|id| {
                 HandoffId::from_str(id)
-                    .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))
+                    .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))
             })
             .transpose()?;
         let handoff = if let Some(handoff_id) = requested_id {
@@ -5529,8 +5805,8 @@ impl AiMemoryServer {
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let handoff_id = HandoffId::from_str(&args.handoff_id)
-            .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
+        let handoff_id = HandoffId::from_str(args.handoff_id.trim())
+            .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))?;
         let (ws, proj) = self
             .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
@@ -5816,7 +6092,7 @@ impl AiMemoryServer {
             match args.message_id.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
-                    McpError::internal_error(format!("invalid message_id: {e}"), None)
+                    McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
             };
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -5897,7 +6173,7 @@ impl AiMemoryServer {
             match args.message_id.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
-                    McpError::internal_error(format!("invalid message_id: {e}"), None)
+                    McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
             };
         let admission = self
@@ -8025,6 +8301,7 @@ mod tests {
         "memory_read_page",
         "memory_read_session_observations",
         "memory_delete_page",
+        "memory_restore_page",
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
@@ -8051,6 +8328,7 @@ mod tests {
         "memory_read_page",
         "memory_read_session_observations",
         "memory_delete_page",
+        "memory_restore_page",
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
@@ -9822,10 +10100,25 @@ mod tests {
         );
 
         // MEMORY_INSTRUCTIONS is read before an agent ever inspects
-        // `tools/list`, so it carries the same obligation.
+        // `tools/list`, so it carries the same obligation. The ledger pass
+        // removes a new class of file (monthly hook event ledgers), so the
+        // item must name it and its opt-in gate; the stale three-pass count
+        // must not come back either.
         assert!(
             MEMORY_INSTRUCTIONS.contains("hard-deleted even when"),
             "MEMORY_INSTRUCTIONS must warn that expired pages delete despite a pin"
+        );
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("ledger_retention_months"),
+            "MEMORY_INSTRUCTIONS must name the opt-in event-ledger retention pass"
+        );
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("dry_run=true"),
+            "MEMORY_INSTRUCTIONS must say a dry run reports without deleting"
+        );
+        assert!(
+            !MEMORY_INSTRUCTIONS.contains("Three passes"),
+            "the stale three-pass count must not come back in MEMORY_INSTRUCTIONS"
         );
     }
 
@@ -10284,6 +10577,86 @@ mod tests {
             )
             .await;
         assert!(bad.is_err());
+    }
+
+    /// Conflicting scope arguments and a malformed `as_of` are decided from
+    /// the request alone, so they are the caller's mistake: `memory_query`
+    /// answers `invalid params` like the page tools, not an internal error a
+    /// client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn memory_query_answers_bad_arguments_with_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let base = || QueryArgs {
+            query: "karpathy".into(),
+            limit: Some(5),
+            project: None,
+            workspace: None,
+            scopes: Vec::new(),
+            global: None,
+            include_expired: None,
+            include_superseded: None,
+            pin_first: None,
+            explain: None,
+            as_of: None,
+            answer: None,
+            reasoning: None,
+        };
+        let scope = |project: &str| MemoryScopeArg {
+            workspace: "default".into(),
+            project: project.into(),
+        };
+
+        let mut global_project = base();
+        global_project.global = Some(true);
+        global_project.project = Some("scratch".into());
+
+        let mut global_workspace = base();
+        global_workspace.global = Some(true);
+        global_workspace.workspace = Some("default".into());
+
+        let mut global_scopes = base();
+        global_scopes.global = Some(true);
+        global_scopes.scopes = vec![scope("scratch")];
+
+        let mut scopes_project = base();
+        scopes_project.scopes = vec![scope("scratch")];
+        scopes_project.project = Some("scratch".into());
+
+        let mut scopes_workspace = base();
+        scopes_workspace.scopes = vec![scope("scratch")];
+        scopes_workspace.workspace = Some("default".into());
+
+        let mut as_of_scopes = base();
+        as_of_scopes.scopes = vec![scope("scratch")];
+        as_of_scopes.as_of = Some("2026-06-01T00:00:00Z".into());
+
+        let mut malformed_as_of = base();
+        malformed_as_of.as_of = Some("not-a-time".into());
+
+        for (what, args) in [
+            ("global + project", global_project),
+            ("global + workspace", global_workspace),
+            ("global + scopes", global_scopes),
+            ("scopes + project", scopes_project),
+            ("scopes + workspace", scopes_workspace),
+            ("as_of + scopes", as_of_scopes),
+            ("malformed as_of", malformed_as_of),
+        ] {
+            let err = server
+                .memory_query(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        server
+            .memory_query(Parameters(base()), OptionalParts(test_parts_default()))
+            .await
+            .expect("a well-formed query is not rejected");
     }
 
     #[tokio::test]
@@ -12463,6 +12836,92 @@ mod tests {
             text.contains("db-fallback"),
             "expected fallback diagnostic; got {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_marks_an_expired_page() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        for (path, expires_at) in [
+            ("notes/expired.md", "2000-01-01"),
+            ("notes/future.md", "2999-01-01"),
+        ] {
+            wiki.write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(path).unwrap(),
+                frontmatter: serde_json::json!({"title": "Dated", "expires_at": expires_at}),
+                body: "dated body".to_string(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Dated".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+        // The DB-fallback branch annotates too: an expired row with no
+        // markdown file behind it.
+        let a_minute_ago = jiff::Timestamp::now().as_second() - 60;
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/db-only-expired.md").unwrap(),
+                title: "DB Only Expired".into(),
+                body: "fallback body".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"title": "DB Only Expired"}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: Some(jiff::Timestamp::from_second(a_minute_ago).unwrap()),
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let server = server.with_wiki(wiki);
+        for (path, expired) in [
+            ("notes/expired.md", true),
+            ("notes/future.md", false),
+            ("notes/db-only-expired.md", true),
+        ] {
+            let result = server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some(path.into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            // The page is still returned, and the flag appears only once the
+            // TTL has passed: a live page's response keeps its exact shape.
+            assert_eq!(json["path"], path, "{text}");
+            assert_eq!(
+                json.get("expired").and_then(serde_json::Value::as_bool),
+                expired.then_some(true),
+                "{path}: {text}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -14808,6 +15267,91 @@ mod tests {
         }
     }
 
+    /// A malformed path, tier or scope is the caller's mistake, so the page
+    /// tools answer `invalid params` like their siblings, not an internal
+    /// error a client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn page_tools_answer_bad_path_tier_and_scope_with_invalid_params() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let write = |path: &str, tier: Option<&str>, scope: Option<&str>, project: Option<&str>| {
+            WritePageArgs {
+                metadata: Default::default(),
+                path: path.into(),
+                body: "# Page\n".into(),
+                title: None,
+                tier: tier.map(Into::into),
+                tags: vec![],
+                pinned: false,
+                project: project.map(Into::into),
+                workspace: None,
+                scope: scope.map(Into::into),
+                expires_at: None,
+                session_id: None,
+                create_only: false,
+                expected_page_id: None,
+            }
+        };
+        for args in [
+            write("notes/a|b.md", None, None, None),
+            write("../x.md", None, None, None),
+            write("notes/ok.md", Some("bogus"), None, None),
+            write("notes/ok.md", None, Some("global"), Some("x")),
+            write("notes/ok.md", None, Some("profile"), Some("x")),
+            write("notes/ok.md", None, Some("elsewhere"), None),
+        ] {
+            let what = format!("{:?} {:?} {:?}", args.path, args.tier, args.scope);
+            let err = server
+                .memory_write_page(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("../x.md".into()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "read: {err:?}"
+        );
+
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "../x.md".into(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "delete: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn memory_write_page_rejects_workspace_without_project() {
         let tmp = TempDir::new().unwrap();
@@ -17113,6 +17657,285 @@ mod tests {
         );
     }
 
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn restore_args(path: &str, rev: Option<&str>, project: Option<&str>) -> RestorePageArgs {
+        RestorePageArgs {
+            path: path.into(),
+            rev: rev.map(str::to_owned),
+            limit: None,
+            project: project.map(str::to_owned),
+            workspace: project.map(|_| "default".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_lists_checkpoints_and_brings_back_a_deleted_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "notes/retries.md".into(),
+                    body: "# Retries\n\nKeep the same event id.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec!["delivery".into()],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    expected_page_id: None,
+                    create_only: false,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "notes/retries.md".into(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let listed = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args("notes/retries.md", None, None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let revs: Vec<String> = listed["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["rev"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            revs.len() >= 2,
+            "the write and the delete both changed the page: {listed}"
+        );
+        let pre = revs[1].clone();
+
+        let restored = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args("notes/retries.md", Some(&pre), None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(restored["restored_from"], pre.as_str());
+
+        let read = result_json(
+            &server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some("notes/retries.md".into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            read["body"]
+                .as_str()
+                .unwrap()
+                .contains("Keep the same event id.")
+        );
+    }
+
+    /// A restore must bring back the page's metadata, not only its body:
+    /// the write path clears omitted metadata, so a restore that dropped it
+    /// would silently strip `kind`, `entities`, `abstract` and `relations`.
+    #[tokio::test]
+    async fn memory_restore_page_round_trips_frontmatter_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki.clone());
+        let payload = serde_json::json!({
+            "path": "notes/metadata.md", "body": "# Metadata\n\nDurable content.",
+            "kind": "rule", "entities": ["sqlite", "writer actor"],
+            "abstract": "One-line summary.",
+            "relations": {"fixes": ["gotchas/build"], "contradicts": ["decisions/old.md"]},
+            "tags": ["storage"], "pinned": true, "tier": "procedural"
+        });
+        server
+            .memory_write_page(
+                Parameters(serde_json::from_value(payload.clone()).unwrap()),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let path = PagePath::new("notes/metadata.md").unwrap();
+        let before = wiki.read_page(ws, proj, &path).unwrap();
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: path.to_string(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let listed = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args(path.as_str(), None, None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let pre_delete = listed["checkpoints"][1]["rev"].as_str().unwrap().to_owned();
+        server
+            .memory_restore_page(
+                Parameters(restore_args(path.as_str(), Some(&pre_delete), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let after = wiki.read_page(ws, proj, &path).unwrap();
+        for key in [
+            "kind",
+            "entities",
+            "abstract",
+            "relations",
+            "tags",
+            "pinned",
+            "tier",
+        ] {
+            assert_eq!(
+                after.frontmatter.get(key),
+                before.frontmatter.get(key),
+                "restore must keep `{key}`: {}",
+                after.frontmatter
+            );
+        }
+        assert_eq!(after.frontmatter["kind"], "rule");
+        assert_eq!(after.frontmatter["relations"], payload["relations"]);
+        assert_eq!(after.body, before.body);
+    }
+
+    /// Metadata that the write path would refuse is refused from a
+    /// checkpoint too, before anything is written.
+    #[test]
+    fn checkpoint_write_metadata_keeps_only_page_metadata_and_rejects_bad_shapes() {
+        let meta = checkpoint_write_metadata(&serde_json::json!({
+            "title": "ignored here", "kind": "rule", "entities": ["a"],
+            "abstract": null, "session_id": "x"
+        }))
+        .unwrap();
+        assert_eq!(meta.kind.as_deref(), Some("rule"));
+        assert_eq!(meta.entities, ["a"]);
+        assert!(meta.abstract_text.is_none());
+        assert!(
+            checkpoint_write_metadata(&serde_json::json!({ "entities": "not-a-list" })).is_err()
+        );
+        assert!(
+            checkpoint_write_metadata(&serde_json::json!({ "relations": { "blocks": ["x"] } }))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_refuses_unknown_explicit_scope_and_bad_rev() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        let foreign = server
+            .memory_restore_page(
+                Parameters(restore_args("notes/x.md", None, Some("typo"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(
+            foreign.is_err(),
+            "an unknown explicit project must fail closed"
+        );
+
+        let bad_rev = server
+            .memory_restore_page(
+                Parameters(restore_args("notes/x.md", Some("deadbeef"), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(bad_rev.is_err(), "an unknown rev must not write anything");
+    }
+
     #[tokio::test]
     async fn memory_delete_page_unknown_explicit_project_does_not_fallback() {
         let tmp = TempDir::new().unwrap();
@@ -18172,6 +18995,128 @@ mod tests {
         );
     }
 
+    /// A malformed handoff or message id is caller input: it answers
+    /// `invalid params` (-32602) like a malformed session id, not an opaque
+    /// internal error, and keeps its message. Cancel trims the id the way
+    /// accept, pop and the admin routes already do.
+    #[tokio::test]
+    async fn malformed_handoff_and_message_ids_are_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let assert_invalid_params = |result: Result<CallToolResult, McpError>, what: &str| {
+            let err = result.expect_err("a malformed id must be refused");
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err}"
+            );
+            assert!(
+                err.to_string().contains(&format!("invalid {what}")),
+                "{err}"
+            );
+        };
+
+        assert_invalid_params(
+            server
+                .memory_handoff_accept(
+                    Parameters(HandoffAcceptArgs {
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                        handoff_id: Some("nope".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "handoff_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_handoff_cancel(
+                    Parameters(HandoffCancelArgs {
+                        handoff_id: "nope".into(),
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "handoff_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_message_pop(
+                    Parameters(MessagePopArgs {
+                        message_id: Some("abc".into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "message_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_message_cancel(
+                    Parameters(MessageCancelArgs {
+                        message_id: Some("abc".into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "message_id",
+        );
+
+        // A valid id with surrounding whitespace still cancels.
+        let begin = server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "padded id".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let begin_text = begin
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let begin_json: serde_json::Value = serde_json::from_str(&begin_text).unwrap();
+        let handoff_id = begin_json["handoff_id"].as_str().unwrap().to_string();
+        let cancel = server
+            .memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: format!(" {handoff_id}\n"),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a whitespace-padded id names the same handoff");
+        let cancel_text = cancel
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(cancel_text.contains("\"cancelled\": true"), "{cancel_text}");
+    }
+
     #[tokio::test]
     async fn handoff_cancel_expires_open_handoff_and_clears_briefing_count() {
         let (_tmp, store, server, _ws, _pj) = setup_server().await;
@@ -18911,6 +19856,59 @@ mod tests {
             "an unknown session read as a refusal: {}",
             err.message
         );
+    }
+
+    /// A blank `session_id` means omitted and a padded one names the same
+    /// session, as in `memory_consolidate` and
+    /// `memory_read_session_observations`.
+    #[tokio::test]
+    async fn auto_improve_reads_blank_session_id_as_omitted_and_trims_padding() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let older = seed_short_completed_session(&store, ws, proj).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let latest = seed_short_completed_session(&store, ws, proj).await;
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        for (raw, expected) in [("  ".to_string(), latest), (format!("  {older}\n"), older)] {
+            let response = call_tool_json(
+                server
+                    .memory_auto_improve(
+                        Parameters(AutoImproveArgs {
+                            session_id: Some(raw.clone()),
+                            ..auto_improve_args(None)
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("session_id {raw:?}: {e:?}")),
+            );
+            assert_eq!(response["session_id"], expected.to_string(), "{raw:?}");
+        }
     }
 
     #[tokio::test]

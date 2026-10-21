@@ -12,6 +12,9 @@ Use this skill only for deliberate durable wiki mutations. Routine session captu
 
 - `memory_write_page` writes a durable wiki page for permanent project knowledge.
 - `memory_delete_page` removes a durable wiki page by exact path.
+- `memory_restore_page` lists a page's checkpoints (no `rev`) or writes an
+  earlier version back (with `rev`), including a deleted page. It is admin
+  only on a multi-user server and does not reach `scope: "profile"` pages.
 
 ## Writing durable memory
 

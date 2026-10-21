@@ -19,7 +19,7 @@ use std::sync::Arc;
 use ai_memory_core::{OwnerFilter, ProjectId, WorkspaceId};
 use ai_memory_llm::{Embedder, QueryVector, RerankCandidate, RerankStage};
 use ai_memory_store::{
-    HybridSearch, PageHit, SearchExplain, StoreResult, StreamTimings, VectorQuery,
+    HybridSearch, PageFilter, PageHit, SearchExplain, StoreResult, StreamTimings, VectorQuery,
 };
 
 use crate::state::WebState;
@@ -45,10 +45,12 @@ pub(crate) struct RecallResult {
     pub streams_active: Vec<&'static str>,
 }
 
-/// Rank `query` over `scopes` exactly as a `memory_query` project/scopes
-/// search does (latest versions only, expired pages hidden). `owner` is the
-/// viewer's session-timeline filter: an observation excerpt is shown only
-/// from a session it admits, as in `memory_query`.
+/// Rank `query` over `scopes` as a `memory_query` project/scopes search does
+/// (latest versions only, expired pages hidden), keeping only pages that pass
+/// `filter`. Every stream applies the filter, so the reranker scores only
+/// pages the caller asked for. `owner` is the viewer's
+/// session-timeline filter: an observation excerpt is shown only from a
+/// session it admits, as in `memory_query`.
 pub(crate) async fn search_scopes(
     state: &WebState,
     scopes: &[(WorkspaceId, ProjectId)],
@@ -56,6 +58,7 @@ pub(crate) async fn search_scopes(
     limit: usize,
     explain: bool,
     owner: &OwnerFilter,
+    filter: PageFilter<'_>,
 ) -> StoreResult<RecallResult> {
     let query_vector: Option<QueryVector> = match &state.recall.embedder {
         Some(embedder) => ai_memory_llm::embed_search_query(embedder.as_ref(), query).await,
@@ -83,6 +86,7 @@ pub(crate) async fn search_scopes(
                 include_superseded: false,
                 explain,
                 owner,
+                filter,
             },
         )
         .await?;

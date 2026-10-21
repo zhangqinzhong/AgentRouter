@@ -71,6 +71,42 @@ ssh "$SERVER" "docker inspect --format='{{.State.Health.Status}}' ai-memory"
 # Expect: healthy
 ```
 
+## TrueNAS SCALE and other NAS hosts
+
+There is no TrueNAS catalog app, but the published image runs as a custom app
+on any NAS that runs Docker containers. TrueNAS SCALE 24.10 and later can
+install one from a Compose file. What the image expects:
+
+- the image `docker.io/akitaonrails/ai-memory:<version>` (pin a version rather
+  than `latest`, so an update is a deliberate change of tag);
+- a persistent dataset mounted at `/data`, owned by uid and gid **1000**, the
+  image's `ai-memory` user. TrueNAS apps default to uid 568, so either give
+  the dataset to 1000 or run the container as the dataset's owner;
+- port `49374` published to the LAN;
+- a bearer token and an allowed-hosts list, because the server is reachable
+  from the network (see the next section).
+
+```yaml
+services:
+  ai-memory:
+    image: docker.io/akitaonrails/ai-memory:<version>
+    restart: unless-stopped
+    ports:
+      - "49374:49374"
+    volumes:
+      - /mnt/<pool>/apps/ai-memory:/data
+    environment:
+      AI_MEMORY_AUTH_TOKEN: "<64 hex chars from `ai-memory generate-auth-token`>"
+      # Every name or address clients use to reach the NAS.
+      AI_MEMORY_ALLOWED_HOSTS: "truenas.local,192.0.2.10,localhost,127.0.0.1"
+```
+
+The image's healthcheck runs `ai-memory status`, so the app shows as healthy
+once the server answers. Point clients at `http://<nas>:49374` with the same
+token, as described below for any LAN server. Backups of the dataset follow
+[Backups](#backups): take `ai-memory backup` snapshots, not a copy of a live
+SQLite file.
+
 ## Security - bearer-token auth + encrypted transport
 
 The default `docker-compose.prod.yml.example` binds to `0.0.0.0:49374`

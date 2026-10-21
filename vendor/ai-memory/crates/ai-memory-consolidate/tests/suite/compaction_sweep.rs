@@ -105,6 +105,17 @@ fn backdate_latest(fx: &Fixture, path: &str, days: i64) {
     .unwrap();
 }
 
+fn expire_latest(fx: &Fixture, path: &str) {
+    let conn = rusqlite::Connection::open(fx.tmp.path().join("db/memory.sqlite")).unwrap();
+    conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+    conn.execute(
+        "UPDATE pages SET expires_at = 1 \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+        params![fx.ws.as_bytes(), fx.proj.as_bytes(), path],
+    )
+    .unwrap();
+}
+
 /// The `compacted_at` marker on the current latest version of `path`, and its
 /// body, straight from SQLite.
 fn latest_marker_and_body(fx: &Fixture, path: &str) -> (Option<i64>, String) {
@@ -488,4 +499,72 @@ async fn only_unpinned_episodic_pages_compact() {
         let (marker, _body) = latest_marker_and_body(&fx, path);
         assert!(marker.is_none(), "{path} must not be marked compacted");
     }
+}
+
+/// The curator (which predicts what the sweep would evict) must not report an
+/// expired page as cold, nor flag expired slots as stale, nor include expired
+/// pages in duplicate title findings.
+#[tokio::test]
+async fn curator_skips_expired_pages() {
+    let fx = seed_fixture().await;
+    write(
+        &fx,
+        "sessions/expired.md",
+        "Common Title",
+        Tier::Episodic,
+        false,
+        "an expired episodic note",
+    )
+    .await;
+    backdate_latest(&fx, "sessions/expired.md", COLD_DAYS);
+    expire_latest(&fx, "sessions/expired.md");
+
+    write(
+        &fx,
+        "concepts/live.md",
+        "Common Title",
+        Tier::Semantic,
+        false,
+        "a live semantic note",
+    )
+    .await;
+
+    write(
+        &fx,
+        "_slots/expired-focus.md",
+        "Focus",
+        Tier::Semantic,
+        false,
+        "an expired slot",
+    )
+    .await;
+    backdate_latest(&fx, "_slots/expired-focus.md", COLD_DAYS);
+    expire_latest(&fx, "_slots/expired-focus.md");
+
+    let report = run_curator_report(
+        &fx.store.reader,
+        fx.ws,
+        fx.proj,
+        "default",
+        "scratch",
+        CuratorParams::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        report.findings.iter().all(|f| f.kind != "cold_episodic"),
+        "curator must not flag expired pages as cold episodic: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().all(|f| f.kind != "stale_slot"),
+        "curator must not flag expired slots as stale: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().all(|f| f.kind != "duplicate_title"),
+        "curator must not flag duplicate titles against expired pages: {:?}",
+        report.findings
+    );
 }

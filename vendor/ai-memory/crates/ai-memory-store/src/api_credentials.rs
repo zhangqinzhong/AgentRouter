@@ -78,6 +78,26 @@ pub fn insert_api_credential(
     Ok(id)
 }
 
+/// Count a user's credentials that still authenticate: not revoked and not
+/// expired at `now`.
+///
+/// # Errors
+/// SQL failures.
+pub fn count_active_api_credentials_for_user(
+    conn: &Connection,
+    user_id: UserId,
+    now: i64,
+) -> StoreResult<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM api_credentials \
+         WHERE user_id = ?1 AND revoked_at IS NULL \
+           AND (expires_at IS NULL OR expires_at > ?2)",
+        params![user_id.as_bytes(), now],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
+}
+
 /// Rotate: write a new hash on the same id, clear revoked_at.
 ///
 /// # Errors
@@ -413,7 +433,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 80, "update the pin when adding a migration");
+        assert_eq!(version, 83, "update the pin when adding a migration");
         let cols: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('users') \

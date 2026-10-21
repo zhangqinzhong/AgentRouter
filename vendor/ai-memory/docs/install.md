@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -96,11 +96,29 @@ sh install.sh
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
 
-Windows is not covered by the script; use the zip in
+Native Windows has its own script, `install.ps1`, published next to
+`install.sh` with its own `install.ps1.sha256`. In PowerShell (no
+administrator rights needed):
+
+```powershell
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+ai-memory setup
+```
+
+It downloads `ai-memory-windows-x86_64.zip` and its `.sha256`, stops before
+unpacking when the checksum file is missing, names another asset, or does not
+match, and refuses an archive entry that is absolute or holds `..`. The
+release goes to `%LOCALAPPDATA%\Programs\ai-memory` (`AI_MEMORY_INSTALL_DIR`
+overrides it), which is added to your user `PATH` unless
+`AI_MEMORY_NO_MODIFY_PATH=1`. An existing install there is left alone; update it
+with `ai-memory upgrade`. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
+work as for `install.sh`. On Windows on Arm it installs the x86_64 build, which
+Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
+failure under `iex` leaves your PowerShell window open. Details are in
 [`docs/windows.md`](windows.md).
 
-`ai-memory setup [--yes] [--agent <name>]... [--no-service]` runs, in order,
-the commands a native install otherwise needs one by one:
+`ai-memory setup [--yes] [--agent <name>]... [--no-service] [--plan [--json]] [--web [--no-open]]`
+runs, in order, the commands a native install otherwise needs one by one:
 
 1. `init`. On a fresh data dir this mints the root bearer token into
    `<data_dir>/auth-tokens/default` (owner-only) and records
@@ -119,25 +137,68 @@ the commands a native install otherwise needs one by one:
    link that resolves to the same file instead: the path as invoked, an
    `ai-memory` on `PATH` such as `~/.nix-profile/bin/ai-memory`, or Homebrew's
    `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`. With no such link it names
-   the versioned path, and you re-run `setup` after upgrading. The step is skipped when a server already answers at the configured
-   URL and no unit of ours exists yet (Docker, a packaged system unit, a
-   foreground `serve`), when the configured server is not on this machine,
-   with `--no-service`, and on Windows.
+   the versioned path, and you re-run `setup` after upgrading.
+   On Windows there is no per-user service manager, so `setup` writes an
+   `ai-memory` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+   (no administrator rights needed) that runs `ai-memory service-host` at
+   logon, and starts that host right away. The host runs `serve --transport
+   http --enable-web` on the same data dir and config with no console window
+   and restarts it after a failure, giving up after five failures within ten
+   seconds of starting; see
+   [`docs/windows.md`](windows.md#scenario-e-keep-the-server-running-native-windows-service).
+   The step is skipped when a server already answers at the configured
+   URL and no unit or logon entry of ours exists yet (Docker, a packaged system
+   unit, a foreground `serve`), when the configured server is not on this
+   machine, and with `--no-service`.
 3. For each agent: `install-mcp --apply`, `install-hooks --apply` and
    `install-skills --scope global`. With no `--agent`, `setup` wires every
    harness whose session store or MCP config exists under your home, using the
    same store locations as `doctor` (including `CLAUDE_CONFIG_DIR`,
-   `CODEX_HOME` and similar relocations). OpenCode 2 and the Kiro CLI v3
-   engine share a store with OpenCode and Kiro CLI, so they are wired only
-   when named, for example `--agent opencode2`.
+   `CODEX_HOME` and similar relocations). The plan numbers each agent and
+   says what it was found by (its session store, its MCP config, or for Muse
+   its directory), then lists the other agents `--agent` accepts. Cursor,
+   Gemini CLI, Droid and the other agents with no store to look for are
+   wired by naming them. OpenCode 1 and 2 share one session store, so a
+   detected or named `opencode` runs `opencode --version` once and wires the
+   plugin and MCP entry for the major it reports, as `install-mcp --client
+   opencode` and `install-hooks --agent opencode` do by hand. When that probe
+   fails (no `opencode` on `PATH`, a timeout, or unreadable output), `setup`
+   writes no OpenCode plugin or MCP entry and reports the problem; `--agent
+   opencode2` forces V2 without probing. The Kiro CLI v3 engine shares a
+   store with Kiro CLI, so it is wired only when named.
 4. A self-check that writes nothing: `GET /healthz`, a `memory_status` call
-   over MCP with the install's credential, and `doctor`.
+   over MCP with the install's credential, and `doctor`. When Codex was wired,
+   `setup` also asks Codex whether it will run the ai-memory hooks. If Codex
+   has not trusted them yet, the closing line says so and tells you to open
+   Codex, run `/hooks`, and trust them, instead of reporting the install as
+   ready. That still exits 0, because only you can grant the trust in Codex.
 
-Without `--yes`, `setup` prints this plan and asks on a terminal; with no
-terminal (a script, an agent's tool call) it changes nothing and exits
-non-zero, asking for `--yes`. Each step is idempotent: a second run rewrites no
+Without `--yes`, `setup` prints this plan and asks on a terminal. `y` applies
+it. With more than one agent in the plan you can instead type the numbers of
+the agents to wire (`1 3` or `1,3`); every other step still runs, and an answer
+naming a number outside the plan changes nothing. With no terminal (a script,
+an agent's tool call) it changes nothing and exits non-zero, asking for
+`--yes`. `--plan` prints the plan and exits without changing anything;
+`--plan --json` prints it as a JSON document for a script or front end, with a
+`format` field that is bumped only when a field changes meaning or is removed.
+
+`ai-memory setup --web` shows the same plan as a page in your browser instead
+of the terminal. It prints a one-time address on `127.0.0.1` (and opens it,
+unless `--no-open` or there is no desktop), where you tick the agents to wire
+and press Apply. Apply runs `ai-memory setup --yes --agent <each one you
+picked>` and streams its output to the page, so the result is the same as the
+terminal command; `--no-service` is passed through. The page answers only
+requests that name its own address, carry the secret part of the URL, and,
+for a change, come from the page itself, so another site open in the same
+browser cannot drive it. It holds no token. It stops when you press Finish,
+after 15 minutes without a request, or on Ctrl-C. On a remote machine,
+forward the port it prints (`ssh -L <port>:127.0.0.1:<port> <host>`) and open
+the same address locally. Each step is idempotent: a second run rewrites no
 file and leaves a running service alone. A step that fails does not stop the
-others; `setup` lists each `problem:` at the end and exits non-zero. The token
+others; `setup` lists each `problem:` at the end and exits non-zero. When every step
+passed it ends by naming the agents to restart and the question to ask one of
+them, "What do you remember about this project?": answering it takes a call
+to ai-memory's tools, so the reply shows the wiring works. The token
 is never printed or passed on a command line, and no harness config holds it:
 hooks read the credential files `init` writes, and MCP clients reach the
 server through `ai-memory mcp-bridge`.
@@ -424,8 +485,12 @@ managed Agent Skills are installed or updated alongside it.
 
 If you install into `AGENTS.md` and the project is also used from Claude Code,
 make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
-loads `CLAUDE.md` and does not read `AGENTS.md`, so without that import the
-installed block is absent from context at session start. See
+2.1.277 and later reads `AGENTS.md` only when no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` exists in the working directory or
+any directory above it. Without that import, sessions that read only
+`CLAUDE.md` (older Claude Code, the AGENTS.md plugin disabled, the `claude-md`
+Project instructions setting, or a developer's own `CLAUDE.local.md`) miss the
+installed block at session start. See
 [Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
 
 ---
@@ -501,8 +566,10 @@ Download the `x86_64` or `aarch64` RPM from the
 [latest GitHub release](https://github.com/akitaonrails/ai-memory/releases/latest)
 and install it with `sudo dnf install ./ai-memory-*.rpm`. The package includes
 the binary, hook sources, system and user systemd units, and system service
-configuration. Follow the [user-level service](#user-level-service) or
-[system service](#system-service) steps below to initialize and start it.
+configuration. On a single-user machine, run `ai-memory setup`, as in the
+[one-step native install](#one-step-native-install-installsh--ai-memory-setup).
+For the manual route, follow the [user-level service](#user-level-service) or
+[system service](#system-service) steps below.
 
 ## Arch Linux native packages (AUR)
 
@@ -546,6 +613,14 @@ only one can listen on `127.0.0.1:49374` unless you change `bind` in one config.
 
 Use this on a single-user workstation. It needs no sudo after package install and
 keeps all state in your home directory.
+
+The short route is `ai-memory setup`, which does everything below and wires
+your agents too (see the
+[one-step native install](#one-step-native-install-installsh--ai-memory-setup)).
+It writes its own unit to `~/.config/systemd/user/ai-memory.service`, which
+takes precedence over the packaged one of the same name, with the config at
+`~/.local/share/ai-memory/config.toml`. The manual steps below use the packaged
+unit and its paths instead.
 
 ```bash
 mkdir -p ~/.config/ai-memory ~/.local/share/ai-memory
@@ -658,6 +733,18 @@ bind = "0.0.0.0:49374"
 allowed_hosts = ["homelab", "192.168.0.90", "localhost", "127.0.0.1"]
 ```
 
+`server_url` does not need to be set here. When neither `config.toml` nor
+`AI_MEMORY_SERVER_URL` names one, the thin-client commands derive it from
+`bind`, so a local `ai-memory status` reaches this server rather than the
+default port. An unspecified bind is mapped to loopback (`0.0.0.0` becomes
+`127.0.0.1`, `[::]` becomes `[::1]`). Set `server_url` only when clients
+reach the server at an address it does not bind, such as behind a reverse
+proxy or a tunnel:
+
+```toml
+server_url = "https://memory.example"
+```
+
 ```bash
 # optional: replace the token init wrote
 TOKEN=$(ai-memory generate-auth-token)
@@ -734,6 +821,12 @@ ai-memory auth login oidc-device \
   --issuer "https://issuer.example.com/realms/team" \
   --client-id "ai-memory-cli"
 ```
+
+The issuer, and the device and token endpoints its discovery document lists,
+must use `https`. Plain `http` is accepted only on `localhost`, `127.0.0.1`
+and `::1`, for a local test issuer. Authentication requests do not follow
+redirects, and refresh revalidates the token endpoint stored by older releases
+before sending a refresh token.
 
 The stored OIDC access token is also used by thin-client HTTP commands
 (`status`, `search`, `read-page`, `write-page`, `backup`, `embed`, and
@@ -1095,6 +1188,10 @@ section](../README.md#nixos) (`nixosModules.default`,
 `services.ai-memory.enable`). This section is the maintainer test ladder
 for the flake and module: what CI runs, and what each tier proves.
 
+The package does not bundle `git`: the module adds `pkgs.git` to the
+service's `PATH`, and a package-only install needs `git` installed beside it.
+Do not wrap the binary to supply it (see the README section for why).
+
 ### Maintainer test ladder
 
 1. **Package smoke**: `nix build .#packages.<system>.default` then
@@ -1431,6 +1528,34 @@ checkpoint/prompt sidecars, hidden reasoning, images, and provider metadata,
 and preserves `parentId` on visible events for branch provenance. An unknown
 future transcript version fails closed until its schema is audited. Direct
 `cmd`, `cmdc`, or `command-code` launches remain unchanged.
+
+### IBM Bob
+
+IBM Bob IDE and Bob Shell share their global settings below `~/.bob/settings`.
+Install MCP and lifecycle capture together:
+
+```bash
+ai-memory install-mcp --client ibm-bob --apply \
+    --server-url "https://memory.example/mcp" \
+    --auth-token "$TOKEN"
+ai-memory install-hooks --agent ibm-bob --apply \
+    --server-url "https://memory.example" \
+    --auth-token "$TOKEN"
+```
+
+The `bob` alias is accepted. MCP is merged into `mcp.json` as Bob's native
+`streamable-http` entry with `protocolNegotiation: "legacy"`; this skips Bob's
+non-standard discovery probe and uses the standard MCP handshake. Hooks are
+merged into the root `hooks` object of `settings.json`, preserving other
+settings and handlers. The installer uses only the five events common to the
+IDE and Shell, delivers the pending handoff as plain `SessionStart` context,
+and enforces capture exclusions for tool events.
+
+Bob has no true session-end event. Use `ai-memory finalize-session --agent
+ibm-bob` after the final turn when you need the summary and handoff immediately.
+Managed `ai-memory run ibm-bob` resume is not supported because Bob does not
+document a stable native transcript store. See [the IBM Bob MCP and hook
+details](mcp-install.md#ibm-bob).
 
 ### Kiro CLI
 
@@ -1789,6 +1914,50 @@ project's `.muse/hooks.json` in a trusted workspace; ai-memory does not write
 it, because its commands carry this machine's paths. No managed workstream
 (`ai-memory run muse`) and no transcript backfill from
 `${XDG_DATA_HOME:-~/.local/share}/muse/sessions` are claimed yet.
+
+### CodeBuddy Code
+
+CodeBuddy Code (`codebuddy`), Tencent's coding agent, reads lifecycle hooks
+from the `hooks` key of `~/.codebuddy/settings.json`.
+`install-hooks --agent codebuddy` (alias `code-buddy`) merges ai-memory's
+entries there, keeping your other settings and any hooks you already have
+(#1299):
+
+```bash
+ai-memory install-hooks --agent codebuddy --apply
+```
+
+Without `--apply` the command prints the block to merge by hand, and
+`ai-memory setup-agent --agent codebuddy` prints the same block for a host
+that runs CodeBuddy against a remote server. Running `--apply` again changes
+nothing.
+
+CodeBuddy sends Claude Code-shaped JSON on stdin (`session_id`, `cwd`,
+`tool_name`, `tool_input`, `tool_use_id`, `tool_response`) with Claude Code's
+tool names, so each entry runs the native
+`ai-memory hook --event … --agent codebuddy` command with an empty matcher.
+There is no script bundle; the local spool, bearer auth and
+`[capture] ignore_paths` apply. Seven events are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop` and
+`SessionEnd`.
+
+The `SessionStart` hook delivers the prior session's handoff through
+`hookSpecificOutput.additionalContext`, which CodeBuddy appends to the
+session. With nothing to deliver, the `SessionStart` and `UserPromptSubmit`
+hooks print nothing, since CodeBuddy appends their output too. An interactive
+session can start without a `cwd` in the payload; the hook then uses
+`CODEBUDDY_PROJECT_DIR`, which CodeBuddy sets for its hooks. When neither
+names a directory, the hook still records the event but fetches no handoff,
+because the server cannot tell which project's handoff to claim; the
+handoff stays open for `memory_handoff_list` and `memory_handoff_accept`.
+
+`ai-memory setup` wires CodeBuddy when `~/.codebuddy` exists, and
+`ai-memory uninstall` removes the entries. There is no `install-mcp` client
+for CodeBuddy yet, no transcript backfill, no session close for headless
+`codebuddy -p` runs and no managed workstream. This integration follows
+CodeBuddy's hook documentation and the payloads reported on v2.164 to
+v2.167; the maintainers have not yet run it end to end. Start a new
+CodeBuddy session after installing so it loads the hooks.
 
 ### Hermes Agent (Nous Research)
 
@@ -2802,8 +2971,9 @@ sends Chat Completions `reasoning_effort` (clamped to `low`/`medium`/`high`/
 OpenAI-style `reasoning_effort`. Anthropic and Anthropic-OAuth map the same
 key to `output_config.effort` and adaptive/disabled thinking on models that
 accept those fields (Haiku 4.5 omits them because it rejects them, while Haiku
-5.5 receives them; Fable 5 / Mythos 5 / Mythos Preview omit
-`thinking: disabled` because those models reject it). `ultra` and `persistent` clamp to `max` on OpenAI-style
+5.5 receives them; Fable 5 / Mythos 5 / Mythos Preview / Opus 5.5 omit
+`thinking: disabled` because those models reject it, and Sonnet 5.5, which
+rejects it too, receives `thinking: between_tools` for `none`). `ultra` and `persistent` clamp to `max` on OpenAI-style
 hosts. Gemini and Copilot ignore the key.
 
 [Atlas Cloud](https://www.atlascloud.ai/models/qwen/qwen3.5-flash) uses the
@@ -2969,6 +3139,22 @@ at the default `input_token_safety_margin` of 0.8 -- and rejects output limits
 below 1,000, because the batch schema and a useful response cannot fit reliably
 below those floors. Lowering the safety margin shrinks the character budget, so
 a smaller margin needs a proportionally larger `max_input_tokens`.
+
+Long sessions can omit observations or truncate an individual body before the
+request reaches the model. To add a bounded set of literal error lines, paths,
+URLs, status codes and versions from that missing text, opt in with:
+
+```toml
+[consolidation]
+verbatim_residue = true
+```
+
+or `AI_MEMORY_CONSOLIDATION__VERBATIM_RESIDUE=true`. The default is false.
+Enabling it widens the subset of already-sanitized captured text sent to the
+configured LLM provider; it does not append anything directly to a wiki page.
+The block is capped, marked as untrusted observation data, and the provider's
+reply still passes through the existing structured-output and wiki-write
+boundaries.
 
 ---
 

@@ -12,3 +12,10 @@ test('only proven same local login is deduplicated; paid credentials stay separa
  assert.equal(mergeAccountSnapshots([provider],[{...row,credentialId:'other-account'}],local).length,2);
  assert.equal(mergeAccountSnapshots([provider],[{...row,meters:[]}],local).length,2);
 });
+
+test('Grok product usage is a share of the pool, not a remaining quota',()=>{
+ const [snapshot]=localQuotaSnapshots({grok:{configured:true,primary_window:{used_percent:20},products:[{product:'GrokBot',label:'Grok Bot',window:{used_percent:12}}]}});
+ assert.equal(snapshot.status,'ok');
+ const share=snapshot.meters.find(m=>m.id==='product_GrokBot');
+ assert.equal(share.used,12);assert.equal(share.remaining,undefined);assert.equal(share.displayMode,'used-share');
+});

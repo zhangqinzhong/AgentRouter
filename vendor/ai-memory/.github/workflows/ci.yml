@@ -45,6 +45,21 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  management-ui:
+    name: optional server-rendered management console
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - run: cargo clippy --workspace --all-targets --features ai-memory-cli/management-ui -- -D warnings
+      - run: cargo test -p ai-memory-mcp --features management-ui management
+      - run: cargo test -p ai-memory-store owned_session_purge
+      - run: cargo test -p ai-memory-web --features management-ui management
+      - run: cargo test -p ai-memory-cli --features management-ui --lib management_ui
+
   test:
     name: test (${{ matrix.os }})
     strategy:
@@ -399,6 +414,8 @@ jobs:
       - run: scripts/check-changelog-sections.sh
       - name: released sections stay frozen
         run: scripts/check-changelog-frozen.sh "origin/${{ github.base_ref || github.event.repository.default_branch }}"
+      - name: released database migrations stay frozen
+        run: scripts/check-migrations-immutable.sh "origin/${{ github.base_ref || github.event.repository.default_branch }}"
 
   # End-to-end docker smoke: packages the release-build binary and confirms
   # the image runs. Catches Dockerfile drift (missing COPY, bad ENTRYPOINT)

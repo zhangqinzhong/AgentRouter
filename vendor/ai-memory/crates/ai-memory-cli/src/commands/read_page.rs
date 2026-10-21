@@ -28,6 +28,10 @@ struct PageContent {
     title: Option<String>,
     body: String,
     frontmatter: serde_json::Value,
+    /// Set by the server when the page's `expires_at` TTL has passed: the
+    /// exact-path read still answers, while `search` no longer lists the page.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
 }
 
 /// Run the `read-page` subcommand.
@@ -69,15 +73,65 @@ pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&page)?);
     } else {
-        if let Some(ref title) = page.title {
-            println!("# {title}");
-        }
-        println!("path: {}", page.path);
-        println!();
-        print!("{}", page.body);
-        if !page.body.ends_with('\n') {
-            println!();
-        }
+        print!("{}", render_text(&page));
     }
     Ok(())
+}
+
+fn render_text(page: &PageContent) -> String {
+    let mut out = String::new();
+    if let Some(title) = &page.title {
+        out.push_str(&format!("# {title}\n"));
+    }
+    out.push_str(&format!("path: {}\n", page.path));
+    if page.expired {
+        out.push_str("expired: true\n");
+    }
+    out.push('\n');
+    out.push_str(&page.body);
+    if !page.body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(expired: bool) -> PageContent {
+        PageContent {
+            path: "notes/example.md".into(),
+            workspace: "default".into(),
+            project: "app".into(),
+            title: Some("Example".into()),
+            body: "body".into(),
+            frontmatter: serde_json::json!({}),
+            expired,
+        }
+    }
+
+    #[test]
+    fn text_output_marks_only_expired_pages() {
+        assert_eq!(
+            render_text(&page(false)),
+            "# Example\npath: notes/example.md\n\nbody\n"
+        );
+        assert_eq!(
+            render_text(&page(true)),
+            "# Example\npath: notes/example.md\nexpired: true\n\nbody\n"
+        );
+    }
+
+    #[test]
+    fn older_server_response_defaults_to_live() {
+        let parsed: PageContent = serde_json::from_value(serde_json::json!({
+            "path": "notes/example.md",
+            "title": null,
+            "body": "body\n",
+            "frontmatter": {}
+        }))
+        .unwrap();
+        assert!(!parsed.expired);
+    }
 }

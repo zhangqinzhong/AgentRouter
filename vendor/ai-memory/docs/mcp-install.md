@@ -23,8 +23,9 @@ Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
 > other client gets a local stdio entry, in its own format, that runs
 > `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
 > the token file at launch and forwards no session id, so the client passes
-> `workspace` and `project` like any static client. The client must find
-> `ai-memory` on its `PATH` (GUI apps may need the full path). ZCode keeps
+> `workspace` and `project` like any static client. Stdio entries name the
+> `ai-memory` binary by its absolute path, so the client does not need it on
+> its `PATH`; the Docker wrapper keeps the bare `ai-memory`. ZCode keeps
 > HTTP entries only and is refused. Passing `--auth-token` explicitly (or
 > `AI_MEMORY_AUTH_TOKEN`) keeps the HTTP snippets below, header included.
 
@@ -201,7 +202,8 @@ sessions through that entry. Opt into ai-memory's local stdio bridge instead:
 ai-memory install-mcp --client claude-code --session-aware --apply
 ```
 
-The generated entry runs `ai-memory mcp-bridge`, connects to the same configured
+The generated entry runs `ai-memory mcp-bridge`, naming the binary by its
+absolute path, connects to the same configured
 local or remote `/mcp` endpoint, preserves bearer authentication, and adds
 `X-Memory-Actor-Session-Id: <CLAUDE_CODE_SESSION_ID>` to every upstream request.
 It supports ai-memory's default stateless HTTP mode and opt-in stateful mode.
@@ -532,7 +534,7 @@ id as the actor session:
   "mcpServers": {
     "ai-memory": {
       "type": "stdio",
-      "command": "ai-memory",
+      "command": "/home/you/.local/bin/ai-memory",
       "args": ["mcp-bridge", "--agent", "muse",
                "--server-url", "http://127.0.0.1:49374/mcp",
                "--data-dir", "/home/you/.local/share/ai-memory"],
@@ -1311,8 +1313,8 @@ stdout but prepends successful user-prompt hook output to the turn).
 
 ## Command Code
 
-**Status:** MCP and the four stable shell-hook events are supported. Managed
-workstreams and experimental Mods are not installed.
+**Status:** MCP, the four stable shell-hook events, and opt-in managed
+workstreams are supported. Experimental Mods are not installed.
 
 **Config files:** `~/.commandcode/mcp.json` for MCP and
 `~/.commandcode/settings.json` for lifecycle hooks.
@@ -1349,19 +1351,67 @@ envelope, and inject pending handoffs with
 
 `Stop` is only a turn boundary. Run `ai-memory finalize-session --agent
 command-code` after the final turn (or add `--session-id <uuid>` when several
-sessions share the project). ai-memory does not generate a Mod: that API is
-experimental and unsandboxed. Command Code officially documents its
-project-scoped append-only JSONL location, native resume selectors, `--yolo`,
-and Windows aliases, but not the JSONL record schema. A managed adapter remains
-deferred until a real logged-in client acceptance test supplies sanitized
-structural fixtures and validates checkout ownership, incremental visible-event
-import, resume identity, normal-exit finalization, and native Windows execution.
+sessions share the project). A managed `ai-memory run command-code` launch
+finalizes automatically on normal exit when it can tie the native session to
+the run. Its read-only adapter validates the observed v3 header, UUID filename,
+and canonical checkout before importing visible events, and resumes with the
+exact native `--session <uuid>` selector. Unknown transcript versions fail
+closed. ai-memory does not generate a Mod: that API is experimental and
+unsandboxed.
 
 Sources: <https://commandcode.ai/docs/mcp>,
 <https://commandcode.ai/docs/hooks>,
 <https://commandcode.ai/docs/mods>, and
 <https://commandcode.ai/docs/reference/cli>, plus the native-session contract at
 <https://commandcode.ai/docs/sessions>.
+
+## IBM Bob
+
+**Status:** MCP and lifecycle hooks are supported for IBM Bob IDE and Bob
+Shell. Managed workstreams and transcript backfill are not claimed.
+
+**Config files:** `~/.bob/settings/mcp.json` for MCP and
+`~/.bob/settings/settings.json` for lifecycle hooks. Bob also accepts a
+project-level `.bob/mcp.json`; pass that path with `--config-file` when wanted.
+
+```bash
+ai-memory install-mcp --client ibm-bob --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent ibm-bob --apply \
+    --server-url "https://memory.example" --auth-token "$TOKEN"
+```
+
+The alias `bob` is accepted by both commands. The MCP entry uses Bob's native
+`streamable-http` transport with `protocolNegotiation: "legacy"`. Bob's
+automatic negotiation first sends a non-standard `server/discover` request;
+the documented legacy setting skips that probe and starts with the standard
+MCP initialization ai-memory implements. Existing servers and settings are
+preserved, and applying either command again is a no-op.
+
+The hook installer registers the five events shared by Bob IDE and Bob Shell:
+`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`.
+Definitions omit `matcher`, which Bob documents only for tool events. The
+native command receives Bob's JSON on stdin, enforces capture exclusions over
+the Claude-shaped tool fields, and prints a pending handoff as plain
+`SessionStart` context. Capture-only `SessionStart` and `UserPromptSubmit`
+events stay silent so `{}` is never injected into the model context.
+
+Bob does not expose a true `SessionEnd`; `Stop` is a turn boundary. After the
+last turn, finalize explicitly when an immediate summary and handoff matter:
+
+```bash
+ai-memory finalize-session --agent ibm-bob
+```
+
+There is no `ai-memory run ibm-bob` adapter. Bob Shell documents resume
+selectors but not a stable transcript-store schema and path, so claiming
+cross-harness transcript import would be unsafe without fixtures and a logged-in
+acceptance test. Bob reads `AGENTS.md`, so the normal ai-memory routing snippet
+and Agent Skills need no Bob-specific instruction file.
+
+Sources: [Bob MCP configuration](https://bob.ibm.com/docs/ide/configuration/mcp/mcp-in-bob),
+[Bob IDE lifecycle hooks](https://bob.ibm.com/docs/ide/configuration/lifecycle-hooks),
+and [Bob Shell lifecycle hooks](https://bob.ibm.com/docs/shell/configuration/lifecycle-hooks).
 
 ## Kiro CLI
 

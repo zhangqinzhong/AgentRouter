@@ -34,7 +34,27 @@ pub(crate) async fn handler(
         tracing::error!(%error, "web health read failed");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     };
-    let derived = match state.reader.derived_index_status().await {
+    // The configured embedder's stored-vector triple, read once so the
+    // missing-vector count and the "embedder" row below both match the
+    // identity rows are stored under (`model_identity`, not the wire
+    // model name). With no embedder the historical "no vector at all"
+    // count is kept. The count takes a clone: the row keeps the original.
+    let configured_embedding = state.recall.embedder.as_deref().map(|embedder| {
+        (
+            embedder.provider().to_owned(),
+            embedder.model_identity(),
+            embedder.dim(),
+        )
+    });
+    let derived = match match configured_embedding.clone() {
+        Some(identity) => {
+            state
+                .reader
+                .derived_index_status_for_embedding(identity)
+                .await
+        }
+        None => state.reader.derived_index_status().await,
+    } {
         Ok(derived) => derived,
         Err(error) => return internal(error),
     };
@@ -71,15 +91,11 @@ pub(crate) async fn handler(
         derived,
         storage,
         consolidation,
-        embedder: state
-            .recall
-            .embedder
-            .as_ref()
-            .map(|embedder| EmbedderIdentity {
-                provider: embedder.provider().to_owned(),
-                model: embedder.model_identity(),
-                dim: embedder.dim(),
-            }),
+        embedder: configured_embedding.map(|(provider, model, dim)| EmbedderIdentity {
+            provider,
+            model,
+            dim,
+        }),
     };
     let view = HealthView {
         wired: state.health.is_some(),

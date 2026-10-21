@@ -524,10 +524,14 @@ because your host already trusts that root; the container does not.
 **Notes.**
 - Point `SSL_CERT_FILE` at the *combined* bundle, never at the interception
   root alone; that would drop every public root and break all other TLS.
-- Native (non-Docker) installs: on Linux, install the root system-wide
-  (`update-ca-certificates` / `trust anchor`) or set `SSL_CERT_FILE`; on
-  Windows the client reads the schannel store, so import the root there
-  instead (`SSL_CERT_FILE` does not apply).
+- Native (non-Docker) installs: install the root into the OS trust store (the
+  commands in Path 2's trust-install table work for any root), or set
+  `SSL_CERT_FILE` / `SSL_CERT_DIR`. The client honors both on every OS,
+  Windows and macOS included, and they replace the OS store there too, so the
+  combined-bundle rule above still applies.
+- `ai-memory mcp-bridge` is the exception: on Windows and macOS it ignores
+  `SSL_CERT_FILE` / `SSL_CERT_DIR`, so a root the bridge must trust has to be
+  in the OS store. See the bridge section below.
 
 ## What ai-memory does to support being behind a proxy
 
@@ -576,3 +580,7 @@ not needed.
 The bridge uses the platform certificate verifier, so it trusts the same roots the
 operating system does. A certificate the OS does not trust (a self-signed one, or a
 private CA that has not been installed into the system trust store) is rejected.
+On Windows and macOS the bridge asks the OS directly and ignores `SSL_CERT_FILE`
+/ `SSL_CERT_DIR`; on Linux it honors them, as the main client does everywhere. A
+root supplied only through `SSL_CERT_FILE` therefore reaches provider calls and
+the `ai-memory` CLI on Windows and macOS, but not the bridge.

@@ -1,7 +1,7 @@
 //! Integration tests for ai-memory routing instructions.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use ai_memory_core::routing_skills::MANAGED_MARKER;
@@ -476,4 +476,170 @@ fn devin_install_instructions_writes_project_devin_skills() {
     assert!(skill_content.contains(MANAGED_MARKER));
     assert!(!project.path().join(".claude/skills").exists());
     assert!(!project.path().join(".agents/skills").exists());
+}
+
+/// The first Claude Code instruction file above where `tempfile` puts a
+/// project. Probing a real temp dir follows `TMPDIR` the way the tests do.
+fn claude_file_above_temp_dir() -> Option<PathBuf> {
+    let probe = tempfile::tempdir().ok()?;
+    let probe = fs::canonicalize(probe.path()).ok()?;
+    probe.parent()?.ancestors().find_map(|dir| {
+        ["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"]
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.is_file())
+    })
+}
+
+/// The file named by the skip note (`note: <path> exists, so Claude Code ...`).
+fn noted_file(stderr: &str) -> Option<PathBuf> {
+    stderr.lines().find_map(|line| {
+        let (path, _) = line
+            .strip_prefix("note: ")?
+            .split_once(" exists, so Claude Code reads it")?;
+        Some(PathBuf::from(path))
+    })
+}
+
+/// #1297: with only `AGENTS.md` written, a `CLAUDE.local.md` or
+/// `.claude/CLAUDE.md` makes Claude Code read that instead, so the install
+/// says so. Controls: `AGENTS.md` alone, a `CLAUDE.md` target alongside, and a
+/// shadowing file that already imports `@AGENTS.md` print no note.
+#[test]
+fn install_instructions_warns_when_claude_code_will_skip_agents_md() {
+    let note = "so Claude Code reads it instead of AGENTS.md";
+    let run_in = |files: &[(&str, &str)]| {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("AGENTS.md"), "# Project\n").unwrap();
+        for (name, text) in files {
+            let path = project.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let output = run_ai_memory(
+            project.path(),
+            home.path(),
+            &["install-instructions", "--no-skills"],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_success(output);
+        let agents = fs::read_to_string(project.path().join("AGENTS.md")).unwrap();
+        assert!(agents.contains(MARKER_START), "AGENTS.md gets the block");
+        (stderr, project)
+    };
+    let run = |files: &[(&str, &str)]| run_in(files).0;
+    for shadow in ["CLAUDE.local.md", ".claude/CLAUDE.md"] {
+        let (stderr, project) = run_in(&[(shadow, "# mine\n")]);
+        // A Claude file above the temp dir also ends in `shadow`, so compare
+        // the file the note names, not a substring (#1346).
+        let named = noted_file(&stderr).and_then(|path| fs::canonicalize(path).ok());
+        let expected = fs::canonicalize(project.path().join(shadow)).unwrap();
+        assert_eq!(named, Some(expected), "{shadow}: {stderr}");
+    }
+    // #1346: the binary checks every ancestor of the cwd, so a Claude file
+    // above the OS temp dir prints the note for any temp project. On Windows
+    // %TEMP% sits inside the real home, next to a user's ~/.claude/CLAUDE.md.
+    if let Some(path) = claude_file_above_temp_dir() {
+        eprintln!(
+            "skipping no-note controls: {} sits above the temp dir",
+            path.display()
+        );
+        return;
+    }
+    assert!(!run(&[]).contains(note));
+    assert!(!run(&[("CLAUDE.local.md", "@AGENTS.md\n")]).contains(note));
+    // A CLAUDE.md alongside becomes a target too, so Claude Code sees the block.
+    assert!(!run(&[("CLAUDE.md", "# claude\n")]).contains(note));
+}
+
+const MEMORY_FILES: [&str; 3] = ["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"];
+
+/// Whether any ancestor strictly above `dir` holds one of the memory files the
+/// binary scans for. A temp-dir `home` on a developer box usually sits under a
+/// real user profile that may itself carry `CLAUDE.md` / `.claude/CLAUDE.md`,
+/// which would pollute the "no note" controls (see #1346). When that is the
+/// case, skip the negative assertion instead of failing spuriously.
+fn ancestor_above_has_memory_file(dir: &Path) -> bool {
+    dir.parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .any(|ancestor| {
+            MEMORY_FILES
+                .iter()
+                .any(|name| ancestor.join(name).is_file())
+        })
+}
+
+/// #1345: with the project under `$HOME` and `$HOME/.claude/CLAUDE.md` present,
+/// the file is the user's own memory, not a project blocker, so no note should
+/// be printed. This also guards the `HOME` wiring: passing `None` would make the
+/// ancestor walk treat the home `.claude/CLAUDE.md` as a blocker and print the
+/// note.
+#[test]
+fn install_instructions_no_note_when_project_under_home() {
+    let note = "so Claude Code reads it instead of AGENTS.md";
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("AGENTS.md"), "# Project\n").unwrap();
+    fs::create_dir_all(home.path().join(".claude")).unwrap();
+    fs::write(home.path().join(".claude/CLAUDE.md"), "# user memory\n").unwrap();
+
+    let output = run_ai_memory(
+        &project,
+        home.path(),
+        &["install-instructions", "--no-skills"],
+    );
+    assert_success(output.clone());
+    if ancestor_above_has_memory_file(home.path()) {
+        eprintln!("skipping no-note control: an ancestor of the temp home holds a memory file");
+        return;
+    }
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(note),
+        "home .claude/CLAUDE.md must not trigger the note:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #1345: with `$HOME` given through a symlink, the ancestor walk resolves the
+/// physical home path while `HOME` is the symlink, so a plain `==` comparison
+/// misfires. The note must stay suppressed in that case too.
+#[cfg(unix)]
+#[test]
+fn install_instructions_no_note_when_home_is_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let note = "so Claude Code reads it instead of AGENTS.md";
+    let real_home = tempfile::tempdir().unwrap();
+    let project = real_home.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("AGENTS.md"), "# Project\n").unwrap();
+    fs::create_dir_all(real_home.path().join(".claude")).unwrap();
+    fs::write(
+        real_home.path().join(".claude/CLAUDE.md"),
+        "# user memory\n",
+    )
+    .unwrap();
+
+    let link_parent = tempfile::tempdir().unwrap();
+    let home_link = link_parent.path().join("homelink");
+    symlink(real_home.path(), &home_link).unwrap();
+
+    let output = run_ai_memory(
+        &project,
+        &home_link,
+        &["install-instructions", "--no-skills"],
+    );
+    assert_success(output.clone());
+    if ancestor_above_has_memory_file(real_home.path()) {
+        eprintln!("skipping no-note control: an ancestor of the temp home holds a memory file");
+        return;
+    }
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(note),
+        "symlinked HOME must not trigger the note:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

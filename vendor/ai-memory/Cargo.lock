@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -58,6 +58,7 @@ dependencies = [
  "jiff",
  "jsonc-parser",
  "libc",
+ "parking_lot",
  "reqwest 0.12.28",
  "rmcp",
  "rstest",
@@ -68,6 +69,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2",
+ "subtle",
  "sysinfo",
  "tar",
  "tempfile",
@@ -80,12 +82,13 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows-registry",
  "zip",
 ]
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -112,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "icu_normalizer",
  "jiff",
@@ -128,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -152,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -179,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -208,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -244,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -270,11 +273,11 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.0.0"
+version = "3.1.2"
 
 [[package]]
 name = "ai-memory-web"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -301,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -333,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.0.0"
+version = "3.1.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -467,12 +470,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19fe8d6cb13c4714962c072ea496f3392015f0989b1a2847bb4b2d9effd71d83"
 dependencies = [
  "askama_parser",
- "basic-toml",
  "mime",
  "mime_guess",
  "proc-macro2",
  "quote",
- "serde",
  "syn 2.0.117",
 ]
 
@@ -602,15 +603,6 @@ name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
-
-[[package]]
-name = "basic-toml"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "bit-set"
@@ -803,7 +795,7 @@ dependencies = [
  "iana-time-zone",
  "num-traits",
  "serde",
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -2231,7 +2223,7 @@ dependencies = [
  "simd_cesu8",
  "thiserror 2.0.18",
  "walkdir",
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -2719,7 +2711,7 @@ dependencies = [
  "libc",
  "redox_syscall",
  "smallvec",
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -3435,9 +3427,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -4794,7 +4786,7 @@ checksum = "d2ed2439a290666cd67ecce2b0ffaad89c2a56b976b736e6ece670297897832d"
 dependencies = [
  "windows-implement",
  "windows-interface",
- "windows-result",
+ "windows-result 0.1.2",
  "windows-targets 0.52.6",
 ]
 
@@ -4827,12 +4819,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
+name = "windows-link"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b39de7c7fe78858b0144c50c3fc000bab3be17d5e9b85b1053871693c7f7415"
+
+[[package]]
+name = "windows-registry"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a14b75dbbc0f2bb1ebbf6dcb6dc0035ae17f10ec280045d10fa27ad8874903b2"
+dependencies = [
+ "windows-link 0.100.0",
+ "windows-result 0.100.0",
+ "windows-strings",
+]
+
+[[package]]
 name = "windows-result"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e383302e8ec8515204254685643de10811af0ed97ea37210dc26fb0032647f8"
 dependencies = [
  "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-result"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44873a1ef61c85d5e2991db91fe656cfcf0731097e00dff1ac860f1cb3b752a0"
+dependencies = [
+ "windows-link 0.100.0",
+]
+
+[[package]]
+name = "windows-strings"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a70b590c684f1d2854f74999896f7c0558f1bdde62f599088599e20ea1d2f60"
+dependencies = [
+ "windows-link 0.100.0",
 ]
 
 [[package]]
@@ -4868,7 +4895,7 @@ version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -4908,7 +4935,7 @@ version = "0.53.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
 dependencies = [
- "windows-link",
+ "windows-link 0.2.1",
  "windows_aarch64_gnullvm 0.53.1",
  "windows_aarch64_msvc 0.53.1",
  "windows_i686_gnu 0.53.1",
@@ -5326,8 +5353,7 @@ dependencies = [
 [[package]]
 name = "zip"
 version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+source = "git+https://github.com/zip-rs/zip2?rev=771dfc534d2614158af5497ea3dff4d4208d7db1#771dfc534d2614158af5497ea3dff4d4208d7db1"
 dependencies = [
  "crc32fast",
  "flate2",

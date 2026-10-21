@@ -59,6 +59,15 @@ plain_tree "${TMP_ROOT}/plain-tree"
 base="$(publish plain "${TMP_ROOT}/plain-tree")"
 run_install plain "file://${base}" || fail "plain release refused: $(cat "${TMP_ROOT}/plain/out.log")"
 [ -x "${TMP_ROOT}/plain/home/.local/lib/ai-memory/ai-memory" ] || fail "plain release not unpacked"
+# The test PATH lacks ~/.local/bin, so the next step names the link by its full
+# path; with the bin dir on PATH it is the bare command.
+grep -Fq "next: ${TMP_ROOT}/plain/home/.local/bin/ai-memory setup" "${TMP_ROOT}/plain/out.log" \
+  || fail "off-PATH next step not absolute: $(cat "${TMP_ROOT}/plain/out.log")"
+base_on_path="$(publish on-path "${TMP_ROOT}/plain-tree")"
+run_install on-path "file://${base_on_path}" PATH="${TMP_ROOT}/on-path/home/.local/bin:${PATH}" \
+  || fail "on-PATH install refused: $(cat "${TMP_ROOT}/on-path/out.log")"
+grep -Fxq "next: ai-memory setup" <(sed 's/^[^:]*: //' "${TMP_ROOT}/on-path/out.log") \
+  || fail "on-PATH next step not the bare command: $(cat "${TMP_ROOT}/on-path/out.log")"
 
 # A symlink member pointing outside the tree is refused, and nothing lands.
 plain_tree "${TMP_ROOT}/symlink-tree"

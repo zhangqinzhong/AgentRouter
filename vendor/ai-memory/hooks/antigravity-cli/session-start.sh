@@ -17,6 +17,16 @@ QS=$(ai_memory_marker_qs "$CWD")
 # The `[briefing]` opt-in rides the handoff GET, as in the native hook.
 BRIEF_QS=$(ai_memory_briefing_qs "$CWD")
 SESSION_ID=$(ai_memory_extract_session_id "$PAYLOAD")
+# invocationNum restarts at 0 on every user turn: only a conversation's first
+# turn may post session-start and claim a handoff.
+if [ -n "$SESSION_ID" ]; then
+    START_MARKER=$(ai_memory_briefed_file "agy-start-$SESSION_ID")
+    if [ -e "$START_MARKER" ]; then
+        printf '{}\n'
+        exit 0
+    fi
+    ai_memory_mark_briefed "$START_MARKER"
+fi
 SESSION_QS=""
 if [ -n "$SESSION_ID" ]; then
     SESSION_QS="&session_id=$(ai_memory_url_encode "$SESSION_ID")"

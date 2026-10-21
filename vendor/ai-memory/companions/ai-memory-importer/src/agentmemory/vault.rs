@@ -22,7 +22,7 @@ use super::{
     validate_id, validate_planned_path,
 };
 use crate::{
-    DEFAULT_SERVER_URL, ImportClient, YamlMap, sha256_hex, sha256_parts, slugify,
+    DEFAULT_SERVER_URL, ImportClient, YamlMap, first_h1_line, sha256_hex, sha256_parts, slugify,
     split_frontmatter, validate_label, validate_source_rel, yaml_string,
 };
 
@@ -283,9 +283,7 @@ pub(crate) fn plan(dir: &Path, destination: &Destination, prefix: &str) -> Resul
             links.get(target.trim_end_matches(".md")).cloned()
         });
         let body = ai_memory_client::sanitize_external_text(&linked);
-        let title = body
-            .lines()
-            .find_map(|line| line.strip_prefix("# "))
+        let title = first_h1_line(&body)
             .map(|title| one_line(title, MAX_EXPLICIT_TITLE_CHARS))
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| one_line(&page.id, MAX_EXPLICIT_TITLE_CHARS));

@@ -79,14 +79,15 @@ jobs:
   # Windows jobs auto-run on those PRs without a human remembering the label.
   # It runs on every event (a cheap Linux job) so the `needs:` edge below is
   # always satisfied; the filter step only fires on `pull_request`, where its
-  # `platform` output drives the gate. On schedule / manual dispatch the output
-  # is empty and unused, because those jobs' `if:` short-circuits on
+  # path outputs drive the gates. On schedule / manual dispatch the outputs
+  # are empty and unused, because those jobs' `if:` short-circuits on
   # `github.event_name != 'pull_request'`.
   changes:
     name: detect platform-sensitive changes
     runs-on: ubuntu-latest
     outputs:
       platform: ${{ steps.filter.outputs.platform }}
+      wikisync: ${{ steps.filter.outputs.wikisync }}
     steps:
       # For `pull_request` events this action reads the changed-file list from
       # the GitHub API, so no checkout is needed. Pinned to a full commit SHA
@@ -103,9 +104,40 @@ jobs:
               - 'crates/ai-memory-store/**'
               - 'crates/ai-memory-hooks/**'
               - 'crates/ai-memory-cli/src/commands/install_hooks.rs'
+              - 'crates/ai-memory-cli/src/commands/render_shared.rs'
+              - 'crates/ai-memory-cli/src/commands/service_host.rs'
+              - 'crates/ai-memory-cli/src/commands/user_service.rs'
               - 'hooks/**'
               - 'tests/hooks/**'
+              - 'install.ps1'
+              - 'tests/install_ps1.ps1'
               - '.github/workflows/windows.yml'
+            wikisync:
+              - 'companions/ai-memory-wikisync/**'
+              - '.github/workflows/windows.yml'
+
+  # This companion has its own Cargo workspace. Its path changes run native
+  # Windows checks without also starting the root workspace or hook suite.
+  wikisync:
+    name: wiki sync companion (windows-latest)
+    needs: changes
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'windows') ||
+      contains(github.event.pull_request.labels.*.name, 'full-ci') ||
+      needs.changes.outputs.wikisync == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: companions/ai-memory-wikisync
+      - run: cargo fmt --check --manifest-path companions/ai-memory-wikisync/Cargo.toml
+      - run: cargo clippy --locked --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path companions/ai-memory-wikisync/Cargo.toml
 
   test:
     name: test (windows-latest)
@@ -123,6 +155,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo test --workspace --all-targets
+      - name: install.ps1 against local releases
+        run: pwsh -NoProfile -File tests/install_ps1.ps1 -Binary target/debug/ai-memory.exe
       - name: Check the external lifecycle relay
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target

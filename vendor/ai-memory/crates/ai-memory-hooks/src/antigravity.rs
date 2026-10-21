@@ -100,18 +100,38 @@ pub fn read_step_output(output_path: &Path, max_bytes: usize) -> Option<String> 
         return None;
     }
 
-    let text = match std::str::from_utf8(&buffer) {
-        Ok(valid) => valid,
-        Err(err) => {
-            let valid = &buffer[..err.valid_up_to()];
-            std::str::from_utf8(valid).unwrap_or_default()
-        }
-    };
+    let text = decode_step_output(&buffer);
     let trimmed = text.trim_end();
     if trimmed.trim().is_empty() {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// Decode step output read under a byte cap. A code point the cap cut in
+/// half at the end is dropped; any other invalid byte (a legacy code page
+/// such as cp1252, or binary output) becomes U+FFFD, so the text after it is
+/// kept instead of being discarded with it.
+fn decode_step_output(buffer: &[u8]) -> String {
+    let mut out = String::with_capacity(buffer.len());
+    let mut rest = buffer;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.push_str(valid);
+                return out;
+            }
+            Err(err) => {
+                let (valid, after) = rest.split_at(err.valid_up_to());
+                out.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                let Some(invalid_len) = err.error_len() else {
+                    return out;
+                };
+                out.push(char::REPLACEMENT_CHARACTER);
+                rest = &after[invalid_len..];
+            }
+        }
     }
 }
 
@@ -299,6 +319,36 @@ mod tests {
 
         let read = read_step_output(&file_path, 5);
         assert_eq!(read, Some("abc".to_string()));
+    }
+
+    /// Output that is not valid UTF-8 (cp1252 text from a Windows command,
+    /// or binary data) must not lose everything after the first bad byte,
+    /// nor all of it when the bad byte comes first.
+    #[test]
+    fn test_read_step_output_keeps_text_around_invalid_utf8() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("output.txt");
+
+        fs::write(&file_path, b"ok\n\xff tail").unwrap();
+        assert_eq!(
+            read_step_output(&file_path, 1024),
+            Some("ok\n\u{FFFD} tail".to_string())
+        );
+
+        fs::write(&file_path, b"\xe9chec: build failed").unwrap();
+        assert_eq!(
+            read_step_output(&file_path, 1024),
+            Some("\u{FFFD}chec: build failed".to_string())
+        );
+
+        // An invalid byte and a code point cut by the cap in one read.
+        let mut bytes = b"a\xffb".to_vec();
+        bytes.extend_from_slice("🦀".as_bytes());
+        fs::write(&file_path, &bytes).unwrap();
+        assert_eq!(
+            read_step_output(&file_path, 5),
+            Some("a\u{FFFD}b".to_string())
+        );
     }
 
     #[test]

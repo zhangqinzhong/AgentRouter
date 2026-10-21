@@ -106,6 +106,14 @@ pub struct ActorContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorizedViewer(pub crate::UserId);
 
+/// Marks a request that authenticated with the legacy browser credential: the
+/// root bearer sent as HTTP Basic, or an `ai_memory_auth` cookie an older build
+/// set. That path exists only until human auth is set up and admits GET only,
+/// so a page served through it can tell the viewer that a change it would post
+/// cannot succeed, instead of offering a control that always fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyBrowserAuth;
+
 impl AuthorizedViewer {
     /// The user id inside.
     #[must_use]

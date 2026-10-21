@@ -484,6 +484,7 @@ async fn prepare_run(
             resolved_agent: Some(prepared.agent),
             native_session_id: prepared.native_session_id,
             source_cursor: prepared.source_cursor,
+            previous_native_session: prepared.previous_native_session,
             sync_after: prepared.sync_after,
             sync_through: prepared.sync_through,
             may_adopt_existing_session: prepared.may_adopt_existing_session,
@@ -626,6 +627,7 @@ async fn run_context(
         &context.workstream_name,
         context.workstream_id,
         context.sync_after,
+        context.previous_native_session.as_ref(),
     );
     Json(ManagedRunContextResponse { context: rendered }).into_response()
 }

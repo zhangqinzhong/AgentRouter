@@ -103,7 +103,17 @@ pub enum PolicyState {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExtractionState {
-    /// Tool does not require path extraction.
+    /// No path extraction applied to this event. Two cases produce it:
+    ///
+    /// - An active policy met a search/list tool ([`ToolFamily::SearchList`]).
+    ///   The policy drops it whatever its arguments say, so no path is
+    ///   extracted or counted. Under an inactive or invalid policy the same
+    ///   tool reports [`Self::Extracted`]: the state depends on the policy,
+    ///   not only on the tool.
+    /// - `ai-memory hook --check-capture` evaluated no policy at all, because
+    ///   the event is not a tool event or no working directory was found. The
+    ///   report then pairs it with `policy_state: inactive` and
+    ///   `tool_family: unknown`.
     NotApplicable,
     /// Direct fields were extracted successfully.
     Extracted,
@@ -181,6 +191,7 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // `tool_name`/`tool_input`/`tool_use_id` (captured live, Cursor 3.24.9).
         // Meta Muse Code sends the same three fields, `tool_use_id` being the
         // provider's call id (`call_…`, captured offline on Muse Code 1.4.7).
+        // CodeBuddy Code sends the same Claude Code fields (#1299).
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
@@ -189,7 +200,9 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::Grizzybot
         | AgentKind::Zcode
         | AgentKind::CopilotCli
-        | AgentKind::Muse => (
+        | AgentKind::Muse
+        | AgentKind::CodeBuddy
+        | AgentKind::IbmBob => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -261,6 +274,8 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Grizzybot
                             | AgentKind::Droid
                             | AgentKind::Muse
+                            | AgentKind::CodeBuddy
+                            | AgentKind::IbmBob
                     ) {
                         "tool_input"
                     } else {
@@ -1103,7 +1118,11 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // Factory Droid's hooks send the same Claude Code shape (#1240).
         | AgentKind::Droid
         // Meta Muse Code too, with its own tool names (Muse Code 1.4.7).
-        | AgentKind::Muse => object
+        // CodeBuddy Code uses Claude Code's names and the same two fields
+        // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
+        | AgentKind::Muse
+        | AgentKind::CodeBuddy
+        | AgentKind::IbmBob => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -3643,6 +3662,19 @@ fn windows_session(cwd: &str) -> bool {
     normalize_root(cwd).is_ok_and(|root| flavor_of(&root) == Flavor::Windows)
 }
 
+/// Never-match `ignore_paths` entry used by server re-inspection to compile
+/// an Active policy without seeing the client's real patterns. The spelling
+/// must share the cwd's path flavor: a POSIX absolute sentinel is rejected
+/// on a Windows repository (GHSA-gcpc-88hm-3xqr), which would make every
+/// kept file and shell event metadata-only (#1250).
+pub(crate) fn inspection_sentinel(cwd: &str) -> &'static str {
+    if windows_session(cwd) {
+        "C:/__ai_memory_capture_server_inspection_never_match__"
+    } else {
+        "/__ai_memory_capture_server_inspection_never_match__"
+    }
+}
+
 /// Whether a Windows shell word names a file the matcher cannot place, so a
 /// command holding it proves no miss: a drive-relative path (`C:docs\x`, a
 /// bare `C:`), which Windows resolves from that drive's own current directory
@@ -4574,6 +4606,7 @@ mod tests {
             AgentKind::CopilotCli,
             AgentKind::Droid,
             AgentKind::Muse,
+            AgentKind::CodeBuddy,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -4713,6 +4746,118 @@ mod tests {
     /// `Execute` is matched like any shell. The same payloads under
     /// `AgentKind::Other` stay unrecognized and keep their output, which is
     /// what the Droid mapping changes.
+    /// CodeBuddy Code sends Claude Code's tool names and fields (#1299), so an
+    /// ignored path in a `Read`, `Write`, `Edit` or `Bash` call drops. Under
+    /// `AgentKind::Other` the same calls are not recognized and keep, so the
+    /// test fails if the CodeBuddy `extract` arm is removed.
+    #[test]
+    fn codebuddy_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "codebuddy-session",
+                "cwd": "/repo",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "toolu_1",
+            })
+        };
+        let disposition =
+            |agent: AgentKind, raw: &Value| policy.inspect(agent, raw, "/repo").protocol().clone();
+        for (name, input, control) in [
+            (
+                "Read",
+                json!({"file_path": "secret/a"}),
+                json!({"file_path": "src/lib.rs"}),
+            ),
+            (
+                "Write",
+                json!({"file_path": "/repo/secret/a", "content": "x"}),
+                json!({"file_path": "/repo/src/lib.rs", "content": "x"}),
+            ),
+            (
+                "Edit",
+                json!({"file_path": "secret/a", "old_string": "a", "new_string": "b"}),
+                json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            (
+                "Bash",
+                json!({"command": "cat secret/a"}),
+                json!({"command": "cat src/lib.rs"}),
+            ),
+        ] {
+            assert_eq!(
+                disposition(AgentKind::CodeBuddy, &call(name, input.clone())).disposition(),
+                CaptureDisposition::Drop,
+                "{name}"
+            );
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the CodeBuddy mapping the call is not recognized"
+            );
+            assert_eq!(
+                disposition(AgentKind::CodeBuddy, &call(name, control)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+    }
+
+    /// Bob's Claude-shaped file and shell calls must pass through the same
+    /// capture exclusions. The legitimate control proves the mapping does not
+    /// discard every Bob tool call.
+    #[test]
+    fn ibm_bob_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |path: &str| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "bob-session",
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_input": {"file_path": path},
+                "tool_use_id": "toolu_1",
+            })
+        };
+
+        assert_eq!(
+            policy
+                .inspect(AgentKind::IbmBob, &call("secret/token"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::IbmBob, &call("src/lib.rs"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Other, &call("secret/token"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "without the Bob mapping the call is not recognized"
+        );
+    }
+
     #[test]
     fn droid_tool_calls_honor_capture_exclusions() {
         let policy = CapturePolicy::resolve(
@@ -5687,6 +5832,36 @@ mod tests {
                 CapturePolicy::resolve(CaptureSource::Parsed(&config(pattern)), r"C:\repo", None);
             assert_eq!(policy.state(), PolicyState::Active, "{pattern}");
         }
+    }
+
+    /// Server re-inspection compiles a never-match sentinel as Active. The
+    /// sentinel must share the cwd's path flavor: a POSIX absolute one is
+    /// Invalid on a Windows repository (GHSA-gcpc-88hm-3xqr), which is how
+    /// #1250 over-stripped kept events.
+    #[test]
+    fn inspection_sentinel_matches_cwd_flavor() {
+        const POSIX: &str = "/__ai_memory_capture_server_inspection_never_match__";
+        const WINDOWS: &str = "C:/__ai_memory_capture_server_inspection_never_match__";
+        let config = |pattern: &str| CaptureConfig {
+            ignore_paths: vec![pattern.to_owned()],
+        };
+        let state = |pattern: &str, cwd: &str| {
+            CapturePolicy::resolve(CaptureSource::Parsed(&config(pattern)), cwd, None).state()
+        };
+        assert_eq!(inspection_sentinel(r"C:\repo"), WINDOWS);
+        assert_eq!(inspection_sentinel(r"\\server\share\repo"), WINDOWS);
+        assert_eq!(inspection_sentinel("/repo"), POSIX);
+        assert_eq!(inspection_sentinel("/c/repo"), POSIX);
+        assert_eq!(state(POSIX, r"C:\repo"), PolicyState::Invalid);
+        assert!(
+            describe_invalid_capture_config(&config(POSIX), r"C:\repo", None)
+                .as_deref()
+                .is_some_and(|reason| reason.contains("POSIX"))
+        );
+        assert_eq!(state(WINDOWS, r"C:\repo"), PolicyState::Active);
+        assert_eq!(state(POSIX, "/repo"), PolicyState::Active);
+        assert_eq!(state(POSIX, "/c/repo"), PolicyState::Active);
+        assert_eq!(state(WINDOWS, r"\\server\share\repo"), PolicyState::Active);
     }
 
     /// Native and generated TypeScript classify every tool name alike; the

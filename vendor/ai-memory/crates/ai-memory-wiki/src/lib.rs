@@ -15,6 +15,7 @@ mod git;
 mod ledger;
 mod markdown;
 pub mod migrations;
+mod okf_index;
 mod watcher;
 mod wiki;
 
@@ -28,14 +29,15 @@ pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
 pub use ledger::is_rotated_event_ledger;
 pub use markdown::{
-    Markdown, delink_wikilinks, derive_title, emit, extract_links, extract_relation_links, parse,
-    rewrite_local_wikilinks,
+    Markdown, decode_markdown_destination_path, delink_wikilinks, derive_title, emit,
+    extract_links, extract_relation_links, parse, rewrite_local_wikilinks,
 };
 pub use migrations::run_pending as run_wiki_migrations;
+pub use okf_index::okf_directory_listing;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{
-    ConditionalWrite, MoveSessionOutcome, PurgeSessionOutcome, SessionPageFile, Wiki,
-    WritePageRequest,
+    ConditionalWrite, EventLedgerFile, MoveSessionOutcome, PAGE_CHECKPOINT_WALK_LIMIT,
+    PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest,
 };
 
 // Integration tests compile into this crate's test harness instead of a

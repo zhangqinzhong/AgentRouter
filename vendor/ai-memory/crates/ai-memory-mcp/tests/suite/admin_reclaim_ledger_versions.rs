@@ -127,10 +127,8 @@ async fn deleting_without_confirm_is_refused_and_changes_nothing() {
     );
 }
 
-/// `confirm` has no serde default, so a body that omits it is rejected by the
-/// extractor before the handler runs — the same fail-closed shape
-/// `/admin/compact` uses. A request that never states its intent cannot
-/// delete.
+/// An omitted `confirm` reads as `false`, so a body that never states its
+/// intent gets the same 400 as an explicit `false` — and cannot delete.
 #[tokio::test]
 async fn omitting_confirm_entirely_is_refused() {
     let tmp = TempDir::new().unwrap();
@@ -139,11 +137,7 @@ async fn omitting_confirm_entirely_is_refused() {
 
     let resp = post(state, "/admin/reclaim-ledger-versions", json!({})).await;
 
-    assert!(
-        resp.status().is_client_error(),
-        "expected a client error, got {}",
-        resp.status(),
-    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(page_rows(&store).await, 2);
 }
 

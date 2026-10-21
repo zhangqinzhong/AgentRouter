@@ -45,14 +45,17 @@ Consequences for ai-memory:
 
 | App | Extension unit | Can bundle hooks? | Can bundle MCP? | Install path | Source |
 | --- | --- | --- | --- | --- | --- |
-| Codex (CLI + desktop) | Plugin | Yes | Yes | Plugin marketplace | <https://developers.openai.com/codex/hooks>; plugin hook trust in `codex-rs/app-server/src/effective_plugin_change.rs` |
-| Cursor | Plugin | Yes | Yes | Cursor Marketplace / Customize page; `cursor://` MCP install deeplinks | <https://cursor.com/docs/plugins> |
-| Antigravity | Plugin | Yes, CLI only per docs | — | Marketplace | <https://antigravity.google/docs/hooks> |
-| Zed | Extension | No | Yes (MCP extensions) | Extension registry | <https://zed.dev/docs/extensions/mcp-extensions> |
+| Codex (CLI + desktop) | Plugin | Yes, but only for manually installed plugins: a plugin with lifecycle hooks is not eligible for the public plugin directory | Yes (the public directory requires a public HTTPS endpoint) | Repo, personal or Git marketplace (`.agents/plugins/marketplace.json`); public directory only without hooks | <https://developers.openai.com/plugins/build/plugins>; <https://learn.chatgpt.com/docs/hooks>; plugin hook trust in `codex-rs/app-server/src/effective_plugin_change.rs` |
+| Cursor | Cursor Plugin (`.cursor-plugin/plugin.json` + `hooks/hooks.json`) or Agent Plugin (root `plugin.json`) | Cursor Plugin format only; an Agent Plugin carries skills and MCP, not hooks | Yes | Cursor Marketplace / Customize page; `cursor://` deeplinks install an MCP config, not hooks | <https://cursor.com/docs/plugins>; <https://cursor.com/docs/reference/plugins> |
+| Antigravity | Plugin | Yes, CLI only per docs | Yes (`mcp_config.json` plugin component) | `agy plugin install <name>@antigravity-plugins-official`, a GitHub URL or local directory, or a folder in `~/.gemini/config/plugins/` / `.agents/plugins/` | <https://antigravity.google/docs/plugins.md>; <https://antigravity.google/docs/hooks.md> |
+| Zed | Extension | No | Yes, but MCP extensions are being deprecated in favor of the official MCP registry; remote servers belong in the native UI | Extension registry (MCP registry for new servers) | <https://zed.dev/docs/extensions/mcp-extensions> |
 | ChatGPT (hosted chat) | Plugin | No | Remote only, needs a reachable server | Published directory with review | <https://developers.openai.com/plugins> |
 
 Codex trusts plugin hooks automatically only for plugins a ChatGPT
 workspace lists for the signed-in account (`trust_materialized_plugin_hooks`);
 a plugin from any other source goes through the normal per-hook trust, so a
 plugin does not remove the silent "untrusted hook" failure. Whether Cursor
-plugin hooks need approval is not stated in its docs.
+plugin hooks need approval is not stated in its docs (the hooks page only
+says project hooks run in any trusted workspace). The #721 de-duplication of
+Cursor's copy of the Claude Code hooks needs Cursor's own ai-memory hooks, so
+only the Cursor Plugin format can provide it.

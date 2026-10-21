@@ -61,11 +61,18 @@ ai_memory_find_marker() {
 # tables). Returns the first match or nothing. Ignores comments and
 # blank lines by construction (the regex only matches the `key = "..."`
 # shape).
+ai_memory_strip_utf8_bom() {
+    # Byte spelling keeps this portable across GNU/BSD sed and the awk images
+    # used in CI; LC_ALL=C makes the three bytes ordinary pattern characters.
+    LC_ALL=C sed "1s/^$(printf '\357\273\277')//"
+}
+
 ai_memory_parse_toml_key() {
     file="$1"; key="$2"
     [ -f "$file" ] || return 0
-    sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\1/p" \
-        "$file" | head -n 1
+    ai_memory_strip_utf8_bom <"$file" \
+        | sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\1/p" \
+        | head -n 1
 }
 
 # Like ai_memory_parse_toml_key but also accepts a BARE value
@@ -76,8 +83,9 @@ ai_memory_parse_toml_key() {
 ai_memory_parse_toml_flag() {
     file="$1"; key="$2"
     [ -f "$file" ] || return 0
-    sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?.*/\1/p" \
-        "$file" | head -n 1 | sed 's/[[:space:]]*$//'
+    ai_memory_strip_utf8_bom <"$file" \
+        | sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?.*/\1/p" \
+        | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
@@ -104,7 +112,8 @@ ai_memory_marker_declares_settings() {
     for key in workspace project project_strategy drop_subagent_captures identity identity_style; do
         [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
     done
-    LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' "$file" && return 0
+    ai_memory_strip_utf8_bom <"$file" \
+        | LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' && return 0
     ai_memory_marker_declares_server "$file" && return 0
     for key in default_global inject_on_session_start max_chars contribute consume; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
@@ -549,7 +558,7 @@ ai_memory_aliases_json_value() {
 
 ai_memory_aliases_json() {
     [ -f "$1" ] || return 0
-    _ai_alias_body=$(LC_ALL=C awk '
+    _ai_alias_body=$(ai_memory_strip_utf8_bom <"$1" | LC_ALL=C awk '
         BEGIN { table = 0; count = 0; bad = 0 }
         {
             line = $0
@@ -572,7 +581,7 @@ ai_memory_aliases_json() {
             if (bad) print "invalid"
             else if (count == 1) print body
         }
-    ' "$1")
+    ')
     [ "$_ai_alias_body" = "invalid" ] && { printf 'invalid'; return 0; }
     [ -n "$_ai_alias_body" ] || return 0
     _ai_alias_trimmed=$(printf '%s' "$_ai_alias_body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -961,9 +970,18 @@ ai_memory_post_hook() {
 # Every request in this bundle sends `X-AI-Memory-Client`: an unauthenticated
 # server reached through a non-loopback host name refuses a handoff fetch
 # without it, because a web page cannot add that header to a request it makes.
+#
+# The GET claims the newest open handoff in whatever project the server
+# resolves. `ai_memory_marker_qs` adds `&cwd=` whenever the payload named a
+# directory, so a URL without it names no project: the server would fall back
+# to its default or the caller's last active project, and the claim could
+# consume another repository's handoff. Fetch nothing then; the handoff stays
+# open for memory_handoff_accept (parity with the native hook).
 ai_memory_get_handoff() {
     case "$1" in
         *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) return 0 ;;
+        *'&cwd='*) ;;
+        *) return 0 ;;
     esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then

@@ -66,21 +66,26 @@ ai-memory run --profile work omp --profile omp-work
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
 and always selects the Claude harness. The exact spelling never changes
 the agent kind, session store, or transcript import.
-Combine that wildcard with `--executable` to launch the right account's
-binary while keeping each account's managed workstream distinguishable in
-your shell history:
+A `claude*` name other than plain `claude` and `claude-code` also picks the
+binary: when no `--executable` is given and an executable with exactly that
+name is on the launch `PATH` (including a `PATH` set with `--env`), `run`
+launches it. Per-account wrapper scripts therefore work without repeating
+yourself:
 
 ```bash
 # ~/bin/claude-corp and ~/bin/claude-personal are wrapper scripts (earlier on
 # PATH than the bare `claude`) that each exec the real claude binary with
 # that account's config/credentials directory.
-ai-memory run claude-corp --executable claude-corp --model opus
-ai-memory run claude-personal --executable claude-personal
+ai-memory run claude-corp --model opus
+ai-memory run claude-personal
 ```
 
-Only the `--executable` value matters for which binary actually runs; the
-positional name is free-form as long as it starts with `claude`, so pick
-whatever reads clearly to you.
+If no executable with that name exists, `run` prints a warning on stderr and
+starts plain `claude`, so a mistyped or missing wrapper cannot silently put you
+on the wrong account. An explicit `--executable` always wins, and `claude` and
+`claude-code` always mean the plain `claude` binary. The name must be a bare
+command name found through `PATH` (a shell alias or function is invisible
+here); to use a binary elsewhere, pass `--executable <path>`.
 
 ```bash
 cd /path/to/project
@@ -102,6 +107,50 @@ ai-memory run kiro --v3
 # or omit the harness and continue the newest usable session automatically
 ai-memory run
 ```
+
+When that second command is a real harness switch, the server returns only the
+previous harness and native session identity. The launcher verifies that
+session against this exact checkout, reads it through the existing read-only
+adapter, and writes its visible normalized history to a private temporary
+Markdown file. The child receives only this local variable:
+
+```text
+AI_MEMORY_PREVIOUS_SESSION_HISTORY=/private/temp/.../history.md
+```
+
+The startup packet tells the receiving agent to read the file when the user
+asks to continue or an exact detail is absent from the bounded portable packet.
+That server-authored directive is outside the packet's untrusted-history fence;
+only the imported transcript evidence is inside the fence. The canonical
+ai-memory routing block provides the same fallback: when all three
+wrapper-owned variables `AI_MEMORY_RUN_ID`, `AI_MEMORY_WORKSTREAM_ID`, and
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY` are present, "continue", "resume", or
+"pick up where we left off" means to read the named file before inferring the
+unfinished task. This covers quota exhaustion and other abrupt exits where the
+outgoing harness cannot prepare a handoff.
+
+The dossier is evidence, not instructions: it is fenced as untrusted history,
+contains no hidden reasoning or unsupported/private records, and disappears
+when the child exits. The remote ai-memory server never receives its path or
+body. A same-harness resume needs no dossier because that harness resumes its
+own native session. If the prior store is missing, unreadable, on another
+machine, or above the adapter's safety bounds, launch continues with the
+portable ledger and handoff and prints one warning.
+
+If a same-machine harness switch has no
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY`, check the executable used by the exact
+shell that launched it:
+
+```bash
+type -a ai-memory
+ai-memory --version
+```
+
+Native-history continuation requires the 3.1.0 or newer host client. A stale
+Cargo or package-manager binary earlier in `PATH` can shadow an updated Docker
+wrapper and its checksum-verified native runner. Upgrade or remove the
+shadowing executable, then restart the managed run; an already-running child
+keeps the environment inherited from its old launcher.
 
 After an interactive managed session exits successfully, `ai-memory run` offers
 the installed harnesses, a way to run the current harness again, and quit.
@@ -182,9 +231,11 @@ Probably not at first. Hooks alone already carry most continuity.
   works with nothing but `install-hooks`; no `ai-memory run` involved.
 - Use it when you want the harness's own native resume (`claude
   --resume` / the picker) to survive a switch to another harness. The
-  managed ledger records the visible event stream portably, so `ai-memory
-  continue` can reopen the same workstream in a different agent with
-  the exact tool-call history instead of a summary.
+  managed ledger records the visible event stream portably, while a
+  same-machine harness switch exposes the previous native session's larger
+  local visible-history dossier on demand. `ai-memory continue` can therefore
+  reopen the same workstream in a different agent with more than a summary,
+  without uploading the native transcript to the server.
 
 If you never switch harnesses mid-workstream, the default path is
 simpler and you lose nothing by staying on it.
@@ -417,7 +468,13 @@ resume, continue, session, or fork selector.
    an explicit interactive adapter can offer matching local sessions for
    one-time adoption. Otherwise the adapter passes native arguments through in
    order and adds a create/resume selector only when the user did not supply one.
-3. `AI_MEMORY_RUN_ID` marks lifecycle hooks as managed. SessionStart links the
+3. `AI_MEMORY_RUN_ID` marks lifecycle hooks as managed. When preparation
+   selects a different harness from the newest linked one, the run pins that
+   prior harness/session identity before the destination link can change
+   recency. The host revalidates it against the checkout and, when available,
+   exposes a private local visible-history dossier through
+   `AI_MEMORY_PREVIOUS_SESSION_HISTORY`; no path or dossier body is sent to the
+   server. SessionStart then links the
    actual native session and injects only the portable events that session has
    not seen. Crush, which has no SessionStart hook, receives the same bounded
    packet through a temporary `options.global_context_paths` entry. Kimi Code
@@ -823,7 +880,7 @@ OMP currently needs no added flag. ai-memory does not add a duplicate when the
 translated native flag is already present.
 
 Managed support is intentionally narrower than the general integration matrix.
-Gemini CLI, Devin CLI, Cursor, and other agents may
+IBM Bob, Gemini CLI, Devin CLI, Cursor, and other agents may
 have MCP or lifecycle-hook support without native managed resume. Contributors
 adding another managed harness must follow the [managed-harness contribution
 protocol](managed-harness-contributions.md), including read-only extraction,
@@ -1103,6 +1160,19 @@ heartbeats resumed. The native harness remains usable throughout the outage.
 If the outage exceeds one lease window, the original launcher may renew its run
 only while no newer launcher has claimed the workstream. A replacement prepare,
 cancel, finish, or destructive operation remains terminal for the old run.
+
+The outage wording is reserved for a server the launcher could not reach. When
+the server answers a heartbeat and rejects it, the notice carries the server's
+own reason instead. A lapsed timestamp alone is not that case: `heartbeat`
+renews any run whose state is still `active`, so the original launcher recovers
+its own lease after an outage or a host suspend. The rejection arrives once the
+run stops being active, because it was finished, cancelled, or expired by a
+later prepare. That last one is the common path on a workstation, since the
+first statement of every prepare expires each active run whose lease has
+already passed. A launcher that was suspended past its lease keeps renewing
+until any other `run` prepares a workstream, and then reads `managed run lease
+is not active` from a server that is reachable and idle. Reporting that as an
+outage would send the operator looking for a server that never went away.
 
 If the client is terminated without cleanup, such as with `kill -9`, its lease
 expires within 90 seconds. A later managed run starts from the last committed

@@ -82,10 +82,13 @@ async function listRolloutFiles(sessionsDir, options = {}) {
       : null;
   const stats = options?.stats && typeof options.stats === "object" ? options.stats : null;
   if (dayInventoryCache) {
-    if (dayInventoryCache.version !== 1) {
+    // v2: isRolloutFileName also accepts rollout-*.jsonl.zst/.zstd. Old v1
+    // day lists omit archives that were already on disk when the directory
+    // metadata last matched, so bump to force a one-time rescan.
+    if (dayInventoryCache.version !== 2) {
       dayInventoryCache.days = {};
     }
-    dayInventoryCache.version = 1;
+    dayInventoryCache.version = 2;
     if (!dayInventoryCache.days || typeof dayInventoryCache.days !== "object") {
       dayInventoryCache.days = {};
     }
@@ -166,7 +169,75 @@ function isRolloutFileName(name) {
   if (typeof name !== "string") return false;
   if (name.includes("/") || name.includes("\\")) return false;
   if (name !== path.basename(name)) return false;
-  return name.startsWith("rollout-") && name.endsWith(".jsonl");
+  if (!name.startsWith("rollout-")) return false;
+  return name.endsWith(".jsonl") || isCompressedRolloutFileName(name);
+}
+
+// Compressed rollout archives cannot be tailed by byte offset: the cursor
+// stores compressed bytes while the parser consumes decompressed text. Treat
+// them as content-addressed snapshots — one parse per (inode, size) version —
+// reusing the DSH session's zstd machinery (built-in zlib first,
+// `@mongodb-js/zstd` fallback) including its multi-frame handling. Returns
+// null for a missing/non-file path; an empty archive yields no lines (the
+// same outcome as an empty uncompressed rollout).
+const CODEX_ROLLOUT_COMPRESSED_PATTERN = /^rollout-.*\.jsonl\.zstd?$/;
+const CODEX_ROLLOUT_TEXT_MAX_BYTES = 256 * 1024 * 1024;
+
+function isCompressedRolloutFileName(name) {
+  return typeof name === "string" && CODEX_ROLLOUT_COMPRESSED_PATTERN.test(name);
+}
+
+function isCompressedRolloutPath(filePath) {
+  if (typeof filePath !== "string") return false;
+  return isCompressedRolloutFileName(path.basename(filePath));
+}
+
+async function readCodexRolloutSnapshot(filePath, { maxOutputBytes = CODEX_ROLLOUT_TEXT_MAX_BYTES } = {}) {
+  const handle = await fs.open(filePath, "r").catch(() => null);
+  if (!handle) return null;
+  try {
+    const initialStat = await handle.stat().catch(() => null);
+    if (!initialStat || !initialStat.isFile()) return null;
+    const outputLimit = Number.isSafeInteger(maxOutputBytes) && maxOutputBytes >= 0
+      ? maxOutputBytes
+      : CODEX_ROLLOUT_TEXT_MAX_BYTES;
+    let data;
+    try {
+      data = await handle.readFile();
+    } catch (_error) {
+      // Transient mount/IO failures (e.g. WSL ESTALE) must not abort the rest
+      // of sync; treat like a missing archive and keep the prior cursor.
+      return null;
+    }
+    const metadata = {
+      size: data.length,
+      mtimeMs: Number.isFinite(initialStat.mtimeMs) ? initialStat.mtimeMs : 0,
+      inode: initialStat.ino || 0,
+    };
+    if (data.length === 0) return { ...metadata, unchanged: false, lines: [] };
+    let decoded;
+    try {
+      const inspected = inspectDshZstdFrames(data, outputLimit);
+      decoded = await decodeDshZstd(data, { maxOutputBytes: outputLimit, inspected });
+    } catch (_error) {
+      // Malformed / truncated / oversized archives must not abort the rest of
+      // the sync: return null so the caller keeps the prior cursor and retries.
+      return null;
+    }
+    // Fatal UTF-8: uncompressed JSONL parsing rejects invalid bytes under
+    // invalidRecordPolicy=throw. toString("utf8") would silently replace them
+    // and claim utf8Valid, so a corrupted discriminator could drop usage
+    // during repairCodexRescanInflation. Fail the snapshot instead.
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+    } catch (_error) {
+      return null;
+    }
+    return { ...metadata, unchanged: false, lines: text.length > 0 ? text.split("\n") : [] };
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 function directoryInventoryStatKey(st) {
@@ -192,7 +263,7 @@ async function listRolloutFilesDeep(dir) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) {
         await walk(p);
-      } else if (e.isFile() && e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
+      } else if (e.isFile() && isRolloutFileName(e.name)) {
         out.push(p);
       }
     }
@@ -502,6 +573,16 @@ async function parseRolloutIncremental({
       ? prev?.codexUsageRecord || (prev?.lastTotal ? { sawTokenCount: true } : null)
       : null;
 
+    // Compressed archives are whole-file snapshots. If the compressed bytes
+    // changed under the same inode, force historical dedup; parseRolloutFile
+    // ignores retained baselines for the parse itself. Do NOT clear cursor
+    // fields here — a soft decode failure must leave the prior cursor intact.
+    const compressedSnapshotRescan = isCompressedRolloutPath(filePath)
+      && sameInode
+      && !truncated
+      && prevOffset > 0
+      && prevOffset !== st.size;
+
     const codexProjectFastPath =
       projectEnabled && (fileSource === DEFAULT_SOURCE || fileSource === "acode");
     const projectOffset = sameInode && !truncated ? Number(prev.projectOffset || 0) : 0;
@@ -560,7 +641,8 @@ async function parseRolloutIncremental({
         ? getAcodeEventDedup()
         : null;
     const codexEventTracker = rolloutEventDedup
-      ? (needsHistoricalRolloutDedup({
+      ? (compressedSnapshotRescan
+          || needsHistoricalRolloutDedup({
           filePath,
           prev,
           sameInode,
@@ -611,6 +693,22 @@ async function parseRolloutIncremental({
           sessionId: codexSessionIdFromPath(filePath),
           invalidRecordPolicy,
         });
+
+    if (result.snapshotUnavailable) {
+      // Leave cursors.files[key] untouched so the next readable snapshot is
+      // compared against the prior (inode, offset, baselines).
+      if (cb) {
+        cb({
+          index: idx + 1,
+          total: totalFiles,
+          filePath,
+          filesProcessed,
+          eventsAggregated,
+          bucketsQueued: touchedBuckets.size,
+        });
+      }
+      continue;
+    }
 
     const nextCursor = {
       inode,
@@ -2146,7 +2244,7 @@ function openclawUsageEventIdentity(obj, msg, usage, model) {
 function codexSessionIdFromPath(filePath) {
   if (typeof filePath !== "string") return null;
   const m = filePath.match(
-    /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$/,
+    /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl(?:\.zstd?)?$/,
   );
   return m ? m[1] : null;
 }
@@ -2180,6 +2278,105 @@ async function parseRolloutFile({
   const endOffset = st.size;
   const projectFileContexts = [];
   addProjectFileContext(projectFileContexts, projectContext);
+  // Compressed archives are immutable snapshots, not append-only logs: a byte
+  // range of the compressed file is not a prefix of the decompressed text, so
+  // resume-in-the-middle is impossible. Parse the whole snapshot whenever its
+  // (inode, size) identity is new; unchanged snapshots are skipped by the
+  // caller before reaching this function.
+  if (isCompressedRolloutPath(filePath)) {
+    // Mirror the uncompressed exhausted-cursor guard. When a custom
+    // publicRepoResolver disables the outer skip, an unchanged archive must
+    // not be re-parsed with retained baselines (that inflates totals).
+    if (startOffset >= endOffset) {
+      return {
+        endOffset,
+        lastTotal,
+        tokenUsageBaselines,
+        lastModel,
+        modelAttributionState: previousModelAttributionState,
+        usageRecordState: previousUsageRecordState,
+        eventsAggregated: 0,
+        projectFileContexts,
+      };
+    }
+    const snapshot = await readCodexRolloutSnapshot(filePath);
+    if (!snapshot) {
+      // Soft sync skips a bad archive and keeps the prior cursor so later
+      // files still count. Strict rebuilds (invalidRecordPolicy=throw), used
+      // by repairCodexRescanInflation, must fail closed: a silent skip here
+      // would let another readable session satisfy the non-empty-bucket
+      // safeguard and permanently delete this archive's prior usage.
+      if (invalidRecordPolicy === "throw") {
+        throw new Error(`unreadable Codex compressed archive: ${filePath}`);
+      }
+      return {
+        endOffset: startOffset,
+        lastTotal,
+        tokenUsageBaselines,
+        lastModel,
+        modelAttributionState: previousModelAttributionState,
+        usageRecordState: previousUsageRecordState,
+        eventsAggregated: 0,
+        projectFileContexts,
+        // Tell the incremental caller not to rewrite cursors.files[key]. If the
+        // archive inode changed under a transient decode miss, overwriting the
+        // prior cursor would drop historical-dedup baselines and double-count.
+        snapshotUnavailable: true,
+      };
+    }
+    // Decompressed lines have no meaningful compressed-byte offsets; the
+    // shared parser only needs their content plus termination flags. Byte
+    // counters stay at the snapshot's compressed size so the cursor records
+    // (inode, size) identity, not decompressed progress.
+    const records = (async function* snapshotRecords() {
+      for (let index = 0; index < snapshot.lines.length; index += 1) {
+        const raw = snapshot.lines[index];
+        const terminated = index + 1 < snapshot.lines.length || raw.endsWith("\n");
+        yield {
+          line: terminated ? raw : `${raw}`,
+          physicalBytes: 0,
+          terminated,
+          utf8Valid: true,
+        };
+      }
+    })();
+    // Size changed under the same inode: drop retained baselines for THIS
+    // parse only. Soft-fail above still returns the caller-supplied baselines
+    // so the prior cursor is preserved when decode fails.
+    const rescanBaselines = startOffset > 0 && startOffset < endOffset;
+    const parsed = await parseRolloutRecords({
+      records,
+      startOffset: 0,
+      endOffset: 0,
+      lastTotal: rescanBaselines ? null : lastTotal,
+      tokenUsageBaselines: rescanBaselines ? null : tokenUsageBaselines,
+      lastModel: rescanBaselines ? null : lastModel,
+      modelAttributionState: rescanBaselines ? null : previousModelAttributionState,
+      usageRecordState: rescanBaselines ? null : previousUsageRecordState,
+      compactionResponseIds,
+      hourlyState,
+      touchedBuckets,
+      source,
+      projectState,
+      projectTouchedBuckets,
+      projectRef,
+      projectKey,
+      projectMetaCache,
+      publicRepoCache,
+      publicRepoResolver,
+      projectContext,
+      projectFileContexts,
+      seenCodexEvents,
+      sessionId,
+      filePath,
+      invalidRecordPolicy,
+    });
+    // parseRolloutRecords counts streamed bytes; snapshots have none, so pin
+    // the cursor to the compressed size — the (inode, size) identity that
+    // makes an unchanged archive skip on the next sync.
+    parsed.endOffset = snapshot.size;
+    return parsed;
+  }
   if (startOffset >= endOffset) {
     return {
       endOffset,
@@ -2197,7 +2394,76 @@ async function parseRolloutFile({
     start: startOffset,
     end: endOffset - 1,
   });
+  // Compressed snapshots never reach this branch (parseRolloutFile routes them
+  // to parseRolloutRecords directly); the byte-counting stream below is only
+  // meaningful for append-only uncompressed logs.
+  const records = (async function* streamRecords() {
+    const invalidUtf8 = invalidRecordPolicy === "throw" ? "throw" : "record";
+    for await (const record of physicalJsonlRecords(stream, { invalidUtf8 })) {
+      yield record;
+    }
+  })();
 
+  return parseRolloutRecords({
+    records,
+    startOffset,
+    endOffset,
+    lastTotal,
+    tokenUsageBaselines,
+    lastModel,
+    modelAttributionState: previousModelAttributionState,
+    usageRecordState: previousUsageRecordState,
+    compactionResponseIds,
+    hourlyState,
+    touchedBuckets,
+    source,
+    projectState,
+    projectTouchedBuckets,
+    projectRef,
+    projectKey,
+    projectMetaCache,
+    publicRepoCache,
+    publicRepoResolver,
+    projectContext,
+    projectFileContexts,
+    seenCodexEvents,
+    sessionId,
+    filePath,
+    invalidRecordPolicy,
+  });
+}
+
+async function parseRolloutRecords({
+  records,
+  startOffset,
+  endOffset,
+  lastTotal,
+  tokenUsageBaselines,
+  lastModel,
+  modelAttributionState: previousModelAttributionState,
+  usageRecordState: previousUsageRecordState = null,
+  compactionResponseIds = null,
+  hourlyState,
+  touchedBuckets,
+  source,
+  projectState,
+  projectTouchedBuckets,
+  projectRef,
+  projectKey,
+  projectMetaCache,
+  publicRepoCache,
+  publicRepoResolver,
+  projectContext,
+  projectFileContexts: existingProjectFileContexts,
+  seenCodexEvents,
+  sessionId,
+  filePath,
+  invalidRecordPolicy,
+}) {
+  const projectFileContexts = Array.isArray(existingProjectFileContexts)
+    ? existingProjectFileContexts
+    : [];
+  addProjectFileContext(projectFileContexts, projectContext);
   let model = typeof lastModel === "string" ? lastModel : null;
   const modelAttributionState = createCodexModelAttributionState(
     previousModelAttributionState || { model },
@@ -2273,8 +2539,7 @@ async function parseRolloutFile({
     eventsAggregated += 1;
   }
 
-  const invalidUtf8 = invalidRecordPolicy === "throw" ? "throw" : "record";
-  for await (const record of physicalJsonlRecords(stream, { invalidUtf8 })) {
+  for await (const record of records) {
     scannedEndOffset += record.physicalBytes;
     if (record.terminated) committedEndOffset = scannedEndOffset;
     if (!record.utf8Valid) {
@@ -2531,6 +2796,78 @@ async function scanRolloutProjectFileContexts({
   if (!projectState || endOffset <= 0) {
     return {
       endOffset,
+      lastTotal,
+      tokenUsageBaselines,
+      lastModel,
+      modelAttributionState,
+      eventsAggregated: 0,
+      projectFileContexts,
+    };
+  }
+
+  // Compressed archives cannot be scanned as byte streams: JSONL newlines in
+  // the compressed payload are not record boundaries. Decode the snapshot,
+  // then walk decompressed lines for cwd changes. Pin the cursor to the
+  // compressed size so the next sync's unchanged check keeps working.
+  if (isCompressedRolloutPath(filePath)) {
+    const snapshot = await readCodexRolloutSnapshot(filePath);
+    if (!snapshot) {
+      if (invalidRecordPolicy === "throw") {
+        throw new Error(`unreadable Codex compressed archive: ${filePath}`);
+      }
+      return {
+        endOffset,
+        lastTotal,
+        tokenUsageBaselines,
+        lastModel,
+        modelAttributionState,
+        eventsAggregated: 0,
+        projectFileContexts,
+        snapshotUnavailable: true,
+      };
+    }
+    let currentCwd = null;
+    for (const raw of snapshot.lines) {
+      const line = typeof raw === "string" ? raw : "";
+      if (
+        !line ||
+        !(
+          line.includes('"turn_context"') ||
+          line.includes('"session_meta"')
+        ) ||
+        !line.includes('"cwd"')
+      ) {
+        continue;
+      }
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch (error) {
+        if (invalidRecordPolicy === "throw") throw error;
+        continue;
+      }
+      if (
+        (obj?.type !== "turn_context" && obj?.type !== "session_meta") ||
+        !obj?.payload ||
+        typeof obj.payload !== "object" ||
+        typeof obj.payload.cwd !== "string"
+      ) {
+        continue;
+      }
+      const nextCwd = obj.payload.cwd.trim();
+      if (!nextCwd || nextCwd === currentCwd) continue;
+      const context = await resolveProjectContextForPath({
+        startDir: wsl.mapWslCwdToUnc(nextCwd, filePath),
+        projectMetaCache,
+        publicRepoCache,
+        publicRepoResolver,
+        projectState,
+      });
+      currentCwd = nextCwd;
+      addProjectFileContext(projectFileContexts, context);
+    }
+    return {
+      endOffset: snapshot.size,
       lastTotal,
       tokenUsageBaselines,
       lastModel,
@@ -21884,6 +22221,10 @@ module.exports = {
   listRolloutFiles,
   listRolloutFilesDeep,
   codexSessionIdFromPath,
+  isRolloutFileName,
+  isCompressedRolloutFileName,
+  isCompressedRolloutPath,
+  readCodexRolloutSnapshot,
   filterColdCodexRolloutFiles,
   listClaudeProjectFiles,
   listGeminiSessionFiles,

@@ -2,6 +2,8 @@
 
 {% block title %}Pending writes — ai-memory{% endblock %}
 
+{% block nav_pending_current %}aria-current="page"{% endblock %}
+
 {% block content %}
 <div class="mb-6">
   <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Pending writes</h1>
@@ -34,6 +36,14 @@
   <span id="pending-count">{{ rows.len() }}</span> shown · {{ total }} pending in {{ project_count }} project{% if project_count != 1 %}s{% endif %}
   {% if truncated %}· only the oldest {{ limit }} of this selection are listed; pick a project, or use <code>ai-memory pending-writes list</code>{% endif %}
 </p>
+
+{% if read_only %}
+<p class="mb-4 rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
+  This browser signed in with the root token, which can only read pages. To approve or reject here, set up password sign-in
+  (<code>AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD</code>, see "Human password bootstrap and recovery" in <code>docs/install.md</code>).
+  Until then, use the command shown under each proposal.
+</p>
+{% endif %}
 
 <p id="pending-status" class="mb-4 hidden rounded-md px-3 py-2 text-sm" role="status" aria-live="polite"></p>
 
@@ -89,6 +99,18 @@
           <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-sm text-slate-700 dark:text-slate-300">{{ row.body_markdown }}</pre>
         </div>
         <p class="text-xs text-slate-500 dark:text-slate-400 font-mono break-all">id {{ row.id }}</p>
+        {% if read_only %}
+        <div>
+          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">POSIX shell</h2>
+          <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.posix_cli_approve }}
+{{ row.posix_cli_reject }}</pre>
+        </div>
+        <div>
+          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">PowerShell</h2>
+          <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.powershell_cli_approve }}
+{{ row.powershell_cli_reject }}</pre>
+        </div>
+        {% else %}
         <div class="flex flex-wrap items-center gap-2">
           <button type="button" data-action="approve"
                   class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">Approve</button>
@@ -97,6 +119,7 @@
           <input type="text" name="reason" maxlength="500" placeholder="Reject reason (optional)" aria-label="Reject reason"
                  class="flex-1 min-w-0 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500">
         </div>
+        {% endif %}
       </div>
     </details>
   </li>
@@ -146,7 +169,10 @@
       },
       body: JSON.stringify(action === "reject" ? { reason: reason.value.trim() } : {})
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (json) {
+      // An auth refusal can answer in plain text, not JSON: keep that text.
+      return resp.text().then(function (text) {
+        var json = {};
+        try { json = JSON.parse(text); } catch (e) { json = { error: text.trim() }; }
         if (resp.ok) {
           item.remove();
           count.textContent = String(document.querySelectorAll(".pending-item").length);

@@ -383,6 +383,8 @@ export type ProviderAccountMeterDetail = {
 };
 
 export type ProviderAccountMeter = {
+  /** Attribution within a shared pool, never an independent remaining quota. */
+  displayMode?: "used-share";
   details?: ProviderAccountMeterDetail[];
   id: string;
   kind: ProviderAccountMeterKind;
@@ -2201,6 +2203,8 @@ export type UsageDateRange = {
 };
 
 export type UsageStatsFilter = {
+  monitorQuery?: import("./monitor").MonitorQuery;
+  scope?: "gateway";
   credential?: string;
   includeProxy?: boolean;
   model?: string;
@@ -2244,7 +2248,21 @@ export type UsageComparisonRow = UsageTotals & {
   provider?: string;
 };
 
+export type GatewayMonitor = {
+  from: string;
+  to: string;
+  latencyP50Ms: number | null;
+  latencyP95Ms: number | null;
+  ttftP50Ms: number | null;
+  ttftP95Ms: number | null;
+  ttftSamples: number;
+  minutes: Array<{ bucket: string; requests: number; errors: number; tokens: number; durationMs: number }>;
+  failures: Array<{ id: string; at: string; provider: string; model: string; status: number }>;
+};
+
 export type UsageStatsSnapshot = {
+  monitorReport?: import("./monitor").MonitorReport;
+  monitor?: GatewayMonitor;
   gatewayTotals?: UsageTotals;
   localCollectionState?: "loading" | "ready" | "error";
   clientModels: UsageComparisonRow[];

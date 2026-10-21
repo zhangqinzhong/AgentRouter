@@ -31,11 +31,13 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams, ServerInfo,
+    CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ClientRequest, ErrorCode,
+    ListToolsResult, PaginatedRequestParams, ServerInfo, ServerJsonRpcMessage,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, ServiceError};
+use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{StreamableHttpClientTransport, stdio};
+use rmcp::transport::{StreamableHttpClientTransport, Transport, stdio};
 use rmcp::{ErrorData as McpError, Peer, ServerHandler, ServiceExt};
 
 use crate::cli::{BridgeAgent, McpBridgeArgs};
@@ -82,6 +84,80 @@ fn upstream_error(error: ServiceError) -> McpError {
     match error {
         ServiceError::McpError(error) => error,
         other => McpError::internal_error(format!("upstream MCP request failed: {other}"), None),
+    }
+}
+
+/// The stdio transport, kept open through a dual-era client's version probe.
+///
+/// rmcp 2.2's server handshake answers `ping` before `initialize` and ends
+/// the session on any other message. A client that speaks both the 2026-07-28
+/// revision and the `initialize` handshake (Antigravity CLI 1.4, the
+/// Antigravity 2.24 app) first sends `server/discover`, and falls back to
+/// `initialize` when the server answers with any error or not at all
+/// (<https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio#backward-compatibility>).
+/// Exiting instead closes the pipe under that fallback. Until `initialize`
+/// arrives this answers every other request with Method not found, so the
+/// client sees a legacy server, and drops notifications: a client that stopped
+/// waiting for its probe may cancel it. From `initialize` on, every message
+/// passes through to rmcp unchanged.
+///
+/// Revisit on an rmcp 3.x bump: its handshake answers the probe itself
+/// (modelcontextprotocol/rust-sdk#1248).
+struct PreInitializeGate<T> {
+    inner: T,
+    initialize_seen: bool,
+}
+
+impl<T> PreInitializeGate<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            initialize_seen: false,
+        }
+    }
+}
+
+impl<T: Transport<RoleServer>> Transport<RoleServer> for PreInitializeGate<T> {
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: ServerJsonRpcMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+        while !self.initialize_seen {
+            let ClientJsonRpcMessage::Request(request) = self.inner.receive().await? else {
+                continue;
+            };
+            match request.request {
+                ClientRequest::InitializeRequest(_) => self.initialize_seen = true,
+                ClientRequest::PingRequest(_) => {}
+                _ => {
+                    let error = McpError::new(
+                        ErrorCode::METHOD_NOT_FOUND,
+                        format!(
+                            "{} is not available before initialize",
+                            request.request.method()
+                        ),
+                        None,
+                    );
+                    self.inner
+                        .send(ServerJsonRpcMessage::error(error, Some(request.id)))
+                        .await
+                        .ok()?;
+                    continue;
+                }
+            }
+            return Some(ClientJsonRpcMessage::Request(request));
+        }
+        self.inner.receive().await
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
     }
 }
 
@@ -228,8 +304,11 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         upstream: upstream.peer().clone(),
         server_info,
     };
+    let (stdin, stdout) = stdio();
     let downstream = bridge
-        .serve(stdio())
+        .serve(PreInitializeGate::new(AsyncRwTransport::new_server(
+            stdin, stdout,
+        )))
         .await
         .context("starting session-aware stdio MCP bridge")?;
 

@@ -131,3 +131,18 @@ test('native rolling hourly query spans midnight without folding clock hours',as
   assert.deepEqual(today.data.map(x=>x.total_tokens),[300]);
  } finally {await fs.rm(dir,{recursive:true,force:true})}
 });
+
+test('hourly cost trend uses the same priced rows as summary and model totals',async()=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'ar-hourly-cost-'));
+ try{
+  const qp=path.join(dir,'queue.jsonl');
+  const rows=[0,1].map(i=>({source:'codex',model:'gpt-5',hour_start:`2026-09-14T0${i}:00:00.000Z`,input_tokens:1000000,output_tokens:1000,cached_input_tokens:0,cache_creation_input_tokens:0,total_tokens:1001000,conversation_count:1}));
+  await fs.writeFile(qp,rows.map(JSON.stringify).join('\n')+'\n');
+  const {queryOffline}=require('../../packages/core/src/vendor/tokentracker/lib/offline-api');
+  const query={from:'2026-09-14',to:'2026-09-14',tz:'UTC'};
+  const summary=await queryOffline(qp,'/functions/tokentracker-usage-summary',query);
+  const hourly=await queryOffline(qp,'/functions/tokentracker-usage-hourly',{...query,day:query.from});
+  const cost=hourly.data.reduce((sum,row)=>sum+row.total_cost_usd,0);
+  assert.ok(cost>0);assert.ok(Math.abs(cost-Number(summary.totals.total_cost_usd))<0.000001);
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});

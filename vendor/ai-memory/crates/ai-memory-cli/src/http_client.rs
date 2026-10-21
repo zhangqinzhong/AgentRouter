@@ -12,8 +12,6 @@
 
 use std::fmt;
 use std::io::{BufWriter, Write as _};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -402,11 +400,9 @@ fn build_url_with_query(
 
 /// Turn a low-level reqwest connect/timeout error into a friendlier
 /// message that surfaces the resolved server URL. The common cases are
-/// "Connection refused" and a connect that never completes: on Windows a
-/// closed loopback port is routinely dropped (timed out) by the firewall
-/// instead of being refused, and both mean the same operator problem —
-/// the CLI defaulted to (or was pointed at) an endpoint where nothing
-/// answered.
+/// "Connection refused", a connect that never completes, and a peer that
+/// closes before sending an HTTP response. They all mean the same operator
+/// problem: the CLI was pointed at an endpoint where no server answered.
 pub(crate) fn augment_connect_error(
     err: reqwest::Error,
     endpoint: &ServerEndpoint,
@@ -447,13 +443,10 @@ pub(crate) fn server_unreachable(err: &anyhow::Error) -> bool {
     !answered && err.chain().any(error_chain_indicates_no_answer)
 }
 
-/// Whether an error chain means "nothing answered at the transport
-/// layer": reqwest classified it as a connect-phase or timeout failure,
-/// or a `ConnectionRefused`/`TimedOut` io::Error — or its platform
-/// wording — is buried in the source chain. reqwest wraps its errors
-/// deeply, and matching only an explicit RST would hide the diagnosis
-/// from exactly the hosts (windows-latest among them) whose firewalls
-/// turn a refused loopback connect into a silent timeout.
+/// Whether an error chain means "nothing answered at the transport layer".
+/// reqwest may classify this as a connect/timeout failure or wrap the socket
+/// error deeply. A peer can also accept and close before the HTTP response,
+/// which is equally unreachable from the caller's perspective.
 fn error_chain_indicates_no_answer(err: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(req) = err.downcast_ref::<reqwest::Error>()
         && (req.is_connect() || req.is_timeout())
@@ -465,13 +458,25 @@ fn error_chain_indicates_no_answer(err: &(dyn std::error::Error + 'static)) -> b
         if let Some(io) = e.downcast_ref::<std::io::Error>()
             && matches!(
                 io.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
             )
         {
             return true;
         }
         let wording = e.to_string().to_ascii_lowercase();
-        if wording.contains("connection refused") || wording.contains("timed out") {
+        if wording.contains("connection refused")
+            || wording.contains("connection reset")
+            || wording.contains("connection aborted")
+            || wording.contains("connection closed before message completed")
+            || wording.contains("unexpected eof")
+            || wording.contains("broken pipe")
+            || wording.contains("timed out")
+        {
             return true;
         }
         src = e.source();
@@ -523,7 +528,11 @@ async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration)
 ///
 /// Intended for routes whose response is binary (e.g. `POST /admin/backup`
 /// returns an `application/gzip` tarball). On non-2xx the response body is
-/// consumed and returned as an error string. Returns bytes written.
+/// consumed and returned as an error string. Returns bytes written. A completed
+/// download atomically replaces the destination path; a destination symlink is
+/// replaced rather than modifying the file it points to. Replacement symlinks
+/// and new destinations use private permissions; only existing regular files
+/// retain their permissions.
 ///
 /// # Errors
 /// Returns an error when the connection fails, the response is non-2xx,
@@ -537,9 +546,10 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
     let mut resp = require_success(reqwest::Method::POST, resp).await?;
-    let file = private_output_file(dest)
-        .with_context(|| format!("creating output file {}", dest.display()))?;
-    let mut writer = BufWriter::new(file);
+    let permissions = checked_output_permissions(dest)?;
+    let mut temporary = private_output_file(dest)
+        .with_context(|| format!("creating temporary output beside {}", dest.display()))?;
+    let mut writer = BufWriter::new(temporary.as_file_mut());
     let mut written = 0_u64;
     while let Some(chunk) = resp
         .chunk()
@@ -554,18 +564,72 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     writer
         .flush()
         .with_context(|| format!("flushing {}", dest.display()))?;
+    drop(writer);
+    // A failed response must leave the previous archive usable. The temporary
+    // file stays private until the entire response has arrived.
+    if let Some(permissions) = permissions {
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .with_context(|| format!("preserving permissions for {}", dest.display()))?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temporary output beside {}", dest.display()))?;
+    let persisted = temporary
+        .persist(dest)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replacing output file {}", dest.display()))?;
+    persisted
+        .sync_all()
+        .with_context(|| format!("syncing output file {}", dest.display()))?;
+    if let Ok(directory) = std::fs::File::open(output_parent(dest)) {
+        let _ = directory.sync_all();
+    }
     Ok(written)
 }
 
-/// Open a downloaded backup output file with private permissions before the
-/// first response bytes are written. Existing user-selected output files keep
-/// their existing permissions when overwritten.
-fn private_output_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    options.open(path)
+/// Atomic replacement still requires permission to write an existing regular
+/// file. Opening without create or truncate checks OS permissions and ACLs
+/// without changing the archive before the response is complete.
+fn checked_output_permissions(dest: &Path) -> Result<Option<std::fs::Permissions>> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(None),
+        Ok(metadata) if metadata.is_file() => {
+            let probe = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dest)
+                .with_context(|| {
+                    format!(
+                        "checking output file write permission for {}",
+                        dest.display()
+                    )
+                })?;
+            drop(probe);
+            Ok(Some(metadata.permissions()))
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            anyhow::bail!("output path is a directory: {}", dest.display());
+        }
+        Ok(_) => anyhow::bail!("output path is not a regular file: {}", dest.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("reading output file permissions"),
+    }
+}
+
+/// Download beside the destination so publication is an atomic rename on the
+/// same filesystem. NamedTempFile removes an incomplete response on every exit.
+fn private_output_file(path: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(".ai-memory-download.")
+        .tempfile_in(output_parent(path))
+}
+
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[cfg(test)]
@@ -592,6 +656,19 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn output_write_permission_probe_never_truncates_existing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("backup.tar.gz");
+        std::fs::write(&output, b"previous usable archive").unwrap();
+        assert!(
+            super::checked_output_permissions(&output)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous usable archive");
+    }
+
     #[cfg(unix)]
     #[test]
     fn downloaded_backup_output_is_private_when_created() {
@@ -599,9 +676,13 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("backup.tar.gz");
-        private_output_file(&output).unwrap();
+        let temporary = private_output_file(&output).unwrap();
+        assert!(
+            !output.exists(),
+            "download is not published before completion"
+        );
         assert_eq!(
-            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            temporary.as_file().metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
@@ -899,21 +980,17 @@ mod tests {
     // Server reachability probe
     // ----------------------------------------------------------------
 
-    /// Bind a loopback listener, capture its address, and release it: the
-    /// next connection to that address is refused. Rebinding races exist on
-    /// loopback but are vanishingly rare under a test load.
-    async fn closed_port_endpoint() -> ServerEndpoint {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        ServerEndpoint::from_pair(Some(format!("http://{address}")), None)
+    /// Keep a listener bound and close every accepted connection so parallel
+    /// tests cannot reuse an allegedly closed ephemeral port.
+    fn no_answer_endpoint() -> ServerEndpoint {
+        ServerEndpoint::from_pair(Some(ai_memory_test_support::dead_http_endpoint()), None)
     }
 
     #[tokio::test]
-    async fn probe_reports_a_closed_port_as_unreachable_with_the_diagnosis() {
-        let endpoint = closed_port_endpoint().await;
+    async fn probe_reports_an_accept_then_close_peer_as_unreachable_with_the_diagnosis() {
+        let endpoint = no_answer_endpoint();
         let ServerProbe::Unreachable(error) = probe_server(&endpoint).await else {
-            panic!("a closed port must be Unreachable");
+            panic!("a peer that closes before responding must be Unreachable");
         };
         let url = endpoint.build_url("/workstream/runs");
         let augmented = augment_connect_error(error, &endpoint, &url);

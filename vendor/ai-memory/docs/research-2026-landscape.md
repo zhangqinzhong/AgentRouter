@@ -843,9 +843,14 @@ it composes with R5 (the cross-session abstraction pass produces good
 L1 summaries) rather than competing with it. **Partly realized on 2.4:**
 extractive tier-down (A2, #808) already persists the L0 abstract + L1
 summary + L2 keep-token shape for cold episodic pages
-([`design-memory-aging.md`](design-memory-aging.md)); the remaining R7 work
-is the *tiered on-start brief* that leads with abstracts, still a design
-doc before code. Directory-scoped retrieval
+([`design-memory-aging.md`](design-memory-aging.md)). The *tiered on-start
+brief* landed after 3.0
+([`design-tiered-session-brief.md`](design-tiered-session-brief.md)): every
+core page gets an extractive L0 excerpt (`abstract:`, else `summary:`, else
+the prose it opens with), and the leftover budget buys L1 excerpts and whole
+bodies, pinned and `_slots/` pages first, with crowded `_rules/` excerpts
+under one heading (Letta-code MemFS's directory deferral, done at render
+time). It needs no LLM, no new tool and no migration. Directory-scoped retrieval
 (OpenViking's subtree filters, which replaced its TrieHI recursion in
 v0.4.23) is the lower-priority half: a path-prefix filter
 on `memory_query` within a project, worth noting but not scheduling

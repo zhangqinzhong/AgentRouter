@@ -1,5 +1,12 @@
 import {
-  cn, parseStatusBucketDate, UsageSeriesPoint, UsageStatsRange, UsageStatsSnapshot, useAppText, useMemo
+  cn,
+  parseStatusBucketDate,
+  UsageSeriesPoint,
+  UsageStatsRange,
+  UsageStatsSnapshot,
+  useAppText,
+  useMemo,
+  useState,
 } from "../shared/index";
 import { UsageTrendLineChart } from "./usage-trend-line";
 
@@ -22,7 +29,10 @@ function overviewTrendRangeDays(range: UsageStatsRange): number {
 
 // Preserve the calendar date of every hour: yesterday and today can contain
 // the same clock hour in a rolling window and must never be merged.
-export function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boolean): TrendRow[] {
+export function adaptSeriesToTrendRows(
+  series: UsageSeriesPoint[],
+  hourly: boolean,
+): TrendRow[] {
   const byKey = new Map<string, TrendRow>();
   for (const point of series) {
     const date = parseStatusBucketDate(point.bucket);
@@ -38,11 +48,14 @@ export function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boole
     const requests = point.requestCount || 0;
     if (existing) {
       existing.total_tokens = Number(existing.total_tokens ?? 0) + tokens;
-      existing.billable_total_tokens = Number(existing.billable_total_tokens ?? 0) + tokens;
+      existing.billable_total_tokens =
+        Number(existing.billable_total_tokens ?? 0) + tokens;
       existing.total_cost_usd = Number(existing.total_cost_usd ?? 0) + cost;
       existing.total_requests = Number(existing.total_requests ?? 0) + requests;
       if (point.models) {
-        const models = { ...(existing.models as Record<string, number> | undefined) };
+        const models = {
+          ...(existing.models as Record<string, number> | undefined),
+        };
         for (const [model, value] of Object.entries(point.models)) {
           models[model] = (models[model] ?? 0) + value;
         }
@@ -64,14 +77,19 @@ export function adaptSeriesToTrendRows(series: UsageSeriesPoint[], hourly: boole
   return [...byKey.values()];
 }
 
-export function overviewTrendFromTo(series: UsageSeriesPoint[], range: UsageStatsRange, now: Date = new Date()): { from: string; to: string } {
+export function overviewTrendFromTo(
+  series: UsageSeriesPoint[],
+  range: UsageStatsRange,
+  now: Date = new Date(),
+): { from: string; to: string } {
   const days = overviewTrendRangeDays(range);
   const to = new Date(now);
   const from = new Date(to);
   if (range === "today" || range === "24h") {
     if (range === "today") from.setHours(0, 0, 0, 0);
     else from.setTime(to.getTime() - 24 * 60 * 60 * 1000);
-    const hourKey = (date: Date) => `${overviewTrendDayKey(date)}T${String(date.getHours()).padStart(2, "0")}:00:00`;
+    const hourKey = (date: Date) =>
+      `${overviewTrendDayKey(date)}T${String(date.getHours()).padStart(2, "0")}:00:00`;
     return { from: hourKey(from), to: hourKey(to) };
   }
   from.setDate(from.getDate() - (days - 1));
@@ -84,30 +102,57 @@ export function overviewTrendFromTo(series: UsageSeriesPoint[], range: UsageStat
     from.setTime(Math.min(...parsedDays.map((date) => date.getTime())));
     to.setTime(Math.max(...parsedDays.map((date) => date.getTime())));
   } else if (parsedDays.length > 0 && days > 1) {
-    from.setTime(Math.min(from.getTime(), ...parsedDays.map((date) => date.getTime())));
-    to.setTime(Math.max(to.getTime(), ...parsedDays.map((date) => date.getTime())));
+    from.setTime(
+      Math.min(from.getTime(), ...parsedDays.map((date) => date.getTime())),
+    );
+    to.setTime(
+      Math.max(to.getTime(), ...parsedDays.map((date) => date.getTime())),
+    );
   }
   return { from: overviewTrendDayKey(from), to: overviewTrendDayKey(to) };
 }
 
 export function UsageTrendSection({
   usageRange,
-  usageStats
+  usageStats,
 }: {
   usageRange: UsageStatsRange;
   usageStats: UsageStatsSnapshot;
 }) {
   const t = useAppText();
+  const [metric, setMetric] = useState<"tokens" | "cost">("tokens");
   const period = overviewTrendPeriod(usageRange);
   const rows = useMemo(
     () => adaptSeriesToTrendRows(usageStats.series, period === "day"),
-    [period, usageStats.series]
+    [period, usageStats.series],
   );
-  const { from, to } = useMemo(() => overviewTrendFromTo(usageStats.series, usageRange, new Date(usageStats.generatedAt)), [usageRange, usageStats.series, usageStats.generatedAt]);
+  const { from, to } = useMemo(
+    () =>
+      overviewTrendFromTo(
+        usageStats.series,
+        usageRange,
+        new Date(usageStats.generatedAt),
+      ),
+    [usageRange, usageStats.series, usageStats.generatedAt],
+  );
 
   return (
     <section>
-      <h2 className={cn("mb-3 text-sm font-medium")}>{t("Usage Trend")}</h2>
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className={cn("text-sm font-medium")}>{t("Usage Trend")}</h2>
+        <div className="flex gap-1 rounded-lg bg-muted p-1">
+          {(["tokens", "cost"] as const).map((value) => (
+            <button
+              key={value}
+              aria-pressed={metric === value}
+              onClick={() => setMetric(value)}
+              className={`rounded-md px-3 py-1 text-xs ${metric === value ? "bg-background shadow-sm" : ""}`}
+            >
+              {value === "tokens" ? "Token" : t("Estimated cost")}
+            </button>
+          ))}
+        </div>
+      </div>
       <UsageTrendLineChart
         from={from}
         loading={false}
@@ -115,6 +160,8 @@ export function UsageTrendSection({
         period={period}
         rows={rows}
         showHeader={false}
+        size="overview"
+        metric={metric}
         to={to}
       />
     </section>

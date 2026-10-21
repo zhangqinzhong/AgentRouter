@@ -363,10 +363,21 @@
               version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
               src = ./.;
-              cargoLock.lockFile = ./Cargo.lock;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+                outputHashes = {
+                  "zip-8.6.0" = "sha256-TrN48XjjyMcZ3f6VF2eTMQDPqwzzH2QYavQaOUkolQA=";
+                };
+              };
 
               # No nativeBuildInputs needed — the build is fully self-contained
               # (SQLite bundled, libgit2 vendored, rustls with webpki-roots).
+              #
+              # The binary is deliberately NOT wrapped (wrapProgram renames it
+              # to `.ai-memory-wrapped`, which hides a running server from the
+              # live-process guard that matches the process name `ai-memory`).
+              # Commands that shell out to `git` find it on PATH; the NixOS
+              # module adds git to the service's PATH.
 
               # Skip the Tailwind CLI download in the sandbox. The build script
               # falls back to the vendored static/tailwind.css committed to the

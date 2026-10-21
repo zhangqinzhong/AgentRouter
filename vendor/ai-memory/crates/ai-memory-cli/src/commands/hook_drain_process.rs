@@ -118,6 +118,7 @@ pub enum BackfillTarget<'a> {
 pub fn backfill_command_spec(
     data_dir: &Path,
     target: BackfillTarget<'_>,
+    inflight_claim: &str,
 ) -> io::Result<DrainCommandSpec> {
     let (flag, value) = match target {
         BackfillTarget::ServerUrl(url) => ("--server-url", url),
@@ -131,6 +132,8 @@ pub fn backfill_command_spec(
             OsString::from("backfill"),
             OsString::from("--auto"),
             OsString::from("--quiet"),
+            OsString::from("--inflight-claim"),
+            OsString::from(inflight_claim),
             OsString::from(flag),
             OsString::from(value),
         ],
@@ -141,8 +144,12 @@ pub fn backfill_command_spec(
 
 /// Spawn the detached one-time boot backfill without inheriting hook stdio.
 /// Best-effort: a spawn failure must never break session start.
-pub fn spawn_backfill(data_dir: &Path, target: BackfillTarget<'_>) -> io::Result<()> {
-    let spec = backfill_command_spec(data_dir, target)?;
+pub fn spawn_backfill(
+    data_dir: &Path,
+    target: BackfillTarget<'_>,
+    inflight_claim: &str,
+) -> io::Result<()> {
+    let spec = backfill_command_spec(data_dir, target, inflight_claim)?;
     spawn_spec(&spec)
 }
 
@@ -383,27 +390,37 @@ mod tests {
     }
 
     /// The backfill goes where the hook resolved, and a profile travels as a
-    /// name only — the worker reads its token from the data dir.
+    /// name only — the worker reads its server credential from the data dir.
     #[test]
-    fn backfill_carries_the_hooks_target_and_no_token() {
+    fn backfill_carries_the_hooks_target_and_no_bearer() {
         let tmp = tempfile::tempdir().unwrap();
-        let default =
-            backfill_command_spec(tmp.path(), BackfillTarget::ServerUrl("https://a.example"))
-                .unwrap();
+        let default = backfill_command_spec(
+            tmp.path(),
+            BackfillTarget::ServerUrl("https://a.example"),
+            "11111111222243338444555555555555",
+        )
+        .unwrap();
         assert_eq!(
             &default.args[2..],
             [
                 "backfill",
                 "--auto",
                 "--quiet",
+                "--inflight-claim",
+                "11111111222243338444555555555555",
                 "--server-url",
                 "https://a.example"
             ]
             .map(OsString::from)
         );
-        let profile = backfill_command_spec(tmp.path(), BackfillTarget::Profile("team-b")).unwrap();
+        let profile = backfill_command_spec(
+            tmp.path(),
+            BackfillTarget::Profile("team-b"),
+            "11111111222243338444555555555555",
+        )
+        .unwrap();
         assert_eq!(
-            &profile.args[5..],
+            &profile.args[7..],
             ["--server-profile", "team-b"].map(OsString::from)
         );
         assert!(profile.live_token.is_none());

@@ -310,6 +310,10 @@ in
           after = if isLoopback then [ "network.target" ] else [ "network-online.target" ];
           wants = lib.optionals (!isLoopback) [ "network-online.target" ];
           wantedBy = [ "multi-user.target" ];
+          # The package binary is not wrapped (a wrapper renames the process
+          # and blinds the live-process guard), so the git it shells out to
+          # comes from the unit's PATH.
+          path = [ pkgs.git ];
 
           serviceConfig = lib.mkMerge [
             {

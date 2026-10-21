@@ -495,6 +495,59 @@ async function resolveGrokAccessToken({
   };
 }
 
+// Billing product ids → the name grok.com shows in the usage legend.
+// Unknown ids are humanized below so a new product still gets a row.
+const GROK_PRODUCT_LABELS = new Map([
+  ["GrokBuild", "Grok Build"],
+  ["GrokBot", "Grok Bot"],
+  ["GrokChat", "Chat"],
+  ["GrokImagine", "Imagine"],
+  ["Cursor", "Cursor"],
+]);
+
+function normalizeGrokProductId(value) {
+  if (typeof value !== "string") return null;
+  const id = value.trim();
+  if (!/^[A-Za-z][A-Za-z0-9]{0,31}$/.test(id)) return null;
+  return id;
+}
+
+function humanizeGrokProductId(productId) {
+  const spaced = productId
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return spaced.slice(0, 40) || null;
+}
+
+/**
+ * Per-product shares of the same pool as creditUsagePercent.
+ * A 12% Grok Bot row is 12 points of the weekly cap, not its own 100% quota.
+ * Zero and non-finite rows are omitted (grok.com hides unused products).
+ * API order is preserved; a repeated product id keeps the first finite row.
+ */
+function normalizeGrokProductUsage(productUsage, resetAt) {
+  if (!Array.isArray(productUsage)) return [];
+  const seen = new Set();
+  const products = [];
+  for (const entry of productUsage) {
+    if (!entry || typeof entry !== "object") continue;
+    const product = normalizeGrokProductId(entry.product);
+    if (!product || seen.has(product)) continue;
+    const raw = Number(entry.usagePercent);
+    if (!Number.isFinite(raw) || raw <= 0) continue;
+    const window = buildWindow({ usedPercent: raw, resetAt });
+    if (!window || !(window.used_percent > 0)) continue;
+    const label = GROK_PRODUCT_LABELS.get(product) || humanizeGrokProductId(product);
+    if (!label) continue;
+    seen.add(product);
+    products.push({ product, label, window });
+  }
+  return products;
+}
+
 /**
  * Parse either:
  *   - Unified billing (`?format=credits`): weekly/monthly period + creditUsagePercent
@@ -578,6 +631,8 @@ function normalizeGrokBillingResponse(body) {
     billing_period_start: periodStart,
     primary_window: primaryWindow,
     secondary_window: secondaryWindow,
+    // Shares of primary_window. Do not add these on top of credit_usage_percent.
+    products: normalizeGrokProductUsage(config.productUsage, resetAt),
   };
 }
 
@@ -734,6 +789,7 @@ module.exports = {
   normalizeGrokPeriodType,
   inferGrokPeriodTypeFromDates,
   sumProductUsagePercent,
+  normalizeGrokProductUsage,
   normalizeGrokBillingResponse,
   fetchGrokBilling,
   fetchGrokLimits,

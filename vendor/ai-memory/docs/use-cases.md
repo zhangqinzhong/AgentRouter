@@ -3,8 +3,11 @@
 > Moved verbatim from the README front page; the scenarios and walkthroughs are unchanged.
 
 - **"Quit Claude Code and continue the same work in Codex."** Use the optional
-  managed launcher when you want native session resume plus the portable visible
-  history, not only a summary handoff:
+  managed launcher when you want native session resume plus portable visible
+  history, not only a summary handoff. On a real harness switch the launcher
+  also gives the receiving child a private local history dossier through
+  `AI_MEMORY_PREVIOUS_SESSION_HISTORY`, so "continue from where we left off"
+  can recover exact visible details omitted by the bounded startup packet:
 
   ```bash
   cd /path/to/project
@@ -38,6 +41,13 @@
   # `memory_handoff_cancel` needs to clear a stale one.
   ai-memory handoffs
   ```
+
+  The dossier is produced by the previous harness's checkout-validated,
+  read-only adapter, is marked as untrusted historical data, and is deleted
+  when the managed child exits. Its path and contents never go to the server.
+  Hidden reasoning and unsupported/private native records remain excluded. If
+  the prior native store lives on another machine or was removed, the portable
+  server ledger and handoff remain the fallback.
 
 - **"Pick the project instead of remembering where it lives."** Start from a
   directory containing your checkouts and choose the checkout before the
@@ -126,8 +136,8 @@
 - **"What did we decide about X six weeks ago?"** Use `memory_query X` from
   the agent for FTS5 fused with entity matches and linked-page expansion (plus
   vector similarity when an embedder is configured). For a quick terminal-only
-  FTS5 lookup, use `ai-memory search X`; that admin command does not run the
-  hybrid streams. Pages are
+  FTS5 lookup, use `ai-memory search X` (add `--global` to search every
+  project); that admin command does not run the hybrid streams. Pages are
   LLM-consolidated, so the hit is a coherent decision page, not a raw
   chat log. Pass `explain: true` to see why each hit ranked where it
   did in project or explicit-scope retrieval. Cross-project

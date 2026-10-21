@@ -653,13 +653,19 @@ impl Bootstrap {
                 .iter()
                 .map(|req| (&req.path, req.body.as_str(), &req.frontmatter))
                 .collect();
-            crate::link_guard::unresolved_cross_scope_links(&self.reader, cfg.workspace_id, &pages)
-                .await?
+            crate::link_guard::unresolved_generated_links(
+                &self.reader,
+                cfg.workspace_id,
+                cfg.project_id,
+                &pages,
+            )
+            .await?
         };
         if !unresolved.is_empty() {
             for req in &mut requests {
-                req.body =
-                    crate::link_guard::delink_body(&req.body, &req.path, &unresolved).into_owned();
+                req.body = crate::link_guard::delink_body(&req.body, &req.path, &unresolved.body)
+                    .into_owned();
+                crate::link_guard::prune_relations(&mut req.frontmatter, &unresolved.relations);
             }
         }
 

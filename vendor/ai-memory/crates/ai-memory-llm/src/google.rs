@@ -9,7 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::embedding::{Embedder, normalise};
+use crate::embedding::{Embedder, normalise, retry_delay};
 use crate::error::{LlmError, LlmResult};
 use crate::response::{provider_error_body, response_json_limited};
 
@@ -38,6 +38,7 @@ impl GoogleEmbedder {
     /// Propagates HTTP client construction errors.
     pub fn new(api_key: SecretString, model: impl Into<String>, dim: u32) -> LlmResult<Self> {
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .timeout(Duration::from_secs(120))
             .build()?;
         let model = normalize_model_id(model.into());
@@ -85,6 +86,7 @@ impl GoogleEmbedder {
 
         debug!(url, model = %self.model, ?task_type, "POST google/embedContent");
         let mut attempt = 0u32;
+        let mut waited = Duration::ZERO;
         loop {
             let resp = self
                 .client
@@ -94,13 +96,15 @@ impl GoogleEmbedder {
                 .send()
                 .await?;
             let status = resp.status();
-            if status.as_u16() == 429 && attempt < 5 {
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+            if let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) {
                 attempt += 1;
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
+                waited += delay;
                 debug!(
                     attempt,
                     ?delay,
-                    "google embedContent rate-limited; retrying"
+                    status = status.as_u16(),
+                    "google embedContent 429/503; retrying"
                 );
                 tokio::time::sleep(delay).await;
                 continue;

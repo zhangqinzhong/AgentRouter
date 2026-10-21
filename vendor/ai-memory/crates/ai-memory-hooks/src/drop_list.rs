@@ -194,6 +194,25 @@ mod tests {
             serde_json::json!({ "session_id": "s", "tool_name": "read_file", "tool_use_id": "call_3" }),
         );
         assert!(!list.matches(&muse_kept));
+        // CodeBuddy Code sends Claude Code's `tool_name` / `tool_use_id`.
+        let codebuddy = agent_event(
+            "codebuddy",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "Read", "tool_input": { "file_path": "a" }, "tool_use_id": "plugin-4" }),
+        );
+        assert!(list.matches(&codebuddy));
+        let codebuddy_by_name = agent_event(
+            "codebuddy",
+            "pre-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "noisy_poll", "tool_use_id": "toolu_4" }),
+        );
+        assert!(list.matches(&codebuddy_by_name));
+        let codebuddy_kept = agent_event(
+            "codebuddy",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "Read", "tool_use_id": "toolu_4" }),
+        );
+        assert!(!list.matches(&codebuddy_kept));
         // Controls: the same agents with ordinary ids and names stay.
         let kept = agent_event(
             "opencode",

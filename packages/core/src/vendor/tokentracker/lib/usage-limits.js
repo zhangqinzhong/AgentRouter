@@ -729,6 +729,33 @@ function normalizeCursorUsageSummary(body) {
   };
 }
 
+/**
+ * Cursor's Sand "Grok Bot" RPC reports the shared Super weekly pool (same
+ * reset and about the same percent as Grok billing's creditUsagePercent).
+ * Once the Grok card lists a Grok Bot product share, that Sand bar would
+ * show the whole pool a second time under Cursor. Hide it only in that
+ * case. A real separate Sand quota (different reset, or a percent more than
+ * a point away from the pool) stays. Accounts with no Grok Bot product row
+ * keep the Sand bar.
+ */
+function cursorSandDuplicatesGrokPool(cursor, grok) {
+  const sand = cursor?.quaternary_window;
+  const pool = grok?.primary_window;
+  if (!sand || !pool || cursor?.error || grok?.error) return false;
+  const products = Array.isArray(grok.products) ? grok.products : [];
+  if (!products.some((entry) => entry?.product === "GrokBot" && entry.window)) return false;
+  const sandReset = Date.parse(sand.reset_at || "");
+  const poolReset = Date.parse(pool.reset_at || "");
+  // Same instant. Two seconds covers one side dropping milliseconds.
+  // A different billing window is days apart, so it still stays visible.
+  if (!Number.isFinite(sandReset) || !Number.isFinite(poolReset)) return false;
+  if (Math.abs(sandReset - poolReset) > 2000) return false;
+  const sandPct = Number(sand.used_percent);
+  const poolPct = Number(pool.used_percent);
+  if (!Number.isFinite(sandPct) || !Number.isFinite(poolPct)) return false;
+  return Math.abs(sandPct - poolPct) <= 1;
+}
+
 function normalizeCursorSandUsageStatus(body, { eligible = true } = {}) {
   if (!eligible || !body || body.includedLimitZero === true) return null;
   const usedPercent = clampPercent(body.usagePercent);
@@ -4215,11 +4242,15 @@ async function fetchUsageLimitsUncached({
       : { configured: true, error: reason?.message || "Unknown error" };
   }
 
+  const cursorLimits = cursorSandDuplicatesGrokPool(cursor, grok)
+    ? { ...cursor, quaternary_window: null }
+    : cursor;
+
   const data = {
     fetched_at: new Date(nowMs).toISOString(),
     claude: withPlanLabel(claude, claudePlanType, "Claude"),
     codex: withPlanLabel(codex, codex.plan_type, "Codex"),
-    cursor: withPlanLabel(cursor, cursor.membership_type, "Cursor"),
+    cursor: withPlanLabel(cursorLimits, cursorLimits.membership_type, "Cursor"),
     // Kimi's subType (TYPE_PURCHASE/TYPE_EVENT) is the credit *source*, not a plan
     // tier, and membership.level is an opaque enum (LEVEL_INTERMEDIATE) with no
     // authoritative human-readable plan mapping. Both rendered as garbage like
@@ -4307,6 +4338,7 @@ module.exports = {
   fetchKimiLimits,
   normalizeCursorUsageSummary,
   normalizeCursorSandUsageStatus,
+  cursorSandDuplicatesGrokPool,
   normalizeGeminiQuotaResponse,
   normalizeKimiUsageResponse,
   parseKiroUsageOutput,

@@ -130,6 +130,11 @@ pub struct AbArgs {
     /// published runs use 1215.
     #[arg(long)]
     generated_seed: Option<u64>,
+
+    /// Compare the byte-compatible default request on the baseline side with
+    /// the opt-in verbatim-residue request on the candidate side.
+    #[arg(long)]
+    residue: bool,
 }
 
 /// JSON shape of an eval fixture file. We only care about
@@ -178,6 +183,8 @@ struct CaseRun {
 struct FixtureReport {
     fixture: String,
     projection: PromptFidelity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_projection: Option<PromptFidelity>,
     baseline: Vec<CaseRun>,
     candidate: Vec<CaseRun>,
 }
@@ -195,6 +202,7 @@ struct AbReport {
     runs: u32,
     generated_seed: Option<u64>,
     generated_sha256: Option<String>,
+    verbatim_residue_ab: bool,
     baseline: SideMeta,
     candidate: SideMeta,
     fixtures: Vec<FixtureReport>,
@@ -269,16 +277,30 @@ pub async fn run(args: AbArgs) -> Result<()> {
         println!("→ {} ({} observations)", fx.name, fx.observations.len());
         let observations = synthesise_observations(&fx);
         let session_id = SessionId::new();
-        let request = build_batch_request(session_id, &observations);
-        let scorer = Scorer::new(
+        let baseline_request = build_batch_request(session_id, &observations, false);
+        let candidate_request = build_batch_request(session_id, &observations, args.residue);
+        let baseline_scorer = Scorer::new(
             session_id,
             &observations,
-            &request,
+            &baseline_request,
             &fx.must_mention,
             &fx.must_not_mention,
         );
-        let projection = scorer.prompt(observations.len());
+        let candidate_scorer = Scorer::new(
+            session_id,
+            &observations,
+            &candidate_request,
+            &fx.must_mention,
+            &fx.must_not_mention,
+        );
+        let projection = baseline_scorer.prompt(observations.len());
+        let candidate_projection = args
+            .residue
+            .then(|| candidate_scorer.prompt(observations.len()));
         println!("  projection: {}", describe_projection(&projection));
+        if let Some(candidate) = &candidate_projection {
+            println!("  + residue: {}", describe_projection(candidate));
+        }
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -287,12 +309,19 @@ pub async fn run(args: AbArgs) -> Result<()> {
         std::fs::create_dir_all(run_dir.join("requests"))?;
         std::fs::write(
             run_dir.join("requests").join(format!("{stem}.txt")),
-            request_text(&request),
+            request_text(&baseline_request),
         )?;
+        if args.residue {
+            std::fs::write(
+                run_dir.join("requests").join(format!("{stem}.residue.txt")),
+                request_text(&candidate_request),
+            )?;
+        }
 
         let mut report = FixtureReport {
             fixture: fx.name.clone(),
             projection,
+            candidate_projection,
             baseline: Vec::new(),
             candidate: Vec::new(),
         };
@@ -300,8 +329,16 @@ pub async fn run(args: AbArgs) -> Result<()> {
             // Run both providers concurrently per fixture so a slow one
             // doesn't double the wall-clock.
             let (a_res, b_res) = tokio::join!(
-                run_one(baseline_provider.clone(), "baseline", request.clone()),
-                run_one(candidate_provider.clone(), "candidate", request.clone()),
+                run_one(
+                    baseline_provider.clone(),
+                    "baseline",
+                    baseline_request.clone()
+                ),
+                run_one(
+                    candidate_provider.clone(),
+                    "candidate",
+                    candidate_request.clone()
+                ),
             );
             let case_stem = if args.runs > 1 {
                 format!("{stem}.r{run}")
@@ -309,7 +346,13 @@ pub async fn run(args: AbArgs) -> Result<()> {
                 stem.clone()
             };
             let a = persist_case(
-                "baseline", &fx.name, &case_stem, run, &run_dir, a_res, &scorer,
+                "baseline",
+                &fx.name,
+                &case_stem,
+                run,
+                &run_dir,
+                a_res,
+                &baseline_scorer,
             )?;
             let b = persist_case(
                 "candidate",
@@ -318,7 +361,7 @@ pub async fn run(args: AbArgs) -> Result<()> {
                 run,
                 &run_dir,
                 b_res,
-                &scorer,
+                &candidate_scorer,
             )?;
             for case in [&a, &b] {
                 println!(
@@ -345,6 +388,7 @@ pub async fn run(args: AbArgs) -> Result<()> {
         runs: args.runs,
         generated_seed: args.generated_seed,
         generated_sha256,
+        verbatim_residue_ab: args.residue,
         baseline: SideMeta {
             provider: baseline.provider_name().to_string(),
             model: baseline.model.clone(),
@@ -790,6 +834,15 @@ pub(crate) fn describe_projection(p: &PromptFidelity) -> String {
     }
     if let Some(r) = p.recall_prompt {
         let _ = write!(out, "  recall_prompt {r:.3}");
+    }
+    if let Some(coverage) = p.error_line_observation_coverage {
+        let _ = write!(out, "  error_obs {coverage:.3}");
+    }
+    if let Some(share) = p.file_error_line_share {
+        let _ = write!(out, "  file_error_share {share:.3}");
+    }
+    if !p.must_not_mention_hits.is_empty() {
+        let _ = write!(out, "  forbidden {:?}", p.must_not_mention_hits);
     }
     out
 }

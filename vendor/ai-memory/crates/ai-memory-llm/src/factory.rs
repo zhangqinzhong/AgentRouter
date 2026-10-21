@@ -384,8 +384,12 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
     match config.provider {
         ProviderChoice::Anthropic => {
             let key = config.auth.require_api_key()?;
+            let mut provider = AnthropicProvider::new(key, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
             Ok(Arc::new(
-                AnthropicProvider::new(key, config.model)?
+                provider
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers),
@@ -393,8 +397,12 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         }
         ProviderChoice::OpenAi => {
             let key = config.auth.require_api_key()?;
+            let mut provider = OpenAiProvider::new(key, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
             Ok(Arc::new(
-                OpenAiProvider::new(key, config.model)?
+                provider
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers),
@@ -496,6 +504,10 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             }
             Ok(Arc::new(
                 provider
+                    // Go's Chat Completions catalogue supports JSON Schema;
+                    // the wrapper falls back only when a model explicitly
+                    // rejects the parameter or returns an unparsable shape.
+                    .with_strict(true)
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers),

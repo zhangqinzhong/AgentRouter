@@ -108,6 +108,16 @@ questions gained and 3 lost; local embeddings 0.800 → 0.945 on the full set
 of the 2.4 configuration on a 3.0 build needs
 `--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
 
+The apparent stream-off local-embedding drop from the published 2.4 number
+(`0.815`) to the corrected 3.0 number (`0.800`) was investigated in #1263.
+The 19 questions whose hit@5 result differed between the stored pre-3.0 run
+and the corrected 3.0 stream-off run were replayed through the current harness
+with the checksum-verified v2.6.7 release binary. v2.6.7 and 3.0 matched on 18
+of 19; 3.0 gained the remaining hit. In particular, all apparent 3.0 losses
+were also losses on v2.6.7 once sessions were replayed under per-question ids.
+The delta came from the harness correction in `85eb1723`, not a regression in
+the stream-off ranking path, so no product change was warranted.
+
 ### Illustrative sample-20 run (triple + QA-accuracy, NOT a baseline)
 
 Recorded to show the triple + QA columns on a real run. **`--sample 20`, 20

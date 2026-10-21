@@ -1,8 +1,16 @@
 # Design: verbatim residue for the consolidation prompt (#1215)
 
 **Status: design of record (#1216, merged 2026-10-12). The maintainer answered
-Q1 to Q3 in #1215 (§9). The measurement harness of §4 lands first, on its own;
-the mechanism of §3 follows it (§8).**
+Q1 to Q3 in #1215 (§9). The measurement harness landed first in #1233. The
+opt-in mechanism of §3 was implemented on `release/3.1` with its default off;
+the conditional prompt-copy change remains governed by §8.**
+
+The implementation measurement is published in
+[`docs/benchmarks/consolidation-literal-fidelity-2026-10-15.md`](benchmarks/consolidation-literal-fidelity-2026-10-15.md).
+Across three same-model runs, newly visible at-risk facts reached pages above
+the baseline's zero/noise floor while facts already present in both requests
+kept identical recall. The opt-in mechanism therefore passes §4.3; the
+separate prompt-copy change is not implied by that result.
 
 When a session has more observations than the consolidation prompt can carry,
 the projection keeps the highest-scoring 256 and replaces the rest with one

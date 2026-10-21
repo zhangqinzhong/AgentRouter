@@ -61,7 +61,7 @@ test("empty overview shows no-data state and an account setup action", () => {
       usageStats={createEmptyUsageStats("7d")}
     />
   );
-  assert.match(html, /No requests yet/);
+  assert.match(html, /No model usage yet/);
   assert.match(html, /Request success rate/);
   assert.match(html, /Configure account usage/);
   assert.doesNotMatch(html, /data-overview-widget-id/);

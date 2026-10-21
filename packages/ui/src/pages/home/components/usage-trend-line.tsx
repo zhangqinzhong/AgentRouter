@@ -288,6 +288,7 @@ export function UsageTrendLineChart({
  to='',
  size='compact',
  showHeader=true,
+ metric='tokens',
  periods=PERIODS
 }:{
  period:TrendPeriod;
@@ -296,7 +297,8 @@ export function UsageTrendLineChart({
  loading?:boolean;
  from?:string;
  to?:string;
- size?:'compact'|'full';
+ size?:'compact'|'full'|'overview';
+ metric?:'tokens'|'cost';
  showHeader?:boolean;
  periods?:TrendPeriod[];
 }){
@@ -305,9 +307,10 @@ export function UsageTrendLineChart({
  const scrollerRef=useRef<HTMLDivElement>(null);
  const grain=useMemo(()=>trendAxisGrain(period,from,to),[from,period,to]);
  const points=useMemo(()=>completeTrendPoints(rows,period,from,to),[from,period,rows,to]);
- const yTicks=useMemo(()=>trendAxisTicks(Math.max(0,...points.map((point)=>point.tokens)),size==='full'?4:2),[points,size]);
+ const chartPoints=useMemo(()=>points.map(point=>({...point,value:metric==='cost'?Number(point.row.total_cost_usd||0):point.tokens})),[points,metric]);
+ const yTicks=useMemo(()=>trendAxisTicks(Math.max(0,...chartPoints.map(point=>point.value)),size==='compact'?2:4),[chartPoints,size]);
  const yMax=yTicks[yTicks.length-1]||0;
- const height=size==='full'?'h-[min(52vh,520px)] min-h-[320px]':'h-[140px]';
+ const height=size==='overview'?'h-[320px]':size==='full'?'h-[min(52vh,520px)] min-h-[320px]':'h-[140px]';
  const pan=size==='full'&&points.length>14;
  const innerWidth=pan?Math.max(points.length*(grain==='monthly'?64:40),720):undefined;
  const longAxis=period==='custom'||period==='total'||period==='month';
@@ -334,7 +337,7 @@ export function UsageTrendLineChart({
     <div ref={scrollerRef} className={`w-full ${height} ${pan?'overflow-x-auto overflow-y-hidden [scrollbar-width:thin]':''}`}>
      <div className="h-full" style={innerWidth?{width:innerWidth,minWidth:'100%'}:{width:'100%'}}>
       <ResponsiveContainer width="100%" height="100%">
-       <AreaChart data={points} margin={{top:16,right:marginRight,left:0,bottom:4}}>
+       <AreaChart data={chartPoints} margin={{top:16,right:marginRight,left:0,bottom:4}}>
         <defs>
          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={LINE} stopOpacity={0.32}/>
@@ -343,11 +346,11 @@ export function UsageTrendLineChart({
         </defs>
         <CartesianGrid stroke="rgba(128,128,128,0.18)" strokeDasharray="2 5" vertical={false}/>
         <XAxis axisLine={false} dataKey="label" interval="preserveStartEnd" minTickGap={longAxis||pan?24:8} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickLine={false}/>
-        <YAxis allowDecimals={false} axisLine={false} domain={yMax>0?[0,yMax]:[0,1]} fontSize={11} interval={0} padding={{top:0,bottom:8}} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickFormatter={(value)=>formatTokenCount(Number(value)||0)} tickLine={false} ticks={yTicks} width="auto"/>
+        <YAxis allowDecimals={false} axisLine={false} domain={yMax>0?[0,yMax]:[0,1]} fontSize={11} interval={0} padding={{top:0,bottom:8}} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickFormatter={(value)=>metric==='cost'?formatUsdCurrency(Number(value)||0):formatTokenCount(Number(value)||0)} tickLine={false} ticks={yTicks} width="auto"/>
         <Tooltip content={<TrendHoverTooltip grain={grain} period={period}/>} cursor={{stroke:'rgba(60,60,60,0.28)',strokeWidth:1}} wrapperStyle={{zIndex:40,outline:'none'}}/>
         <Area
          activeDot={{r:4,stroke:LINE,fill:LINE,strokeWidth:0}}
-         dataKey="tokens"
+         dataKey="value"
          dot={false}
          fill={`url(#${gradientId})`}
          stroke={LINE}

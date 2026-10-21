@@ -290,6 +290,82 @@ mod slow {
         }
     }
 
+    impl Fixture {
+        /// A CodeBuddy SessionStart, run from inside the project, whose payload
+        /// carries `cwd` only when given one.
+        fn codebuddy_start(&self, cwd: Option<&Path>, project_dir: Option<&Path>) -> Output {
+            let mut cmd = command(self.root.as_path());
+            cmd.args([
+                "hook",
+                "--agent",
+                "codebuddy",
+                "--event",
+                "session-start",
+                "--server-url",
+                &self.base,
+                "--auth-token",
+                TOKEN,
+            ])
+            .env_remove("CODEBUDDY_PROJECT_DIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            if let Some(dir) = project_dir {
+                cmd.env("CODEBUDDY_PROJECT_DIR", dir);
+            }
+            let mut body = json!({"session_id": SessionId::new(), "source": "startup"});
+            if let Some(cwd) = cwd {
+                body["cwd"] = json!(cwd);
+            }
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(body.to_string().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            output
+        }
+    }
+
+    /// Security boundary 6c: a SessionStart that names no directory must not
+    /// claim a handoff. The server would resolve such a claim to its default
+    /// project, here the one holding the baton, so an agent opened anywhere
+    /// else would consume it. The hook process runs inside that project on
+    /// purpose: its own directory is not evidence of where CodeBuddy is.
+    /// Controls: the payload's `cwd`, or `CODEBUDDY_PROJECT_DIR`, claims it.
+    #[tokio::test]
+    async fn codebuddy_start_without_a_directory_leaves_the_default_projects_handoff() {
+        let fixture = Fixture::start().await;
+        let project = fixture.root.as_path().join("project");
+        fixture.seed_handoff().await;
+
+        let unscoped = fixture.codebuddy_start(None, None);
+        let stdout = String::from_utf8_lossy(&unscoped.stdout);
+        assert!(!stdout.contains(MARKER), "unscoped claim: {stdout}");
+        assert!(
+            String::from_utf8_lossy(&unscoped.stderr).contains("memory_handoff_accept"),
+            "{unscoped:?}"
+        );
+
+        let scoped = fixture.codebuddy_start(Some(&project), None);
+        let stdout = String::from_utf8_lossy(&scoped.stdout);
+        assert!(
+            stdout.contains(MARKER),
+            "the handoff must still be open for its own project: {stdout}"
+        );
+        assert!(stdout.contains("additionalContext"), "{stdout}");
+
+        fixture.seed_handoff().await;
+        let from_env = fixture.codebuddy_start(None, Some(&project));
+        assert!(
+            String::from_utf8_lossy(&from_env.stdout).contains(MARKER),
+            "{from_env:?}"
+        );
+    }
+
     #[tokio::test]
     async fn external_capture_preserves_native_handoffs_and_mcp_recall() {
         let fixture = Fixture::start().await;

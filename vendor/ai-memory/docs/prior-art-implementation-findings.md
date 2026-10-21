@@ -31,7 +31,7 @@ The follow-up implementation landed the pragmatic subset of this roadmap:
 |---|---|
 | Slots | `_slots/` pages are pinned automatically and surfaced in briefing/explore snapshots. |
 | Scheduled maintenance | Server-side schedule runs lint and forget sweep daily by default; embedding backfill is opt-in. |
-| Vector contract | Status reports missing embeddings and stored triples; batch writes leave vector completeness to backfill. |
+| Vector contract | Status reports missing embeddings and stored triples; every wiki mutation attempts embeddings after its durable commit, and backfill repairs provider/configuration gaps. |
 | Links / graph | Markdown and wikilinks are parsed into `links`; unresolved forward links resolve when targets appear; query uses graph-neighbor RRF. |
 | Raw fallback | `observations_fts` provides bounded raw fallback when compiled wiki search misses. |
 | Diagnostics | `status` includes FTS row counts, missing embeddings, embedding triples, and unresolved/stale link counts. |
@@ -154,17 +154,18 @@ for keeping scheduled and queued provider work outside hook latency.
 
 ### P0: Clarify And Fix The Vector Indexing Contract
 
-There was a concrete mismatch in the implementation notes: `Wiki`'s
-comment implied `write_page` / `apply_batch` both computed embeddings
-when an embedder was attached, but the code only embedded in
-`write_page`. The comment now states the contract explicitly:
-`apply_batch` keeps SQL/file fan-out atomic and vector completeness is
-owned by admin or scheduled backfill.
+There was a concrete mismatch in the original implementation notes:
+`Wiki`'s comment implied `write_page` / `apply_batch` both computed
+embeddings when an embedder was attached, but only `write_page` did so at
+the time. That gap has since been closed. `write_page`, `apply_batch`,
+auto-improvement approvals, and checkpoint restores all attempt to embed
+each written version after the durable mutation commits and releases its
+guard.
 
-Also, `write_page` logs and continues if the embedder fails. That is a
-reasonable availability tradeoff, but docs and invariants should be
-precise: FTS5/page persistence is transactional; vector completeness is
-best-effort unless a backfill/status mechanism says otherwise.
+Embedding still logs and continues if the provider fails. That is a
+deliberate availability tradeoff: FTS5/page persistence is transactional,
+while vector completeness is best-effort and observable through status and
+repairable through admin or scheduled backfill.
 
 Options evaluated:
 
@@ -174,8 +175,10 @@ Options evaluated:
 | Add `embedding_status` and scheduled backfill | Better availability and observability, slightly more schema/state. |
 | Document vector indexing as optional best-effort | Minimal change, but less trustworthy without visible status. |
 
-The implemented choice is status plus scheduled backfill. It preserves the
-durable FTS path, exposes vector gaps, and keeps backfill opt-in.
+The implemented choice combines mutation-time best-effort embedding with
+status and scheduled backfill. It preserves the durable FTS path, exposes
+vector gaps, and keeps backfill opt-in. Since #1258, backfill covers provider
+failures and configuration changes rather than every page a batch writes.
 
 ### Implemented: Graph/Link Retrieval
 
@@ -316,7 +319,7 @@ These items previously drifted from the code. Their current status is:
 | scheduled maintenance | Fixed: docs describe default scheduled lint/sweep, opt-in embedding backfill, and the independent hollow-project cleanup. |
 | procedural tier | Fixed: consolidation can classify procedural memory, auto-improvement can create or patch bounded `procedures/` pages, and retention preserves semantic/procedural tiers. |
 | SessionEnd consolidation | Fixed: substantive SessionEnd processing writes a deterministic page and handoff; lifecycle-only sessions close without generated artifacts or LLM work and release their session-bound startup handoff. Opt-in LLM work uses a durable retry queue, while PreCompact/manual consolidation remain available. |
-| batch embeddings | Fixed: code comments and status diagnostics now describe batch vector completeness as backfill-owned. |
+| batch embeddings | Fixed: every wiki mutation attempts post-commit embedding; status exposes gaps and backfill repairs provider/configuration misses. |
 
 ## Implemented Roadmap Slice
 

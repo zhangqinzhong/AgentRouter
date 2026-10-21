@@ -235,7 +235,8 @@ timeouts, invalid JSON, `passed = false`, missing `passed`, or score deltas belo
 `min_delta` reject only that targeted proposal. Non-targeted proposals bypass the
 gate. If all proposals fail eval, the run is still staged with zero proposals and
 the rejected candidates so the rejection buffer can remember the failed attempt.
-Hooks never run the eval command. See
+The server owns this executable policy: neither the CLI nor a direct admin
+request can replace it. Hooks never run the eval command. See
 [`auto-improve-eval-gates.md`](auto-improve-eval-gates.md) for the full stdin /
 stdout contract and example scorer scripts.
 
@@ -414,7 +415,9 @@ imply each other.
 rejection-buffer summary included in future reviewer prompts. The buffer is
 scoped by `workspace_id` + `project_id` and stores human rejects, approval
 conflicts/failures, and validator/model rejected candidates when they carry a
-reason.
+reason. An approval that fails because a `reject`-policy admission webhook was
+unreachable, timed out, rate-limited or answered 5xx still marks the proposal
+`failed`, but is not stored: an outage says nothing about the proposal.
 
 ## Proposal Format
 
@@ -469,7 +472,7 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `ai-memory pending-writes diff <id>` | Show markdown diff. |
 | `ai-memory pending-writes approve <id>` | Apply through the normal wiki mutation path. |
 | `ai-memory pending-writes reject <id>` | Discard proposal with audit trail. |
-| `GET {web_slug}/pending` | Root-only browser page. It lists pending proposals across all projects, with a project filter and a sort. Approve and reject post to the `/admin/pending-writes/{id}/approve\|reject` routes with the session cookie and the CSRF header. |
+| `GET {web_slug}/pending` | Root-only browser page. It lists pending proposals across all projects, with a project filter and a sort. Approve and reject post to the `/admin/pending-writes/{id}/approve\|reject` routes with the session cookie and the CSRF header. A browser signed in with the root bearer through HTTP Basic, before password sign-in is set up, can only read: the page shows each proposal's `pending-writes` commands instead of the buttons. |
 
 Pending proposals should be visible as markdown under `_pending/auto-improve/`
 so humans can review them in the wiki/Obsidian workflow. SQLite can still hold
