@@ -7,6 +7,8 @@ import { geminiProviderPreset } from "@agentrouter/core/providers/presets/gemini
 import { minimaxChinaProviderPreset } from "@agentrouter/core/providers/presets/minimax/index.ts";
 import { moonshotGlobalProviderPreset } from "@agentrouter/core/providers/presets/moonshot/index.ts";
 import { qiniuAiProviderPreset } from "@agentrouter/core/providers/presets/qiniu-ai/index.ts";
+import { createProviderDraftFromDeepLinkPayload } from "@agentrouter/ui/pages/home/shared/providers.ts";
+import { getProviderPresets } from "@agentrouter/core/providers/presets/index.ts";
 import { xiaomiMimoProviderPreset } from "@agentrouter/core/providers/presets/xiaomi/index.ts";
 import { AddProviderDialog, AddProviderForm, ProviderConnectivityCheckDialog, ProvidersView, localAgentProviderAlreadyImported, localAgentProviderPluginSuffixesForCandidate, uniqueProviderProbeProtocolRows } from "@agentrouter/ui/pages/home/components/providers.tsx";
 import {
@@ -1716,3 +1718,19 @@ function providerInstallLinkPayload(link) {
   const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
   return JSON.parse(new TextDecoder().decode(bytes));
 }
+
+
+test("Xiaomi preset deep links use current default IDs without replacing explicit custom lists", () => {
+  const presets = getProviderPresets().filter((preset) => preset.id === "xiaomi" || preset.id.startsWith("xiaomi-token-plan-"));
+  setProviderPresets(presets);
+  assert.equal(presets.length, 4);
+  for (const preset of presets) {
+    for (const endpoint of preset.endpoints) {
+      const draft = createProviderDraftFromDeepLinkPayload({ baseUrl: endpoint.baseUrl, models: [] }, []);
+      assert.equal(draft.presetId, preset.id);
+      assert.equal(draft.modelsText, "mimo-v2.6-pro\nmimo-v2.6-flash");
+      const explicit = createProviderDraftFromDeepLinkPayload({ baseUrl: endpoint.baseUrl, models: ["custom-model"] }, []);
+      assert.equal(explicit.modelsText, "custom-model");
+    }
+  }
+});
