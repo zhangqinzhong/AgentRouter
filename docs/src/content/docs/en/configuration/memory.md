@@ -41,12 +41,22 @@ The flow is `Preview → Install → Inspect`; preview before removing:
 - Removal restores the prior file only if the current postimage still matches; if another tool or user modified it, removal **refuses** rather than overwriting.
 - Clients sharing a config file may need to be removed in reverse installation order.
 - Removing a client never purges stored memory.
+- After the bundled runtime is upgraded, starting memory re-applies hook integrations that AgentRouter still owns and that are unchanged, so they point at the current runtime. Files edited after installation are left alone.
 
 Project-specific adapters (VS Code Copilot, Swival, Kiro v2 custom-agent hooks) require an explicit target and stay available through the bundled CLI instead of guessing a project. A configured entry is not reported as a verified live capture.
 
 ## Capture
 
 Capture is strictly opt-in per project: place an `.ai-memory.toml` with explicit `workspace` and `project` names in a project you want remembered. AgentRouter never writes markers automatically and never enables capture for all repositories. Installed integrations buffer events in native hooks and deliver them at session boundaries plus bounded mid-session drains.
+
+## Model organization
+
+Capture, search and handoffs work without a model. Model organization extracts durable knowledge from sessions and has two sources:
+
+- **AgentRouter provider** (default): pick a model the gateway already serves; requests go through the local AgentRouter gateway. The first save creates a dedicated API key named "AI Memory", whose usage appears as its own caller in Monitoring. Delete the key to revoke access; memory never recreates it.
+- **Custom OpenAI-compatible API**: enter the URL, model and API key manually. A saved key never follows a changed URL or source.
+
+With "Require approval before applying proposed edits" on, proposed changes wait in Advanced maintenance until approved.
 
 ## Semantic search
 

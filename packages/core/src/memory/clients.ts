@@ -105,6 +105,35 @@ export class MemoryClients {
     };
   }
 
+  /**
+   * Hook commands embed the versioned runtime path. After the bundled runtime
+   * changes, re-apply each integration AgentRouter owns whose file is still
+   * our exact postimage, so capture keeps using the running engine. Files the
+   * user changed since installation are left alone.
+   */
+  async refreshRuntime(profiles: ProfileConfig[] = []): Promise<string[]> {
+    const runtimeRoot = path.join(this.dataDir, "runtime") + path.sep;
+    const current = path.dirname(this.runtimeExecutable()) + path.sep;
+    const refreshed: string[] = [];
+    for (const entry of definitions) {
+      if (!entry.hooks) continue;
+      const targets: Array<{ id: string; profile?: ProfileConfig }> = [{ id: "global" }, ...profiles
+        .filter((profile) => profile.enabled && profile.agent === entry.id && (profile.scope === "agentrouter" || profile.scope === "custom"))
+        .map((profile) => ({ id: profile.id, profile }))];
+      for (const target of targets) {
+        const receipt = this.receipt(entry.id, target.id, "hooks");
+        if (!receipt || receipt.path !== this.configPath(entry, "hooks", target.profile)) continue;
+        const bytes = regularRead(receipt.path);
+        if (!bytes || digest(bytes) !== receipt.afterSha256) continue;
+        const text = bytes.toString("utf8");
+        if (!text.includes(runtimeRoot) || text.includes(current)) continue;
+        await this.change(entry.id, target.id, "hooks", "install", profiles);
+        refreshed.push(target.id === "global" ? entry.id : `${entry.id}:${target.id}`);
+      }
+    }
+    return refreshed;
+  }
+
   list(profiles: ProfileConfig[] = []): MemoryClient[] {
     return definitions.filter((entry) => entry.id !== "claude-desktop" || process.platform === "darwin").map((entry) => {
       const global = this.targetFor(entry, "global");

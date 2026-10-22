@@ -219,3 +219,34 @@ test("MiMo schema additions do not invalidate ownership or disappear on removal"
     await assert.rejects(clients.change("xiaomi-mimo", "mcp", "remove"), /changed/);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
+
+test("runtime refresh re-applies owned hook integrations and leaves user-changed files alone", async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "ar-memory-refresh-"));
+  const data = path.join(home, "memory-data");
+  const hooks = path.join(home, ".codex", "hooks.json");
+  let runtime = path.join(data, "runtime", "3.0.0-aaaaaaaaaaaa", "ai-memory");
+  const calls = [];
+  const clients = new MemoryClients(home, data, "http://127.0.0.1:49374", async (args) => {
+    calls.push(args);
+    if (args.includes("--apply")) { mkdirSync(path.dirname(hooks), { recursive: true }); writeFileSync(hooks, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: `${runtime} hook --event session-start` }] }] } })); }
+    return "ok";
+  }, process.env, () => "", () => runtime);
+  try {
+    await clients.change("codex", "global", "hooks", "install");
+    assert.deepEqual(await clients.refreshRuntime(), [], "current runtime needs no refresh");
+    runtime = path.join(data, "runtime", "3.1.2-bbbbbbbbbbbb", "ai-memory");
+    assert.deepEqual(await clients.refreshRuntime(), ["codex"]);
+    assert.match(readFileSync(hooks, "utf8"), /3\.1\.2-bbbbbbbbbbbb/);
+    assert.equal(clients.list().find((c) => c.id === "codex").hooksConfigured, true, "refresh keeps ownership");
+    await clients.change("codex", "global", "hooks", "remove");
+    assert.equal(existsSync(hooks), false, "removal still restores the pre-install state");
+
+    await clients.change("codex", "global", "hooks", "install");
+    writeFileSync(hooks, readFileSync(hooks, "utf8").replace("session-start", "session-start --user-flag"));
+    runtime = path.join(data, "runtime", "3.2.0-cccccccccccc", "ai-memory");
+    const before = calls.length;
+    assert.deepEqual(await clients.refreshRuntime(), []);
+    assert.equal(calls.length, before, "a user-changed file is not rewritten");
+    assert.match(readFileSync(hooks, "utf8"), /--user-flag/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
