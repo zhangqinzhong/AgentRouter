@@ -51,7 +51,7 @@ export function adaptSeriesToTrendRows(
       existing.billable_total_tokens =
         Number(existing.billable_total_tokens ?? 0) + tokens;
       existing.total_cost_usd = Number(existing.total_cost_usd ?? 0) + cost;
-      existing.total_requests = Number(existing.total_requests ?? 0) + requests;
+      existing.recorded_turns = Number(existing.recorded_turns ?? 0) + requests;
       if (point.models) {
         const models = {
           ...(existing.models as Record<string, number> | undefined),
@@ -68,7 +68,7 @@ export function adaptSeriesToTrendRows(
       : { day: dayKey, total_tokens: tokens };
     row.billable_total_tokens = tokens;
     row.total_cost_usd = cost;
-    row.total_requests = requests;
+    row.recorded_turns = requests;
     if (point.models && Object.keys(point.models).length > 0) {
       row.models = { ...point.models };
     }

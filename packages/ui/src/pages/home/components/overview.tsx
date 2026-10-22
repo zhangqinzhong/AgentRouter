@@ -76,7 +76,7 @@ function overviewStatCells(totals: UsageTotals, translate: (value: string) => st
     { label: translate("Recorded turns"), value: formatCompactNumber(totals.requestCount) },
     { label: translate("Total tokens"), title: totals.totalTokens.toLocaleString(), value: formatCompactNumber(totals.totalTokens) },
     { label: translate("Estimated cost"), value: formatUsdCost(totals.costUsd) },
-    { label: translate("Cache ratio"), value: totals.totalTokens > 0 ? formatPercent(totals.cacheRatio) : "—" }
+    { label: translate("Cached input share"), title: translate("Cache read and cache write tokens as a share of all input tokens."), value: totals.totalTokens > 0 ? formatPercent(totals.cacheRatio) : "—" }
   ];
 }
 

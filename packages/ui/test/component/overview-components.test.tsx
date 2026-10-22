@@ -48,7 +48,7 @@ test("OverviewView separates local usage from gateway monitoring", () => {
   assert.doesNotMatch(html, /All providers|Provider Analysis|System status/);
   assert.ok(html.indexOf("Usage Trend") < html.indexOf("Model usage"));
   assert.ok(html.indexOf("Client activity") < html.indexOf("Account Balance"));
-  for (const label of ["Recorded turns", "Total tokens", "Estimated cost", "Cache ratio"]) assert.ok(html.includes(label));
+  for (const label of ["Recorded turns", "Total tokens", "Estimated cost", "Cached input share"]) assert.ok(html.includes(label));
   assert.match(html, /128/);
   assert.match(html, /\$1\.23/);
 });
@@ -438,9 +438,9 @@ test("overview trend adapter carries model breakdown and request counts", () => 
 
   assert.equal(rows.length, 2);
   assert.equal(rows[0].billable_total_tokens, 1000);
-  assert.equal(rows[0].total_requests, 4);
+  assert.equal(rows[0].recorded_turns, 4);
   assert.deepEqual(rows[0].models, { "gpt-5.6-sol": 700, "glm-5.3": 300 });
-  assert.equal(rows[1].total_requests, 2);
+  assert.equal(rows[1].recorded_turns, 2);
   assert.equal(rows[1].models && (rows[1].models as Record<string, number>)["gpt-5.6-sol"], 200);
 });
 
@@ -619,4 +619,34 @@ test("account quota colors follow each remaining allowance, not refresh errors",
     assert.match(html, /bg-emerald-500[^>]*style="width:88%"/);
     assert.match(html, /bg-red-500[^>]*style="width:5%"/);
   }
+});
+
+
+test("trend bucket identity stays unique across months and years with repeated tick labels", () => {
+  const rows = [
+    {day:"2026-03-10",total_tokens:18_126_000,total_cost_usd:8.38,recorded_turns:267},
+    {day:"2026-09-10",total_tokens:885_027_178,total_cost_usd:195.93,recorded_turns:633},
+  ];
+  const daily = completeTrendPoints(rows, "month", "2026-03-07", "2026-10-22");
+  const march = daily.find(p=>p.bucket==="2026-03-10")!;
+  const september = daily.find(p=>p.bucket==="2026-09-10")!;
+  assert.equal(march.label, september.label);
+  assert.equal(september.tokens, 885_027_178);
+  assert.equal(september.row.recorded_turns, 633);
+  assert.equal(new Set(daily.map(p=>p.bucket)).size, daily.length);
+  const monthly = completeTrendPoints(rows, "total", "2025-03-01", "2026-10-22");
+  assert.equal(new Set(monthly.map(p=>p.bucket)).size, monthly.length);
+  assert.equal(monthly.find(p=>p.bucket==="2026-09")?.tokens, 885_027_178);
+});
+
+test("monthly trend preserves counts, costs and model totals when combining daily rows", () => {
+  const rows = [
+    {day:"2026-09-01",total_tokens:10,models:{a:8,b:2},recorded_turns:2,total_cost_usd:0.25},
+    {day:"2026-09-02",total_tokens:20,models:{a:15,b:5},recorded_turns:3,total_cost_usd:0.75},
+  ];
+  const [point] = completeTrendPoints(rows, "total", "2026-09-01", "2026-09-30");
+  assert.equal(point.tokens,30);
+  assert.equal(point.row.recorded_turns,5);
+  assert.equal(point.row.total_cost_usd,1);
+  assert.deepEqual(point.row.models,{a:23,b:7});
 });

@@ -12,6 +12,7 @@ import {localUsageRange} from './local-usage';
 
 export type TrendPeriod='day'|'week'|'month'|'year'|'total'|'custom';
 type TrendRow=Record<string,unknown>;
+type TrendPoint={bucket:string;label:string;tokens:number;row:TrendRow};
 
 const PERIODS:TrendPeriod[]=['day','week','month','year','total','custom'];
 const LINE='#007aff';
@@ -61,11 +62,12 @@ function fillMonthPoints(
  locale:string,
  compact:boolean
 ){
- const points:{label:string;tokens:number;row:TrendRow}[]=[];
+ const points:TrendPoint[]=[];
  for(let cursor=shiftMonths(start,0);cursor<=shiftMonths(end,0);cursor=shiftMonths(cursor,1)){
   const key=monthKey(cursor);
   const row=byMonth.get(key);
   points.push({
+   bucket:key,
    label:compact?compactMonthLabel(key,locale):formatTickLabel({month:key},'monthly',locale),
    tokens:rowTokens(row),
    row:{...(row||{}),month:key}
@@ -103,9 +105,8 @@ function rowTokens(row:TrendRow|undefined){
  return Number.isFinite(value)&&value>0?value:0;
 }
 
-// A rolling window repeats the starting clock hour at the right edge. Recharts
-// looks the tooltip up by that text, so a second "07:00" would resolve to the
-// first point and draw yesterday after today. Date the later copy.
+// Show the date at midnight and on repeated clock hours to make rolling
+// windows readable. Bucket identity is separate from these display labels.
 function rollingHourLabel(date:Date,state:{previousDay:string;seen:Map<string,number>;spanMonths:boolean;locale:string}){
  const clock=`${pad(date.getHours())}:00`;
  const day=dayKey(date);
@@ -124,12 +125,15 @@ function rollingHourLabel(date:Date,state:{previousDay:string;seen:Map<string,nu
 
 function addTokenRows(left:TrendRow|undefined,right:TrendRow):TrendRow{
  if(!left)return right;
- const models={...(left.models&&typeof left.models==='object'?left.models as Record<string,number>:{}),...(right.models&&typeof right.models==='object'?right.models as Record<string,number>:{})};
+ const models={...(left.models&&typeof left.models==='object'?left.models as Record<string,number>:{})};
+ for(const [model,value] of Object.entries(right.models&&typeof right.models==='object'?right.models as Record<string,number>:{}))models[model]=(models[model]||0)+Number(value||0);
  return {
   ...left,
   ...right,
   total_tokens:rowTokens(left)+rowTokens(right),
-  billable_total_tokens:Number(left.billable_total_tokens||0)+Number(right.billable_total_tokens||0),
+  billable_total_tokens:rowTokens(left)+rowTokens(right),
+  total_requests:Number(left.total_requests||0)+Number(right.total_requests||0),
+  recorded_turns:Number(left.recorded_turns||0)+Number(right.recorded_turns||0),
   conversation_count:Number(left.conversation_count||0)+Number(right.conversation_count||0),
   total_cost_usd:Number(left.total_cost_usd||0)+Number(right.total_cost_usd||0),
   models
@@ -161,7 +165,7 @@ export function completeTrendPoints(rows:TrendRow[],period:TrendPeriod,from:stri
  const locale=getCopyLocale();
  const start=parseDay(from)||new Date();
  const end=parseDay(to)||start;
- const points:{label:string;tokens:number;row:TrendRow}[]=[];
+ const points:TrendPoint[]=[];
  if(period==='day'){
   if(from&&from.indexOf('T')>=0){
    // Rolling 24h axis: from/to are tz-local "YYYY-MM-DDTHH:00:00" bounds from
@@ -176,7 +180,7 @@ export function completeTrendPoints(rows:TrendRow[],period:TrendPeriod,from:stri
     const d=new Date(ts);
     const key=`${dayKey(d)}T${pad(d.getHours())}`;
     const row=byHour.get(key);
-    points.push({label:rollingHourLabel(d,hourState),tokens:rowTokens(row),row:row||{hour:`${key}:00:00`}});
+    points.push({bucket:new Date(ts).toISOString(),label:rollingHourLabel(d,hourState),tokens:rowTokens(row),row:row||{hour:`${key}:00:00`}});
    }
    return points;
   }
@@ -184,7 +188,7 @@ export function completeTrendPoints(rows:TrendRow[],period:TrendPeriod,from:stri
   for(let hour=0;hour<24;hour+=1){
    const key=`${day}T${pad(hour)}`;
    const row=byHour.get(key);
-   points.push({label:String(hour),tokens:rowTokens(row),row:row||{hour:`${key}:00:00`,day}});
+   points.push({bucket:key,label:String(hour),tokens:rowTokens(row),row:row||{hour:`${key}:00:00`,day}});
   }
   return points;
  }
@@ -207,7 +211,7 @@ export function completeTrendPoints(rows:TrendRow[],period:TrendPeriod,from:stri
   // Rolling windows start on an arbitrary weekday; derive the label from the
   // actual date instead of a Monday-anchored index.
   const label=period==='week'?copy(`heatmap.day.${WEEKDAYS[(cursor.getDay()+6)%7]||'mon'}`):period==='custom'?formatTickLabel({day:key},'daily',locale):String(cursor.getDate());
-  points.push({label,tokens:rowTokens(row),row:row||{day:key}});
+  points.push({bucket:key,label,tokens:rowTokens(row),row:row||{day:key}});
   cursor=addDays(cursor,1);
  }
  return points;
@@ -229,6 +233,7 @@ function TrendHoverTooltip({
  period:TrendPeriod;
  grain:'hourly'|'daily'|'monthly';
 }){
+ const t=useAppText();
  if(!active||!payload?.[0])return null;
  const point=payload[0].payload;
  const row=point.row;
@@ -238,6 +243,7 @@ function TrendHoverTooltip({
  const cost=row.total_cost_usd;
  const conversations=Number(row.conversation_count)||0;
  const requests=Number(row.total_requests)||0;
+ const turns=Number(row.recorded_turns)||0;
  return (
   <div className="max-w-[280px] min-w-[220px] rounded-xl border border-oai-gray-200/50 bg-white/95 p-3.5 shadow-xl backdrop-blur-md dark:border-oai-gray-800/50 dark:bg-oai-gray-900/95">
    <div className="border-b border-oai-gray-100 pb-1.5 text-[11px] font-semibold text-oai-gray-500 dark:border-oai-gray-800/80 dark:text-oai-gray-400">{timeLabel}</div>
@@ -245,11 +251,12 @@ function TrendHoverTooltip({
     <span className="text-lg font-bold leading-none text-oai-gray-900 dark:text-white" title={formatTokenTooltip(tokens)}>{formatTokenCount(tokens)}</span>
     <span className="text-[10px] font-semibold uppercase tracking-wider text-oai-gray-400">{copy('heatmap.unit.tokens')}</span>
    </div>
-   {(cost!=null||conversations>0||requests>0)&&(
+   {(cost!=null||turns>0||conversations>0||requests>0)&&(
     <div className="mt-2 flex items-center gap-3 text-[11px] text-oai-gray-500 dark:text-oai-gray-400">
-     {cost!=null?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{formatUsdCurrency(cost)}</span> {copy('trend.zoom.tooltip.cost')}</span>:null}
-     {conversations>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{conversations.toLocaleString(getCopyLocale())}</span> {copy('trend.zoom.tooltip.conversations')}</span>:null}
-     {conversations<=0&&requests>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{requests.toLocaleString(getCopyLocale())}</span> {copy('trend.zoom.tooltip.requests')}</span>:null}
+     {cost!=null?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{formatUsdCurrency(cost)}</span> {t('Estimated cost')}</span>:null}
+     {turns>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{turns.toLocaleString(getCopyLocale())}</span> {t('Recorded turns')}</span>:null}
+     {turns<=0&&conversations>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{conversations.toLocaleString(getCopyLocale())}</span> {copy('trend.zoom.tooltip.conversations')}</span>:null}
+     {turns<=0&&conversations<=0&&requests>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{requests.toLocaleString(getCopyLocale())}</span> {copy('trend.zoom.tooltip.requests')}</span>:null}
     </div>
    )}
    {segments.length>0?(
@@ -307,6 +314,7 @@ export function UsageTrendLineChart({
  const scrollerRef=useRef<HTMLDivElement>(null);
  const grain=useMemo(()=>trendAxisGrain(period,from,to),[from,period,to]);
  const points=useMemo(()=>completeTrendPoints(rows,period,from,to),[from,period,rows,to]);
+ const labelsByBucket=useMemo(()=>new Map(points.map(point=>[point.bucket,point.label])),[points]);
  const chartPoints=useMemo(()=>points.map(point=>({...point,value:metric==='cost'?Number(point.row.total_cost_usd||0):point.tokens})),[points,metric]);
  const yTicks=useMemo(()=>trendAxisTicks(Math.max(0,...chartPoints.map(point=>point.value)),size==='compact'?2:4),[chartPoints,size]);
  const yMax=yTicks[yTicks.length-1]||0;
@@ -345,7 +353,7 @@ export function UsageTrendLineChart({
          </linearGradient>
         </defs>
         <CartesianGrid stroke="rgba(128,128,128,0.18)" strokeDasharray="2 5" vertical={false}/>
-        <XAxis axisLine={false} dataKey="label" interval="preserveStartEnd" minTickGap={longAxis||pan?24:8} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickLine={false}/>
+        <XAxis axisLine={false} dataKey="bucket" tickFormatter={(bucket)=>labelsByBucket.get(String(bucket))??String(bucket)} interval="preserveStartEnd" minTickGap={longAxis||pan?24:8} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickLine={false}/>
         <YAxis allowDecimals={false} axisLine={false} domain={yMax>0?[0,yMax]:[0,1]} fontSize={11} interval={0} padding={{top:0,bottom:8}} tick={{fill:'var(--muted-foreground)',fontSize:11}} tickFormatter={(value)=>metric==='cost'?formatUsdCurrency(Number(value)||0):formatTokenCount(Number(value)||0)} tickLine={false} ticks={yTicks} width="auto"/>
         <Tooltip content={<TrendHoverTooltip grain={grain} period={period}/>} cursor={{stroke:'rgba(60,60,60,0.28)',strokeWidth:1}} wrapperStyle={{zIndex:40,outline:'none'}}/>
         <Area
