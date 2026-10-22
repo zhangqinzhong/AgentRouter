@@ -53,7 +53,7 @@ Capture is strictly opt-in per project: place an `.ai-memory.toml` with explicit
 
 Capture, search and handoffs work without a model. Model organization extracts durable knowledge from sessions and has two sources:
 
-- **AgentRouter provider** (default): pick a model the gateway already serves; requests go through the local AgentRouter gateway. The first save creates a dedicated API key named "AI Memory", whose usage appears as its own caller in Monitoring. Delete the key to revoke access; memory never recreates it.
+- **AgentRouter provider** (default): pick a model the gateway already serves; requests go through the local AgentRouter gateway. The first save creates a dedicated API key named "AI Memory", Delete the key to revoke access; memory never recreates it. Monitoring lists this usage under the caller `ai-memory` (taken from the request User-Agent). Models that reject `json_schema` structured output return one 400 before memory retries with a fallback, which shows as an extra failed request.
 - **Custom OpenAI-compatible API**: enter the URL, model and API key manually. A saved key never follows a changed URL or source.
 
 With "Require approval before applying proposed edits" on, proposed changes wait in Advanced maintenance until approved.

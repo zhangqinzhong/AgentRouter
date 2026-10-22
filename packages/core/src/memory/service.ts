@@ -424,4 +424,7 @@ export class MemoryService {
   }
 }
 
-export const memoryService = new MemoryService({ dataDir: path.join(CONFIGDIR, "ai-memory"), profiles: async () => (await loadAppConfig()).profile.profiles });
+// AR_MEMORY_PORT lets an isolated instance (development, a second web server) avoid the default memory port.
+const memoryPortFromEnv = Number(process.env.AR_MEMORY_PORT);
+export const memoryService = new MemoryService({ dataDir: path.join(CONFIGDIR, "ai-memory"), profiles: async () => (await loadAppConfig()).profile.profiles,
+  port: Number.isInteger(memoryPortFromEnv) && memoryPortFromEnv > 0 && memoryPortFromEnv < 65536 ? memoryPortFromEnv : undefined });

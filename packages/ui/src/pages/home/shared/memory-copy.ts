@@ -53,7 +53,7 @@ export const memoryCopyZh: Record<string, string> = {
   "Custom OpenAI-compatible API": "自定义 OpenAI 兼容 API",
   "Select a model": "选择模型",
   "No models are available in AgentRouter. Add a provider first.": "AgentRouter 中暂无可用模型，请先添加供应商。",
-  "Requests go through the local AgentRouter gateway with the dedicated API key \"{name}\". Usage appears under this caller in Monitoring; delete the key to revoke access.": "请求经本机 AgentRouter 网关转发，使用专用 API Key「{name}」。用量在监控中心按该调用方单独统计；删除该 Key 即可停用。",
+  "Requests go through the local AgentRouter gateway with the dedicated API key \"{name}\"; delete the key to revoke access. Monitoring lists this usage under the caller \"ai-memory\".": "请求经本机 AgentRouter 网关转发，使用专用 API Key「{name}」；删除该 Key 即可停用。监控中心按调用方「ai-memory」单独统计这部分用量。",
   "Saved; leave blank to keep for the same API URL": "已保存；地址不变时留空保留",
   "Optional for local models": "本地模型可留空",
   "Clear saved API key": "清除已保存的 API Key",
