@@ -1208,20 +1208,19 @@ if (p === "/functions/tokentracker-usage-model-breakdown") {
         ma.totals.cache_creation_input_tokens += row.cache_creation_input_tokens || 0;
         ma.totals.reasoning_output_tokens += row.reasoning_output_tokens || 0;
         ma.totals.conversation_count += row.conversation_count || 0;
+        // Price the original bucket before grouping, just like daily/hourly
+        // trends. Aggregating first loses time-of-use discounts, long-context
+        // premiums and the distinction between reported and estimated costs.
         ma.totals.total_cost_usd = Number(ma.totals.total_cost_usd || 0)
-          + (Number(row.total_cost_usd) || 0);
+          + computeRowCost(row);
       }
 
       const sources = Array.from(bySource.values()).map((s) => {
         s.models = Array.from(s.models.values())
-          .map((m) => {
-            const cost = computeRowCost({
-              ...m.totals,
-              model: m.model,
-              source: s.source,
-            });
-            return { ...m, totals: { ...m.totals, total_cost_usd: cost.toFixed(6) } };
-          })
+          .map((m) => ({
+            ...m,
+            totals: { ...m.totals, total_cost_usd: Number(m.totals.total_cost_usd).toFixed(6) },
+          }))
           .sort((a, b) => b.totals.total_tokens - a.totals.total_tokens);
         const sourceCost = s.models.reduce((sum, m) => sum + Number(m.totals.total_cost_usd), 0);
         s.totals.total_cost_usd = sourceCost.toFixed(6);

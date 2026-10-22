@@ -45,6 +45,8 @@ jobs:
           npm run build:memory
           npm run test:core
           npm run test:ui
+          npx playwright install --with-deps chromium
+          npx playwright test tests/e2e/overview-trend-tooltip.spec.ts --project=chromium
           npm run test:architecture
           npm run test:gateway-stream
 

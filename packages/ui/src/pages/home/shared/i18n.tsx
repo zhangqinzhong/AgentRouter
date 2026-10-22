@@ -1939,6 +1939,8 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       "Trend": "趋势",
       "Usage Trend": "用量趋势",
       "Recorded turns": "记录回合",
+      "Cached input share": "缓存 Token 占比",
+      "Cache read and cache write tokens as a share of all input tokens.": "缓存读取与缓存写入 Token 占全部输入 Token 的比例。",
       "Model usage": "模型用量",
       "Client activity": "客户端活动",
       "Share": "占比",
