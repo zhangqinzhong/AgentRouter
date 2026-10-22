@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.10.7 - 2026-10-22
+
+### Fixes
+- Keep trend tooltips and active points on the selected date when day or month labels repeat across history.
+- Preserve model token totals and recorded turns when combining trend buckets; clarify recorded-turn and cached-input labels.
+- Calculate model and client costs per original usage bucket so summaries retain time-of-use discounts, long-context pricing and reported costs consistently with the trend.
+
 ## 1.10.6 - 2026-10-21
 
 ### Fixes
