@@ -7,7 +7,7 @@ import path from "node:path";
 
 let bundle: string;
 let css: string;
-test.use({ viewport: { width: 1400, height: 800 }, timezoneId: "UTC", reducedMotion: "reduce" });
+test.use({ viewport: { width: 1400, height: 800 }, timezoneId: "UTC", contextOptions: { reducedMotion: "reduce" } });
 test.beforeAll(async () => {
   const result = await build({
     absWorkingDir: process.cwd(),
