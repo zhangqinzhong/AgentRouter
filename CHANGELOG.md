@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.11.0 - 2026-10-23
+
+### Features
+- Organize memory with models already configured in AgentRouter, using a dedicated gateway API key and separate ai-memory usage attribution.
+- Keep custom OpenAI-compatible endpoints available as an alternative model source, with credentials isolated when changing sources or destinations.
+
+### Fixes
+- Refresh unchanged, AgentRouter-managed lifecycle hooks when starting memory after a bundled runtime upgrade.
+
 ## 1.10.7 - 2026-10-22
 
 ### Fixes
