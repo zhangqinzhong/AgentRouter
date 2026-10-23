@@ -295,6 +295,50 @@ test("memory model credentials are explicit, private, destination-bound and usab
   } finally { await service.shutdown(); await new Promise((resolve) => mock.close(resolve)); rmSync(root, { recursive: true, force: true }); }
 });
 
+test("AgentRouter model source uses the gateway endpoint and a dedicated key", { skip: !available, timeout: 30_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "ar-memory-gateway-model-"));
+  let received;
+  const mock = http.createServer((req, res) => {
+    let body = ""; req.on("data", (chunk) => body += chunk);
+    req.on("end", () => {
+      received = { authorization: req.headers.authorization, body: JSON.parse(body) };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "test", model: "x", created: 0, object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: '{"answer":"OK"}' }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+    });
+  });
+  await new Promise((resolve) => mock.listen(0, "127.0.0.1", resolve));
+  let key; let created = 0;
+  const gateway = {
+    models: async () => ["Mock/local-fixture"],
+    baseUrl: async () => `http://127.0.0.1:${mock.address().port}/v1`,
+    ensureApiKey: async () => { if (!key) { key = "ar-memory-test-key"; created++; } return key; },
+    currentApiKey: async () => key
+  };
+  const service = new MemoryService({ dataDir: path.join(root, "data"), home: root, runtimeDir, port: await unusedPort(), gateway });
+  const settings = { enabled: true, source: "agentrouter", baseUrl: "", model: "Mock/local-fixture", autoReview: true, requireApproval: true, consolidateOnEnd: false };
+  try {
+    assert.deepEqual(await service.request({ action: "gatewayModels" }), { models: ["Mock/local-fixture"], apiKeyName: "AI Memory" });
+    await service.request({ action: "saveModelConfig", settings: { ...settings, enabled: false }, confirmed: true });
+    assert.equal(created, 0, "a disabled model does not create a gateway key");
+    await assert.rejects(service.request({ action: "saveModelConfig", settings: { ...settings, model: "Other/unknown" }, confirmed: true }), /available in AgentRouter/);
+    await assert.rejects(service.request({ action: "saveModelConfig", settings, apiKey: "manual", confirmed: true }), /dedicated gateway API key/);
+    const saved = await service.request({ action: "saveModelConfig", settings, confirmed: true });
+    assert.equal(saved.source, "agentrouter"); assert.equal(saved.hasApiKey, true); assert.equal(created, 1);
+    assert.equal(saved.baseUrl, `http://127.0.0.1:${mock.address().port}/v1`);
+    assert.ok(!JSON.stringify(saved).includes(key));
+    await service.request({ action: "testModel", confirmed: true });
+    assert.equal(received.authorization, `Bearer ${key}`);
+    assert.equal(received.body.model, "Mock/local-fixture");
+    await service.request({ action: "saveModelConfig", settings, confirmed: true });
+    assert.equal(created, 1, "the dedicated key is reused");
+    key = undefined;
+    await service.request({ action: "start" }); await service.shutdown();
+    assert.equal((await service.request({ action: "modelConfig" })).hasApiKey, false, "a deleted gateway key stays revoked");
+    const custom = await service.request({ action: "saveModelConfig", settings: { ...settings, source: "custom", baseUrl: `http://127.0.0.1:${mock.address().port}/v1` }, confirmed: true });
+    assert.equal(custom.hasApiKey, false, "the gateway key never follows a custom endpoint");
+  } finally { await service.shutdown(); await new Promise((resolve) => mock.close(resolve)); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("MiMo plugin captures opted-in sessions, preserves idle sessions and injects handoffs", { skip: !available, timeout: 45_000 }, async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "ar-memory-mimo-hooks-"));
   const project = path.join(root, "project"); mkdirSync(project);

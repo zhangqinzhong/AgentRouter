@@ -1,24 +1,28 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import type { MemoryModelStatus, MemoryRequest } from "@agentrouter/core/contracts/memory";
+import type { MemoryGatewayModels, MemoryModelStatus, MemoryRequest } from "@agentrouter/core/contracts/memory";
 import { useAppText } from "../shared/i18n";
 async function call<T>(request: MemoryRequest): Promise<T> { if (!window.agentrouter?.memory) throw new Error("Memory service is unavailable."); return await window.agentrouter.memory(request) as T; }
 export function MemoryModelSettingsPanel({ running }: { running: boolean }) {
   const t = useAppText();
   const [value, setValue] = useState<MemoryModelStatus>();
+  const [gateway, setGateway] = useState<MemoryGatewayModels>();
   const [key, setKey] = useState("");
   const [clearKey, setClearKey] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  useEffect(() => { void call<MemoryModelStatus>({ action: "modelConfig" }).then(setValue).catch((e) => setError(String(e))); }, []);
+  useEffect(() => {
+    void call<MemoryModelStatus>({ action: "modelConfig" }).then(setValue).catch((e) => setError(String(e)));
+    void call<MemoryGatewayModels>({ action: "gatewayModels" }).then(setGateway).catch((e) => setError(String(e)));
+  }, []);
   function update(change: Partial<MemoryModelStatus>) { setValue((old) => old && ({ ...old, ...change })); setDirty(true); setNotice(""); }
   async function save() {
     if (!value || !window.confirm(t("Save memory model settings? Enabled model tasks send captured project content to this API and may incur charges. Changes take effect on next start."))) return;
     setBusy(true); setError("");
-    try { setValue(await call<MemoryModelStatus>({ action: "saveModelConfig", settings: value, apiKey: clearKey ? "" : key || undefined, confirmed: true })); setKey(""); setClearKey(false); setDirty(false); setNotice(t("Configuration saved. Changes take effect on next start.")); }
+    try { setValue(await call<MemoryModelStatus>({ action: "saveModelConfig", settings: value, apiKey: value.source === "agentrouter" ? undefined : clearKey ? "" : key || undefined, confirmed: true })); setKey(""); setClearKey(false); setDirty(false); setNotice(t("Configuration saved. Changes take effect on next start.")); }
     catch (e) { setError(String(e)); } finally { setBusy(false); }
   }
   async function test() {
@@ -35,9 +39,23 @@ export function MemoryModelSettingsPanel({ running }: { running: boolean }) {
       {running && <p className="text-xs text-muted-foreground">{t("Model settings can be edited while memory is running. Restart memory after saving to apply changes.")}</p>}
       <fieldset disabled={busy} className="space-y-3">
         <label className="flex items-center gap-2 text-sm"><Checkbox checked={value.enabled} onCheckedChange={(enabled) => update({ enabled })} />{t("Use a model to organize memory")}</label>
-        <div className="grid gap-3 sm:grid-cols-2">{(["baseUrl", "model"] as const).map((field) => <label key={field} className="text-xs text-muted-foreground">{t(field === "baseUrl" ? "OpenAI-compatible API URL" : "Model name")}<input className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[13px]" value={value[field]} onChange={(e) => update({ [field]: e.target.value })} placeholder={field === "baseUrl" ? "http://127.0.0.1:11434/v1" : ""} /></label>)}</div>
-        <label className="block text-xs text-muted-foreground">API Key<input type="password" autoComplete="new-password" className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[13px]" value={key} placeholder={t(value.hasApiKey ? "Saved; leave blank to keep for the same API URL" : "Optional for local models")} onChange={(e) => { setKey(e.target.value); setClearKey(false); setDirty(true); }} /></label>
-        {value.hasApiKey && <label className="flex items-center gap-2 text-xs"><Checkbox checked={clearKey} onCheckedChange={(checked) => { setClearKey(checked); setDirty(true); }} />{t("Clear saved API key")}</label>}
+        <label className="block text-xs text-muted-foreground">{t("Model source")}<select className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[13px]" value={value.source} onChange={(e) => update({ source: e.target.value as MemoryModelStatus["source"], model: "" })}>
+          <option value="agentrouter">{t("AgentRouter provider")}</option>
+          <option value="custom">{t("Custom OpenAI-compatible API")}</option>
+        </select></label>
+        {value.source === "agentrouter" ? <>
+          <label className="block text-xs text-muted-foreground">{t("Model")}<select className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[13px]" value={value.model} onChange={(e) => update({ model: e.target.value })}>
+            <option value="">{t("Select a model")}</option>
+            {value.model && !gateway?.models.includes(value.model) && <option value={value.model}>{value.model}</option>}
+            {gateway?.models.map((model) => <option key={model} value={model}>{model}</option>)}
+          </select></label>
+          {gateway && gateway.models.length === 0 && <p className="text-xs text-muted-foreground">{t("No models are available in AgentRouter. Add a provider first.")}</p>}
+          <p className="text-xs text-muted-foreground">{t("Requests go through the local AgentRouter gateway with the dedicated API key \"{name}\"; delete the key to revoke access. Monitoring lists this usage under the caller \"ai-memory\".").replace("{name}", gateway?.apiKeyName ?? "AI Memory")}</p>
+        </> : <>
+          <div className="grid gap-3 sm:grid-cols-2">{(["baseUrl", "model"] as const).map((field) => <label key={field} className="text-xs text-muted-foreground">{t(field === "baseUrl" ? "OpenAI-compatible API URL" : "Model name")}<input className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[13px]" value={value[field]} onChange={(e) => update({ [field]: e.target.value })} placeholder={field === "baseUrl" ? "http://127.0.0.1:11434/v1" : ""} /></label>)}</div>
+          <label className="block text-xs text-muted-foreground">API Key<input type="password" autoComplete="new-password" className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[13px]" value={key} placeholder={t(value.hasApiKey ? "Saved; leave blank to keep for the same API URL" : "Optional for local models")} onChange={(e) => { setKey(e.target.value); setClearKey(false); setDirty(true); }} /></label>
+          {value.hasApiKey && <label className="flex items-center gap-2 text-xs"><Checkbox checked={clearKey} onCheckedChange={(checked) => { setClearKey(checked); setDirty(true); }} />{t("Clear saved API key")}</label>}
+        </>}
         <label className="flex items-center gap-2 text-sm"><Checkbox checked={value.consolidateOnEnd} onCheckedChange={(consolidateOnEnd) => update({ consolidateOnEnd })} />{t("Organize each completed session")}</label>
         <label className="flex items-center gap-2 text-sm"><Checkbox checked={value.autoReview} onCheckedChange={(autoReview) => update({ autoReview })} />{t("Review completed sessions in the background")}</label>
         <label className="flex items-center gap-2 text-sm"><Checkbox checked={value.requireApproval} onCheckedChange={(requireApproval) => update({ requireApproval })} />{t("Require approval before applying proposed edits")}</label>

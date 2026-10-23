@@ -42,7 +42,7 @@ export type MemoryReadRequest = {
 };
 export type MemoryRequest =
   | { action: "status" | "start" | "stop" | "tools" | "clients" | "logs" | "config" | "backup" }
-  | { action: "projectList" | "modelConfig" }
+  | { action: "projectList" | "modelConfig" | "gatewayModels" }
   | { action: "saveModelConfig"; settings: MemoryModelSettings; apiKey?: string; confirmed?: boolean }
   | { action: "testModel"; confirmed?: boolean }
   | { action: "projectPreview"; setup: MemoryProjectSetup }
@@ -58,5 +58,8 @@ export type MemoryProjectSetup = { directory: string; workspace: string; project
 export type MemoryProjectPlan = MemoryProjectSetup & { id: string; files: Array<{ path: string; content: string; changed: boolean }> };
 export type MemoryProjectInstallation = MemoryProjectSetup & { appliedAt: string; configured: boolean };
 
-export type MemoryModelSettings = { enabled: boolean; baseUrl: string; model: string; autoReview: boolean; requireApproval: boolean; consolidateOnEnd: boolean };
+/** "agentrouter" routes model tasks through the local AgentRouter gateway with a dedicated API key; "custom" uses an explicit OpenAI-compatible endpoint. */
+export type MemoryModelSource = "agentrouter" | "custom";
+export type MemoryModelSettings = { enabled: boolean; source: MemoryModelSource; baseUrl: string; model: string; autoReview: boolean; requireApproval: boolean; consolidateOnEnd: boolean };
+export type MemoryGatewayModels = { models: string[]; apiKeyName: string };
 export type MemoryModelStatus = MemoryModelSettings & { hasApiKey: boolean; configured: boolean };

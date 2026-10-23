@@ -8,7 +8,8 @@ import { CONFIGDIR } from "@agentrouter/core/config/constants";
 import { loadAppConfig } from "@agentrouter/core/config/config";
 import { resolveRuntimeAppPath } from "@agentrouter/core/runtime/app-paths";
 import type { ProfileConfig } from "@agentrouter/core/contracts/app";
-import type { MemoryModelSettings, MemoryModelStatus, MemoryRequest, MemorySettings, MemoryStatus, MemoryTool } from "@agentrouter/core/contracts/memory";
+import type { MemoryGatewayModels, MemoryModelSettings, MemoryModelStatus, MemoryRequest, MemorySettings, MemoryStatus, MemoryTool } from "@agentrouter/core/contracts/memory";
+import { agentRouterGatewayAccess, MEMORY_GATEWAY_API_KEY_NAME, type MemoryGatewayAccess } from "./gateway-model";
 import { MemoryProjects } from "./projects";
 import { MemoryClients } from "./clients";
 import { memoryReadPath, MemoryTransport } from "./transport";
@@ -26,7 +27,7 @@ function waitForExit(child: ChildProcess, timeout: number): Promise<void> {
   });
 }
 
-export type MemoryServiceOptions = { dataDir: string; home?: string; configDir?: string; profiles?: () => Promise<ProfileConfig[]>; runtimeDir?: string; port?: number; readyTimeoutMs?: number };
+export type MemoryServiceOptions = { dataDir: string; home?: string; configDir?: string; profiles?: () => Promise<ProfileConfig[]>; runtimeDir?: string; port?: number; readyTimeoutMs?: number; gateway?: MemoryGatewayAccess };
 export class MemoryService {
   private child?: ChildProcess;
   private external = false;
@@ -42,9 +43,11 @@ export class MemoryService {
   readonly transport: MemoryTransport;
   readonly clients: MemoryClients;
   readonly projects: MemoryProjects;
+  private readonly gateway: MemoryGatewayAccess;
 
   constructor(readonly options: MemoryServiceOptions) {
     this.endpoint = `http://127.0.0.1:${options.port ?? 49374}`;
+    this.gateway = options.gateway ?? agentRouterGatewayAccess;
     this.home = options.home ?? resolveRuntimeAppPath("home");
     this.transport = new MemoryTransport(this.endpoint, () => this.token);
     this.projects = new MemoryProjects(options.dataDir, (args) => this.command(args));
@@ -89,27 +92,41 @@ export class MemoryService {
         return this.status();
       }
       case "modelConfig": return this.modelConfig();
+      case "gatewayModels": return { models: await this.gateway.models(), apiKeyName: MEMORY_GATEWAY_API_KEY_NAME } satisfies MemoryGatewayModels;
       case "saveModelConfig": {
         // Persist for the next start; the running child retains its existing environment.
         if (request.confirmed !== true) throw new Error("Confirm the memory model configuration.");
         const s = request.settings;
-        if (!s || [s.enabled, s.autoReview, s.requireApproval, s.consolidateOnEnd].some((v) => typeof v !== "boolean") || typeof s.model !== "string" || s.model.length > 200 || typeof s.baseUrl !== "string" || s.baseUrl.length > 4096) throw new Error("Invalid memory model settings.");
-        if (s.enabled) {
-          const url = new URL(s.baseUrl);
-          if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || !s.model.trim()) throw new Error("Enter a model and an HTTP(S) API base URL without credentials or query parameters.");
-        }
-        if (request.apiKey !== undefined && (typeof request.apiKey !== "string" || request.apiKey.length > 8192 || /[\r\n]/.test(request.apiKey))) throw new Error("Invalid model API key.");
+        const source = s?.source ?? "custom";
+        if (!s || [s.enabled, s.autoReview, s.requireApproval, s.consolidateOnEnd].some((v) => typeof v !== "boolean") || !["agentrouter", "custom"].includes(source) || typeof s.model !== "string" || s.model.length > 200 || typeof s.baseUrl !== "string" || s.baseUrl.length > 4096) throw new Error("Invalid memory model settings.");
         const previous = this.modelRecord();
-        // A saved credential must never silently follow a changed destination.
-        const apiKey = request.apiKey ?? (previous?.baseUrl === s.baseUrl ? previous.apiKey : "");
+        let baseUrl = s.baseUrl;
+        let apiKey: string;
+        if (source === "agentrouter") {
+          // The gateway owns routing and credentials; only its dedicated key is stored here.
+          if (request.apiKey !== undefined) throw new Error("AgentRouter models use the dedicated gateway API key.");
+          if (s.enabled && !(await this.gateway.models()).includes(s.model.trim())) throw new Error("Select a model available in AgentRouter.");
+          baseUrl = await this.gateway.baseUrl();
+          apiKey = s.enabled ? await this.gateway.ensureApiKey() : (previous?.source === "agentrouter" ? previous.apiKey ?? "" : "");
+        } else {
+          if (s.enabled) {
+            const url = new URL(s.baseUrl);
+            if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || !s.model.trim()) throw new Error("Enter a model and an HTTP(S) API base URL without credentials or query parameters.");
+          }
+          if (request.apiKey !== undefined && (typeof request.apiKey !== "string" || request.apiKey.length > 8192 || /[\r\n]/.test(request.apiKey))) throw new Error("Invalid model API key.");
+          // A saved credential must never silently follow a changed destination or source.
+          apiKey = request.apiKey ?? (previous?.source !== "agentrouter" && previous?.baseUrl === s.baseUrl ? previous.apiKey ?? "" : "");
+        }
         if (previous) this.privateWrite(`backups/model-${Date.now()}.json`, JSON.stringify(previous));
-        this.privateWrite("agentrouter-model.json", JSON.stringify({ enabled: s.enabled, baseUrl: s.baseUrl, model: s.model.trim(), autoReview: s.autoReview, requireApproval: s.requireApproval, consolidateOnEnd: s.consolidateOnEnd, apiKey }, null, 2));
+        this.privateWrite("agentrouter-model.json", JSON.stringify({ enabled: s.enabled, source, baseUrl, model: s.model.trim(), autoReview: s.autoReview, requireApproval: s.requireApproval, consolidateOnEnd: s.consolidateOnEnd, apiKey }, null, 2));
         return this.modelConfig();
       }
       case "testModel": {
         if (request.confirmed !== true) throw new Error("Confirm the model test request.");
         const model = this.modelRecord();
         if (!model?.enabled) throw new Error("Configure a memory model first.");
+        // The test only needs the CLI; it must work before memory has ever been started.
+        if (!this.activeExecutable) this.prepareRuntime();
         return { output: await this.command(["llm-test", "--provider", "openai-compat", "--model", model.model, "--base-url", model.baseUrl, "--prompt", 'Return only the JSON object {"answer":"OK"}. Do not include any other text.', "--structured"]) };
       }
       case "clients": {
@@ -184,6 +201,27 @@ export class MemoryService {
   private tools(): Promise<MemoryTool[]> {
     return this.toolCatalog ? Promise.resolve(this.toolCatalog) : this.transport.tools().then((tools) => this.toolCatalog = tools);
   }
+  /** Keeps a gateway-backed model on the current gateway port and key; a deleted key is not recreated. */
+  private async refreshGatewayModelRecord() {
+    const record = this.modelRecord();
+    if (record?.source !== "agentrouter" || !record.enabled) return;
+    try {
+      const baseUrl = await this.gateway.baseUrl();
+      const apiKey = await this.gateway.currentApiKey() ?? "";
+      if (baseUrl !== record.baseUrl || apiKey !== (record.apiKey ?? "")) this.privateWrite("agentrouter-model.json", JSON.stringify({ ...record, baseUrl, apiKey }, null, 2));
+    } catch (error) {
+      this.log(`[agentrouter] gateway model settings were not refreshed: ${this.redact(error instanceof Error ? error.message : String(error))}\n`);
+    }
+  }
+  /** Installed hooks embed the runtime path; re-apply unchanged integrations after the bundled runtime changes. */
+  private async refreshClientRuntime() {
+    try {
+      const refreshed = await this.clients.refreshRuntime(this.options.profiles ? await this.options.profiles() : []);
+      if (refreshed.length) this.log(`[agentrouter] refreshed client integrations for runtime ${MEMORY_VERSION}: ${refreshed.join(", ")}\n`);
+    } catch (error) {
+      this.log(`[agentrouter] client integrations were not refreshed: ${this.redact(error instanceof Error ? error.message : String(error))}\n`);
+    }
+  }
   private requireRunning() { if (this.state !== "running" || (!this.child && !this.external)) throw new Error("Start memory first."); }
 
   private async start(): Promise<MemoryStatus> {
@@ -191,6 +229,7 @@ export class MemoryService {
     this.state = "starting"; this.lastError = undefined;
     try {
       this.token = this.accessToken();
+      await this.refreshGatewayModelRecord();
       if (this.externalReuse && await this.adoptExisting()) {
         // Preview and install shell out to the CLI. Attaching to the
         // already-running server does not stage that binary.
@@ -198,6 +237,7 @@ export class MemoryService {
         this.external = true;
         this.state = "running";
         this.startedAt = new Date().toISOString();
+        if (this.activeExecutable) await this.refreshClientRuntime();
         return this.status();
       }
       await this.assertPortFree();
@@ -226,7 +266,9 @@ export class MemoryService {
         try {
           const response = await fetch(`${this.endpoint}/api/v1/projects`, { headers: { authorization: `Bearer ${this.token}` }, redirect: "error", signal: AbortSignal.timeout(800) });
           if (response.ok && Array.isArray(await response.json()) && this.child === child && child.exitCode === null) {
-            this.state = "running"; this.startedAt = new Date().toISOString(); return this.status();
+            this.state = "running"; this.startedAt = new Date().toISOString();
+            await this.refreshClientRuntime();
+            return this.status();
           }
         } catch { /* Startup includes database migrations. */ }
         await delay(150);
@@ -301,13 +343,14 @@ export class MemoryService {
     if (!/^[a-f0-9]{64}$/.test(value)) throw new Error("Invalid memory service credential.");
     return value;
   }
-  private modelRecord(): (MemoryModelSettings & { apiKey?: string }) | undefined {
+  private modelRecord(): (Omit<MemoryModelSettings, "source"> & { source?: MemoryModelSettings["source"]; apiKey?: string }) | undefined {
     const file = path.join(this.options.dataDir, "agentrouter-model.json");
     return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : undefined;
   }
   private modelConfig(): MemoryModelStatus {
     const value = this.modelRecord();
-    return { enabled: value?.enabled ?? false, baseUrl: value?.baseUrl ?? "", model: value?.model ?? "", autoReview: value?.autoReview ?? true,
+    return { enabled: value?.enabled ?? false, // Records saved before sources existed were explicit endpoints; a fresh setup defaults to the gateway.
+      source: value ? value.source ?? "custom" : "agentrouter", baseUrl: value?.baseUrl ?? "", model: value?.model ?? "", autoReview: value?.autoReview ?? true,
       requireApproval: value?.requireApproval ?? true, consolidateOnEnd: value?.consolidateOnEnd ?? false, hasApiKey: !!value?.apiKey, configured: !!value };
   }
   private environment(): NodeJS.ProcessEnv {
@@ -381,4 +424,7 @@ export class MemoryService {
   }
 }
 
-export const memoryService = new MemoryService({ dataDir: path.join(CONFIGDIR, "ai-memory"), profiles: async () => (await loadAppConfig()).profile.profiles });
+// AR_MEMORY_PORT lets an isolated instance (development, a second web server) avoid the default memory port.
+const memoryPortFromEnv = Number(process.env.AR_MEMORY_PORT);
+export const memoryService = new MemoryService({ dataDir: path.join(CONFIGDIR, "ai-memory"), profiles: async () => (await loadAppConfig()).profile.profiles,
+  port: Number.isInteger(memoryPortFromEnv) && memoryPortFromEnv > 0 && memoryPortFromEnv < 65536 ? memoryPortFromEnv : undefined });
