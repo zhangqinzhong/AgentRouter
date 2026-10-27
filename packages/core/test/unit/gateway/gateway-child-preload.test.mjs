@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { gatewayChildPreloadEnvAndArgs } from "@ccr/core/gateway/core-runtime/supervisor.ts";
+import { gatewayChildPreloadEnvAndArgs } from "@agentrouter/core/gateway/core-runtime/supervisor.ts";
 
 test("gateway child preload is disabled when API_TIMEOUT_MS is unset or non-positive", () => {
   for (const config of [{}, { API_TIMEOUT_MS: 0 }, { API_TIMEOUT_MS: "0" }, { API_TIMEOUT_MS: "abc" }, { API_TIMEOUT_MS: -1000 }]) {

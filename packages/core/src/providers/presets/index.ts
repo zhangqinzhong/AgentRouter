@@ -8,6 +8,7 @@ import { geminiProviderPreset } from "@agentrouter/core/providers/presets/gemini
 import { infistarAiProviderPreset } from "@agentrouter/core/providers/presets/infistar-ai/index";
 import { kimiCodingProviderPreset } from "@agentrouter/core/providers/presets/kimi-coding/index";
 import { minimaxChinaProviderPreset, minimaxGlobalProviderPreset } from "@agentrouter/core/providers/presets/minimax/index";
+import { minimaxCodingProviderPreset } from "@agentrouter/core/providers/presets/minimax-coding/index";
 import { mistralProviderPreset } from "@agentrouter/core/providers/presets/mistral/index";
 import { moonshotChinaProviderPreset, moonshotGlobalProviderPreset } from "@agentrouter/core/providers/presets/moonshot/index";
 import { nvidiaProviderPreset } from "@agentrouter/core/providers/presets/nvidia/index";
@@ -59,6 +60,7 @@ export const providerPresets: ProviderPreset[] = [
   zaiGlobalGeneralProviderPreset,
   minimaxGlobalProviderPreset,
   minimaxChinaProviderPreset,
+  minimaxCodingProviderPreset,
   mistralProviderPreset,
   moonshotChinaProviderPreset,
   moonshotGlobalProviderPreset,

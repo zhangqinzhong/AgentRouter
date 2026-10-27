@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { RequestLogStore } from "@ccr/core/observability/request-log-store.ts";
-import { createBetterSqliteDatabase } from "@ccr/core/storage/sqlite-native.ts";
+import { RequestLogStore } from "@agentrouter/core/observability/request-log-store.ts";
+import { createBetterSqliteDatabase } from "@agentrouter/core/storage/sqlite-native.ts";
 
 const execFileAsync = promisify(execFile);
 const isBackfillHeapWorker = process.env.CCR_REQUEST_LOG_BACKFILL_WORKER === "1";
