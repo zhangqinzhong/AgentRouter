@@ -1,13 +1,19 @@
 import type { ProviderAccountConfig, ProviderAccountMappingConfig } from "@agentrouter/core/contracts/app";
 import type { ProviderPreset } from "@agentrouter/core/providers/presets/types";
 
-// ⚠️ `percentage` renvoyé par api.z.ai = pourcentage CONSOMMÉ
-// (6 % consommé = 94 % restant sur la fenêtre 5 h). `remaining` est donc
-// `100 - percentage` — l'inverse afficherait un quota inversé et ferait
-// fuir le trafic d'un provider qui a de la marge.
+// The quota endpoint reports `percentage` as the CONSUMED share of the window:
+// 6 % consumed means 94 % left on the 5 h window. `remaining` is therefore
+// `100 - percentage` — mapping it the other way round would invert every meter
+// and make a provider with headroom look exhausted.
 //
-// `unit` : 3 = fenêtre 5 h, 6 = fenêtre weekly. Le type est `CREDIT_LIMIT`
-// depuis le passage des plans aux crédits (avant : `TOKENS_LIMIT`).
+// The windows are discriminated by `unit` (3 = rolling 5 h window, 6 = weekly
+// window) and not by `type`: Z.ai renamed the limit type from `TOKENS_LIMIT`
+// to `CREDIT_LIMIT` when the plans moved from tokens to credits, so filtering
+// on the type name made every meter come back empty. `unit` alone is stable
+// across both spellings.
+//
+// The key is sent raw (`Authorization: <key>`), like the Zhipu AI presets:
+// api.z.ai accepts that form — and the Bearer form — interchangeably.
 const zaiQuotaMapping: ProviderAccountMappingConfig = {
   meters: [
     {
@@ -15,10 +21,10 @@ const zaiQuotaMapping: ProviderAccountMappingConfig = {
       kind: "quota",
       label: "5h quota",
       limit: 100,
-      remaining: "100 - $.data.limits[?(@.type==\"CREDIT_LIMIT\" && @.unit==3)].percentage",
-      resetAt: "$.data.limits[?(@.type==\"CREDIT_LIMIT\" && @.unit==3)].nextResetTime",
+      remaining: "100 - $.data.limits[?(@.unit==3)].percentage",
+      resetAt: "$.data.limits[?(@.unit==3)].nextResetTime",
       unit: "%",
-      used: "$.data.limits[?(@.type==\"CREDIT_LIMIT\" && @.unit==3)].percentage",
+      used: "$.data.limits[?(@.unit==3)].percentage",
       window: "5h"
     },
     {
@@ -26,10 +32,10 @@ const zaiQuotaMapping: ProviderAccountMappingConfig = {
       kind: "quota",
       label: "Weekly quota",
       limit: 100,
-      remaining: "100 - $.data.limits[?(@.type==\"CREDIT_LIMIT\" && @.unit==6)].percentage",
-      resetAt: "$.data.limits[?(@.type==\"CREDIT_LIMIT\" && @.unit==6)].nextResetTime",
+      remaining: "100 - $.data.limits[?(@.unit==6)].percentage",
+      resetAt: "$.data.limits[?(@.unit==6)].nextResetTime",
       unit: "%",
-      used: "$.data.limits[?(@.type==\"CREDIT_LIMIT\" && @.unit==6)].percentage",
+      used: "$.data.limits[?(@.unit==6)].percentage",
       window: "weekly"
     }
   ]
@@ -38,7 +44,7 @@ const zaiQuotaMapping: ProviderAccountMappingConfig = {
 const zaiGlobalProviderAccountConfig: ProviderAccountConfig = {
   connectors: [
     {
-      auth: "provider-api-key",
+      auth: "provider-api-key-raw",
       endpoint: "https://api.z.ai/api/monitor/usage/quota/limit",
       headers: {
         "Accept-Language": "en-US,en"
