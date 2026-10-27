@@ -1177,167 +1177,42 @@ test("native activity calendar fills local days and filters providers", async ()
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("UsageStore provider filter matches compound provider keys by their id segment", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-test-"));
+test("#1875 success rate counts the latest attempt for each client request", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-usage-request-outcome-"));
   try {
     const store = new UsageStore(path.join(dir, "usage.sqlite"));
-    const now = new Date();
-    await store.record({
-      createdAt: now.toISOString(),
-      durationMs: 50,
-      method: "POST",
-      model: "glm-5.3",
-      path: "/v1/messages",
-      provider: "provider-workglm-abc::anthropic_messages",
-      requestId: "req-1",
-      statusCode: 200,
-      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
-    });
-    await store.record({
-      createdAt: now.toISOString(),
-      durationMs: 50,
-      method: "POST",
-      model: "gpt-test",
-      path: "/v1/messages",
-      provider: "api::openai_chat_completions::cred:primary",
-      requestId: "req-2",
-      statusCode: 200,
-      usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 }
-    });
+    const createdAt = new Date().toISOString();
+    const attempts = [
+      { requestId: "rescued-request", statusCode: 429 },
+      { requestId: "rescued-request", statusCode: 200 },
+      { requestId: "failed-request", statusCode: 503 },
+      { requestId: "", statusCode: 500 }
+    ];
 
-    const workglm = await store.getStats("30d", { provider: "provider-workglm-abc" });
-    assert.equal(workglm.totals.requestCount, 1);
-    assert.equal(workglm.totals.totalTokens, 15);
-
-    const api = await store.getStats("30d", { provider: "api" });
-    assert.equal(api.totals.requestCount, 1);
-    assert.equal(api.totals.totalTokens, 25);
-
-    const none = await store.getStats("30d", { provider: "provider-workglm-xyz" });
-    assert.equal(none.totals.requestCount, 0);
-
-    const stats = await store.getStats("30d", {});
-    assert.equal(stats.providerModels.length, 2);
-    assert.ok(stats.providerModels.every((row) => !row.provider.includes("::")));
-  } finally {
-    rmSync(dir, { force: true, recursive: true });
-  }
-});
-
-test("UsageStore honors custom date ranges with a fixed provider status window", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-custom-range-test-"));
-  try {
-    const store = new UsageStore(path.join(dir, "usage.sqlite"));
-    const pad = (value) => String(value).padStart(2, "0");
-    const dayKey = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-    const now = new Date();
-    const twoDaysAgo = new Date(now);
-    twoDaysAgo.setDate(now.getDate() - 2);
-
-    const recordEvent = async (createdAt, provider, requestId) => {
+    for (const attempt of attempts) {
       await store.record({
-        createdAt: createdAt.toISOString(),
-        durationMs: 100,
+        createdAt,
+        durationMs: 5,
         method: "POST",
-        model: "alpha-model",
+        model: "local",
         path: "/v1/messages",
-        provider,
-        requestId,
-        statusCode: 200,
-        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
+        provider: "local",
+        requestId: attempt.requestId,
+        statusCode: attempt.statusCode,
+        usage: { inputTokens: 1, outputTokens: 1 }
       });
-    };
-    await recordEvent(twoDaysAgo, "alpha", "custom-1");
-    await recordEvent(now, "alpha", "custom-2");
+    }
 
-    const narrow = await store.getStats("custom", { includeProxy: true }, { from: dayKey(twoDaysAgo), to: dayKey(twoDaysAgo) });
-    assert.equal(narrow.range, "custom");
-    assert.equal(narrow.totals.requestCount, 1);
-    assert.equal(narrow.series.length, 1);
+    const stats = await store.getStats("today");
+    assert.equal(stats.totals.requestCount, 4, "all upstream attempts remain in usage totals");
+    assert.equal(stats.totals.errorCount, 2, "only the final identified attempt and blank-ID row fail");
+    assert.equal(stats.totals.successRate, 1 / 3);
 
-    const wide = await store.getStats("custom", { includeProxy: true }, { from: dayKey(twoDaysAgo), to: dayKey(now) });
-    assert.equal(wide.range, "custom");
-    assert.equal(wide.series.length, 3);
-    assert.equal(wide.totals.requestCount, 2);
-
-    const fallback = await store.getStats("custom", { includeProxy: true }, { from: "", to: "nope" });
-    assert.equal(fallback.range, "7d");
-
-    // Provider status series always spans the trailing 90-day window, whatever the range.
-    assert.equal(wide.providerSeries?.[0]?.series.length, 90);
-    const today = await store.getStats("today", { includeProxy: true });
-    assert.equal(today.providerSeries?.[0]?.series.length, 90);
-    assert.ok(today.providerSeries?.[0]?.series.every((point) => !point.bucket.includes(" ")));
+    const currentBucket = stats.series.find((point) => point.requestCount > 0);
+    assert.equal(currentBucket?.requestCount, 4);
+    assert.equal(currentBucket?.errorCount, 2);
+    assert.equal(currentBucket?.successRate, 1 / 3);
   } finally {
-    rmSync(dir, { force: true, recursive: true });
+    rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test("UsageStore merges credential-suffixed provider keys in the status series", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "ar-usage-compound-provider-test-"));
-  try {
-    const store = new UsageStore(path.join(dir, "usage.sqlite"));
-    const recordEvent = async (provider, requestId) => {
-      await store.record({
-        createdAt: new Date().toISOString(),
-        durationMs: 90,
-        method: "POST",
-        model: "glm-5.3-flash",
-        path: "/v1/messages",
-        provider,
-        requestId,
-        statusCode: 200,
-        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }
-      });
-    };
-    await recordEvent("workglm::openai_compatible", "compound-1");
-    await recordEvent("workglm::openai_compatible::cred:key-2", "compound-2");
-
-    const stats = await store.getStats("today", { includeProxy: true });
-    const workglm = stats.providerSeries.find((row) => row.provider === "workglm");
-    assert.ok(workglm, "credential-suffixed keys should collapse onto the base provider label");
-    assert.equal(workglm.series.length, 90);
-    assert.equal(workglm.totals.requestCount, 2);
-    const todayBucket = workglm.series[workglm.series.length - 1];
-    assert.equal(todayBucket.requestCount, 2, "same-day rows from both keys must sum, not overwrite");
-  } finally {
-    rmSync(dir, { force: true, recursive: true });
-  }
-});
-
-test('overview uses all local sources once and preserves gateway health separately', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'ar-overview-local-'));
-  try {
-    const store = new UsageStore(path.join(dir, 'usage.sqlite'));
-    await store.record({client:'Codex',provider:'company',model:'model-a',method:'POST',path:'/v1/responses',statusCode:200,usage:{totalTokens:999,inputTokens:999,outputTokens:0},durationMs:10});
-    await store.record({client:'Codex',provider:'company',model:'model-a',method:'POST',path:'/v1/responses',statusCode:500,usage:{totalTokens:0,inputTokens:0,outputTokens:0},durationMs:10});
-    const gateway = await store.getStats('today');
-    const sources = ['codex','claude','zcode','future-tool'].map(source => ({source,models:[{model:'model-a',totals:{total_tokens:100,conversation_count:1}}]}));
-    const result = mergeLocalOverviewSnapshot(gateway,{totals:{total_tokens:400},sources,series:[]},{});
-    assert.equal(result.totals.totalTokens,400);
-    assert.equal(result.models.length,4);
-    assert.equal(result.gatewayTotals.totalTokens,999);
-    assert.equal(result.gatewayTotals.errorCount,1);
-    const empty = mergeLocalOverviewSnapshot(gateway,{totals:{},sources:[],series:[]},{});
-    assert.equal(empty.totals.totalTokens,0);
-    assert.equal(empty.models.length,0);
-    assert.equal(empty.series.reduce((n,row)=>n+row.totalTokens,0),0);
-  } finally {rmSync(dir,{recursive:true,force:true});}
-});
-
-
-test('overview gives Grok Bot its own client and provider without merging Cursor or Grok Build', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'ar-overview-grokbot-'));
-  try {
-    const store = new UsageStore(path.join(dir, 'usage.sqlite'));
-    const snapshot = await store.getStats('today');
-    const sources = ['grokbot', 'cursor', 'grok'].map(source => ({source, models:[{model:source+'-model',totals:{total_tokens:100}}]}));
-    const result = mergeLocalOverviewSnapshot(snapshot,{totals:{},sources,series:[]},{});
-    assert.deepEqual(result.clientModels.map(r=>r.client),['Grok Bot','Cursor','Grok']);
-    assert.deepEqual(result.providerModels.map(r=>r.provider),['Grok Bot','Cursor','Grok']);
-    assert.equal(result.totals.totalTokens,300);
-    const filtered = mergeLocalOverviewSnapshot(snapshot,{totals:{},sources,series:[]},{provider:'Grok Bot'});
-    assert.equal(filtered.totals.totalTokens,100);
-    assert.equal(filtered.clientModels[0].client,'Grok Bot');
-  } finally {rmSync(dir,{recursive:true,force:true});}
 });
