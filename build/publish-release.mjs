@@ -13,8 +13,14 @@ if (head !== tagged) throw new Error('Release tag does not point to the checked-
 const prerelease = parseReleaseVersion(version).channel !== 'stable';
 const artifactRoot = process.argv[2];
 if (!artifactRoot) throw new Error('Usage: node build/publish-release.mjs <downloaded-artifacts>');
-const gh = args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).trim();
+const gh = args => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] }).trim();
 const repository = process.env.GITHUB_REPOSITORY || gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+function readRelease() {
+  // The tag REST endpoint does not expose drafts. The CLI resolves drafts and
+  // published releases alike; its numeric API URL remains valid after upload.
+  const apiUrl = gh(['release', 'view', tag, '--repo', repository, '--json', 'apiUrl', '--jq', '.apiUrl']);
+  return JSON.parse(gh(['api', apiUrl]));
+}
 const stage = mkdtempSync(path.join(os.tmpdir(), 'ar-publish-'));
 const walk = directory => readdirSync(directory, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? walk(path.join(directory, entry.name)) : entry.isFile() ? [path.join(directory, entry.name)] : []);
 try {
@@ -31,17 +37,17 @@ try {
   let assets = validateReleaseAssets(stage, version);
   writeFileSync(path.join(stage, 'SHA256SUMS'), assets.map(asset => `${asset.sha256}  ${asset.name}`).join('\n') + '\n');
   assets = validateReleaseAssets(stage, version);
-  const endpoint = `repos/${repository}/releases/tags/${tag}`;
   let release;
-  try { release = JSON.parse(gh(['api', endpoint])); } catch { /* A new tag has no release yet. */ }
+  try { release = readRelease(); } catch { /* A new tag has no release yet. */ }
   if (release && !release.draft) {
     verifyPublishedAssets(assets, release.assets);
     if (release.prerelease !== prerelease) throw new Error('Published release channel differs from the requested channel.');
     console.log(`${tag} is already published with matching assets; no files were overwritten.`);
   } else {
     if (!release) gh(['release', 'create', tag, '--repo', repository, '--draft', '--title', `AgentRouter ${tag}`, '--notes-file', `docs/releases/${version}.md`, ...(prerelease ? ['--prerelease'] : [])]);
-    gh(['release', 'upload', tag, '--repo', repository, '--clobber', ...assets.map(asset => path.join(stage, asset.name))]);
-    release = JSON.parse(gh(['api', endpoint]));
+    const pending = assets.filter(asset => !release?.assets?.some(remote => remote.name === asset.name && remote.size === asset.size && remote.digest === `sha256:${asset.sha256}`));
+    if (pending.length) gh(['release', 'upload', tag, '--repo', repository, '--clobber', ...pending.map(asset => path.join(stage, asset.name))]);
+    release = readRelease();
     verifyPublishedAssets(assets, release.assets);
     gh(['release', 'edit', tag, '--repo', repository, '--draft=false', `--prerelease=${prerelease}`, `--latest=${!prerelease}`]);
     console.log(`Published ${tag} (${prerelease ? 'prerelease' : 'stable'}), ${assets.length} verified assets.`);
