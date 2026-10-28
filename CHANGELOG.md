@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.12.0-rc.4 - 2026-10-27
+
+### Maintenance
+- Resolve draft releases by their numeric API ID and resume complete or partial drafts without re-uploading verified assets.
+- Exercise publisher creation, resume, digest rejection, immutable reruns and release channels end to end.
+
 ## 1.12.0-rc.3 - 2026-10-27
 
 ### Maintenance
