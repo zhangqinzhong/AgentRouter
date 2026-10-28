@@ -1,6 +1,7 @@
 import { collectorFetchOptions } from "./fetch-options";
 import { parentPort } from "node:worker_threads";
 import { createRequire } from "node:module";
+import { resolveRuntimeAppPath } from "../runtime/app-paths";
 const {createCollector} = createRequire(__filename)("./tokentracker/collector.cjs");
 let fetchId=0;
 const fetches=new Map<number,{resolve:(response:Response)=>void;reject:(error:Error)=>void;cleanup:()=>void}>();
@@ -19,7 +20,7 @@ const fetchFromHost:typeof fetch=async(input,init={})=>new Promise<Response>((re
     fetches.delete(id);cleanup();reject(error instanceof Error ? error : new Error("Provider request could not be transferred"));
   }
 });
-const collector = createCollector({fetchImpl:fetchFromHost});
+const collector = createCollector({home:resolveRuntimeAppPath("home"),fetchImpl:fetchFromHost});
 parentPort?.on("message", async (message) => {
   if(message.fetchId) {
     const request=fetches.get(message.fetchId);if(!request)return;fetches.delete(message.fetchId);request.cleanup();

@@ -22,7 +22,14 @@ function codexStores(root) {
 
 // The session index owns location preferences. Usage collection reads the same
 // records, rather than maintaining a second configuration that can drift.
-async function collectionRoots({ home = os.homedir(), indexPath = path.join(home, '.agentrouter/sessions/index.sqlite'), env = process.env } = {}) {
+async function collectionRoots({ home = os.homedir(), indexPath, env = process.env, platform = process.platform } = {}) {
+  // Match resolveRuntimeConfigDir(), including Windows AppData. Injected test
+  // homes must not inherit the machine's AppData or read its private index.
+  const runtimeHome = path.resolve(env.AR_INTERNAL_HOME_DIR || os.homedir());
+  const configDir = platform === 'win32' && path.resolve(home) === runtimeHome
+    ? path.join(env.AR_INTERNAL_APP_DATA_DIR || env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'agentrouter')
+    : path.join(home, '.agentrouter');
+  indexPath ??= path.join(configDir, 'sessions', 'index.sqlite');
   const defaultClaude = [path.join(home, '.claude/projects')];
   const defaultCodex = codexStores(path.join(home, '.codex'));
   const customClaude = [], customCodex = [];
@@ -30,7 +37,7 @@ async function collectionRoots({ home = os.homedir(), indexPath = path.join(home
     if (env.CLAUDE_CONFIG_DIR?.trim()) defaultClaude.push(path.join(expand(env.CLAUDE_CONFIG_DIR, home), 'projects'));
     if (env.CODEX_HOME?.trim()) defaultCodex.push(...codexStores(expand(env.CODEX_HOME, home)));
   }
-  const profiles = path.join(home, '.agentrouter/profiles');
+  const profiles = path.join(configDir, 'profiles');
   for (const entry of await fsp.readdir(profiles, { withFileTypes: true }).catch(e => { if (e.code === 'ENOENT') return []; throw e; })) {
     if (!entry.isDirectory()) continue;
     for (const prefix of ['', 'custom']) {

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.12.0-rc.2 - 2026-10-27
+
+### Fixes
+- Share custom source configuration with the native Windows AppData index and managed profile directories.
+- Keep collector workers inside the configured runtime home, including isolated previews.
+
 ## 1.12.0-rc.1 - 2026-10-27
 
 ### Features
