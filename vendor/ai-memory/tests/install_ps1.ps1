@@ -2,8 +2,9 @@
 # installs (under PowerShell 7 and Windows PowerShell 5.1), also while another
 # process holds the unpacked binary open, and a checksum mismatch, an archive
 # entry escaping the install dir, and an existing install are each refused
-# with nothing written. The user PATH is never touched
-# (AI_MEMORY_NO_MODIFY_PATH=1). Needs python on PATH for the HTTP server.
+# with nothing written. Outside GitHub Actions the user PATH is never touched
+# (AI_MEMORY_NO_MODIFY_PATH=1); on a runner, one case lets install.ps1 add to
+# it and restores the value it found. Needs python on PATH for the HTTP server.
 #
 # Usage: pwsh -NoProfile -File tests/install_ps1.ps1 -Binary target\debug\ai-memory.exe
 
@@ -55,11 +56,12 @@ try {
         Start-Sleep -Milliseconds 200
     }
 
-    # install <shell> <release> <dest>: run install.ps1 with the test env; returns the exit code.
-    function Install([string] $shell, [string] $release, [string] $dest, [string] $log) {
+    # install <shell> <release> <dest> [-ModifyPath]: run install.ps1 with the
+    # test env, leaving the user PATH alone unless -ModifyPath; returns the exit code.
+    function Install([string] $shell, [string] $release, [string] $dest, [string] $log, [switch] $ModifyPath) {
         $env:AI_MEMORY_RELEASE_BASE_URL = "http://127.0.0.1:$port/$release"
         $env:AI_MEMORY_INSTALL_DIR = $dest
-        $env:AI_MEMORY_NO_MODIFY_PATH = '1'
+        if (-not $ModifyPath) { $env:AI_MEMORY_NO_MODIFY_PATH = '1' }
         try {
             & $shell -NoProfile -ExecutionPolicy Bypass -File $script *> $log
             return $LASTEXITCODE
@@ -165,6 +167,33 @@ public static class StagedBinaryScan
         $env:TMP = $savedTmp
         $env:TEMP = $savedTemp
         [StagedBinaryScan]::Stop()
+    }
+
+    # Adding the install dir must leave the rest of the user PATH as it was:
+    # still REG_EXPAND_SZ, with %VAR% entries unexpanded (#1509). This rewrites
+    # the real HKCU\Environment Path, so it runs only on a GitHub Actions
+    # runner, and the value it found is put back.
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $environment = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+        $saved = $environment.GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
+        $savedKind = if ($null -ne $saved) { $environment.GetValueKind('Path') }
+        $probe = '%USERPROFILE%\ai-memory-path-probe'
+        try {
+            $environment.SetValue('Path', (@($probe, $saved) | Where-Object { $_ }) -join ';', 'ExpandString')
+            foreach ($shell in @('pwsh', 'powershell')) {
+                $dest = Join-Path $tmp "inst-path-$shell\ai-memory"
+                $log = Join-Path $tmp "path-$shell.log"
+                if ((Install $shell 'good' $dest $log -ModifyPath) -ne 0) { Fail "$shell failed to install with a PATH update: $(Get-Content $log -Raw)" }
+                $kind = $environment.GetValueKind('Path')
+                $entries = $environment.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';'
+                if ($kind -ne 'ExpandString') { Fail "$shell stored the user PATH as $kind" }
+                if ($entries -notcontains $probe) { Fail "$shell expanded $probe in the user PATH: $($entries -join ';')" }
+                if ($entries -notcontains $dest) { Fail "$shell did not add $dest to the user PATH" }
+            }
+        } finally {
+            if ($null -eq $saved) { $environment.DeleteValue('Path', $false) } else { $environment.SetValue('Path', $saved, $savedKind) }
+            $environment.Dispose()
+        }
     }
 
     Publish badsum -BadSum | Out-Null

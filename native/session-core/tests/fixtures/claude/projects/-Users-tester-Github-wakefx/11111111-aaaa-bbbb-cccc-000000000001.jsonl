@@ -10,3 +10,10 @@
 {"type":"wibble-experimental","payload":{"note":"unknown line type, must be counted"}}
 {"type":"atis-latch","sessionId":"11111111-aaaa-bbbb-cccc-000000000001","atis":true}
 {"type":"bridge-session","sessionId":"11111111-aaaa-bbbb-cccc-000000000001","bridgeSessionId":"bridge-fixture","lastSequenceNum":42,"ownerAccountUuid":"account-fixture","ownerOrganizationUuid":"organization-fixture"}
+{"type":"agent-name","agentName":"Desktop agent name is not a title","sessionId":"11111111-aaaa-bbbb-cccc-000000000001"}
+{"type":"cost-state","totalCostUSD":0.42,"modelUsage":{},"totalAPIDuration":1200,"sessionId":"11111111-aaaa-bbbb-cccc-000000000001"}
+{"type":"api-request","id":"req-fixture","params":{"model":"claude-fixture"},"shapeHash":"shape-fixture","sessionId":"11111111-aaaa-bbbb-cccc-000000000001"}
+{"type":"api-request-blob","hash":"blob-fixture","message":{"role":"user","content":[{"type":"text","text":"request blob, not a turn"}]},"sessionId":"11111111-aaaa-bbbb-cccc-000000000001"}
+{"type":"api-request-shape","shapeHash":"shape-fixture","shape":{"system":[],"tools":[]},"sessionId":"11111111-aaaa-bbbb-cccc-000000000001"}
+{"type":"relocated","relocatedCwd":"/Users/tester/Github/wakefx/.claude/worktrees/fixture","sessionId":"11111111-aaaa-bbbb-cccc-000000000001"}
+{"type":"worktree-state","worktreeSession":{"originalCwd":"/Users/tester/Github/wakefx","worktreePath":"/Users/tester/Github/wakefx/.claude/worktrees/fixture","worktreeBranch":"claude/fixture"},"sessionId":"11111111-aaaa-bbbb-cccc-000000000001"}

@@ -126,6 +126,11 @@ graph neighbours (latest-scoped by construction), and the
 raw-observation fallback. Audit reads take no access bump and no
 rerank. Omit `as_of` and nothing changes.
 
+An `as_of` query reads one project: the current one, or the one named by
+`workspace` + `project`. Combining it with `global=true` or `scopes` is
+refused as invalid params. A repository's `[recall] default_global`
+marker setting does not broaden it to a cross-project search.
+
 One asymmetry to know: the FTS leg hides pages already TTL-expired at
 T (the usual `not_expired` predicate evaluated at T); the entity leg
 ignores TTL, on the grounds that a page valid at T was still what we

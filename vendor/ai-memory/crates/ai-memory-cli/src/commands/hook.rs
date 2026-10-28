@@ -298,6 +298,7 @@ fn payload_has_session_id(raw: &serde_json::Value) -> bool {
         "sessionID",
         "session",
         "conversationId",
+        "taskId",
     ]
     .iter()
     .any(|key| {
@@ -358,6 +359,14 @@ fn resolve_hook_cwd_with(
         extract_cwd(raw)
             .or_else(|| env_lookup(CODEBUDDY_PROJECT_DIR_ENV))
             .filter(|s| !s.trim().is_empty())
+    } else if agent_kind == AgentKind::QwenCode {
+        // Qwen Code sets `QWEN_PROJECT_DIR` (and Claude/Gemini aliases) on
+        // every command hook
+        // (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
+        let mut env_lookup = env_lookup;
+        extract_cwd(raw)
+            .or_else(|| env_lookup(QWEN_PROJECT_DIR_ENV))
+            .filter(|s| !s.trim().is_empty())
     } else {
         extract_cwd(raw).filter(|s| !s.trim().is_empty())
     }
@@ -365,6 +374,9 @@ fn resolve_hook_cwd_with(
 
 /// The project directory CodeBuddy Code exports to every hook process.
 const CODEBUDDY_PROJECT_DIR_ENV: &str = "CODEBUDDY_PROJECT_DIR";
+
+/// The project directory Qwen Code exports to every command hook process.
+const QWEN_PROJECT_DIR_ENV: &str = "QWEN_PROJECT_DIR";
 
 fn cwd_query_suffix(
     agent: &str,
@@ -503,24 +515,57 @@ fn parse_minutes(raw: Option<String>, default: Duration) -> Duration {
     }
 }
 
-fn should_process_hook_event(agent: AgentKind, event: HookEvent, raw: &serde_json::Value) -> bool {
-    if agent == AgentKind::AntigravityCli && event == HookEvent::SessionStart {
-        return raw.get("invocationNum").and_then(serde_json::Value::as_u64) == Some(0);
-    }
-    true
+/// The event token the Antigravity `PreInvocation` hook is rendered with.
+/// Earlier installs render it as `session-start`; both are read the same way.
+pub(crate) const ANTIGRAVITY_PRE_INVOCATION_EVENT: &str = "pre-invocation";
+
+/// What an Antigravity `session-start` or `pre-invocation` event marks
+/// (<https://antigravity.google/docs/hooks/>).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AntigravityBoundary {
+    /// Any other agent or event.
+    None,
+    /// A later model call inside a turn, or a malformed counter: nothing to do.
+    LaterInvocation,
+    /// The native `SessionStart`, the only start event without `invocationNum`.
+    ConversationStart,
+    /// `PreInvocation` with `invocationNum` 0. The counter restarts on every
+    /// user turn, so this marks a turn; it doubles as the conversation start
+    /// on builds that fire no `SessionStart`.
+    TurnStart,
 }
 
-/// `<data_dir>/briefed/agy-start-<conversationId>` for an Antigravity
-/// SessionStart that names its conversation; `None` for every other event.
+fn antigravity_boundary(
+    agent: AgentKind,
+    event: &str,
+    raw: &serde_json::Value,
+) -> AntigravityBoundary {
+    if agent != AgentKind::AntigravityCli {
+        return AntigravityBoundary::None;
+    }
+    let pre_invocation = event == ANTIGRAVITY_PRE_INVOCATION_EVENT;
+    if !pre_invocation && HookEvent::parse(event) != HookEvent::SessionStart {
+        return AntigravityBoundary::None;
+    }
+    match raw.get("invocationNum") {
+        None if !pre_invocation => AntigravityBoundary::ConversationStart,
+        Some(counter) if counter.as_u64() == Some(0) => AntigravityBoundary::TurnStart,
+        // A PreInvocation without its documented counter fails closed so a
+        // later invocation can never consume a handoff.
+        _ => AntigravityBoundary::LaterInvocation,
+    }
+}
+
+fn should_process_hook_event(agent: AgentKind, event: &str, raw: &serde_json::Value) -> bool {
+    antigravity_boundary(agent, event, raw) != AntigravityBoundary::LaterInvocation
+}
+
+/// `<data_dir>/briefed/agy-start-<conversationId>`, which records that an
+/// Antigravity conversation already started; `None` without a conversation id.
 fn antigravity_conversation_start_marker(
     data_dir: &Path,
-    agent: AgentKind,
-    event: HookEvent,
     raw: &serde_json::Value,
 ) -> Option<PathBuf> {
-    if agent != AgentKind::AntigravityCli || event != HookEvent::SessionStart {
-        return None;
-    }
     let conversation = raw
         .get("conversationId")
         .and_then(serde_json::Value::as_str)
@@ -531,6 +576,209 @@ fn antigravity_conversation_start_marker(
             .join("briefed")
             .join(format!("agy-start-{}", sanitize_briefed_key(conversation))),
     )
+}
+
+/// Claims an Antigravity conversation's start atomically. `create_new` lets
+/// exactly one of a concurrent native SessionStart and first-turn
+/// PreInvocation win, so only one of them posts session-start and claims a
+/// handoff. `false` means the conversation already started; any other
+/// failure counts as a win, as the best-effort marker always has (the worst
+/// case is a repeated start, never a lost one).
+fn claim_conversation_start(marker: &Path) -> bool {
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(_) => {
+            // Rewrites the empty marker and applies the bounded retention.
+            mark_briefed(marker);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => true,
+    }
+}
+
+/// Transcript read cursors kept at once. A cursor that falls out only makes
+/// the next read of its conversation start over, and the server's ingest
+/// keys drop the prompts it already has.
+const MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS: usize = 256;
+/// Cursor files are tiny JSON objects. Refuse a corrupted or replaced file
+/// before it can make a lifecycle hook allocate without a useful bound.
+const MAX_ANTIGRAVITY_TRANSCRIPT_CURSOR_BYTES: u64 = 16 * 1024;
+/// Filesystem work for transcript recovery must not hold up the harness. A
+/// timeout leaves the cursor untouched, so the next hook retries the read.
+const ANTIGRAVITY_TRANSCRIPT_READ_BUDGET: Duration = Duration::from_millis(100);
+
+/// `<data_dir>/hook-state/antigravity-transcripts/<conversationId>.json`.
+fn antigravity_transcript_cursor_path(data_dir: &Path, conversation: &str) -> PathBuf {
+    data_dir
+        .join("hook-state")
+        .join("antigravity-transcripts")
+        .join(format!("{}.json", sanitize_briefed_key(conversation)))
+}
+
+fn load_antigravity_transcript_cursor(path: &Path) -> ai_memory_hooks::TranscriptCursor {
+    let Some(bytes) = fs::File::open(path).ok().and_then(|file| {
+        let mut bytes = Vec::new();
+        file.take(MAX_ANTIGRAVITY_TRANSCRIPT_CURSOR_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() as u64 <= MAX_ANTIGRAVITY_TRANSCRIPT_CURSOR_BYTES).then_some(bytes)
+    }) else {
+        return ai_memory_hooks::TranscriptCursor::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Atomic (private random temp + fsync + rename + parent fsync) and best
+/// effort, with bounded retention: a lost write only makes the next read
+/// repeat prompts the server drops by key.
+fn store_antigravity_transcript_cursor(path: &Path, cursor: &ai_memory_hooks::TranscriptCursor) {
+    let (Some(dir), Ok(bytes)) = (path.parent(), serde_json::to_vec(cursor)) else {
+        return;
+    };
+    if ai_memory_wiki::write_atomic(path, &bytes).is_err() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut others = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.path() != path
+                && entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect::<Vec<_>>();
+    others.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, stale) in others
+        .into_iter()
+        .skip(MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS.saturating_sub(1))
+    {
+        let _ = fs::remove_file(stale);
+    }
+}
+
+/// Whether the live hooks already captured prompts of this conversation
+/// from its transcript, so `finalize-session` must not replay them again
+/// from `history.jsonl`.
+pub(crate) fn antigravity_transcript_prompts_captured(data_dir: &Path, conversation: &str) -> bool {
+    load_antigravity_transcript_cursor(&antigravity_transcript_cursor_path(data_dir, conversation))
+        .prompts
+        > 0
+}
+
+/// Ingest key of a recovered prompt: stable per conversation, step, time and
+/// text, so a repeated read (a lost cursor, a crash before it was stored, a
+/// rewind that re-reads the file) is dropped by the server instead of stored
+/// twice, while a new prompt that reuses a rewound step number is not.
+fn antigravity_prompt_ingest_key(
+    conversation: &str,
+    prompt: &ai_memory_hooks::TranscriptPrompt,
+) -> String {
+    let step = prompt.step_index.map_or_else(
+        || format!("offset:{}", prompt.line_offset),
+        |step| format!("step:{step}"),
+    );
+    let text = format!("{:x}", Sha256::digest(prompt.text.as_bytes()));
+    let created_at = prompt.created_at.as_deref().unwrap_or("");
+    let mut hasher = Sha256::new();
+    for part in [
+        "antigravity-transcript-prompt",
+        conversation,
+        step.as_str(),
+        created_at,
+        text.as_str(),
+    ] {
+        hasher.update(part.len().to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("agy_{}", &digest[..60])
+}
+
+/// Recovered Antigravity prompts ready to spool, and the cursor to store
+/// once they are.
+struct AntigravityPromptEvents {
+    /// `(ingest key, body)` of each `user-prompt` event, in transcript order.
+    events: Vec<(String, String)>,
+    cursor_path: PathBuf,
+    cursor: ai_memory_hooks::TranscriptCursor,
+}
+
+fn run_before_deadline<T: Send + 'static>(
+    budget: Duration,
+    task: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("ai-memory-antigravity-transcript".into())
+        .spawn(move || {
+            let _ = sender.send(task());
+        })
+        .ok()?;
+    receiver.recv_timeout(budget).ok()
+}
+
+/// The `user-prompt` events for the prompts Antigravity wrote to this
+/// conversation's transcript since the last read. Antigravity puts no
+/// prompt in any hook payload; `transcriptPath` names the transcript and is
+/// read only inside the conversation's own `brain/<conversationId>/`
+/// directory under `home` ([`ai_memory_hooks::antigravity_transcript_path`]).
+/// Each body keeps the event's conversation and workspace fields so the
+/// server scopes it like the event itself, and is capped and scrubbed like
+/// any client-side prompt; the server sanitizes it again on ingest.
+fn antigravity_transcript_prompt_events(
+    data_dir: &Path,
+    home: Option<&Path>,
+    raw: &serde_json::Value,
+) -> Option<AntigravityPromptEvents> {
+    let conversation = ai_memory_hooks::antigravity_conversation_id(raw)?.to_owned();
+    let declared = raw.get("transcriptPath")?.as_str()?.to_owned();
+    let request = serde_json::json!({
+        "conversationId": conversation.clone(),
+        "transcriptPath": declared,
+    });
+    let home = home?.to_owned();
+    let cursor_path = antigravity_transcript_cursor_path(data_dir, &conversation);
+    let (cursor_path, read) =
+        run_before_deadline(ANTIGRAVITY_TRANSCRIPT_READ_BUDGET, move || {
+            let transcript = ai_memory_hooks::antigravity_transcript_path(&request, &home)?;
+            let cursor = load_antigravity_transcript_cursor(&cursor_path);
+            let read = ai_memory_hooks::read_transcript_prompts(&transcript, &cursor)?;
+            Some((cursor_path, read))
+        })??;
+    let mut events = Vec::with_capacity(read.prompts.len());
+    for prompt in &read.prompts {
+        let mut body = serde_json::Map::new();
+        for key in ["conversationId", "workspacePaths", "cwd", "modelName"] {
+            if let Some(value) = raw.get(key) {
+                body.insert(key.into(), value.clone());
+            }
+        }
+        body.insert("prompt".into(), prompt.text.clone().into());
+        if let Some(at) = &prompt.created_at {
+            body.insert("occurred_at".into(), at.clone().into());
+        }
+        let mut body = serde_json::Value::Object(body);
+        ai_memory_hooks::cap_lifecycle_body_for_client(&mut body, HookEvent::UserPrompt);
+        events.push((
+            antigravity_prompt_ingest_key(&conversation, prompt),
+            serde_json::to_string(&body).ok()?,
+        ));
+    }
+    Some(AntigravityPromptEvents {
+        events,
+        cursor_path,
+        cursor: read.cursor,
+    })
 }
 
 /// A `--agent claude-code` hook invoked by Cursor (it runs Claude Code's
@@ -577,13 +825,14 @@ fn write_success_response<W: std::io::Write>(
         Ok(())
     } else if matches!(
         agent,
-        AgentKind::Muse | AgentKind::CodeBuddy | AgentKind::IbmBob
+        AgentKind::Muse | AgentKind::CodeBuddy | AgentKind::IbmBob | AgentKind::QwenCode
     ) && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
     {
         // Muse and IBM Bob add SessionStart and UserPromptSubmit stdout to the
-        // turn as context, and CodeBuddy appends exit-0 stdout of both to the
-        // session, so a capture-only reply stays empty rather than put `{}` in
-        // front of the model on every prompt.
+        // turn as context, CodeBuddy appends exit-0 stdout of both to the
+        // session, and Qwen Code injects both as tagged model context, so a
+        // capture-only reply stays empty rather than put `{}` in front of the
+        // model on every prompt.
         Ok(())
     } else if event == HookEvent::UserPrompt && agent.user_prompt_injects_handoff() {
         // Kimi Code injects any non-empty UserPromptSubmit stdout into the turn
@@ -729,9 +978,11 @@ fn user_prompt_recap_envelope(recap: &str) -> serde_json::Value {
 
 fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
     if agent == AgentKind::AntigravityCli {
+        // A system message stays in the conversation for later turns; an
+        // `ephemeralMessage` would be dropped after the first one.
         serde_json::json!({
             "injectSteps": [{
-                "ephemeralMessage": handoff,
+                "systemMessage": { "systemMessage": handoff },
             }]
         })
     } else if agent == AgentKind::CopilotCli {
@@ -748,6 +999,48 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
             }
         })
     }
+}
+
+/// Hermes adds a hook's stdout to the turn only as a JSON object whose
+/// `context` is a non-blank string (`_parse_context` in
+/// `agent/shell_hooks.py`); plain text and every other key are dropped.
+fn hermes_prompt_context_envelope(handoff: String) -> serde_json::Value {
+    serde_json::json!({ "context": handoff })
+}
+
+/// The variable Hermes exports `terminal.cwd` through, to its tools and to
+/// every hook process (`hermes_cli/cli_config_load.py`, `gateway/run.py`).
+const HERMES_TERMINAL_CWD_ENV: &str = "TERMINAL_CWD";
+
+/// Set to "1" in a Hermes gateway process (`gateway/run.py`); hooks inherit it.
+const HERMES_GATEWAY_ENV: &str = "_HERMES_GATEWAY";
+
+/// The profile a multiplexing Hermes gateway runs as (`profiles_to_serve`).
+const HERMES_GATEWAY_HOST_PROFILE: &str = "default";
+
+/// The Hermes session's working directory, when the hook process carries one
+/// that exists here. A container backend can export a path that exists only
+/// inside the sandbox, and a relative value names nothing, so either falls
+/// back to the payload cwd.
+///
+/// A multiplexing gateway serves every profile from the default profile's
+/// process. Its environment holds the default profile's `terminal.cwd`, while
+/// each other profile's lives in a per-turn scope its hooks never see, so in
+/// a gateway the variable is trusted only for an event the default profile
+/// fired. A standalone gateway of another profile loses it too: nothing in
+/// the hook's environment tells it apart from a multiplexed one.
+fn hermes_terminal_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Option<String> {
+    let in_gateway = runtime_env
+        .var_os(HERMES_GATEWAY_ENV)
+        .is_some_and(|value| value == "1");
+    if in_gateway && profile != Some(HERMES_GATEWAY_HOST_PROFILE) {
+        return None;
+    }
+    let path = PathBuf::from(runtime_env.var_os(HERMES_TERMINAL_CWD_ENV)?);
+    if !path.is_absolute() || !path.is_dir() {
+        return None;
+    }
+    path.to_str().map(str::to_owned)
 }
 
 /// Run a single hook end-to-end. Always returns Ok and always writes a JSON
@@ -789,7 +1082,34 @@ where
     W: std::io::Write,
     S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
-    let runtime_env = RuntimeEnv::from_process();
+    run_with_payload_in_home(
+        data_dir,
+        args,
+        payload,
+        stdout,
+        spawn_background_drainer,
+        home_dir(),
+        RuntimeEnv::from_process(),
+    )
+    .await
+}
+
+/// [`run_with_payload`] with the home directory given, the root that the
+/// Antigravity step output and transcript reads are confined to, and the
+/// process environment captured by the caller.
+async fn run_with_payload_in_home<W, S>(
+    data_dir: Option<PathBuf>,
+    args: HookArgs,
+    payload: String,
+    stdout: &mut W,
+    spawn_background_drainer: S,
+    home: Option<PathBuf>,
+    runtime_env: RuntimeEnv,
+) -> anyhow::Result<()>
+where
+    W: std::io::Write,
+    S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
+{
     let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
     let spool_policy =
         Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd), runtime_env.clone())
@@ -802,17 +1122,29 @@ where
         args.server_url.clone_from(&spool_policy.server_url);
     }
     let agent_kind = AgentKind::from_wire(&args.agent);
-    let hook_event = HookEvent::parse(&args.event);
+    let mut hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
     // than server configuration. Hooks deliberately bypass Config::load.
     let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())
         || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
+        // Hermes adds a JSON `context` response from every primary-session
+        // pre_llm_call to the upcoming turn.
+        || (hook_event == HookEvent::UserPrompt
+            && agent_kind.json_context_user_prompt_injects_handoff())
+        // Claude Code, Codex and Qwen Code answer a "reload context" prompt
+        // with the compaction recap in a `UserPromptSubmit` context envelope;
+        // that path is context delivery too.
+        || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_context())
         // Grok delivers the handoff on the first PostToolUse (its SessionStart /
         // UserPromptSubmit stdout is discarded); that path is context delivery
         // too, so external capture must not suppress it.
-        || (hook_event == HookEvent::PostToolUse && agent_kind.post_tool_injects_handoff());
+        || (hook_event == HookEvent::PostToolUse && agent_kind.post_tool_injects_handoff())
+        // On an Antigravity build without SessionStart, the first turn's
+        // PreInvocation delivers the handoff in its place.
+        || (agent_kind == AgentKind::AntigravityCli
+            && args.event == ANTIGRAVITY_PRE_INVOCATION_EVENT);
     if external_capture && !args.check_capture && !delivers_context {
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
@@ -835,41 +1167,84 @@ where
             return Ok(());
         }
     };
+    // Read before the Hermes shaping below drops `extra` and `profile`.
+    // A delegated child's lifecycle belongs to the parent's session: storing
+    // it would open a session nothing ever finalizes, and its first turn
+    // would claim a handoff meant for the user's next session.
+    let hermes_delegated_child = agent_kind == AgentKind::Hermes
+        && matches!(
+            hook_event,
+            HookEvent::SessionStart
+                | HookEvent::UserPrompt
+                | HookEvent::Stop
+                | HookEvent::SessionEnd
+        )
+        && ai_memory_hooks::hermes_is_delegated_child(&json);
+    let hermes_profile = (agent_kind == AgentKind::Hermes)
+        .then(|| json.get("profile").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_owned);
+    let hermes_user_prompt = hook_event == HookEvent::UserPrompt
+        && agent_kind.json_context_user_prompt_injects_handoff()
+        && !hermes_delegated_child;
+    let hermes_first_prompt = hermes_user_prompt && ai_memory_hooks::hermes_is_first_turn(&json);
+    if agent_kind == AgentKind::Hermes
+        && ai_memory_hooks::shape_hermes_lifecycle_body(&mut json, hook_event)
+    {
+        payload = serde_json::to_string(&json)?;
+    }
     // Read before any capture rewrite can drop the prompt text.
     let reload_requested = hook_event == HookEvent::UserPrompt
-        && ai_memory_hooks::user_prompt_text(&json)
+        && ai_memory_hooks::user_prompt_text_for_agent(agent_kind, &json)
             .is_some_and(|prompt| ai_memory_core::compaction_recap::is_reload_request(&prompt));
-    // Antigravity exposes PreInvocation rather than a true SessionStart. It
-    // fires before every model call; invocation zero is the only startup
-    // boundary. Fail closed when the documented counter is absent so a later
-    // invocation can never consume a handoff intended for the next session.
-    let event_admits_capture = should_process_hook_event(agent_kind, hook_event, &json)
+    // Antigravity's PreInvocation fires before every model call; only
+    // invocation zero, the start of a user turn, is a boundary.
+    let antigravity = antigravity_boundary(agent_kind, &args.event, &json);
+    let event_admits_capture = should_process_hook_event(agent_kind, &args.event, &json)
         && !is_redundant_cursor_copy(
             agent_kind,
             &json,
             super::install_hooks::cursor_native_hooks_installed,
         )
-        && !is_dropped_plugin_copy(&args, &json, env_lookup);
+        && !is_dropped_plugin_copy(&args, &json, env_lookup)
+        && !hermes_delegated_child;
     if !event_admits_capture && !args.check_capture {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
-    // `invocationNum` restarts at 0 on every user turn, so invocation zero
-    // marks a turn, not a conversation. Only the first turn of a conversation
-    // may post session-start and claim a handoff.
+    // Only a conversation's first start boundary posts session-start and
+    // claims a handoff: the native SessionStart, or on builds without it the
+    // first turn's PreInvocation. Every later turn start only recovers the
+    // turn's prompts from the transcript (below) and posts no event of its
+    // own. A turn start without a conversation id cannot be told from a new
+    // conversation, so it does nothing.
+    let mut antigravity_turn_only = false;
     if !args.check_capture
-        && let Some(marker) = antigravity_conversation_start_marker(
-            &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
-            agent_kind,
-            hook_event,
-            &json,
+        && matches!(
+            antigravity,
+            AntigravityBoundary::ConversationStart | AntigravityBoundary::TurnStart
         )
     {
-        if marker.exists() {
+        let marker = antigravity_conversation_start_marker(
+            &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+            &json,
+        );
+        let started = match &marker {
+            Some(marker) => !claim_conversation_start(marker),
+            None => antigravity == AntigravityBoundary::TurnStart,
+        };
+        if started && antigravity == AntigravityBoundary::ConversationStart {
             write_success_response(stdout, agent_kind, hook_event)?;
             return Ok(());
         }
-        mark_briefed(&marker);
+        antigravity_turn_only = started;
+        args.event = if started {
+            ANTIGRAVITY_PRE_INVOCATION_EVENT
+        } else {
+            "session-start"
+        }
+        .into();
+        hook_event = HookEvent::parse(&args.event);
     }
     // Assistant/Stop capture (#196). On an opted-in install
     // (`install-hooks --capture-assistant`), extract the assistant message,
@@ -894,15 +1269,29 @@ where
         payload = serde_json::to_string(&json)?;
     }
     if agent_kind == AgentKind::AntigravityCli
-        && ai_memory_hooks::enrich_antigravity_step_output(
-            &mut json,
-            hook_event,
-            home_dir().as_deref(),
-        )
+        && ai_memory_hooks::enrich_antigravity_step_output(&mut json, hook_event, home.as_deref())
     {
         payload = serde_json::to_string(&json)?;
     }
     let (payload_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    // Hermes reports its own process cwd on every event, which for a gateway
+    // is wherever the gateway started. The session's working directory is
+    // `terminal.cwd`, which Hermes exports to hooks as `TERMINAL_CWD`, so that
+    // replaces the reported cwd. A tool event can still move to another
+    // checkout its own absolute locations prove (below).
+    let payload_cwd = match (agent_kind == AgentKind::Hermes)
+        .then(|| hermes_terminal_cwd(&runtime_env, hermes_profile.as_deref()))
+        .flatten()
+    {
+        Some(cwd) => {
+            if let Some(object) = json.as_object_mut() {
+                object.insert("cwd".into(), cwd.clone().into());
+                payload = serde_json::to_string(&json)?;
+            }
+            Some(cwd)
+        }
+        None => payload_cwd,
+    };
     let tool_event = is_tool_event(&args.event);
     // Some harnesses report a cwd other than where the tool ran: a subagent's
     // parent session (#932), or Hermes' own process cwd while its tools take
@@ -1122,18 +1511,58 @@ where
     // delivery succeeded but whose response was lost — closing the
     // conservative-retry duplication vector. Older servers ignore the param.
     if !external_capture {
-        let ingest_key = uuid::Uuid::new_v4().simple().to_string();
-        let event_url = format!(
-            "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
-            args.event, args.agent, hook_qs, capture_qs
-        );
-        let entry =
-            hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present)
-                .routed_to(profile_name);
-        if hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_err() {
-            eprintln!(
-                "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+        // Antigravity's prompts exist only in its transcript. A Stop's go
+        // ahead of it, so the turn checkpoint it publishes includes them; a
+        // start's follow it. A later turn start spools only its prompts.
+        let mut antigravity_prompts = (agent_kind == AgentKind::AntigravityCli
+            && (antigravity_turn_only
+                || matches!(hook_event, HookEvent::SessionStart | HookEvent::Stop)))
+        .then(|| antigravity_transcript_prompt_events(&dd, home.as_deref(), &json))
+        .flatten();
+        let spool_prompts = |prompts: AntigravityPromptEvents| {
+            let mut spooled = true;
+            for (ingest_key, body) in prompts.events {
+                let url = format!(
+                    "{base}/hook?event=user-prompt&agent={}{hook_qs}&ingest_key={ingest_key}",
+                    args.agent
+                );
+                let entry = hook_spool::entry_for(url, body, effective_token, oidc_present)
+                    .routed_to(profile_name);
+                spooled &=
+                    hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_ok();
+            }
+            // Advance only past prompts that were all spooled; a re-read
+            // repeats the spooled ones under the same ingest keys.
+            if spooled {
+                store_antigravity_transcript_cursor(&prompts.cursor_path, &prompts.cursor);
+            } else {
+                eprintln!(
+                    "ai-memory hook warning: failed to spool an Antigravity prompt; it is retried on the next turn"
+                );
+            }
+        };
+        if hook_event == HookEvent::Stop
+            && let Some(prompts) = antigravity_prompts.take()
+        {
+            spool_prompts(prompts);
+        }
+        if !antigravity_turn_only {
+            let ingest_key = uuid::Uuid::new_v4().simple().to_string();
+            let event_url = format!(
+                "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
+                args.event, args.agent, hook_qs, capture_qs
             );
+            let entry =
+                hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present)
+                    .routed_to(profile_name);
+            if hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_err() {
+                eprintln!(
+                    "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+                );
+            }
+        }
+        if let Some(prompts) = antigravity_prompts {
+            spool_prompts(prompts);
         }
         // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
         // per turn, so its stored id is cleared by `finalize-session` (or
@@ -1372,6 +1801,50 @@ where
         // text. Empty handoff or any fetch error means print nothing at all
         // (kimi ignores empty stdout; warnings go to stderr).
         return Ok(());
+    }
+
+    // user-prompt: Hermes ignores `on_session_start` stdout, but adds a
+    // `pre_llm_call` JSON `context` to the upcoming turn. Check every primary
+    // prompt so a resumed native session can receive a handoff produced while
+    // another harness was active. Only a genuinely new session asks for the
+    // startup briefing/profile digest; later or resumed prompts request an
+    // already-open handoff only.
+    if hermes_user_prompt && handoff_scoped {
+        let client = build_client();
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+        let native_session_qs = canonical_session_id
+            .as_deref()
+            .map_or_else(String::new, |session_id| {
+                format!("&session_id={}", url_encode(session_id))
+            });
+        let handoff_qs = if hermes_first_prompt {
+            qs.clone()
+        } else {
+            policy_cwd
+                .as_deref()
+                .map(|cwd| {
+                    marker_query_suffix_without_briefing(
+                        cwd,
+                        args.project_strategy.and_then(|s| s.baked()),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let profile_qs = if hermes_first_prompt {
+            ""
+        } else {
+            "&profile_digest=0"
+        };
+        let handoff_url = format!(
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
+            args.agent
+        );
+        if let Some(handoff) =
+            get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
+        {
+            writeln!(stdout, "{}", hermes_prompt_context_envelope(handoff))?;
+            return Ok(());
+        }
     }
 
     // post-tool-use: Grok shows hookSpecificOutput.additionalContext to the
@@ -2325,31 +2798,64 @@ mod tests {
         }
     }
 
+    /// Each documented Antigravity start event, under both the current
+    /// rendering (SessionStart → `session-start`, PreInvocation →
+    /// `pre-invocation`) and the one earlier installs carry (PreInvocation →
+    /// `session-start`).
     #[test]
-    fn antigravity_preinvocation_only_maps_invocation_zero_to_session_start() {
-        for (raw, expected) in [
-            (serde_json::json!({"invocationNum": 0}), true),
-            (serde_json::json!({"invocationNum": 1}), false),
-            (serde_json::json!({"invocationNum": 0.5}), false),
-            (serde_json::json!({"invocationNum": "0"}), false),
-            (serde_json::json!({}), false),
-        ] {
-            assert_eq!(
-                should_process_hook_event(AgentKind::AntigravityCli, HookEvent::SessionStart, &raw,),
-                expected,
-                "{raw}"
-            );
+    fn antigravity_start_events_map_to_conversation_and_turn_boundaries() {
+        use AntigravityBoundary::{ConversationStart, LaterInvocation, TurnStart};
+        let agy = AgentKind::AntigravityCli;
+        for event in ["session-start", ANTIGRAVITY_PRE_INVOCATION_EVENT] {
+            for (raw, expected) in [
+                (
+                    serde_json::json!({"invocationNum": 0, "initialNumSteps": 4}),
+                    TurnStart,
+                ),
+                (serde_json::json!({"invocationNum": 1}), LaterInvocation),
+                (serde_json::json!({"invocationNum": 0.5}), LaterInvocation),
+                (serde_json::json!({"invocationNum": "0"}), LaterInvocation),
+                (serde_json::json!({"invocationNum": null}), LaterInvocation),
+                (serde_json::json!({"invocationNum": -1}), LaterInvocation),
+            ] {
+                assert_eq!(
+                    antigravity_boundary(agy, event, &raw),
+                    expected,
+                    "{event} {raw}"
+                );
+                assert_eq!(
+                    should_process_hook_event(agy, event, &raw),
+                    expected != LaterInvocation,
+                    "{event} {raw}"
+                );
+            }
         }
-        assert!(should_process_hook_event(
-            AgentKind::ClaudeCode,
-            HookEvent::SessionStart,
-            &serde_json::json!({})
-        ));
-        assert!(should_process_hook_event(
-            AgentKind::AntigravityCli,
-            HookEvent::PostToolUse,
-            &serde_json::json!({})
-        ));
+        // Only SessionStart omits the counter; a PreInvocation without it
+        // fails closed.
+        let session_start = serde_json::json!({"conversationId": "c", "workspacePaths": ["/w"]});
+        assert_eq!(
+            antigravity_boundary(agy, "session-start", &session_start),
+            ConversationStart
+        );
+        assert_eq!(
+            antigravity_boundary(agy, ANTIGRAVITY_PRE_INVOCATION_EVENT, &session_start),
+            LaterInvocation
+        );
+        for (agent, event) in [
+            (agy, "post-tool-use"),
+            (agy, "pre-tool-use"),
+            (agy, "stop"),
+            (AgentKind::ClaudeCode, "session-start"),
+            (AgentKind::ClaudeCode, ANTIGRAVITY_PRE_INVOCATION_EVENT),
+        ] {
+            let later = serde_json::json!({"invocationNum": 3});
+            assert_eq!(
+                antigravity_boundary(agent, event, &later),
+                AntigravityBoundary::None,
+                "{agent:?} {event}"
+            );
+            assert!(should_process_hook_event(agent, event, &later));
+        }
     }
 
     #[test]
@@ -2392,6 +2898,13 @@ mod tests {
             (AgentKind::IbmBob, HookEvent::UserPrompt, b"".as_slice()),
             (
                 AgentKind::IbmBob,
+                HookEvent::PostToolUse,
+                b"{}\n".as_slice(),
+            ),
+            (AgentKind::QwenCode, HookEvent::SessionStart, b"".as_slice()),
+            (AgentKind::QwenCode, HookEvent::UserPrompt, b"".as_slice()),
+            (
+                AgentKind::QwenCode,
                 HookEvent::PostToolUse,
                 b"{}\n".as_slice(),
             ),
@@ -2740,6 +3253,7 @@ mod tests {
         let cases = [
             ("codebuddy", "session-start", serde_json::json!({})),
             ("ibm-bob", "session-start", serde_json::json!({})),
+            ("qwen-code", "session-start", serde_json::json!({})),
             ("claude-code", "session-start", serde_json::json!({})),
             ("codex", "session-start", serde_json::json!({})),
             (
@@ -3062,6 +3576,31 @@ mod tests {
             serde_json::json!({"hook_event_name": "SessionStart", "cwd": "payload-project"});
         assert_eq!(
             resolve_hook_cwd_with("codebuddy", &with_cwd, project_dir, process).as_deref(),
+            Some("payload-project")
+        );
+    }
+
+    /// Qwen Code exports `QWEN_PROJECT_DIR` on every command hook. A missing
+    /// payload `cwd` uses that directory; the process cwd is never a fallback.
+    #[test]
+    fn qwen_code_missing_cwd_uses_qwen_project_dir_only() {
+        let bare = serde_json::json!({"hook_event_name": "SessionStart", "source": "startup"});
+        let project_dir =
+            |name: &str| (name == "QWEN_PROJECT_DIR").then(|| "env-project".to_owned());
+        let process = || Some(PathBuf::from("process-project"));
+
+        assert_eq!(
+            resolve_hook_cwd_with("qwen-code", &bare, project_dir, process).as_deref(),
+            Some("env-project")
+        );
+        assert_eq!(
+            resolve_hook_cwd_with("qwen-code", &bare, |_| None, process),
+            None
+        );
+        let with_cwd =
+            serde_json::json!({"hook_event_name": "SessionStart", "cwd": "payload-project"});
+        assert_eq!(
+            resolve_hook_cwd_with("qwen-code", &with_cwd, project_dir, process).as_deref(),
             Some("payload-project")
         );
         // Another agent never reads CodeBuddy's variable.
@@ -3688,12 +4227,16 @@ mod tests {
         let mut args = devin_hook_args("post-tool-use");
         args.agent = agent.into();
         args.capture_mode = capture_mode;
-        run_with_payload(
+        // An empty environment: a suite run from a Hermes terminal inherits
+        // its TERMINAL_CWD, which would reroute the Hermes cases.
+        run_with_payload_in_home(
             Some(data_dir.to_path_buf()),
             args,
             raw.to_string(),
             &mut Vec::new(),
             |_, _| panic!("a tool event below the threshold must only spool"),
+            home_dir(),
+            RuntimeEnv::default(),
         )
         .await
         .unwrap();
@@ -5217,7 +5760,7 @@ mod tests {
             "cwd": tmp.path(),
             "extra": {"tool_call_id": "call-42", "status": "ok"}
         });
-        run_with_payload(
+        run_with_payload_in_home(
             Some(data_dir.clone()),
             args,
             raw.to_string(),
@@ -5226,6 +5769,8 @@ mod tests {
                 called.set(true);
                 Ok(())
             },
+            home_dir(),
+            RuntimeEnv::default(),
         )
         .await
         .unwrap();
@@ -5962,7 +6507,7 @@ mod tests {
         assert_eq!(
             output,
             serde_json::json!({
-                "injectSteps": [{"ephemeralMessage": "AGY-HANDOFF"}]
+                "injectSteps": [{"systemMessage": {"systemMessage": "AGY-HANDOFF"}}]
             })
         );
         let mut recorded = Vec::new();
@@ -6022,46 +6567,89 @@ mod tests {
         assert!(first_request(&mut requests).await.is_none());
     }
 
+    /// A re-read of the same prompt keeps its key (the server drops it), while
+    /// a rewind's new prompt that reuses the step number gets a new one.
     #[test]
-    fn antigravity_conversation_marker_only_for_named_antigravity_starts() {
+    fn antigravity_prompt_ingest_key_follows_step_time_and_text() {
+        let prompt = |text: &str, created_at: Option<&str>| ai_memory_hooks::TranscriptPrompt {
+            step_index: Some(4),
+            line_offset: 0,
+            text: text.into(),
+            created_at: created_at.map(Into::into),
+        };
+        let at = Some("2026-10-18T10:00:00Z");
+        let key = antigravity_prompt_ingest_key("conv", &prompt("fix the parser", at));
+        assert_eq!(
+            key,
+            antigravity_prompt_ingest_key("conv", &prompt("fix the parser", at)),
+            "a repeated read is deduplicated"
+        );
+        for other in [
+            antigravity_prompt_ingest_key("conv", &prompt("rewound prompt", at)),
+            antigravity_prompt_ingest_key(
+                "conv",
+                &prompt("fix the parser", Some("2026-10-18T11:00:00Z")),
+            ),
+            antigravity_prompt_ingest_key("other-conv", &prompt("fix the parser", at)),
+        ] {
+            assert_ne!(key, other);
+        }
+        assert!(key.starts_with("agy_") && key.len() == 64);
+    }
+
+    /// A concurrent native SessionStart and first-turn PreInvocation race
+    /// for the same marker: exactly one of them may claim the start (and so
+    /// the handoff); a later boundary of the same conversation never does.
+    #[test]
+    fn antigravity_conversation_start_is_claimed_exactly_once_under_races() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("briefed").join("agy-start-race");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let winners = (0..8)
+            .map(|_| {
+                let marker = marker.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_conversation_start(&marker)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "exactly one boundary claims the start");
+        assert!(marker.is_file());
+        assert!(
+            !claim_conversation_start(&marker),
+            "a later turn never re-claims"
+        );
+        // Control: another conversation still claims its own start.
+        let other = tmp.path().join("briefed").join("agy-start-other");
+        assert!(claim_conversation_start(&other));
+    }
+
+    #[test]
+    fn antigravity_conversation_marker_is_keyed_by_a_sanitized_conversation_id() {
         let dir = Path::new("/d");
-        let raw = serde_json::json!({"conversationId": "a/b"});
         assert_eq!(
             antigravity_conversation_start_marker(
                 dir,
-                AgentKind::AntigravityCli,
-                HookEvent::SessionStart,
-                &raw
+                &serde_json::json!({"conversationId": "a/b"})
             ),
             Some(dir.join("briefed").join("agy-start-a_b"))
         );
-        assert!(
-            antigravity_conversation_start_marker(
-                dir,
-                AgentKind::AntigravityCli,
-                HookEvent::SessionStart,
-                &serde_json::json!({})
-            )
-            .is_none()
-        );
-        assert!(
-            antigravity_conversation_start_marker(
-                dir,
-                AgentKind::AntigravityCli,
-                HookEvent::PostToolUse,
-                &raw
-            )
-            .is_none()
-        );
-        assert!(
-            antigravity_conversation_start_marker(
-                dir,
-                AgentKind::ClaudeCode,
-                HookEvent::SessionStart,
-                &raw
-            )
-            .is_none()
-        );
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"conversationId": "  "}),
+            serde_json::json!({"conversationId": 7}),
+        ] {
+            assert!(
+                antigravity_conversation_start_marker(dir, &raw).is_none(),
+                "{raw}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6089,6 +6677,519 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         assert!(first_request(&mut requests).await.is_none());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn antigravity_native_session_start_delivers_a_persistent_handoff_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "AGY-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("session-start", &base),
+            serde_json::json!({
+                "conversationId": "agy-native",
+                "workspacePaths": [tmp.path()],
+                "modelName": "gemini-3-pro"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "injectSteps": [{"systemMessage": {"systemMessage": "AGY-HANDOFF"}}]
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?") && request.contains("session_id=agy-native")
+            }),
+            "{recorded:?}"
+        );
+
+        // The first turn's PreInvocation follows at once, under the current
+        // rendering and under the one earlier installs carry; neither starts
+        // the conversation again nor claims a second handoff.
+        let spooled = hook_spool::spool_len(&hook_spool::spool_dir(&data_dir));
+        let (base, mut requests) = serve_requests("200 OK", "MUST-NOT-BE-CONSUMED").await;
+        for event in [ANTIGRAVITY_PRE_INVOCATION_EVENT, "session-start"] {
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                antigravity_hook_args(event, &base),
+                serde_json::json!({
+                    "invocationNum": 0,
+                    "initialNumSteps": 1,
+                    "conversationId": "agy-native",
+                    "workspacePaths": [tmp.path()]
+                })
+                .to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("must not spawn")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stdout, b"{}\n", "{event}");
+        }
+        assert!(first_request(&mut requests).await.is_none());
+        assert_eq!(
+            hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)),
+            spooled,
+            "a turn start posts no event of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_first_pre_invocation_starts_the_conversation_without_session_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "AGY-HANDOFF").await;
+        let turn = serde_json::json!({
+            "invocationNum": 0,
+            "initialNumSteps": 1,
+            "conversationId": "agy-old-build",
+            "workspacePaths": [tmp.path()]
+        })
+        .to_string();
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args(ANTIGRAVITY_PRE_INVOCATION_EVENT, &base),
+            turn.clone(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "injectSteps": [{"systemMessage": {"systemMessage": "AGY-HANDOFF"}}]
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded
+                .iter()
+                .any(|request| request.contains("event=session-start")),
+            "the fallback posts a session-start: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?") && request.contains("session_id=agy-old-build")
+            }),
+            "{recorded:?}"
+        );
+
+        let (base, mut requests) = serve_requests("200 OK", "MUST-NOT-BE-CONSUMED").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            antigravity_hook_args(ANTIGRAVITY_PRE_INVOCATION_EVENT, &base),
+            turn,
+            &mut stdout,
+            |_, _| Err(std::io::Error::other("must not spawn")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        assert!(first_request(&mut requests).await.is_none());
+    }
+
+    /// `<home>/.gemini/antigravity/brain/<conversation>/.system_generated/logs/transcript.jsonl`.
+    fn agy_transcript(home: &Path, conversation: &str) -> PathBuf {
+        let logs = home
+            .join(".gemini/antigravity/brain")
+            .join(conversation)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        logs.join("transcript.jsonl")
+    }
+
+    fn append_user_input(transcript: &Path, step: u64, text: &str) {
+        use std::io::Write as _;
+        let line = serde_json::json!({
+            "step_index": step,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-10-18T10:00:00Z",
+            "content": text,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(transcript)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    fn agy_event_payload(
+        conversation: &str,
+        workspace: &Path,
+        transcript: &Path,
+        extra: serde_json::Value,
+    ) -> String {
+        let mut payload = serde_json::json!({
+            "conversationId": conversation,
+            "workspacePaths": [workspace],
+            "transcriptPath": transcript,
+            "artifactDirectoryPath": transcript.parent().unwrap().parent().unwrap().parent().unwrap(),
+            "modelName": "gemini-3-pro",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            payload[key] = value.clone();
+        }
+        payload.to_string()
+    }
+
+    async fn run_agy_hook(data_dir: &Path, home: &Path, event: &str, payload: String) {
+        let mut stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_dir.to_path_buf()),
+            antigravity_hook_args(event, &dead_server_url()),
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+            Some(home.to_path_buf()),
+            RuntimeEnv::from_process(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The spooled entries, removed from the spool (whose test capacity is
+    /// three) so a longer sequence can keep spooling.
+    fn take_spooled_entries(data_dir: &Path) -> Vec<hook_spool::SpoolEntry> {
+        let spool = hook_spool::spool_dir(data_dir);
+        let entries = read_spooled_entries(&spool);
+        for entry in std::fs::read_dir(&spool).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        entries
+    }
+
+    fn event_names(entries: &[hook_spool::SpoolEntry]) -> Vec<(String, Option<String>)> {
+        entries
+            .iter()
+            .map(|entry| {
+                let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                (
+                    query_param(&entry.url, "event").unwrap().to_owned(),
+                    body.get("prompt")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+
+    fn spooled_events(data_dir: &Path) -> Vec<(String, Option<String>)> {
+        event_names(&read_spooled_entries(&hook_spool::spool_dir(data_dir)))
+    }
+
+    /// No Antigravity event carries the prompt; the transcript does. Each is
+    /// spooled once as a `user-prompt`: after the start, at the start of its
+    /// turn, and ahead of a Stop that found it unread, so the turn
+    /// checkpoint the Stop publishes includes it.
+    #[tokio::test]
+    async fn antigravity_transcript_prompts_are_spooled_once_in_turn_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data_dir, home, workspace) = (
+            tmp.path().join("data"),
+            tmp.path().join("home"),
+            tmp.path().join("repo"),
+        );
+        std::fs::create_dir_all(&workspace).unwrap();
+        let conversation = "ec33ebf9-0cba-4100-8142-c61503f6c587";
+        let transcript = agy_transcript(&home, conversation);
+        let payload = |extra: serde_json::Value| {
+            agy_event_payload(conversation, &workspace, &transcript, extra)
+        };
+        append_user_input(&transcript, 0, "Fix the login redirect");
+
+        let mut entries = Vec::new();
+        run_agy_hook(
+            &data_dir,
+            &home,
+            "session-start",
+            payload(serde_json::json!({})),
+        )
+        .await;
+        entries.extend(take_spooled_entries(&data_dir));
+        let pre_invocation = ANTIGRAVITY_PRE_INVOCATION_EVENT;
+        for counter in [0, 1, 2] {
+            run_agy_hook(
+                &data_dir,
+                &home,
+                pre_invocation,
+                payload(serde_json::json!({"invocationNum": counter})),
+            )
+            .await;
+            entries.extend(take_spooled_entries(&data_dir));
+        }
+        append_user_input(&transcript, 4, "Add a regression test");
+        run_agy_hook(
+            &data_dir,
+            &home,
+            pre_invocation,
+            payload(serde_json::json!({"invocationNum": 0})),
+        )
+        .await;
+        entries.extend(take_spooled_entries(&data_dir));
+        append_user_input(&transcript, 9, "Also update the docs");
+        let stop = payload(serde_json::json!({
+            "executionNum": 0,
+            "terminationReason": "NO_TOOL_CALL",
+            "fullyIdle": true,
+        }));
+        run_agy_hook(&data_dir, &home, "stop", stop.clone()).await;
+        entries.extend(take_spooled_entries(&data_dir));
+        // A repeated Stop finds nothing new.
+        run_agy_hook(&data_dir, &home, "stop", stop).await;
+        entries.extend(take_spooled_entries(&data_dir));
+
+        let prompt = |text: &str| ("user-prompt".to_owned(), Some(text.to_owned()));
+        assert_eq!(
+            event_names(&entries),
+            [
+                ("session-start".to_owned(), None),
+                prompt("Fix the login redirect"),
+                prompt("Add a regression test"),
+                prompt("Also update the docs"),
+                ("stop".to_owned(), None),
+                ("stop".to_owned(), None),
+            ]
+        );
+
+        let first = &entries[1];
+        let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(body["conversationId"], conversation);
+        assert_eq!(body["workspacePaths"], serde_json::json!([workspace]));
+        assert_eq!(body["occurred_at"], "2026-10-18T10:00:00Z");
+        assert!(body.get("transcriptPath").is_none(), "{body}");
+        let key = query_param(&first.url, "ingest_key").unwrap();
+        assert!(key.starts_with("agy_") && key.len() == 64, "{key}");
+        let expected_key = antigravity_prompt_ingest_key(
+            conversation,
+            &ai_memory_hooks::TranscriptPrompt {
+                step_index: Some(0),
+                line_offset: 0,
+                text: "Fix the login redirect".into(),
+                created_at: Some("2026-10-18T10:00:00Z".into()),
+            },
+        );
+        assert_eq!(
+            key, expected_key,
+            "stable per conversation, step, time and text"
+        );
+        assert_eq!(query_param(&first.url, "agent"), Some("antigravity-cli"));
+        // The prompt is scoped exactly like the event it rode with.
+        let scope = |url: &str| {
+            url.split('?')
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .filter(|part| !part.starts_with("event=") && !part.starts_with("ingest_key="))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scope(&first.url), scope(&entries[4].url));
+        assert!(antigravity_transcript_prompts_captured(
+            &data_dir,
+            conversation
+        ));
+        assert!(!antigravity_transcript_prompts_captured(
+            &data_dir,
+            "agy-other"
+        ));
+    }
+
+    /// Adversarial: `transcriptPath` is payload input and the hook uploads
+    /// what it reads. Only the named conversation's own transcript under the
+    /// home's Antigravity data directories is read; a forged path outside
+    /// it, or another conversation's transcript, yields no prompt.
+    #[tokio::test]
+    async fn antigravity_transcript_reads_are_confined_to_the_conversations_own_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, workspace) = (tmp.path().join("home"), tmp.path().join("repo"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let foreign = agy_transcript(&tmp.path().join("elsewhere"), "agy-a");
+        append_user_input(&foreign, 0, "outside the home");
+        let other = agy_transcript(&home, "agy-b");
+        append_user_input(&other, 0, "another conversation");
+        let secret = home.join("notes.jsonl");
+        std::fs::write(
+            &secret,
+            "{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"content\":\"secret\"}\n",
+        )
+        .unwrap();
+        let stop = serde_json::json!({"terminationReason": "NO_TOOL_CALL", "fullyIdle": true});
+        for (case, path) in [
+            ("foreign", &foreign),
+            ("other", &other),
+            ("secret", &secret),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{case}"));
+            run_agy_hook(
+                &data_dir,
+                &home,
+                "stop",
+                agy_event_payload("agy-a", &workspace, path, stop.clone()),
+            )
+            .await;
+            assert_eq!(
+                spooled_events(&data_dir),
+                [("stop".to_owned(), None)],
+                "{case}"
+            );
+            assert!(!antigravity_transcript_prompts_captured(&data_dir, "agy-a"));
+        }
+        // Control: the conversation's own transcript is read.
+        let own = agy_transcript(&home, "agy-a");
+        append_user_input(&own, 0, "own prompt");
+        let data_dir = tmp.path().join("data-own");
+        run_agy_hook(
+            &data_dir,
+            &home,
+            "stop",
+            agy_event_payload("agy-a", &workspace, &own, stop),
+        )
+        .await;
+        assert_eq!(
+            spooled_events(&data_dir),
+            [
+                ("user-prompt".to_owned(), Some("own prompt".to_owned())),
+                ("stop".to_owned(), None)
+            ]
+        );
+    }
+
+    /// A repository the allowlist leaves out emits nothing, prompts included,
+    /// and its transcript is not even read.
+    #[tokio::test]
+    async fn antigravity_transcript_prompts_follow_the_capture_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data_dir, home, workspace) = (
+            tmp.path().join("data"),
+            tmp.path().join("home"),
+            tmp.path().join("repo"),
+        );
+        std::fs::create_dir_all(&workspace).unwrap();
+        let transcript = agy_transcript(&home, "agy-a");
+        append_user_input(&transcript, 0, "unmarked repository");
+        let mut args = antigravity_hook_args("stop", &dead_server_url());
+        args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+        let mut stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_dir.clone()),
+            args,
+            agy_event_payload(
+                "agy-a",
+                &workspace,
+                &transcript,
+                serde_json::json!({"terminationReason": "NO_TOOL_CALL", "fullyIdle": true}),
+            ),
+            &mut stdout,
+            |_, _| Ok(()),
+            Some(home),
+            RuntimeEnv::from_process(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+        assert!(!antigravity_transcript_prompts_captured(&data_dir, "agy-a"));
+    }
+
+    #[test]
+    fn antigravity_transcript_cursor_store_is_atomic_and_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("hook-state/antigravity-transcripts");
+        let cursor = ai_memory_hooks::TranscriptCursor {
+            file: Some("transcript.jsonl".into()),
+            head: Some("0123456789abcdef".into()),
+            offset: 42,
+            last_step: Some(3),
+            resync: false,
+            prompts: 2,
+        };
+        let path = antigravity_transcript_cursor_path(tmp.path(), "a/b");
+        assert_eq!(path, dir.join("a_b.json"));
+        store_antigravity_transcript_cursor(&path, &cursor);
+        assert_eq!(load_antigravity_transcript_cursor(&path), cursor);
+        assert!(antigravity_transcript_prompts_captured(tmp.path(), "a/b"));
+        // Corrupt state reads as a fresh cursor rather than failing the hook.
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(
+            load_antigravity_transcript_cursor(&path),
+            ai_memory_hooks::TranscriptCursor::default()
+        );
+        std::fs::write(
+            &path,
+            vec![0_u8; (MAX_ANTIGRAVITY_TRANSCRIPT_CURSOR_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert_eq!(
+            load_antigravity_transcript_cursor(&path),
+            ai_memory_hooks::TranscriptCursor::default()
+        );
+        let unrelated = dir.join("keep.lock");
+        std::fs::write(&unrelated, b"not a cursor").unwrap();
+        for n in 0..MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS + 5 {
+            store_antigravity_transcript_cursor(
+                &antigravity_transcript_cursor_path(tmp.path(), &format!("c{n}")),
+                &cursor,
+            );
+        }
+        let names = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".json"))
+            .collect::<Vec<_>>();
+        assert!(
+            names.len() <= MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS,
+            "{}",
+            names.len()
+        );
+        assert!(
+            names.iter().all(|name| name.ends_with(".json")),
+            "{names:?}"
+        );
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"not a cursor");
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")
+        }));
+    }
+
+    #[test]
+    fn antigravity_transcript_read_deadline_does_not_wait_for_blocked_work() {
+        assert_eq!(run_before_deadline(Duration::from_secs(1), || 42), Some(42));
+
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let result = run_before_deadline(Duration::from_millis(20), move || blocked.recv());
+        drop(release);
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -7149,6 +8250,556 @@ mod tests {
         }
     }
 
+    fn hermes_args(event: &str, server_url: &str) -> HookArgs {
+        let mut args = kimi_hook_args(event, server_url);
+        args.agent = "hermes".into();
+        args
+    }
+
+    /// The stdin envelope Hermes gives every shell hook
+    /// (`_payload_fields` in `agent/shell_hooks.py`, v0.22.2).
+    fn hermes_payload(hook_event_name: &str, cwd: &Path, extra: serde_json::Value) -> String {
+        serde_json::json!({
+            "hook_event_name": hook_event_name,
+            "tool_name": null,
+            "tool_input": null,
+            "session_id": "hermes-session",
+            "cwd": cwd,
+            "profile": "default",
+            "extra": extra,
+        })
+        .to_string()
+    }
+
+    fn pre_llm_call_extra(is_first_turn: bool) -> serde_json::Value {
+        serde_json::json!({
+            "task_id": "task-1",
+            "turn_id": "turn-1",
+            "user_message": "refactor the parser",
+            "conversation_history": [
+                {"role": "user", "content": "HISTORY_SENTINEL"}
+            ],
+            "is_first_turn": is_first_turn,
+            "model": "hermes-4",
+            "platform": "cli",
+            "sender_id": ""
+        })
+    }
+
+    /// Run one Hermes hook with an injected environment, so a test never
+    /// inherits a `TERMINAL_CWD` from the shell running the suite.
+    async fn run_hermes(
+        data_dir: &Path,
+        args: HookArgs,
+        payload: String,
+        runtime_env: RuntimeEnv,
+    ) -> Vec<u8> {
+        let mut stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_dir.to_path_buf()),
+            args,
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+            None,
+            runtime_env,
+        )
+        .await
+        .unwrap();
+        stdout
+    }
+
+    fn spooled_entries(data_dir: &Path) -> Vec<hook_spool::SpoolEntry> {
+        let spool = hook_spool::spool_dir(data_dir);
+        if spool.exists() {
+            read_spooled_entries(&spool)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A `pre_llm_call` claims the handoff and prints the one shape Hermes
+    /// adds to the turn: `{"context": "..."}`.
+    #[tokio::test]
+    async fn hermes_prompt_prints_the_handoff_as_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        let stdout = run_hermes(
+            &data_dir,
+            hermes_args("user-prompt-submit", &base),
+            hermes_payload("pre_llm_call", tmp.path(), pre_llm_call_extra(true)),
+            RuntimeEnv::default(),
+        )
+        .await;
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "{\"context\":\"HERMES-HANDOFF\"}\n"
+        );
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(request.contains("agent=hermes"), "{request}");
+        assert!(request.contains("session_id=hermes-session"), "{request}");
+
+        // The prompt was captured too, without the conversation history.
+        let entries = spooled_entries(&data_dir);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .url
+                .contains("event=user-prompt-submit&agent=hermes")
+        );
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["prompt"], "refactor the parser");
+        assert_eq!(body["session_id"], "hermes-session");
+        assert!(
+            !entries[0].body.contains("HISTORY_SENTINEL"),
+            "{}",
+            entries[0].body
+        );
+        assert!(!entries[0].body.contains("conversation_history"));
+    }
+
+    /// No pending handoff: `{}`, which Hermes reads as "no context", never a
+    /// bare body or an empty `context`.
+    #[tokio::test]
+    async fn hermes_prompt_without_a_handoff_prints_an_empty_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let stdout = run_hermes(
+            &tmp.path().join("data"),
+            hermes_args("user-prompt-submit", &base),
+            hermes_payload("pre_llm_call", tmp.path(), pre_llm_call_extra(true)),
+            RuntimeEnv::default(),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+    }
+
+    /// A resumed Hermes session has history, so `is_first_turn` is false. It
+    /// still checks for a handoff produced by the harness that ran in between,
+    /// but suppresses first-turn briefing and profile composition.
+    #[tokio::test]
+    async fn hermes_resumed_prompt_claims_a_handoff_without_startup_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        write_briefing_marker(tmp.path());
+        let stdout = run_hermes(
+            &data_dir,
+            hermes_args("user-prompt-submit", &base),
+            hermes_payload("pre_llm_call", tmp.path(), pre_llm_call_extra(false)),
+            RuntimeEnv::default(),
+        )
+        .await;
+        assert_eq!(stdout, b"{\"context\":\"HERMES-HANDOFF\"}\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(request.contains("session_id=hermes-session"), "{request}");
+        assert!(request.contains("profile_digest=0"), "{request}");
+        assert!(!request.contains("briefing"), "{request}");
+    }
+
+    /// `on_session_start` stdout is ignored, while the turn and session ends
+    /// are not context channels. None may claim a handoff.
+    #[tokio::test]
+    async fn hermes_never_claims_the_handoff_outside_a_primary_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        for (event, payload) in [
+            (
+                "session-start",
+                hermes_payload(
+                    "on_session_start",
+                    tmp.path(),
+                    serde_json::json!({"model": "hermes-4", "platform": "cli"}),
+                ),
+            ),
+            (
+                "stop",
+                hermes_payload(
+                    "on_session_end",
+                    tmp.path(),
+                    serde_json::json!({"completed": true, "turn_exit_reason": "done"}),
+                ),
+            ),
+            (
+                "session-end",
+                hermes_payload(
+                    "on_session_finalize",
+                    tmp.path(),
+                    serde_json::json!({"platform": "cli", "reason": "shutdown"}),
+                ),
+            ),
+        ] {
+            let stdout = run_hermes(
+                &data_dir,
+                hermes_args(event, &base),
+                payload,
+                RuntimeEnv::default(),
+            )
+            .await;
+            assert_eq!(stdout, b"{}\n", "{event}");
+        }
+        // The session-start backlog drain may POST spooled events; none of
+        // the requests may touch /handoff.
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+    }
+
+    /// A `delegate_task` child runs as its own Hermes session with an empty
+    /// history, so its first `pre_llm_call` reports `is_first_turn` too. It
+    /// must not claim the handoff, and none of its lifecycle events may be
+    /// stored as a session of its own.
+    #[tokio::test]
+    async fn hermes_delegated_child_lifecycle_is_neither_stored_nor_handed_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        let mut first_turn = pre_llm_call_extra(true);
+        first_turn["platform"] = "subagent".into();
+        first_turn["user_message"] = "CHILD_GOAL_SENTINEL".into();
+        let child = serde_json::json!({"model": "hermes-4", "platform": "subagent"});
+        for (event, payload) in [
+            (
+                "user-prompt-submit",
+                hermes_payload("pre_llm_call", tmp.path(), first_turn),
+            ),
+            (
+                "session-start",
+                hermes_payload("on_session_start", tmp.path(), child.clone()),
+            ),
+            (
+                "stop",
+                hermes_payload("on_session_end", tmp.path(), child.clone()),
+            ),
+            (
+                "session-end",
+                hermes_payload("on_session_finalize", tmp.path(), child),
+            ),
+        ] {
+            let stdout = run_hermes(
+                &data_dir,
+                hermes_args(event, &base),
+                payload,
+                RuntimeEnv::default(),
+            )
+            .await;
+            assert_eq!(stdout, b"{}\n", "{event}");
+        }
+        assert!(spooled_entries(&data_dir).is_empty());
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+            assert!(!request.contains("CHILD_GOAL_SENTINEL"), "{request}");
+        }
+    }
+
+    /// `on_session_finalize` after a gateway `/new` names both sessions; only
+    /// the ending one may be closed.
+    #[tokio::test]
+    async fn hermes_finalize_spools_the_ending_session_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let payload = serde_json::json!({
+            "hook_event_name": "on_session_finalize",
+            "tool_name": null,
+            "tool_input": null,
+            "session_id": "old-session",
+            "cwd": tmp.path(),
+            "profile": "default",
+            "extra": {
+                "platform": "telegram",
+                "reason": "new_session",
+                "old_session_id": "old-session",
+                "new_session_id": "new-session"
+            }
+        })
+        .to_string();
+        let stdout = run_hermes(
+            &data_dir,
+            hermes_args("session-end", &dead_server_url()),
+            payload,
+            RuntimeEnv::default(),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+        let entries = spooled_entries(&data_dir);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].url.contains("event=session-end&agent=hermes"));
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["session_id"], "old-session");
+        assert_eq!(body["reason"], "new_session");
+        assert!(
+            !entries[0].body.contains("new-session"),
+            "{}",
+            entries[0].body
+        );
+    }
+
+    #[test]
+    fn hermes_terminal_cwd_takes_only_an_existing_absolute_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let env = |value: &str| RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", value)]);
+        let cwd = |env: &RuntimeEnv| hermes_terminal_cwd(env, Some("work"));
+        assert_eq!(cwd(&env(dir)).as_deref(), Some(dir));
+        assert_eq!(cwd(&env("relative/dir")), None);
+        assert_eq!(
+            cwd(&env(&tmp.path().join("missing").to_string_lossy())),
+            None
+        );
+        assert_eq!(cwd(&env(&file.to_string_lossy())), None);
+        assert_eq!(cwd(&RuntimeEnv::default()), None);
+        // Outside a gateway one process serves one profile, so its variable
+        // holds whatever profile fired, named or not.
+        assert_eq!(hermes_terminal_cwd(&env(dir), None).as_deref(), Some(dir));
+    }
+
+    /// A multiplexing gateway exports the default profile's `terminal.cwd`
+    /// to every hook, whichever profile fired it. Only the default profile's
+    /// events may use it there.
+    #[test]
+    fn hermes_gateway_terminal_cwd_belongs_to_the_default_profile_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", dir),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        assert_eq!(
+            hermes_terminal_cwd(&gateway, Some("default")).as_deref(),
+            Some(dir)
+        );
+        assert_eq!(hermes_terminal_cwd(&gateway, Some("work")), None);
+        assert_eq!(hermes_terminal_cwd(&gateway, Some("custom")), None);
+        assert_eq!(hermes_terminal_cwd(&gateway, None), None);
+        let other_marker = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", dir),
+            ("_HERMES_GATEWAY", "0"),
+        ]);
+        assert_eq!(
+            hermes_terminal_cwd(&other_marker, Some("work")).as_deref(),
+            Some(dir)
+        );
+    }
+
+    /// A gateway reports its own process cwd (here an unmarked home); the
+    /// session's project arrives as `TERMINAL_CWD`. Under allowlist mode the
+    /// prompt is captured only because that variable selected the marked
+    /// repository, and the body's cwd says so.
+    #[tokio::test]
+    async fn hermes_terminal_cwd_routes_lifecycle_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = repo_with_marker(
+            tmp.path(),
+            "some-repo",
+            "workspace = \"w\"\nproject = \"some-repo\"\n",
+        );
+        let repo_str = repo.to_str().unwrap();
+        let args = || {
+            let mut args = hermes_args("user-prompt-submit", &dead_server_url());
+            args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+            args
+        };
+
+        let data_dir = tmp.path().join("data-routed");
+        run_hermes(
+            &data_dir,
+            args(),
+            hermes_payload("pre_llm_call", &home, pre_llm_call_extra(false)),
+            RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", repo_str)]),
+        )
+        .await;
+        let entries = spooled_entries(&data_dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(query_param(&entries[0].url, "project"), Some("some-repo"));
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["cwd"], repo_str);
+
+        // Controls: no variable, or one that names nothing usable, leaves the
+        // unmarked process cwd in charge, which allowlist mode drops.
+        for (name, env) in [
+            ("unset", RuntimeEnv::default()),
+            (
+                "relative",
+                RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", "some-repo")]),
+            ),
+            (
+                "missing",
+                RuntimeEnv::with_process_env_for_tests(&[(
+                    "TERMINAL_CWD",
+                    &tmp.path().join("gone").to_string_lossy(),
+                )]),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{name}"));
+            run_hermes(
+                &data_dir,
+                args(),
+                hermes_payload("pre_llm_call", &home, pre_llm_call_extra(false)),
+                env,
+            )
+            .await;
+            assert!(spooled_entries(&data_dir).is_empty(), "{name}");
+        }
+    }
+
+    /// In a multiplexing gateway the variable is the default profile's, so an
+    /// event another profile fired keeps the gateway's own cwd, which
+    /// allowlist mode drops, while the default profile's event is routed.
+    #[tokio::test]
+    async fn hermes_gateway_terminal_cwd_routes_only_the_default_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = repo_with_marker(tmp.path(), "default-repo", "project = \"default-repo\"\n");
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", repo.to_str().unwrap()),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        let payload = |profile: &str| {
+            let mut payload: serde_json::Value = serde_json::from_str(&hermes_payload(
+                "pre_llm_call",
+                &home,
+                pre_llm_call_extra(false),
+            ))
+            .unwrap();
+            payload["profile"] = profile.into();
+            payload.to_string()
+        };
+        let args = || {
+            let mut args = hermes_args("user-prompt-submit", &dead_server_url());
+            args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+            args
+        };
+        for (profile, spooled) in [("default", 1), ("work", 0)] {
+            let data_dir = tmp.path().join(format!("data-{profile}"));
+            run_hermes(&data_dir, args(), payload(profile), gateway.clone()).await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), spooled, "{profile}");
+            if let Some(entry) = entries.first() {
+                assert_eq!(query_param(&entry.url, "project"), Some("default-repo"));
+            }
+        }
+    }
+
+    /// Adversarial: `TERMINAL_CWD` selects a checkout, so that checkout's
+    /// exclusions and server profile apply to what lands there. A relative
+    /// read of an excluded path is dropped before the spool, a public read is
+    /// kept, and a marker naming an unregistered server profile drops the
+    /// event instead of delivering it to the install default.
+    #[tokio::test]
+    async fn hermes_terminal_cwd_applies_the_selected_checkout_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let guarded = repo_with_marker(
+            tmp.path(),
+            "guarded",
+            "project = \"guarded\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        );
+        let routed_away = repo_with_marker(tmp.path(), "routed", "server = \"nobody\"\n");
+        let read = |path: &str| {
+            serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": "read_file",
+                "tool_input": {"path": path},
+                "session_id": "hermes-session",
+                "cwd": home,
+                "extra": {"tool_call_id": "call-1", "status": "ok", "result": "SENTINEL_CONTENT"}
+            })
+            .to_string()
+        };
+        let env = |dir: &Path| {
+            RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", dir.to_str().unwrap())])
+        };
+        for (name, dir, path, spooled) in [
+            ("excluded read", &guarded, "secret/token.txt", 0),
+            ("public read", &guarded, "README.md", 1),
+            ("refused profile", &routed_away, "README.md", 0),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            run_hermes(
+                &data_dir,
+                hermes_args("post-tool-use", &dead_server_url()),
+                read(path),
+                env(dir),
+            )
+            .await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), spooled, "{name}");
+            assert!(
+                entries.iter().all(|e| !e.body.contains("secret/token")),
+                "{name}"
+            );
+        }
+    }
+
+    /// Tool events fall back to `TERMINAL_CWD` when their own locations prove
+    /// nothing, and an absolute location in another checkout still wins
+    /// (#1199).
+    #[tokio::test]
+    async fn hermes_tool_events_prefer_their_locations_then_terminal_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let session_repo =
+            repo_with_marker(tmp.path(), "session-repo", "project = \"session-repo\"\n");
+        let other_repo = repo_with_marker(tmp.path(), "other-repo", "project = \"other-repo\"\n");
+        let env = RuntimeEnv::with_process_env_for_tests(&[(
+            "TERMINAL_CWD",
+            session_repo.to_str().unwrap(),
+        )]);
+        let tool = |input: serde_json::Value| {
+            serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": "terminal",
+                "tool_input": input,
+                "session_id": "hermes-session",
+                "cwd": home,
+                "extra": {"tool_call_id": "call-1", "status": "ok", "result": "ok"}
+            })
+            .to_string()
+        };
+        let args = || {
+            let mut args = hermes_args("post-tool-use", &dead_server_url());
+            args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+            args
+        };
+
+        for (name, input, project) in [
+            (
+                "no location",
+                serde_json::json!({"command": "ls"}),
+                "session-repo",
+            ),
+            (
+                "other workdir",
+                serde_json::json!({"command": "ls", "workdir": other_repo}),
+                "other-repo",
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            run_hermes(&data_dir, args(), tool(input), env.clone()).await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), 1, "{name}");
+            assert_eq!(
+                query_param(&entries[0].url, "project"),
+                Some(project),
+                "{name}"
+            );
+        }
+    }
+
     fn write_briefing_marker(dir: &Path) {
         std::fs::write(
             dir.join(".ai-memory.toml"),
@@ -7269,6 +8920,10 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let cwd = tmp.path().join("repo");
         std::fs::create_dir(&cwd).unwrap();
+        // The repo's own marker, with no `[briefing]`. Without one, the
+        // developer's `~/.ai-memory.toml` applies to every cwd and can opt
+        // this repo into the brief.
+        std::fs::write(cwd.join(".ai-memory.toml"), "project = \"repo\"\n").unwrap();
         let (base, mut requests) = serve_requests("404 Not Found", "").await;
 
         let mut stdout = Vec::new();
@@ -7696,6 +9351,54 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         let seen = all_requests(&mut requests).await;
         assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn qwen_ignores_unsubmitted_prompt_for_reload_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let mut args = claude_args("user-prompt-submit", &base);
+        args.agent = "qwen-code".into();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            args,
+            serde_json::json!({
+                "session_id": "qwen-session",
+                "cwd": tmp.path(),
+                "prompt": "reload context",
+                "submitted_prompt": "keep working"
+            }),
+        )
+        .await;
+        assert!(stdout.is_empty());
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn qwen_submitted_reload_prompt_fetches_a_recap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let mut args = claude_args("user-prompt-submit", &base);
+        args.agent = "qwen-code".into();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            args,
+            serde_json::json!({
+                "session_id": "qwen-session",
+                "cwd": tmp.path(),
+                "prompt": "automated continuation",
+                "submitted_prompt": "reload context"
+            }),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "RECAP-BODY"
+        );
+        let seen = all_requests(&mut requests).await;
+        assert_eq!(recap_requests(&seen).len(), 1, "{seen:?}");
     }
 
     #[tokio::test]

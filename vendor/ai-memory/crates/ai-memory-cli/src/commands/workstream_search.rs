@@ -32,7 +32,7 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
         return Ok(());
     }
     for event in events {
-        let role = event.role.as_deref().unwrap_or(event.kind.as_str());
+        let role = event.display_label();
         println!(
             "## Event {} | {} | {}",
             event.sequence,

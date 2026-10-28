@@ -1,8 +1,9 @@
 # Desktop support — phased plan (research output, reconciled with RFC #878)
 
-> This file reconciles RFC #878 (github.com/akitaonrails/ai-memory#878) with
-> the findings in this directory (2026-10-07). Nothing here is scheduled
-> work; each phase lists what would need to change and where the risk sits.
+> This dated rollout record reconciles RFC #878
+> (github.com/akitaonrails/ai-memory#878) with the findings in this directory
+> (2026-10-07). Nothing remaining here is scheduled work; each phase records
+> what shipped or what would still need to change and where the risk sits.
 
 ## What the research changed vs the RFC
 
@@ -64,6 +65,37 @@ The research's best new target, ahead of the RFC's `.mcpb`:
 - Tests: payload-mapping unit tests against the documented schema
   (camelCase fields; `<app_data_dir>` variants per surface).
 
+Status (3.2, [#1415](https://github.com/akitaonrails/ai-memory/issues/1415),
+implemented by [#1416](https://github.com/akitaonrails/ai-memory/pull/1416)):
+the premise above that Antigravity has no SessionStart is
+out of date. The hook reference bundled with `agy` 1.4.0 and App 2.24.0 (and
+<https://antigravity.google/docs/hooks/>) documents `SessionStart`, fired once
+per new conversation before the first model call; `agy` 1.3.0, verified here
+on 2026-10-08, fired none. There is still no end event and no prompt in any
+payload. What shipped, under the existing `antigravity-cli` agent kind:
+
+- `SessionStart` posts session-start and injects the handoff as an
+  `injectSteps` `systemMessage`, which persists across turns (the old
+  `ephemeralMessage` was dropped after the first). `PreInvocation` gets its
+  own `pre-invocation` handler; its invocation zero stands in for
+  `SessionStart` on builds without it, gated once per conversation by the
+  existing `briefed/agy-start-<conversationId>` marker, so the two never
+  deliver twice.
+- Prompts come from `transcriptPath`: at each turn start, at `SessionStart`
+  and at `Stop`, the native hook reads the `USER_INPUT` steps written since
+  its per-conversation cursor and spools them as `user-prompt` events.
+  Containment, bounds and symlink refusal are recorded in
+  [`../security-boundaries.md`](../security-boundaries.md).
+- A `Stop` with a normal `terminationReason` (`NO_TOOL_CALL`, or `model_stop`
+  as the web page spells it) and `fullyIdle: true` takes OpenCode 2's
+  turn-checkpoint path: summary page and one refreshed baton, session left
+  open. `finalize-session` remains the explicit close and the way to queue
+  opt-in consolidation.
+- `PostInvocation` stays unwired: the turn checkpoint covers what a flush
+  there would have done.
+- Not done: the `.agents/hooks.json` workspace install option, and the IDE
+  verification pass.
+
 ## Phase 2 — scope & dedup polish for desktop-originated sessions
 
 - Decide scratch-workspace routing: single `desktop/claude-scratch` project
@@ -77,7 +109,7 @@ The research's best new target, ahead of the RFC's `.mcpb`:
 
 ## Phase 3 — explicit capture for hookless surfaces (RFC Phase 1, adjusted)
 
-- Tool-surface change (23-tool count, MEMORY_INSTRUCTIONS/SNIPPET_BODY,
+- Tool-surface change (current 24-tool count, MEMORY_INSTRUCTIONS/SNIPPET_BODY,
   prompt-surface regression tests, adversarial boundary test) for an
   explicit capture tool the model calls on apps without hooks (Claude Chat
   tab, Grok Bot, hosted ChatGPT chat). Scoping per RFC: fixed
@@ -125,7 +157,9 @@ The research's best new target, ahead of the RFC's `.mcpb`:
 7. Antigravity's SessionStart mapping fired on every user turn
    (`invocationNum` restarts per turn): resolved — gated per conversation by
    a `briefed/agy-start-<conversationId>` marker in the native, shell and
-   PowerShell hooks.
+   PowerShell hooks. Current builds fire a native `SessionStart`, which is now
+   wired; the same marker keeps the `PreInvocation` fallback from delivering
+   a second handoff.
 8. Cowork capture on Linux, where tasks run in a VM.
 9. Cursor runs the operator's Claude Code hooks by default, so a Cursor
    session reaches ai-memory twice when Cursor's own hooks are installed

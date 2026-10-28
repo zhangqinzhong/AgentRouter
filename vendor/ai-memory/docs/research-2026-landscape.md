@@ -1,4 +1,4 @@
-# Agent-Memory Landscape, September 2026 - Research Report
+# Agent-Memory Landscape, October 2026 - Research Report
 
 > Follow-up to the May 2026 research pass (`research-agentmemory.md`,
 > `research-basic-memory.md`, `research-cognee.md`,
@@ -9,13 +9,11 @@
 > change. Sources at the end; every load-bearing claim was checked against
 > a live page in September 2026, not remembered.
 >
-> **Refreshed 2026-10-13.** The popularity table, the camp table and the
-> entries for Mem0, OpenViking, Zep/Graphiti, Cognee, Supermemory,
-> agentmemory, TencentDB Agent Memory, Letta, Hindsight, memU and EverOS were
-> re-read against primary sources (repositories, release metadata from the
-> GitHub API, vendor research pages) on that date. Claude-mem, MemPalace,
-> Memori, MemOS and memvid were added. Corrections are made in place;
-> [the 2026-10-13 refresh](#refresh-2026-10-13-what-changed) in §3 summarizes what moved.
+> **Refreshed 2026-10-18.** Every tracked competitor was checked against its
+> official repository, releases, package metadata, or product documentation.
+> The [2026-10-18 delta ledger](#refresh-2026-10-18-one-by-one-delta) records
+> both material changes and explicit no-change findings. Older corrections
+> remain in place so the report keeps its audit trail.
 
 ## 1. The headline: our architectural bet got standardized
 
@@ -29,10 +27,10 @@ memory servers advertise themselves as "OKF-backed", and the format is
 positioned as the interop layer that makes agent memory portable across
 tools.
 
-Our `wiki/` **is nearly an OKF bundle already**: markdown, YAML
-frontmatter, one page per concept, typed via our own frontmatter
-conventions. The delta is a conventions mapping, not an architecture
-change.
+Our `wiki/` is now a native **OKF v0.2 bundle**: markdown, YAML frontmatter,
+one page per concept, with generated `index.md` and `log.md` projections and
+an `ai-memory okf check` conformance command. The interoperability work is
+already shipped.
 
 The second validation came from an unexpected direction: **Letta**
 (formerly MemGPT) published "Is a Filesystem All You Need?" arguing that
@@ -76,7 +74,10 @@ gate that installs the packaged artifacts and runs capture and recovery.
 
 **basic-memory** is alive, with the same positioning (structured markdown both
 humans and LLMs edit; local files). No architectural surprises. Its
-niche overlaps most with OKF, which may absorb its differentiation.
+niche overlaps most with OKF, which may absorb its differentiation. Its
+unreleased v0.24 changelog now describes native OKF v0.2, optimistic writes,
+structured and cross-project filters, document extraction, temporal
+qualifiers, a local reranker, locked notes, and cloud team collaboration.
 
 **cognee** has moved into content-led growth ("best memory
 framework" listicles on its own blog rank for every comparison query)
@@ -352,8 +353,9 @@ grounded, cited chat. It is on **every axis we deliberately chose against**: the
 **vault is an opaque hosted store** (no git, no markdown, no self-host, nothing to
 `grep`/diff), **LLM is intrinsic and not optional** (Gemini-class extraction/
 embeddings, no zero-LLM mode), and the memory engine is **closed-source** (the
-only open artifact is the MIT npm client `@liquidlm/cli`, v0.1.5 published
-2026-09-17; the GitHub `cli` repo is archived and empty). Where it is
+only open artifact is the MIT npm client `@liquidlm/cli`, stable v0.1.6, with
+v0.2.0-alpha.1 as a prerelease; the GitHub `cli` repo is archived and empty).
+Where it is
 interesting is **breadth of ingestion and a clean MCP tool surface**: heavy
 multimodal capture (video/audio/image/PDF/Office, auto-transcription, a
 `yt-dlp`-fetch-locally pattern), a GitHub repo-sync connector, and eight native
@@ -411,8 +413,11 @@ which is our consolidation/auto-improve loop under other names. It validates the
 but from the LLM-leaning corner: the minimal tier still **requires an LLM for the
 core flow** (embedding/reranking optional, OpenRouter the default; a zero-LLM
 demo exists but is not the operating default), it is a Python stack rather than a
-single binary. *Update 2026-10-13 (v1.4.1, ~13.4K stars):* native Windows
-support, an ANN vector index and an optional Milvus backend. An official
+single binary. *Update 2026-10-18 (v1.4.2, ~13.5K stars):* native Windows
+support, an ANN vector index and an optional Milvus backend. v1.4.2 also
+separates foreground query embedding from background writes, batches
+embeddings, self-repairs index damage, and hardens full-scope keys and path
+containment. An official
 `everos-mcp` server (EverMind-AI/EverOS-MCP) was documented on 2026-10-12,
 so the earlier "MCP support is not stated" no longer holds. Benchmarks are
 now published: `benchmarks/README.md` (2026-09-08) reports LoCoMo 94.42 and
@@ -587,20 +592,22 @@ with another or with ours, and no ranking is claimed.
 | Cognee | BEAM 0.79 (20 questions, one conversation), 0.67 at 10M | End-to-end LLM-judged QA | Tuned and scored on the same questions; gpt-5 for ingestion, answering and judging |
 | memvid | +35% LoCoMo (relative) | Relative claim | Unverified |
 
-**claude-mem (`thedotmack/claude-mem`, ~100.3K stars, Apache-2.0, v13.37.0
-on 2026-10-13).** Five lifecycle hooks feed SQLite FTS5 plus Chroma, and an
+**claude-mem (`thedotmack/claude-mem`, ~101.6K stars, Apache-2.0, v14.0.1
+on 2026-10-17).** Five lifecycle hooks feed SQLite FTS5 plus Chroma, and an
 LLM "observer" compresses every observation, so capture is LLM-driven. A
 paid cloud tier (CMEM Pro) exists, and the README endorses a cryptocurrency
 token. Recent work: non-blocking hooks that write to a spool, to-do tools, a
 three-step progressive search, a bridge that intercepts reads of Claude
 Code's and Codex's native memory folders and answers them from its own
 store, and surfacing past observations for a file when the agent reads it.
-No benchmarks are published.
+v14 adds the local “My Work” request/workstream dashboard and the optional
+paid TeamBrain shared-work layer. No benchmarks are published.
 
-**MemPalace (v3.10.0, ~59.5K stars).** See §2 for the benchmark history.
+**MemPalace (v3.11.0, ~59.6K stars).** See §2 for the benchmark history.
 It now ships hooks for Claude Code, Codex and Cursor, a team server and a
 temporal graph, and its README publishes retrieval-only numbers (96.6% R@5
-raw, 98.4% on 450 held-out questions).
+raw, 98.4% on 450 held-out questions). v3.11 adds dry-run-first audit/repair
+and optional multimodal EmbeddingGemma 2 retrieval.
 
 **Mem0 (~67.1K stars, core v2.2.1 on 2026-09-25).** Native coding-agent
 plugins for Claude Code, Codex, Cursor, Kimi, Antigravity, OpenCode and pi
@@ -621,11 +628,10 @@ April 2026 retrieval is a single-pass add-only extraction plus semantic +
 BM25 + entity fusion (the OSS package needs the `[nlp]` extra), so the old
 "vector-only" description is wrong.
 
-**Zep / Graphiti (~31.7K stars, v0.30.2 on 2026-09-08).** v0.30.0 sends
+**Zep / Graphiti (~32.0K stars, v0.31.1 on 2026-10-15).** v0.30.0 sends
 Neo4j queries to the configured database and reframes the README as a
 temporal knowledge graph framework (#1801); v0.30.2 uses a driver per
-request and isolates concurrent groups (#1699). Unreleased on `main`
-(bumped to 0.31.0): #1964 from Zep's internal fork (combined extraction per
+request and isolates concurrent groups (#1699). v0.31 released #1964 from Zep's internal fork (combined extraction per
 episode in bulk, date rules for facts, stricter contradiction rules), #1778
 `LLMRuntime` per-prompt model routing, and an MCP server on MCP SDK 2.x
 (#1921). FalkorDBLite is an embedded option; Kuzu support is deprecated
@@ -633,10 +639,11 @@ because upstream is unmaintained. Hosted Zep has a Context MCP server with
 per-user OIDC sign-in, read-only connections set by an admin, and a write
 kill switch; its plugin says it is "not positioned for Claude Code, Codex".
 
-**Letta (`letta-ai/letta` ~25.1K stars; `letta-ai/letta-code` ~3.6K).** The
-V1 server is retired: commit #3430 (2026-08-16) archived it at 0.16.8, and
+**Letta (`letta-ai/letta` ~25.2K stars; `letta-ai/letta-code` ~3.7K).** The
+V1 server is retired: commit #3430 (2026-08-16) moved its source to an
+`archive` branch at 0.16.8, and
 the README points to Letta Code, a coding agent whose default backend is
-Letta Cloud (v0.34.13 on 2026-10-13). Since February 2026 ("context
+Letta Cloud (v0.34.16 on 2026-10-16). Since February 2026 ("context
 repositories") every agent's memory is a git repository of Markdown files
 with YAML frontmatter and a `MEMORY.md` index; "dreaming" subagents write in
 parallel through git worktrees, with no vector index by default. Its essay
@@ -646,8 +653,8 @@ a Letta key and keeps one memory across all projects by default. Letta Code
 also has a `/doctor`-style memory audit that includes the token cost of the
 session brief. The ADE references in older notes describe the retired line.
 
-**Memori (~17.1K stars)** sits in the app-memory camp; its paper
-(arXiv:2603.19935) reports LoCoMo 87%. **MemOS (~11.8K stars, v2.0.34)**
+**Memori (~17.2K stars)** sits in the app-memory camp; its paper
+(arXiv:2603.19935) reports LoCoMo 87%. **MemOS (~11.9K stars, v2.0.34)**
 belongs to the memory-OS camp and reports LoCoMo 88.83 and LongMemEval
 89.20 on its own harness. **memvid (~16.6K stars)** has had no commits since
 2026-07-14 and publishes only relative claims (+35% LoCoMo), unverified.
@@ -657,41 +664,80 @@ graph), qmd (~30.4K, markdown search), context-mode (~27.9K, survives
 compaction with a per-project SQLite FTS5 store fed by hooks) and beads
 (~27.8K, an issue tracker with `bd remember`).
 
-### Popularity and maintenance signal (as of 2026-10-13)
+### Refresh, 2026-10-18: one-by-one delta
 
-Star counts, releases and last commits come from the GitHub API on
-2026-10-13; the "Sept" column is the 2026-09-18 figure where this report
-tracked it. Rows marked *not re-read* keep their September figures. Of the
-rows re-read with a commit date, all but memvid and the retired Letta server
-had commits in October 2026; Letta's original server is retired in favour of
-Letta Code.
+This pass used the 2026-10-13 refresh as its baseline. `Released` means the
+capability is in a tagged release; `main` means it is visible in the default
+branch but is not yet a stable release. The table records quiet projects
+explicitly.
+
+| Project | Change since 2026-10-13 | What it means for ai-memory |
+|---|---|---|
+| **claude-mem** | **Released v14.0.0/v14.0.1.** “My Work” turns captured requests into a local dashboard with workstream cards, evidence drill-down, live attention states, and an explicit human “Checked” state. TeamBrain adds selected shared work, collision awareness, decisions, and delegation as a paid service. | The local work dashboard is the clearest new product gap. Build a read-only operational view over ai-memory's existing managed-workstream ledger, with derived attention states and a minimal human review marker. Do not copy the paid cloud or create a second task tracker. |
+| **Mem0** | No material memory change. The repository added event promotion; the latest core release remains v2.2.1. | No action. Its category and cloud-first tradeoffs are unchanged. |
+| **MemPalace** | **Released v3.11.0.** Adds a dry-run-first audit/repair workflow, optional EmbeddingGemma 2 multimodal retrieval, embedder identity checks, large-palace performance work, and security fixes. v3.12 work is on `main`, not released. | ai-memory already records embedding identity, rejects stale vectors, and has `doctor`, lint, reindex, backup, and health tools. A unified audit UX is worth evaluating; native image/audio/video memory remains outside the text-only core. |
+| **Hindsight** | No new stable release after v1.0.0. `main` adds decision-model triage before consolidation, decision-routed reflection/ranking, scheduled full mental-model refreshes, operation-specific request extensions, more providers, and richer source exports. | Measure per-operation model profiles and a cheap structured decision tier before adopting either. Any periodic full refresh must produce reviewed proposals, never silently rewrite source truth. |
+| **OpenViking** | No new stable release after v0.5.0. `main` adds mixed image/text queries, scoped one-use downloads, Redis-backed idle commit scheduling, multi-replica account stores, privacy commands, and bot steering. | Most changes target a multimodal distributed context platform. The resource drill-down pattern validates ai-memory's progressive disclosure; the scaling and opaque-media stack does not fit the single-binary markdown core. |
+| **Cognee** | **Released v1.6.5.** Adds code docstrings as graph documents, Memify APIs, batched trace processing, base64 embeddings, a Calendar connector, and session/dataset binding. | No new core work. Code graphs and connectors remain adjacent; batched ingestion reinforces the existing single-writer batching design. |
+| **Zep/Graphiti** | **Released v0.31.0/v0.31.1.** Per-prompt `LLMRuntime` routing, combined extraction, temporal/dedup fixes, Decisions clients, and MCP SDK/group routing moved from unreleased work into a stable release. | This strengthens the case for a measured per-operation provider/model profile. It does not justify a graph database or LLM-mandatory path. |
+| **Supermemory** | No new release after server-v0.0.9. `main` aligns the v5 API/docs and hardens MCP authorization, writable defaults, and deletion by ID. | No product gap. The authorization fixes validate ai-memory's fail-closed scope resolver and capability gates. |
+| **agentmemory** | No new release after v0.9.30. `main` contains redaction, vector/compression recovery, bounded graph-index work, Redis mutation serialization, and Devin integration preparation. | No action. ai-memory already has Devin support, bounded capture, recovery, and a stricter sanitizer boundary. |
+| **TencentDB Agent Memory** | v2.0.3-beta.1 remains the newest release; subsequent commits are fixes. | No material change to the proxy-fan-in comparison. |
+| **Letta V1 server** | No product work. The repository is **not GitHub-archived**: its README redirects active development to Letta Code, while the retired V1 source lives on an `archive` branch. | Correct the old “repository archived” wording. The V1 server remains retired, but the repository itself is an active redirect. |
+| **Letta Code** | **Released v0.34.14-v0.34.16.** Adds steering, resuming, and stopping remote Claude Code/Codex subagents, vault inheritance, listener heartbeats, and recovery fixes. | This is an agent runtime feature, not a memory-system gap. Managed workstreams remain harness-neutral. |
+| **Memori** | No commits since 2026-10-03 and no new release. | No material change. |
+| **memvid** | No commits since 2026-07-14 and no new release. | Remains quiet; its relative benchmark claim is still not independently useful. |
+| **memU** | No feature release. Four Windows path/idempotency fixes landed. | No material change. |
+| **EverOS** | **Released v1.4.2.** Fixes an FD leak, separates query embedding capacity from background writes, batches embeddings, keys indexes by the full scope tuple, self-repairs damaged indexes, and hardens path containment. | Adopted for the in-process local embedder after measurement: eight background workers raised query p50/p95 from 36/41 ms to 74/76 ms on the reference host; one document slot plus one reserved query slot brought them to 39/51 ms. Hosted providers and the reranker retain their existing policies. |
+| **MemOS** | No commits or release after the prior cutoff. Its current headline remains DeepSeek Harness integration, multimodal memory, memory cubes, asynchronous ingestion, and feedback/correction. | No material change. The memory-OS and multimodal tradeoffs remain different from ai-memory's scope. |
+| **Honcho** | **Released v3.3.0.** Adds an optional Chroma backend, scoped custom instructions, cursor pagination, prompt-budget handling, and performance fixes; stable object `uid` work followed on `main`. | No core work. Its theory-of-mind buyer remains different. Operation-scoped instructions are a useful reference if per-operation LLM profiles are designed. |
+| **Engram** | No new tag after v3.4.0. `main` adds local aliases/routing preview, project provenance, compact search/history clients, capture guards, tombstones, and sync isolation. | No new gap. ai-memory already has stronger repository identity, routing diagnostics, tombstone/supersession semantics, and conflict-aware wiki sync. |
+| **basic-memory** | No new stable release after v0.23.2. The unreleased v0.24 changelog describes optimistic checksummed writes, native OKF v0.2 export/check, cross-project and structured filters, document extraction with provenance, temporal qualifiers, a local reranker, locked notes, more harnesses, and cloud team collaboration. | ai-memory already ships native OKF, conditional writes, temporal queries, attribution, and lifecycle capture. Structured filters are a real gap. Document ingestion belongs in an optional importer; local reranking stays measure-first; live co-edit/cloud is a different product. |
+| **mcp-memory-service** | **Released v12.1.0/v12.1.1.** Security fixes include stored-XSS handling and graph-write scoping; automatic supersession is now conservative. `main` adds Codex hooks, store-partitioned SSE, tombstone protection, and BM25 fixes. | No new feature work. The release validates conservative supersession, output encoding, and strict write scoping already required by ai-memory's invariants. |
+| **LangMem** | No repository or package release since the prior cutoff. | No material change. |
+| **Caura** | **Released backend-v3.34.5.** `main` also carries a beta collaboration extension: tenant-scoped peer discovery, requests, correlated replies, presence, leases, progress, and recovery for running Claude/Codex hosts. External effects remain at-least-once. | Treat the bus as adjacent fleet orchestration. ai-memory messaging is durable project-to-project continuity, not a live peer runtime. Do not add presence or wake orchestration to the memory core. |
+| **LiquidLM** | Stable CLI is v0.1.6; v0.2.0-alpha.1 is prerelease. Public client work adds scoped tokens, MCP installation, safer upload reconciliation, search/upload commands, and local media fetching; the engine remains closed. | Correct the version. Its managed multimodal second-brain UX remains outside ai-memory's core. |
+| **Claude Code native memory** | Releases 2.1.299-2.1.302 improve compaction and runtime stability but add no material project-memory capability. | No change to the comparison: excellent zero-setup single-harness memory, weak portability and team continuity. |
+
+The adjacent codebase-memory, search, context-compaction, and issue-tracking
+projects were not promoted into the competitor set. They remain useful
+integration references, but they solve a different primary job.
+
+### Popularity and maintenance signal (as of 2026-10-18)
+
+Star counts, releases and last commits come from official GitHub or package
+metadata checked on 2026-10-18; the "Sept" column preserves the 2026-09-18
+figure where this report tracked one. Memori, memvid, LangMem, and MemOS had
+no commit after the prior cutoff. Letta's original server remains retired in
+favour of Letta Code, but its repository is a redirect rather than an archived
+GitHub repository.
 
 | Project | Stars (~) | Sept | Last commit | Latest release | Status |
 |---|---|---|---|---|---|
-| claude-mem | 100.3k | not tracked | 2026-10-13 | v13.37.0 (2026-10-13) | ACTIVE |
-| Mem0 | 67.1k | 65.6k | 2026-10-12 | core v2.2.1 (2026-09-25) | ACTIVE |
-| MemPalace | 59.5k | not tracked | not re-read (active) | v3.10.0 | ACTIVE |
+| claude-mem | 101.6k | not tracked | 2026-10-18 | v14.0.1 (2026-10-17) | ACTIVE |
+| Mem0 | 67.4k | 65.6k | 2026-10-17 | core v2.2.1 (2026-09-25); TS v3.3.1 | ACTIVE |
+| MemPalace | 59.6k | not tracked | 2026-10-18 | v3.11.0 (2026-10-14) | ACTIVE |
 | Hindsight | 49.1k | 23.9k | 2026-10-13 | v1.0.0 (2026-10-13) | ACTIVE |
-| OpenViking | 39.8k | 38.0k | 2026-10-13 | v0.5.0 (2026-10-09) | ACTIVE |
-| Cognee | 32.2k | 30.8k | 2026-10-08 | v1.6.3 (2026-10-07) | ACTIVE |
-| Zep/Graphiti | 31.7k | 31.0k | 2026-10-09 | v0.30.2 (2026-09-08); `main` at 0.31.0, unreleased | ACTIVE |
-| Supermemory | 31.2k | 30.1k | 2026-10-13 | server-v0.0.9 (2026-10-12) | ACTIVE |
-| agentmemory | 29.4k | 29.3k | 2026-10-13 | v0.9.30 (2026-10-06) | ACTIVE |
-| TencentDB Agent Memory | 28.6k | 27.2k | 2026-10-13 | v2.0.2 (2026-10-09); v2.0.3-beta.1 (2026-10-13) | ACTIVE |
-| Letta (V1 server) | 25.1k | 24.8k | 2026-09-10 (docs only) | 0.16.8, frozen | RETIRED (archived 2026-08-16) |
-| Letta Code | 3.6k | not tracked | release 2026-10-13 | v0.34.13 (2026-10-13) | ACTIVE |
-| Memori | 17.1k | not tracked | not re-read | not re-read | not re-read |
-| memvid | 16.6k | not tracked | 2026-07-14 | not re-read | QUIET (no commits since 2026-07-14) |
-| memU | 14.5k | 14.4k | 2026-10-13 | PyPI `memu-cli` 0.10.0 (2026-08-05), 0.11.0b3 (2026-08-21) | ACTIVE |
-| EverOS | 13.4k | 13.1k | not re-read | v1.4.1 (2026-09-24) | ACTIVE |
-| MemOS | 11.8k | not tracked | not re-read | v2.0.34 | not re-read |
-| Honcho | 7.2k | 7.2k | 2026-09-18 | tag v3.2.0 (no GH release) | not re-read |
-| Engram | 6.8k | 6.8k | 2026-09-22 | v2.0.0 (2026-09-18) | not re-read |
-| basic-memory | 4.0k | 4.0k | 2026-09-16 | v0.23.2 (2026-08-25) | not re-read |
-| mcp-memory-service | 2.0k | 2.0k | 2026-09-18 | v11.12.0 (2026-09-14) | not re-read |
-| LangMem | 1.7k | 1.7k | 2026-09-09 | none (PyPI-versioned) | not re-read |
-| Caura | 0.5k | 0.5k | 2026-09-22 | backend-v3.17.2 (2026-09-19) | not re-read |
-| LiquidLM | n/a (closed) | n/a | n/a (engine closed) | `@liquidlm/cli` 0.1.5 (2026-09-17) | not re-read |
+| OpenViking | 40.3k | 38.0k | 2026-10-18 | v0.5.0 (2026-10-09) | ACTIVE |
+| Cognee | 32.5k | 30.8k | 2026-10-16 | v1.6.5 (2026-10-16) | ACTIVE |
+| Zep/Graphiti | 32.0k | 31.0k | 2026-10-17 | v0.31.1 (2026-10-15) | ACTIVE |
+| Supermemory | 31.3k | 30.1k | 2026-10-18 | server-v0.0.9 (2026-10-12) | ACTIVE |
+| agentmemory | 29.7k | 29.3k | 2026-10-18 | v0.9.30 (2026-10-06) | ACTIVE |
+| TencentDB Agent Memory | 29.6k | 27.2k | 2026-10-15 | v2.0.3-beta.1 (2026-10-13) | ACTIVE |
+| Letta (V1 server) | 25.2k | 24.8k | no V1 code after retirement | 0.16.8, frozen | RETIRED (source on `archive` branch) |
+| Letta Code | 3.7k | not tracked | 2026-10-18 | v0.34.16 (2026-10-16) | ACTIVE |
+| Memori | 17.2k | not tracked | 2026-10-03 | v3.3.6 (2026-05-28) | QUIET |
+| memvid | 16.6k | not tracked | 2026-07-14 | v2.0.140 (2026-05-27) | QUIET |
+| memU | 14.6k | 14.4k | 2026-10-17 | PyPI `memu-cli` 0.10.0 (stable) | ACTIVE |
+| EverOS | 13.5k | 13.1k | 2026-10-16 | v1.4.2 (2026-10-14) | ACTIVE |
+| MemOS | 11.9k | not tracked | no change after cutoff | v2.0.34 (2026-09-23) | ACTIVE |
+| Honcho | 7.7k | 7.2k | 2026-10-17 | v3.3.0 (2026-10-14) | ACTIVE |
+| Engram | 7.4k | 6.8k | 2026-10-18 | v3.4.0 (2026-10-12) | ACTIVE |
+| basic-memory | 4.3k | 4.0k | 2026-10-18 | v0.23.2 (2026-08-25); v0.24 unreleased | ACTIVE |
+| mcp-memory-service | 2.0k | 2.0k | 2026-10-18 | v12.1.1 (2026-10-16) | ACTIVE |
+| LangMem | 1.7k | 1.7k | 2026-10-02 | PyPI 0.0.30 (2025-10-27) | QUIET |
+| Caura | 0.5k | 0.5k | 2026-10-18 | backend-v3.34.5 (2026-10-18) | ACTIVE |
+| LiquidLM | n/a (closed) | n/a | n/a (engine closed) | `@liquidlm/cli` 0.1.6; 0.2.0-alpha.1 prerelease | ACTIVE |
 
 Adjacent, not memory systems (not ranked above): codebase-memory-mcp ~46.5k,
 qmd ~30.4k, context-mode ~27.9k, beads ~27.8k.
@@ -706,8 +752,7 @@ PyPI rather than GitHub releases (an earlier "releases lag code" reading here
 was a misread); memvid has had no commits since 2026-07-14;
 LangMem and Honcho publish no GitHub *releases* (PyPI/tag-only versioning);
 and LiquidLM is **closed-source**, so it has no repo signal at all; its only
-public, open artifact is the MIT npm client `@liquidlm/cli` (v0.1.5,
-2026-09-17).
+public, open artifact is the MIT npm client `@liquidlm/cli` (stable v0.1.6).
 
 ## 4. Research developments worth knowing
 
@@ -724,23 +769,25 @@ public, open artifact is the MIT npm client `@liquidlm/cli` (v0.1.5,
   the field's evolution as Storage (preserve trajectories) → Reflection
   (refine them) → Experience (abstract *across* trajectories, proactive).
   We are solidly through Storage and Reflection (capture, consolidation,
-  curator, lint, feedback-driven salience). The frontier it names,
-  cross-trajectory abstraction, is where our auto-improve is only a
-  beginning.
+  curator, lint, feedback-driven salience). The opt-in experience pass now
+  covers cross-trajectory abstraction, although its quality gain remains an
+  evaluation question rather than a settled default.
 - **LongMemEval-V2 (arXiv:2605.12493)**: the benchmark generation has
   moved from "recall the fact" to "behave like an experienced colleague"
   over long horizons, and finds every evaluated system far from it. Two
-  implications: our product framing matches where evaluation is going,
-  and the eval-harness recommendation from the May research (#8 in
-  `research-agentmemory.md`, never implemented) is now more pressing:
-  the field publishes audited numbers and we publish none.
+  implications: our product framing matches where evaluation is going, and
+  the in-repo evaluation harness should keep expanding beyond retrieval. We
+  now publish reproducible retrieval-through-capture numbers and ship an
+  answerer/judge path with context, latency, and exact-model receipts. The
+  remaining evidence gap is a published run over the full 470-question set.
 - **Bi-temporal validity (Zep paper, arXiv:2501.13956, now mainstream
   via Graphiti)** is the one *specific* mechanism from the graph camp
   worth studying: every fact/edge carries event-time and
   ingestion-time, so "what did we believe on June 1" and "what was true
   on June 1" are both answerable, and corrections are supersessions
-  rather than overwrites. Our pages already supersede; our `links` and
-  `entities` rows do not carry validity intervals.
+  rather than overwrites. ai-memory now ships ingestion-time temporal
+  validity and `as_of` reads on SQLite; true world-time extraction remains a
+  deliberate LLM-dependent boundary.
 - Also active, lower relevance for us: MIRIX (multi-agent memory
   specialization), MemOS (scheduling memory like an OS),
   A-TMA (state-aware memory failure taxonomy), sleep-time compute
@@ -756,146 +803,114 @@ public, open artifact is the MIT npm client `@liquidlm/cli` (v0.1.5,
 > improving, and is ai-memory worth migrating *to*? It is the self-critical
 > record behind this section's recommendations.
 
-The May research led us to build: versioned supersession, retention
+The May research led us to build versioned supersession, retention
 formulas, hybrid RRF retrieval, opt-in LLM consolidation, handoffs as a
 protocol, single self-contained binary, typed scope isolation. Every one
-of those choices looks *better* in September than it did in May. The
+of those choices still fits the field in October. The
 substrate competitors struggled (mempalace's metaphor, agentmemory's
 KV), the file-first camp got standardized, and pages-over-facts got a
 paper. Nothing in this pass argues for re-architecture. The
-recommendations are additive and ranked:
+original recommendations below are retained as an implementation audit;
+their headings state what has shipped.
 
-**R1: OKF conformance (small, high leverage).** Map our frontmatter
-conventions onto OKF v0.1 (`type` field plus its small vocabulary) and
-add an OKF export, possibly just documentation plus a thin
-`ai-memory export --okf` view of `wiki/`. Being the *server-grade*
-implementation of the format Google standardized helps our positioning:
-interop with every OKF-aware consumer, at conventions-mapping cost.
-Evaluate whether native conformance (wiki pages *are* OKF files) beats
-an export step; the closer to native, the stronger the story.
+**R1: OKF conformance - shipped.** The wiki is a native OKF v0.2 bundle,
+with generated index/log projections and `ai-memory okf check`. No export-only
+compatibility layer is needed.
 
-**R2: Reproducible eval harness against LongMemEval-V2 (medium).** The
-oldest open recommendation, now with a sharper reason: benchmark claims
-are being audited (mempalace) and honest numbers are being published
-(mcp-memory-service). We cannot say where we stand, and "experienced
-colleague over long horizons" is our pitch. Harness in-repo,
-runnable on demand like `writer_throughput`, numbers in docs with the
-run command, and never a marketing claim without the harness. Hindsight
-(`research-hindsight.md`) sharpens this further: a funded competitor now
-ships a *paper* with per-category LongMemEval sub-scores (91.4% then, 94.6%
-on its own harness as of 2026-10), so the
-bar is no longer "publish a number" but "publish a harness and a metric
-someone else can re-run". Fix the split and the metric (theirs is
-accuracy, agentmemory/mcp-memory-service quote R@5; pick one and state
-it) so our result is comparable, not just present. **Now load-bearing on
-2.4:** the two aging features that can move quality, belief-strength folded
-into ranking (#815) and the LLM "dream" pass (#816), ship **off by default
-and gated on this harness before they may default on**; no R2 delta has
-shown a gain yet, so both remain opt-in and unproven (see
-[`design-memory-aging.md`](design-memory-aging.md) R2 acceptance).
+**R2: Reproducible eval harness - shipped; full-set QA run still open.** The
+in-repo harness publishes retrieval-through-capture and component results with
+run commands and receipts, and includes an opt-in answerer/judge QA mode with
+per-question outcomes and exact provider/model provenance. It also keeps the
+belief-strength and LLM dream features off by default because neither has
+shown a useful retrieval delta. The remaining work is operational: run and
+publish the full 470-question QA set rather than only the existing sample.
 
-**R3: Typed relation edges (small-medium).** `causes` / `fixes` /
-`contradicts` on our existing `links`/`entities` model, from the
-doobidoo playbook. Cheap because the tables exist; valuable because
-`contradicts` feeds the lint pass we already run, and `fixes` makes
-bug-page chains retrievable as chains.
+**R3: Typed relation edges - shipped.** `causes`, `fixes`, and `contradicts`
+are stored and explained, related-page reads can traverse them, and
+contradiction lint uses them. Edge kind does not yet affect rank by default.
 
-**R4: Temporal validity on entities/links (medium, evaluate first).**
-Bi-temporal-lite: `valid_from` / `superseded_at` on entity-page links so
-"what was the database choice in June" is answerable. Pages already
-supersede; this extends the same idea one level down. Worth a design
-doc before any code; the Graphiti paper is the reference.
+**R4: Temporal validity - shipped at the evidence-backed boundary.**
+Ingestion-time validity, supersession, and `as_of` reads cover historical
+belief without requiring an LLM to invent world-time dates. Full bi-temporal
+fact extraction remains deliberately out of scope for the zero-LLM path.
 
-**R5: Cross-session abstraction pass (medium-large, the "Experience"
-gap).** A periodic consolidation that reads *across* recent sessions
-per project and rewrites pattern/preference pages: the cross-trajectory
-abstraction both the survey and TriMem's narrative layer point at.
-auto-improve is the natural host; today it is per-session-triggered.
-Hindsight's **mental-model tier + reflect loop** (`research-hindsight.md`)
-is the shipped reference implementation for exactly this (a background
-job that rewrites standing-answer pages across accumulated evidence, that
-an agent boots from), and it is worth reading before designing ours. Its
-consolidation-as-belief-strength (evidence count + quotes, strengthen/
-weaken/extend) also points at how R3/R4 could carry *confidence*, not
-just supersession order.
+**R5: Cross-session abstraction pass - shipped, opt-in.** The experience pass
+requires evidence from multiple sessions and feeds reviewed changes through
+the auto-improvement path. It remains opt-in because the current eval does not
+show enough quality benefit to make it a default.
 
-**R6: Local embeddings via ONNX (medium; already reserved).**
-`models/` has been reserved for exactly this since M9.5 planning.
-Competitors ship all-MiniLM locally by default; it removes the provider
-dependency from vector search and makes hybrid retrieval a zero-config
-default rather than an opt-in. The `ort` crate is the known path.
+**R6: Local embeddings - shipped.** A checksum-pinned pure-Rust candle path
+provides local embeddings without ONNX or a provider key, with identity stored
+beside every vector and stale models excluded.
 
-**R7: Progressive-disclosure retrieval/brief tiers (medium; evaluate
-first, design doc before code).** From OpenViking's L0/L1/L2 model, whose
-reported 34-91% input-token cut is almost entirely deferring full content.
-We already have the pieces: `memory_query` returns ~24-word snippets (an
-L0), `memory_read_page` returns the full body (an L2), and V61 abstract
-embeddings + the session brief exist. The gap is an explicit **L1
-"overview" tier** and, more concretely, a **tiered on-start brief** that
-leads with per-page abstracts and expands to full bodies only on demand
-instead of loading core-page bodies up front (`render_session_brief`
-today spends its whole char budget on L2). This is a token-efficiency
-win on the exact hot path (every opted-in session start) with no new
-storage: reuse the abstract already embedded at V61. Worth a design doc
-that decides where the L1 overview comes from (frontmatter summary,
-first-paragraph extraction, or the existing abstract) before any code;
-it composes with R5 (the cross-session abstraction pass produces good
-L1 summaries) rather than competing with it. **Partly realized on 2.4:**
-extractive tier-down (A2, #808) already persists the L0 abstract + L1
-summary + L2 keep-token shape for cold episodic pages
-([`design-memory-aging.md`](design-memory-aging.md)). The *tiered on-start
-brief* landed after 3.0
-([`design-tiered-session-brief.md`](design-tiered-session-brief.md)): every
-core page gets an extractive L0 excerpt (`abstract:`, else `summary:`, else
-the prose it opens with), and the leftover budget buys L1 excerpts and whole
-bodies, pinned and `_slots/` pages first, with crowded `_rules/` excerpts
-under one heading (Letta-code MemFS's directory deferral, done at render
-time). It needs no LLM, no new tool and no migration. Directory-scoped retrieval
-(OpenViking's subtree filters, which replaced its TrieHI recursion in
-v0.4.23) is the lower-priority half: a path-prefix filter
-on `memory_query` within a project, worth noting but not scheduling
-until R7's tiering lands.
+**R7: Progressive-disclosure brief tiers - shipped.** The session brief now
+starts with bounded extracts for all standing pages, then spends the remaining
+budget on pinned and slot content. It runs without an LLM or migration. The
+remaining retrieval gap was a path-prefix filter, now shipped with the other
+structured MCP filters described below.
 
-**R8: Queryable metadata/tag filters + a published eval triple (small-
-medium; from Supermemory).** Two borrowable ideas from the entrant that leads
-on ergonomics. First, **structured metadata/tag filtering on `memory_query`**:
-we already key every row by the `(workspace, project, path)` 3-tuple, but
-Supermemory's `containerTags` + arbitrary metadata filters let a caller narrow
-recall by attributes (kind, tier, author, tag) *before* ranking. A bounded,
-optional filter argument on `memory_query`, composing with FTS5/RRF rather than
-replacing it, closes a real query-ergonomics gap at low cost; most of the
-plumbing (page frontmatter, kinds/tiers, `_slots`) already exists. Second,
-**publish an accuracy / latency / context-tokens triple** from the in-repo
-`recall_eval.rs`, mirroring Supermemory's open **MemScore / MemoryBench**
-philosophy: honest engineering discipline and the right answer to a field now
-competing on self-reported single numbers. It composes with R2 (the
-reproducible-harness recommendation) rather than competing. A per-project or
-per-user **"profile" page** auto-surfaced on start (Supermemory's standing
-profile) is a lighter third idea that maps onto our durable pages + the session
-brief, worth noting but ranked below the two above. Deliberately *not* borrowed from this
-camp: managed cloud connectors and LLM-required extraction in the **core**. If
-connectors ever land they belong in the companion importer as opt-in, outside
-the trusted boundary, so the file-first / zero-LLM model is preserved (the same
-line drawn for multimodal/PDF import: OCR/transcribe to markdown pages, never an
-opaque store). On the other two axes: **security, nothing
-to borrow** (Supermemory is weaker on every axis we chose: an opaque default store,
-cloud-first, LLM-required, `containerTag` isolation vs our 3-tuple + invariant
-#16, so this pass is confirmation of our posture, not a source of borrowings;
-the only security-relevant note is defensive: any future importer connector must
-cross the existing sanitizer boundary), and **performance, only f16/
-half-precision embedding storage is worth *evaluating*** (a stored-format change
-with a real recall-vs-size tradeoff, gated on `recall_eval.rs`), while their
-"sub-300ms p50" is a publish-a-number contract, not a change we need. Ranked, the
-only thing worth actually building is the metadata/tag filter; the eval triple is
-worth doing because it de-risks measuring anything else; f16 is evaluate-only;
-the rest is hold-or-reject. No implementation is scheduled here.
+**R8: Queryable metadata/tag filters shipped; full eval run still open.** The
+retrieval harness and accuracy/latency/context reporting exist. `memory_query`
+now exposes kind, tier, literal path-prefix, and exact-array tag predicates
+before every page-ranking stream, including global, historical, profile, and
+pinned results. Author remains deferred until null root/anonymous attribution
+has explicit semantics. Document extraction now stays in the importer
+companion: explicit local text/Markdown, text-layer PDF, DOCX, PPTX, XLSX, and
+VTT/SRT become attributed sanitized markdown through bounded
+conditional writes. The server remains text-first; connectors, OCR, images,
+and raw media remain out of scope.
+
+### Current plan after the 2026-10-18 pass
+
+This is the implementation ledger for the short list selected by that pass.
+Items not marked complete still need their own design and approval.
+
+1. **P1 - Workstream operations view. Completed.** `/web/workstreams` is a
+   read-only root/operator view over bounded managed-run aggregates. It derives
+   only active, interrupted, completed, and empty from trusted lifecycle
+   columns and exposes no checkout path, native session id, or transcript
+   content. It does not infer task states from untrusted prose or create a
+   second task system.
+2. **P1 - Protect interactive recall from background embedding. Completed.**
+   The opt-in real-model probe found material local CPU contention, so local
+   inference now admits one document embedding and reserves a second slot for
+   queries. The same probe verifies the improvement; hosted providers remain
+   unchanged, and provider failures still degrade to lexical/entity/graph
+   retrieval.
+3. **P2 - Structured query filters. Completed.** `memory_query` now exposes
+   the existing pre-rank kind/tier filters plus bounded literal path-prefix and
+   exact-array tag filters. The same predicate covers normal hybrid streams,
+   global FTS, `as_of`, profile results, and pinned prepends; filtered misses
+   omit metadata-less raw observations. `as_of` remains the valid-time control,
+   and author remains deferred until null root/anonymous attribution has
+   explicit semantics.
+4. **P2 - Per-operation LLM profiles, telemetry completed; routing deferred.**
+   Root-protected status now reports bounded process-lifetime call count,
+   outcome, latency, coarse token estimates, reported usage, and health for a
+   closed set of workloads. It captures no prompts or outputs, and labels do
+   not affect the provider wire request. Real measurements still need to show
+   a quality/cost benefit before public per-workload provider/model settings or
+   a cheap decision tier are added.
+5. **P3 - Optional document importer. Completed.** The companion extracts one
+   explicit local text/Markdown, text-layer PDF, DOCX, PPTX, XLSX, VTT, or SRT
+   file into attributed, sanitized markdown. Source, archive, extracted
+   text, sheet, and cell limits fail closed; deterministic digest paths and
+   conditional MCP writes make reruns idempotent without overwriting a foreign
+   page. Opaque files, OCR, raw media, connectors, and native multimodal
+   embeddings stay out of the server core.
+6. **P3 - End-to-end QA evaluation. Deferred to an authorized paid run.** Use
+   the shipped answerer/judge path for one deliberate full 470-question run and
+   publish its receipt with accuracy, p50/p95 latency, context tokens, and exact
+   models. This is not a release gate and needs explicit provider/budget
+   approval because it makes roughly 940 paid model calls. Do not build a
+   duplicate path or claim a cross-tool ranking without a shared harness.
 
 **Deliberately not recommended:** joining the memory-OS camp (agent
 self-editing its memory is token-expensive, and Letta's own successor now
 keeps memory as git-backed markdown files);
 adopting a graph database (bi-temporal-lite on SQLite covers the useful
-part); spatial/metaphor architectures (mempalace); publishing any
-benchmark number before R2 exists; chasing agentmemory's tool-count
+part); spatial/metaphor architectures (mempalace); presenting unlike
+benchmarks as a ranking; chasing agentmemory's tool-count
 (the May conclusion stands: a sharp small surface is the advantage).
 
 ## 6. Sources
@@ -956,7 +971,8 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
 - LiquidLM: liquidlm.com (+ /about, /docs, /docs/assistants, /docs/mcp: Vaults,
   MCP tool surface, per-harness support with test dates), github.com/liquidlm
   (org: an archived empty `cli` repo + a homebrew tap, no engine source), and the
-  npm registry metadata for `@liquidlm/cli` (MIT, v0.1.5 published 2026-09-17).
+  npm registry metadata for `@liquidlm/cli` (MIT; stable v0.1.6 as of
+  2026-10-18, with v0.2.0-alpha.1 as a prerelease).
   Solo maker (Carlos Souza), closed-source cloud engine, no benchmarks; the
   backend internals, model, and any numbers are undisclosed/vendor framing.
   Analyzed inline in §3 per the no-standalone-doc convention.
@@ -1060,3 +1076,31 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
     2026-07-14).
   - Adjacent tools: GitHub metadata for codebase-memory-mcp, qmd,
     context-mode and beads.
+- 2026-10-18 delta pass (official sources only):
+  - GitHub repository and release metadata for every row in the popularity
+    table, plus package registries for `memu-cli` and `@liquidlm/cli`.
+  - claude-mem [v14.0.0 release notes](https://github.com/thedotmack/claude-mem/releases/tag/v14.0.0)
+    (`My Work`, TeamBrain) and v14.0.1.
+  - MemPalace [v3.11.0 release notes](https://github.com/MemPalace/mempalace/releases/tag/v3.11.0)
+    and the subsequent default-branch changelog.
+  - Hindsight default-branch changelog and
+    [mental-model documentation](https://github.com/vectorize-io/hindsight/blob/main/skills/hindsight-docs/references/developer/api/mental-models.md).
+  - OpenViking default-branch release notes and docs for multimodal query,
+    scoped downloads, Redis scheduling, accounts, privacy, and VikingBot.
+  - Cognee [v1.6.5 release notes](https://github.com/topoteretes/cognee/releases/tag/v1.6.5).
+  - Graphiti [v0.31.0](https://github.com/getzep/graphiti/releases/tag/v0.31.0)
+    and v0.31.1 release notes.
+  - Letta V1 README/branch list and Letta Code v0.34.14-v0.34.16 release
+    notes. The branch list is the basis for correcting “GitHub-archived” to
+    “retired source on the `archive` branch.”
+  - EverOS [v1.4.2 release notes](https://github.com/EverMind-AI/EverOS/releases/tag/v1.4.2)
+    and changelog.
+  - Honcho [changelog](https://github.com/plastic-labs/honcho/blob/main/CHANGELOG.md)
+    through v3.3.0.
+  - basic-memory default-branch changelog for the unreleased v0.24 section;
+    stable release metadata remains v0.23.2.
+  - mcp-memory-service [v12.1.1 release notes](https://github.com/doobidoo/mcp-memory-service/releases/tag/v12.1.1)
+    and subsequent default-branch commits.
+  - Caura's `docs/agent-collaboration-extension.md`, collaboration client
+    README, and backend-v3.34.5 release metadata. The docs explicitly call the
+    collaboration extension a beta preview and external effects at-least-once.

@@ -1317,6 +1317,8 @@ mod tests {
         let session_uri = format!("/web/w/default/scratch/s/{session}");
         for uri in [
             "/web",
+            "/web/graph",
+            "/web/w/default/scratch/graph",
             "/web/pending",
             "/web/login",
             "/api/v1/projects",

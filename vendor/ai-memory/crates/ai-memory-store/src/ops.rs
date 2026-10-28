@@ -4,7 +4,7 @@
 //! the writer thread would violate the single-writer invariant (see
 //! [`crate::writer`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
@@ -175,6 +175,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
+use crate::fts_query::cjk_index_terms;
 
 /// One embedding upsert requested by a backfill or embed command.
 #[derive(Debug)]
@@ -454,35 +455,56 @@ pub fn get_or_create_project_as(
     let id = if let Some(bytes) = existing {
         ai_memory_core::ProjectId::from_slice(&bytes)?
     } else {
-        also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
-        let id = ai_memory_core::ProjectId::new();
-        tx.execute(
-            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.as_bytes(),
-                workspace_id.as_bytes(),
-                name,
-                repo_path.as_deref(),
-                Timestamp::now().as_microsecond()
-            ],
-        )?;
-        // `open` and no creator are the column defaults, so the insert above
-        // is the one upstream always ran; only what differs needs a write.
-        if initial_access_mode(name, new_project_mode) == crate::AccessMode::Restricted {
-            tx.execute(
-                "UPDATE projects SET access_mode = 'restricted' WHERE id = ?1",
-                params![id.as_bytes()],
-            )?;
+        // A name that a promoted project still answers to (its `legacy_name`
+        // or `canonical_name`) is not a new project. Inserting a row under it
+        // splits one project in two — the capture lands in an empty twin while
+        // every read keeps resolving the promoted project — and the name then
+        // resolves ambiguously for both paths until someone purges the twin
+        // (#1657). Reuse the row the read path already picks, and let the
+        // authorization choke point decide whether the caller may write there;
+        // an ambiguous name is an error, never another twin. The exact-name
+        // lookup above still runs first, so a name that is only a name behaves
+        // exactly as before.
+        let coordinate = if crate::project_coordinates::supports_coordinates(&tx)? {
+            crate::project_coordinates::resolve(&tx, *workspace_id, name)?
+        } else {
+            None
+        };
+        match coordinate {
+            Some(coordinate) => coordinate.id,
+            None => {
+                also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
+                let id = ai_memory_core::ProjectId::new();
+                tx.execute(
+                    "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        id.as_bytes(),
+                        workspace_id.as_bytes(),
+                        name,
+                        repo_path.as_deref(),
+                        Timestamp::now().as_microsecond()
+                    ],
+                )?;
+                // `open` and no creator are the column defaults, so the insert
+                // above is the one upstream always ran; only what differs needs
+                // a write.
+                if initial_access_mode(name, new_project_mode) == crate::AccessMode::Restricted {
+                    tx.execute(
+                        "UPDATE projects SET access_mode = 'restricted' WHERE id = ?1",
+                        params![id.as_bytes()],
+                    )?;
+                }
+                if let Some(creator) = creator {
+                    tx.execute(
+                        "UPDATE projects SET created_by = ?1 WHERE id = ?2",
+                        params![creator.as_bytes(), id.as_bytes()],
+                    )?;
+                }
+                created = true;
+                id
+            }
         }
-        if let Some(creator) = creator {
-            tx.execute(
-                "UPDATE projects SET created_by = ?1 WHERE id = ?2",
-                params![creator.as_bytes(), id.as_bytes()],
-            )?;
-        }
-        created = true;
-        id
     };
     tx.commit()?;
     if scheduler_state_table_exists(conn)? {
@@ -1581,6 +1603,156 @@ fn stamped_frontmatter(mut conformed: serde_json::Value, now_us: i64) -> StoreRe
     Ok(serde_json::to_string(&conformed)?)
 }
 
+/// Rows the CJK backfill indexes per transaction before it truncates the WAL.
+const CJK_BACKFILL_BATCH: i64 = 256;
+
+/// Rows added by [`backfill_cjk_indexes`] while opening an upgraded store.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CjkBackfillSummary {
+    pub(crate) pages: u64,
+    pub(crate) observations: u64,
+}
+
+/// Repair missing rows in the derived CJK indexes before readers start.
+///
+/// Every source row receives an auxiliary row, including Latin-only content
+/// (whose terms are empty). That makes this an idempotent anti-join instead of
+/// rescanning every Latin row at each startup. Deletes and direct content
+/// updates remove the derived row through V87 triggers, so a crash or an
+/// offline maintenance edit converges here on the next open.
+pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBackfillSummary> {
+    backfill_cjk_indexes_in_batches(conn, CJK_BACKFILL_BATCH)
+}
+
+/// [`backfill_cjk_indexes`] with an explicit batch size (tests use a tiny
+/// batch to drive the cursor across several batches).
+///
+/// Each batch resumes after the highest rowid the previous one indexed. A
+/// batch returns the missing rows in rowid order and indexes every one of
+/// them before it commits, so no row at or below the cursor is still missing
+/// and the anti-join probes each source row once. Without the cursor every
+/// batch filtered from the first rowid again and re-probed the whole indexed
+/// prefix, so the pass slowed down as it went: quadratic in the row count,
+/// hours of startup on a store with 1.6 million observations (#1652).
+pub(crate) fn backfill_cjk_indexes_in_batches(
+    conn: &mut Connection,
+    batch: i64,
+) -> StoreResult<CjkBackfillSummary> {
+    type PageRow = (i64, String, String, String);
+    type ObservationRow = (i64, String, String);
+    let batch = batch.max(1);
+    let mut summary = CjkBackfillSummary::default();
+
+    let mut after = i64::MIN;
+    loop {
+        let tx = conn.transaction()?;
+        let rows: Vec<PageRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT p.rowid, p.title, p.body, p.path_search FROM pages p \
+                 WHERE p.rowid > ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM pages_cjk_fts f WHERE f.rowid = p.rowid) \
+                 ORDER BY p.rowid LIMIT ?2",
+            )?;
+            stmt.query_map(params![after, batch], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        if rows.is_empty() {
+            tx.commit()?;
+            break;
+        }
+        for (rowid, title, body, path_search) in &rows {
+            index_page_cjk(&tx, *rowid, title, body, path_search)?;
+            after = *rowid;
+        }
+        summary.pages += rows.len() as u64;
+        tx.commit()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    }
+
+    after = i64::MIN;
+    loop {
+        let tx = conn.transaction()?;
+        let rows: Vec<ObservationRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT o.rowid, o.title, o.body FROM observations o \
+                 WHERE o.rowid > ?1 AND NOT EXISTS ( \
+                     SELECT 1 FROM observations_cjk_fts f WHERE f.rowid = o.rowid \
+                 ) ORDER BY o.rowid LIMIT ?2",
+            )?;
+            stmt.query_map(params![after, batch], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        if rows.is_empty() {
+            tx.commit()?;
+            break;
+        }
+        for (rowid, title, body) in &rows {
+            index_observation_cjk(&tx, *rowid, title, body)?;
+            after = *rowid;
+        }
+        summary.observations += rows.len() as u64;
+        tx.commit()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    }
+    Ok(summary)
+}
+
+fn index_page_cjk(
+    conn: &Connection,
+    rowid: i64,
+    title: &str,
+    body: &str,
+    path_search: &str,
+) -> StoreResult<()> {
+    let result = conn.execute(
+        "INSERT INTO pages_cjk_fts(rowid, title, body, path_search) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            rowid,
+            cjk_index_terms(title),
+            cjk_index_terms(body),
+            cjk_index_terms(path_search)
+        ],
+    );
+    finish_cjk_index_write(result)
+}
+
+fn index_observation_cjk(
+    conn: &Connection,
+    rowid: i64,
+    title: &str,
+    body: &str,
+) -> StoreResult<()> {
+    let result = conn.execute(
+        "INSERT INTO observations_cjk_fts(rowid, title, body) VALUES (?1, ?2, ?3)",
+        params![rowid, cjk_index_terms(title), cjk_index_terms(body)],
+    );
+    finish_cjk_index_write(result)
+}
+
+fn finish_cjk_index_write(result: rusqlite::Result<usize>) -> StoreResult<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            // Historical migration tests deliberately stop at V18/V19/V33
+            // and then exercise current operation helpers against that frozen
+            // schema. A real Store migrates through V87 before the writer is
+            // spawned, so a missing table remains a fatal integrity error in
+            // every production build.
+            #[cfg(test)]
+            if error.to_string().contains("no such table:")
+                && error.to_string().contains("_cjk_fts")
+            {
+                return Ok(());
+            }
+            Err(error.into())
+        }
+    }
+}
+
 /// What a [`backfill_entity_index`] pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EntityBackfillSummary {
@@ -1917,6 +2089,13 @@ pub(crate) fn upsert_page_in_tx(
                 compacted_at,
             ],
         )?;
+        index_page_cjk(
+            tx,
+            tx.last_insert_rowid(),
+            &page.title,
+            &page.body,
+            &path_search,
+        )?;
         replace_links_in_tx(tx, &new_id, page)?;
         attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
@@ -2000,6 +2179,13 @@ pub(crate) fn upsert_page_in_tx(
             page.expires_at.map(|ts| ts.as_microsecond()),
             compacted_at,
         ],
+    )?;
+    index_page_cjk(
+        tx,
+        tx.last_insert_rowid(),
+        &page.title,
+        &page.body,
+        &path_search,
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
     attach_entities_in_tx(tx, &new_id, page, now)?;
@@ -3298,6 +3484,326 @@ pub fn end_admitted_session_with_handoff(
     Ok(id)
 }
 
+/// An idle auto-end candidate as selected by the server-side tick
+/// ([`crate::reader::ReaderPool::idle_open_sessions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleEndAction {
+    /// A substantive session: end it with its summary page and, when the
+    /// caller asks for it, its consolidation job.
+    Substantive {
+        /// The latest `sessions/<id>.md` version the tick WROTE OR KEPT.
+        /// The stamp re-verifies it is still the latest: a checkpoint or a
+        /// real `SessionEnd` page landing after the tick's write would
+        /// otherwise leave the stamp pointing at a page that no longer
+        /// represents the session's work.
+        expected_page_id: PageId,
+        /// The session's observation count at the moment the digest was
+        /// built (read in the digest's own snapshot: EVERY observation of
+        /// the session, whatever project each row landed in — the same
+        /// population `session_observation_count` counts). The stamp
+        /// re-verifies the live count still equals it: a non-end observation
+        /// landing after the digest would otherwise reach the watermark
+        /// without reaching the page.
+        observation_count: i64,
+        /// The tick's clock, in Unix microseconds. `ended_at` is stamped
+        /// with it — not with the session's last activity — so the
+        /// auto-improvement discovery, which is ordered by `ended_at`, finds
+        /// auto-ended sessions in the order they were ended.
+        now_us: i64,
+        /// The session's last activity, in Unix microseconds. Recorded in
+        /// the audit detail next to the tick's clock.
+        last_activity_us: i64,
+    },
+    /// A boundary-only session: end it without a page or a consolidation
+    /// job; a handoff accepted for it reopens for its owner.
+    LifecycleOnly {
+        /// The tick's clock, as in [`Self::Substantive::now_us`].
+        now_us: i64,
+        /// The session's last activity, as in
+        /// [`Self::Substantive::last_activity_us`].
+        last_activity_us: i64,
+    },
+}
+
+/// Outcome of one candidate in a batched idle end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleEndResult {
+    /// The substantive session ended with its summary page and watermark.
+    EndedSubstantive,
+    /// The lifecycle-only session ended (releasing its accepted handoff
+    /// when one existed).
+    EndedLifecycleOnly,
+    /// The session could no longer be ended: a real `SessionEnd` won the
+    /// race (the CAS saw `ended_at` set), the candidate no longer matches
+    /// its row's scope, the observation count or the latest page version
+    /// moved after the tick read it, or substantive work arrived before the
+    /// lifecycle-only atomic re-check. The row is untouched.
+    Lost,
+}
+
+/// One session for [`idle_end_sessions`], fully scoped so the guarded write
+/// never trusts a caller-provided id alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleEndCandidate {
+    /// Session to end.
+    pub session_id: SessionId,
+    /// Workspace the session row must belong to.
+    pub workspace_id: WorkspaceId,
+    /// Project the session row must belong to.
+    pub project_id: ProjectId,
+    /// Harness recorded on the session row.
+    pub agent_kind: AgentKind,
+    /// What the end does.
+    pub action: IdleEndAction,
+}
+
+/// End a batch of idle sessions in one writer command.
+///
+/// Each candidate is stamped by its own guarded write. The substantive end
+/// is an `UPDATE … WHERE ended_at IS NULL` CAS that ALSO re-verifies what the
+/// summary page saw: the session's observation count (every row of the
+/// session, the digest's population) must still equal the
+/// count the digest was built from, and the latest page version must still
+/// be the one the tick wrote or kept. Any mismatch — a non-end observation,
+/// a checkpoint page, or a real `SessionEnd` landing after the tick's read —
+/// reports [`IdleEndResult::Lost`] and rolls the candidate's transaction
+/// back: no stamp, no audit, no enqueue; the page the tick wrote stays an
+/// ordinary version. The lifecycle-only end applies the same scope/open
+/// guards before any mutation and re-checks substantiveness atomically,
+/// reporting `Lost` instead of downgrading substantive work to a boundary-
+/// only end. Immediately before the batch, the writer actor also snapshots
+/// active managed-run session links. Since every managed-run link and idle
+/// stamp is serialized through that actor, no link can land between this
+/// decisive snapshot and the guarded writes.
+///
+/// `ended_at` is the tick's clock (`now_us`), and
+/// `ended_observation_count` is counted in the same transaction as the
+/// stamp, so a later real `SessionEnd` is `AlreadyEnded` (no new
+/// observations) or `ReEnd` (new work arrived) against that watermark —
+/// never a double end of the same work. The session's last activity is
+/// preserved in the audit detail (`last_activity_us`). No handoff is
+/// created here: the baton is the hook path's decision.
+///
+/// `enqueue_consolidation` is the server's resolved
+/// `consolidate_on_session_end` flag, the same effect the hook path applies
+/// to a substantive end, computed once per tick. The enqueue runs INSIDE the
+/// stamp's transaction: a failed enqueue rolls back the stamp and the audit,
+/// leaving the session open for the next tick. A lost candidate is never
+/// enqueued.
+///
+/// # Errors
+/// Returns a [`StoreError`] on any SQL or commit failure. A CAS miss is not
+/// an error: it is reported per candidate as [`IdleEndResult::Lost`].
+pub fn idle_end_sessions(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+) -> StoreResult<Vec<IdleEndResult>> {
+    idle_end_sessions_inner(conn, candidates, enqueue_consolidation, None)
+}
+
+/// Test-only: [`idle_end_sessions`] with a `pre_stamp` hook that runs on
+/// the writer connection BEFORE each candidate's stamp transaction opens
+/// (after the previous candidate finished, before the `transaction()`
+/// below) — not inside it. Lets a test race a real effect (a non-end
+/// observation, a checkpoint page, a real `SessionEnd` stamp)
+/// deterministically into the window between the tick's page write and the
+/// stamp, without sleeps. The hook simulates a concurrent writer's effect
+/// landing in that window; it is not a participant in the stamp
+/// transaction.
+#[cfg(test)]
+pub fn idle_end_sessions_pre_stamp(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+    pre_stamp: &mut dyn FnMut(&mut Connection),
+) -> StoreResult<Vec<IdleEndResult>> {
+    idle_end_sessions_inner(conn, candidates, enqueue_consolidation, Some(pre_stamp))
+}
+
+fn idle_end_sessions_inner(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+    mut pre_stamp: Option<&mut dyn FnMut(&mut Connection)>,
+) -> StoreResult<Vec<IdleEndResult>> {
+    let mut results = Vec::with_capacity(candidates.len());
+    // The production command holds the sole writer actor for the entire
+    // batch, so one snapshot is decisive and avoids one query per candidate.
+    // The test seam deliberately mutates between candidates and therefore
+    // refreshes after each injected effect.
+    let active_sessions = if pre_stamp.is_none() {
+        Some(active_managed_run_sessions(conn)?)
+    } else {
+        None
+    };
+    for candidate in candidates {
+        if let Some(hook) = pre_stamp.as_mut() {
+            hook(conn);
+        }
+        let managed_run_active = match &active_sessions {
+            Some(active) => active.contains(&candidate.session_id),
+            None => active_managed_run_sessions(conn)?.contains(&candidate.session_id),
+        };
+        if managed_run_active {
+            results.push(IdleEndResult::Lost);
+            continue;
+        }
+        let result = match &candidate.action {
+            IdleEndAction::Substantive {
+                expected_page_id,
+                observation_count,
+                now_us,
+                last_activity_us,
+            } => {
+                let tx = conn.transaction()?;
+                let page_blob: &[u8] = expected_page_id.as_bytes();
+                let changed = tx.execute(
+                    "UPDATE sessions \
+                     SET ended_at = ?1, summary_page_id = ?2, \
+                         ended_observation_count = ( \
+                             SELECT COUNT(*) FROM observations \
+                             WHERE session_id = ?3 \
+                         ) \
+                     WHERE id = ?3 AND workspace_id = ?4 AND project_id = ?5 \
+                       AND ended_at IS NULL \
+                       AND ( \
+                             SELECT COUNT(*) FROM observations \
+                             WHERE session_id = ?3 \
+                         ) = ?6 \
+                       AND ( \
+                             SELECT id FROM pages \
+                             WHERE workspace_id = ?4 AND project_id = ?5 \
+                               AND path = ?7 AND is_latest = 1 \
+                         ) = ?2",
+                    params![
+                        *now_us,
+                        page_blob,
+                        candidate.session_id.as_bytes(),
+                        candidate.workspace_id.as_bytes(),
+                        candidate.project_id.as_bytes(),
+                        *observation_count,
+                        format!("sessions/{}.md", candidate.session_id)
+                    ],
+                )?;
+                if changed == 0 {
+                    // A real SessionEnd (or another writer) ended the
+                    // session after the tick selected it, the session's
+                    // work or its page moved after the tick's read, or the
+                    // candidate no longer matches its row: the newer effect
+                    // owns the row. Drop the transaction to roll back.
+                    results.push(IdleEndResult::Lost);
+                    continue;
+                }
+                audit_with_detail(
+                    &tx,
+                    "idle_session_end",
+                    Some(candidate.workspace_id.as_bytes()),
+                    Some(candidate.project_id.as_bytes()),
+                    Some(expected_page_id.as_bytes()),
+                    None,
+                    *now_us,
+                    &serde_json::json!({
+                        "session_id": candidate.session_id.to_string(),
+                        "action": "substantive",
+                        "last_activity_us": *last_activity_us,
+                    })
+                    .to_string(),
+                )?;
+                // The enqueue runs inside the stamp's transaction: a failed
+                // enqueue propagates, the transaction rolls back, and the
+                // session stays open for the next tick.
+                if enqueue_consolidation {
+                    crate::session_consolidation::enqueue_in_tx(
+                        &tx,
+                        candidate.workspace_id,
+                        candidate.project_id,
+                        candidate.session_id,
+                    )?;
+                }
+                tx.commit()?;
+                IdleEndResult::EndedSubstantive
+            }
+            IdleEndAction::LifecycleOnly {
+                now_us,
+                last_activity_us,
+            } => {
+                let tx = conn.transaction()?;
+                // The same guards as the substantive arm, before any
+                // mutation or handoff release: the candidate's scope must
+                // match the row and the row must still be open. Anything
+                // else is a stale or foreign candidate: `Lost`, nothing
+                // written.
+                let open: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM sessions \
+                     WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                       AND ended_at IS NULL",
+                    params![
+                        candidate.session_id.as_bytes(),
+                        candidate.workspace_id.as_bytes(),
+                        candidate.project_id.as_bytes()
+                    ],
+                    |row| row.get(0),
+                )?;
+                if open == 0 {
+                    results.push(IdleEndResult::Lost);
+                    continue;
+                }
+                let outcome =
+                    end_lifecycle_only_session_in_tx(&tx, &candidate.session_id, Some(*now_us))?;
+                match outcome {
+                    LifecycleOnlyEndOutcome::Ended { .. } => {
+                        // The auto-end audit is its own row in the stamp's
+                        // transaction, distinct from the
+                        // `release_lifecycle_only_handoff` row the handoff
+                        // release writes when a handoff was released.
+                        audit_with_detail(
+                            &tx,
+                            "idle_session_end",
+                            Some(candidate.workspace_id.as_bytes()),
+                            Some(candidate.project_id.as_bytes()),
+                            None,
+                            None,
+                            *now_us,
+                            &serde_json::json!({
+                                "session_id": candidate.session_id.to_string(),
+                                "action": "lifecycle_only",
+                                "last_activity_us": *last_activity_us,
+                            })
+                            .to_string(),
+                        )?;
+                        tx.commit()?;
+                        IdleEndResult::EndedLifecycleOnly
+                    }
+                    // Substantive work raced the tick's classification: leave
+                    // the session open (the transaction rolls back) and let
+                    // the real end — or the next tick — handle it.
+                    LifecycleOnlyEndOutcome::Substantive => {
+                        results.push(IdleEndResult::Lost);
+                        continue;
+                    }
+                }
+            }
+        };
+        results.push(result);
+    }
+    Ok(results)
+}
+
+fn active_managed_run_sessions(conn: &Connection) -> StoreResult<HashSet<SessionId>> {
+    let mut stmt = conn.prepare(
+        "SELECT native_session_id FROM managed_runs \
+         WHERE state = 'active' AND native_session_id IS NOT NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut sessions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let native_session_id: String = row.get(0)?;
+        sessions.insert(SessionId::from_native(&native_session_id));
+    }
+    Ok(sessions)
+}
+
 /// Mark a keyed hook event complete after its downstream effects finish.
 ///
 /// This transition is idempotent so two resumed processors can converge on the
@@ -3368,6 +3874,7 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
             now,
         ],
     )?;
+    index_observation_cjk(conn, conn.last_insert_rowid(), &obs.title, &obs.body)?;
     Ok(id)
 }
 
@@ -5627,7 +6134,13 @@ pub enum PurgeMode {
 /// being made about it. A list inside a string literal cannot be compared to
 /// anything, and the failure mode of getting it wrong is silent — text stays
 /// searchable after an operator asked for it to be reclaimed.
-const ALL_FTS_INDEXES: &[&str] = &["observations_fts", "pages_fts", "workstream_events_fts"];
+const ALL_FTS_INDEXES: &[&str] = &[
+    "observations_cjk_fts",
+    "observations_fts",
+    "pages_cjk_fts",
+    "pages_fts",
+    "workstream_events_fts",
+];
 
 /// Rebuild every FTS5 index, then `VACUUM`. Runs after the caller's
 /// transaction has committed: `VACUUM` cannot run inside one, and a rebuild is
@@ -11155,6 +11668,126 @@ pub(crate) mod tests {
         assert!(
             wal_len < 256 * 1024,
             "WAL not bounded by the between-batch checkpoint: {wal_len} bytes"
+        );
+    }
+
+    /// Two bare source tables under the V87 derived indexes and triggers,
+    /// holding `rows` pages and as many observations with no derived row yet:
+    /// the shape of a store opened for the first time after that upgrade.
+    fn unindexed_cjk_fixture(rows: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pages (title TEXT, body TEXT, path_search TEXT);
+             CREATE TABLE observations (title TEXT, body TEXT);",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("../migrations/V87__cjk_search_indexes.sql"))
+            .unwrap();
+        for i in 0..rows {
+            conn.execute(
+                "INSERT INTO pages (title, body, path_search) VALUES (?1, ?2, 'notes')",
+                params![format!("page {i}"), format!("支付服务 {i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO observations (title, body) VALUES ('prompt', ?1)",
+                [format!("需要恢复索引 {i}")],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// Source rows still without a derived row, as `(pages, observations)`.
+    fn missing_cjk_rows(conn: &Connection) -> (i64, i64) {
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        (
+            count(
+                "SELECT COUNT(*) FROM pages p \
+                 WHERE NOT EXISTS (SELECT 1 FROM pages_cjk_fts f WHERE f.rowid = p.rowid)",
+            ),
+            count(
+                "SELECT COUNT(*) FROM observations o \
+                 WHERE NOT EXISTS (SELECT 1 FROM observations_cjk_fts f WHERE f.rowid = o.rowid)",
+            ),
+        )
+    }
+
+    /// The cursor must pick up a missing row that follows an indexed one
+    /// inside a batch window, stop after the last one, and leave a repaired
+    /// store alone on the next run.
+    #[test]
+    fn cjk_backfill_resumes_past_indexed_rows_in_small_batches() {
+        let mut conn = unindexed_cjk_fixture(7);
+        // What an interrupted earlier run leaves behind: a prefix, a row in
+        // the middle and the last row already carry their derived rows.
+        for rowid in [1, 2, 4, 7] {
+            conn.execute(
+                "INSERT INTO pages_cjk_fts (rowid, title, body, path_search) \
+                 VALUES (?1, '', '', '')",
+                [rowid],
+            )
+            .unwrap();
+        }
+        for rowid in [3, 6] {
+            conn.execute(
+                "INSERT INTO observations_cjk_fts (rowid, title, body) VALUES (?1, '', '')",
+                [rowid],
+            )
+            .unwrap();
+        }
+        assert_eq!(missing_cjk_rows(&conn), (3, 5));
+
+        let summary = backfill_cjk_indexes_in_batches(&mut conn, 2).unwrap();
+        assert_eq!((summary.pages, summary.observations), (3, 5));
+        assert_eq!(missing_cjk_rows(&conn), (0, 0));
+        // The repaired rows carry their terms, not placeholders.
+        let searchable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages_cjk_fts WHERE pages_cjk_fts MATCH 'body:支付'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(searchable, 3);
+
+        let again = backfill_cjk_indexes(&mut conn).unwrap();
+        assert_eq!(again, CjkBackfillSummary::default());
+    }
+
+    /// Doubling the rows must not quadruple the work. Each batch resumes
+    /// after the last rowid it indexed instead of probing the indexed prefix
+    /// again, which made the pass quadratic on a large upgraded store (#1652).
+    /// SQLite's progress handler counts virtual-machine steps: a measure of
+    /// the rows visited that, unlike a clock, reads the same on every machine.
+    #[test]
+    fn cjk_backfill_work_grows_linearly_with_the_row_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let steps = |rows: i64| -> usize {
+            let mut conn = unindexed_cjk_fixture(rows);
+            let visits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&visits);
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let summary = backfill_cjk_indexes_in_batches(&mut conn, 1).unwrap();
+            assert_eq!(
+                (summary.pages, summary.observations),
+                (rows as u64, rows as u64)
+            );
+            visits.load(Ordering::Relaxed)
+        };
+
+        let small = steps(100);
+        let large = steps(200);
+        assert!(
+            large < small * 3,
+            "doubling the rows must not triple the work: {small} steps for 100, {large} for 200"
         );
     }
 

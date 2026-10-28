@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::UserId;
+use crate::sanitize::truncate_utf8_bytes;
 
 /// Path prefix every profile entry lives under, in whichever scope holds the
 /// profile.
@@ -463,8 +464,9 @@ impl ProfileEntry {
     ///
     /// The statement is the frontmatter `summary` or `abstract` when set,
     /// otherwise the first line of prose in the body, collapsed to one line
-    /// and capped at [`ENTRY_STATEMENT_MAX_BYTES`]. Returns `None` when the
-    /// page has nothing to state.
+    /// and capped at [`ENTRY_STATEMENT_MAX_BYTES`]. A longer statement ends in
+    /// `…` inside that cap, so the reader can tell the rule goes on. Returns
+    /// `None` when the page has nothing to state.
     #[must_use]
     pub fn from_page(
         path: &str,
@@ -484,7 +486,7 @@ impl ProfileEntry {
             .or_else(|| first_prose_line(body))
             .or_else(|| Some(title.trim().to_owned()).filter(|t| !t.is_empty()))?;
         let statement = collapse_whitespace(&statement);
-        let statement = truncate_bytes(&statement, ENTRY_STATEMENT_MAX_BYTES).to_owned();
+        let statement = truncate_utf8_bytes(&statement, ENTRY_STATEMENT_MAX_BYTES);
         let applies_to = match frontmatter.get("applies_to") {
             Some(serde_json::Value::String(one)) => vec![one.trim().to_ascii_lowercase()],
             Some(serde_json::Value::Array(many)) => many
@@ -622,18 +624,6 @@ fn labelled_field(line: &str) -> Option<(&str, &str)> {
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Truncate to at most `max` bytes without splitting a UTF-8 character.
-fn truncate_bytes(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 /// Opening fence around stored text in injected context.
@@ -1107,6 +1097,38 @@ mod tests {
             ProfileEntry::from_page("profile/a.md", "A", &long, &serde_json::Value::Null).unwrap();
         assert_eq!(e.statement.len(), ENTRY_STATEMENT_MAX_BYTES);
         assert_eq!(e.category(), "");
+    }
+
+    #[test]
+    fn a_statement_over_the_cap_ends_in_an_ellipsis_inside_it() {
+        let entry = |statement: &str| {
+            ProfileEntry::from_page(
+                "profile/habits/a.md",
+                "A",
+                "# A\n",
+                &serde_json::json!({ "summary": statement }),
+            )
+            .unwrap()
+            .statement
+        };
+
+        // A cut mid-sentence used to read as the whole rule.
+        let long = format!("{} never commit the lockfile.", "word ".repeat(60));
+        let cut = entry(&long);
+        assert!(cut.len() <= ENTRY_STATEMENT_MAX_BYTES, "{}", cut.len());
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(long.starts_with(cut.trim_end_matches('…')));
+
+        // The ellipsis never lands inside a multibyte character.
+        let accented = "é".repeat(ENTRY_STATEMENT_MAX_BYTES);
+        let cut = entry(&accented);
+        assert!(cut.len() <= ENTRY_STATEMENT_MAX_BYTES, "{}", cut.len());
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(cut.trim_end_matches('…').chars().all(|c| c == 'é'));
+
+        // A statement that fits is left alone.
+        let exact = "x".repeat(ENTRY_STATEMENT_MAX_BYTES);
+        assert_eq!(entry(&exact), exact);
     }
 
     #[test]

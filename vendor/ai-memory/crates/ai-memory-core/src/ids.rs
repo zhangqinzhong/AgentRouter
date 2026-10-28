@@ -301,6 +301,19 @@ pub enum AgentKind {
     /// but consume `SessionStart` stdout as plain context text.
     #[serde(rename = "ibm-bob", alias = "bob")]
     IbmBob,
+    /// DeepSeek Harness (DSH), whose Claude Code hooks bridge
+    /// (`@deepseek-ai/dsh-hooks-claude-code`) fires Claude Code-shaped
+    /// payloads for seven events (no `SessionEnd` or `PreCompact`).
+    Dsh,
+    /// Cline CLI, whose file hooks use `taskId` plus nested `tool_call` /
+    /// `tool_result` payloads. Run-start hooks are detached by default.
+    Cline,
+    /// Qwen Code (`qwen`), whose hooks send Claude Code-shaped payloads
+    /// (`session_id`, `cwd`, `tool_name`, `tool_input`, `tool_use_id`) and
+    /// whose MCP servers use Gemini CLI's `httpUrl` field in
+    /// `~/.qwen/settings.json`.
+    #[serde(rename = "qwen-code", alias = "qwen")]
+    QwenCode,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -311,7 +324,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 30] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -338,6 +351,9 @@ impl AgentKind {
         Self::Muse,
         Self::CodeBuddy,
         Self::IbmBob,
+        Self::Dsh,
+        Self::Cline,
+        Self::QwenCode,
         Self::Other,
     ];
 
@@ -371,6 +387,9 @@ impl AgentKind {
             Self::Muse => "muse",
             Self::CodeBuddy => "codebuddy",
             Self::IbmBob => "ibm-bob",
+            Self::Dsh => "dsh",
+            Self::Cline => "cline",
+            Self::QwenCode => "qwen-code",
             Self::Other => "other",
         }
     }
@@ -407,6 +426,9 @@ impl AgentKind {
             "muse" | "muse-code" | "musecode" => Self::Muse,
             "codebuddy" | "code-buddy" => Self::CodeBuddy,
             "ibm-bob" | "bob" => Self::IbmBob,
+            "dsh" | "deepseek-harness" | "deepseek_harness" => Self::Dsh,
+            "cline" | "cline-cli" => Self::Cline,
+            "qwen-code" | "qwen" | "qwencode" => Self::QwenCode,
             _ => Self::Other,
         }
     }
@@ -464,6 +486,10 @@ impl AgentKind {
     /// against v2.164.0–v2.167.0, #1299), so the native hook fetches the
     /// handoff for it. The fetch stays the built-in SessionStart path; a
     /// separate `GET /handoff` client is not part of the installer.
+    ///
+    /// Qwen Code injects `hookSpecificOutput.additionalContext` from
+    /// `SessionStart` stdout into the session (Qwen Code hooks reference:
+    /// <https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -474,6 +500,12 @@ impl AgentKind {
                 | Self::KimiCode
                 | Self::Hermes
                 | Self::Pool
+                // DSH's bridge runs SessionStart detached, so its stdout
+                // cannot be relied on to deliver a fetched handoff.
+                | Self::Dsh
+                // Cline CLI runs TaskStart/TaskResume detached by default,
+                // so accepting a single-use handoff there would discard it.
+                | Self::Cline
                 | Self::Other
         )
     }
@@ -499,17 +531,33 @@ impl AgentKind {
         matches!(self, Self::KimiCode)
     }
 
+    /// Whether this agent adds a JSON `context` from the native `user-prompt`
+    /// hook's stdout to the upcoming turn.
+    ///
+    /// Hermes Agent ignores `on_session_start` stdout but adds a
+    /// `pre_llm_call` hook's `{"context": "..."}` to the user message, and
+    /// (`agent/turn_context.py`, `agent/shell_hooks.py`, v0.22.2). The hook
+    /// checks every primary-session prompt: a resumed Hermes session reports
+    /// `extra.is_first_turn = false`, but still needs to receive a handoff
+    /// produced while another harness was active.
+    #[must_use]
+    pub fn json_context_user_prompt_injects_handoff(self) -> bool {
+        matches!(self, Self::Hermes)
+    }
+
     /// Whether this agent adds a `UserPromptSubmit` hook's
     /// `hookSpecificOutput.additionalContext` to the turn it belongs to.
     ///
     /// Claude Code places it alongside the submitted prompt and Codex adds it
-    /// as developer context (both hook references). The compaction recap uses
-    /// this channel. Grok discards an allowing `UserPromptSubmit`'s output,
-    /// and Kimi Code injects raw stdout rather than this envelope, so neither
-    /// is listed.
+    /// as developer context (both hook references). Qwen Code sends it as a
+    /// tagged text part
+    /// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
+    /// The compaction recap uses this channel. Grok discards an allowing
+    /// `UserPromptSubmit`'s output, and Kimi Code injects raw stdout rather
+    /// than this envelope, so neither is listed.
     #[must_use]
     pub fn user_prompt_injects_context(self) -> bool {
-        matches!(self, Self::ClaudeCode | Self::Codex)
+        matches!(self, Self::ClaudeCode | Self::Codex | Self::QwenCode)
     }
 
     /// Whether `PostToolUse` stdout is model-visible context.
@@ -665,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_kind_hermes_round_trips_without_claiming_handoff_delivery() {
+    fn agent_kind_hermes_round_trips_and_claims_handoffs_on_user_prompts() {
         assert_eq!(AgentKind::Hermes.as_str(), "hermes");
         assert_eq!(AgentKind::from_wire("hermes"), AgentKind::Hermes);
         assert_eq!(AgentKind::from_wire("hermes-agent"), AgentKind::Hermes);
@@ -677,8 +725,19 @@ mod tests {
             serde_json::to_string(&AgentKind::Hermes).unwrap(),
             "\"hermes\""
         );
+        // `on_session_start` stdout is ignored, so the destructive fetch must
+        // not run there; a primary-session `pre_llm_call` carries it instead.
         assert!(!AgentKind::Hermes.session_start_injects_handoff());
         assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
+        assert!(AgentKind::Hermes.json_context_user_prompt_injects_handoff());
+        for other in AgentKind::ALL {
+            if other != AgentKind::Hermes {
+                assert!(
+                    !other.json_context_user_prompt_injects_handoff(),
+                    "{other:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -696,6 +755,26 @@ mod tests {
         // destructive handoff fetch must not happen from its native hook.
         assert!(!AgentKind::Pool.session_start_injects_handoff());
         assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_dsh_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Dsh.as_str(), "dsh");
+        assert_eq!(AgentKind::from_wire("dsh"), AgentKind::Dsh);
+        assert_eq!(AgentKind::from_wire("deepseek-harness"), AgentKind::Dsh);
+        assert_eq!(AgentKind::from_wire("deepseek_harness"), AgentKind::Dsh);
+        // serde uses rename_all = "kebab-case" → "dsh".
+        assert_eq!(serde_json::to_string(&AgentKind::Dsh).unwrap(), "\"dsh\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"dsh\"").unwrap(),
+            AgentKind::Dsh
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("dsh-2"), AgentKind::Other);
+        // DSH's Claude Code hooks bridge runs SessionStart detached, so the
+        // destructive handoff fetch must not happen from its hook bundle.
+        assert!(!AgentKind::Dsh.session_start_injects_handoff());
+        assert!(!AgentKind::Dsh.user_prompt_injects_handoff());
     }
 
     #[test]
@@ -820,6 +899,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_kind_qwen_code_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::QwenCode.as_str(), "qwen-code");
+        for alias in ["qwen-code", "qwen", "qwencode"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::QwenCode, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::QwenCode).unwrap(),
+            "\"qwen-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"qwen-code\"").unwrap(),
+            AgentKind::QwenCode
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"qwen\"").unwrap(),
+            AgentKind::QwenCode
+        );
+        assert_eq!(AgentKind::from_wire("qwen-code-2"), AgentKind::Other);
+        assert!(AgentKind::QwenCode.session_start_injects_handoff());
+        assert!(!AgentKind::QwenCode.user_prompt_injects_handoff());
+        assert!(AgentKind::QwenCode.user_prompt_injects_context());
+        assert!(!AgentKind::QwenCode.post_tool_injects_handoff());
+        assert!(!AgentKind::QwenCode.reuses_session_id_after_end());
+    }
+
+    #[test]
     fn agent_kind_grizzybot_round_trips() {
         assert_eq!(AgentKind::Grizzybot.as_str(), "grizzybot");
         assert_eq!(AgentKind::from_wire("grizzybot"), AgentKind::Grizzybot);
@@ -922,11 +1027,14 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_context_injection_is_claude_code_and_codex() {
+    fn user_prompt_context_injection_is_claude_code_codex_and_qwen_code() {
         for agent in AgentKind::ALL {
             assert_eq!(
                 agent.user_prompt_injects_context(),
-                matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex),
+                matches!(
+                    agent,
+                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::QwenCode
+                ),
                 "{}",
                 agent.as_str()
             );
@@ -1319,5 +1427,19 @@ mod portable_page_path_tests {
         ] {
             assert_ne!(portable_page_key(a), portable_page_key(b));
         }
+    }
+
+    #[test]
+    fn cline_wire_identity_fails_safe_for_detached_start_hooks() {
+        assert_eq!(
+            super::AgentKind::from_wire("cline"),
+            super::AgentKind::Cline
+        );
+        assert_eq!(
+            super::AgentKind::from_wire("cline-cli"),
+            super::AgentKind::Cline
+        );
+        assert_eq!(super::AgentKind::Cline.as_str(), "cline");
+        assert!(!super::AgentKind::Cline.session_start_injects_handoff());
     }
 }

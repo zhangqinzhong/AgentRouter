@@ -24,9 +24,32 @@ where
     if entry.get("type").and_then(serde_json::Value::as_str) != Some("oauth") {
         return Ok(None);
     }
-    serde_json::from_value::<T>(entry)
+    serde_json::from_value::<T>(entry.clone())
         .map(Some)
-        .map_err(|e| LlmError::Auth(format!("parse {key} auth entry: {e}")))
+        .map_err(|_| {
+            // serde quotes the offending value, and a value in the wrong field
+            // of this file is usually a token. Describe the error from a copy
+            // with every string blanked so the message never carries one.
+            let detail = serde_json::from_value::<T>(redact_strings(entry)).map_or_else(
+                |e| e.to_string(),
+                |_| "entry does not match the expected shape".to_owned(),
+            );
+            LlmError::Auth(format!("parse {key} auth entry: {detail}"))
+        })
+}
+
+fn redact_strings(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(_) => Value::String("<redacted>".to_owned()),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_strings).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(field, value)| (field, redact_strings(value)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 pub(crate) fn save_entry<T>(path: &Path, key: &str, entry: Option<T>) -> LlmResult<()>
@@ -214,6 +237,55 @@ mod tests {
         let err = load_entry::<TestEntry>(&path, "test").unwrap_err();
         assert!(
             matches!(err, LlmError::Auth(ref msg) if msg.contains("parse test auth entry")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A token written into a field of the wrong type (here `expires`, by a
+    /// hand edit or a provisioning script) must not come back in the error,
+    /// which reaches terminals, CI logs and captured hook output.
+    #[test]
+    fn wrong_type_error_does_not_echo_the_stored_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let secret = "sk-leak-0123456789abcdef";
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "test": { "type": "oauth", "access": "a", "refresh": "r", "expires": secret }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let err = load_entry::<TestEntry>(&path, "test").unwrap_err();
+        let LlmError::Auth(msg) = err else {
+            panic!("unexpected error: {err}");
+        };
+        assert!(
+            !msg.contains(secret),
+            "auth entry error leaked the value: {msg}"
+        );
+        assert!(
+            msg.contains("parse test auth entry") && msg.contains("invalid type: string"),
+            "the error must still say what is wrong: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_field_error_still_names_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "test": { "type": "oauth", "access": "a", "expires": 1 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let err = load_entry::<TestEntry>(&path, "test").unwrap_err();
+        assert!(
+            matches!(err, LlmError::Auth(ref msg) if msg.contains("missing field `refresh`")),
             "unexpected error: {err}"
         );
     }

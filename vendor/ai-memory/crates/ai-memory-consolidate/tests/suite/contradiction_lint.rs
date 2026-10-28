@@ -450,3 +450,229 @@ async fn llm_lint_pass_does_not_audit_the_previous_lint_report() {
         "{prompt}"
     );
 }
+
+/// Manually labeled, synthetic pairs. Vectors are controlled inputs, not model
+/// outputs: these cases measure the classification boundary, not embedding
+/// quality or production precision. `expected_findings` records today's
+/// behavior independently of the label; update it when semantics change.
+///
+/// A positive pair contains incompatible simultaneous values for the same
+/// setting and scope. Compatible active pairs are negatives. Expired,
+/// superseded and foreign-project pairs exercise eligibility and are excluded
+/// from the classification metrics. A prediction means any `kind = contradiction`
+/// finding, including an advisory similarity candidate; it does not mean the
+/// server independently verified the conflict. The typed-edge control also
+/// contains conflicting prose, so its label does not rely on the edge alone.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceCase {
+    id: String,
+    language: String,
+    label: EvidenceLabel,
+    setup: EvidenceSetup,
+    first: String,
+    second: String,
+    second_vector: [f32; 2],
+    expected_findings: usize,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceLabel {
+    Conflict,
+    Compatible,
+    Ineligible,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceSetup {
+    Active,
+    Declared,
+    Superseded,
+    Expired,
+    ForeignProject,
+}
+
+fn evidence_cases() -> Vec<EvidenceCase> {
+    serde_json::from_str(include_str!("../fixtures/contradiction_evidence.json")).unwrap()
+}
+
+async fn seed_evidence_case(case: &EvidenceCase) -> Fixture {
+    let fx = seed_fixture().await;
+    let first = write_semantic(&fx, "decisions/first.md", &case.first).await;
+    let project_id = if matches!(case.setup, EvidenceSetup::ForeignProject) {
+        fx.store
+            .writer
+            .get_or_create_project(fx.ws, "foreign", None)
+            .await
+            .unwrap()
+    } else {
+        fx.proj
+    };
+    let path = if matches!(case.setup, EvidenceSetup::Superseded) {
+        "decisions/first.md"
+    } else {
+        "decisions/second.md"
+    };
+    let frontmatter = if matches!(case.setup, EvidenceSetup::Declared) {
+        serde_json::json!({"relations": {"contradicts": ["decisions/first.md"]}})
+    } else {
+        serde_json::json!({})
+    };
+    let second = fx
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: fx.ws,
+            project_id,
+            path: PagePath::new(path).unwrap(),
+            frontmatter,
+            body: case.second.clone(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some(path.into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    if !matches!(case.setup, EvidenceSetup::Declared) {
+        seed_embedding(&fx, first, &[1.0, 0.0]);
+        seed_embedding(&fx, second, &case.second_vector);
+    }
+    if matches!(case.setup, EvidenceSetup::Expired) {
+        let conn = rusqlite::Connection::open(fx.tmp.path().join("db/memory.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE pages SET expires_at = 1 WHERE id = ?1",
+            params![first.as_bytes()],
+        )
+        .unwrap();
+    }
+    fx
+}
+
+async fn evidence_findings(fx: &Fixture) -> Vec<(String, Vec<String>)> {
+    let report = run_lint(
+        &fx.store.reader,
+        &fx.wiki,
+        None,
+        fx.ws,
+        fx.proj,
+        options(coord()),
+    )
+    .await
+    .unwrap();
+    report
+        .findings
+        .into_iter()
+        .filter(|finding| finding.kind == "contradiction")
+        .map(|finding| (finding.severity, finding.pages))
+        .collect()
+}
+
+#[derive(Default, Debug)]
+struct EvidenceCounts {
+    tp: usize,
+    fp: usize,
+    tn: usize,
+    fn_: usize,
+    excluded: usize,
+    findings: usize,
+}
+
+impl EvidenceCounts {
+    fn record(&mut self, case: &EvidenceCase, findings: usize) {
+        self.findings += findings;
+        match (case.label, findings > 0) {
+            (EvidenceLabel::Conflict, true) => self.tp += 1,
+            (EvidenceLabel::Conflict, false) => self.fn_ += 1,
+            (EvidenceLabel::Compatible, true) => self.fp += 1,
+            (EvidenceLabel::Compatible, false) => self.tn += 1,
+            (EvidenceLabel::Ineligible, _) => self.excluded += 1,
+        }
+    }
+
+    fn report(&self) {
+        // Undefined metrics stay None rather than being reported as zero.
+        let ratio = |n: usize, d: usize| (d != 0).then(|| n as f64 / d as f64);
+        println!(
+            "synthetic classification: {self:?}; precision={:?}; recall={:?}; f1={:?}; fpr={:?}; fnr={:?}",
+            ratio(self.tp, self.tp + self.fp),
+            ratio(self.tp, self.tp + self.fn_),
+            ratio(2 * self.tp, 2 * self.tp + self.fp + self.fn_),
+            ratio(self.fp, self.fp + self.tn),
+            ratio(self.fn_, self.tp + self.fn_),
+        );
+    }
+}
+
+#[tokio::test]
+async fn labeled_evidence_pairs_record_current_classification() {
+    let mut counts = EvidenceCounts::default();
+    let cases = evidence_cases();
+    let mut ids = std::collections::HashSet::new();
+    for case in &cases {
+        assert!(ids.insert(&case.id), "duplicate fixture id: {}", case.id);
+        let fx = seed_evidence_case(case).await;
+        let before = latest_page_count(&fx);
+        let first = evidence_findings(&fx).await;
+        assert_eq!(
+            first.len(),
+            case.expected_findings,
+            "{} ({})",
+            case.id,
+            case.language
+        );
+        if matches!(case.label, EvidenceLabel::Ineligible) {
+            assert!(first.is_empty(), "excluded pair: {}", case.id);
+        }
+        if matches!(case.setup, EvidenceSetup::Declared) {
+            assert_eq!(first[0].0, "warning", "typed edge control");
+        }
+        assert_eq!(
+            first,
+            evidence_findings(&fx).await,
+            "repeat parity: {}",
+            case.id
+        );
+        assert_eq!(
+            latest_page_count(&fx),
+            before,
+            "lint mutated pages: {}",
+            case.id
+        );
+        counts.record(case, first.len());
+    }
+    assert_eq!(cases.len(), 11);
+    counts.report();
+}
+
+/// Timing excludes fixture creation. Each trial is one isolated pair, not a
+/// scan over the whole corpus. Run explicitly; no wall-clock assertion enters
+/// CI, and the measurements do not imply a production throughput target.
+#[tokio::test]
+#[ignore = "manual offline lint timing receipt; run with --ignored --nocapture"]
+async fn labeled_evidence_pairs_timing_receipt() {
+    const TRIALS: usize = 20;
+    let mut timings = Vec::new();
+    for case in evidence_cases() {
+        let fx = seed_evidence_case(&case).await;
+        let expected = evidence_findings(&fx).await;
+        for _ in 0..TRIALS {
+            let started = std::time::Instant::now();
+            let actual = evidence_findings(&fx).await;
+            timings.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(actual, expected, "repeat parity: {}", case.id);
+        }
+    }
+    timings.sort_by(f64::total_cmp);
+    let percentile = |pct: usize| timings[(pct * timings.len()).div_ceil(100) - 1];
+    println!(
+        "synthetic isolated-pair lint: trials={} p50_ms={:.6} p95_ms={:.6}; LLM calls=0",
+        timings.len(),
+        percentile(50),
+        percentile(95),
+    );
+}

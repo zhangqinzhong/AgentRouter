@@ -227,7 +227,7 @@ its precision for entity-phrased questions.
 - Full local gate per AGENTS.md; fast Linux CI per merge, full matrix on
   the release-candidate SHA before any tag, per the CI pacing rule.
 
-## 9. Open questions (for maintainer input before coding)
+## 9. Questions resolved during implementation
 
 1. The v2.1.0 cut landed after your "targeting 2.1" note: does the
    implementation PR still ride the `release/2.1` line (2.1.x additive)

@@ -122,28 +122,57 @@ export page whose `pagination.hasMore` is true needs `--allow-partial`.
 Claude memory graph and Qdrant imports remain roadmap items; there are no code
 stubs for them.
 
+### Local documents
+
+`document --file <path>` extracts one explicitly selected local document into
+one attributed page under `imported/documents/`. Supported inputs are UTF-8
+text and Markdown, text-layer PDF, DOCX, PPTX (including speaker notes), XLSX,
+WebVTT, and SRT. CSV and TSV are imported as text so their original delimiters
+remain visible. Legacy XLS, XLSB, and ODS files must first be exported as XLSX
+or delimiter-separated text.
+
+The page records the source file's basename, format, SHA-256 digest, and
+extractor version, followed by sanitized text. Its path includes the full
+source digest, and its last line carries a deterministic provenance marker.
+A rerun therefore performs no duplicate write. If another page already owns
+that path, the import refuses to replace it.
+
+This is text extraction, not a media pipeline. Image-only PDFs need OCR before
+import. Images, raw audio/video, and proprietary media transcription are not
+supported; provide a completed VTT or SRT transcript instead. The original
+opaque file is never uploaded or stored in ai-memory. DOCX text marked hidden
+by formatting may still be extracted; deleted revisions and field instructions
+are excluded. Review `--show-body` before every live import of a document whose
+visibility rules matter.
+
+VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
+between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep
+their cue text.
+
 ## Safety contract
 
 - Default mode is dry-run; live mode requires `--apply`.
 - Live mode requires explicit `--workspace`, `--project`, and
   `--manifest-out <path>`.
-- Live writes use only `POST /admin/write-page`; the importer never opens
-  ai-memory SQLite or wiki files directly and never deletes pages.
+- The OMC wiki route writes only through `POST /admin/write-page`. No route
+  opens ai-memory SQLite or wiki files directly or deletes pages.
 - The destination workspace/project must already exist unless
   `--create-destination` is passed.
-- Existing destination pages abort the import unless `--overwrite` is passed.
-  The importer also re-checks each page immediately before writing.
+- Existing OMC destination pages abort the import unless `--overwrite` is
+  passed. The importer also re-checks each page immediately before writing.
   This is best-effort protection: a concurrent writer could still race between
   the check and `/admin/write-page`, so avoid running competing import/write jobs
   into the same destination.
-- It stops on the first live-write error and updates the manifest with completed
-  writes and the failed checkpoint.
+- The OMC route stops on the first live-write error and updates the manifest
+  with completed writes and the failed checkpoint.
 - Path handling fails closed: absolute paths, `..`, unsafe destination paths,
   and reserved/internal destination prefixes are rejected. Duplicate generated
   destination paths abort planning.
 - Dry-run output does not print full page bodies unless `--show-body` is passed.
-- Only endpoint-supported metadata is mapped: `title`, `kind`, `tier`, `tags`,
-  `pinned`, and `body`. Unknown frontmatter is ignored.
+- The OMC route maps only endpoint-supported metadata: `title`, `kind`, `tier`,
+  `tags`, `pinned`, and `body`. Unknown frontmatter is ignored.
+- Manifests use randomized private temporary files in the destination directory,
+  sync their contents, and atomically replace the previous manifest.
 - Auth comes only from `AI_MEMORY_AUTH_TOKEN`; there is intentionally no CLI
   token argument.
 - External conversations are fully parsed, schema-checked, bounded, and
@@ -196,6 +225,26 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
 - Without `--create-destination`, every destination must already exist; the
   check is a read, which never creates a scope.
 
+The document route adds these boundaries:
+
+- It accepts one explicit regular file on Unix, refuses a final-component
+  symlink, opens with `O_NOFOLLOW`, and verifies the opened inode. The source is
+  capped at 32 MiB. Document import currently fails closed on native Windows;
+  use WSL2 until equivalent handle identity checks are implemented.
+- Office ZIP containers are preflighted before extraction: at most 4,096
+  entries, 16 MiB per entry, and 64 MiB claimed expanded size. XLSX extraction
+  streams at most 64 sheets and 100,000 actual cells without materializing the
+  worksheet's coordinate rectangle. PDF extraction is capped at 2,000 pages
+  and 16 MiB of decompressed stream data per load/extraction operation.
+- Working extracted text is capped at 2 MiB. The stored body is UTF-8-safely
+  truncated to 1 MiB with an explicit marker, then passed through the shared
+  client-side credential sanitizer before a manifest or request is created.
+- Live writes use MCP `memory_write_page` with `create_only`. The server must
+  support conditional writes, and a conflicting page counts as the same import
+  only when its complete body equals the current sanitized plan. A provenance
+  marker alone is never trusted. No document content grants authority or
+  changes the destination scope.
+
 ## Usage
 
 Dry-run with a summary:
@@ -233,6 +282,31 @@ Options:
 - `--include-session-logs`: include `session-log-*` pages.
 - `--show-body`: print full page bodies during dry-run.
 - `--pinned`: pin all imported pages.
+
+## Document usage
+
+Dry-run one document (the default):
+
+```bash
+cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+  document --file /path/to/report.pdf \
+  --workspace default --project my-project
+```
+
+Review the sanitized extracted page body with `--show-body` before applying it,
+especially for DOCX files that may contain text hidden by formatting:
+
+```bash
+AI_MEMORY_AUTH_TOKEN=... \
+cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+  document --file /path/to/report.pdf \
+  --workspace default --project my-project \
+  --apply --manifest-out /tmp/document-import-manifest.json
+```
+
+Use `--title` to override the displayed title and `--dest-prefix` to select a
+different non-reserved imported-page family. The destination must already
+exist unless `--create-destination` is passed.
 
 ## External conversation usage
 

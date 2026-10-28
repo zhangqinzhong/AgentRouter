@@ -1,6 +1,9 @@
 # Design proposal: decision requests and replies on cross-project messages (#1281)
 
-**Status: design proposal, not implemented. 3.2 candidate.**
+**Status: open design proposal, not implemented, with no assigned release.**
+Issue [#1281](https://github.com/akitaonrails/ai-memory/issues/1281) remains
+open. Any implementation must rebase the migration numbers, tool count, and
+branch assumptions below against the then-current tree.
 
 The maintainer set the scope in
 [#1281](https://github.com/akitaonrails/ai-memory/issues/1281#issuecomment-6185835811):
@@ -188,8 +191,8 @@ Proposal (Q1, option c):
 | `memory_message_pop` | New `work_id`. A plain pop skips bound replies. It adds `decision_notice`. |
 | `memory_message_cancel` | Skips replies. |
 
-The tool count stays at 23, the admin routes get the same fields, and `/api/v1`
-and `/web` do not change. The handler and the validator refuse the
+The proposal adds no MCP tool; the admin routes get the same fields, and
+`/api/v1` and `/web` do not change. The handler and the validator refuse the
 `invalid_params` reasons before the store. The store returns a typed
 `StoreError` for each other reason, never `internal_error`.
 
@@ -352,7 +355,7 @@ control, and fails with its guard removed.
 | PR | Base | Content |
 |---|---|---|
 | 0 | `main` | This note (docs only, as #1008). |
-| 1 | The branch for 3.2 work | One piece: V81; types and validator; the capability; store, writer, MCP and HTTP changes; `MEMORY_INSTRUCTIONS` and the messaging skill; `docs/agent-messaging.md`, `docs/usage.md`, `docs/ARCHITECTURE.md`; inventory rows; the TypeScript SDK (its drift test needs it), with error codes for the new reasons; `CHANGELOG.md`; tests 1 to 11. |
+| 1 | The feature branch selected after approval | One piece: the next free migration; types and validator; the capability; store, writer, MCP and HTTP changes; `MEMORY_INSTRUCTIONS` and the messaging skill; `docs/agent-messaging.md`, `docs/usage.md`, `docs/ARCHITECTURE.md`; inventory rows; the TypeScript SDK (its drift test needs it), with error codes for the new reasons; `CHANGELOG.md`; tests 1 to 11. |
 | 2 | Same | CLI flags (`--reply-to`, `--choice`, `--decision-file`, `--work-id`) and an e2e test. |
 
 ## 9. Alternatives

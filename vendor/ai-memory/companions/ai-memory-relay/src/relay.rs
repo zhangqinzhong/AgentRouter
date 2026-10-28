@@ -167,7 +167,11 @@ fn read_input(file: &Path, binding: &Binding) -> Result<Vec<ValidEvent>> {
             file.display()
         );
     }
-    let input: Vec<InputEvent> = serde_json::from_slice(&raw).map_err(|e| {
+    // A Windows producer can write the file as UTF-8 with a byte-order mark
+    // (Windows PowerShell's `-Encoding UTF8`); the server's `/hook` ingress and
+    // the native hook client skip it too.
+    let json = raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&raw);
+    let input: Vec<InputEvent> = serde_json::from_slice(json).map_err(|e| {
         // Category plus position only. `Display` on a serde error can quote the
         // offending value ("invalid type: string \"...\""), and an event body is
         // exactly the thing that must not reach a terminal or a log.

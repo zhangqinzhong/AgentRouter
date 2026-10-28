@@ -3262,16 +3262,16 @@ async fn owner_finish_store_strict_resolution_refuses_pairing_missing_and_sql_fa
     conn.execute_batch("ALTER TABLE project_grants RENAME TO unavailable_grants;")
         .unwrap();
     f.refused_unchanged(run.run_id, f.alice()).await;
-    // The legacy resolution remains fail-open; it is insufficient for finish.
-    let legacy = ai_memory_store::resolve_project_authz(
+    // The common resolver also refuses when its authorization data is
+    // unreadable; a store fault must not open a restricted project.
+    let common = ai_memory_store::resolve_project_authz(
         &conn,
         f.ws,
         f.project,
         &ai_memory_store::ProjectPrincipal::user(f.alice),
         true,
-    )
-    .unwrap();
-    assert_eq!(legacy.access_mode, ai_memory_store::AccessMode::Open);
+    );
+    assert!(common.is_err());
     conn.execute_batch("ALTER TABLE unavailable_grants RENAME TO project_grants;")
         .unwrap();
     conn.execute(
@@ -4313,6 +4313,122 @@ async fn open_feedback_findings_ignores_expired_pages() {
     assert_eq!(findings[0].reason.as_deref(), Some("live page is stale"));
 }
 
+/// A link authored by a superseded page version is not a reference.
+/// `replace_links_in_tx` deletes rows only for the new version's id, so v1's
+/// row survives an edit, and `refresh_incoming_links_for_path` repoints it at
+/// the new latest id without filtering on `is_latest` — so without a join to a
+/// live source page, a link the author removed still answers for its target.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_a_superseded_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/b.md", "B", "target"))
+        .await
+        .unwrap();
+
+    // a.md v1 links b.md.
+    let mut a_v1 = page(ws, proj, "notes/a.md", "A", "see b");
+    a_v1.links = vec![ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new("notes/b.md").unwrap(),
+        relation: None,
+    }];
+    store.writer.upsert_page(a_v1).await.unwrap();
+
+    // Control: while the link is live, b.md is not an orphan.
+    let (_, _, linked_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        linked_orphans, 0,
+        "with a live inbound link neither page is an orphan"
+    );
+
+    // a.md v2 drops the link; v1's row survives, repointed at b.md's latest id.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/a.md", "A", "no link now"))
+        .await
+        .unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 2,
+        "both pages are orphans once the only link is gone from the latest version"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert!(
+        orphan_paths.contains(&"notes/b.md"),
+        "b.md lost its only inbound link and must be listed: {orphan_paths:?}"
+    );
+}
+
+/// A link authored by a TTL-expired page is not a reference either, and the
+/// workspace-wide health queries (which bind no project) agree with the
+/// project-scoped ones. A live link to a second target is the control.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_an_expired_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let link_to = |path: &str| ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new(path).unwrap(),
+        relation: None,
+    };
+
+    for path in ["notes/expired_target.md", "notes/live_target.md"] {
+        store
+            .writer
+            .upsert_page(page(ws, proj, path, path, "target"))
+            .await
+            .unwrap();
+    }
+    let mut expired_source = page(ws, proj, "notes/expired_source.md", "E", "see target");
+    expired_source.links = vec![link_to("notes/expired_target.md")];
+    expired_source.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired_source).await.unwrap();
+    let mut live_source = page(ws, proj, "notes/live_source.md", "L", "see target");
+    live_source.links = vec![link_to("notes/live_target.md")];
+    store.writer.upsert_page(live_source).await.unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 1,
+        "only the target of the expired page's link is an orphan"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(orphan_paths, ["notes/expired_target.md"]);
+}
+
 /// Memory health counts and detail lists ignore TTL-expired pages.
 #[tokio::test]
 async fn memory_health_ignores_expired_pages() {
@@ -4419,4 +4535,141 @@ async fn memory_health_ignores_expired_pages() {
     assert_eq!(p_detail.stale[0].path, "notes/live_stale.md");
     assert!(p_detail.duplicates.is_empty());
     assert_eq!(p_detail.orphans.len(), 2);
+}
+
+/// The briefing's `pages_latest` must agree with the page lists in the same
+/// snapshot: an expired page is hidden from every one of them, so counting it
+/// in the headline makes the brief advertise a page the agent cannot reach.
+#[tokio::test]
+async fn briefing_pages_latest_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/live.md", "Live", "content"))
+        .await
+        .unwrap();
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let live_pages = store
+        .reader
+        .list_unexpired_pages("acme", "shared-app")
+        .await
+        .unwrap();
+    assert_eq!(live_pages.len(), 1, "one of the two pages is expired");
+
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        project.counts.pages_latest,
+        live_pages.len() as u64,
+        "project pages_latest counts only the unexpired latest page"
+    );
+    assert_eq!(
+        project.recent_pages.len(),
+        1,
+        "control: the list the count is supposed to agree with holds one page"
+    );
+    // Control: the all-versions total is deliberately TTL-blind, so a fix that
+    // merely broke both counts the same way cannot satisfy this test.
+    assert_eq!(
+        project.counts.pages_all, 2,
+        "control: pages_all stays the raw all-versions total"
+    );
+
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.counts.pages_latest, 1);
+    assert_eq!(workspace.counts.pages_all, 2);
+
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.counts.pages_latest, 1);
+    assert_eq!(global.counts.pages_all, 2);
+}
+
+/// The briefing's activity windows are what an agent calibrates verbosity
+/// against, and `recent_pages` in the same snapshot already hides TTL-expired
+/// pages. A page written today with an expiry an hour ago must not make the
+/// project look active.
+#[tokio::test]
+async fn briefing_activity_windows_ignore_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert!(
+        project.recent_pages.is_empty(),
+        "control: the only page in the window is already hidden from the list"
+    );
+    assert_eq!(
+        project.activity_7d.pages_updated, 0,
+        "the expired page does not count as 7-day project activity"
+    );
+    assert_eq!(project.activity_30d.pages_updated, 0);
+
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.activity_7d.pages_updated, 0);
+    assert_eq!(workspace.activity_30d.pages_updated, 0);
+
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.activity_7d.pages_updated, 0);
+    assert_eq!(global.activity_30d.pages_updated, 0);
+
+    // Control: a live page written in the same window still counts, so the
+    // guard cannot pass by zeroing the counter outright.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/live.md", "Live", "content"))
+        .await
+        .unwrap();
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(project.activity_7d.pages_updated, 1);
+    assert_eq!(project.activity_30d.pages_updated, 1);
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.activity_7d.pages_updated, 1);
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.activity_7d.pages_updated, 1);
 }

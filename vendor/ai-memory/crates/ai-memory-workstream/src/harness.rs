@@ -1167,7 +1167,13 @@ fn has_flag(args: &[OsString], names: &[&str]) -> bool {
 
 fn flag_value(args: &[OsString], names: &[&str]) -> Option<String> {
     for (index, arg) in args.iter().enumerate() {
-        let value = arg.to_str()?;
+        // Skip an argument that is not UTF-8 rather than ending the scan, as
+        // `has_flag` and `flag_path` do. OS arguments are arbitrary byte
+        // strings on Linux and macOS, so one stray byte anywhere ahead of the
+        // selector used to hide a selector the user passed explicitly.
+        let Some(value) = arg.to_str() else {
+            continue;
+        };
         for name in names {
             if value == *name {
                 return args
@@ -1882,6 +1888,45 @@ mod tests {
             ["exec", "resume", "chosen", "continue here"]
         );
         assert_eq!(plan.expected_session_id.as_deref(), Some("chosen"));
+    }
+
+    /// A non-UTF-8 argument ahead of the selector must not hide it. OS
+    /// arguments are arbitrary byte strings, so nothing upstream can promise
+    /// UTF-8; `has_native_session_selector` uses the resilient `has_flag` and
+    /// still sees the flag, so a `flag_value` that gave up would leave the
+    /// plan with no expected id and send a pinned run to post-exit transcript
+    /// discovery.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_argument_does_not_hide_a_later_native_selector() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let bad = OsString::from_vec(vec![0xff]);
+        let plan = build_launch_plan(
+            ManagedHarness::OpenCode,
+            None,
+            vec![
+                bad,
+                OsString::from("--session=chosen"),
+                OsString::from("--auto"),
+            ],
+            Some("linked"),
+        )
+        .unwrap();
+        assert_eq!(plan.expected_session_id.as_deref(), Some("chosen"));
+        // Control: the same line without the stray byte already worked, so a
+        // regression in the selector scan itself cannot pass this test.
+        let clean = build_launch_plan(
+            ManagedHarness::OpenCode,
+            None,
+            vec![OsString::from("--session=chosen"), OsString::from("--auto")],
+            Some("linked"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.expected_session_id, clean.expected_session_id,
+            "a stray byte must not change the selector the plan reads"
+        );
     }
 
     #[test]

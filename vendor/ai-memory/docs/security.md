@@ -71,6 +71,30 @@ HTTPS-only. Close or redirect direct HTTP access to that hostname.
 Non-loopback binds should also set `AI_MEMORY_ALLOWED_HOSTS` to guard against
 DNS rebinding.
 
+For a private LAN where the operator deliberately accepts plaintext transport,
+`serve --allow-insecure-human-auth` (environment
+`AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) permits a non-loopback listener
+with a Non-Secure human session cookie. This exception is disabled by default
+and prints an unconditional startup warning. It does not weaken password
+checks, session or API-key authorization, CSRF, rate limits, the Host allowlist,
+or the separate unauthenticated-exposure guard. It also provides no encryption:
+any peer able to observe or alter LAN traffic can steal passwords, Bearer/API
+credentials, session cookies, and memory data. Prefer the HTTPS proxy path.
+The option changes no stored user, password, session, or API-key state; removing
+it restores the startup refusal.
+
+For the official Docker image, the environment form avoids replacing its
+default `serve` command:
+
+```bash
+docker run -d --name ai-memory \
+    -p 192.168.1.100:49374:49374 \
+    -v ai-memory-data:/data \
+    -e AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true \
+    -e AI_MEMORY_ALLOWED_HOSTS="192.168.1.100,localhost,127.0.0.1" \
+    akitaonrails/ai-memory:latest
+```
+
 With no token (the loopback default), a web page open in your browser can
 still address `127.0.0.1:49374`. The server refuses those requests on the
 machine and admin routes: a request the browser marks as cross-site

@@ -8,7 +8,7 @@
   "lib/cn.ts": "d1f1e0d62cb8d8d1e04c26e14de842d8a151f75812d81b046c65b5d1fe8e4b27",
   "lib/format.ts": "a0a6bf5864b440166544f7a5f363d28d5aee4024f32b4090954c51080e4c9c5a",
   "lib/model-breakdown.ts": "b23f45fb6d2e2d7d1b729684e53d55a659c2f84cbd58d6691d18de0ceb566bd0",
-  "lib/provider-display.js": "6c1530ea97a36d3192eeadb1cfd8df9a09b64bd70dd96fce1d9874607db03232",
+  "lib/provider-display.js": "c9358a3fc4050e200797f0d1915b28551386e8bd0c9fda7073f4eaf44794f83f",
   "lib/currency.ts": "a319c132f17e240eb0a5bf505d0cbdbc85f3f1e50c33375e88c6afbb287f9ea4",
   "lib/safe-browser.ts": "ef955af692501a80506e1aecb919a5a841a0e66ca77842e37eec7ffd5a307e77",
   "lib/token-format.js": "77e48c1dc16f797ab0503387d4e26048dc401593aed8e10c8205c5f22a3b0322",

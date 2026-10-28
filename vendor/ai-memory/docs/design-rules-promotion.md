@@ -13,9 +13,9 @@ Insight borrowed from ECC (`docs/research-ecc.md`): **"Memory is unreviewed
 context, not executable policy. Promote accepted knowledge into governed
 project documentation."** ai-memory already points in this direction: the lint
 emits a `rule_suggestion` finding ("this page looks like a durable rule;
-consider copying it into CLAUDE.md/AGENTS.md"). The 2.1 feature closes that
-loop by turning a durable memory into a governed, always-loaded rule the agent
-obeys every turn.
+consider copying it into CLAUDE.md/AGENTS.md"). A future feature would close
+that loop by turning a durable memory into a governed, always-loaded rule the
+agent obeys every turn.
 
 The maintainer named the trap, and it kills this feature if we get it wrong:
 AGENTS.md is a scarce, shared budget. If promotion dumps every learned rule

@@ -328,6 +328,14 @@ fn json_err(status: StatusCode, msg: &str) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
+fn internal_err(error: impl std::fmt::Display) -> Response {
+    tracing::error!(error = %error, "human authentication request failed");
+    json_err(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "authentication unavailable",
+    )
+}
+
 fn peer_ip(headers: &HeaderMap, extensions: &axum::http::Extensions, cidrs: &[Cidr]) -> IpAddr {
     let peer = extensions
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -414,7 +422,7 @@ async fn human_auth_configured(state: &AuthState) -> Result<bool, Response> {
         .reader
         .bootstrap_completed()
         .await
-        .map_err(|error| json_err(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?
+        .map_err(internal_err)?
     {
         return Ok(true);
     }
@@ -422,7 +430,7 @@ async fn human_auth_configured(state: &AuthState) -> Result<bool, Response> {
         .reader
         .any_password_hash()
         .await
-        .map_err(|error| json_err(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))
+        .map_err(internal_err)
 }
 
 fn set_cookie(name: &str, value: &str, http_only: bool, max_age: i64, secure: bool) -> String {
@@ -522,7 +530,7 @@ async fn password_collides_with_api_key(
         .reader
         .token_hash_exists(hash)
         .await
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+        .map_err(internal_err)
 }
 
 async fn issue_cookies(
@@ -532,10 +540,8 @@ async fn issue_cookies(
     expected_role: UserRole,
     expected_must_change: bool,
 ) -> Result<(String, String, i64), Response> {
-    let secret = ai_memory_store::web_sessions::generate_session_secret()
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    let csrf = ai_memory_store::web_sessions::generate_csrf_secret()
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let secret = ai_memory_store::web_sessions::generate_session_secret().map_err(internal_err)?;
+    let csrf = ai_memory_store::web_sessions::generate_csrf_secret().map_err(internal_err)?;
     let session_hash = hash_session_secret(&secret);
     let csrf_hash = hash_session_secret(&csrf);
     let issued = runtime
@@ -643,7 +649,7 @@ async fn handle_login(
         .await
     {
         Ok(v) => v,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
 
     let fail = || {
@@ -665,7 +671,7 @@ async fn handle_login(
         Err(ai_memory_store::StoreError::InvalidState(msg)) if msg.contains("saturated") => {
             return json_err(StatusCode::TOO_MANY_REQUESTS, "kdf saturated");
         }
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     if !ok {
         return fail();
@@ -760,7 +766,7 @@ async fn handle_recovery(
         Err(ai_memory_store::StoreError::InvalidState(msg)) if msg.contains("saturated") => {
             return json_err(StatusCode::TOO_MANY_REQUESTS, "kdf saturated");
         }
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     if let Err(e) = runtime
         .writer
@@ -772,7 +778,7 @@ async fn handle_recovery(
         )
         .await
     {
-        return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        return internal_err(e);
     }
     tracing::info!(username = %runtime.root_username, "root recovered via break-glass");
     let mut resp = StatusCode::NO_CONTENT.into_response();
@@ -854,7 +860,7 @@ async fn handle_change_password(
     {
         Ok(Some(u)) => u,
         Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "auth required"),
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     let Some(phc) = login.password_hash.clone() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth required");
@@ -863,7 +869,7 @@ async fn handle_change_password(
         .await
     {
         Ok(v) => v,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     if !ok {
         return json_err(StatusCode::UNAUTHORIZED, "invalid credentials");
@@ -875,15 +881,15 @@ async fn handle_change_password(
     }
     let new_phc = match ai_memory_store::password::hash_password(body.new_password).await {
         Ok(h) => h,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     let secret = match ai_memory_store::web_sessions::generate_session_secret() {
         Ok(s) => s,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     let csrf = match ai_memory_store::web_sessions::generate_csrf_secret() {
         Ok(s) => s,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     if let Err(e) = runtime
         .writer
@@ -897,7 +903,8 @@ async fn handle_change_password(
         )
         .await
     {
-        return json_err(StatusCode::CONFLICT, &e.to_string());
+        tracing::warn!(error = %e, user_id = %session.user.id, "password change lost its concurrency check");
+        return json_err(StatusCode::CONFLICT, "credentials changed; retry");
     }
     let mut resp = StatusCode::NO_CONTENT.into_response();
     append_session_cookies(
@@ -961,7 +968,7 @@ async fn handle_session_introspect(
     let hash = hash_session_secret(&body.session);
     let live = match runtime.reader.find_live_session_by_hash(hash).await {
         Ok(v) => v,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     let Some(live) = live else {
         return Json(IntrospectResponse {
@@ -1157,7 +1164,7 @@ async fn load_session(
         .reader
         .find_live_session_by_hash(hash)
         .await
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .map_err(internal_err)?
         .ok_or_else(|| json_err(StatusCode::UNAUTHORIZED, "auth required"))?;
     if live.user.disabled_at.is_some() {
         return Err(json_err(StatusCode::UNAUTHORIZED, "auth required"));
@@ -1953,6 +1960,50 @@ mod tests {
             assert_eq!(
                 json_error(resp).await,
                 serde_json::json!({"error": "invalid credentials"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn login_store_failure_answers_without_its_cause() {
+        let (tmp, state, password) = human_fixture(None).await;
+
+        // Legitimate control: the same credentials work while the store is
+        // healthy, so a blanket refusal cannot satisfy this regression.
+        let _ = login_cookies(state.clone(), &password).await;
+
+        let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+        conn.execute_batch("ALTER TABLE users RENAME TO unavailable_users;")
+            .unwrap();
+        let resp = public_auth_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "username": "root",
+                            "password": password
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json_error(resp).await;
+        assert_eq!(
+            error,
+            serde_json::json!({"error": "authentication unavailable"})
+        );
+        let rendered = error.to_string().to_ascii_lowercase();
+        for internal in ["sqlite", "users", "no such table"] {
+            assert!(
+                !rendered.contains(internal),
+                "leaked {internal}: {rendered}"
             );
         }
     }

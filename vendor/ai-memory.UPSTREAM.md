@@ -1,12 +1,17 @@
 # ai-memory provenance
 
 - Upstream: https://github.com/akitaonrails/ai-memory
-- Release: v3.1.2
-- Commit: `5519b89cc653bec4cfccbb770c6b4e5dcfcda759`
+- Release: v3.2.5
+- Commit: `3829f6187d8e9b7e6f32a9b2ac8831a64c5eff6f`
 - License: MIT, retained verbatim in `ai-memory/LICENSE`.
-- Import: complete GitHub source archive at the pinned v3.1.2 commit, without the upstream Git database.
+- Import: complete GitHub source archive at the pinned v3.2.5 commit, without the upstream Git database.
 
-The upstream source is unmodified. AgentRouter owns the TypeScript supervisor,
+Local source-only patch: the shared sanitizer fixture uses AWS’s documented
+`AKIAIOSFODNN7EXAMPLE` test key instead of a random full-shaped credential,
+preventing another synthetic-secret alert while retaining redaction coverage.
+The shipped runtime binary remains the pinned upstream release.
+
+AgentRouter owns the TypeScript supervisor,
 native React interface, transport adapters, and client integration receipts.
 These live outside this directory. Runtime resources are bundled at build time,
 not downloaded by the installed application. Official binaries are pinned by

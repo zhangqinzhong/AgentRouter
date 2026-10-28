@@ -276,7 +276,19 @@ impl PageWriteMetadata {
                     None => target.as_str(),
                     Some((scope, path)) => {
                         let parts: Vec<_> = scope.split('/').collect();
+                        // `ai_memory_wiki::split_scope` only recognises a
+                        // scope built from alphanumerics and `-_/.`; on a
+                        // scope holding anything else it returns no scope at
+                        // all and leaves the colon inside the page path. That
+                        // path is one `PagePath::new` accepts but
+                        // `ensure_portable` refuses, so the write would mint a
+                        // `links` row no page write could ever repoint. The
+                        // write boundary has to agree with the reader on what
+                        // a scope is, so the character class is shared.
                         if parts.len() > 2
+                            || !scope
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
                             || parts.iter().any(|s| {
                                 s.trim().is_empty() || *s != s.trim() || matches!(*s, "." | "..")
                             })
@@ -705,6 +717,36 @@ impl FromStr for Tier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A relation target's scope must be one `ai_memory_wiki::split_scope`
+    /// recognises. It accepts only alphanumerics and `-_/.`, and on anything
+    /// else it returns no scope and leaves the colon inside the page path —
+    /// a path `PagePath::new` accepts but `ensure_portable` refuses, so no
+    /// page write could ever create it and the `links` row stays unresolved
+    /// forever. A space is the realistic case: project names come from folder
+    /// basenames.
+    #[test]
+    fn page_write_metadata_refuses_a_scope_the_link_reader_cannot_parse() {
+        let metadata = |target: &str| -> PageWriteMetadata {
+            serde_json::from_value(serde_json::json!({
+                "relations": {"fixes": [target]}
+            }))
+            .unwrap()
+        };
+        for target in ["my project:notes/x", "a+b:notes/x", "ws/my project:notes/x"] {
+            assert!(
+                metadata(target).into_frontmatter().is_err(),
+                "{target} must be refused"
+            );
+        }
+        // Control: a scope the reader does parse still writes.
+        for target in ["other:notes/x", "workspace/other:notes/x"] {
+            assert!(
+                metadata(target).into_frontmatter().is_ok(),
+                "{target} must stay accepted"
+            );
+        }
+    }
 
     #[test]
     fn page_write_metadata_scope_components_refuse_surrounding_whitespace() {

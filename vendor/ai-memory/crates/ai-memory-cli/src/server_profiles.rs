@@ -305,7 +305,9 @@ pub(crate) fn read_token(data_dir: &Path, name: &ProfileName) -> Option<String> 
 /// `marker_dir` is the directory of the marker that declared the key, in the
 /// same lexical namespace as the hook's cwd (see `marker::absolute_normalized`);
 /// `roots` are compared against it component-wise, so `~/work/team-b` admits
-/// `~/work/team-b/repo` but not `~/work/team-bb`.
+/// `~/work/team-b/repo` but not `~/work/team-bb`. A Windows root folds ASCII
+/// case, since the filesystem does and the cwd a harness reports can differ
+/// in case from the spelling the root was registered with.
 pub(crate) fn resolve(
     data_dir: &Path,
     raw_name: &str,
@@ -328,7 +330,7 @@ pub(crate) fn resolve(
             .roots
             .iter()
             .filter_map(|root| expand_root(root, home))
-            .any(|root| marker_dir.starts_with(&root));
+            .any(|root| crate::marker::path_contains(&root, &marker_dir));
         if !admitted {
             return Err(Rejection::OutsideRoots);
         }
@@ -696,6 +698,42 @@ mod tests {
             resolve(dd.path(), "b", &team_b, None),
             Err(Rejection::OutsideRoots),
             "a `~` root cannot match when home is unknown"
+        );
+    }
+
+    /// Case folding is scoped to Windows roots: on a case-sensitive
+    /// filesystem `work/Team-B` and `work/team-b` are different directories
+    /// and a root over one must not admit the other.
+    #[cfg(unix)]
+    #[test]
+    fn a_posix_root_still_matches_case_sensitively() {
+        let dd = tempfile::tempdir().unwrap();
+        let home = dd.path().join("home");
+        add(
+            dd.path(),
+            &name("b"),
+            "https://b.example",
+            &["~/work/Team-B".to_owned()],
+            Some("tok-b"),
+        )
+        .unwrap();
+        assert!(
+            resolve(
+                dd.path(),
+                "b",
+                &home.join("work").join("Team-B").join("repo"),
+                Some(&home)
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            resolve(
+                dd.path(),
+                "b",
+                &home.join("work").join("team-b").join("repo"),
+                Some(&home)
+            ),
+            Err(Rejection::OutsideRoots)
         );
     }
 

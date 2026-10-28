@@ -34,7 +34,9 @@ pub struct AntigravityAdapter {
 
 const DB_FILE: &str = "conversation_summaries.db";
 /// 写 `brain` 的 app 数据目录(`~/.gemini` 下):桌面端 / CLI 与 IDE
-const APP_DIRS: [&str; 2] = ["antigravity", "antigravity-ide"];
+/// 写 `brain` 的 app 数据目录(`~/.gemini` 下):桌面端、IDE 与 CLI(索引库也在 CLI 目录里;
+/// 索引的 `app_data_dir` 列记的就是这几个名字)
+const APP_DIRS: [&str; 3] = ["antigravity", "antigravity-ide", "antigravity-cli"];
 /// 会话目录里转录的相对路径
 const TRANSCRIPT: [&str; 3] = [".system_generated", "logs", "transcript.jsonl"];
 const ENCRYPTED_NOTE: &str =
@@ -743,8 +745,8 @@ impl AgentAdapter for AntigravityAdapter {
         } else if name == "brain" {
             Self::from_parts(None, vec![dir])
         } else if name == "antigravity-cli" || dir.join(DB_FILE).is_file() {
-            // 索引库所在的目录(或它的拷贝)
-            Self::from_parts(Some(dir.join(DB_FILE)), Vec::new())
+            // 索引库所在的目录(或它的拷贝);CLI 的转录也写在这里的 brain 下
+            Self::from_parts(Some(dir.join(DB_FILE)), vec![dir.join("brain")])
         } else if APP_DIRS.contains(&name.as_str()) {
             Self::from_parts(None, vec![dir.join("brain")])
         } else {

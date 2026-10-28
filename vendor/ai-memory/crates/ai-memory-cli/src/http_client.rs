@@ -271,6 +271,39 @@ pub(crate) fn split_origin_and_path(raw: &str) -> (String, String) {
     (trimmed.to_string(), String::new())
 }
 
+/// Whether `url` names a server on this machine: an `http`/`https` URL whose
+/// host is `localhost`, an address in `127.0.0.0/8`, or `[::1]`, carrying no
+/// user information.
+///
+/// Parsed the way the HTTP client parses it, so the host checked here is the
+/// host a request would reach. Text before an `@` is user information, not
+/// the host, and a URL that has any is refused outright rather than
+/// interpreted. `localhost.` (trailing dot) is refused too: a fully qualified
+/// name can be answered by a DNS server instead of the local resolver. This
+/// gates the install's own root token (`config.rs`, `mcp-bridge`), so an
+/// unparsable or ambiguous URL is never treated as local.
+pub(crate) fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    }
+    host.parse::<std::net::Ipv4Addr>()
+        .map_or(host == "localhost", |ip| ip.is_loopback())
+}
+
 /// GET `<endpoint>{path}` with optional query params, deserialise JSON.
 ///
 /// # Errors
@@ -637,6 +670,45 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// The host checked must be the host a request reaches: user
+    /// information before an `@` is refused, never read as the host.
+    #[test]
+    fn loopback_url_is_decided_by_the_parsed_host() {
+        for url in [
+            "http://127.0.0.1:49374",
+            "http://localhost:49374/mcp",
+            "http://LOCALHOST:1",
+            "https://localhost",
+            "http://[::1]:49374",
+            "http://[::1]",
+            "http://127.0.0.2:1",
+            "http://127.255.255.254/",
+        ] {
+            assert!(is_loopback_url(url), "{url} is loopback");
+        }
+        for url in [
+            "http://localhost:80@attacker.example/",
+            "http://127.0.0.1:1@evil.example/",
+            "http://u:p@[::1]:49374@evil.example/",
+            "http://user@localhost:49374",
+            "http://user:pw@127.0.0.1:49374",
+            "http://evil.example#@localhost:1",
+            "http://evil.example/?@localhost:1",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.:49374",
+            "http://0.0.0.0:49374",
+            "http://192.168.1.10:49374",
+            "http://[::ffff:127.0.0.1]:49374",
+            "ftp://localhost/",
+            "localhost:49374",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url} is not loopback");
+        }
+    }
 
     #[test]
     fn only_an_unanswered_request_is_unreachable() {

@@ -5,6 +5,9 @@
  * only LF as a record separator so valid U+2028/U+2029 characters inside JSON
  * strings remain part of the record. Reading raw bytes keeps byte budgets exact
  * and lets malformed UTF-8 fail closed.
+ * Records longer than maxRecordBytes content bytes (excluding LF) are reported
+ * as { line: null, utf8Valid: null, oversized: true } without being buffered
+ * beyond the limit or decoded.
  */
 class PhysicalJsonlLimitError extends Error {
   constructor(maxPhysicalBytes) {
@@ -26,6 +29,7 @@ function decodePhysicalLine(buffer, { stripCr = false } = {}) {
 async function* physicalJsonlRecords(input, {
   invalidUtf8 = "throw",
   maxPhysicalBytes = Infinity,
+  maxRecordBytes = Infinity,
 } = {}) {
   if (invalidUtf8 !== "throw" && invalidUtf8 !== "record") {
     throw new TypeError(`unsupported invalidUtf8 policy: ${invalidUtf8}`);
@@ -33,8 +37,12 @@ async function* physicalJsonlRecords(input, {
   const byteLimit = Number.isFinite(maxPhysicalBytes)
     ? Math.max(0, Number(maxPhysicalBytes))
     : Infinity;
+  const recordLimit = Number.isFinite(maxRecordBytes)
+    ? Math.max(0, Number(maxRecordBytes))
+    : Infinity;
   const fragments = [];
   let fragmentsBytes = 0;
+  let oversized = false;
   let physicalBytesRead = 0;
 
   for await (const value of input) {
@@ -53,6 +61,17 @@ async function* physicalJsonlRecords(input, {
       if (physicalBytesRead + physicalBytes > byteLimit) {
         throw new PhysicalJsonlLimitError(byteLimit);
       }
+      const contentBytes = fragmentsBytes + fragment.length;
+      if (oversized || contentBytes > recordLimit) {
+        fragments.length = 0;
+        fragmentsBytes = 0;
+        oversized = false;
+        physicalBytesRead += physicalBytes;
+        start = newline + 1;
+        newline = chunk.indexOf(0x0a, start);
+        yield { line: null, utf8Valid: null, oversized: true, physicalBytes, terminated: true };
+        continue;
+      }
       const lineBuffer = fragments.length === 0
         ? fragment
         : Buffer.concat([...fragments, fragment], fragmentsBytes + fragment.length);
@@ -66,10 +85,10 @@ async function* physicalJsonlRecords(input, {
         line = decodePhysicalLine(lineBuffer, { stripCr: true });
       } catch (error) {
         if (invalidUtf8 === "throw") throw error;
-        yield { line: null, utf8Valid: false, physicalBytes, terminated: true };
+        yield { line: null, utf8Valid: false, oversized: false, physicalBytes, terminated: true };
         continue;
       }
-      yield { line, utf8Valid: true, physicalBytes, terminated: true };
+      yield { line, utf8Valid: true, oversized: false, physicalBytes, terminated: true };
     }
 
     if (start < chunk.length) {
@@ -77,12 +96,23 @@ async function* physicalJsonlRecords(input, {
       if (physicalBytesRead + fragmentsBytes + fragment.length > byteLimit) {
         throw new PhysicalJsonlLimitError(byteLimit);
       }
-      fragments.push(Buffer.from(fragment));
+      if (!oversized) {
+        if (fragmentsBytes + fragment.length > recordLimit) {
+          fragments.length = 0;
+          oversized = true;
+        } else {
+          fragments.push(Buffer.from(fragment));
+        }
+      }
       fragmentsBytes += fragment.length;
     }
   }
 
   if (fragmentsBytes > 0) {
+    if (oversized) {
+      yield { line: null, utf8Valid: null, oversized: true, physicalBytes: fragmentsBytes, terminated: false };
+      return;
+    }
     const lineBuffer = fragments.length === 1
       ? fragments[0]
       : Buffer.concat(fragments, fragmentsBytes);
@@ -94,7 +124,7 @@ async function* physicalJsonlRecords(input, {
       if (invalidUtf8 === "throw") throw error;
       utf8Valid = false;
     }
-    yield { line, utf8Valid, physicalBytes: fragmentsBytes, terminated: false };
+    yield { line, utf8Valid, oversized: false, physicalBytes: fragmentsBytes, terminated: false };
   }
 }
 

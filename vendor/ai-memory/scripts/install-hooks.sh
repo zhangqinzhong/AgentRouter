@@ -144,11 +144,12 @@ if [[ "$AGENT" == "command-code" ]]; then
     )
 fi
 
-# Antigravity CLI wires only PreInvocation (session-start), PreToolUse,
-# PostToolUse and Stop, and its bundle ships exactly those four scripts.
+# Antigravity wires SessionStart, PreInvocation, PreToolUse, PostToolUse and
+# Stop, and its bundle ships exactly those five scripts.
 if [[ "$AGENT" == "antigravity-cli" ]]; then
     SCRIPTS=(
         "session-start"
+        "pre-invocation"
         "pre-tool-use"
         "post-tool-use"
         "stop"

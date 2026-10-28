@@ -6,10 +6,12 @@ default-behavior-unchanged. Shipped: **P1** typed redaction labels
 `evidence_count` explain field, ranking-inert; **P3** the typed edge kind in
 `graph_via.edge` explain, ranking unchanged; **P4** an opt-in `settled_first`
 briefing (default off); **P5** the no-API-key subscription docs. The
-**eval-gated activations remain deferred behind the R2 harness** (which does not
-yet exist): P2's confidence→authority factor and P3's typed-edge rank weighting /
-`contradicts` cap are NOT wired into ranking: the data and explanations land, and
-the default-rank flips wait for a number. Targets the `release/2.2` line
+R2 harness now exists and has been run. P2's confidence-to-authority factor
+was wired behind the default-off `belief_authority_weight` in 2.4; its
+zero-LLM R2 delta was `0.000` because that corpus has no consolidation
+evidence, so it remains off pending a consolidated-corpus result. P3's
+typed-edge rank weighting and `contradicts` cap remain unbuilt. The original
+implementation plan targeted the `release/2.2` line
 (2.2.x; every item here is additive). Derived from
 [`research-hindsight.md`](research-hindsight.md) §11 ("Strengths worth
 borrowing") and the landscape recommendations R3/R5 in
@@ -51,7 +53,8 @@ Restated from `AGENTS.md` because they bound each design below:
 - **Migrations are backup-gated (#9 / #633 ordering).** Any new column/table is
   a `V63__*.sql` refinery step behind the pre-migration archive, plus the pin
   bump at `api_credentials.rs:414` (currently `62`).
-- **MCP tool count is frozen at 23** (enforced by `MCP_TOOL_NAMES` and the
+- **MCP tool count was frozen at 23 for this plan** (enforced by
+  `MCP_TOOL_NAMES` and the
   registered-router test in `server.rs`). None of these phases needs a *new* tool; they extend
   existing surfaces (`memory_query` explain, `memory_status`, `memory_lint`,
   the scheduler). If P2 ever warranted a dedicated tool, that is a separate

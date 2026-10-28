@@ -936,7 +936,7 @@ fn warn_remote_server(config: &Config) {
     if !config.server_url_configured() {
         return;
     }
-    if is_loopback_url(&config.server_url) {
+    if is_local_server_url(&config.server_url) {
         return;
     }
     eprintln!(
@@ -946,12 +946,11 @@ fn warn_remote_server(config: &Config) {
     );
 }
 
-fn is_loopback_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains("127.0.0.1")
-        || lower.contains("localhost")
-        || lower.contains("[::1]")
-        || lower.contains("0.0.0.0")
+/// Loopback, or the `0.0.0.0` bind address a local server is often reached
+/// through. Only decides whether to print the remote-server note.
+fn is_local_server_url(url: &str) -> bool {
+    crate::http_client::is_loopback_url(url)
+        || reqwest::Url::parse(url).is_ok_and(|parsed| parsed.host_str() == Some("0.0.0.0"))
 }
 
 struct ReqwestFetcher {
@@ -1782,10 +1781,14 @@ mod tests {
     }
 
     #[test]
-    fn is_loopback_detects_common_forms() {
-        assert!(is_loopback_url("http://127.0.0.1:49374"));
-        assert!(is_loopback_url("http://localhost:49374"));
-        assert!(!is_loopback_url("http://192.168.1.10:49374"));
+    fn local_server_url_detects_common_forms() {
+        assert!(is_local_server_url("http://127.0.0.1:49374"));
+        assert!(is_local_server_url("http://localhost:49374"));
+        assert!(is_local_server_url("http://0.0.0.0:49374"));
+        assert!(!is_local_server_url("http://192.168.1.10:49374"));
+        // A host that merely contains a loopback name is remote.
+        assert!(!is_local_server_url("http://localhost.example.com:49374"));
+        assert!(!is_local_server_url("http://127.0.0.1.example.com"));
     }
 
     #[test]

@@ -88,9 +88,9 @@ recorder, `agy -p` and the documented stream-json input
   `transcript.jsonl` sits next to it. The docs name only `transcript.jsonl`.
   Both start with a `USER_INPUT` step whose `content` holds the prompt in
   `<USER_REQUEST>` tags, in print mode as well.
-- Print mode writes no `~/.gemini/antigravity-cli/history.jsonl` line (the
-  #1160 replay therefore has nothing to replay for `agy -p`); the transcript
-  does have the prompt.
+- Print mode writes no `~/.gemini/antigravity-cli/history.jsonl` line; the
+  transcript does have the prompt and managed export now uses it as the
+  print-mode fallback (#1605).
 - Conversation state is kept per conversation in
   `~/.gemini/antigravity-cli/conversations/<id>.db`, with `brain/<id>/`,
   `annotations/<id>.pbtxt` and `presence/<id>.lock` alongside.

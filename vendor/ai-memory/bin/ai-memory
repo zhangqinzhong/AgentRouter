@@ -498,6 +498,15 @@ native_host_binary() {
   case "$(uname -s 2>/dev/null || true)" in
     Linux) os="linux" ;;
     Darwin) os="macos" ;;
+    MINGW* | MSYS* | CYGWIN*)
+      # Git Bash on native Windows: no Linux/macOS release client exists, and
+      # the helper container cannot run host harnesses anyway. Point at the
+      # two supported paths instead of a bare refusal (#1545).
+      echo "ai-memory: the POSIX container wrapper cannot run host commands on native Windows" >&2
+      echo "use the PowerShell wrapper (bin/ai-memory.ps1) or install the native Windows client:" >&2
+      echo "  irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex" >&2
+      return 1
+      ;;
     *)
       echo "ai-memory: the container wrapper cannot provide native host commands on this OS" >&2
       echo "install the native release binary to use managed launches or native lifecycle hooks" >&2
@@ -642,18 +651,57 @@ refresh_volume_token() {
 
 # ---- intercept wrapper-only subcommands ----------------------------------
 
-case "${1:-}" in
+# Resolve the command once for host interception and container URL routing.
+# Keep the original argv intact: the native client parses the same global options.
+WRAPPER_SUBCOMMAND=""
+EXPLICIT_HOST_CONFIG=0
+WRAPPER_ARGS=("$@")
+idx=0
+while [ "${idx}" -lt "${#WRAPPER_ARGS[@]}" ]; do
+  arg="${WRAPPER_ARGS[$idx]}"
+  case "${arg}" in
+    --config= | --data-dir=)
+      break
+      ;;
+    --config)
+      [ "$((idx + 1))" -lt "${#WRAPPER_ARGS[@]}" ] || break
+      case "${WRAPPER_ARGS[$((idx + 1))]}" in "" | -?*) break ;; esac
+      EXPLICIT_HOST_CONFIG=1
+      idx=$((idx + 2))
+      ;;
+    --config=*)
+      EXPLICIT_HOST_CONFIG=1
+      idx=$((idx + 1))
+      ;;
+    --data-dir)
+      [ "$((idx + 1))" -lt "${#WRAPPER_ARGS[@]}" ] || break
+      case "${WRAPPER_ARGS[$((idx + 1))]}" in "" | -?*) break ;; esac
+      idx=$((idx + 2))
+      ;;
+    --data-dir=*)
+      idx=$((idx + 1))
+      ;;
+    --*)
+      # Help, version and invalid options belong to the CLI parser. In
+      # particular, none may accidentally trigger the wrapper's upgrade.
+      break
+      ;;
+    *)
+      WRAPPER_SUBCOMMAND="${arg}"
+      break
+      ;;
+  esac
+done
+
+case "${WRAPPER_SUBCOMMAND}" in
   upgrade)
-    shift
     cmd_upgrade
     exit 0
     ;;
   run | show | continue | resume | workstreams | rename-workstream)
-    NATIVE_HOST_COMMAND=$1
-    shift
     NATIVE_HOST_BIN=$(native_host_binary)
     use_volume_token
-    exec "${NATIVE_HOST_BIN}" "${NATIVE_HOST_COMMAND}" "$@"
+    exec "${NATIVE_HOST_BIN}" "$@"
     ;;
   install-hooks)
     # Capture exclusions and allowlist mode are client-side privacy controls.
@@ -787,36 +835,6 @@ USER_ARGS=(-u "$(id -u):$(id -g)")
 # a host-reachable URL for config vs. a container-reachable URL for HTTP.
 # (issue #107)
 RENDERS_HOST_CONFIG=0
-WRAPPER_SUBCOMMAND=""
-EXPLICIT_HOST_CONFIG=0
-WRAPPER_ARGS=("$@")
-idx=0
-while [ "${idx}" -lt "${#WRAPPER_ARGS[@]}" ]; do
-  arg="${WRAPPER_ARGS[$idx]}"
-  case "${arg}" in
-    --config)
-      EXPLICIT_HOST_CONFIG=1
-      idx=$((idx + 2))
-      ;;
-    --config=*)
-      EXPLICIT_HOST_CONFIG=1
-      idx=$((idx + 1))
-      ;;
-    --data-dir)
-      idx=$((idx + 2))
-      ;;
-    --data-dir=*)
-      idx=$((idx + 1))
-      ;;
-    --*)
-      idx=$((idx + 1))
-      ;;
-    *)
-      WRAPPER_SUBCOMMAND="${arg}"
-      break
-      ;;
-  esac
-done
 WRITES_HOST_FILES=0
 case "${WRAPPER_SUBCOMMAND}" in
     install-mcp | install-hooks | setup-agent)

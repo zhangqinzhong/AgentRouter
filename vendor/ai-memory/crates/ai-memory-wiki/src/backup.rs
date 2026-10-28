@@ -10,7 +10,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -202,7 +202,21 @@ fn create_pre_migration_backup_inner(
                 }
             }
         }
-        tar.into_inner()?.finish()?;
+        // The verify pass below re-reads the page cache, so it cannot tell an
+        // archive on stable storage from one that is not. This archive is the
+        // gate for a destructive in-place migration, so it has to survive a
+        // crash: fsync the file, then its directory entry. The admin backup
+        // endpoints sync after `finish` for the same reason.
+        finish_archive(tar)?.sync_all()?;
+        File::open(&dest_dir)
+            .and_then(|dir| dir.sync_all())
+            .unwrap_or_else(|e| {
+                tracing::debug!(
+                    dest = %dest_dir.display(),
+                    error = %e,
+                    "could not fsync the backup destination directory"
+                );
+            });
     }
 
     // Verify: re-open and count entries; a torn or unreadable archive
@@ -257,10 +271,56 @@ fn create_pre_migration_backup_inner(
     Ok(receipt)
 }
 
+/// End the gzip stream and flush the buffer, returning the underlying writer.
+///
+/// `GzEncoder::finish` hands back the `BufWriter`; dropping it would write the
+/// buffered tail from `Drop`, which discards the error, and a backup on a full
+/// disk would then reach the verify pass as if it had been written.
+fn finish_archive<W: Write>(
+    tar: tar::Builder<flate2::write::GzEncoder<BufWriter<W>>>,
+) -> std::io::Result<W> {
+    tar.into_inner()?
+        .finish()?
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A destination that takes no bytes, like a full disk.
+    struct FullDisk;
+
+    impl Write for FullDisk {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::StorageFull.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The whole small archive sits in the `BufWriter` until `finish`, so the
+    /// write that fails is the one flushing that tail; it must reach the
+    /// caller instead of being dropped with the buffer.
+    #[test]
+    fn a_failed_final_flush_fails_the_archive() {
+        let enc =
+            flate2::write::GzEncoder::new(BufWriter::new(FullDisk), flate2::Compression::default());
+        let mut tar = tar::Builder::new(enc);
+        let body = b"page body";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, "wiki/page.md", &body[..])
+            .unwrap();
+
+        let error = finish_archive(tar).err().expect("a full disk must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+    }
 
     fn data_dir_with_content() -> TempDir {
         let tmp = TempDir::new().unwrap();

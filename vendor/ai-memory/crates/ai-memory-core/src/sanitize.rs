@@ -27,9 +27,27 @@
 //! `[sanitize].allowlist` — the allowlist is checked *per match*, so a
 //! pattern still runs but an allowlisted span survives unchanged.
 //!
+//! Private keys come first: complete PEM and PGP armor blocks, and a block
+//! cut off before its end line (`head` of a key file, a truncated tool
+//! result) as long as at least one key-body line follows the header. A
+//! sentence that only names a header has no body line and survives. The
+//! allowlist never exempts a private key.
+//!
+//! Invisible formatting characters (Unicode `Default_Ignorable_Code_Point`:
+//! zero-width spaces and joiners, soft hyphens, variation selectors, …) do
+//! not hide a credential from the patterns. When the text carries any, each
+//! pattern also runs over a copy with them removed and the match is mapped
+//! back to the original span, invisible characters included. Text that
+//! matches nothing is stored byte for byte, so emoji sequences and scripts
+//! that need joiners (Persian, the Indic scripts) are never altered.
+//!
 //! Terminal escape sequences, NUL and bidi overrides are stripped rather
 //! than redacted: they are not secrets, but stored text is replayed to a
-//! terminal by the CLI, and a NUL makes the markdown file binary.
+//! terminal by the CLI, and a NUL makes the markdown file binary. Tag
+//! characters outside an emoji flag sequence, a byte-order mark after the
+//! start of the text, and the invisible math operators are stripped too:
+//! captured prose has no use for them, and they can carry text a reader
+//! never sees.
 //!
 //! ## What we deliberately do not catch
 //!
@@ -37,6 +55,9 @@
 //! be safely redacted without knowing their structure — too many false
 //! positives. Operators who care about that level of paranoia should
 //! add a custom pattern via `extra_patterns`.
+//!
+//! Look-alike characters (full-width `ｓｋ－…`, other confusables) are not
+//! folded: matching does not apply NFKC normalization.
 
 use std::sync::Arc;
 
@@ -64,10 +85,107 @@ const fn is_stripped_control(c: char) -> bool {
         | '\u{7f}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
+/// Characters whose only realistic use in captured text is hiding it: the
+/// tag block (also used by emoji flag sequences, which [`emoji_tag_run_len`]
+/// keeps), the invisible math operators, and a byte-order mark anywhere but
+/// the start of the text (`U+2060` replaced it as a zero-width no-break
+/// space).
+const fn is_hidden_text_char(offset: usize, c: char) -> bool {
+    matches!(c, '\u{2061}'..='\u{2064}' | '\u{e0000}'..='\u{e007f}')
+        || (c == '\u{feff}' && offset > 0)
+}
+
+/// Unicode `Default_Ignorable_Code_Point` (UAX #44, `DerivedCoreProperties`):
+/// characters that render as nothing. Matching ignores them; storage keeps
+/// them unless [`is_stripped_control`] or [`is_hidden_text_char`] says
+/// otherwise.
+const fn is_default_ignorable(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
+        | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}'
+        | '\u{ffa0}' | '\u{fff0}'..='\u{fff8}' | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
+}
+
+/// Byte length of the tag characters that close an emoji flag sequence
+/// (`U+1F3F4`, tag letters, `U+E007F` cancel tag) at the start of `rest`, or
+/// 0 when `rest` does not start with a well-formed run.
+fn emoji_tag_run_len(rest: &str) -> usize {
+    let mut len = 0;
+    for c in rest.chars() {
+        match c {
+            '\u{e0020}'..='\u{e007e}' => len += c.len_utf8(),
+            '\u{e007f}' if len > 0 => return len + c.len_utf8(),
+            _ => return 0,
+        }
+    }
+    0
+}
+
+/// `text` with every [`is_default_ignorable`] character removed, plus the
+/// original byte offset of each byte kept, so a match found in the shadow
+/// maps back to the span it covers in `text`.
+struct Shadow {
+    text: String,
+    origin: Vec<usize>,
+}
+
+impl Shadow {
+    fn new(text: &str) -> Self {
+        let mut shadow = String::with_capacity(text.len());
+        let mut origin = Vec::with_capacity(text.len());
+        for (index, c) in text.char_indices() {
+            if is_default_ignorable(c) {
+                continue;
+            }
+            shadow.push(c);
+            origin.extend(index..index + c.len_utf8());
+        }
+        Self {
+            text: shadow,
+            origin,
+        }
+    }
+
+    /// The span of `text` a shadow match `start..end` covers: from its first
+    /// visible character through its last, invisible characters between them
+    /// included.
+    fn original_span(&self, text_len: usize, start: usize, end: usize) -> (usize, usize) {
+        let from = self.origin.get(start).copied().unwrap_or(text_len);
+        let to = match end.checked_sub(1).and_then(|last| self.origin.get(last)) {
+            Some(last) if end > start => last + 1,
+            _ => from,
+        };
+        (from, to)
+    }
+}
+
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
 /// better to redact a stray hash than to leak a credential.
 const BUILTIN_PATTERNS: &[(&str, &str)] = &[
+    // Private keys run first, while their base64 body lines are still intact
+    // for the token rules below to leave alone.
+    //
+    // A complete PEM or PGP armor block (`… PRIVATE KEY BLOCK-----` is the PGP
+    // form) — multi-line, lazy match.
+    (
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----",
+        "private_key",
+    ),
+    // A block with no end line: the head of a key file, or a tool result cut
+    // short before the hook saw it. It needs at least one key-body line (16+
+    // base64 characters filling the rest of the line) after the header,
+    // optionally behind armor headers (`Proc-Type:`, `Version:`, …) and blank
+    // lines, so prose that only names the header keeps it. Lines break on a
+    // real newline or a JSON-escaped one. The line end after the last body
+    // line sits outside the `secret` group: it has to be there, but it is not
+    // redacted.
+    (
+        r#"(?P<secret>-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?:(?:\r?\n|(?:\\r)?\\n)[ \t]*(?:(?:Proc-Type|DEK-Info|Version|Comment|Hash):[^\r\n\\]*)?)*?(?:(?:\r?\n|(?:\\r)?\\n)[ \t]*[A-Za-z0-9+/=]{16,}[ \t]*)+)(?:\r?(?m:$)|["'\\…]|\.\.\.)"#,
+        "private_key",
+    ),
     // Bearer-style tokens.
     (r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#, "bearer_token"),
     // Vendor-prefixed API keys.
@@ -148,11 +266,6 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // credential from a short encoded fragment; config that long is pasted as
     // JSON, not base64.
     (r"eyJ[A-Za-z0-9_\-+/]{40,}={0,2}", "base64_json_token"),
-    // PEM private key blocks — multi-line, lazy match.
-    (
-        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-        "private_key",
-    ),
     // URL-embedded credentials: scheme://user:pass@host.
     (
         r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^:/\s]+:[^@\s]+@[^\s]+",
@@ -238,10 +351,22 @@ pub struct Sanitizer {
 }
 
 struct SanitizerInner {
-    patterns: Vec<(Regex, &'static str)>,
+    patterns: Vec<Pattern>,
     allowlist: Vec<String>,
     escapes: Regex,
 }
+
+struct Pattern {
+    re: Regex,
+    label: &'static str,
+    /// A built-in rule whose match must include context that is not itself
+    /// secret (a line end) redacts only its `secret` capture group.
+    secret_group: bool,
+}
+
+/// The one label the allowlist never exempts: no project codename belongs
+/// inside a private key, and a short entry would otherwise match key bodies.
+const PRIVATE_KEY_LABEL: &str = "private_key";
 
 impl std::fmt::Debug for Sanitizer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -277,15 +402,32 @@ impl Sanitizer {
     pub fn new(cfg: &SanitizeConfig) -> Result<Self, regex::Error> {
         let mut patterns = Vec::with_capacity(BUILTIN_PATTERNS.len() + cfg.extra_patterns.len());
         for (p, label) in BUILTIN_PATTERNS {
-            patterns.push((Regex::new(p)?, *label));
+            let re = Regex::new(p)?;
+            let secret_group = re.capture_names().any(|name| name == Some("secret"));
+            patterns.push(Pattern {
+                re,
+                label,
+                secret_group,
+            });
         }
         for p in &cfg.extra_patterns {
-            patterns.push((Regex::new(p)?, "custom"));
+            patterns.push(Pattern {
+                re: Regex::new(p)?,
+                label: "custom",
+                secret_group: false,
+            });
         }
         Ok(Self {
             inner: Arc::new(SanitizerInner {
                 patterns,
-                allowlist: cfg.allowlist.clone(),
+                // A blank entry is a substring of every match and would turn
+                // redaction off entirely. `Config::load` warns about it.
+                allowlist: cfg
+                    .allowlist
+                    .iter()
+                    .filter(|entry| !entry.trim().is_empty())
+                    .cloned()
+                    .collect(),
                 escapes: Regex::new(ESCAPE_SEQUENCES)?,
             }),
         })
@@ -306,39 +448,118 @@ impl Sanitizer {
         // Before the redaction passes: an escape inside a secret would
         // otherwise split it out of reach of every pattern below.
         let mut out = self.strip_control(input);
-        for (re, label) in &self.inner.patterns {
-            out = re
-                .replace_all(&out, |caps: &regex::Captures<'_>| {
-                    let m = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
-                    if self.inner.allowlist.iter().any(|a| m.contains(a)) {
-                        m.to_string()
-                    } else {
-                        debug!(pattern = re.as_str(), "sanitize: redacted match");
-                        format!("[REDACTED:{label}]")
-                    }
-                })
-                .into_owned();
+        for pattern in &self.inner.patterns {
+            // When invisible characters are present, the pass that looks
+            // through them goes first, so a split secret is redacted whole
+            // rather than losing only the part before the split. The plain
+            // pass then still finds a match that needs an invisible character
+            // as its word boundary.
+            if out.contains(is_default_ignorable) {
+                let shadow = Shadow::new(&out);
+                out = self.redact(&out, Some(&shadow), pattern);
+            }
+            out = self.redact(&out, None, pattern);
         }
         out
     }
 
-    /// Drop terminal escape sequences and the control characters that have
-    /// no place in a page.
+    /// One pattern over `text`, or over `shadow` with each match mapped back
+    /// to the span of `text` it covers.
+    fn redact(&self, text: &str, shadow: Option<&Shadow>, pattern: &Pattern) -> String {
+        let view = shadow.map_or(text, |shadow| shadow.text.as_str());
+        let spans: Vec<regex::Match<'_>> = if pattern.secret_group {
+            pattern
+                .re
+                .captures_iter(view)
+                .filter_map(|caps| caps.name("secret").or_else(|| caps.get(0)))
+                .collect()
+        } else {
+            pattern.re.find_iter(view).collect()
+        };
+        let mut out = String::new();
+        let mut copied = 0;
+        let mut redacted = false;
+        for m in spans {
+            if self.allowlisted(pattern.label, m.as_str()) {
+                continue;
+            }
+            let (start, end) = match shadow {
+                Some(shadow) => shadow.original_span(text.len(), m.start(), m.end()),
+                None => (m.start(), m.end()),
+            };
+            if start < copied {
+                continue;
+            }
+            debug!(pattern = pattern.re.as_str(), "sanitize: redacted match");
+            out.push_str(&text[copied..start]);
+            out.push_str("[REDACTED:");
+            out.push_str(pattern.label);
+            out.push(']');
+            copied = end;
+            redacted = true;
+        }
+        if !redacted {
+            return text.to_string();
+        }
+        out.push_str(&text[copied..]);
+        out
+    }
+
+    /// Whether an allowlist entry exempts `matched`. Compared with invisible
+    /// characters removed, so they neither break nor fake an entry.
+    fn allowlisted(&self, label: &str, matched: &str) -> bool {
+        if label == PRIVATE_KEY_LABEL || self.inner.allowlist.is_empty() {
+            return false;
+        }
+        let visible: String;
+        let matched = if matched.contains(is_default_ignorable) {
+            visible = matched
+                .chars()
+                .filter(|c| !is_default_ignorable(*c))
+                .collect();
+            visible.as_str()
+        } else {
+            matched
+        };
+        self.inner
+            .allowlist
+            .iter()
+            .any(|entry| matched.contains(entry.as_str()))
+    }
+
+    /// Drop terminal escape sequences, the control characters that have no
+    /// place in a page, and characters that hide text.
     ///
     /// Captured text is replayed to a terminal by `ai-memory read-page` and
     /// `search`, where an escape rewrites the screen or the window title, and
     /// a bidi override reverses what the reader sees. A NUL additionally
     /// makes the markdown file binary, which costs it `grep` and git diffs.
+    /// Tag characters spell out text no reader sees; the ones that finish an
+    /// emoji flag (England, Scotland, Wales) stay.
     fn strip_control(&self, input: &str) -> String {
         let stripped = self.inner.escapes.replace_all(input, "");
-        if stripped.contains(is_stripped_control) {
-            stripped
-                .chars()
-                .filter(|c| !is_stripped_control(*c))
-                .collect()
-        } else {
-            stripped.into_owned()
+        if !stripped
+            .char_indices()
+            .any(|(offset, c)| is_stripped_control(c) || is_hidden_text_char(offset, c))
+        {
+            return stripped.into_owned();
         }
+        let mut out = String::with_capacity(stripped.len());
+        let mut offset = 0;
+        while let Some(c) = stripped[offset..].chars().next() {
+            let next = offset + c.len_utf8();
+            if c == '\u{1f3f4}' {
+                let tags = emoji_tag_run_len(&stripped[next..]);
+                out.push_str(&stripped[offset..next + tags]);
+                offset = next + tags;
+                continue;
+            }
+            if !is_stripped_control(c) && !is_hidden_text_char(offset, c) {
+                out.push(c);
+            }
+            offset = next;
+        }
+        out
     }
 }
 
@@ -1193,6 +1414,189 @@ mod tests {
             out.contains("PROJECT_TOKEN_PUBLIC"),
             "allowlist span should survive; got: {out}"
         );
+    }
+
+    /// One line of a fake key body. Short on purpose: a complete fake block
+    /// stays under the length the secret scanner's private-key rule needs.
+    const FAKE_KEY_LINE: &str = "b3BlbnNzaC1rZXktdjEAAAAA";
+
+    /// The vectors the client companion's scrub runs too
+    /// (`companions/ai-memory-client`), so the two copies cannot drift.
+    #[test]
+    fn shared_sanitizer_vectors_hold() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/sanitizer_vectors.json"
+        ))
+        .unwrap();
+        let strings = |key: &str| -> Vec<String> {
+            vectors[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect()
+        };
+        for secret in strings("credentials") {
+            let (head, tail) = secret.split_at(secret.len() / 2);
+            for invisible in strings("invisibles") {
+                let out = s().scrub(&format!("key {head}{invisible}{tail} end"));
+                assert!(
+                    out.contains("[REDACTED:") && !out.contains(head) && !out.contains(tail),
+                    "{invisible:?} inside {secret}: {out:?}"
+                );
+                assert!(out.starts_with("key ") && out.ends_with(" end"), "{out:?}");
+            }
+        }
+        let body_line = vectors["key_body_line"].as_str().unwrap();
+        for block in vectors["key_blocks"].as_array().unwrap() {
+            let input = block["input"].as_str().unwrap();
+            let out = s().scrub(input);
+            assert!(
+                out.contains("[REDACTED:private_key]") && !out.contains(body_line),
+                "{input:?} -> {out:?}"
+            );
+            for kept in block["kept"].as_array().unwrap() {
+                assert!(out.contains(kept.as_str().unwrap()), "{input:?} -> {out:?}");
+            }
+        }
+        for text in strings("unchanged") {
+            assert_eq!(s().scrub(&text), text);
+        }
+    }
+
+    #[test]
+    fn invisible_character_inside_an_operator_pattern_match_is_redacted() {
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"CANARY-[0-9]{6}".to_string()],
+            allowlist: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            sn.scrub("found CANARY-12\u{200b}3456 here"),
+            "found [REDACTED:custom] here"
+        );
+    }
+
+    /// An invisible character neither breaks an allowlist entry (the span is
+    /// still exempt) nor lets a secret that is not allowlisted through.
+    #[test]
+    fn invisible_characters_neither_break_nor_bypass_the_allowlist() {
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec!["KEEP_ME".to_string()],
+        })
+        .unwrap();
+        for kept in [
+            "SERVICE_TOKEN=KEEP_ME_visible_value",
+            "SERVICE_TOKEN=KEEP\u{200b}_ME_visible_value",
+        ] {
+            assert_eq!(sn.scrub(kept), kept, "allowlisted span must survive");
+        }
+        let out = sn.scrub("SERVICE_TOKEN=s3cretva\u{200b}lue0123");
+        assert!(
+            out.contains("[REDACTED:env_secret]") && !out.contains("lue0123"),
+            "a secret without the allowlist entry must still be redacted: {out:?}"
+        );
+    }
+
+    #[test]
+    fn characters_that_hide_text_are_stripped() {
+        let hidden: String = "hidden note"
+            .chars()
+            .map(|c| char::from_u32(0xe0000 + u32::from(c)).unwrap())
+            .collect();
+        let out = s().scrub(&format!("visible{hidden} text"));
+        assert_eq!(out, "visible text");
+
+        assert_eq!(s().scrub("a\u{2062}b\u{feff}c"), "abc");
+        // A flag start with no cancel tag is not a flag: its tags go.
+        assert_eq!(s().scrub("\u{1f3f4}\u{e0067}\u{e0062} x"), "\u{1f3f4} x");
+    }
+
+    #[test]
+    fn pgp_private_key_block_is_redacted() {
+        let block = format!(
+            "before\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: 1\n\n\
+             {FAKE_KEY_LINE}\n-----END PGP PRIVATE KEY BLOCK-----\nafter"
+        );
+        assert_eq!(s().scrub(&block), "before\n[REDACTED:private_key]\nafter");
+    }
+
+    #[test]
+    fn private_key_block_without_an_end_line_is_redacted() {
+        let line = FAKE_KEY_LINE;
+        for (input, expected) in [
+            (
+                format!("$ head -3 key.pem\n-----BEGIN PRIVATE KEY-----\n{line}\n{line}\n$ ls"),
+                "$ head -3 key.pem\n[REDACTED:private_key]\n$ ls".to_string(),
+            ),
+            (
+                format!("-----BEGIN RSA PRIVATE KEY-----\r\n{line}\r\n{line}\r\n"),
+                "[REDACTED:private_key]\r\n".to_string(),
+            ),
+            (
+                format!(r#"{{"stdout":"-----BEGIN OPENSSH PRIVATE KEY-----\n{line}\n{line}"}}"#),
+                r#"{"stdout":"[REDACTED:private_key]"}"#.to_string(),
+            ),
+            (
+                format!(
+                    "  -----BEGIN EC PRIVATE KEY-----\n  {line}\n  {}",
+                    &line[..20]
+                ),
+                "  [REDACTED:private_key]".to_string(),
+            ),
+            (
+                format!(
+                    "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\
+                     DEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{line}\n"
+                ),
+                "[REDACTED:private_key]\n".to_string(),
+            ),
+        ] {
+            assert_eq!(s().scrub(&input), expected, "input: {input:?}");
+        }
+    }
+
+    /// A key body line can contain `eyJ…`, which a token rule would redact
+    /// in part, leaving the rest of the key unrecognizable to the key rules.
+    #[test]
+    fn key_rules_run_before_token_rules_can_split_a_key_body() {
+        let first = format!("MIIEeyJ{}", "A".repeat(50));
+        let input = format!("-----BEGIN PRIVATE KEY-----\n{first}\n{FAKE_KEY_LINE}\n");
+        assert_eq!(s().scrub(&input), "[REDACTED:private_key]\n");
+    }
+
+    #[test]
+    fn allowlist_never_exempts_a_private_key() {
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec!["b3Bl".to_string()],
+        })
+        .unwrap();
+        let complete =
+            format!("-----BEGIN PRIVATE KEY-----\n{FAKE_KEY_LINE}\n-----END PRIVATE KEY-----");
+        assert_eq!(sn.scrub(&complete), "[REDACTED:private_key]");
+        let unterminated = format!("-----BEGIN PRIVATE KEY-----\n{FAKE_KEY_LINE}\n");
+        assert_eq!(sn.scrub(&unterminated), "[REDACTED:private_key]\n");
+    }
+
+    #[test]
+    fn blank_allowlist_entries_are_ignored() {
+        let input = "token=ghp_FAKEfakeFAKEfakeFAKEfake012345678";
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec![String::new(), "   ".to_string()],
+        })
+        .unwrap();
+        assert_eq!(sn.scrub(input), "token=[REDACTED:github_token]");
+
+        // Control: a real entry still exempts its span.
+        let sn = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec!["ghp_FAKE".to_string()],
+        })
+        .unwrap();
+        assert_eq!(sn.scrub(input), input);
     }
 
     /// JSON is the shape most captured tool payloads arrive in, and the

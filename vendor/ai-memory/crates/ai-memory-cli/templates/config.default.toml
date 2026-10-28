@@ -31,14 +31,6 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 # Default tracing filter (overridable by RUST_LOG).
 log_level = "info"
 
-# Optional env-only presets for managed harness launches. Select one with
-# `ai-memory run --profile work claude`. `--env-file` overrides the profile,
-# and repeated `--env` entries override both. Keep executable paths, native
-# argv, and permission-bypass choices on the command line.
-# [run.profiles.work.env]
-# CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
-# ANTHROPIC_BASE_URL = "https://api.anthropic.com"
-
 # Optional server-side hook ingest limiter for shared/remote installs. The rate
 # is tokens per second per actor/session source; 0 or unset disables it. Burst
 # defaults to the rate (minimum one token when enabled). Env equivalents:
@@ -55,15 +47,6 @@ log_level = "info"
 # be installed with `ai-memory install-hooks --agent claude-code
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
-
-# Server-side drop list for tool events (#1241): the server acknowledges and
-# discards a matching PreToolUse/PostToolUse event before it is sanitized or
-# stored, whatever the client sends. Applies to every project on this server.
-# At most 64 entries per list, 128 characters each. Example: Claude Code marks
-# plugin tool calls with their own tool-use id prefix.
-# [ingest]
-# drop_tool_use_id_prefixes = ["toolu_plugin_"]
-# drop_tool_names = ["mcp__noisy__poll"]
 
 # Strip root-level anyOf/oneOf/allOf from MCP tool input schemas on every
 # tools/list, even without a `?flavor=moonshot` / `?flavor=bedrock` marker.
@@ -150,6 +133,17 @@ log_level = "info"
 #   embedding_model    = "..."            # provider-specific override
 #   embedding_dim      = 384              # must match the model
 
+# --- Session lifecycle (server-side) --------------------------------------
+# [sessions] idle_end_after_hours = N (default 0 = off): the maintenance
+# tick ends open sessions whose last activity is older than N hours
+# (crashed harness, closed terminal, timed-out hook) with the summary page
+# and consolidation job a real SessionEnd would have given — never a
+# handoff. Bounded batch of 25 every 15 minutes; a late real SessionEnd
+# always wins (page write conditional on the selected version, end stamp a
+# CAS on ended_at IS NULL). Validated at load: 0 or 1..=8760.
+#   [sessions]
+#   idle_end_after_hours = 24
+
 [decay]
 lambda = 0.02
 sigma = 0.6
@@ -161,6 +155,57 @@ breadth_weight = 0.0
 observation_retention_days = 0     # 0 = never prune raw observations
 observation_prune_batch = 5000     # rows per prune transaction
 ledger_retention_months = 0        # 0 = never delete hook event ledgers
+
+# NOTE: commented example tables stay below the first real table, where the
+# top-level keys have ended. A `[table]` header owns every key after it, so an
+# example table uncommented above a top-level key would silently capture it.
+
+# Optional env-only presets for managed harness launches. Select one with
+# `ai-memory run --profile work claude`. `--env-file` overrides the profile,
+# and repeated `--env` entries override both. Keep executable paths, native
+# argv, and permission-bypass choices on the command line.
+# [run.profiles.work.env]
+# CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+# ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+
+# Server-side drop list for tool events (#1241): the server acknowledges and
+# discards a matching PreToolUse/PostToolUse event before it is sanitized or
+# stored, whatever the client sends. Applies to every project on this server.
+# At most 64 entries per list, 128 characters each. Example: Claude Code marks
+# plugin tool calls with their own tool-use id prefix. Subagent classification
+# runs first, so a matching marked event still seeds tracking that suppresses
+# the subagent session's unmarked tail.
+# [ingest]
+# drop_tool_use_id_prefixes = ["toolu_plugin_"]
+# drop_tool_names = ["mcp__noisy__poll"]
+#
+# Drop whole hook event kinds instead of individual tool calls. In production
+# ~87% of pre-tool-use observations have an empty body and pre-tool-use pairs
+# 1:1 with post-tool-use, which carries the content. Dropping a kind also
+# turns off everything that kind's processing does:
+#   user-prompt       loses prompts: session summaries, baton open questions
+#                     and profile learning; with pre-tool-use, it also stops
+#                     the project fallback pointer advancing (session-start
+#                     still advances it)
+#   pre-tool-use      loses the pre-call evidence; a call that never produced
+#                     a post-tool-use then leaves no trace, so the session may
+#                     end lifecycle-only
+#   post-tool-use     loses results, the completed-call count and file-work
+#                     evidence
+#   stop              loses the opt-in assistant reply and the
+#                     normal-completion signal; OpenCode loses its turn
+#                     checkpoint/baton
+#   pre-compact /     lose the compaction checkpoint and its rewrite job
+#   post-compaction   (the session is not ended)
+#   notification      loses the observation (search/consolidation context)
+#   subagent-start /  lose the subagent metadata (when stored, they become
+#   subagent-stop     `other` observations)
+# session-start and session-end are rejected at startup (they open/close the
+# session state machine); any other known kind may be named. The portable
+# workstream ledger (`ai-memory run`) is not filtered by this key. Empty by
+# default (nothing dropped).
+# Env equivalent: AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
+# drop_events = ["pre-tool-use"]
 
 # Privacy strip.
 #

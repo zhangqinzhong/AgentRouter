@@ -46,7 +46,9 @@ local-embeddings = [
 ]
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` brings `start_paused`, which makes the bounded query wait in
+# the capacity tests advance deterministically instead of sleeping.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 rstest.workspace = true
 # In-process HTTP mock for the openai-compat strict-fallback tests.

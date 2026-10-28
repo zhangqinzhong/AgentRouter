@@ -71,6 +71,10 @@ Methods: `query`
 | `as_of` | `asOf` |
 | `answer` | `answer` |
 | `reasoning` | `reasoning` |
+| `kind` | `kind` |
+| `tier` | `tier` |
+| `path_prefix` | `pathPrefix` |
+| `tag` | `tag` |
 
 ## `memory_status`
 

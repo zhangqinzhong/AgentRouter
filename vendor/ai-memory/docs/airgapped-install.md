@@ -28,8 +28,10 @@ into the air-gapped environment.
 Covered in full in [`DATA_HANDLING.md`](../DATA_HANDLING.md), summarized
 here: ai-memory has no telemetry, analytics, or phone-home behavior. The
 server, CLI, and lifecycle hooks run entirely against the local data
-directory. The only things that make a network call are things you
-explicitly configure:
+directory. The things that make a network call are the ones you explicitly
+configure, plus one default: the local embedding model download described
+below, which fires on the first start when `embedding_provider` is unset,
+unless the files are pre-seeded.
 
 - **A cloud LLM/embedding provider**, if you want AI-assisted consolidation,
   search, or provider-based embeddings. Skip this and use the `local`

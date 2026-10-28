@@ -18,9 +18,10 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ai_memory_core::{PagePath, Tier};
-use ai_memory_llm::{Embedder, LocalEmbedder};
+use ai_memory_llm::{Embedder, EmbeddingCapacity, LocalEmbedder};
 use ai_memory_store::Store;
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use tempfile::TempDir;
@@ -266,6 +267,135 @@ async fn embedding_is_deterministic() {
         .await
         .unwrap();
     assert_eq!(a, b, "same input must produce identical vectors");
+}
+
+fn percentile(mut samples: Vec<Duration>, percentile: usize) -> Duration {
+    samples.sort_unstable();
+    let index = (samples.len() * percentile).div_ceil(100).saturating_sub(1);
+    samples[index]
+}
+
+async fn measure_queries(embedder: &Arc<dyn Embedder>, count: usize) -> Vec<Duration> {
+    let mut samples = Vec::with_capacity(count);
+    for sequence in 0..count {
+        let started = Instant::now();
+        embedder
+            .embed_query(&format!(
+                "where is the deployment runbook for production? sample {sequence}"
+            ))
+            .await
+            .unwrap();
+        samples.push(started.elapsed());
+    }
+    samples
+}
+
+async fn measure_queries_under_document_load(
+    embedder: &Arc<dyn Embedder>,
+    workers: usize,
+    document: &str,
+    query_samples: usize,
+    documents_per_worker: usize,
+) -> Vec<Duration> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(workers + 1));
+    let mut background = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let embedder = Arc::clone(embedder);
+        let barrier = Arc::clone(&barrier);
+        let document = document.to_owned();
+        background.push(tokio::spawn(async move {
+            barrier.wait().await;
+            for sequence in 0..documents_per_worker {
+                embedder
+                    .embed_document(&format!("{document} worker {worker} item {sequence}"))
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+
+    barrier.wait().await;
+    let loaded = measure_queries(embedder, query_samples).await;
+    for task in background {
+        task.await.unwrap();
+    }
+    loaded
+}
+
+/// Manual capacity probe for the shared local embedder. It is deliberately a
+/// benchmark, not a CI assertion: CPU topology and scheduler load determine
+/// the ratio. Run it before adding an admission-control policy so the policy
+/// responds to measured contention rather than an assumed bottleneck.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual local-model contention benchmark"]
+async fn local_query_latency_under_document_load() {
+    const QUERY_SAMPLES: usize = 9;
+    const DOCUMENTS_PER_WORKER: usize = 12;
+
+    let embedder: Arc<dyn Embedder> =
+        Arc::new(LocalEmbedder::load(Path::new(&models_root())).unwrap());
+    embedder.embed_query("warm the local model").await.unwrap();
+
+    let idle = measure_queries(&embedder, QUERY_SAMPLES).await;
+    let workers = std::env::var("AI_MEMORY_EMBED_BENCH_WORKERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(2)
+                .clamp(2, 8)
+        });
+    assert!(workers > 0, "benchmark needs at least one worker");
+    let document = "A long-lived project memory page describes architecture decisions, \
+        deployment procedures, incident recovery, database migrations, authentication \
+        boundaries, contributor workflow, release validation, and operational runbooks. "
+        .repeat(32);
+    let loaded = measure_queries_under_document_load(
+        &embedder,
+        workers,
+        &document,
+        QUERY_SAMPLES,
+        DOCUMENTS_PER_WORKER,
+    )
+    .await;
+    let cores = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4);
+    let bounded: Arc<dyn Embedder> =
+        Arc::new(EmbeddingCapacity::new(embedder, ai_memory_llm::local_capacity(cores)).unwrap());
+    let bounded_loaded = measure_queries_under_document_load(
+        &bounded,
+        workers,
+        &document,
+        QUERY_SAMPLES,
+        DOCUMENTS_PER_WORKER,
+    )
+    .await;
+
+    let idle_p50 = percentile(idle.clone(), 50);
+    let idle_p95 = percentile(idle, 95);
+    let loaded_p50 = percentile(loaded.clone(), 50);
+    let loaded_p95 = percentile(loaded, 95);
+    let bounded_p50 = percentile(bounded_loaded.clone(), 50);
+    let bounded_p95 = percentile(bounded_loaded, 95);
+    eprintln!(
+        "local embedding contention: workers={workers} idle_p50_ms={} \
+         idle_p95_ms={} loaded_p50_ms={} loaded_p95_ms={} \
+         loaded_p50_ratio={:.2} loaded_p95_ratio={:.2} \
+         bounded_p50_ms={} bounded_p95_ms={} bounded_p50_ratio={:.2} \
+         bounded_p95_ratio={:.2}",
+        idle_p50.as_millis(),
+        idle_p95.as_millis(),
+        loaded_p50.as_millis(),
+        loaded_p95.as_millis(),
+        loaded_p50.as_secs_f64() / idle_p50.as_secs_f64(),
+        loaded_p95.as_secs_f64() / idle_p95.as_secs_f64(),
+        bounded_p50.as_millis(),
+        bounded_p95.as_millis(),
+        bounded_p50.as_secs_f64() / idle_p50.as_secs_f64(),
+        bounded_p95.as_secs_f64() / idle_p95.as_secs_f64(),
+    );
 }
 
 /// A handful of synonym/paraphrase orderings beyond the single case in

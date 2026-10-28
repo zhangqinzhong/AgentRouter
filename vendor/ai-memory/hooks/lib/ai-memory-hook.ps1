@@ -785,8 +785,9 @@ function Invoke-AiMemoryDrainSpool {
             $headers["Authorization"] = "Bearer $($entry.token)"
         }
         $code = 0
+        $NoProxy = Get-AiMemoryNoProxy
         try {
-            Invoke-WebRequest `
+            Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
@@ -897,6 +898,17 @@ function Clear-AiMemorySessionId {
     Remove-Item -Force -ErrorAction SilentlyContinue $Path
 }
 
+# PowerShell 7 hands Invoke-WebRequest the HTTP_PROXY, HTTPS_PROXY and
+# ALL_PROXY proxy even for a loopback URL, so a sandbox with an empty NO_PROXY
+# (ai-jail) routes the hook to a proxy that answers 4xx. -NoProxy (PowerShell
+# 6+) connects directly, as the native hook and the shell bundle do. Windows
+# PowerShell 5.1 reads no environment proxy and has no -NoProxy. Splat the
+# result into every Invoke-WebRequest.
+function Get-AiMemoryNoProxy {
+    if ($PSVersionTable.PSVersion.Major -ge 6) { return @{ NoProxy = $true } }
+    return @{}
+}
+
 function Read-AiMemoryStdin {
     try {
         if (-not [Console]::IsInputRedirected) { return "" }
@@ -916,12 +928,15 @@ function Read-AiMemoryStdin {
     return ""
 }
 
-function Test-AiMemoryAntigravityInitialInvocation {
-    param([string] $Payload)
+# Parity with `antigravity_boundary` in the native hook: only SessionStart
+# omits invocationNum, a PreInvocation is a start boundary at invocation zero,
+# and a missing or malformed counter on a PreInvocation fails closed.
+function Test-AiMemoryAntigravityStartBoundary {
+    param([string] $Payload, [switch] $PreInvocation)
     try {
         $Parsed = $Payload | ConvertFrom-Json
         $Property = $Parsed.PSObject.Properties["invocationNum"]
-        if ($null -eq $Property) { return $false }
+        if ($null -eq $Property) { return (-not $PreInvocation) }
         $Value = $Property.Value
         return (($Value -is [int] -or $Value -is [long]) -and [long]$Value -eq 0)
     } catch {
@@ -972,7 +987,17 @@ function Invoke-AiMemoryHook {
         # `{ "additionalContext": ... }` envelope rather than Claude Code's
         # nested hookSpecificOutput shape.
         [switch] $CopilotCliSessionStartOutput,
-        [switch] $AntigravityPreInvocationOutput,
+        # Antigravity SessionStart output: a fetched handoff becomes an
+        # `injectSteps` system message. With -AntigravityPreInvocation the
+        # payload is a PreInvocation, a start boundary only at invocation 0.
+        [switch] $AntigravityStartOutput,
+        # Claude Code prepends a SessionStart hook's stdout to the resuming
+        # session. Bare text does not start with "{", so it logs every start as
+        # "Hook output does not start with {, treating as plain text" and the
+        # handoff lands unstructured. The POSIX peers of these bundles already
+        # emit the envelope; this is their PowerShell half.
+        [switch] $SessionStartEnvelope,
+        [switch] $AntigravityPreInvocation,
         # Deliver the `[briefing]` compiled project brief on the FIRST
         # handoff fetch of a session only (kimi-code's user-prompt path:
         # kimi discards SessionStart hook stdout, so the brief rides the
@@ -987,13 +1012,13 @@ function Invoke-AiMemoryHook {
 
     $Server = if ($env:AI_MEMORY_HOOK_URL) { $env:AI_MEMORY_HOOK_URL } else { "http://127.0.0.1:49374" }
     $Payload = Read-AiMemoryStdin
-    if ($AntigravityPreInvocationOutput -and -not (Test-AiMemoryAntigravityInitialInvocation -Payload $Payload)) {
+    if ($AntigravityStartOutput -and -not (Test-AiMemoryAntigravityStartBoundary -Payload $Payload -PreInvocation:$AntigravityPreInvocation)) {
         [Console]::Out.Write("{}")
         return
     }
     # invocationNum restarts at 0 on every user turn: only a conversation's
-    # first turn may post session-start and claim a handoff.
-    if ($AntigravityPreInvocationOutput) {
+    # first start boundary may post session-start and claim a handoff.
+    if ($AntigravityStartOutput) {
         $Conversation = $null
         try { $Conversation = [string](($Payload | ConvertFrom-Json).conversationId) } catch { }
         if ($Conversation -and $Conversation.Trim()) {
@@ -1005,21 +1030,21 @@ function Invoke-AiMemoryHook {
             Set-AiMemoryBriefed -Path $StartMarker
         }
     }
-    # Assistant/Stop capture (#196) is native-only. Scoped to claude-code + stop
-    # so a PostToolUse whose tool output legitimately contains the literal string
-    # is unaffected. If a Stop payload still carries the raw field, drop the whole
-    # event rather than POST it verbatim (the script fallback cannot sanitize it).
-    if ($Agent -eq "claude-code" -and $Event -eq "stop" -and $Payload -and $Payload.Contains('"last_assistant_message"')) {
+    # Assistant/Stop capture (#196) is native-only. Scoped to agents whose Stop
+    # payload may carry the field, so unrelated tool output containing the literal
+    # string is unaffected. If a Stop payload still carries the raw field, drop the
+    # whole event rather than POST it verbatim (the fallback cannot sanitize it).
+    if (($Agent -eq "claude-code" -or $Agent -eq "dsh") -and $Event -eq "stop" -and $Payload -and $Payload.Contains('"last_assistant_message"')) {
         return
     }
     $Cwd = Resolve-AiMemoryCwd -Payload $Payload -Agent $Agent
     if (Test-AiMemoryServerRouted -Cwd $Cwd) {
-        if ($AntigravityPreInvocationOutput) { [Console]::Out.Write("{}") }
+        if ($AntigravityStartOutput) { [Console]::Out.Write("{}") }
         return
     }
     $QS = Get-AiMemoryMarkerQuery -Cwd $Cwd
     if ($Cwd -and $null -eq $QS) {
-        if ($AntigravityPreInvocationOutput -or $GrokPostTool) { [Console]::Out.Write("{}") }
+        if ($AntigravityStartOutput -or $GrokPostTool) { [Console]::Out.Write("{}") }
         return
     }
     if ($env:AI_MEMORY_RUN_ID) {
@@ -1053,8 +1078,9 @@ function Invoke-AiMemoryHook {
         # reason the shell bundle mints `ai_memory_ingest_key`. `ps` plus a
         # GUID's hex fits the server's key grammar.
         $HookUrl = "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS&ingest_key=ps$([Guid]::NewGuid().ToString('N').Substring(0, 16))"
+        $NoProxy = Get-AiMemoryNoProxy
         try {
-            Invoke-WebRequest `
+            Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
@@ -1170,8 +1196,9 @@ function Invoke-AiMemoryHook {
         if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
         }
+        $NoProxy = Get-AiMemoryNoProxy
         try {
-            $Response = Invoke-WebRequest `
+            $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
                 -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
@@ -1188,19 +1215,29 @@ function Invoke-AiMemoryHook {
                 } elseif ($CopilotCliSessionStartOutput) {
                     $Payload = @{ additionalContext = $Response.Content }
                     [Console]::Out.Write(($Payload | ConvertTo-Json -Depth 5 -Compress))
-                } elseif ($AntigravityPreInvocationOutput) {
+                } elseif ($AntigravityStartOutput) {
+                    # A system message stays in the conversation for later
+                    # turns; an ephemeralMessage is dropped after the first.
                     $Payload = @{
-                        injectSteps = @(@{ ephemeralMessage = $Response.Content })
+                        injectSteps = @(@{ systemMessage = @{ systemMessage = $Response.Content } })
+                    }
+                    [Console]::Out.Write(($Payload | ConvertTo-Json -Depth 5 -Compress))
+                } elseif ($SessionStartEnvelope) {
+                    $Payload = @{
+                        hookSpecificOutput = @{
+                            hookEventName = "SessionStart"
+                            additionalContext = [string]$Response.Content
+                        }
                     }
                     [Console]::Out.Write(($Payload | ConvertTo-Json -Depth 5 -Compress))
                 } else {
                     [Console]::Out.Write($Response.Content)
                 }
-            } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
+            } elseif ($AntigravityStartOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput -or $SessionStartEnvelope) {
                 [Console]::Out.Write("{}")
             }
         } catch {
-            if ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
+            if ($AntigravityStartOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput -or $SessionStartEnvelope) {
                 [Console]::Out.Write("{}")
             }
         }
@@ -1217,7 +1254,7 @@ function Invoke-AiMemoryHook {
         if ($ProfileFile) {
             Set-AiMemoryBriefed -Path $ProfileFile
         }
-    } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
+    } elseif ($AntigravityStartOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
         [Console]::Out.Write("{}")
     }
 }

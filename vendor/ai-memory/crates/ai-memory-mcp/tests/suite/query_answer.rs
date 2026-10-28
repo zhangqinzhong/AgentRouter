@@ -41,6 +41,7 @@ const PROJ: &str = "scratch";
 /// synthesized shape AND that the default path never touches the LLM.
 struct FakeAnswerLlm {
     calls: Arc<AtomicUsize>,
+    response: Value,
 }
 
 #[async_trait::async_trait]
@@ -69,10 +70,7 @@ impl LlmProvider for FakeAnswerLlm {
     ) -> LlmResult<serde_json::Value> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         // Shape must deserialize into the server's answer-synthesis struct.
-        Ok(json!({
-            "answer": "The widget subsystem stores its needle in notes/topic.md.",
-            "citations": ["notes/topic.md"],
-        }))
+        Ok(self.response.clone())
     }
 }
 
@@ -100,6 +98,17 @@ fn mount(server: AiMemoryServer) -> Router {
 
 /// Build a harness; `with_provider` decides whether a fake LLM is attached.
 async fn harness(with_provider: bool) -> Harness {
+    harness_with_response(
+        with_provider,
+        json!({
+            "answer": "The widget subsystem stores its needle in notes/topic.md.",
+            "citations": ["notes/topic.md"],
+        }),
+    )
+    .await
+}
+
+async fn harness_with_response(with_provider: bool, response: Value) -> Harness {
     let tmp = TempDir::new().expect("tempdir");
     let store = Store::open(tmp.path()).expect("store");
     let ws = store.writer.get_or_create_workspace(WS).await.expect("ws");
@@ -115,6 +124,7 @@ async fn harness(with_provider: bool) -> Harness {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider: Arc<dyn LlmProvider> = Arc::new(FakeAnswerLlm {
             calls: calls.clone(),
+            response,
         });
         server = server.with_llm(provider);
         Some(calls)
@@ -349,6 +359,207 @@ async fn answer_true_without_provider_degrades_gracefully() {
         !note.trim().is_empty(),
         "answer_unavailable note must explain why"
     );
+}
+
+#[tokio::test]
+async fn answer_rejects_a_citation_not_in_the_request() {
+    let h = harness_with_response(
+        true,
+        json!({
+            "answer": "Invented answer must not escape.",
+            "citations": ["notes/topic.md", "notes/fabricated.md"],
+        }),
+    )
+    .await;
+    seed_needle(&h).await;
+    let resp = call(
+        &h.router,
+        "memory_query",
+        query_args("needle", json!({"answer": true})),
+    )
+    .await;
+    assert_eq!(hit_paths(&resp), ["notes/topic.md"]);
+    assert!(resp.get("answer").is_none(), "unsupported answer: {resp}");
+    assert!(
+        resp.get("answer_unavailable").is_some(),
+        "missing reason: {resp}"
+    );
+    assert!(!resp.to_string().contains("Invented answer"));
+    assert!(!resp.to_string().contains("fabricated.md"));
+    assert_eq!(h.calls.as_ref().unwrap().load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn answer_rejects_a_citation_from_an_unqueried_project() {
+    let h = harness_with_response(
+        true,
+        json!({
+            "answer": "Foreign answer must not escape.",
+            "citations": ["notes/foreign.md"],
+        }),
+    )
+    .await;
+    seed_needle(&h).await;
+    let foreign = h
+        .store
+        .writer
+        .get_or_create_project(h.ws, "foreign", None)
+        .await
+        .unwrap();
+    h.store
+        .writer
+        .upsert_page(page(
+            h.ws,
+            foreign,
+            "notes/foreign.md",
+            "needle foreign secret",
+        ))
+        .await
+        .unwrap();
+    let resp = call(
+        &h.router,
+        "memory_query",
+        query_args("needle", json!({"answer": true})),
+    )
+    .await;
+    assert_eq!(hit_paths(&resp), ["notes/topic.md"]);
+    assert!(resp.get("answer").is_none(), "foreign citation: {resp}");
+    assert!(resp.get("answer_unavailable").is_some());
+    assert!(!resp.to_string().contains("foreign"));
+    assert_eq!(h.calls.as_ref().unwrap().load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn answer_rejects_same_path_citations_across_scopes() {
+    let h = harness(true).await;
+    seed_needle(&h).await;
+    let foreign_ws = h
+        .store
+        .writer
+        .get_or_create_workspace("other")
+        .await
+        .unwrap();
+    let foreign = h
+        .store
+        .writer
+        .get_or_create_project(foreign_ws, PROJ, None)
+        .await
+        .unwrap();
+    h.store
+        .writer
+        .upsert_page(page(
+            foreign_ws,
+            foreign,
+            "notes/topic.md",
+            "needle from another workspace",
+        ))
+        .await
+        .unwrap();
+    let resp = call(
+        &h.router,
+        "memory_query",
+        json!({
+            "query": "needle", "answer": true,
+            "scopes": [{"workspace": WS, "project": PROJ}, {"workspace": "other", "project": PROJ}],
+        }),
+    )
+    .await;
+    assert_eq!(hit_paths(&resp).len(), 2, "both scopes must match: {resp}");
+    assert!(resp.get("answer").is_none(), "ambiguous citation: {resp}");
+    assert!(resp.get("answer_unavailable").is_some());
+    assert_eq!(h.calls.as_ref().unwrap().load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn answer_deduplicates_citations_in_model_order_and_preserves_unicode() {
+    let paths = ["notes/decisão.md", "notes/topic.md", "notes/決定.md"];
+    let h = harness_with_response(
+        true,
+        json!({
+            "answer": "All three snippets mention needle.",
+            "citations": [paths[0], paths[1], paths[0], paths[2], paths[1]],
+        }),
+    )
+    .await;
+    for path in paths {
+        h.store
+            .writer
+            .upsert_page(page(h.ws, h.proj, path, "needle appears here"))
+            .await
+            .unwrap();
+    }
+    let resp = call(
+        &h.router,
+        "memory_query",
+        query_args("needle", json!({"answer": true})),
+    )
+    .await;
+    assert_eq!(resp.pointer("/answer/citations"), Some(&json!(paths)));
+    assert!(resp.get("answer_unavailable").is_none());
+    assert_eq!(h.calls.as_ref().unwrap().load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn answer_global_preferences_accept_unique_paths_and_refuse_collisions() {
+    for (path, accepted) in [("notes/global.md", true), ("notes/topic.md", false)] {
+        let h = harness_with_response(
+            true,
+            json!({
+                "answer": "The global preference mentions needle.",
+                "citations": [path],
+            }),
+        )
+        .await;
+        seed_needle(&h).await;
+        let global = ai_memory_store::create_global_scope(&h.store.writer)
+            .await
+            .unwrap();
+        h.store
+            .writer
+            .upsert_page(page(
+                global.workspace_id,
+                global.project_id,
+                path,
+                "needle global preference",
+            ))
+            .await
+            .unwrap();
+        let resp = call(
+            &h.router,
+            "memory_query",
+            query_args("needle", json!({"answer": true})),
+        )
+        .await;
+        assert_eq!(resp["global_scope_hits"].as_array().unwrap().len(), 1);
+        assert_eq!(resp.get("answer").is_some(), accepted, "{resp}");
+        assert_eq!(
+            resp.get("answer_unavailable").is_some(),
+            !accepted,
+            "{resp}"
+        );
+        assert_eq!(h.calls.as_ref().unwrap().load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn answer_preserves_empty_citations_for_abstention() {
+    let h = harness_with_response(
+        true,
+        json!({
+            "answer": "The snippets do not contain enough information.",
+            "citations": [],
+        }),
+    )
+    .await;
+    seed_needle(&h).await;
+    let resp = call(
+        &h.router,
+        "memory_query",
+        query_args("needle", json!({"answer": true})),
+    )
+    .await;
+    assert_eq!(resp.pointer("/answer/citations"), Some(&json!([])));
+    assert!(resp.get("answer_unavailable").is_none());
 }
 
 /// 4. Live smoke test: wire a real provider only when a key is in the

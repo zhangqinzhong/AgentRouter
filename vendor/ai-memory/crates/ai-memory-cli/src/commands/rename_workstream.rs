@@ -10,6 +10,13 @@ use crate::http_client::{ServerEndpoint, post_json};
 
 /// Retitle one workstream selectable from this checkout.
 pub async fn run(config: &Config, args: RenameWorkstreamArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
+    if args.to.trim().is_empty() {
+        bail!("--to was passed empty; specify the new workstream name");
+    }
+
     // clap's `conflicts_with` rejects passing both, but not passing neither:
     // the pair is optional on either side, so an empty invocation reaches here
     // with nothing to address.
@@ -84,5 +91,64 @@ mod tests {
         let rendered = render_human(&renamed("stable", "stable"));
         assert!(rendered.contains("already has that name"));
         assert!(!rendered.contains("Renamed"));
+    }
+
+    fn test_args() -> RenameWorkstreamArgs {
+        RenameWorkstreamArgs {
+            workspace: None,
+            project: None,
+            from: Some("old".into()),
+            workstream_id: None,
+            to: "new".into(),
+            json: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.project = Some("   ".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.workspace = Some("".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_from_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.from = Some("   ".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--from was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_to_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.to = "   ".into();
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--to was passed empty"),
+            "unexpected error: {error}"
+        );
     }
 }

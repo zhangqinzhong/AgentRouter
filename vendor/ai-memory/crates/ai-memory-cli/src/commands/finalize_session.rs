@@ -125,8 +125,9 @@ pub(crate) async fn finalize(
     Ok((workspace, project, finalized))
 }
 
-/// Antigravity CLI's live hooks carry no prompt event, so its sessions reach
-/// the server without a single prompt; its `history.jsonl` has them. Other
+/// Antigravity's hooks carry no prompt event. Current native hooks recover
+/// prompts from the conversation's transcript; for a session they did not
+/// (shell hooks, an older install), `agy`'s `history.jsonl` has them. Other
 /// agents capture prompts live. `--all-owners` finalizes sessions owned by
 /// other users, whose prompts this machine's history does not hold.
 fn replays_prompts(agent: AgentKind, all_owners: bool) -> bool {
@@ -146,6 +147,11 @@ async fn replay_prompts(
     session_id: &str,
 ) {
     if !super::hook::admits_capture_at(&config.data_dir, Path::new(cwd)) {
+        return;
+    }
+    // Current hooks capture each prompt live from the conversation's
+    // transcript; replaying `history.jsonl` too would store them twice.
+    if super::hook::antigravity_transcript_prompts_captured(&config.data_dir, session_id) {
         return;
     }
     let Some(home) = super::run::native_home(config) else {

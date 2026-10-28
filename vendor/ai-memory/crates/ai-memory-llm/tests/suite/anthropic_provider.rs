@@ -120,3 +120,62 @@ async fn a_reply_without_a_tool_call_or_json_is_still_an_error() {
         "{outcome:?}"
     );
 }
+
+/// A structured answer the model stopped at `max_tokens` is terminal: the
+/// `tool_use` block's `input` carries only the JSON produced before the budget
+/// ran out, and the batch types it feeds default every field but `updates`, so
+/// a short object deserializes and reads as a complete answer. The control is
+/// `complete`, where prose cut at the budget is a usable reply and must still
+/// succeed on the very same response.
+#[tokio::test]
+async fn a_structured_answer_stopped_at_max_tokens_is_terminal_truncated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "claude-sonnet-5",
+            "stop_reason": "max_tokens",
+            "content": [
+                {"type": "text", "text": "partial prose"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "result",
+                    "input": {"updates": [{"path": "notes/a.md"}]}
+                }
+            ],
+            "usage": {"input_tokens": 7, "output_tokens": 16000}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), "claude-sonnet-5")
+        .unwrap()
+        .with_base_url(server.uri());
+
+    let schema = json!({"type": "object", "properties": {"updates": {"type": "array"}}});
+    let err = provider
+        .complete_structured_raw(ChatRequest::user_prompt("consolidate"), schema)
+        .await
+        .expect_err("a budget stop must not return a partial structured result");
+    match &err {
+        LlmError::TruncatedResponse {
+            model,
+            completion_tokens,
+        } => {
+            assert_eq!(model, "claude-sonnet-5");
+            assert_eq!(*completion_tokens, Some(16000));
+        }
+        other => panic!("expected TruncatedResponse, got {other:?}"),
+    }
+    assert_eq!(err.class(), "truncated-response");
+    assert!(!err.is_transient(), "a budget stop must not be retried");
+
+    // Control: the non-structured path reads the same `stop_reason` as a
+    // normal outcome and returns the prose it did get.
+    let response = provider
+        .complete(ChatRequest::user_prompt("summarize"))
+        .await
+        .expect("prose cut at the budget is still an answer");
+    assert_eq!(response.text, "partial prose");
+}

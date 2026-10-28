@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -14,28 +13,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  model-catalog:
+  validate:
     name: Validate release
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-
-      - name: Set up session engine toolchain
-        run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Verify release version
-        run: node build/verify-release-version.mjs
-
+          cache: npm
+      - run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
+      - run: npm ci
+      - name: Require immutable release tag
+        shell: bash
+        run: test "$GITHUB_REF_TYPE" = tag
+      - run: node build/verify-release-version.mjs
       - name: Validate source
         run: |
           npm run typecheck
@@ -46,247 +41,118 @@ jobs:
           npm run test:core
           npm run test:ui
           npx playwright install --with-deps chromium
-          npx playwright test tests/e2e/overview-trend-tooltip.spec.ts --project=chromium
+          npx playwright test tests/e2e/overview-trend-tooltip.spec.ts tests/e2e/data-sources.spec.ts --project=chromium
           npm run test:architecture
           npm run test:gateway-stream
 
-      - name: Upload model catalog
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-model-catalog
-          path: packages/core/models.json
-          if-no-files-found: error
-          retention-days: 1
-
   macos:
-    name: macOS (${{ matrix.display_name }})
-    needs: model-catalog
+    name: macOS (${{ matrix.arch }})
+    needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
-            arch_flag: --arm64
             runner: macos-15
-            display_name: Apple Silicon
             release_label: Apple-Silicon
-            artifact_name: macos-apple-silicon-arm64
           - arch: x64
-            arch_flag: --x64
             runner: macos-15-intel
-            display_name: Intel
             release_label: Intel
-            artifact_name: macos-intel-x64
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
-
-      - name: Set up session engine toolchain
-        run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
-      - name: Download updated model catalog
-        uses: actions/download-artifact@v4
-        with:
-          name: release-model-catalog
-          path: packages/core
-
-      - name: Verify tag version
-        shell: bash
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          package_version="$(node -p "require('./package.json').version")"
-          if [[ "$tag_version" != "$package_version" ]]; then
-            echo "Tag v$tag_version does not match package.json version $package_version"
-            exit 1
-          fi
-
+      - run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
+      - run: npm ci
+      - run: node build/verify-release-version.mjs
       - name: Validate native source
         run: |
           node build/check-native-parity.mjs
           node build/test-native.mjs
-
-      - name: Build ad-hoc macOS artifacts
+      - name: Build macOS artifacts
         run: |
           npm run build:assets
-          npx electron-builder \
-            --config build/electron-builder.local.cjs \
-            --mac ${{ matrix.arch_flag }} \
-            --publish never \
-            -c.mac.artifactName='AgentRouter_${version}-mac-${{ matrix.release_label }}-${arch}.${ext}'
-
-      - name: Upload macOS release files
-        uses: actions/upload-artifact@v4
+          npx electron-builder --config build/electron-builder.local.cjs --mac --${{ matrix.arch }} --publish never -c.mac.artifactName='AgentRouter_${version}-mac-${{ matrix.release_label }}-${arch}.${ext}'
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: macos-${{ matrix.arch }}
           path: |
             release-local/AgentRouter_*-mac-${{ matrix.release_label }}-${{ matrix.arch }}.*
             release-local/latest-mac.yml
           if-no-files-found: error
 
-  publish-macos:
-    name: Publish macOS
-    needs: macos
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install metadata merge dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Download macOS release files
-        uses: actions/download-artifact@v4
-        with:
-          pattern: macos-*
-          path: macos-release-artifacts
-
-      - name: Merge macOS update metadata
-        run: node build/merge-macos-update-metadata.mjs latest-mac.yml macos-release-artifacts/*/latest-mac.yml
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            notes="docs/releases/${GITHUB_REF_NAME#v}.md"
-            if [ -f "$notes" ]; then
-              gh release create "$GITHUB_REF_NAME" --title "AgentRouter $GITHUB_REF_NAME" --notes-file "$notes"
-            else
-              gh release create "$GITHUB_REF_NAME" --title "AgentRouter $GITHUB_REF_NAME" --generate-notes
-            fi
-          fi
-
-      - name: Upload macOS release assets
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          shopt -s nullglob
-          assets=(macos-release-artifacts/*/AgentRouter_*-mac-*.*)
-          if (( ${#assets[@]} == 0 )); then
-            echo "No macOS release assets were found."
-            exit 1
-          fi
-
-          upload_args=()
-          for asset in "${assets[@]}"; do
-            name="$(basename "$asset")"
-            case "$name" in
-              *Apple-Silicon-arm64.dmg) label="macOS Apple Silicon DMG (arm64)" ;;
-              *Apple-Silicon-arm64.zip) label="macOS Apple Silicon ZIP (arm64)" ;;
-              *Apple-Silicon-arm64.dmg.blockmap) label="macOS Apple Silicon DMG blockmap (arm64)" ;;
-              *Apple-Silicon-arm64.zip.blockmap) label="macOS Apple Silicon ZIP blockmap (arm64)" ;;
-              *Intel-x64.dmg) label="macOS Intel DMG (x64)" ;;
-              *Intel-x64.zip) label="macOS Intel ZIP (x64)" ;;
-              *Intel-x64.dmg.blockmap) label="macOS Intel DMG blockmap (x64)" ;;
-              *Intel-x64.zip.blockmap) label="macOS Intel ZIP blockmap (x64)" ;;
-              *) label="$name" ;;
-            esac
-            upload_args+=("${asset}#${label}")
-          done
-          upload_args+=("latest-mac.yml#macOS update metadata")
-
-          gh release upload "$GITHUB_REF_NAME" "${upload_args[@]}" --clobber
-
   windows:
     name: Windows
-    needs: publish-macos
+    needs: validate
     runs-on: windows-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
-
-      - name: Set up session engine toolchain
-        run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Download updated model catalog
-        uses: actions/download-artifact@v4
+      - run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
+      - run: npm ci
+      - run: node build/verify-release-version.mjs
+      - run: npm run build:app:win:local
+      - uses: actions/upload-artifact@v4
         with:
-          name: release-model-catalog
-          path: packages/core
-
-      - name: Verify tag version
-        shell: bash
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          package_version="$(node -p "require('./package.json').version")"
-          if [[ "$tag_version" != "$package_version" ]]; then
-            echo "Tag v$tag_version does not match package.json version $package_version"
-            exit 1
-          fi
-
-      - name: Build and publish Windows artifacts
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run build:app:win:release -- --publish always
+          name: windows-x64
+          path: |
+            release-local/AgentRouter_*.exe
+            release-local/AgentRouter_*.exe.blockmap
+            release-local/latest.yml
+          if-no-files-found: error
 
   linux:
     name: Linux
-    needs: publish-macos
+    needs: validate
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
-
-      - name: Set up session engine toolchain
-        run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Download updated model catalog
-        uses: actions/download-artifact@v4
+      - run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
+      - run: npm ci
+      - run: node build/verify-release-version.mjs
+      - run: npm run build:assets
+      - run: npx electron-builder --linux AppImage --publish never
+      - uses: actions/upload-artifact@v4
         with:
-          name: release-model-catalog
-          path: packages/core
+          name: linux-x64
+          path: |
+            release/*/AgentRouter_*.AppImage
+            release/*/latest-linux.yml
+          if-no-files-found: error
 
-      - name: Verify tag version
-        shell: bash
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          package_version="$(node -p "require('./package.json').version")"
-          if [[ "$tag_version" != "$package_version" ]]; then
-            echo "Tag v$tag_version does not match package.json version $package_version"
-            exit 1
-          fi
-
-      - name: Build and publish Linux artifacts
+  publish:
+    name: Verify all platforms and publish
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+      - name: Publish verified draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          npm run build:assets
-          npx electron-builder --linux AppImage --publish always
+        run: node build/publish-release.mjs release-artifacts

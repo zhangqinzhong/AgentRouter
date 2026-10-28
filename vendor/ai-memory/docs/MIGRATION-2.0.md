@@ -27,7 +27,7 @@ one-shot wiki migration runs before the server accepts any traffic:
 
    Set `AI_MEMORY_BACKUP_DIR=/somewhere/else` before starting if your
    home is small; the destination must be outside the data directory.
-The archive is re-opened and verified after writing. **If the backup
+The archive is flushed and fsynced, then re-opened and verified. **If the backup
     cannot be written or verified, the migration aborts and the server
     refuses to start**. Your data is untouched and the error says why.
 

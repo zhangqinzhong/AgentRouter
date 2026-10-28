@@ -132,17 +132,20 @@ Structural enforcement (recommended): make the unguarded lookups crate-private s
 compiler forces new call sites through the guarded resolver + `authorize_project`, the
 same way `ScopeResolver` already funnels scoped access.
 
-### Ship inert, and never fail closed on missing rows
+### Ship inert, distinguish compatibility gaps from store failures
 
 The feature must be a no-op until an operator opts in, and it must not turn a resolution
 gap into a lockout (the #678 dead-end lesson: an unresolved pointer means degrade, not
 refuse). Concretely: an empty `project_grants` table plus `access_mode DEFAULT 'open'`
 means every existing project stays open; enabling `restricted` on a project with **zero
 grants still admits root and the project creator** (never "locked out of my own data");
-a startup that cannot read the grants table (older schema mid-migration) degrades to
-`open` with a loud warning rather than denying every read; and single-user / loopback
-(`distinguishes_operators()` false) skips the gate entirely. Enforcement is gated on
-both the server distinguishing operators **and** the specific project being `restricted`.
+an unknown project or access-mode token remains compatible by reading as `open`; and
+single-user / loopback (`distinguishes_operators()` false) skips the gate entirely.
+Once a restricted project exists, however, a SQL/store failure while reading its row or
+grant propagates and refuses the request instead of opening the project. Migrations
+finish before the store serves requests, so a missing authorization table is a store
+failure, not a compatibility state. Enforcement is gated on both the server
+distinguishing operators **and** the specific project being `restricted`.
 
 ### Management surface (root-only, `/admin/*`)
 `ai-memory user grant --user alice --workspace w --project p --level write` and

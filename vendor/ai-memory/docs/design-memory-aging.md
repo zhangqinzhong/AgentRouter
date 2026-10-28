@@ -1,5 +1,11 @@
 # Design: memory aging — decay curves, tier-down, dream pass, access-weighting (2.4)
 
+**Status: implemented in 2.4.** The zero-LLM aging set and the opt-in LLM
+dream pass shipped; ranking-affecting and lossy behavior remains default-off
+as designed. Sections labelled "Current state" and the phased PR plan preserve
+the pre-implementation baseline. Current feature status and R2 results are in
+[`competitive-parity.md`](competitive-parity.md#prior-gaps-and-current-status).
+
 Design-of-record for a 2.4 feature set that improves how ai-memory handles
 **old** memory: decay/compression/consolidation and access-weighted retention.
 It is honest about what already ships, what is dormant, and what is proposed;
@@ -246,6 +252,36 @@ Everything in A works with no provider and does not require ranking changes.
   `design-hindsight-borrowings.md` §4) that step is R2-gated separately.
 - *Failure modes:* false-positive band → advisory-only output; the operator/lint
   decides.
+
+**Classification fixtures ([RFC #1685](https://github.com/akitaonrails/ai-memory/issues/1685)).**
+The existing `contradiction_lint` suite also runs
+[`contradiction_evidence.json`](../crates/ai-memory-consolidate/tests/fixtures/contradiction_evidence.json),
+a small manually labeled English, Portuguese and Chinese corpus. Its vectors
+are controlled inputs, not outputs from an embedding model. The fixtures record
+current classification, including compatible pairs inside the band and a
+conflicting pair above it; they do not estimate production precision or propose
+a new response contract.
+
+A prediction is any `contradiction` finding, including an advisory similarity
+candidate. Positives contain incompatible simultaneous values for the same
+setting and scope; compatible active pairs are negatives. Superseded, expired
+and foreign-project pairs test eligibility separately and do not enter the
+classification metrics. The declared-edge control contains conflicting
+prose and has no embeddings. Expected counts document the current behavior;
+labels should remain independent when an approved classifier change updates
+those counts.
+
+```bash
+cargo test -p ai-memory-consolidate labeled_evidence_pairs_record_current_classification -- --nocapture
+cargo test -p ai-memory-consolidate labeled_evidence_pairs_timing_receipt -- --ignored --nocapture
+```
+
+The first command reports the confusion counts, precision, recall, F1 and
+false-positive/false-negative rates and checks repeated classification parity.
+The optional second command reports lint p50/p95 over 20 runs per isolated pair after a
+warm-up, excluding fixture creation. Both run offline without an LLM. Timing has
+no pass threshold and is not a benchmark of a full store. Neither changes lint's
+public classification; that decision remains in the RFC.
 
 ### Bucket B — LLM "dream" pass (opt-in, OFF by default, R2-gated)
 

@@ -2,13 +2,19 @@
 
 ## PR → CI → tag → Release
 
-修复版本默认递增补丁号。发布 PR 同时更新根目录和四个 workspace 的 `package.json`、`package-lock.json`、`CHANGELOG.md`、`docs/releases/<version>.md`、`.github/release-request`。
+版本采用 `主版本.次版本.修订号`，按用户可见的兼容性影响选择：兼容修复为 patch；兼容的新功能、新客户端来源为 minor；不兼容的管理 API、CLI 或配置改动为 major。代码量和上游依赖版本不直接决定 AgentRouter 版本。普通改动合批发布，紧急修复可独立发 patch。
 
-提交前执行 `node build/verify-release-version.mjs`。PR CI 检查类型、采集器、核心、UI、原生视图差异和 Swift 测试。原生测试使用 `node build/test-native.mjs`，兼容旧版 SwiftPM 的资源解析；生产构建仍由 Xcode 编译资源。合并前用 `gh pr checks <PR> --watch` 确认全部通过，不跳过失败检查。
+发布 PR 更新根目录和四个 workspace 的 `package.json`、`package-lock.json`、`CHANGELOG.md`、`docs/releases/<version>.md`、`.github/release-request` 和 `.github/release-plan.json`。发布计划声明上一个稳定版 `baseVersion`、`change`（major/minor/patch）及产品层面的 `reason`，由 PR 审查确认分类。CI 验证数字递增、基线 tag、版本一致、说明文件；patch 不允许包含 Features 更新项。
 
-合并到 main 后，Release Kickoff 按 `.github/release-request` 创建 tag 并显式启动 Release（工作流 token 创建 tag 不会触发另一个 push 工作流）。不要同时手动推同名 tag。已有 tag 指向不同提交时停止，禁止移动已发布 tag。
+功能版和破坏性更新先发 `x.y.z-rc.1`；需要更早预览时可先发 `x.y.z-beta.1`。候选版全平台构建成功、校验并实际验证后，另开稳定版 PR，把版本改为 `x.y.z`，并在发布计划中设置 `candidate: "vx.y.z-rc.N"`。稳定版与候选版之间只允许版本、更新日志及发布说明变化；有源码变化必须先发下一个候选版。预发布在 GitHub 标记为 prerelease 且 `latest=false`，不进入稳定版更新源。
 
-Release 再次校验源码和版本，构建 Apple Silicon、Intel，发布 macOS 后继续 Windows、Linux。用 `gh run list --workflow release.yml` 和 `gh release view v<version>` 检查状态。
+提交前执行 `node build/verify-release-version.mjs`。PR CI 检查类型、采集器、核心、UI、浏览器回归、Rust 会话引擎、原生视图差异及 Swift 测试。合并前检查 PR 的全部 CI 结果，解决失败后再合并。
+
+合并到 main 后，Release Kickoff 验证计划，创建不可移动的 tag 并显式启动 Release。不要另行手动推同名 tag；已有 tag 指向不同提交时流程停止。
+
+Release 对 Apple Silicon、Intel、Windows 和 Linux 并行构建，所有平台成功后汇总产物、合并 macOS 更新元数据，验证版本、文件大小、SHA-512 和必需平台。全部通过后创建草稿、上传完整产物和 `SHA256SUMS`，再核对 GitHub 资产摘要并公开发布。禁止先公开一半平台的稳定版；已公开版本的产物不覆盖，修复应发布新版本。发布中断可重跑同一个工作流，只有草稿产物可以被替换。
+
+用 `gh run list --workflow release.yml`、`gh release view v<version>` 检查实际状态。Git tag、构建成功、Release 已公开、本机安装是不同交付状态，分别验证。
 
 ## 本机安装
 

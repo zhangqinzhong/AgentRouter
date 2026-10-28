@@ -1806,7 +1806,9 @@ pub async fn drain_with_live_token(
                     // profile's capture there is the cross-server delivery
                     // profiles exist to prevent (#992).
                     let retry = configured.as_deref().and_then(|server| {
-                        if chunk[0].1.profile.is_some() || !is_loopback_url(&chunk[0].1.url) {
+                        if chunk[0].1.profile.is_some()
+                            || !crate::http_client::is_loopback_url(&chunk[0].1.url)
+                        {
                             return None;
                         }
                         let rerooted = batch_endpoint(&reroot_url(&chunk[0].1.url, server)?);
@@ -2350,22 +2352,6 @@ impl<'a> ProfileTokens<'a> {
         let rest = entry_url.strip_prefix(resolved.url.as_str())?;
         rest.starts_with('/').then(|| resolved.token.clone())
     }
-}
-
-/// Is this URL's host a loopback address?
-///
-/// A loopback authority is only meaningful on the machine that recorded it, so
-/// a stale port in one is unambiguous — nothing else could have been meant. A
-/// remote host is left alone: re-pointing it would misdeliver a spool that was
-/// deliberately captured against another server.
-pub(crate) fn is_loopback_url(url: &str) -> bool {
-    let rest = match url.split_once("://") {
-        Some((_, rest)) => rest,
-        None => url,
-    };
-    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
-    host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1"
 }
 
 /// Rewrite `url`'s scheme and authority onto `server_url`, keeping path and

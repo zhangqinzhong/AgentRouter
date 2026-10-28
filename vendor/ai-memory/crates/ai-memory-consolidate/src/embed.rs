@@ -32,8 +32,9 @@ pub struct EmbedBackfillCounts {
     pub skipped: usize,
     /// Pages that failed to embed (read error or provider error).
     pub failed: usize,
-    /// Pages that would be embedded in a live run (only meaningful
-    /// when `dry_run` was requested).
+    /// Pages the live run would call the embedder for (only meaningful
+    /// when `dry_run` was requested) — a missing body vector, a missing L0
+    /// abstract vector, or both.
     pub would_embed: usize,
     /// L0 abstracts (frontmatter `abstract:`) embedded into
     /// `page_abstract_embeddings` — the opt-in fifth retrieval stream.
@@ -150,9 +151,12 @@ pub async fn run_embedding_backfill(
             continue;
         }
         if options.dry_run {
-            if need_body {
-                counts.would_embed += 1;
-            }
+            // Either vector means the live run calls the embedder for this
+            // page. Counting only `need_body` dropped an abstract-only page
+            // from the report entirely: the `skipped` branch above fires only
+            // when NEITHER vector is missing, so the page appeared in no
+            // count at all and the dry run reported no work to do.
+            counts.would_embed += 1;
             continue;
         }
         let md = match wiki.read_page(workspace_id, project_id, &cand.path) {

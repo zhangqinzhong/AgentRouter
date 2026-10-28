@@ -36,21 +36,9 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
       let cursors;
       try { cursors=JSON.parse(await fs.readFile(cursorsPath,'utf8')); }
       catch (e) { if(e.code !== 'ENOENT') throw e; cursors={}; }
-      const codexHomes = new Set([path.join(home,'.codex')]);
-      const claudeHomes = new Set([path.join(home,'.claude')]);
-      const profileRoot = path.join(home,'.agentrouter','profiles');
-      const entries = await fs.readdir(profileRoot,{withFileTypes:true}).catch(e=>{if(e.code==='ENOENT')return [];throw e});
-      for (const entry of entries.filter(e=>e.isDirectory())) {
-        for (const prefix of ['', 'custom']) {
-          codexHomes.add(path.join(profileRoot,entry.name,prefix,'codex'));
-          claudeHomes.add(path.join(profileRoot,entry.name,prefix,'claude'));
-        }
-      }
-      const codexFiles = [...new Set((await Promise.all([...codexHomes].flatMap(dir=>[
-        rollout.listRolloutFiles(path.join(dir,'sessions')),
-        rollout.listRolloutFilesDeep(path.join(dir,'archived_sessions')),
-      ]))).flat())].sort();
-      const claudeFiles = [...new Set((await Promise.all([...claudeHomes].map(dir=>rollout.listClaudeProjectFiles(path.join(dir,'projects'))))).flat())].sort();
+      const roots = await require('./collection-roots.cjs').collectionRoots({home});
+      const codexFiles = [...new Set((await Promise.all(roots.codexStores.map(dir => rollout.listRolloutFilesDeep(dir)))).flat())].sort();
+      const claudeFiles = [...new Set((await Promise.all(roots.claudeProjects.map(dir => rollout.listClaudeProjectFiles(dir)))).flat())].sort();
       await require('./rebuild-codex.cjs').rebuildCodex({dataDir,cursors,files:codexFiles});
       await rollout.parseRolloutIncremental({rolloutFiles:codexFiles,cursors,queuePath,projectQueuePath,source:'codex'});
       await rollout.parseClaudeIncremental({projectFiles:claudeFiles,cursors,queuePath,projectQueuePath,source:'claude'});
@@ -89,7 +77,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
       return {subscriptions:[...new Map([...inherited,...own].map(row=>[row.id,row])).values()]};
     }
     if(endpoint.endsWith('session-transcript')) return require('./lib/session-analytics').getSessionTranscript({home,sessionHash:query.sessionHash,offset:Number(query.offset || 0)});
-    if(endpoint.endsWith('local-sync')) { await sync(query.auto!=='true'); if(query.auto!=='true')resetUsageLimitsCache();return {ok:true,code:0}; }
+    if(endpoint.endsWith('local-sync')) { await sync(query.auto!=='true'); if(query.sessions==='1')await require('./lib/session-analytics').buildSessionAnalytics({home,force:true}); if(query.auto!=='true')resetUsageLimitsCache();return {ok:true,code:0}; }
     // Overview reads the persisted snapshot first; optional network sources and
     // price refresh must never hold its initial response hostage.
     if (query.background === '1') {

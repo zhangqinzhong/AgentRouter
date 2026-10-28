@@ -65,6 +65,7 @@ fn scripts_cover_subcommands_from_across_the_tree() {
         for subcommand in [
             "init",
             "serve",
+            "recent",
             "write-page",
             "purge-project",
             "move-session",

@@ -25,6 +25,37 @@ struct MoveProjectRequest {
     on_conflict: String,
 }
 
+/// The exact command that performs the move the refusal just described.
+///
+/// Rebuilt from `args` rather than hand-written, the same way
+/// `move_session::apply_command` does, so the printed command cannot drift
+/// from the request the command actually sends. Every flag the operator
+/// passed has to reappear here: the request built below carries
+/// `args.force` and `args.on_conflict`, so a printed command that dropped
+/// them would not reproduce the operation just described. A dropped
+/// `--on-conflict overwrite` is the worst of the two — `on_conflict`
+/// defaults to `block`, so the pasted command REFUSES with a 409 listing the
+/// conflicting paths instead of merging them, and a dropped `--force` leaves
+/// the active-project guard in place.
+fn confirm_command(from_workspace: &str, target_flag: &str, args: &MoveProjectArgs) -> String {
+    let from_workspace = super::render_shared::native_shell_quote(from_workspace);
+    let to_workspace = super::render_shared::native_shell_quote(&args.to_workspace);
+    let mut cmd = format!(
+        "ai-memory move-project --from-workspace {from_workspace} {target_flag} --to-workspace {to_workspace}"
+    );
+    if args.force {
+        cmd.push_str(" --force");
+    }
+    if args.on_conflict != "block" {
+        cmd.push_str(&format!(
+            " --on-conflict {}",
+            super::render_shared::native_shell_quote(&args.on_conflict)
+        ));
+    }
+    cmd.push_str(" --confirm");
+    cmd
+}
+
 /// Run the `move-project` subcommand.
 ///
 /// Resolves the source project name (auto-derived from the git repo root
@@ -38,11 +69,15 @@ struct MoveProjectRequest {
 /// Returns an error when `--confirm` is absent, the server is unreachable,
 /// or the server returns a non-2xx response.
 pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
-    let (from_workspace, project, project_id) = match args.project_id {
+    super::refuse_empty_explicit(args.from_workspace.as_deref(), "--from-workspace")?;
+    super::refuse_empty_explicit(Some(args.to_workspace.as_str()), "--to-workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
+    let (from_workspace, project, project_id) = match &args.project_id {
         Some(id) => (
             super::resolve_workspace(config, args.from_workspace.as_deref())?,
             None,
-            Some(id),
+            Some(id.clone()),
         ),
         None => {
             let (ws, project) = super::resolve_scope(
@@ -54,8 +89,20 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         }
     };
     let (target_flag, requested) = match (&project, &project_id) {
-        (Some(project), _) => (format!("--project {project}"), project.clone()),
-        (None, Some(id)) => (format!("--project-id {id}"), id.clone()),
+        (Some(project), _) => (
+            format!(
+                "--project {}",
+                super::render_shared::native_shell_quote(project)
+            ),
+            project.clone(),
+        ),
+        (None, Some(id)) => (
+            format!(
+                "--project-id {}",
+                super::render_shared::native_shell_quote(id)
+            ),
+            id.clone(),
+        ),
         (None, None) => bail!("one of --project or --project-id is required"),
     };
 
@@ -66,15 +113,11 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
              place — sessions, observations and history preserved). If it \
              already has one, the pages are copied in and merged, then the \
              source is PURGED. Both are irreversible.\n\
-             Re-run with --confirm to proceed:\n\n  \
-             ai-memory move-project --from-workspace {} {} \
-             --to-workspace {} --confirm",
+             Re-run with --confirm to proceed:\n\n  {}",
             from_workspace,
             target_flag,
             args.to_workspace,
-            from_workspace,
-            target_flag,
-            args.to_workspace,
+            confirm_command(&from_workspace, &target_flag, &args),
         );
     }
 
@@ -175,7 +218,70 @@ fn moved_project_name(report: &serde_json::Value, requested: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::moved_project_name;
+    use super::{confirm_command, moved_project_name};
+    use crate::cli::MoveProjectArgs;
+
+    fn args() -> MoveProjectArgs {
+        MoveProjectArgs {
+            from_workspace: Some("default".into()),
+            project: Some("api".into()),
+            project_id: None,
+            to_workspace: "team".into(),
+            confirm: false,
+            force: false,
+            on_conflict: "block".into(),
+        }
+    }
+
+    /// The command the refusal hands the operator must round-trip every flag
+    /// they passed, because the request this command actually builds carries
+    /// `force` and `on_conflict` verbatim. A dropped `--on-conflict
+    /// overwrite` falls back to the `block` default, so the pasted command
+    /// comes back as a 409 listing the conflicting paths instead of merging
+    /// them — the opposite of what the operator asked for.
+    #[test]
+    fn confirm_command_repeats_force_and_on_conflict() {
+        let mut a = args();
+        a.force = true;
+        a.on_conflict = "overwrite".into();
+        assert_eq!(
+            confirm_command("default", "--project api", &a),
+            "ai-memory move-project --from-workspace default --project api \
+             --to-workspace team --force --on-conflict overwrite --confirm"
+        );
+    }
+
+    /// And the mirror: a plain run must not start emitting flags nobody
+    /// typed. `--on-conflict` has a clap default of `block`, so echoing it
+    /// unconditionally would put a merge policy into a command the operator
+    /// never chose one for.
+    #[test]
+    fn confirm_command_omits_flags_the_operator_did_not_pass() {
+        let mut a = args();
+        a.project = None;
+        a.project_id = Some("0192b6a1-4c2e-7d3f-8a5b-1234567890ab".into());
+        assert_eq!(
+            confirm_command(
+                "default",
+                "--project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                &a
+            ),
+            "ai-memory move-project --from-workspace default \
+             --project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab \
+             --to-workspace team --confirm"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn confirm_command_quotes_free_form_scope_names() {
+        let mut a = args();
+        a.to_workspace = "new team".into();
+        assert_eq!(
+            confirm_command("old team", "--project 'api; echo nope'", &a),
+            "ai-memory move-project --from-workspace 'old team' --project 'api; echo nope' --to-workspace 'new team' --confirm"
+        );
+    }
 
     #[test]
     fn a_move_by_id_rekeys_the_link_under_the_resolved_name() {

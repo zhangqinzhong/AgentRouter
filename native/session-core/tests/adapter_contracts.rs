@@ -506,7 +506,7 @@ fn claude_parse_contract() {
         .parse_transcript(&r)
         .expect("claude parse_transcript");
 
-    // 标题=最后一条 custom-title,压过首条用户消息推导
+    // 标题=最后一条 custom-title,压过首条用户消息推导(agent-name 的会话名不当标题)
     assert_eq!(s.meta.title, "QR login revamp");
     assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
     assert_eq!(s.meta.project_name, "wakefx");
@@ -516,7 +516,8 @@ fn claude_parse_contract() {
     assert_eq!(s.meta.message_count, 3);
     assert_eq!(s.meta.created_at, ms("2026-08-01T09:59:00Z"));
     assert_eq!(s.meta.updated_at, ms("2026-08-01T10:02:00Z"));
-    // "wibble-experimental" 计 unknown;summary / atis-latch / bridge-session 不计
+    // "wibble-experimental" 计 unknown;summary / atis-latch / bridge-session 与 2.1 起的 agent-name /
+    // cost-state / api-request* / relocated / worktree-state 不计——项目也不随 relocated 去 worktree
     assert_eq!(s.unknown_line_count, 1);
     assert_eq!(t.unknown_line_count, 1);
 
@@ -1481,6 +1482,87 @@ fn codex_review_output_is_readable_and_not_duplicated() {
     assert_eq!(session.meta.title, UNTITLED);
     assert_eq!(session.units.len(), 1);
     assert!(session.units[0].text.contains("Keep the selected row"));
+}
+
+/// 0.156 起的两种记录:`token_usage_record` 每次模型调用一行,`realtime_item` 的起止
+/// 标记是语音会话的元数据,都不算未知行(Clean Up 移动前要求整份读懂,否则拒清)。
+/// token 以 event_msg 的 token_count 为准,用量记录里整个线程的累计只在文件里没有
+/// token_count 时才用;带内容的语音子类型(transcript_segment 等)还没见过样本,照旧计未知行
+#[test]
+fn codex_usage_and_realtime_records_are_known() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let day = home.path().join("sessions/2026/10/19");
+    fs::create_dir_all(&day).unwrap();
+    let id = "01a12345-0000-7000-8000-000000000156";
+    let usage = |input: i64| {
+        serde_json::json!({
+            "input_tokens": input, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+            "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": input + 10
+        })
+    };
+    let realtime = |kind: &str| {
+        serde_json::json!({"timestamp": "2026-10-19T00:00:05.000Z", "type": "realtime_item",
+            "payload": {"realtime_session_id": "rs-1", "type": kind}})
+    };
+    let token_count = serde_json::json!({"timestamp": "2026-10-19T00:00:04.000Z", "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"total_token_usage": usage(3000),
+            "last_token_usage": usage(100), "model_context_window": 272000}}});
+    let lines = vec![
+        serde_json::json!({"timestamp": "2026-10-19T00:00:00.000Z", "type": "session_meta",
+            "payload": {"id": id, "timestamp": "2026-10-19T00:00:00.000Z", "cwd": "/work/wake",
+                "originator": "codex_cli_rs", "source": "cli", "cli_version": "0.156.0"}}),
+        realtime("realtime_session_started"),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:02.000Z", "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Count the tokens"}]}}),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:03.000Z", "type": "response_item",
+            "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done."}]}}),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:03.500Z", "type": "token_usage_record",
+            "payload": {"thread_id": id, "turn_id": "t-1", "session_id": id, "root_turn_id": "t-1",
+                "response_id": "resp_1", "usage": usage(100), "turn_token_usage": usage(100),
+                "thread_token_usage": usage(4000)}}),
+        token_count.clone(),
+        realtime("realtime_session_closed"),
+        realtime("transcript_segment"),
+    ];
+    let path = day.join(format!("rollout-2026-10-19T00-00-00-{id}.jsonl"));
+    let write = |lines: &[serde_json::Value]| {
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(&path, body).unwrap();
+    };
+    write(&lines);
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let r = adapter.file_ref(&path).expect("用户线程照常列出");
+    let transcript = adapter.parse_transcript(&r).unwrap();
+    assert_eq!(
+        transcript.unknown_line_count, 1,
+        "只有 transcript_segment 计未知行"
+    );
+    let texts: Vec<&str> = transcript
+        .mainline
+        .iter()
+        .filter(|m| m.kind != MessageKind::Meta)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert_eq!(texts, ["Count the tokens", "Done."]);
+    let session = adapter.parse_session(&r).unwrap();
+    assert_eq!(
+        session.meta.tokens_used,
+        Some(3010),
+        "token 以 token_count 的累计为准"
+    );
+
+    // 哪天 Codex 不写 token_count 了:退回用量记录里整个线程的累计,不至于没有 token
+    let without: Vec<serde_json::Value> = lines.into_iter().filter(|l| *l != token_count).collect();
+    write(&without);
+    let r = adapter.file_ref(&path).unwrap();
+    assert_eq!(
+        adapter.parse_session(&r).unwrap().meta.tokens_used,
+        Some(4010)
+    );
 }
 
 #[test]
@@ -3012,6 +3094,7 @@ fn antigravity_transcripts_replace_index_cards() {
     );
     let ide = gemini.join("antigravity-ide").join("brain");
     let desktop = gemini.join("antigravity").join("brain");
+    let cli_brain = gemini.join("antigravity-cli").join("brain");
     let asked = ms("2026-08-30T02:11:10Z");
     // 第一张贴图在第一轮之后几秒;第二张离哪一轮都差出两个小时,不挂
     let t1 =
@@ -3036,7 +3119,7 @@ fn antigravity_transcripts_replace_index_cards() {
     let adapter = AntigravityAdapter::new().with_custom_root(gemini.clone());
     assert_eq!(
         adapter.data_roots(),
-        vec![db.clone(), desktop.clone(), ide.clone()]
+        vec![db.clone(), desktop.clone(), ide.clone(), cli_brain.clone()]
     );
     let mut refs = adapter.list_session_files().expect("antigravity list");
     refs.sort_by(|a, b| (&a.native_id, &a.file_path).cmp(&(&b.native_id, &b.file_path)));
@@ -3184,7 +3267,10 @@ fn antigravity_transcripts_replace_index_cards() {
     let roots = |dir: PathBuf| AntigravityAdapter::new().with_custom_root(dir).data_roots();
     assert_eq!(roots(ide.clone()), vec![ide.clone()]);
     assert_eq!(roots(gemini.join("antigravity-ide")), vec![ide.clone()]);
-    assert_eq!(roots(gemini.join("antigravity-cli")), vec![db.clone()]);
+    assert_eq!(
+        roots(gemini.join("antigravity-cli")),
+        vec![db.clone(), cli_brain.clone()]
+    );
 }
 
 // ---------------------------------------------------------------- seq 契约
@@ -7577,4 +7663,42 @@ fn grok_bot_reads_framed_keys_and_custom_roots() {
             .data_roots(),
         vec![copy]
     );
+}
+
+#[test]
+fn codex_reads_both_archive_extensions_and_cleans_all_encodings() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let source = fs::read(&codex_ref().file_path).unwrap();
+    let compressed = zstd::stream::encode_all(source.as_slice(), 0).unwrap();
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let day = home.path().join("sessions/2026/10/26");
+    fs::create_dir_all(&day).unwrap();
+    let plain = day.join("rollout-2026-10-26T12-00-00-00000000-0000-4000-8000-000000000099.jsonl");
+    fs::write(&plain, &source).unwrap();
+    let plain_ref = adapter.file_ref(&plain).unwrap();
+    let expected = adapter.parse_session(&plain_ref).unwrap();
+    for extension in ["zst", "zstd"] {
+        let archive = plain.with_extension(format!("jsonl.{extension}"));
+        fs::write(&archive, &compressed).unwrap();
+        let file_ref = adapter
+            .file_ref(&archive)
+            .expect("archive must be recognized");
+        assert_eq!(file_ref.native_id, plain_ref.native_id);
+        let actual = adapter.parse_session(&file_ref).unwrap();
+        assert_eq!(actual.meta.tokens_used, expected.meta.tokens_used);
+        assert_eq!(actual.meta.message_count, expected.meta.message_count);
+        assert_eq!(
+            fs::read(&archive).unwrap(),
+            compressed,
+            "reading leaves the archive intact"
+        );
+    }
+    assert_eq!(adapter.list_session_files().unwrap().len(), 3);
+    assert_eq!(adapter.session_paths(&expected.meta).len(), 3);
+    let archive = plain.with_extension("jsonl.zstd");
+    let parsed = adapter
+        .parse_session(&adapter.file_ref(&archive).unwrap())
+        .unwrap();
+    assert_eq!(adapter.session_paths(&parsed.meta).len(), 3);
 }

@@ -353,3 +353,64 @@ fn redaction_marker_suffix_never_exempts_a_credential() {
         assert_eq!(sanitize_external_text(&control), control);
     }
 }
+
+/// The vectors the server sanitizer runs too (`ai-memory-core::sanitize`), so
+/// the two copies cannot drift: credentials split by an invisible character,
+/// private-key blocks with and without an end line, and text that must pass
+/// through unchanged.
+#[test]
+fn shared_sanitizer_vectors_hold() {
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/sanitizer_vectors.json"
+    ))
+    .unwrap();
+    let strings = |key: &str| -> Vec<String> {
+        vectors[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect()
+    };
+    for secret in strings("credentials") {
+        let (head, tail) = secret.split_at(secret.len() / 2);
+        for invisible in strings("invisibles") {
+            let out = sanitize_external_text(&format!("key {head}{invisible}{tail} end"));
+            assert!(
+                out.contains("[REDACTED") && !out.contains(head) && !out.contains(tail),
+                "{invisible:?} inside {secret}: {out:?}"
+            );
+            assert!(out.starts_with("key ") && out.ends_with(" end"), "{out:?}");
+        }
+    }
+    let body_line = vectors["key_body_line"].as_str().unwrap();
+    for block in vectors["key_blocks"].as_array().unwrap() {
+        let input = block["input"].as_str().unwrap();
+        let out = sanitize_external_text(input);
+        assert!(
+            out.contains("[REDACTED PRIVATE KEY]") && !out.contains(body_line),
+            "{input:?} -> {out:?}"
+        );
+        for kept in block["kept"].as_array().unwrap() {
+            assert!(out.contains(kept.as_str().unwrap()), "{input:?} -> {out:?}");
+        }
+    }
+    for text in strings("unchanged") {
+        assert_eq!(sanitize_external_text(&text), text);
+    }
+}
+
+#[test]
+fn characters_that_hide_text_or_split_a_credential_are_removed() {
+    let hidden: String = "hidden note"
+        .chars()
+        .map(|c| char::from_u32(0xe0000 + u32::from(c)).unwrap())
+        .collect();
+    assert_eq!(
+        sanitize_external_text(&format!("visible{hidden} text")),
+        "visible text"
+    );
+    // A control character inside a credential no longer keeps it whole.
+    let out = sanitize_external_text("sk-leak-012345\u{0}6789abcdef0123");
+    assert_eq!(out, "[REDACTED CREDENTIAL]");
+}

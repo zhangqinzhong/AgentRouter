@@ -515,6 +515,21 @@ pub fn user_prompt_text(raw: &serde_json::Value) -> Option<String> {
     extract_content(raw, &["prompt", "message", "text"])
 }
 
+/// The submitted user prompt for a specific harness.
+///
+/// Qwen's `prompt` field can also contain a continuation or hook-generated
+/// prompt. Its optional `submitted_prompt` field is the provenance-bearing
+/// value for an actual user submission, so Qwen must never fall back to the
+/// generic field.
+#[must_use]
+pub fn user_prompt_text_for_agent(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    if agent == AgentKind::QwenCode {
+        extract_content(raw, &["submitted_prompt"])
+    } else {
+        user_prompt_text(raw)
+    }
+}
+
 /// Identify the harness from the payload itself when it carries an
 /// unambiguous vendor marker, overriding the `?agent=` the hook command
 /// declared.
@@ -555,6 +570,7 @@ pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
             "sessionID",
             "session",
             "conversationId",
+            "taskId",
         ],
     )
     .or_else(|| {
@@ -573,7 +589,12 @@ pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
         )
     });
     let cwd = extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"])
-        .or_else(|| extract_first_string_array_item(raw, &["workspacePaths", "workspace_roots"]))
+        .or_else(|| {
+            extract_first_string_array_item(
+                raw,
+                &["workspacePaths", "workspace_roots", "workspaceRoots"],
+            )
+        })
         .or_else(|| {
             extract_string_path(
                 raw,
@@ -678,7 +699,7 @@ impl HookEnvelope {
         } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
             legacy_tool_title(event, agent, &raw)
         } else {
-            best_title_hint(event, &raw).or_else(|| {
+            best_title_hint(event, agent, &raw).or_else(|| {
                 source_event
                     .as_deref()
                     .map(|source| extension_title_hint(&raw, source))
@@ -693,7 +714,7 @@ impl HookEnvelope {
         } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
             legacy_tool_body(event, agent, &raw)
         } else {
-            best_body_excerpt(event, &raw).or_else(|| {
+            best_body_excerpt(event, agent, &raw).or_else(|| {
                 source_event
                     .as_deref()
                     .and_then(|_| extension_body_excerpt(&raw))
@@ -848,6 +869,12 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // path.
             | AgentKind::CodeBuddy
             | AgentKind::IbmBob
+            // DSH's Claude Code hooks bridge (`@deepseek-ai/dsh-hooks-claude-code`)
+            // forwards Claude Code's snake_case tool fields for PreToolUse /
+            // PostToolUse.
+            | AgentKind::Dsh
+            | AgentKind::Cline
+            | AgentKind::QwenCode
     )
 }
 
@@ -910,6 +937,12 @@ fn safe_tool_body(
         summary.push_str("\ntool_call_id: ");
         summary.push_str(id);
     }
+    if let Some(mcp) = &metadata.mcp_tool {
+        summary.push_str("\nmcp_server: ");
+        summary.push_str(&mcp.server);
+        summary.push_str("\nmcp_tool: ");
+        summary.push_str(&mcp.tool);
+    }
     match event {
         HookEvent::PreToolUse => Some(summary),
         HookEvent::PostToolUse => {
@@ -941,6 +974,10 @@ fn safe_tool_body(
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/extra/error_message").and_then(value_to_text))
                     .or_else(|| extract_content(raw, &["error"]))
+            } else if agent == AgentKind::Cline {
+                raw.pointer("/tool_result/output")
+                    .and_then(value_to_text)
+                    .or_else(|| raw.pointer("/tool_result/error").and_then(value_to_text))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -1084,14 +1121,23 @@ fn push_candidates<'a>(out: &mut Vec<&'a serde_json::Value>, value: &'a serde_js
     }
 }
 
-fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
+fn best_title_hint(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
     match event {
         HookEvent::SessionStart => extract_string(raw, &["model", "title"]).and_then(first_line),
         HookEvent::UserPrompt => {
             // Kimi Code sends `prompt` as content blocks
             // (`[{"type":"text","text":...}]`); `extract_content` flattens
             // them and returns identical values for plain-string agents.
-            extract_content(raw, &["prompt", "message", "text"]).and_then(first_line)
+            user_prompt_text_for_agent(agent, raw)
+                .or_else(|| {
+                    (agent != AgentKind::QwenCode)
+                        .then(|| {
+                            raw.pointer("/userPromptSubmit/prompt")
+                                .and_then(value_to_text)
+                        })
+                        .flatten()
+                })
+                .and_then(first_line)
         }
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             extract_string(raw, &["tool", "tool_name", "name"])
@@ -1176,9 +1222,20 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
+fn best_body_excerpt(
+    event: HookEvent,
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]),
+        HookEvent::UserPrompt => user_prompt_text_for_agent(agent, raw).or_else(|| {
+            (agent != AgentKind::QwenCode)
+                .then(|| {
+                    raw.pointer("/userPromptSubmit/prompt")
+                        .and_then(value_to_text)
+                })
+                .flatten()
+        }),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -1244,8 +1301,14 @@ pub fn cap_lifecycle_body_for_client(raw: &mut serde_json::Value, event: HookEve
 
 fn core_body_cap(event: HookEvent) -> Option<(&'static [&'static str], usize)> {
     match event {
+        // `submitted_prompt` is Qwen Code's prompt field
+        // (`user_prompt_text_for_agent`), and the only one a Qwen
+        // `UserPromptSubmit` body carries. It is listed here so the field is
+        // capped and scrubbed alongside its siblings; every listed key is
+        // capped independently, so this is not a fallback and leaves the
+        // submission-provenance rule intact.
         HookEvent::UserPrompt => Some((
-            &["prompt", "message", "text"],
+            &["prompt", "message", "text", "submitted_prompt"],
             USER_PROMPT_EXCERPT_MAX_BYTES,
         )),
         HookEvent::Notification => Some((&["message", "text"], NOTIFICATION_EXCERPT_MAX_BYTES)),
@@ -1355,6 +1418,7 @@ mod tests {
             let written = safe_tool_title(&ToolObservationMetadata {
                 tool_family: family,
                 tool_call_id: None,
+                mcp_tool: None,
             });
             assert!(
                 is_safe_tool_title(&written),
@@ -1410,6 +1474,27 @@ mod tests {
         assert!(ProjectSource::RepoRoot.yields_to_session());
         assert!(!ProjectSource::Marker.yields_to_session());
         assert!(!ProjectSource::Unspecified.yields_to_session());
+    }
+
+    #[test]
+    fn cline_context_uses_task_id_and_first_workspace_root() {
+        let raw = serde_json::json!({
+            "taskId": "cline-task-1",
+            "workspaceRoots": ["/work/project", "/work/other"],
+            "userPromptSubmit": {"prompt": "continue the audit"}
+        });
+        let context = hook_payload_context(&raw);
+        assert_eq!(context.session_id.as_deref(), Some("cline-task-1"));
+        assert_eq!(context.cwd.as_deref(), Some("/work/project"));
+        let envelope = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(envelope.body_excerpt.as_deref(), Some("continue the audit"));
     }
 
     #[test]
@@ -2197,6 +2282,9 @@ mod tests {
         assert_eq!(parse_agent("poolside"), AgentKind::Pool);
         assert_eq!(parse_agent("codebuddy"), AgentKind::CodeBuddy);
         assert_eq!(parse_agent("code-buddy"), AgentKind::CodeBuddy);
+        assert_eq!(parse_agent("qwen-code"), AgentKind::QwenCode);
+        assert_eq!(parse_agent("qwen"), AgentKind::QwenCode);
+        assert_eq!(parse_agent("qwencode"), AgentKind::QwenCode);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -2348,6 +2436,49 @@ mod tests {
         assert!(unknown.body_excerpt.is_none());
     }
 
+    /// Qwen Code documents Claude Code's snake_case tool fields, including
+    /// `tool_use_id`. A recognized Qwen payload becomes a closed tool
+    /// observation while an unknown agent carrying identical JSON stays on
+    /// the capture-only path.
+    #[test]
+    fn qwen_code_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "write_file",
+            "tool_use_id": "toolu_qwen",
+            "tool_input": {"file_path": "src/lib.rs", "content": "x"},
+            "tool_response": "wrote file"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("qwen-code".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::QwenCode);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_qwen"), "{body}");
+        assert!(body.contains("\n---\nwrote file"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("qwen-code-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
+    }
+
     /// Hermes 3.x puts the tool result inside `extra.result` and mirrors the
     /// call status in `extra.status` (`ok` | `error`). The extractor must read
     /// both from the documented `extra` object: output lands in the body
@@ -2454,6 +2585,142 @@ mod tests {
             !body.contains("search hit count: 3"),
             "unknown family must not leak output — body: {body}"
         );
+    }
+
+    /// Hermes v0.22.2 names an MCP tool `mcp__<server>__<tool>`
+    /// (`tools/mcp_tool_schema.py` `mcp_prefixed_tool_name`) in the same
+    /// `pre_tool_call` / `post_tool_call` envelope as its own tools. Such a
+    /// call stays an unknown family, so its arguments and result are never
+    /// kept, but its server and tool names are (#1522).
+    #[test]
+    fn hermes_mcp_tool_keeps_its_server_and_tool_names_but_no_input_or_output() {
+        for (event, hermes_event, expected) in [
+            (
+                "pre-tool-use",
+                "pre_tool_call",
+                "tool_family: unknown\ntool_call_id: call_00_2m0e\nmcp_server: aim\nmcp_tool: memory_query",
+            ),
+            (
+                "post-tool-use",
+                "post_tool_call",
+                "tool_family: unknown\ntool_call_id: call_00_2m0e\nmcp_server: aim\nmcp_tool: memory_query\noutcome: success",
+            ),
+        ] {
+            let raw = serde_json::json!({
+                "hook_event_name": hermes_event,
+                "tool_name": "mcp__aim__memory_query",
+                "tool_input": {"query": "SECRET-ARGUMENT"},
+                "session_id": "hermes-session",
+                "cwd": "/repo",
+                "extra": {
+                    "tool_call_id": "call_00_2m0e",
+                    "status": "ok",
+                    "result": "SECRET-RESULT"
+                }
+            });
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("hermes".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert_eq!(env.title_hint.as_deref(), Some("tool unknown"));
+            assert_eq!(env.body_excerpt.as_deref(), Some(expected), "{event}");
+        }
+    }
+
+    /// Every documented `mcp__<server>__<tool>` spelling keeps both names:
+    /// a hyphenated Claude Code server, a Claude Code plugin server, Codex's
+    /// own example and a Hermes name clamped to 64 characters with a hash.
+    #[test]
+    fn mcp_tool_names_from_each_documented_harness_keep_server_and_tool() {
+        for (agent, tool_name, server, tool) in [
+            (
+                "claude-code",
+                "mcp__brave-search__web_search",
+                "brave-search",
+                "web_search",
+            ),
+            (
+                "claude-code",
+                "mcp__plugin_my-plugin_db__query",
+                "plugin_my-plugin_db",
+                "query",
+            ),
+            ("codex", "mcp__fs__read", "fs", "read"),
+            (
+                "hermes",
+                "mcp__plugin_bridge_team_server__list_open_pull_requests_1a2b3c4d",
+                "plugin_bridge_team_server",
+                "list_open_pull_requests_1a2b3c4d",
+            ),
+        ] {
+            let mut raw = serde_json::json!({
+                "tool_name": tool_name,
+                "tool_input": {"path": "/etc/SECRET"},
+                "tool_use_id": "call-1",
+                "tool_response": "SECRET-OUTPUT",
+            });
+            if agent == "hermes" {
+                raw["extra"] =
+                    serde_json::json!({"tool_call_id": "call-1", "result": "SECRET-OUTPUT"});
+            }
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PreToolUse".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some(
+                    format!(
+                        "tool_family: unknown\ntool_call_id: call-1\nmcp_server: {server}\nmcp_tool: {tool}"
+                    )
+                    .as_str()
+                ),
+                "{agent} {tool_name}"
+            );
+        }
+    }
+
+    /// A name that is not exactly the documented MCP shape keeps no name at
+    /// all, as before: an older Hermes `mcp_<server>_<tool>` cannot be split,
+    /// and free text, over-long names and empty halves are refused.
+    #[test]
+    fn names_outside_the_mcp_shape_keep_no_tool_identity() {
+        for tool_name in [
+            "mcp_github_create_issue",
+            "mcp__server",
+            "mcp____tool",
+            "mcp__server__",
+            "MCP__server__tool",
+            "mcp__my server__tool",
+            "mcp__srv__tool\nsecret",
+            "mcp__srv__tool.read",
+            "mcp__srv/path__tool",
+            "mcp__s\u{e9}rver__tool",
+            &format!("mcp__srv__{}", "t".repeat(55)),
+            "brand_new_tool",
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PreToolUse".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"tool_name": tool_name, "tool_input": {}, "tool_use_id": "call-1"}),
+            );
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some("tool_family: unknown\ntool_call_id: call-1"),
+                "{tool_name:?}"
+            );
+        }
     }
 
     /// Real Hermes execution-surface tools classify as non-file so their
@@ -2926,6 +3193,103 @@ mod tests {
         assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
     }
 
+    /// A Qwen Code `UserPromptSubmit` body carries its prompt only in
+    /// `submitted_prompt` (`user_prompt_text_for_agent`), so that field must
+    /// be scrubbed and capped before the native hook spools the body, exactly
+    /// like the `prompt` / `message` / `text` siblings.
+    #[test]
+    fn client_body_cap_covers_qwen_submitted_prompt() {
+        // AWS access key id shape: a built-in pattern.
+        let secret = format!("AKIA{}", "A".repeat(16));
+        let mut raw = serde_json::json!({
+            "session_id": "qwen-session",
+            "submitted_prompt": format!(
+                "{} {secret}",
+                "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES - 14)
+            ),
+        });
+        assert!(
+            cap_lifecycle_body_for_client(&mut raw, HookEvent::UserPrompt),
+            "oversized Qwen submitted_prompt left the body unchanged"
+        );
+        let capped = raw["submitted_prompt"]
+            .as_str()
+            .expect("oversized submitted_prompt capped");
+        assert!(
+            capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES,
+            "submitted_prompt exceeds the per-event cap: {} bytes",
+            capped.len()
+        );
+        assert!(capped.ends_with('…'), "submitted_prompt not truncated");
+        assert!(
+            !capped.contains("AKIA"),
+            "unredacted secret fragment survived the cap: {capped:?}"
+        );
+        assert!(
+            capped.contains("[REDACTED:"),
+            "capped submitted_prompt carries no redaction marker: {capped:?}"
+        );
+    }
+
+    /// Capping is size-triggered: a Qwen prompt within the limit reaches the
+    /// spool byte-for-byte, and the body is reported unchanged so the hook
+    /// keeps the original serialization.
+    #[test]
+    fn client_body_cap_leaves_normal_qwen_submitted_prompt_untouched() {
+        let mut raw = serde_json::json!({
+            "session_id": "qwen-session",
+            "submitted_prompt": "MARKER_QWEN_USER_PROMPT",
+        });
+        assert!(!cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        assert_eq!(raw["submitted_prompt"], "MARKER_QWEN_USER_PROMPT");
+    }
+
+    /// `submitted_prompt` joins the `UserPrompt` arm only: the other harnesses'
+    /// fields keep capping as before, and the `Notification` /
+    /// `PostCompaction` arms are untouched by the new key.
+    #[test]
+    fn client_body_cap_keeps_other_harness_and_event_caps() {
+        let oversized = "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1);
+        let mut raw = serde_json::json!({ "prompt": oversized.clone() });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        let capped = raw["prompt"].as_str().expect("oversized prompt capped");
+        assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+        assert!(capped.ends_with('…'));
+
+        let mut notification = serde_json::json!({
+            "message": "y".repeat(NOTIFICATION_EXCERPT_MAX_BYTES + 1),
+            "submitted_prompt": oversized.clone(),
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut notification,
+            HookEvent::Notification
+        ));
+        assert!(
+            notification["message"]
+                .as_str()
+                .expect("oversized notification message capped")
+                .len()
+                <= NOTIFICATION_EXCERPT_MAX_BYTES
+        );
+        assert_eq!(
+            notification["submitted_prompt"], oversized,
+            "submitted_prompt must not be capped outside the UserPrompt arm"
+        );
+
+        let mut compaction = serde_json::json!({ "submitted_prompt": oversized.clone() });
+        assert!(!cap_lifecycle_body_for_client(
+            &mut compaction,
+            HookEvent::PostCompaction
+        ));
+        assert_eq!(compaction["submitted_prompt"], oversized);
+    }
+
     /// Kimi Code's content-block `prompt` must flatten into the title
     /// exactly like the body excerpt does.
     #[test]
@@ -3277,6 +3641,41 @@ mod tests {
         assert_eq!(env.body_excerpt.as_deref(), Some("MARKER_PROMPT_789"));
     }
 
+    #[test]
+    fn qwen_user_prompt_uses_only_submission_provenance() {
+        let query = HookQuery {
+            event: "user-prompt-submit".into(),
+            agent: Some("qwen-code".into()),
+            ..Default::default()
+        };
+        let envelope = HookEnvelope::from_query_and_body(
+            query.clone(),
+            serde_json::json!({
+                "session_id": "qwen-session",
+                "prompt": "AUTOMATED_CONTINUATION_MUST_NOT_BE_CAPTURED",
+                "submitted_prompt": "MARKER_QWEN_USER_PROMPT"
+            }),
+        );
+        assert_eq!(
+            envelope.title_hint.as_deref(),
+            Some("MARKER_QWEN_USER_PROMPT")
+        );
+        assert_eq!(
+            envelope.body_excerpt.as_deref(),
+            Some("MARKER_QWEN_USER_PROMPT")
+        );
+
+        let automated = HookEnvelope::from_query_and_body(
+            query,
+            serde_json::json!({
+                "session_id": "qwen-session",
+                "prompt": "AUTOMATED_CONTINUATION_MUST_NOT_BE_CAPTURED"
+            }),
+        );
+        assert!(automated.title_hint.is_none());
+        assert!(automated.body_excerpt.is_none());
+    }
+
     // Native fields and canonical tool names follow Codex rust-v0.154.0's
     // pre/post-tool-use schemas. `tool_response` accepts any JSON value.
     #[test]
@@ -3382,7 +3781,13 @@ mod tests {
                 assert!(env.body_excerpt.is_none());
             }
         }
-        for tool in ["mcp__fs__read", "update_plan", "UNPROVEN_TOOL"] {
+        for (tool, identity) in [
+            // An MCP tool keeps its validated names (#1522), never its input
+            // or output.
+            ("mcp__fs__read", "\nmcp_server: fs\nmcp_tool: read"),
+            ("update_plan", ""),
+            ("UNPROVEN_TOOL", ""),
+        ] {
             let env = HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: "PostToolUse".into(),
@@ -3393,7 +3798,12 @@ mod tests {
             );
             assert_eq!(
                 env.body_excerpt.as_deref(),
-                Some("tool_family: unknown\ntool_call_id: call-unknown\noutcome: unknown")
+                Some(
+                    format!(
+                        "tool_family: unknown\ntool_call_id: call-unknown{identity}\noutcome: unknown"
+                    )
+                    .as_str()
+                )
             );
         }
         for response in [

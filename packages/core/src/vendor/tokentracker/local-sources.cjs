@@ -59,6 +59,8 @@ async function collectAdditionalSources({home,cursors,queuePath,projectQueuePath
  async function run(source,task){try{results[source]=await task()}catch(error){throw new Error(`Local ${source} collection failed: ${error.message}`,{cause:error})}}
  await run('openclaw',async()=>rollout.parseOpenclawIncremental({...common,sessionFiles:await rollout.resolveOpenclawSessionFiles(env),source:'openclaw'}));
  await run('grok',async()=>rollout.parseGrokBuildIncremental({...common,sessions:rollout.resolveGrokBuildSessions(env)}));
+ await runOptional(results,'muse',async()=>{const files=rollout.resolveMuseSessionFiles(env);return files.length?rollout.parseMuseIncremental({...common,sessionFiles:files}):{}});
+ await runOptional(results,'opensquilla',async()=>{const dbPaths=rollout.resolveOpenSquillaDbPaths(env).filter((dbPath)=>fs.existsSync(dbPath));return dbPaths.length?rollout.parseOpenSquillaIncremental({dbPaths,cursors,queuePath}):{}});
  await run('lmstudio',async()=>rollout.parseLmstudioIncremental({...common,logFiles:await rollout.resolveLmstudioLogFiles(env)}));
  await run('gemini',async()=>rollout.parseGeminiIncremental({...common,sessionFiles:await rollout.listGeminiSessionFiles(path.join(env.GEMINI_HOME||path.join(home,'.gemini'),'tmp')),source:'gemini'}));
  const data=home===require('node:os').homedir()?(process.env.XDG_DATA_HOME||path.join(home,'.local/share')):path.join(home,'.local/share');

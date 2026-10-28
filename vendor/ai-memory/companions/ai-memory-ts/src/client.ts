@@ -30,6 +30,7 @@ import {
   record,
   relatedPage,
   requiredList,
+  sessionActivity,
   statusCounts,
   str,
   untrusted,
@@ -395,7 +396,15 @@ export class HandoffsNamespace {
       options,
     );
     const o = record(decoded, "memory_handoff_list");
-    return { handoffs: requiredList(o, "handoffs", "memory_handoff_list", handoff), raw: o };
+    const newer = o["newer_unended_session"];
+    return {
+      handoffs: requiredList(o, "handoffs", "memory_handoff_list", handoff),
+      newerUnendedSession:
+        newer === undefined || newer === null
+          ? undefined
+          : sessionActivity(newer, "memory_handoff_list.newer_unended_session"),
+      raw: o,
+    };
   }
 
   /**
@@ -698,6 +707,10 @@ export class AiMemoryClient {
       limit: a.limit,
       include_expired: a.includeExpired === true ? true : undefined,
       explain: a.explain === true ? true : undefined,
+      kind: a.kind,
+      tier: a.tier,
+      path_prefix: a.pathPrefix,
+      tag: a.tag,
     };
     let wireArgs: Record<string, unknown>;
     const isGlobal = a.global === true;
@@ -825,7 +838,8 @@ export class AiMemoryClient {
 
   /**
    * A session's captured observations (prompts, tool calls), paged. Omit
-   * `sessionId` for the latest completed session. Calls
+   * `sessionId` for the newest other session with captured work, ended or
+   * cut off. Calls
    * `memory_read_session_observations`.
    */
   async observations(args?: ObservationsArgs, options?: CallOptions): Promise<ObservationsResult> {

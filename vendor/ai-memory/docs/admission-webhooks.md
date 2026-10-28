@@ -442,7 +442,7 @@ under the webhook's `timeout_ms`.
 
 ## 10. Tests
 
-`crates/ai-memory-wiki/tests/admission.rs` covers the wire contract end
+`crates/ai-memory-wiki/tests/suite/admission.rs` covers the wire contract end
 to end against an axum loopback server. Categories:
 
 - Mutating frontmatter and body propagates correctly.

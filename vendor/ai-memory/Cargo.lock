@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -55,15 +55,18 @@ dependencies = [
  "figment",
  "flate2",
  "fs2",
+ "http",
  "jiff",
  "jsonc-parser",
  "libc",
  "parking_lot",
  "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "rmcp",
  "rstest",
  "rusqlite",
  "rustls",
+ "ruzstd",
  "secrecy",
  "serde",
  "serde_json",
@@ -81,6 +84,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-width",
  "uuid",
  "windows-registry",
  "zip",
@@ -88,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -115,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "icu_normalizer",
  "jiff",
@@ -131,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -155,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -169,6 +173,7 @@ dependencies = [
  "git2",
  "icu_normalizer",
  "jiff",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -176,13 +181,14 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -211,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -247,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -273,11 +279,11 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.1.2"
+version = "3.2.5"
 
 [[package]]
 name = "ai-memory-web"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -304,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -336,12 +342,14 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.1.2"
+version = "3.2.5"
 dependencies = [
  "ai-memory-core",
  "anyhow",
  "jiff",
+ "libc",
  "rusqlite",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2",
@@ -3491,9 +3499,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -3505,6 +3513,12 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 
 [[package]]
 name = "ryu"
@@ -4136,9 +4150,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -4730,9 +4744,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]

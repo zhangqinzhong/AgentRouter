@@ -29,8 +29,9 @@ use crate::auto_improve::{
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
     self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
-    ObservationPruneOutcome, PagesMode, PurgeSummary, ReorgSummary,
+    IdleEndCandidate, IdleEndResult, IngestObservationOutcome, LifecycleOnlyEndOutcome,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSummary,
+    ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -222,6 +223,22 @@ pub(crate) enum WriteCmd {
     EndLifecycleOnlySession {
         session_id: SessionId,
         reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
+    },
+    EndIdleSessions {
+        candidates: Vec<IdleEndCandidate>,
+        enqueue_consolidation: bool,
+        reply: oneshot::Sender<StoreResult<Vec<IdleEndResult>>>,
+    },
+    /// Test-only: [`WriteCmd::EndIdleSessions`] with a pre-stamp hook that
+    /// runs on the writer connection BEFORE each candidate's stamp
+    /// transaction opens, racing an effect into the window between the
+    /// tick's page write and the stamp.
+    #[cfg(test)]
+    EndIdleSessionsPreStamp {
+        candidates: Vec<IdleEndCandidate>,
+        enqueue_consolidation: bool,
+        pre_stamp: Box<dyn FnMut(&mut Connection) + Send>,
+        reply: oneshot::Sender<StoreResult<Vec<IdleEndResult>>>,
     },
     SweepHollowProjects {
         min_age_days: u32,
@@ -717,6 +734,10 @@ pub(crate) enum WriteCmd {
     },
     TouchApiCredential {
         id: ApiCredentialId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    BindApiCredentialPepperVerifier {
+        verifier: String,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     TouchUserLastSeen {
@@ -1471,6 +1492,52 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndLifecycleOnlySession {
             session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// End a batch of idle sessions the server-side tick selected
+    /// ([`crate::reader::ReaderPool::idle_open_sessions`]), one writer
+    /// command per tick. See [`ops::idle_end_sessions`] for the guarded-
+    /// write and watermark semantics; a lost candidate (a real `SessionEnd`
+    /// won the race) is reported, never an error.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors.
+    pub async fn end_idle_sessions(
+        &self,
+        candidates: Vec<IdleEndCandidate>,
+        enqueue_consolidation: bool,
+    ) -> StoreResult<Vec<IdleEndResult>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndIdleSessions {
+            candidates,
+            enqueue_consolidation,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Test-only: [`Self::end_idle_sessions`] with a `pre_stamp` hook that
+    /// runs on the writer connection BEFORE each candidate's stamp
+    /// transaction opens — not inside it — so a test can race a real effect
+    /// into the window between the tick's page write and the stamp without
+    /// sleeps.
+    #[cfg(test)]
+    pub async fn end_idle_sessions_pre_stamp(
+        &self,
+        candidates: Vec<IdleEndCandidate>,
+        enqueue_consolidation: bool,
+        pre_stamp: Box<dyn FnMut(&mut rusqlite::Connection) + Send>,
+    ) -> StoreResult<Vec<IdleEndResult>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndIdleSessionsPreStamp {
+            candidates,
+            enqueue_consolidation,
+            pre_stamp,
             reply: tx,
         })
         .await?;
@@ -3237,6 +3304,20 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record the Argon2id verifier for the configured native-key pepper.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn bind_api_credential_pepper_verifier(&self, verifier: String) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::BindApiCredentialPepperVerifier {
+            verifier,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Update `last_seen_at = now()` for the user. Called fire-and-forget
     /// by the auth middleware on every authenticated request. Returns
     /// `false` when the user doesn't exist (caller authenticated against
@@ -3943,6 +4024,30 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::EndLifecycleOnlySession { session_id, reply } => {
                 let result = ops::end_lifecycle_only_session(&mut conn, &session_id);
                 send_or_warn(reply, result, "end_lifecycle_only_session");
+            }
+            WriteCmd::EndIdleSessions {
+                candidates,
+                enqueue_consolidation,
+                reply,
+            } => {
+                let result = ops::idle_end_sessions(&mut conn, &candidates, enqueue_consolidation);
+                send_or_warn(reply, result, "idle_end_sessions");
+            }
+            #[cfg(test)]
+            WriteCmd::EndIdleSessionsPreStamp {
+                candidates,
+                enqueue_consolidation,
+                pre_stamp,
+                reply,
+            } => {
+                let mut pre_stamp = pre_stamp;
+                let result = ops::idle_end_sessions_pre_stamp(
+                    &mut conn,
+                    &candidates,
+                    enqueue_consolidation,
+                    &mut pre_stamp,
+                );
+                send_or_warn(reply, result, "idle_end_sessions_pre_stamp");
             }
             WriteCmd::SweepHollowProjects {
                 min_age_days,
@@ -4764,6 +4869,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::TouchApiCredential { id, reply } => {
                 let result = api_credentials::touch_api_credential(&conn, id);
                 send_or_warn(reply, result, "touch_api_credential");
+            }
+            WriteCmd::BindApiCredentialPepperVerifier { verifier, reply } => {
+                let result = api_credentials::bind_api_credential_pepper_verifier(&conn, &verifier);
+                send_or_warn(reply, result, "bind_api_credential_pepper_verifier");
             }
             WriteCmd::TouchUserLastSeen { user_id, reply } => {
                 let result = users::touch_user_last_seen(&conn, user_id);

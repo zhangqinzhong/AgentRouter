@@ -86,10 +86,38 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
     if let Some(warning) = resp.manifest_warning.as_deref() {
         eprintln!("ai-memory: warning: {warning}");
     }
-    let short_id = &resp.page_id[..resp.page_id.len().min(8)];
     println!(
         "✓ wrote {} (page_id={}) under {}/{}",
-        resp.path, short_id, workspace, project
+        resp.path,
+        short_page_id(&resp.page_id),
+        workspace,
+        project
     );
     Ok(())
+}
+
+/// The last eight characters of a page id, for display. Page ids are UUIDv7,
+/// whose leading characters are a timestamp that pages written close together
+/// share.
+pub(crate) fn short_page_id(id: &str) -> &str {
+    let start = id.char_indices().rev().nth(7).map_or(0, |(i, _)| i);
+    &id[start..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_page_id;
+
+    #[test]
+    fn short_page_id_keeps_the_random_tail() {
+        assert_eq!(
+            short_page_id("01a16f89-8ca9-7f40-8847-eb44e095e3ea"),
+            "e095e3ea"
+        );
+        assert_eq!(
+            short_page_id("01a16f89-eb81-70a2-8ba4-c84c5783b7fb"),
+            "5783b7fb"
+        );
+        assert_eq!(short_page_id("abc"), "abc");
+    }
 }

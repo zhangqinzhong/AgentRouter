@@ -75,6 +75,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             axum::routing::get(session_observations_handler),
         )
         .route("/graph", axum::routing::get(graph_handler))
+        .route(
+            "/workspaces/{workspace}/projects/{project}/graph",
+            axum::routing::get(project_graph_handler),
+        )
         .with_state(state)
 }
 
@@ -123,20 +127,67 @@ async fn workspaces_handler(
 /// Cross-project dependency graph: every resolved link whose endpoints are
 /// in different projects, each carrying both endpoints' workspace/project/
 /// path. The UI builds nodes from the endpoints (and may aggregate to a
-/// project-level dependency graph). Global for now; project scoping is a
-/// follow-up query param. With authorization on, only edges whose both ends
+/// project-level dependency graph). Omit `workspace`/`project` for the
+/// whole graph; pass both to keep edges that touch that project. Partial
+/// scope is refused. With authorization on, only edges whose both ends
 /// the viewer may read (#708).
 async fn graph_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    Query(query): Query<GraphQuery>,
 ) -> Result<Response, Response> {
+    let viewer = viewer_of(viewer);
+    let scope = match (
+        trimmed_opt(query.workspace.as_deref()),
+        trimmed_opt(query.project.as_deref()),
+    ) {
+        (None, None) => None,
+        (Some(workspace), Some(project)) => {
+            let (workspace_id, project_id) =
+                lookup_project(&state, workspace, project, viewer).await?;
+            Some((workspace_id, project_id))
+        }
+        _ => {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "workspace and project must be provided together",
+            ));
+        }
+    };
     let edges = state
         .reader
-        .cross_project_edges(None, viewer_of(viewer))
+        .cross_project_edges(scope, viewer)
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
         Json(serde_json::json!({ "edges": edges })).into_response(),
+        LIST_CACHE_MAX_AGE,
+    ))
+}
+
+/// In-project link graph: latest unexpired pages and the resolved
+/// wikilinks among them. Same read grant as the project page list.
+async fn project_graph_handler(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    Path((workspace, project)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
+    let graph = state
+        .reader
+        .project_link_graph(workspace_id, project_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(with_cache(
+        Json(serde_json::json!({
+            "workspace": workspace,
+            "project": project,
+            "truncated": graph.truncated,
+            "nodes": graph.nodes,
+            "edges": graph.edges,
+        }))
+        .into_response(),
         LIST_CACHE_MAX_AGE,
     ))
 }
@@ -414,9 +465,13 @@ async fn search_with_request(
     }
     .map_err(internal_error)?;
 
-    Ok(with_cache(
+    // `owner` reaches the hybrid ranker, which attaches an observation excerpt
+    // only from a session that filter admits, so both the order and each hit's
+    // snippet depend on the caller's identity. `private` alone would let a
+    // browser cache replay one actor's hits at the same URL after the
+    // credentials switch, so the filtering path must run on every request.
+    Ok(with_no_store(
         Json(enrich_hits(state, hits).await?).into_response(),
-        LIST_CACHE_MAX_AGE,
     ))
 }
 
@@ -1306,7 +1361,7 @@ async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSear
                 path: meta.path,
                 project: meta.project_name,
                 rank: hit.rank,
-                snippet: hit.snippet,
+                snippet: ai_memory_store::highlighted_snippet_html(&hit.snippet),
                 title: hit.title,
                 workspace: meta.workspace_name,
             });
@@ -1356,6 +1411,14 @@ const MAX_SEARCH_SCOPES: usize = 25;
 struct ProjectListQuery {
     #[serde(default)]
     workspace: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQuery {
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug)]

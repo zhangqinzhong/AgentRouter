@@ -42,6 +42,11 @@ struct MoveSessionRequest {
 /// unknown session/target, 409 guard or page collision, 422 batch source
 /// equal to the destination).
 pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.from_workspace.as_deref(), "--from-workspace")?;
+    super::refuse_empty_explicit(args.from_project.as_deref(), "--from-project")?;
+    super::refuse_empty_explicit(args.to_workspace.as_deref(), "--to-workspace")?;
+    super::refuse_empty_explicit(Some(args.to.as_str()), "--to")?;
+
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
 
     // The batch source is a scope like any other command's: marker, else
@@ -264,14 +269,26 @@ fn apply_command(args: &MoveSessionArgs) -> String {
         cmd.push_str(&id.to_string());
     }
     if let Some(project) = &args.from_project {
-        cmd.push_str(&format!(" --from-project {project}"));
+        cmd.push_str(&format!(
+            " --from-project {}",
+            super::render_shared::native_shell_quote(project)
+        ));
     }
     if let Some(ws) = &args.from_workspace {
-        cmd.push_str(&format!(" --from-workspace {ws}"));
+        cmd.push_str(&format!(
+            " --from-workspace {}",
+            super::render_shared::native_shell_quote(ws)
+        ));
     }
-    cmd.push_str(&format!(" --to {}", args.to));
+    cmd.push_str(&format!(
+        " --to {}",
+        super::render_shared::native_shell_quote(&args.to)
+    ));
     if let Some(ws) = &args.to_workspace {
-        cmd.push_str(&format!(" --to-workspace {ws}"));
+        cmd.push_str(&format!(
+            " --to-workspace {}",
+            super::render_shared::native_shell_quote(ws)
+        ));
     }
     if args.pages != "move" {
         cmd.push_str(&format!(" --pages {}", args.pages));
@@ -329,6 +346,59 @@ mod tests {
             apply_command(&a),
             "ai-memory move-session --from-project ghost --from-workspace default --to target \
              --force --create --confirm"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_from_project_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let a = args(None, Some("   "));
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--from-project was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_from_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = args(None, Some("src"));
+        a.from_workspace = Some("".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--from-workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_to_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = args(None, Some("src"));
+        a.to = "   ".into();
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--to was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_to_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = args(None, Some("src"));
+        a.to_workspace = Some("   ".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--to-workspace was passed empty"),
+            "unexpected error: {error}"
         );
     }
 }

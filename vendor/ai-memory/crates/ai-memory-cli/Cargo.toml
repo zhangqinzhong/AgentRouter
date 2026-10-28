@@ -49,10 +49,12 @@ socket2 = "0.6.3"
 clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true
+unicode-width.workspace = true
 dirs.workspace = true
 figment.workspace = true
 flate2.workspace = true
 fs2.workspace = true
+http.workspace = true
 libc.workspace = true
 # `transport-streamable-http-client-reqwest` pulls reqwest in with no TLS backend
 # (`__reqwest = ["dep:reqwest"]` and nothing more), so the bridge could not reach an
@@ -76,6 +78,11 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
     "reqwest-tls-no-provider",
 ] }
+# The reqwest 0.13 that rmcp's client transport is built on, named so the bridge
+# can hand rmcp its own client (`mcp_bridge::upstream_transport`) instead of
+# rmcp's default, which reads `HTTP_PROXY` and friends. No features of its own:
+# rmcp's choice above is the whole TLS setup.
+reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false }
 rustls = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -100,6 +107,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 ai-memory-test-support.workspace = true
+ruzstd.workspace = true
 tempfile.workspace = true
 rstest.workspace = true
 rusqlite.workspace = true

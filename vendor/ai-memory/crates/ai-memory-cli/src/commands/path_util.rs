@@ -88,6 +88,22 @@ pub(crate) fn claude_config_paths(
     paths
 }
 
+/// `path` as shown to the operator: without a safe `\\?\` verbatim prefix,
+/// which the canonical data dir carries on Windows and which `cmd` and most
+/// scripts cannot use when the path is copied out of a message.
+pub(crate) fn display_path(path: &Path) -> String {
+    strip_windows_verbatim_prefix(&path.to_string_lossy())
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// Strip only Windows verbatim path prefixes that are safe to render as plain
 /// paths. Unknown verbatim forms are left unchanged.
 pub(crate) fn strip_windows_verbatim_prefix(path: &str) -> Cow<'_, str> {
@@ -158,6 +174,28 @@ mod tests {
                 Path::new("settings.json"),
             ),
             [PathBuf::from("/home/alice/.claude/settings.json")]
+        );
+    }
+
+    #[test]
+    fn display_path_drops_the_verbatim_prefix() {
+        assert_eq!(
+            display_path(Path::new(
+                r"\\?\C:\Users\me\AppData\Local\ai-memory\auth.json"
+            )),
+            r"C:\Users\me\AppData\Local\ai-memory\auth.json"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\ai-memory")),
+            r"\\server\share\ai-memory"
+        );
+        assert_eq!(
+            display_path(Path::new("/home/alice/.local/share/ai-memory")),
+            "/home/alice/.local/share/ai-memory"
+        );
+        assert_eq!(
+            display_path(Path::new("/tmp/line\nbreak")),
+            "/tmp/line?break"
         );
     }
 

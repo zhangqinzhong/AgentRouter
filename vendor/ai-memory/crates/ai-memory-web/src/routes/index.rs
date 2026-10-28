@@ -113,15 +113,42 @@ fn okf_dialog(state: &WebState) -> Option<OkfDialog> {
 
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    // One decimal: 1023.95 KB renders as 1024.0. Carry while the formatted
+    // magnitude would still be 1024.0. Stopping at `value < 1024.0` leaves
+    // that sliver printing a size the unit cannot hold (1 MB − 51 bytes came
+    // out as `1024.0 KB` on the migration dialog).
+    while (value * 10.0).round() >= 10_240.0 && unit < UNITS.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_bytes;
+
+    /// A size just under a unit boundary rounds up at one decimal, so it must
+    /// carry to the next unit rather than print a magnitude that unit cannot
+    /// hold. The migration dialog reported `1024.0 KB` for 1 MB − 51 bytes.
+    #[test]
+    fn human_bytes_carries_a_value_that_would_round_up_to_the_next_unit() {
+        for n in 1_048_525..=1_048_575 {
+            assert_eq!(human_bytes(n), "1.0 MB", "{n}");
+        }
+        assert_eq!(human_bytes(1024 * 1024 * 1024 - 51), "1.0 GB");
+        // Controls: a value that does not reach the boundary stays put.
+        assert_eq!(human_bytes(1_048_524), "1023.9 KB");
+        assert_eq!(human_bytes(1_047_976), "1023.4 KB");
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
     }
 }

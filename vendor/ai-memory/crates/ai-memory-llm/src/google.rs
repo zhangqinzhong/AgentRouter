@@ -9,9 +9,10 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::embedding::{Embedder, normalise, retry_delay};
+use crate::embedding::{Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, retry_delay};
 use crate::error::{LlmError, LlmResult};
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
+use crate::text::truncate_for_embedding;
 
 /// Default Gemini API host.
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -74,6 +75,13 @@ impl GoogleEmbedder {
         } else {
             text.to_string()
         };
+        // `gemini-embedding-001`, the default, takes at most 2,048 input tokens
+        // and the API does not document whether a longer input is cut or
+        // refused; `embed_page_version` only logs a refusal, which would leave
+        // the page with no vector. The 8 KB head cut stays near that limit for
+        // prose. Applied after the embedding-2 prefix so it bounds the whole
+        // input. <https://ai.google.dev/gemini-api/docs/embeddings>
+        let prepared = truncate_for_embedding(&prepared, OPENAI_EMBED_MAX_TOKENS);
 
         let url = embed_url(&self.base_url, &self.model);
         let body = GeminiEmbedRequest {
@@ -110,11 +118,7 @@ impl GoogleEmbedder {
                 continue;
             }
             if !status.is_success() {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(provider_error(resp).await);
             }
             let parsed: GeminiEmbedResponse = response_json_limited(resp).await?;
             let values = parsed.embedding.values;
@@ -260,6 +264,58 @@ mod tests {
     fn v2_document_and_query_prefixes() {
         assert!(format_document_v2("hello").contains("text: hello"));
         assert!(format_query_v2("find auth").contains("query: find auth"));
+    }
+
+    #[derive(Clone)]
+    struct AssertBoundedInput;
+
+    impl Respond for AssertBoundedInput {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+                Ok(value) => value,
+                Err(err) => {
+                    return ResponseTemplate::new(500).set_body_string(format!("bad body: {err}"));
+                }
+            };
+            let text = body["content"]["parts"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            if text.len() > 8_000 {
+                return ResponseTemplate::new(500).set_body_string(format!(
+                    "unbounded embedContent input: {} bytes",
+                    text.len()
+                ));
+            }
+            if !text.ends_with('\u{2026}') {
+                return ResponseTemplate::new(500)
+                    .set_body_string("expected the truncation ellipsis");
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embedding": { "values": [1.0, 0.0, 0.0] }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_content_bounds_a_long_input() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-001:embedContent"))
+            .respond_with(AssertBoundedInput)
+            .mount(&server)
+            .await;
+
+        let embedder =
+            GoogleEmbedder::new(SecretString::from("test-key"), "gemini-embedding-001", 3)
+                .expect("google embedder builds")
+                .with_base_url(server.uri());
+
+        let embedding = embedder
+            .embed_document(&"word ".repeat(8_000))
+            .await
+            .expect("a long page is bounded before the request");
+
+        assert_eq!(embedding, vec![1.0, 0.0, 0.0]);
     }
 
     #[tokio::test]

@@ -101,6 +101,40 @@ pub fn looks_like_codex_instructions(candidate: &str) -> bool {
         })
 }
 
+/// `true` when `cwd` is Codex's own memory directory — `$CODEX_HOME/memories`,
+/// which is `~/.codex/memories` by default.
+///
+/// Codex runs a background "memory writing agent" from that directory: its
+/// own sessions, prompts and tool calls, which are the harness maintaining
+/// itself rather than the person working (#1674). Matched on the last two
+/// components so a non-default `CODEX_HOME` is recognized too.
+#[must_use]
+pub fn is_codex_memory_agent_cwd(cwd: &str) -> bool {
+    // Split on both separators: the check must answer the same on the host that
+    // produced the path and on a host reading it from a log or a test.
+    let normalized = cwd.replace('\\', "/");
+    let mut components = normalized.trim_end_matches('/').rsplit('/');
+    let (Some(memories), Some(codex_home)) = (components.next(), components.next()) else {
+        return false;
+    };
+    memories.eq_ignore_ascii_case("memories") && codex_home.eq_ignore_ascii_case(".codex")
+}
+
+/// `true` when `candidate` opens with the header Codex's background memory
+/// agent sends as its single prompt: `## Memory Writing Agent: Phase 2
+/// (Consolidation)` and its siblings.
+///
+/// The header is the second, cwd-independent signal: a `CODEX_HOME` outside
+/// the home directory still names the agent's own run, and a SessionStart
+/// carries no prompt at all.
+#[must_use]
+pub fn looks_like_codex_memory_agent_prompt(candidate: &str) -> bool {
+    candidate
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("## memory writing agent")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +228,45 @@ mod tests {
     fn empty_or_blank_is_scaffolding() {
         assert!(looks_like_scaffolding(""));
         assert!(looks_like_scaffolding("   "));
+    }
+
+    #[test]
+    fn codex_memory_directory_is_recognized_on_every_platform() {
+        for cwd in [
+            "/home/u/.codex/memories",
+            "/home/u/.codex/memories/",
+            "C:\\Users\\u\\.codex\\memories",
+            "/opt/agent/.CODEX/Memories",
+            "/Users/u/codex-home/.codex/memories",
+            "/home/u/.config/.codex/memories",
+        ] {
+            assert!(is_codex_memory_agent_cwd(cwd), "{cwd}");
+        }
+        for cwd in [
+            "/home/u/.codex",
+            "/home/u/.codex/sessions",
+            "/home/u/project/memories",
+            "/home/u/codex/memories",
+            "",
+        ] {
+            assert!(!is_codex_memory_agent_cwd(cwd), "{cwd}");
+        }
+    }
+
+    #[test]
+    fn codex_memory_agent_header_is_recognized() {
+        for prompt in [
+            "## Memory Writing Agent: Phase 2 (Consolidation)\n\n...",
+            "  ## memory writing agent: phase 1",
+        ] {
+            assert!(looks_like_codex_memory_agent_prompt(prompt), "{prompt}");
+        }
+        for prompt in [
+            "Please update the memory writing agent docs",
+            "# Memory Writing Agent",
+            "",
+        ] {
+            assert!(!looks_like_codex_memory_agent_prompt(prompt), "{prompt}");
+        }
     }
 }

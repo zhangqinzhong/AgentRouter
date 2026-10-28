@@ -92,6 +92,13 @@ enum ServicePlan {
     Skip(String),
 }
 
+#[derive(Debug)]
+enum SetupProbe {
+    Healthy,
+    Unreachable(String),
+    Unexpected(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentPlan {
     agent: AgentChoice,
@@ -182,6 +189,7 @@ fn skills_for(agent: AgentChoice) -> InstallSkillsAgent {
         AgentChoice::CopilotCli => InstallSkillsAgent::CopilotCli,
         AgentChoice::Devin => InstallSkillsAgent::Devin,
         AgentChoice::Hermes => InstallSkillsAgent::Hermes,
+        AgentChoice::AntigravityCli => InstallSkillsAgent::Antigravity,
         _ => InstallSkillsAgent::Agents,
     }
 }
@@ -238,6 +246,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         if let Some(dir) = ibm_bob_detected(&home) {
             found.push((AgentChoice::IbmBob, Found::ConfigDir(dir)));
         }
+        if let Some(dir) = qwen_code_detected(&home) {
+            found.push((AgentChoice::QwenCode, Found::ConfigDir(dir)));
+        }
         found
             .into_iter()
             .map(|(agent, found)| (agent, Some(found)))
@@ -258,15 +269,13 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
             home: home.clone(),
             xdg_config_home: env("XDG_CONFIG_HOME").map(PathBuf::from),
         };
-        let reachable = matches!(
-            probe_server(&ServerEndpoint::from_config_resolving_auth(config).await).await,
-            ServerProbe::Reachable
-        );
+        let probe =
+            probe_setup_server(&ServerEndpoint::from_config_resolving_auth(config).await).await;
         plan_service(
             ServiceManager::current(),
             &spec,
             &config.server_url,
-            reachable,
+            &probe,
             &user_service::SystemRunner,
         )
     };
@@ -423,6 +432,13 @@ fn ibm_bob_detected(home: &Path) -> Option<PathBuf> {
     Some(home.join(".bob")).filter(|dir| dir.is_dir())
 }
 
+/// Qwen Code's directory, `~/.qwen`, when it exists. Qwen has no
+/// native-session adapter, so setup finds it by that directory rather than
+/// by [`detect_agents`].
+fn qwen_code_detected(home: &Path) -> Option<PathBuf> {
+    Some(home.join(".qwen")).filter(|dir| dir.is_dir())
+}
+
 /// The binary path the service unit runs. A package manager's versioned
 /// location (a Homebrew `Cellar/<formula>/<version>` or a `/nix/store` path)
 /// disappears on the next upgrade or `brew cleanup` / garbage collection, so a
@@ -487,14 +503,15 @@ fn homebrew_links(resolved: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// Decide the service step. A server already answering with no unit of ours
+/// Decide the service step. An ai-memory server answering with no unit of ours
 /// in place is left in charge (Docker, a packaged unit, a foreground
-/// `serve`): a second server could not bind the port anyway.
+/// `serve`). An unrecognized listener also prevents a bind, but needs an
+/// actionable diagnostic rather than being treated as our server.
 fn plan_service(
     manager: Option<ServiceManager>,
     spec: &user_service::ServiceSpec,
     server_url: &str,
-    reachable: bool,
+    probe: &SetupProbe,
     runner: &dyn CommandRunner,
 ) -> ServicePlan {
     let Some(manager) = manager else {
@@ -504,16 +521,29 @@ fn plan_service(
                 .to_owned(),
         );
     };
-    if !super::hook_spool::is_loopback_url(server_url) {
+    if !crate::http_client::is_loopback_url(server_url) {
         return ServicePlan::Skip(format!(
             "the configured server {server_url} is not on this machine; no local service"
         ));
     }
+    if let SetupProbe::Unexpected(reason) = probe {
+        return ServicePlan::Skip(format!(
+            "{server_url} did not return ai-memory's /healthz JSON ({reason}); leaving the \
+             listener and any existing service unchanged. Check which process owns this address, \
+             then free it or set `bind = \"127.0.0.1:<free-port>\"` in {} and re-run \
+             `ai-memory setup` (update an explicit server_url too). OpenCode's background \
+             service also uses port 49374 by default; move it with \
+             `opencode service set port <free-port>` if it is the occupant.",
+            spec.config_path.display()
+        ));
+    }
     match user_service::render(manager, spec) {
-        Ok(unit) if reachable && !unit.exists(runner) => ServicePlan::Skip(format!(
-            "a server already answers at {server_url}; leaving it in charge (pass --no-service \
+        Ok(unit) if matches!(probe, SetupProbe::Healthy) && !unit.exists(runner) => {
+            ServicePlan::Skip(format!(
+                "an ai-memory server already answers at {server_url}; leaving it in charge (pass --no-service \
              to skip this check)"
-        )),
+            ))
+        }
         Ok(unit) => ServicePlan::Install(unit),
         Err(error) => ServicePlan::Skip(format!("cannot render the service: {error:#}")),
     }
@@ -1045,17 +1075,18 @@ fn wire_mcp_and_hooks(
 async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
     let mut problems = Vec::new();
     let healthz = endpoint.build_url("/healthz");
-    match reqwest::Client::new()
-        .get(&healthz)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => println!("healthz: ok ({healthz})"),
-        Ok(response) => problems.push(format!("{healthz} answered {}", response.status())),
-        Err(error) => {
+    match probe_setup_server(endpoint).await {
+        SetupProbe::Healthy => println!("healthz: ok ({healthz})"),
+        SetupProbe::Unreachable(error) => {
             problems.push(format!("{healthz} did not answer: {error}"));
             // Nothing else can pass without a server.
+            return problems;
+        }
+        SetupProbe::Unexpected(reason) => {
+            problems.push(format!(
+                "{healthz} did not return ai-memory's /healthz JSON ({reason}); check the \
+                 configured server URL and the process listening there"
+            ));
             return problems;
         }
     }
@@ -1075,20 +1106,65 @@ async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
     problems
 }
 
+/// Setup needs the health response before it can leave an existing server
+/// in charge or report success. The shared launch probe remains presence-only
+/// for compatibility with servers that predate `/healthz`.
+async fn probe_setup_server(endpoint: &ServerEndpoint) -> SetupProbe {
+    let response = reqwest::Client::new()
+        .get(endpoint.build_url("/healthz"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return SetupProbe::Unreachable(error.to_string()),
+    };
+    match validate_healthz(response).await {
+        Ok(()) => SetupProbe::Healthy,
+        Err(reason) => SetupProbe::Unexpected(reason),
+    }
+}
+
+async fn validate_healthz(mut response: reqwest::Response) -> Result<(), String> {
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    if !response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err("expected Content-Type application/json".to_owned());
+    }
+    // A foreign listener can return a whole page (or a stream). Bound its
+    // body and never echo it into the terminal.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if body.len().saturating_add(chunk.len()) > 1024 {
+            return Err("health response exceeds 1024 bytes".to_owned());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|value| value["status"] == "ok")
+    {
+        Ok(())
+    } else {
+        Err("expected JSON with status \"ok\"".to_owned())
+    }
+}
+
 /// One `memory_status` call over the server's MCP endpoint, authenticated the
 /// way `mcp-bridge` authenticates, so a refused credential shows here rather
 /// than in the agent's first session.
 async fn memory_status(config: &Config) -> Result<()> {
     use rmcp::ServiceExt as _;
     use rmcp::model::CallToolRequestParams;
-    use rmcp::transport::StreamableHttpClientTransport;
 
     let url = install_mcp::mcp_server_url_from_base(&config.server_url);
-    let transport = StreamableHttpClientTransport::from_config(super::mcp_bridge::upstream_config(
-        &url,
-        None,
-        config.auth.bearer_token.as_deref(),
-    )?);
+    let transport =
+        super::mcp_bridge::upstream_transport(&url, None, config.auth.bearer_token.as_deref())?;
     let client = ().serve(transport).await.with_context(|| format!("connecting to {url}"))?;
     let result = client
         .peer()
@@ -1156,6 +1232,25 @@ mod tests {
             InstallSkillsAgent::Agents
         );
         assert_eq!(AgentPlan::new(AgentChoice::CodeBuddy, None).mcp, None);
+    }
+
+    #[test]
+    fn qwen_code_is_detected_and_wires_hooks_mcp_and_shared_skills() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(qwen_code_detected(home.path()), None);
+        std::fs::create_dir_all(home.path().join(".qwen")).unwrap();
+        assert_eq!(
+            qwen_code_detected(home.path()),
+            Some(home.path().join(".qwen"))
+        );
+        assert_eq!(
+            skills_for(AgentChoice::QwenCode),
+            InstallSkillsAgent::Agents
+        );
+        assert_eq!(
+            AgentPlan::new(AgentChoice::QwenCode, None).mcp,
+            Some(McpClient::QwenCode)
+        );
     }
 
     #[test]
@@ -1571,6 +1666,11 @@ mod tests {
             InstallSkillsAgent::CopilotCli
         );
         assert_eq!(skills_for(AgentChoice::Codex), InstallSkillsAgent::Agents);
+        // Antigravity has no global `~/.agents/skills`; it reads its own roots.
+        assert_eq!(
+            skills_for(AgentChoice::AntigravityCli),
+            InstallSkillsAgent::Antigravity
+        );
         assert_eq!(
             skills_for(AgentChoice::KimiCode),
             InstallSkillsAgent::Agents
@@ -1635,7 +1735,7 @@ mod tests {
             None,
             &spec(tmp.path()),
             "http://127.0.0.1:49374",
-            false,
+            &SetupProbe::Unreachable(String::new()),
             &user_service::SystemRunner,
         ) else {
             panic!("expected a skip");
@@ -1671,11 +1771,11 @@ mod tests {
             ..spec(tmp.path())
         };
         assert!(matches!(
-            plan_service(manager, &spec, url, false, &Reg(None)),
+            plan_service(manager, &spec, url, &SetupProbe::Unreachable(String::new()), &Reg(None)),
             ServicePlan::Install(unit) if unit.manager == ServiceManager::WindowsRun
         ));
         assert!(matches!(
-            plan_service(manager, &spec, url, true, &Reg(None)),
+            plan_service(manager, &spec, url, &SetupProbe::Healthy, &Reg(None)),
             ServicePlan::Skip(reason) if reason.contains("already answers")
         ));
         assert!(matches!(
@@ -1683,7 +1783,7 @@ mod tests {
                 manager,
                 &spec,
                 url,
-                true,
+                &SetupProbe::Healthy,
                 &Reg(Some("\"C:\\ai\\ai-memory.exe\" service-host"))
             ),
             ServicePlan::Install(_)
@@ -1697,7 +1797,7 @@ mod tests {
             Some(ServiceManager::SystemdUser),
             &spec(tmp.path()),
             "https://memory.example.com",
-            true,
+            &SetupProbe::Healthy,
             &user_service::SystemRunner,
         );
         assert!(
@@ -1719,7 +1819,7 @@ mod tests {
             Some(ServiceManager::SystemdUser),
             &spec,
             url,
-            true,
+            &SetupProbe::Healthy,
             &user_service::SystemRunner,
         );
         assert!(matches!(plan, ServicePlan::Skip(reason) if reason.contains("already answers")));
@@ -1728,7 +1828,7 @@ mod tests {
             Some(ServiceManager::SystemdUser),
             &spec,
             url,
-            false,
+            &SetupProbe::Unreachable(String::new()),
             &user_service::SystemRunner,
         ) else {
             panic!("expected an install when nothing answers");
@@ -1740,10 +1840,114 @@ mod tests {
                 Some(ServiceManager::SystemdUser),
                 &spec,
                 url,
-                true,
+                &SetupProbe::Healthy,
                 &user_service::SystemRunner
             ),
             ServicePlan::Install(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn setup_health_probe_requires_successful_bounded_json() {
+        use axum::http::StatusCode;
+
+        for (status, content_type, body, healthy) in [
+            (
+                StatusCode::OK,
+                "application/json",
+                r#"{"status":"ok"}"#.to_owned(),
+                true,
+            ),
+            (
+                StatusCode::OK,
+                "application/json; charset=utf-8",
+                r#"{"status":"ok","extra":1}"#.to_owned(),
+                true,
+            ),
+            (
+                StatusCode::OK,
+                "text/html",
+                r#"{"status":"ok"}"#.to_owned(),
+                false,
+            ),
+            (
+                StatusCode::OK,
+                "application/json",
+                "<!doctype html>".to_owned(),
+                false,
+            ),
+            (
+                StatusCode::OK,
+                "application/json",
+                r#"{"status":"down"}"#.to_owned(),
+                false,
+            ),
+            (
+                StatusCode::OK,
+                "application/json",
+                r#"{"other":"ok"}"#.to_owned(),
+                false,
+            ),
+            (StatusCode::OK, "application/json", " ".repeat(1025), false),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                r#"{"status":"ok"}"#.to_owned(),
+                false,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = axum::Router::new().route(
+                "/memory/healthz",
+                axum::routing::get(move || async move {
+                    (
+                        status,
+                        [(axum::http::header::CONTENT_TYPE, content_type)],
+                        body,
+                    )
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let endpoint =
+                ServerEndpoint::from_pair(Some(format!("http://{address}/memory")), None);
+            let probe = probe_setup_server(&endpoint).await;
+            server.abort();
+            assert_eq!(
+                matches!(probe, SetupProbe::Healthy),
+                healthy,
+                "{status} {content_type}: {probe:?}"
+            );
+            if !healthy {
+                assert!(matches!(probe, SetupProbe::Unexpected(_)), "{probe:?}");
+            }
+        }
+    }
+
+    /// An unhealthy response still means the port is occupied. Do not
+    /// install a second service or restart an existing one over that listener.
+    #[cfg(unix)]
+    #[test]
+    fn an_unrecognized_listener_prevents_service_changes_even_with_an_existing_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(tmp.path());
+        let unit = user_service::render(ServiceManager::SystemdUser, &spec).unwrap();
+        for existing in [false, true] {
+            if existing {
+                std::fs::create_dir_all(unit.path.parent().unwrap()).unwrap();
+                std::fs::write(&unit.path, &unit.contents).unwrap();
+            }
+            let plan = plan_service(
+                Some(ServiceManager::SystemdUser),
+                &spec,
+                "http://127.0.0.1:49374",
+                &SetupProbe::Unexpected("HTTP 503 Service Unavailable".to_owned()),
+                &user_service::SystemRunner,
+            );
+            assert!(
+                matches!(plan, ServicePlan::Skip(reason) if reason.contains("did not return ai-memory's /healthz"))
+            );
+            assert_eq!(unit.path.exists(), existing);
+        }
     }
 }

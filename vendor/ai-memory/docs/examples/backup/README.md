@@ -1,8 +1,9 @@
 # Remote git backup example
 
 Sample scripts + unit files that push an ai-memory install to a remote git
-repository on a daily cadence, keeping a tarball on a second location for the
-SQLite index and models cache that the mirror repo deliberately excludes.
+repository on a daily cadence, keeping an online `ai-memory backup` snapshot
+on a second location for the SQLite state that the mirror repo deliberately
+excludes. Models remain redownloadable and are not backed up.
 
 See [`docs/backup.md`](../../backup.md) for the walkthrough. The pieces in this
 directory are:
@@ -77,4 +78,9 @@ private repository, a fine-grained token scoped to that one repo (or an SSH
 deploy key), and rotate credentials the same way you rotate any other
 long-lived push credential. The script never commits files matched by
 `SECRET_EXCLUDES` (default: `*.env`, `auth.json`, `.secrets`, `*.pem`, `*.key`, `*.crt`); the mirror
-repo's `.gitignore` catches anything the rsync exclude missed.
+repo's `.gitignore` catches anything the rsync exclude missed. The separate
+online snapshot may include `<data_dir>/config.toml`, including secrets stored
+inline there, and always contains private memory data. The git mirror can also
+include inline secrets from the copied config directory because filename globs
+cannot redact TOML values. Inspect or encrypt both outputs and protect them as
+secret-bearing artifacts.

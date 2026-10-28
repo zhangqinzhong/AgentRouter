@@ -7,7 +7,7 @@
 //! wrong slot — closes the structural gap that `memory_delete_page`
 //! (MCP) had until this milestone.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::DeletePageArgs;
@@ -34,6 +34,12 @@ struct DeletePageResponseBody {
 /// failure, scope resolution failure, admission webhook rejecting the
 /// delete, or filesystem error).
 pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    if args.path.trim().is_empty() {
+        bail!("--path was passed empty; specify the wiki page path to delete");
+    }
+
     // Resolve the project the same way write-page/read-page do: explicit
     // flag wins, otherwise derive the current project from host cwd / repo
     // root. Keeps delete + read-back pairs targeting the same project.
@@ -56,4 +62,51 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
     let status = if resp.deleted { "✓ deleted" } else { "no-op" };
     println!("{} {} under {}/{}", status, resp.path, workspace, project);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(path: &str, project: Option<&str>) -> DeletePageArgs {
+        DeletePageArgs {
+            path: path.into(),
+            workspace: None,
+            project: project.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let a = args("notes/example.md", Some("   "));
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = args("notes/example.md", Some("app"));
+        a.workspace = Some("".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_path_is_refused_before_any_request() {
+        let config = Config::default();
+        let a = args("   ", Some("app"));
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--path was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
 }

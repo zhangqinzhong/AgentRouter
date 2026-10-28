@@ -555,7 +555,8 @@ pub async fn create_explicit_scope_guarded(
     let _ = reader;
     refuse_foreign_profile_name(Some(workspace), project, viewer)?;
     let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
-    create_project_in_workspace_guarded(writer, workspace_id, project, viewer, true).await
+    create_project_in_workspace_guarded(writer, workspace_id, workspace, project, viewer, true)
+        .await
 }
 
 /// Refusal for an explicit write that names a profile project it does not own.
@@ -594,9 +595,11 @@ fn refuse_foreign_profile_name(
 }
 
 /// [`create_explicit_scope_guarded`] for a workspace already resolved by id.
+/// `workspace` is that workspace's name, used only in error messages.
 async fn create_project_in_workspace_guarded(
     writer: &WriterHandle,
     workspace_id: WorkspaceId,
+    workspace: &str,
     project: &str,
     viewer: Option<UserId>,
     promote: bool,
@@ -621,7 +624,7 @@ async fn create_project_in_workspace_guarded(
             )
             .await
     }
-    .map_err(|error| project_lookup_error(error, "the resolved workspace", project))?;
+    .map_err(|error| project_lookup_error(error, workspace, project))?;
     let scope = ResolvedScope {
         workspace_id,
         project_id: resolved.project_id,
@@ -713,7 +716,7 @@ pub async fn lookup_profile_scope(
 /// private profile is requested without a database user; store failures
 /// otherwise.
 pub async fn create_profile_scope(
-    _reader: &ReaderPool,
+    reader: &ReaderPool,
     writer: &WriterHandle,
     share: ai_memory_core::profile::EffectiveProfileShare,
     workspace_id: WorkspaceId,
@@ -728,6 +731,7 @@ pub async fn create_profile_scope(
             create_project_in_workspace_guarded(
                 writer,
                 workspace_id,
+                ai_memory_core::DEFAULT_WORKSPACE_NAME,
                 ai_memory_core::GLOBAL_SCOPE_PROJECT,
                 viewer,
                 false,
@@ -735,15 +739,22 @@ pub async fn create_profile_scope(
             .await
             .map(|resolved| resolved.scope)
         }
-        EffectiveProfileShare::Workspace => create_project_in_workspace_guarded(
-            writer,
-            workspace_id,
-            WORKSPACE_PROFILE_PROJECT,
-            viewer,
-            false,
-        )
-        .await
-        .map(|resolved| resolved.scope),
+        EffectiveProfileShare::Workspace => {
+            let workspace = reader
+                .workspace_name_by_id(workspace_id)
+                .await?
+                .unwrap_or_else(|| workspace_id.to_string());
+            create_project_in_workspace_guarded(
+                writer,
+                workspace_id,
+                &workspace,
+                WORKSPACE_PROFILE_PROJECT,
+                viewer,
+                false,
+            )
+            .await
+            .map(|resolved| resolved.scope)
+        }
         EffectiveProfileShare::User => {
             let Some(viewer) = viewer else {
                 return Err(ScopeResolutionError::Forbidden(
@@ -756,6 +767,7 @@ pub async fn create_profile_scope(
             create_project_in_workspace_guarded(
                 writer,
                 workspace_id,
+                ai_memory_core::DEFAULT_WORKSPACE_NAME,
                 &ai_memory_core::profile::user_profile_project(viewer),
                 Some(viewer),
                 false,

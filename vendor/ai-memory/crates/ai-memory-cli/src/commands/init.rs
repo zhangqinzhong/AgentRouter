@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::cli::InitArgs;
+use crate::commands::path_util::display_path;
 use crate::config::Config;
 use ai_memory_mcp::auth::generate_token_hex;
 
@@ -107,7 +108,7 @@ fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<Rec
     println!(
         "Generated a root bearer token in {} (owner-only). The server requires it on every \
          route but /healthz; hooks, the CLI and `ai-memory mcp-bridge` read it from there.",
-        minted.path.display()
+        display_path(&minted.path)
     );
     Ok(Some(RecordedBearer {
         raw: crate::server_profiles::ROOT_TOKEN_RELATIVE.to_owned(),
@@ -169,12 +170,13 @@ pub(crate) fn initialize(
     // way it did.
     let fresh = !cfg_path.exists() && !root.join("db").join(ai_memory_store::DB_FILENAME).exists();
     create_private_dir_all(root)
-        .with_context(|| format!("creating data root {}", root.display()))?;
+        .with_context(|| format!("creating data root {}", display_path(root)))?;
 
     for sub in SUBDIRS {
         let path = root.join(sub);
-        create_private_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
-        tracing::info!(path = %path.display(), "ensured directory");
+        create_private_dir_all(&path)
+            .with_context(|| format!("creating {}", display_path(&path)))?;
+        tracing::info!(path = %display_path(&path), "ensured directory");
     }
 
     let mut outcome = InitOutcome {
@@ -184,13 +186,13 @@ pub(crate) fn initialize(
     };
     if cfg_path.exists() && !args.force {
         tracing::info!(
-            path = %cfg_path.display(),
+            path = %display_path(&cfg_path),
             "config already exists; leaving untouched (pass --force to overwrite)",
         );
     } else {
         if let Some(parent) = cfg_path.parent() {
             create_private_dir_all(parent)
-                .with_context(|| format!("creating config dir {}", parent.display()))?;
+                .with_context(|| format!("creating config dir {}", display_path(parent)))?;
         }
         // Pepper is generated NOW (not at first server start) so it's
         // stable from install onwards: see comment in render_default_
@@ -211,10 +213,10 @@ pub(crate) fn initialize(
             bearer_line
         );
         let mut f = private_config_file(&cfg_path, args.force)
-            .with_context(|| format!("creating {}", cfg_path.display()))?;
+            .with_context(|| format!("creating {}", display_path(&cfg_path)))?;
         f.write_all(body.as_bytes())
-            .with_context(|| format!("writing {}", cfg_path.display()))?;
-        tracing::info!(path = %cfg_path.display(), "wrote default config");
+            .with_context(|| format!("writing {}", display_path(&cfg_path)))?;
+        tracing::info!(path = %display_path(&cfg_path), "wrote default config");
         outcome.config_written = true;
     }
 

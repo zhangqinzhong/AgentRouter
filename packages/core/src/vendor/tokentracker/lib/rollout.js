@@ -5223,16 +5223,21 @@ function buildV2Sql(sessionTable, watermark = null) {
 // sessionTable (which session table exists, session_v2 preferred over session
 // via DESC). Returns null when the probe itself fails — callers treat that as
 // v1-only, matching the pre-existing silent-degradation contract.
-function detectOpencodeMessageLayout(dbPath, sqliteOptions = {}) {
+function detectOpencodeMessageLayout(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   let rows;
   try {
     rows = readSqliteJsonRows(
       dbPath,
       `SELECT (SELECT 1 FROM session_message LIMIT 1) AS hasRows,
               (SELECT name FROM sqlite_master WHERE name IN ('session','session_v2') ORDER BY name DESC LIMIT 1) AS sessionTable`,
-      { label: "OpenCode", timeout: 10_000, maxBuffer: 1024 * 1024, ...sqliteOptions },
+      { label: "OpenCode", timeout: 10_000, maxBuffer: 1024 * 1024, ...sqliteOptions, throwOnReadFailure: true },
     );
-  } catch (_e) {
+  } catch (error) {
+    // A missing session_message table is the normal v1-only miss; with
+    // propagateReadFailure a real read failure must reach the caller — the
+    // session scanner would otherwise skip the v2 generation silently and
+    // cache a zero-token inventory over a readable-in-principle database.
+    if (propagateReadFailure && !isMissingSqliteTableError(error)) throw error;
     return null;
   }
   if (!Array.isArray(rows) || rows.length === 0) return null;
@@ -5252,7 +5257,17 @@ function opencodeMessageProvider(data) {
   return data?.providerID || data?.model?.providerID || "";
 }
 
-function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqliteOptions = {}) {
+// readSqliteJsonRows wraps its two backend errors into the thrown Error, so a
+// "table genuinely absent" miss and a "database unreadable" failure look the
+// same to a caller that only catches. Both backends spell a missing table
+// "no such table" — use that to keep the normal miss on the tolerant path
+// while real read failures can propagate.
+function isMissingSqliteTableError(error) {
+  const messages = [error?.message, error?.cliError?.message, error?.nodeSqliteError?.message];
+  return messages.some((m) => typeof m === "string" && m.includes("no such table"));
+}
+
+function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   if (!dbPath || !fssync.existsSync(dbPath)) return { messages: [], cursor: null };
 
   const identity = opencodeDbIdentity(dbPath);
@@ -5319,7 +5334,11 @@ function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqlite
         throwOnReadFailure: true,
       });
       return Array.isArray(rows) ? rows : [];
-    } catch (_e) {
+    } catch (error) {
+      // A missing table is the normal "other generation's layout" miss; an
+      // unreadable database is not — with propagateReadFailure the session
+      // scan aborts instead of caching a zero-token inventory over it.
+      if (propagateReadFailure && !isMissingSqliteTableError(error)) throw error;
       return null; // query-level failure (e.g. wrong generation's table)
     }
   };
@@ -5397,7 +5416,7 @@ function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqlite
     // baseline every database carries or degrades to), v2 runs only when the
     // probe confirms session_message has rows — this avoids firing a JOIN
     // against a non-existent session table on type-A databases.
-    const probe = detectOpencodeMessageLayout(effectiveDbPath, sqliteOptions);
+    const probe = detectOpencodeMessageLayout(effectiveDbPath, sqliteOptions, { propagateReadFailure });
     const out = [];
     const nextCursor = {
       version: OPENCODE_DB_CURSOR_VERSION,
@@ -5437,8 +5456,8 @@ function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqlite
   }
 }
 
-function readOpencodeDbMessages(dbPath, sqliteOptions = {}) {
-  return readOpencodeDbMessagesIncremental(dbPath, null, sqliteOptions).messages;
+function readOpencodeDbMessages(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
+  return readOpencodeDbMessagesIncremental(dbPath, null, sqliteOptions, { propagateReadFailure }).messages;
 }
 
 // mimocode mirrors the user's Claude Code + claude-mem history into its own
@@ -5465,9 +5484,9 @@ function isMimoNativeMessage(data) {
 
 // Read only genuine mimo assistant messages (mimo's own models), dropping the
 // mirrored Claude/claude-mem rows. See isMimoNativeMessage for why.
-function readMimoDbMessages(dbPath, sqliteOptions = {}) {
+function readMimoDbMessages(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   if (!dbPath || !fssync.existsSync(dbPath)) return [];
-  const all = readOpencodeDbMessages(dbPath, sqliteOptions);
+  const all = readOpencodeDbMessages(dbPath, sqliteOptions, { propagateReadFailure });
   return all.filter((m) => isMimoNativeMessage(m.data));
 }
 
@@ -5554,7 +5573,7 @@ const ZCODE_NATIVE_USAGE_COLUMNS = new Set([
   "cache_read_input_tokens",
 ]);
 
-function detectZcodeNativeUsageLayout(dbPath, sqliteOptions = {}) {
+function detectZcodeNativeUsageLayout(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   if (!dbPath || !fssync.existsSync(dbPath)) return null;
   let rows;
   try {
@@ -5571,7 +5590,11 @@ function detectZcodeNativeUsageLayout(dbPath, sqliteOptions = {}) {
         throwOnReadFailure: true,
       },
     );
-  } catch (_error) {
+  } catch (error) {
+    // propagateReadFailure: an unreadable db is a failure, not "no native
+    // layout" — the session scanner must skip the file, not fall back to an
+    // empty legacy read and cache zero tokens.
+    if (propagateReadFailure) throw error;
     return null;
   }
   const modelUsageColumns = new Set(
@@ -5641,7 +5664,13 @@ function buildZcodeNativeUsageSql({ hasSessionDirectory }) {
     ORDER BY mu.started_at ASC, mu.id ASC`;
 }
 
-function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
+// `propagateReadFailure` (off by default): when the native usage layout is
+// present but its row query fails, throw instead of returning null. The usage
+// queue treats that fallthrough as "no native table, use legacy" — correct for
+// its own resilience — but the session scanner must not cache a zero-token
+// inventory over a failed read (the browser then hides the sessions entirely
+// instead of reporting the db as skipped).
+function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   let snapshot = null;
   let effectiveDbPath = dbPath;
   if (isUncPath(dbPath)) {
@@ -5656,7 +5685,7 @@ function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
 
   let rows;
   try {
-    const layout = detectZcodeNativeUsageLayout(effectiveDbPath, sqliteOptions);
+    const layout = detectZcodeNativeUsageLayout(effectiveDbPath, sqliteOptions, { propagateReadFailure });
     if (!layout) return null;
     rows = readSqliteJsonRows(effectiveDbPath, buildZcodeNativeUsageSql(layout), {
       label: "ZCode",
@@ -5665,7 +5694,8 @@ function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
       ...sqliteOptions,
       throwOnReadFailure: true,
     });
-  } catch (_error) {
+  } catch (error) {
+    if (propagateReadFailure) throw error;
     return null;
   } finally {
     if (snapshot) snapshot.cleanup();
@@ -5717,10 +5747,10 @@ function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
 // table is authoritative from its first completed row onward, but it is not a
 // historical backfill. Keep legacy rows before that boundary so merely adding
 // the new table cannot make older usage disappear from TokenTracker.
-function readZcodeDbMessages(dbPath, sqliteOptions = {}) {
+function readZcodeDbMessages(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   if (!dbPath || !fssync.existsSync(dbPath)) return [];
-  const nativeMessages = readZcodeNativeUsageMessages(dbPath, sqliteOptions);
-  const legacyMessages = readOpencodeDbMessages(dbPath, sqliteOptions)
+  const nativeMessages = readZcodeNativeUsageMessages(dbPath, sqliteOptions, { propagateReadFailure });
+  const legacyMessages = readOpencodeDbMessages(dbPath, sqliteOptions, { propagateReadFailure })
     .filter((message) => isZcodeNativeMessage(message.data))
     .map(normalizeZcodeLegacyMessage);
   if (nativeMessages === null) return legacyMessages;
@@ -12812,6 +12842,279 @@ async function parseLmstudioIncremental({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OpenSquilla
+//
+// Read only the finalized usage ledger's model rows. Transcript entries and
+// message content are not needed for token attribution and are never selected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const OPENSQUILLA_SOURCE = "opensquilla";
+
+function resolveOpenSquillaPath(value, home) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return null;
+  if (raw === "~") return path.resolve(home);
+  if (raw.startsWith("~/") || raw.startsWith("~\\")) {
+    return path.resolve(home, raw.slice(2));
+  }
+  return path.resolve(raw);
+}
+
+function resolveOpenSquillaDbPaths(env = process.env, deps = {}) {
+  const home = deps.home || env.HOME || env.USERPROFILE || os.homedir();
+  const platform = deps.platform || process.platform;
+  const dbOverride = resolveOpenSquillaPath(env.TOKENTRACKER_OPENSQUILLA_DB, home);
+  if (dbOverride) return [dbOverride];
+
+  const gatewayStateDir = resolveOpenSquillaPath(env.OPENSQUILLA_GATEWAY_STATE_DIR, home);
+  if (gatewayStateDir) return [path.join(gatewayStateDir, "sessions.db")];
+
+  const stateHome = resolveOpenSquillaPath(env.OPENSQUILLA_STATE_DIR, home);
+  if (stateHome) return [path.join(stateHome, "state", "sessions.db")];
+
+  const profileHomeOverride = typeof env.OPENSQUILLA_HOME === "string"
+    ? env.OPENSQUILLA_HOME.trim()
+    : "";
+  const profileOverride = typeof env.OPENSQUILLA_PROFILE === "string"
+    ? env.OPENSQUILLA_PROFILE.trim()
+    : "";
+  if (profileHomeOverride || profileOverride) {
+    const profilesRoot = resolveOpenSquillaPath(
+      profileHomeOverride || path.join(home, ".opensquilla", "profiles"),
+      home,
+    );
+    const profile = profileOverride || "default";
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(profile)) return [];
+    return [path.join(profilesRoot, profile, "state", "sessions.db")];
+  }
+
+  const paths = [path.join(home, ".opensquilla", "state", "sessions.db")];
+  let userDataRoot;
+  if (platform === "win32") {
+    userDataRoot = env.APPDATA || path.join(home, "AppData", "Roaming");
+  } else if (platform === "darwin") {
+    userDataRoot = path.join(home, "Library", "Application Support");
+  } else {
+    userDataRoot = env.XDG_CONFIG_HOME || path.join(home, ".config");
+  }
+  paths.unshift(path.join(
+    userDataRoot,
+    "@opensquilla",
+    "desktop-electron",
+    "opensquilla",
+    "state",
+    "sessions.db",
+  ));
+
+  const seen = new Set();
+  return paths.filter((dbPath) => {
+    const resolved = path.resolve(dbPath);
+    const key = platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function readOpenSquillaUsageRows(dbPath, sqliteOptions = {}) {
+  if (!dbPath || !fssync.existsSync(dbPath)) return [];
+  const options = {
+    label: "OpenSquilla",
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: 30_000,
+    ...sqliteOptions,
+    readOnly: true,
+    throwOnReadFailure: true,
+  };
+  const tables = new Set(
+    (await readSqliteJsonRowsAsync(
+      dbPath,
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('usage_events','usage_event_items')",
+      options,
+    )).map((row) => row?.name).filter(Boolean),
+  );
+  if (!tables.has("usage_events") || !tables.has("usage_event_items")) return [];
+  const sql = [
+    "SELECT e.event_id, e.completed_at_ms, i.ordinal,",
+    "COALESCE(i.model, e.model) AS model, i.input_tokens, i.output_tokens,",
+    "i.reasoning_tokens, i.cache_read_tokens, i.cache_write_tokens, i.total_tokens",
+    "FROM usage_events AS e",
+    "JOIN usage_event_items AS i ON i.event_id = e.event_id",
+    "WHERE e.status = 'finalized' AND e.completed_at_ms IS NOT NULL",
+    "ORDER BY e.completed_at_ms, e.event_id, i.ordinal",
+  ].join(" ");
+  return readSqliteJsonRowsAsync(dbPath, sql, options);
+}
+
+function normalizeOpenSquillaUsageRow(row) {
+  const eventId = typeof row?.event_id === "string" ? row.event_id.trim() : "";
+  if (!eventId || row?.ordinal == null) return null;
+
+  // OpenSquilla stores input as a cache-inclusive total and reasoning as an
+  // output subset; normalize both before writing TokenTracker queue rows.
+  const totals = normalizeLocalStudioTokens({
+    input_tokens: row.input_tokens,
+    output_tokens: row.output_tokens,
+    reasoning_tokens: row.reasoning_tokens,
+    cached_tokens: row.cache_read_tokens,
+    cache_creation_input_tokens: row.cache_write_tokens,
+    total_tokens: row.total_tokens,
+  });
+  const timestampMs = coerceEpochMs(row.completed_at_ms);
+  const bucketStart = timestampMs
+    ? toUtcHalfHourStart(new Date(timestampMs).toISOString())
+    : null;
+  if (!totals || !bucketStart) return null;
+
+  return {
+    key: "opensquilla:" + eventId + ":" + String(toNonNegativeInt(row.ordinal)),
+    model: normalizeModelInput(row.model) || DEFAULT_MODEL,
+    bucketStart,
+    totals,
+  };
+}
+
+async function parseOpenSquillaIncremental({
+  dbPaths,
+  cursors,
+  queuePath,
+  onProgress,
+  env,
+  sqliteOptions,
+} = {}) {
+  await ensureDir(path.dirname(queuePath));
+  const priorState = cursors.opensquilla && typeof cursors.opensquilla === "object"
+    ? cursors.opensquilla
+    : {};
+  // Copy before mutate so a failed queue append leaves committed cursors intact.
+  const messages = priorState.messages && typeof priorState.messages === "object"
+    ? { ...priorState.messages }
+    : {};
+  const fingerprints = priorState.fingerprints && typeof priorState.fingerprints === "object"
+    ? { ...priorState.fingerprints }
+    : {};
+  const requestedPaths = Array.isArray(dbPaths) && dbPaths.length
+    ? dbPaths
+    : resolveOpenSquillaDbPaths(env || process.env);
+  const seenPaths = new Set();
+  const availablePaths = requestedPaths.filter((dbPath) => {
+    if (typeof dbPath !== "string" || !dbPath.trim() || !fssync.existsSync(dbPath)) return false;
+    const resolved = path.resolve(dbPath);
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seenPaths.has(key)) return false;
+    seenPaths.add(key);
+    return true;
+  });
+  // No currently readable DB is treated as temporary unavailability — keep
+  // prior observations rather than wiping totals.
+  if (availablePaths.length === 0) {
+    cursors.opensquilla = { ...priorState, messages, fingerprints, updatedAt: new Date().toISOString() };
+    return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+  }
+
+  const pathFingerprints = new Map();
+  let databaseChanged = false;
+  const currentPathKeys = new Set();
+  for (const dbPath of availablePaths) {
+    const key = path.resolve(dbPath);
+    currentPathKeys.add(key);
+    const fingerprint = sqliteSidecarFingerprint(dbPath);
+    pathFingerprints.set(key, fingerprint);
+    if (!fingerprints[key] || !sameSqliteFingerprint(fingerprint, fingerprints[key])) {
+      databaseChanged = true;
+    }
+  }
+  // A removed Desktop/CLI DB must also trigger reconciliation so orphaned
+  // observations can be retracted (fingerprint-only checks would miss this).
+  for (const key of Object.keys(fingerprints)) {
+    if (!currentPathKeys.has(key)) {
+      databaseChanged = true;
+      break;
+    }
+  }
+  if (!databaseChanged) {
+    return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+  }
+
+  // The Desktop profile is first in the default path list. If a migrated CLI
+  // profile retains the same event IDs, prefer the active Desktop copy and
+  // count each model row only once.
+  const rowsByEventItem = new Map();
+  for (const dbPath of availablePaths) {
+    const dbRows = await readOpenSquillaUsageRows(dbPath, sqliteOptions);
+    for (const row of dbRows) {
+      const eventId = typeof row?.event_id === "string" ? row.event_id.trim() : "";
+      if (!eventId || row?.ordinal == null) continue;
+      const key = eventId + ":" + String(toNonNegativeInt(row.ordinal));
+      if (!rowsByEventItem.has(key)) rowsByEventItem.set(key, row);
+    }
+  }
+  const rows = Array.from(rowsByEventItem.values());
+  // structuredClone so a failed enqueueTouchedBuckets cannot leave mutated
+  // totals committed while opensquilla.messages stays unchanged (retry would
+  // subtract again). Same pattern as TRAE / session reconcilers.
+  const hourlyState = structuredClone(normalizeHourlyState(cursors?.hourly));
+  const touchedBuckets = new Set();
+  const cb = typeof onProgress === "function" ? onProgress : null;
+  let eventsAggregated = 0;
+  const currentKeys = new Set();
+  for (let index = 0; index < rows.length; index++) {
+    const event = normalizeOpenSquillaUsageRow(rows[index]);
+    if (event) currentKeys.add(event.key);
+    if (event && reconcilePassiveUsageEvent({
+      event,
+      source: OPENSQUILLA_SOURCE,
+      messages,
+      hourlyState,
+      touchedBuckets,
+    })) eventsAggregated += 1;
+    if (cb) {
+      cb({
+        index: index + 1,
+        total: rows.length,
+        recordsProcessed: index + 1,
+        eventsAggregated,
+        bucketsQueued: touchedBuckets.size,
+      });
+    }
+  }
+
+  // Retract observations that disappeared with a removed database (or were
+  // deleted from the remaining DB). Overlapping event IDs keep Desktop-first
+  // totals via reconcilePassiveUsageEvent above.
+  for (const key of Object.keys(messages)) {
+    if (!key.startsWith("opensquilla:") || currentKeys.has(key)) continue;
+    const previous = messages[key];
+    if (previous?.model && previous?.bucketStart && previous?.totals) {
+      const oldBucket = getHourlyBucket(
+        hourlyState,
+        OPENSQUILLA_SOURCE,
+        previous.model,
+        previous.bucketStart,
+      );
+      subtractTotals(oldBucket.totals, previous.totals);
+      touchedBuckets.add(bucketKey(OPENSQUILLA_SOURCE, previous.model, previous.bucketStart));
+    }
+    delete messages[key];
+    eventsAggregated += 1;
+  }
+
+  const nextFingerprints = {};
+  for (const dbPath of availablePaths) {
+    const key = path.resolve(dbPath);
+    const before = pathFingerprints.get(key);
+    const after = sqliteSidecarFingerprint(dbPath);
+    nextFingerprints[key] = sameSqliteFingerprint(before, after) ? after : before;
+  }
+  const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
+  const updatedAt = new Date().toISOString();
+  hourlyState.updatedAt = updatedAt;
+  cursors.hourly = hourlyState;
+  cursors.opensquilla = { messages, fingerprints: nextFingerprints, updatedAt };
+  return { recordsProcessed: rows.length, eventsAggregated, bucketsQueued };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unsloth Studio
 //
 // Durable inference usage lives in `studio.db`. The SQL projections below
@@ -15037,6 +15340,31 @@ async function parseKilocodeIncremental({
   return { recordsProcessed, eventsAggregated, bucketsQueued };
 }
 
+// Bumped when a record shape starts contributing usage. Files consumed to EOF
+// under an older cursor never re-read them, so the bump triggers an
+// accounting-only replay (messages are skipped, model_usage rows are not).
+const OMP_CURSOR_VERSION = 2;
+
+// OMP stores accounting in two record shapes: assistant messages carry usage in
+// message.usage, standalone model_usage rows carry it in entry.usage. Both the
+// total and the project loops read through this function so they cannot drift.
+function normalizeOmpUsageEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  if (entry.type === "model_usage") {
+    const usage = entry.usage && typeof entry.usage === "object" ? entry.usage : null;
+    const id = typeof entry.id === "string" && entry.id ? `model_usage:${entry.id}` : null;
+    if (!usage || !id) return null;
+    return { id, usage, timestamp: entry.timestamp, model: entry.model };
+  }
+  if (entry.type !== "message") return null;
+  const message = entry.message && typeof entry.message === "object" ? entry.message : null;
+  if (!message || message.role !== "assistant") return null;
+  const usage = message.usage && typeof message.usage === "object" ? message.usage : null;
+  const id = typeof entry.id === "string" && entry.id ? entry.id : null;
+  if (!usage || !id) return null;
+  return { id, usage, timestamp: message.timestamp ?? entry.timestamp, model: message.model };
+}
+
 async function parseOmpIncremental({
   sessionFiles,
   subagentFiles,
@@ -15082,6 +15410,7 @@ async function parseOmpIncremental({
   if (files.length === 0) {
     cursors.omp = {
       ...ompState,
+      version: OMP_CURSOR_VERSION,
       seenIds: Array.from(seenIds),
       fileOffsets,
       ...(projectEnabled
@@ -15120,37 +15449,46 @@ async function parseOmpIncremental({
     const prevIno = prevEntry.ino;
     // Re-read from start if file shrunk (truncate/rewrite) or inode changed.
     const inodeChanged = typeof prevIno === "number" && prevIno !== stat.ino;
-    const startOffset = stat.size < prevSize || inodeChanged ? 0 : prevSize;
+    // Migration belongs to this file and cursor (total/project), not the
+    // provider. New files and newly enabled project collection need all rows.
+    const modelUsageBackfill = prevSize > 0 && !inodeChanged && stat.size >= prevSize
+      && (Number(prevEntry.usageVersion) || 1) < OMP_CURSOR_VERSION;
+    const startOffset = modelUsageBackfill ? 0 : stat.size < prevSize || inodeChanged ? 0 : prevSize;
     if (stat.size <= startOffset) continue;
 
     let stream;
     try {
       stream = fssync.createReadStream(filePath, {
-        encoding: "utf8",
         start: startOffset,
+        end: stat.size - 1,
       });
     } catch { continue; }
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-    for await (const line of rl) {
-      if (!line || !line.trim()) continue;
+    let committedOffset = startOffset;
+    for await (const record of physicalJsonlRecords(stream, { invalidUtf8: "record" })) {
+      const recordEnd = committedOffset + record.physicalBytes;
+      if (record.terminated) committedOffset = recordEnd;
+      const line = record.line;
+      if (!line || !line.trim()) {
+        if (!record.terminated) break;
+        continue;
+      }
       let entry;
-      try { entry = JSON.parse(line); } catch { continue; }
+      try { entry = JSON.parse(line); } catch {
+        if (!record.terminated) break;
+        continue;
+      }
+      // A valid final record is complete even without LF; an interrupted write
+      // must retain the old offset so the next scan can read it in full.
+      committedOffset = recordEnd;
 
-      // First line of each file is type:"session" (header) — skip all
-      // non-message records.
-      if (!entry || entry.type !== "message") continue;
+      const normalized = normalizeOmpUsageEntry(entry);
+      if (!normalized) continue;
+      // Only the consumed prefix was counted before. Messages appended since
+      // that boundary still contribute, even while old accounting is replayed.
+      if (modelUsageBackfill && committedOffset <= prevSize && entry.type !== "model_usage") continue;
 
-      // Only assistant messages carry token usage.
-      const msg = entry.message;
-      if (!msg || msg.role !== "assistant") continue;
-
-      const usage = msg.usage;
-      if (!usage || typeof usage !== "object") continue;
-
-      // Dedup by top-level entry id (8-char string assigned by oh-my-pi).
-      const entryId = typeof entry.id === "string" && entry.id ? entry.id : null;
-      if (!entryId) continue;
+      // Dedup by entry id (message id, or "model_usage:<id>").
+      const { id: entryId, usage } = normalized;
       if (seenIds.has(entryId)) continue;
 
       recordsProcessed++;
@@ -15176,10 +15514,10 @@ async function parseOmpIncremental({
       // ISO string. Entries with no resolvable timestamp are skipped — they
       // cannot be placed in a bucket.
       let tsMs = null;
-      if (Number.isFinite(Number(msg.timestamp)) && Number(msg.timestamp) > 0) {
-        tsMs = Number(msg.timestamp);
-      } else if (typeof entry.timestamp === "string" && entry.timestamp) {
-        const parsed = Date.parse(entry.timestamp);
+      if (Number.isFinite(Number(normalized.timestamp)) && Number(normalized.timestamp) > 0) {
+        tsMs = Number(normalized.timestamp);
+      } else if (typeof normalized.timestamp === "string" && normalized.timestamp) {
+        const parsed = Date.parse(normalized.timestamp);
         if (Number.isFinite(parsed) && parsed > 0) tsMs = parsed;
       }
       if (tsMs == null) {
@@ -15197,7 +15535,7 @@ async function parseOmpIncremental({
           ? toNonNegativeInt(usage.totalTokens)
           : input + output + cacheRead + cacheWrite + reasoningTokens;
 
-      const model = normalizeModelInput(msg.model) || fallbackModel;
+      const model = normalizeModelInput(normalized.model) || fallbackModel;
 
       const delta = {
         input_tokens: input,
@@ -15226,12 +15564,11 @@ async function parseOmpIncremental({
       }
     }
 
-    let postStat = stat;
-    try { postStat = fssync.statSync(filePath); } catch {}
     fileOffsets[filePath] = {
-      size: postStat.size,
-      mtimeMs: postStat.mtimeMs,
-      ino: postStat.ino,
+      size: committedOffset,
+      mtimeMs: stat.mtimeMs,
+      ino: stat.ino,
+      usageVersion: OMP_CURSOR_VERSION,
     };
   }
 
@@ -15249,7 +15586,10 @@ async function parseOmpIncremental({
       const prevSize = Number(prevEntry.size) || 0;
       const prevIno = prevEntry.ino;
       const inodeChanged = typeof prevIno === "number" && prevIno !== stat.ino;
-      const startOffset = stat.size < prevSize || inodeChanged ? 0 : prevSize;
+      // Project migration is independent of the total-usage cursor.
+      const modelUsageBackfill = prevSize > 0 && !inodeChanged && stat.size >= prevSize
+        && (Number(prevEntry.usageVersion) || 1) < OMP_CURSOR_VERSION;
+      const startOffset = modelUsageBackfill ? 0 : stat.size < prevSize || inodeChanged ? 0 : prevSize;
       if (stat.size <= startOffset) continue;
 
       const cwd = await resolveOmpFileCwd(filePath);
@@ -15265,27 +15605,37 @@ async function parseOmpIncremental({
       const projectRef = projectContext?.projectRef || null;
       const projectKey = projectContext?.projectKey || null;
 
+      let committedOffset = startOffset;
       if (projectKey && projectRef) {
         let stream;
         try {
           stream = fssync.createReadStream(filePath, {
-            encoding: "utf8",
             start: startOffset,
+            end: stat.size - 1,
           });
         } catch {
           continue;
         }
-        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-        for await (const line of rl) {
-          if (!line || !line.trim()) continue;
+        for await (const record of physicalJsonlRecords(stream, { invalidUtf8: "record" })) {
+          const recordEnd = committedOffset + record.physicalBytes;
+          if (record.terminated) committedOffset = recordEnd;
+          const line = record.line;
+          if (!line || !line.trim()) {
+            if (!record.terminated) break;
+            continue;
+          }
           let entry;
-          try { entry = JSON.parse(line); } catch { continue; }
-          const msg = entry?.type === "message" ? entry.message : null;
-          const usage = msg?.role === "assistant" ? msg.usage : null;
-          if (!usage || typeof usage !== "object") continue;
+          try { entry = JSON.parse(line); } catch {
+            if (!record.terminated) break;
+            continue;
+          }
+          committedOffset = recordEnd;
+          const normalized = normalizeOmpUsageEntry(entry);
+          if (!normalized) continue;
+          if (modelUsageBackfill && committedOffset <= prevSize && entry.type !== "model_usage") continue;
 
-          const entryId = typeof entry.id === "string" && entry.id ? entry.id : null;
-          if (!entryId || projectSeenIds.has(entryId)) continue;
+          const { id: entryId, usage } = normalized;
+          if (projectSeenIds.has(entryId)) continue;
 
           const input = toNonNegativeInt(usage.input);
           const output = toNonNegativeInt(usage.output);
@@ -15304,10 +15654,10 @@ async function parseOmpIncremental({
           }
 
           let tsMs = null;
-          if (Number.isFinite(Number(msg.timestamp)) && Number(msg.timestamp) > 0) {
-            tsMs = Number(msg.timestamp);
-          } else if (typeof entry.timestamp === "string" && entry.timestamp) {
-            const parsed = Date.parse(entry.timestamp);
+          if (Number.isFinite(Number(normalized.timestamp)) && Number(normalized.timestamp) > 0) {
+            tsMs = Number(normalized.timestamp);
+          } else if (typeof normalized.timestamp === "string" && normalized.timestamp) {
+            const parsed = Date.parse(normalized.timestamp);
             if (Number.isFinite(parsed) && parsed > 0) tsMs = parsed;
           }
           const bucketStart = tsMs == null
@@ -15344,12 +15694,11 @@ async function parseOmpIncremental({
         }
       }
 
-      let postStat = stat;
-      try { postStat = fssync.statSync(filePath); } catch {}
       projectFileOffsets[filePath] = {
-        size: postStat.size,
-        mtimeMs: postStat.mtimeMs,
-        ino: postStat.ino,
+        size: committedOffset,
+        mtimeMs: stat.mtimeMs,
+        ino: stat.ino,
+        usageVersion: OMP_CURSOR_VERSION,
       };
     }
   }
@@ -15386,6 +15735,7 @@ async function parseOmpIncremental({
   }
   cursors.omp = {
     ...ompState,
+    version: OMP_CURSOR_VERSION,
     seenIds: cappedSeen,
     fileOffsets,
     ...(projectEnabled
@@ -16203,6 +16553,405 @@ async function parseReasonixIncremental({ telemetryFiles, cursors, queuePath, on
   hourlyState.updatedAt = updatedAt;
   cursors.hourly = hourlyState;
   cursors.reasonix = { ...state, sessionTotals, updatedAt };
+  return { recordsProcessed, eventsAggregated, bucketsQueued };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Muse Code (Meta) — passive session.jsonl reader.
+//
+//   ~/.local/share/muse/sessions/YYYY/MM/DD/<session>/session.jsonl
+//   ~/.local/share/muse/sessions/YYYY/MM/DD/<session>/subagent/<id>/session.jsonl
+//
+// Every record is `{id, stream, sequence, recorded_at (epoch µs), payload_type,
+// payload}`. Per-model-step usage rides on a `runtime.session` record whose
+// `payload.event.kind` is `goal_usage_attribution`:
+//
+//   quantity: {unit:"tokens", reported:true, input_tokens, output_tokens,
+//              cached_tokens, reasoning_tokens, main_llm_steps}
+//
+// Only `usage_family:"provider"` + `reported:true` rows are model usage (tool and
+// reminder rows are zero placeholders). The usage row names no model: the model
+// comes from the `run.model.configured` record of the same `run_id`.
+//
+// Token semantics (verified against the session snapshot `cost_ledger`, where
+// `input_tokens` equals the sum of these rows and `cache_read_tokens` equals
+// `cached_tokens`): `input_tokens` INCLUDES cache reads, and `reasoning_tokens`
+// is a subset of `output_tokens`. Subagent logs are separate streams whose usage
+// is not repeated in the parent log, so each file is counted once. No prompt,
+// response or path text is read or stored; only counts, timestamps and the
+// model id.
+function resolveMuseHome(env = process.env) {
+  if (env.TOKENTRACKER_MUSE_HOME) return expandHomePath(env.TOKENTRACKER_MUSE_HOME, env);
+  return path.join(env.HOME || require("node:os").homedir(), ".local", "share", "muse");
+}
+
+const MUSE_SCAN_MAX_DEPTH = 8;
+const MUSE_READ_CHUNK_BYTES = 8 * 1024 * 1024;
+const MUSE_WATERMARK_IDS_MAX = 100;
+
+function collectMuseSessionFiles(dir, files, depth = 0) {
+  if (depth > MUSE_SCAN_MAX_DEPTH) return;
+  let entries;
+  try { entries = fssync.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    // Dot directories (.msp-view-v1) hold derived views, not the session log.
+    if (entry.name.startsWith(".")) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) collectMuseSessionFiles(full, files, depth + 1);
+    else if (entry.isFile() && entry.name === "session.jsonl") files.push(full);
+  }
+}
+
+function resolveMuseSessionFiles(env = process.env) {
+  const sessionsDir = path.join(resolveMuseHome(env), "sessions");
+  const files = [];
+  collectMuseSessionFiles(sessionsDir, files);
+  return files;
+}
+
+// The model Muse is configured to use, for rows whose run has no model record
+// in the portion of the log we read. Reads only the `model` string.
+function resolveMuseDefaultModel(env = process.env) {
+  const fallback = "muse";
+  try {
+    const configHome = env.XDG_CONFIG_HOME || path.join(env.HOME || require("node:os").homedir(), ".config");
+    const settings = JSON.parse(fssync.readFileSync(path.join(configHome, "muse", "settings.json"), "utf8"));
+    return typeof settings?.model === "string" && settings.model.trim() ? settings.model.trim() : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// A permission transaction wraps its records as JSON strings under `children`;
+// unwrap them so a model or usage record is never missed inside a frame.
+function* museRecords(entry) {
+  if (entry && Array.isArray(entry.children) && entry.retained_frame) {
+    for (const child of entry.children) {
+      if (!child || typeof child.record_json !== "string") continue;
+      try { yield JSON.parse(child.record_json); } catch { /* skip */ }
+    }
+    return;
+  }
+  yield entry;
+}
+
+
+const MUSE_HEAD_FINGERPRINT_BYTES = 256;
+const MUSE_PREFIX_FINGERPRINT_MAX_BYTES = 8 * 1024 * 1024;
+
+// Fingerprints for Muse session logs so an in-place rewrite is not mistaken
+// for an append. Prefer a hash of the entire consumed prefix (capped); fall
+// back to head+tail samples only when the prefix exceeds the cap.
+function museRangeFingerprint(fd, offset, length) {
+  const n = Math.max(0, Number(length) || 0);
+  if (n <= 0) return null;
+  const buf = Buffer.alloc(n);
+  const read = fssync.readSync(fd, buf, 0, n, Math.max(0, Number(offset) || 0));
+  if (read <= 0) return null;
+  return crypto.createHash("sha256").update(buf.subarray(0, read)).digest("hex");
+}
+
+function museHeadFingerprint(fd, size) {
+  return museRangeFingerprint(fd, 0, Math.min(MUSE_HEAD_FINGERPRINT_BYTES, Math.max(0, Number(size) || 0)));
+}
+
+function musePrefixFingerprint(fd, size) {
+  const total = Math.max(0, Number(size) || 0);
+  if (total <= 0) return null;
+  if (total <= MUSE_PREFIX_FINGERPRINT_MAX_BYTES) {
+    const hash = crypto.createHash("sha256");
+    let offset = 0;
+    const chunk = Buffer.alloc(Math.min(64 * 1024, total));
+    while (offset < total) {
+      const want = Math.min(chunk.length, total - offset);
+      const read = fssync.readSync(fd, chunk, 0, want, offset);
+      if (read <= 0) break;
+      hash.update(chunk.subarray(0, read));
+      offset += read;
+    }
+    return offset === total ? hash.digest("hex") : null;
+  }
+  // Large logs: sample head and tail of the consumed prefix.
+  const head = museHeadFingerprint(fd, total);
+  const tailLen = Math.min(MUSE_HEAD_FINGERPRINT_BYTES, total);
+  const tail = museRangeFingerprint(fd, total - tailLen, tailLen);
+  return head && tail ? `${head}:${tail}` : null;
+}
+
+function museResumeLooksAppendOnly(fd, prevSize, prev, currentPrefixFp, currentMtimeMs, currentSize) {
+  if (prev?.forceRewind === true) return false;
+  if (!(prevSize > 0)) return true;
+  if (typeof prev?.prefixFp === "string" && prev.prefixFp && prev.prefixFp !== currentPrefixFp) return false;
+  // Legacy cursors without prefixFp: reject when the head sample diverges.
+  if (!prev?.prefixFp && typeof prev?.headFp === "string" && prev.headFp) {
+    const head = museHeadFingerprint(fd, prevSize);
+    if (head && head !== prev.headFp) return false;
+  }
+  // Equal-size rewrite above the full-prefix cap (or any equal-size rewrite that
+  // preserves sampled bytes) still bumps mtime on real filesystems. Only apply
+  // when the size is unchanged — growth from an append also changes mtime.
+  if (
+    Number(currentSize) === Number(prevSize) &&
+    Number.isFinite(Number(prev?.mtimeMs)) &&
+    Number.isFinite(Number(currentMtimeMs)) &&
+    Number(prev.mtimeMs) !== Number(currentMtimeMs)
+  ) {
+    return false;
+  }
+  // Resume offset must be a JSONL record boundary.
+  const buf = Buffer.alloc(1);
+  const read = fssync.readSync(fd, buf, 0, 1, prevSize - 1);
+  return read === 1 && buf[0] === 0x0a;
+}
+
+
+// Subagent logs live under .../sessions/<session>/subagent/... . Matching any
+// ancestor named "subagent" would misclassify roots when the Muse home path
+// itself contains that segment (e.g. TOKENTRACKER_MUSE_HOME=/data/subagent/muse).
+function isMuseSubagentSessionFile(filePath, env = process.env) {
+  const sessionsRoot = path.join(resolveMuseHome(env), "sessions");
+  const relative = path.relative(sessionsRoot, filePath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    // Outside the configured sessions root — fall back to a local segment check
+    // that still requires the subagent directory to be a parent of session.jsonl.
+    const parts = filePath.split(path.sep);
+    const sessionIdx = parts.lastIndexOf("session.jsonl");
+    return sessionIdx > 0 && parts.slice(0, sessionIdx).includes("subagent");
+  }
+  return relative.split(path.sep).includes("subagent");
+}
+
+async function parseMuseIncremental({ sessionFiles, cursors, queuePath, onProgress, env } = {}) {
+  await ensureDir(path.dirname(queuePath));
+  const state = cursors.muse && typeof cursors.muse === "object" ? cursors.muse : {};
+  const seenIds = new Set(Array.isArray(state.seenIds) ? state.seenIds : []);
+  const fileOffsets =
+    state.fileOffsets && typeof state.fileOffsets === "object" ? { ...state.fileOffsets } : {};
+  const files = Array.isArray(sessionFiles) ? sessionFiles : resolveMuseSessionFiles(env || process.env);
+  const defaultModel = resolveMuseDefaultModel(env || process.env);
+
+  const hourlyState = normalizeHourlyState(cursors?.hourly);
+  const touchedBuckets = new Set();
+  const cb = typeof onProgress === "function" ? onProgress : null;
+  let recordsProcessed = 0;
+  let eventsAggregated = 0;
+
+  const handleRecord = (rec, fileState) => {
+    if (!rec || typeof rec !== "object") return;
+    const payload = rec.payload;
+    if (!payload || typeof payload !== "object") return;
+    if (rec.payload_type === "run.model.configured") {
+      const modelRec = payload.record;
+      const runId = modelRec?.run_stream?.id;
+      if (typeof modelRec?.model_id === "string" && modelRec.model_id) {
+        if (runId) fileState.runModels[runId] = modelRec.model_id;
+        fileState.model = modelRec.model_id;
+      }
+      return;
+    }
+    if (rec.payload_type !== "runtime.session") return;
+    const event = payload.event;
+    if (!event || event.kind !== "goal_usage_attribution") return;
+    const usage = event.record;
+    const quantity = usage?.quantity;
+    if (!quantity || usage.usage_family !== "provider" || quantity.reported !== true) return;
+    const usageId = typeof usage.usage_id === "string" ? usage.usage_id : null;
+    if (!usageId || seenIds.has(usageId)) return;
+    // A rewritten log is re-read from the start, and `seenIds` keeps only the
+    // newest 10k ids. Rows older than the last one counted from this file are
+    // already in the queue, so skip them even if their id was evicted. Rows at
+    // exactly that timestamp are skipped only when their id was counted, so a
+    // new row that shares the timestamp is kept.
+    const micros = Number(rec.recorded_at);
+    if (fileState.skipThrough && Number.isFinite(micros)) {
+      if (micros < fileState.skipThrough) return;
+      if (micros === fileState.skipThrough && fileState.skipIds.has(usageId)) return;
+    }
+
+    recordsProcessed++;
+    const inputTotal = toNonNegativeInt(quantity.input_tokens);
+    const output = toNonNegativeInt(quantity.output_tokens);
+    const cached = Math.min(toNonNegativeInt(quantity.cached_tokens), inputTotal);
+    const reasoning = Math.min(toNonNegativeInt(quantity.reasoning_tokens), output);
+    seenIds.add(usageId);
+    if (inputTotal === 0 && output === 0) return;
+
+    if (!Number.isFinite(micros) || micros <= 0) return;
+    const bucketStart = toUtcHalfHourStart(new Date(Math.floor(micros / 1000)).toISOString());
+    if (!bucketStart) return;
+
+    const input = inputTotal - cached;
+    const model = fileState.runModels[payload.run_id] || fileState.model || defaultModel;
+    // One conversation per root session, charged to its first usage record.
+    // Subagent logs are part of their parent's conversation.
+    const conversations = fileState.counted || fileState.isSubagent ? 0 : 1;
+    fileState.counted = true;
+    const bucket = getHourlyBucket(hourlyState, "muse", model, bucketStart);
+    addTotals(bucket.totals, {
+      input_tokens: input,
+      cached_input_tokens: cached,
+      cache_creation_input_tokens: 0,
+      output_tokens: output,
+      reasoning_output_tokens: reasoning,
+      total_tokens: input + cached + output,
+      conversation_count: conversations,
+    });
+    touchedBuckets.add(bucketKey("muse", model, bucketStart));
+    eventsAggregated++;
+    // Advance only for rows that reached a bucket, remembering the ids that
+    // share the newest timestamp.
+    if (micros > fileState.watermark) {
+      fileState.watermark = micros;
+      fileState.watermarkIds = [usageId];
+    } else if (micros === fileState.watermark && fileState.watermarkIds.length < MUSE_WATERMARK_IDS_MAX) {
+      fileState.watermarkIds.push(usageId);
+    }
+  };
+
+  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+    const filePath = files[fileIdx];
+    // Open first and stat the descriptor, so the size and inode describe the
+    // file that is actually read (no check-then-open race).
+    let fd;
+    try { fd = fssync.openSync(filePath, "r"); } catch { continue; }
+    let stat;
+    try { stat = fssync.fstatSync(fd); } catch {
+      try { fssync.closeSync(fd); } catch { /* ignore */ }
+      continue;
+    }
+
+    const prev = fileOffsets[filePath] || {};
+    const prevSize = Number(prev.size) || 0;
+    const inodeChanged = typeof prev.ino === "number" && prev.ino !== stat.ino;
+    const prefixFp = musePrefixFingerprint(fd, Math.min(prevSize, stat.size));
+    const headFp = museHeadFingerprint(fd, stat.size);
+    // Same-inode compaction can shrink then grow past prevSize, rewrite the
+    // middle at equal size, or be observed while empty mid-rewrite. Validate
+    // the consumed-prefix fingerprint (and forceRewind) before append-only.
+    const appendOnly = !inodeChanged && stat.size >= prevSize &&
+      museResumeLooksAppendOnly(fd, prevSize, prev, prefixFp, stat.mtimeMs, stat.size);
+    const rewound = !appendOnly;
+    const startOffset = rewound ? 0 : prevSize;
+    if (stat.size <= startOffset) {
+      const emptyObserved = stat.size <= 0 && prevSize > 0;
+      fileOffsets[filePath] = {
+        ...prev,
+        size: Math.min(prevSize, stat.size),
+        mtimeMs: stat.mtimeMs,
+        ino: stat.ino,
+        headFp,
+        prefixFp: stat.size > 0 ? musePrefixFingerprint(fd, stat.size) : null,
+        // An empty observation between truncate and rewrite must not clear
+        // watermark-based replay protection on the next population.
+        forceRewind: emptyObserved || prev.forceRewind === true || rewound,
+      };
+      try { fssync.closeSync(fd); } catch { /* ignore */ }
+      continue;
+    }
+
+    const fileState = {
+      // Keep known model attribution across rewinds: compaction may drop the
+      // original run.model.configured rows while later usage for those runs
+      // remains. Replayed configuration records still overwrite these maps.
+      model: prev.model || null,
+      runModels: { ...(prev.runModels || {}) },
+      // A rewritten log keeps its flag: its usage ids were already counted.
+      counted: prev.counted === true,
+      // Latest usage timestamp (epoch µs) counted from this file; on a rewrite
+      // it becomes the point below which rows are not counted again.
+      watermark: Number(prev.watermark) || 0,
+      watermarkIds: Array.isArray(prev.watermarkIds) ? prev.watermarkIds.slice(0, MUSE_WATERMARK_IDS_MAX) : [],
+      skipThrough: rewound ? Number(prev.watermark) || 0 : 0,
+      skipIds: new Set(rewound && Array.isArray(prev.watermarkIds) ? prev.watermarkIds : []),
+      isSubagent: isMuseSubagentSessionFile(filePath, env || process.env),
+    };
+
+    let consumed = 0;
+    // Hash the bytes we actually parse so a rewrite between read and cursor
+    // save cannot invent a matching fingerprint for unread content.
+    const consumedHash = crypto.createHash("sha256");
+    let hashedPrefix = startOffset === 0;
+    if (startOffset > 0 && startOffset <= MUSE_PREFIX_FINGERPRINT_MAX_BYTES) {
+      // Include the already-trusted prefix so the saved fingerprint covers
+      // the full consumed region, not only this sync's delta.
+      let off = 0;
+      const pre = Buffer.alloc(Math.min(64 * 1024, startOffset));
+      while (off < startOffset) {
+        const want = Math.min(pre.length, startOffset - off);
+        const read = fssync.readSync(fd, pre, 0, want, off);
+        if (read <= 0) break;
+        consumedHash.update(pre.subarray(0, read));
+        off += read;
+      }
+      hashedPrefix = off === startOffset;
+    } else if (startOffset > MUSE_PREFIX_FINGERPRINT_MAX_BYTES) {
+      hashedPrefix = false;
+    }
+    {
+      let position = startOffset;
+      let carry = Buffer.alloc(0);
+      while (position < stat.size) {
+        const length = Math.min(MUSE_READ_CHUNK_BYTES, stat.size - position);
+        const chunk = Buffer.alloc(length);
+        const read = fssync.readSync(fd, chunk, 0, length, position);
+        if (read <= 0) break;
+        position += read;
+        const data = carry.length ? Buffer.concat([carry, chunk.subarray(0, read)]) : chunk.subarray(0, read);
+        // Only complete lines are consumed, so a record still being written is
+        // read whole on the next sync instead of being skipped.
+        const lastNewline = data.lastIndexOf(0x0a);
+        if (lastNewline < 0) { carry = data; continue; }
+        const complete = data.subarray(0, lastNewline + 1);
+        carry = Buffer.from(data.subarray(lastNewline + 1));
+        if (hashedPrefix) consumedHash.update(complete);
+        consumed += complete.length;
+        for (const line of complete.toString("utf8").split("\n")) {
+          if (!line.trim()) continue;
+          let entry;
+          try { entry = JSON.parse(line); } catch { continue; }
+          for (const rec of museRecords(entry)) handleRecord(rec, fileState);
+        }
+      }
+    }
+    const runModelKeys = Object.keys(fileState.runModels);
+    const keptRunModels = {};
+    // Bound the cursor: later records reference recent runs.
+    for (const key of runModelKeys.slice(-50)) keptRunModels[key] = fileState.runModels[key];
+    const consumedSize = startOffset + consumed;
+    // Fingerprint from the same descriptor we read — never reopen (CodeQL
+    // file-system-race) and never trust a post-read rewrite.
+    let savedPrefixFp = null;
+    if (hashedPrefix && consumedSize <= MUSE_PREFIX_FINGERPRINT_MAX_BYTES) {
+      savedPrefixFp = consumedHash.digest("hex");
+    } else {
+      try { savedPrefixFp = musePrefixFingerprint(fd, consumedSize); } catch { /* best-effort */ }
+    }
+    fileOffsets[filePath] = {
+      size: consumedSize,
+      mtimeMs: stat.mtimeMs,
+      ino: stat.ino,
+      headFp,
+      prefixFp: savedPrefixFp,
+      forceRewind: false,
+      model: fileState.model,
+      runModels: keptRunModels,
+      counted: fileState.counted,
+      watermark: fileState.watermark,
+      watermarkIds: fileState.watermarkIds,
+    };
+    try { fssync.closeSync(fd); } catch { /* ignore */ }
+    if (cb) {
+      cb({ index: fileIdx + 1, total: files.length, recordsProcessed, eventsAggregated, bucketsQueued: touchedBuckets.size });
+    }
+  }
+
+  const seenArr = Array.from(seenIds);
+  const cappedSeen = seenArr.length > 10_000 ? seenArr.slice(seenArr.length - 10_000) : seenArr;
+  const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
+  const updatedAt = new Date().toISOString();
+  hourlyState.updatedAt = updatedAt;
+  cursors.hourly = hourlyState;
+  cursors.muse = { ...state, seenIds: cappedSeen, fileOffsets, updatedAt };
   return { recordsProcessed, eventsAggregated, bucketsQueued };
 }
 
@@ -22217,7 +22966,78 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 }
 
 
+function zcodeDbHasContent(dbPath, sqliteOptions = {}) {
+  if (!dbPath || !fssync.existsSync(dbPath)) return null;
+  let snapshot = null;
+  let effectiveDbPath = dbPath;
+  if (isUncPath(dbPath)) {
+    try {
+      snapshot = snapshotSqliteDb(dbPath);
+      effectiveDbPath = snapshot.path;
+    } catch (_error) {
+      // Preserve the existing direct-read fallback for transient snapshot
+      // failures and UNC implementations that support SQLite locking.
+    }
+  }
+  try {
+    const rows = readSqliteJsonRows(
+      effectiveDbPath,
+      "SELECT (SELECT COUNT(*) FROM session) AS sessions, (SELECT COUNT(*) FROM model_usage) AS requests",
+      {
+        label: "ZCode",
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+        ...sqliteOptions,
+        throwOnReadFailure: true,
+      },
+    );
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row) return null;
+    return (Number(row.sessions) || 0) > 0 || (Number(row.requests) || 0) > 0;
+  } catch (_error) {
+    return null;
+  } finally {
+    if (snapshot) snapshot.cleanup();
+  }
+}
+
+function hasZcodeCursorState(cursors) {
+  return [cursors?.zcode, cursors?.zcode?.native, cursors?.zcode?.wsl]
+    .some((state) => Object.keys(state?.messages || {}).length > 0) ||
+    Object.keys(cursors?.hourly?.buckets || {}).some((key) => key.startsWith("zcode|")) ||
+    Object.keys(cursors?.hourly?.groupQueued || {}).some((key) => key.startsWith("zcode|")) ||
+    Object.keys(cursors?.projectHourly?.buckets || {}).some((key) => key.includes("|zcode|"));
+}
+
+function resolveZcodeInstallPaths({ nativeValue, wslValue } = {}, env = process.env, deps = {}) {
+  const mode = wsl.getWslMode(env);
+  const priorityMode = (deps.platform || process.platform) === "win32" && ["native-first", "wsl-first"].includes(mode);
+  const selection = deps.selection || deps.cursors?.zcodeInstallSelection;
+  if (priorityMode && selection?.mode === mode &&
+      selection.zcodeHome === (env.ZCODE_HOME?.trim() || null) &&
+      typeof selection.dbPath === "string" && selection.dbPath) {
+    // A newly discovered or temporarily unavailable install must not change
+    // the cursor's owner. Only an explicit mode/home override releases it.
+    return { native: selection.dbPath, wsl: null };
+  }
+  const paths = resolveInstallPaths({ nativeValue, wslValue }, env, deps);
+  if (!priorityMode || (!selection && hasZcodeCursorState(deps.cursors))) {
+    // Legacy cursors followed the original install resolver. Keep that choice
+    // rather than feeding another database into an already-owned flat ledger.
+    return paths;
+  }
+  const picked = paths.native || paths.wsl;
+  const alternate = picked === nativeValue ? wslValue : nativeValue;
+  if (picked && alternate && zcodeDbHasContent(picked) === false && zcodeDbHasContent(alternate) === true) {
+    return { native: alternate, wsl: null };
+  }
+  return paths;
+}
+
 module.exports = {
+  hasZcodeCursorState,
+  zcodeDbHasContent,
+  resolveZcodeInstallPaths,
   listRolloutFiles,
   listRolloutFilesDeep,
   codexSessionIdFromPath,
@@ -22233,6 +23053,7 @@ module.exports = {
   readOpencodeDbMessagesIncremental,
   readMimoDbMessages,
   readZcodeDbMessages,
+  normalizeOpencodeModelFields,
   hasZcodeNativeUsageSchema,
   resolveQoderDbPath,
   resolveQoderDbPaths,
@@ -22336,6 +23157,10 @@ module.exports = {
   normalizeLocalStudioTokens,
   readLmstudioFileRecords,
   parseLmstudioIncremental,
+  resolveOpenSquillaDbPaths,
+  readOpenSquillaUsageRows,
+  normalizeOpenSquillaUsageRow,
+  parseOpenSquillaIncremental,
   resolveUnslothDbPath,
   readUnslothUsageRows,
   normalizeUnslothUsageRow,
@@ -22384,6 +23209,9 @@ module.exports = {
   resolveReasonixTelemetryFiles,
   normalizeReasonixModel,
   parseReasonixIncremental,
+  resolveMuseHome,
+  resolveMuseSessionFiles,
+  parseMuseIncremental,
   // Exposed for regression tests covering cache-token accounting.
   normalizeGeminiTokens,
   normalizeOpencodeTokens,

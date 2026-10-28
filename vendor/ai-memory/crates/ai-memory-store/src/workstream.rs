@@ -349,6 +349,92 @@ pub struct StoredWorkstreamSummary {
     pub linked_harnesses: Vec<AgentKind>,
 }
 
+/// Trusted lifecycle state shown by the operator workstream overview.
+///
+/// This deliberately does not infer intent from transcript text. In
+/// particular, "waiting for input" cannot be distinguished reliably from an
+/// assistant narrating a future step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkstreamOperationalStatus {
+    /// The newest managed run holds an unexpired lease.
+    Active,
+    /// The newest run expired, exited unsuccessfully, or ended by signal.
+    Interrupted,
+    /// The newest run completed successfully and portable evidence exists.
+    Completed,
+    /// No portable evidence has been imported yet.
+    Empty,
+}
+
+impl WorkstreamOperationalStatus {
+    /// Stable display/filter name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Interrupted => "interrupted",
+            Self::Completed => "completed",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+/// One bounded row in the root/operator managed-workstream overview.
+///
+/// Native session ids, checkout paths, repository fingerprints and lease
+/// owner strings are intentionally absent: operators need lifecycle state,
+/// not host-local or harness-local identifiers.
+#[derive(Debug, Clone)]
+pub struct OperationalWorkstreamSummary {
+    /// Stable workstream identifier.
+    pub workstream_id: WorkstreamId,
+    /// Workspace display name.
+    pub workspace_name: String,
+    /// Project display name.
+    pub project_name: String,
+    /// Human-readable workstream name.
+    pub name: String,
+    /// Derived only from trusted run columns and event count.
+    pub status: WorkstreamOperationalStatus,
+    /// Newest run identifier, when the workstream has been launched.
+    pub latest_run_id: Option<ManagedRunId>,
+    /// Harness used by the newest run.
+    pub latest_agent: Option<AgentKind>,
+    /// Portable events imported across every run.
+    pub event_count: u64,
+    /// Harnesses with a current native-session link, newest first.
+    pub linked_harnesses: Vec<AgentKind>,
+    /// Last selection or import timestamp in microseconds.
+    pub last_active_at: i64,
+    /// Newest run start timestamp in microseconds.
+    pub latest_started_at: Option<i64>,
+    /// Newest run end timestamp in microseconds.
+    pub latest_ended_at: Option<i64>,
+}
+
+fn operational_status(
+    run_state: Option<&str>,
+    lease_expires_at: Option<i64>,
+    exit_code: Option<i32>,
+    event_count: u64,
+    now_us: i64,
+) -> WorkstreamOperationalStatus {
+    if run_state == Some("active") && lease_expires_at.is_some_and(|lease| lease > now_us) {
+        return WorkstreamOperationalStatus::Active;
+    }
+    if run_state == Some("expired")
+        || (run_state == Some("active") && lease_expires_at.is_none_or(|lease| lease <= now_us))
+        || (run_state == Some("finished") && exit_code != Some(0))
+    {
+        return WorkstreamOperationalStatus::Interrupted;
+    }
+    if event_count == 0 {
+        WorkstreamOperationalStatus::Empty
+    } else {
+        WorkstreamOperationalStatus::Completed
+    }
+}
+
 /// How a rename addresses the workstream it retitles.
 ///
 /// Both forms stay inside the caller's resolved scope: an id that belongs to
@@ -1589,6 +1675,142 @@ pub(crate) fn list_recent(
     Ok(summaries)
 }
 
+/// List managed workstreams across every scope for the root/operator console.
+///
+/// The page is selected before current harness links are joined, so a
+/// workstream with several linked harnesses still consumes exactly one slot.
+/// Status ordering puts live and interrupted work ahead of completed and empty
+/// ledgers. The caller supplies `now_us` so stale-lease classification is
+/// deterministic in tests and does not mutate persisted run state.
+pub(crate) fn list_operational(
+    conn: &Connection,
+    limit: usize,
+    offset: usize,
+    now_us: i64,
+) -> StoreResult<Vec<OperationalWorkstreamSummary>> {
+    let limit = i64::try_from(limit.clamp(1, 101)).unwrap_or(101);
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare(
+        "WITH latest_runs AS ( \
+             SELECT id, workstream_id, agent_kind, state, lease_expires_at, \
+                    started_at, ended_at, exit_code, \
+                    ROW_NUMBER() OVER ( \
+                        PARTITION BY workstream_id ORDER BY started_at DESC, id DESC \
+                    ) AS row_num \
+             FROM managed_runs \
+         ), event_totals AS ( \
+             SELECT workstream_id, COUNT(*) AS event_count \
+             FROM workstream_events GROUP BY workstream_id \
+         ), selected AS ( \
+             SELECT w.id, ws.name AS workspace_name, p.name AS project_name, \
+                    w.name, w.updated_at, lr.id AS run_id, \
+                    lr.agent_kind, lr.state, lr.lease_expires_at, \
+                    lr.started_at, lr.ended_at, lr.exit_code, \
+                    COALESCE(events.event_count, 0) AS event_count, \
+                    CASE \
+                      WHEN lr.state = 'active' AND lr.lease_expires_at > ?1 THEN 0 \
+                      WHEN lr.state = 'expired' \
+                        OR (lr.state = 'active' AND lr.lease_expires_at <= ?1) \
+                        OR (lr.state = 'finished' AND lr.exit_code IS NOT 0) THEN 1 \
+                      WHEN COALESCE(events.event_count, 0) > 0 THEN 2 \
+                      ELSE 3 \
+                    END AS attention \
+             FROM workstreams w \
+             JOIN workspaces ws ON ws.id = w.workspace_id \
+             JOIN projects p ON p.id = w.project_id \
+             LEFT JOIN latest_runs lr \
+               ON lr.workstream_id = w.id AND lr.row_num = 1 \
+             LEFT JOIN event_totals events ON events.workstream_id = w.id \
+             ORDER BY attention ASC, w.updated_at DESC, w.id DESC \
+             LIMIT ?2 OFFSET ?3 \
+         ) \
+         SELECT selected.id, selected.workspace_name, selected.project_name, \
+                selected.name, selected.updated_at, selected.run_id, \
+                selected.agent_kind, selected.state, selected.lease_expires_at, \
+                selected.started_at, selected.ended_at, selected.exit_code, \
+                selected.event_count, native.agent_kind \
+         FROM selected \
+         LEFT JOIN workstream_native_sessions native \
+           ON native.workstream_id = selected.id AND native.is_current = 1 \
+         ORDER BY selected.attention ASC, selected.updated_at DESC, selected.id DESC, \
+                  native.updated_at DESC, native.agent_kind ASC",
+    )?;
+    let rows = statement.query_map(params![now_us, limit, offset], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<i32>>(11)?,
+            row.get::<_, u64>(12)?,
+            row.get::<_, Option<String>>(13)?,
+        ))
+    })?;
+
+    let mut summaries: Vec<OperationalWorkstreamSummary> = Vec::new();
+    for row in rows {
+        let (
+            raw_id,
+            workspace_name,
+            project_name,
+            name,
+            last_active_at,
+            raw_run_id,
+            latest_agent,
+            run_state,
+            lease_expires_at,
+            latest_started_at,
+            latest_ended_at,
+            exit_code,
+            event_count,
+            linked_agent,
+        ) = row?;
+        let workstream_id = WorkstreamId::from_slice(&raw_id)?;
+        if summaries
+            .last()
+            .is_none_or(|summary| summary.workstream_id != workstream_id)
+        {
+            let latest_run_id = raw_run_id
+                .as_deref()
+                .map(ManagedRunId::from_slice)
+                .transpose()?;
+            summaries.push(OperationalWorkstreamSummary {
+                workstream_id,
+                workspace_name,
+                project_name,
+                name,
+                status: operational_status(
+                    run_state.as_deref(),
+                    lease_expires_at,
+                    exit_code,
+                    event_count,
+                    now_us,
+                ),
+                latest_run_id,
+                latest_agent: latest_agent.as_deref().map(AgentKind::from_wire),
+                event_count,
+                linked_harnesses: Vec::new(),
+                last_active_at,
+                latest_started_at,
+                latest_ended_at,
+            });
+        }
+        if let Some(agent) = linked_agent
+            && let Some(summary) = summaries.last_mut()
+        {
+            summary.linked_harnesses.push(AgentKind::from_wire(&agent));
+        }
+    }
+    Ok(summaries)
+}
+
 /// Retitle one checkout-local workstream.
 ///
 /// Names are metadata: `workstream_events`, `managed_runs`, and
@@ -1929,7 +2151,7 @@ fn stored_event(row: EventRow, sanitizer: &Sanitizer) -> StoreResult<WorkstreamE
 
 #[cfg(test)]
 mod tests {
-    use super::strip_column_prefixes;
+    use super::{WorkstreamOperationalStatus, operational_status, strip_column_prefixes};
 
     #[test]
     fn column_prefixes_are_stripped_only_at_word_starts() {
@@ -1946,5 +2168,41 @@ mod tests {
             "café_title:x a/body:y"
         );
         assert_eq!(strip_column_prefixes("título:x"), "título:x");
+    }
+
+    #[test]
+    fn operational_status_uses_only_trusted_lifecycle_fields() {
+        use WorkstreamOperationalStatus::{Active, Completed, Empty, Interrupted};
+
+        assert_eq!(
+            operational_status(Some("active"), Some(11), None, 0, 10),
+            Active
+        );
+        assert_eq!(
+            operational_status(Some("active"), Some(10), None, 9, 10),
+            Interrupted
+        );
+        assert_eq!(
+            operational_status(Some("expired"), Some(99), Some(0), 9, 10),
+            Interrupted
+        );
+        assert_eq!(
+            operational_status(Some("finished"), Some(0), None, 9, 10),
+            Interrupted
+        );
+        assert_eq!(
+            operational_status(Some("finished"), Some(0), Some(2), 9, 10),
+            Interrupted
+        );
+        assert_eq!(
+            operational_status(Some("finished"), Some(0), Some(0), 9, 10),
+            Completed
+        );
+        assert_eq!(
+            operational_status(Some("finished"), Some(0), Some(0), 0, 10),
+            Empty
+        );
+        assert_eq!(operational_status(None, None, None, 3, 10), Completed);
+        assert_eq!(operational_status(None, None, None, 0, 10), Empty);
     }
 }

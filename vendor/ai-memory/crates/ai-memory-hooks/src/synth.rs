@@ -214,6 +214,33 @@ impl SessionDigest {
         )
     }
 
+    /// [`Self::load`], also returning the session's observation count from
+    /// the SAME read snapshot the digest was built from.
+    ///
+    /// The idle auto-end tick binds that count to the end stamp (review R36
+    /// F3): an observation landing after the digest was built must invalidate
+    /// the stamp instead of reaching the watermark without reaching the page.
+    ///
+    /// # Errors
+    /// Propagates any store error.
+    pub(crate) async fn load_with_count(
+        reader: &ReaderPool,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<(Self, i64)> {
+        reader
+            .read_session_observations(workspace_id, project_id, session_id, move |snapshot| {
+                let (digest, _stats) = build_digest(snapshot, session_id)?;
+                // Overflow only with more than 9.2e18 observations: fail
+                // toward `Lost` at the stamp (an unrepresentable count never
+                // matches the stamp-time COUNT), never toward a wrong stamp.
+                let total = i64::try_from(snapshot.kind_summary()?.total).unwrap_or(i64::MAX);
+                Ok((digest, total))
+            })
+            .await
+    }
+
     /// [`Self::load`], also reporting what the load read.
     ///
     /// # Errors
@@ -1721,5 +1748,116 @@ mod tests {
             page.body
                 .contains("100 raw observations omitted from the middle")
         );
+    }
+}
+
+#[cfg(test)]
+mod load_with_count_scopes {
+    use ai_memory_core::{
+        AgentKind, NewObservation, NewSession, ObservationKind, Sanitized, Sanitizer,
+    };
+    use ai_memory_store::Store;
+
+    use super::*;
+
+    /// The new raw-id entry point must refuse foreign tuples the way the
+    /// bounded read refuses them: the idle tick's digest can never load a
+    /// session's observations through a scope the session does not belong
+    /// to. Each refusal is paired with the legitimate control in the same
+    /// fixture.
+    #[tokio::test]
+    async fn foreign_and_missing_tuples_load_nothing_the_right_tuple_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "idle", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let foreign_ws = store
+            .writer
+            .get_or_create_workspace("foreign".to_string())
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+            })
+            .await
+            .unwrap();
+        async fn insert_obs(
+            store: &Store,
+            sid: SessionId,
+            ws: WorkspaceId,
+            proj: ProjectId,
+            kind: ObservationKind,
+            body: &str,
+        ) {
+            let obs = NewObservation {
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind,
+                extension: None,
+                source_event: None,
+                title: "scoped test event".into(),
+                body: body.into(),
+                importance: 5,
+                occurred_at: None,
+            };
+            store
+                .writer
+                .insert_observation(Sanitized::new(obs, &Sanitizer::builtin()))
+                .await
+                .unwrap();
+        }
+        insert_obs(&store, sid, ws, proj, ObservationKind::UserPrompt, "prompt").await;
+        insert_obs(&store, sid, ws, proj, ObservationKind::PostToolUse, "tool").await;
+        let reader = store.reader.clone();
+
+        // Violations: a foreign project, a foreign workspace, a missing id —
+        // each is refused, so none of them can load the session's rows.
+        let foreign_project = SessionDigest::load_with_count(&reader, ws, other, sid).await;
+        assert!(
+            matches!(foreign_project, Err(StoreError::SessionCollision)),
+            "a foreign project loads no observations"
+        );
+        let foreign_workspace =
+            SessionDigest::load_with_count(&reader, foreign_ws, proj, sid).await;
+        assert!(
+            matches!(foreign_workspace, Err(StoreError::SessionCollision)),
+            "a foreign workspace loads no observations"
+        );
+        let missing = SessionDigest::load_with_count(&reader, ws, proj, SessionId::new()).await;
+        assert!(
+            matches!(missing, Err(StoreError::SessionCollision)),
+            "a missing id loads nothing"
+        );
+
+        // Legitimate control: the right tuple loads the session's rows and
+        // counts them from the same snapshot.
+        let (digest, count) = SessionDigest::load_with_count(&reader, ws, proj, sid)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "the digest's snapshot counts both rows");
+        assert_eq!(digest.total, 2);
     }
 }

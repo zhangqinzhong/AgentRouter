@@ -26,6 +26,7 @@ use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 /// before it is eligible again. Restarting the process clears all circuit
 /// state; there is no durable or cross-process cooldown.
 pub const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
+const MAX_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 
 /// One provider in an ordered fallback chain.
 ///
@@ -129,7 +130,12 @@ impl FallbackLlmProvider {
         state.last_error_status = err.http_status();
         state.last_error_class = Some(err.class());
         if err.is_transient() {
-            state.circuit_open_until = Some(Instant::now() + CIRCUIT_COOLDOWN);
+            let cooldown = err
+                .retry_after()
+                .unwrap_or(CIRCUIT_COOLDOWN)
+                .max(CIRCUIT_COOLDOWN)
+                .min(MAX_CIRCUIT_COOLDOWN);
+            state.circuit_open_until = Some(Instant::now() + cooldown);
         }
     }
 
@@ -416,9 +422,14 @@ mod tests {
 
     fn clone_err(err: &LlmError) -> LlmError {
         match err {
-            LlmError::Provider { status, body } => LlmError::Provider {
+            LlmError::Provider {
+                status,
+                body,
+                retry_after,
+            } => LlmError::Provider {
                 status: *status,
                 body: body.clone(),
+                retry_after: *retry_after,
             },
             LlmError::Serde(msg) => LlmError::Serde(msg.clone()),
             LlmError::UnexpectedShape(msg) => LlmError::UnexpectedShape(msg.clone()),
@@ -481,6 +492,7 @@ mod tests {
         LlmError::Provider {
             status,
             body: "upstream body that must never leak".to_string(),
+            retry_after: None,
         }
     }
 
@@ -569,22 +581,27 @@ mod tests {
             LlmError::Provider {
                 status: 400,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 401,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 403,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 404,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 422,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Schema("bad schema".into()),
             LlmError::Serde("deserialize failed".into()),
@@ -649,6 +666,40 @@ mod tests {
         LlmError::Provider {
             status,
             body: body.to_string(),
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn provider_retry_hints_are_clamped_to_the_circuit_bounds() {
+        let chain = FallbackLlmProvider::new(vec![Candidate::new(
+            "primary",
+            "m1",
+            Arc::new(ScriptedLlm::ok("primary", "m1", "unused")),
+        )]);
+
+        for (hint, expected) in [(5, 30), (90, 90), (7_200, 3_600)] {
+            let before = Instant::now();
+            chain.record_error(
+                0,
+                &LlmError::Provider {
+                    status: 429,
+                    body: String::new(),
+                    retry_after: Some(Duration::from_secs(hint)),
+                },
+            );
+            let until = chain.entries[0]
+                .state
+                .lock()
+                .unwrap()
+                .circuit_open_until
+                .unwrap();
+            let actual = until.duration_since(before);
+            assert!(
+                actual >= Duration::from_secs(expected)
+                    && actual < Duration::from_secs(expected + 1),
+                "hint {hint}s produced {actual:?}"
+            );
         }
     }
 

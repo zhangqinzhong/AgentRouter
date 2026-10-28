@@ -44,7 +44,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use ai_memory_core::{
     ActorContext, PageEvidence, PageEvidenceKind, PageId, ProjectId, Tier, WorkspaceId,
 };
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload, Role,
+    complete_structured_with_operation_id,
+};
 use ai_memory_store::{DecayParams, ReaderPool};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use schemars::JsonSchema;
@@ -527,7 +530,7 @@ pub async fn run_dream_pass(
             report.cancelled = true;
             break;
         }
-        match merge_one_cluster(wiki, llm, workspace_id, project_id, &plan).await {
+        match merge_one_cluster(wiki, reader, llm, workspace_id, project_id, &plan).await {
             MergeOutcome::Applied {
                 new_survivor_id,
                 superseded,
@@ -568,6 +571,7 @@ enum MergeOutcome {
 /// skips the cluster without touching a source.
 async fn merge_one_cluster(
     wiki: &Wiki,
+    reader: &ReaderPool,
     llm: &(dyn LlmProvider + 'static),
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -619,7 +623,13 @@ async fn merge_one_cluster(
 
     // JSON-schema structured merge (invariant #7). A failed completion skips.
     let request = build_merge_request(&member_bodies);
-    let merged: DreamMergedPage = match complete_structured(llm, request).await {
+    let merged: DreamMergedPage = match complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Dream),
+    )
+    .await
+    {
         Ok(page) => page,
         Err(error) => {
             tracing::warn!(path = %survivor.path.as_str(), %error, "dream pass: LLM merge failed; skipping cluster (retried next run)");
@@ -667,11 +677,44 @@ async fn merge_one_cluster(
             source_id: format!("b2_dream:{}", loser.id),
         });
     }
+    // #1218: a cross-scope link the model invented must not be written. The
+    // member bodies are injected into the merge prompt verbatim, so a
+    // `[[project:path]]` from a source page — or one the model simply made up —
+    // reaches the survivor. Resolve each against the store and de-link what
+    // does not exist, as the consolidator and bootstrap writes already do;
+    // otherwise the merge mints a dangling cross-project edge that
+    // `dangling_cross_project_links` reports on every later lint run and
+    // nothing in the pipeline can clear.
+    let mut survivor_fm = serde_json::Value::Object(survivor_fm);
+    match crate::link_guard::unresolved_generated_links(
+        reader,
+        workspace_id,
+        project_id,
+        &[(&survivor.path, survivor_body.as_str(), &survivor_fm)],
+    )
+    .await
+    {
+        Ok(unresolved) => {
+            survivor_body =
+                crate::link_guard::delink_body(&survivor_body, &survivor.path, &unresolved.body)
+                    .into_owned();
+            crate::link_guard::prune_relations(&mut survivor_fm, &unresolved.relations);
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %survivor.path.as_str(),
+                %error,
+                "dream pass: cross-scope link resolution failed; skipping cluster (retried next run)"
+            );
+            return MergeOutcome::Skipped;
+        }
+    }
+
     requests.push(WritePageRequest {
         workspace_id,
         project_id,
         path: survivor.path.clone(),
-        frontmatter: serde_json::Value::Object(survivor_fm),
+        frontmatter: survivor_fm,
         body: survivor_body,
         tier: Tier::Episodic,
         pinned: false,
@@ -696,6 +739,17 @@ async fn merge_one_cluster(
             survivor.path.as_str()
         );
         let mut stub_fm = frontmatter_object(&loser_md.frontmatter);
+        // The stub's body is now a two-line merge note, so the loser's own
+        // `summary:` would describe content that moved to the survivor:
+        // `page_descriptor_expr` prefers a non-blank frontmatter summary
+        // over the body on every non-FTS retrieval path, and
+        // `abstract_bearing_page_ids` would keep re-embedding the abstract.
+        // Removing both rather than rewriting `summary` to the merge note:
+        // the descriptor then falls back to the body prefix, which already
+        // IS that note. The pre-merge frontmatter stays reachable through
+        // the supersession chain and git.
+        stub_fm.remove("summary");
+        stub_fm.remove("abstract");
         stub_fm.insert("compacted".to_string(), serde_json::Value::Bool(true));
         stub_fm.insert(
             "merged_into".to_string(),

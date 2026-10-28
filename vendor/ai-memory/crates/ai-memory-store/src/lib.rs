@@ -63,13 +63,14 @@ pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalUpsert,
     DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
-    HookSessionAdmission, IdentityResolution, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MAX_PENDING_INBOX_MESSAGES, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
-    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary,
-    PagesMode, ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary,
-    ReorgSummary, RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate,
-    SessionTimesSkipReason, SkippedSessionTimes, StaleAfterRepair, backfill_entity_index,
-    backfill_page_windows, backfill_page_windows_in_batches, purge_session, record_embed_failure,
+    HookSessionAdmission, IdentityResolution, IdleEndAction, IdleEndCandidate, IdleEndResult,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
+    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
+    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
+    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,
@@ -85,20 +86,22 @@ pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
     AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
-    DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
-    GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
-    ObservationOrder, ObservationPage, ObservationPageResult, ObservationProjectionTotals,
-    ObservationRecord, OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter,
-    PageHit, PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
+    CrossProjectEdge, DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount,
+    FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
+    HybridSearch, HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, LinkGraph,
+    LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
+    PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
+    PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
     PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
     ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
     ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
     SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
-    SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
+    SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
     SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
     SessionPromptTitles, SessionSummary, SessionToolTitles, SettledPage, StatusCounts,
     StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -109,14 +112,17 @@ pub use scope::{
     lookup_existing_workspace, lookup_global_scope, lookup_profile_scope,
     resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
-pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
+pub use session_consolidation::{
+    SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, enqueue_in_tx,
+};
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
     LinkOrAdoptManagedRunSession, ManagedRunAuthority, ManagedRunContext, ManagedRunSessionLink,
-    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
-    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection, WorkstreamSelector,
+    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
+    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -219,6 +225,14 @@ impl Store {
                 "project coordinate keys backfilled"
             );
         }
+        let cjk_backfill = ops::backfill_cjk_indexes(&mut conn)?;
+        if cjk_backfill.pages > 0 || cjk_backfill.observations > 0 {
+            tracing::info!(
+                pages = cjk_backfill.pages,
+                observations = cjk_backfill.observations,
+                "CJK search indexes backfilled"
+            );
+        }
 
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;
@@ -283,9 +297,9 @@ mod tests {
     use ai_memory_core::{
         ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
         ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
-        ObservationId, ObservationKind, PageEvidence, PageEvidenceKind, PageId, PagePath,
-        ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
-        WorkstreamId,
+        ObservationId, ObservationKind, OwnerFilter, PageEvidence, PageEvidenceKind, PageId,
+        PagePath, ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId,
+        WorkstreamEventKind, WorkstreamId,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -2467,7 +2481,7 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "alpha.md");
-        assert!(hits[0].snippet.contains("<mark>quick</mark>"));
+        assert!(highlighted_snippet_html(&hits[0].snippet).contains("<mark>quick</mark>"));
 
         // Supersede: only the latest version should appear in counts'
         // pages_latest, and search should still return exactly one hit.
@@ -3218,6 +3232,146 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn structured_filters_hold_in_vector_and_both_graph_directions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "filters", None)
+            .await
+            .unwrap();
+
+        for path in ["kept/vector.md", "other/vector.md"] {
+            let id = store
+                .writer
+                .upsert_page(sample_page(ws, proj, path, "vector-only content"))
+                .await
+                .unwrap();
+            store
+                .writer
+                .store_embedding(
+                    id,
+                    f32_vec_to_bytes(&[1.0, 0.0]),
+                    "test".into(),
+                    "two-dim".into(),
+                    2,
+                )
+                .await
+                .unwrap();
+        }
+        let query_vector = [1.0, 0.0];
+        let (vector_hits, _) = store
+            .reader
+            .hybrid_search_scopes(
+                &[(ws, proj)],
+                HybridSearch {
+                    query: "no-lexical-match",
+                    vector: Some(VectorQuery {
+                        vector: &query_vector,
+                        provider: "test",
+                        model: "two-dim",
+                        dim: 2,
+                    }),
+                    limit: 10,
+                    expiry_cutoff_us: None,
+                    include_superseded: false,
+                    explain: true,
+                    owner: &OwnerFilter::Any,
+                    filter: PageFilter {
+                        path_prefix: Some("kept/"),
+                        ..PageFilter::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(vector_hits.len(), 1, "{vector_hits:?}");
+        assert_eq!(vector_hits[0].0.path.as_str(), "kept/vector.md");
+        assert_eq!(
+            vector_hits[0]
+                .1
+                .as_ref()
+                .and_then(|details| details.vector_rank),
+            Some(1)
+        );
+
+        let tagged = |path: &str, body: &str, tag: &str| {
+            let mut page = sample_page(ws, proj, path, body);
+            page.frontmatter_json = serde_json::json!({"tags": [tag]});
+            page
+        };
+        let mut seed = tagged("graph/seed.md", "graphneedle source", "route");
+        seed.links = vec![
+            PagePath::new("graph/out.md").unwrap().into(),
+            PagePath::new("graph/out-denied.md").unwrap().into(),
+        ];
+        store.writer.upsert_page(seed).await.unwrap();
+        store
+            .writer
+            .upsert_page(tagged("graph/out.md", "outgoing target", "route"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(tagged(
+                "graph/out-denied.md",
+                "excluded outgoing target",
+                "other",
+            ))
+            .await
+            .unwrap();
+        for (path, tag) in [("graph/in.md", "route"), ("graph/in-denied.md", "other")] {
+            let mut incoming = tagged(path, "incoming pointer", tag);
+            incoming.links = vec![PagePath::new("graph/seed.md").unwrap().into()];
+            store.writer.upsert_page(incoming).await.unwrap();
+        }
+
+        let (graph_hits, _) = store
+            .reader
+            .hybrid_search_scopes(
+                &[(ws, proj)],
+                HybridSearch {
+                    query: "graphneedle",
+                    vector: None,
+                    limit: 10,
+                    expiry_cutoff_us: None,
+                    include_superseded: false,
+                    explain: true,
+                    owner: &OwnerFilter::Any,
+                    filter: PageFilter {
+                        tag: Some("route"),
+                        ..PageFilter::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let graph_paths: std::collections::HashSet<_> = graph_hits
+            .iter()
+            .map(|(hit, _)| hit.path.as_str())
+            .collect();
+        assert_eq!(
+            graph_paths,
+            ["graph/seed.md", "graph/out.md", "graph/in.md"]
+                .into_iter()
+                .collect()
+        );
+        for path in ["graph/out.md", "graph/in.md"] {
+            let details = graph_hits
+                .iter()
+                .find(|(hit, _)| hit.path.as_str() == path)
+                .and_then(|(_, details)| details.as_ref())
+                .unwrap();
+            assert!(details.graph_rank.is_some(), "{path}: {details:?}");
+        }
+    }
+
     /// P3 (docs/design-hindsight-borrowings.md): a typed edge (`fixes`) is
     /// surfaced as the graph_via `edge` kind in explain. Ranking is untouched;
     /// only the explanation names why the neighbour was reached.
@@ -3474,7 +3628,7 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, session_id);
-        assert!(hits[0].snippet.contains("<mark>zebra</mark>"));
+        assert!(highlighted_snippet_html(&hits[0].snippet).contains("<mark>zebra</mark>"));
     }
 
     /// The public writer API only accepts `Sanitized<NewObservation>`, and

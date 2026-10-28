@@ -88,6 +88,17 @@ export const briefing = {
   recent_pages: [
     { path: "notes/retries.md", title: "Retry policy", kind: "note", updated_at: "2026-10-13T15:10:53Z" },
   ],
+  recent_sessions: [
+    {
+      session_id: "09db5007-256a-5d22-970e-c9deb0081218",
+      agent_kind: "open-code",
+      cwd: "/work/app",
+      last_activity_at: "2026-10-13T15:20:00Z",
+      ended: false,
+      handed_off: false,
+      current: false,
+    },
+  ],
   scope: { workspace: "demo", project: "app", resolved_by: "explicit" },
 };
 

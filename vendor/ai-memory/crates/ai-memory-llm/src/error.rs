@@ -1,5 +1,7 @@
 //! LLM error type.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Result alias used throughout the LLM crate.
@@ -20,6 +22,8 @@ pub enum LlmError {
         status: u16,
         /// Response body (truncated).
         body: String,
+        /// Provider-requested delay before another equivalent request.
+        retry_after: Option<Duration>,
     },
 
     /// JSON (de)serialization failure.
@@ -65,6 +69,12 @@ pub enum LlmError {
     #[error("auth: {0}")]
     Auth(String),
 
+    /// Optional local work could not start without waiting behind already
+    /// active work. Callers should use their non-provider fallback instead of
+    /// retrying or reporting the provider unhealthy.
+    #[error("{0} capacity is busy")]
+    CapacityBusy(&'static str),
+
     /// JSON schema for structured output could not be derived.
     #[error("schema: {0}")]
     Schema(String),
@@ -98,10 +108,19 @@ impl LlmError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Provider { status, .. } => *status == 429 || (500..=599).contains(status),
+            Self::Provider { status, .. } => Self::status_is_transient(*status),
             Self::Http(e) => e.is_timeout() || e.is_connect(),
             _ => false,
         }
+    }
+
+    /// The status half of [`Self::is_transient`], for a call site that must
+    /// pick an error variant before one exists — a token endpoint answering
+    /// `429`/`5xx` has not rejected the credential, so it must not become an
+    /// `Auth` error, which is deterministic.
+    #[must_use]
+    pub fn status_is_transient(status: u16) -> bool {
+        status == 429 || (500..=599).contains(&status)
     }
 
     /// HTTP status captured from this error, when the failure carries one.
@@ -110,6 +129,16 @@ impl LlmError {
         match self {
             Self::Http(e) => e.status().map(|status| status.as_u16()),
             Self::Provider { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Provider-requested delay before another equivalent request, when the
+    /// failed HTTP response carried a trustworthy, boundedly parsed hint.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Provider { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -127,6 +156,7 @@ impl LlmError {
             Self::EmptyContent { .. } => "empty-content",
             Self::NotConfigured(_) => "not-configured",
             Self::Auth(_) => "auth",
+            Self::CapacityBusy(_) => "capacity-busy",
             Self::Schema(_) => "schema",
             Self::AllCandidatesFailed { .. } => "all-candidates-failed",
         }
@@ -148,7 +178,8 @@ mod tests {
         assert!(
             LlmError::Provider {
                 status: 429,
-                body: String::new()
+                body: String::new(),
+                retry_after: None,
             }
             .is_transient()
         );
@@ -156,7 +187,8 @@ mod tests {
             assert!(
                 LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "status {status} should be transient"
@@ -167,7 +199,8 @@ mod tests {
             assert!(
                 !LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "status {status} must not be treated as transient"
@@ -178,6 +211,7 @@ mod tests {
     #[test]
     fn deterministic_errors_are_not_transient() {
         assert!(!LlmError::Auth("expired".into()).is_transient());
+        assert!(!LlmError::CapacityBusy("embedding").is_transient());
         assert!(!LlmError::Schema("bad".into()).is_transient());
         assert!(!LlmError::Serde("nope".into()).is_transient());
         assert!(!LlmError::UnexpectedShape("no tool block".into()).is_transient());
@@ -238,7 +272,8 @@ mod tests {
         assert_eq!(
             LlmError::Provider {
                 status: 503,
-                body: "boom".into()
+                body: "boom".into(),
+                retry_after: None,
             }
             .http_status(),
             Some(503)
@@ -253,6 +288,7 @@ mod tests {
                 LlmError::Provider {
                     status: 500,
                     body: "secret upstream body".into(),
+                    retry_after: None,
                 },
                 "provider",
             ),
@@ -274,6 +310,7 @@ mod tests {
             ),
             (LlmError::NotConfigured("no key".into()), "not-configured"),
             (LlmError::Auth("expired".into()), "auth"),
+            (LlmError::CapacityBusy("embedding"), "capacity-busy"),
             (LlmError::Schema("bad".into()), "schema"),
             (
                 LlmError::AllCandidatesFailed {
@@ -286,6 +323,34 @@ mod tests {
         for (err, expected) in cases {
             assert_eq!(err.class(), *expected, "unexpected class for {err}");
             assert!(!err.class().contains("secret upstream body"));
+        }
+    }
+
+    #[test]
+    fn status_is_transient_matches_is_transient() {
+        for status in [429u16, 500, 503, 529, 599] {
+            assert!(LlmError::status_is_transient(status), "{status}");
+            assert!(
+                LlmError::Provider {
+                    status,
+                    body: String::new(),
+                    retry_after: None,
+                }
+                .is_transient(),
+                "{status} must agree with is_transient"
+            );
+        }
+        for status in [400u16, 401, 403, 404, 422, 600] {
+            assert!(!LlmError::status_is_transient(status), "{status}");
+            assert!(
+                !LlmError::Provider {
+                    status,
+                    body: String::new(),
+                    retry_after: None,
+                }
+                .is_transient(),
+                "{status} must agree with is_transient"
+            );
         }
     }
 }

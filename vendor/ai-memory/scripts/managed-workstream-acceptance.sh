@@ -456,7 +456,7 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
          INSERT INTO trajectory_blob (data) VALUES (x'414d57532d505249564154452d5452414a4543544f5259');"
     fi
     payload=$(jq -nc --arg id "$session_id" --arg cwd "$PWD" \
-      '{invocationNum: 0, conversationId: $id, workspacePaths: [$cwd]}')
+      '{conversationId: $id, workspacePaths: [$cwd]}')
     printf '%s' "$payload" | \
       AI_MEMORY_HOOK_URL="${AI_MEMORY_SERVER_URL:?}" \
       "$AI_MEMORY_ACCEPTANCE_ANTIGRAVITY_HOOK" \
@@ -998,7 +998,7 @@ jq -e \
 }
 
 # Antigravity fake-mode fixture: `agy` owns the conversation id and SQLite
-# database, while its real PreInvocation hook links that id and accepts any
+# database, while its real SessionStart hook links that id and accepts any
 # pending workstream context. The private trajectory table is never decoded or
 # copied into the ledger.
 ANTIGRAVITY_FAKE_HOME="$CONFIG/antigravity-fake"
@@ -1087,7 +1087,7 @@ if grep -q . "$TMP/antigravity-cross-argv.log"; then
   cat "$TMP/antigravity-cross-argv.log" >&2
   exit 1
 fi
-jq -e '.injectSteps[0].ephemeralMessage | contains("AMWS-FAKE-KIMI")' \
+jq -e '.injectSteps[0].systemMessage.systemMessage | contains("AMWS-FAKE-KIMI")' \
   "$TMP/antigravity-cross-hook.json" >/dev/null || {
   printf 'Antigravity hook did not receive the prior Kimi workstream history\n' >&2
   cat "$TMP/antigravity-cross-hook.json" >&2

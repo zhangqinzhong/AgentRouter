@@ -18,7 +18,7 @@ use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Role, Usage};
 
 /// Default Gemini API base.
@@ -253,13 +253,8 @@ impl GeminiProvider {
                 .header("content-type", "application/json"),
         );
         let resp = request.json(body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<R>(resp).await
     }

@@ -13,6 +13,14 @@
 //! — the moment a restore fails is the moment the operator has no other
 //! copy, so the previous state must survive it.
 //!
+//! A backup's `config.toml` is code-bearing: it can name commands the server
+//! runs (`[auto_improve.eval]`), where consolidated memory is sent (provider
+//! URLs and headers, admission webhooks) and how much is redacted
+//! (`[sanitize]`). A restore therefore keeps an existing live config and saves
+//! the archived one beside it as `config.toml.from-backup` for review;
+//! `--with-config` restores it in place, and a data dir with no config gets
+//! the archived one as before.
+//!
 //! # Exception to invariant §16
 //!
 //! `restore` is one of the documented exceptions to the rule that the CLI
@@ -25,7 +33,7 @@
 use ai_memory_store::Store;
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
 
 use crate::cli::RestoreArgs;
@@ -38,9 +46,32 @@ use crate::process_guard::{busy_message, sibling_processes};
 /// `models/`, `raw/` and anything else beside them are never touched.
 const REPLACED_DIRS: &[&str] = &["wiki", "db"];
 
-/// The one file a restore replaces, and only when the archive carries it;
-/// otherwise the live copy stays.
+/// The one file a restore can replace: only when the archive carries it, and
+/// only with `--with-config` or when the data dir has none.
 const CONFIG_FILE: &str = "config.toml";
+
+/// Where an archived config goes when the live one is kept.
+const CONFIG_FROM_BACKUP_FILE: &str = "config.toml.from-backup";
+
+/// What a restore did with the archive's `config.toml`.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigOutcome {
+    /// The archive carried no config; the live one, if any, is untouched.
+    NotInArchive,
+    /// The archived config is now the live one.
+    Restored,
+    /// The live config was kept and the archived one saved at this path.
+    SavedBeside(PathBuf),
+}
+
+/// The archived config's place: live when asked for or when there is none,
+/// otherwise beside the live one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigPlacement {
+    Absent,
+    Install,
+    Divert,
+}
 
 /// Run the `restore` subcommand.
 ///
@@ -49,7 +80,7 @@ const CONFIG_FILE: &str = "config.toml";
 /// data dir is non-empty without `--force`, the tarball cannot be
 /// extracted, or the restored store fails to open. In every one of those
 /// cases the live data dir is left as it was.
-pub fn run(config: &Config, args: RestoreArgs) -> Result<()> {
+pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
     let siblings = sibling_processes();
     if !siblings.is_empty() {
         bail!(busy_message("restore", &siblings));
@@ -59,22 +90,57 @@ pub fn run(config: &Config, args: RestoreArgs) -> Result<()> {
         bail!("source tarball {} not found", args.from.display());
     }
 
-    restore_data_dir(&config.data_dir, &args.from, args.force)?;
+    let outcome = restore_data_dir_with_legacy_pepper(
+        &config.data_dir,
+        &args.from,
+        args.force,
+        args.with_config,
+        config.auth.token_pepper.as_deref(),
+        args.accept_legacy_api_key_pepper,
+    )
+    .await?;
     info!("restore complete");
     println!(
         "restored {} -> {}",
         args.from.display(),
         config.data_dir.display()
     );
+    match outcome {
+        ConfigOutcome::NotInArchive => {}
+        ConfigOutcome::Restored => println!("restored the backup's config.toml"),
+        ConfigOutcome::SavedBeside(path) => println!(
+            "kept the live config.toml; the backup's copy is at {}. A config can run \
+             commands and redirect data: review it before adopting it, or rerun with \
+             --with-config to restore it in place.",
+            path.display()
+        ),
+    }
     Ok(())
 }
 
 /// Stage, validate, then swap. Nothing under `data_dir` changes until the
 /// archive has been fully extracted into a staging directory and the
-/// staged store has opened; the live `wiki/`, `db/` and (when the archive
-/// carries one) `config.toml` are then exchanged for the staged copies by
+/// staged store has opened; the live `wiki/`, `db/` and (when it is being
+/// restored) `config.toml` are then exchanged for the staged copies by
 /// rename and rolled back if any step of the exchange fails.
-fn restore_data_dir(data_dir: &Path, from: &Path, force: bool) -> Result<()> {
+#[cfg(test)]
+async fn restore_data_dir(
+    data_dir: &Path,
+    from: &Path,
+    force: bool,
+    with_config: bool,
+) -> Result<ConfigOutcome> {
+    restore_data_dir_with_legacy_pepper(data_dir, from, force, with_config, None, false).await
+}
+
+async fn restore_data_dir_with_legacy_pepper(
+    data_dir: &Path,
+    from: &Path,
+    force: bool,
+    with_config: bool,
+    token_pepper: Option<&str>,
+    accept_legacy_api_key_pepper: bool,
+) -> Result<ConfigOutcome> {
     let wiki = data_dir.join("wiki");
     let db = data_dir.join("db").join("memory.sqlite");
     let occupied = (wiki.is_dir() && std::fs::read_dir(&wiki)?.next().is_some()) || db.is_file();
@@ -96,7 +162,16 @@ fn restore_data_dir(data_dir: &Path, from: &Path, force: bool) -> Result<()> {
     let staging = data_dir.join(format!(".restore-staging-{stamp}"));
     let previous = data_dir.join(format!(".restore-previous-{stamp}"));
 
-    let outcome = stage_then_swap(data_dir, from, &staging, &previous);
+    let outcome = stage_then_swap(
+        data_dir,
+        from,
+        &staging,
+        &previous,
+        with_config,
+        token_pepper,
+        accept_legacy_api_key_pepper,
+    )
+    .await;
     // The staging dir is scratch in every outcome: on success its contents
     // were moved into place, on failure the live data was never touched.
     if staging.exists()
@@ -111,7 +186,15 @@ fn restore_data_dir(data_dir: &Path, from: &Path, force: bool) -> Result<()> {
     outcome
 }
 
-fn stage_then_swap(data_dir: &Path, from: &Path, staging: &Path, previous: &Path) -> Result<()> {
+async fn stage_then_swap(
+    data_dir: &Path,
+    from: &Path,
+    staging: &Path,
+    previous: &Path,
+    with_config: bool,
+    token_pepper: Option<&str>,
+    accept_legacy_api_key_pepper: bool,
+) -> Result<ConfigOutcome> {
     std::fs::create_dir(staging)
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
 
@@ -125,24 +208,121 @@ fn stage_then_swap(data_dir: &Path, from: &Path, staging: &Path, previous: &Path
         .with_context(|| format!("extracting {} into {}", from.display(), staging.display()))?;
     info!(from = %from.display(), into = %staging.display(), "tarball extracted into staging");
 
+    let placement = if !staging.join(CONFIG_FILE).is_file() {
+        ConfigPlacement::Absent
+    } else if with_config || !data_dir.join(CONFIG_FILE).exists() {
+        ConfigPlacement::Install
+    } else {
+        ConfigPlacement::Divert
+    };
+
     // 2. Open + drop the staged store so refinery applies any pending
     //    migrations and the SQLite file is validated — still before anything
     //    live is touched. Dropping the store joins the writer thread and
     //    closes every connection, so the directory can be renamed afterwards
     //    on Windows as well.
-    drop(Store::open(staging).context("opening restored store")?);
+    let store = Store::open(staging).context("opening restored store")?;
+    let has_api_credentials = store.reader.api_credentials_exist().await?;
+    let has_pepper_verifier = store
+        .reader
+        .api_credential_pepper_verifier()
+        .await?
+        .is_some();
+    if has_api_credentials && !has_pepper_verifier {
+        if !accept_legacy_api_key_pepper {
+            bail!(
+                "the backup contains API keys but predates token-pepper verification; restore the original [auth].token_pepper and rerun with --accept-legacy-api-key-pepper to confirm it (the live data was not changed)"
+            );
+        }
+        let pepper = token_pepper
+            .filter(|value| !value.trim().is_empty())
+            .context(
+                "--accept-legacy-api-key-pepper requires the original non-blank [auth].token_pepper",
+            )?;
+        let verifier = ai_memory_store::password::hash_password(pepper.to_owned())
+            .await
+            .context("binding the confirmed legacy API-key pepper")?;
+        if !store
+            .writer
+            .bind_api_credential_pepper_verifier(verifier)
+            .await?
+        {
+            bail!("the restored API-key pepper verifier could not be bound");
+        }
+    }
+    // Keeping the live config instead of the archived one must not leave a
+    // server that refuses to start: the pepper this command loaded has to be
+    // the one the restored API keys were hashed with.
+    if placement == ConfigPlacement::Divert && has_api_credentials {
+        let matches = match (
+            token_pepper.filter(|value| !value.trim().is_empty()),
+            store.reader.api_credential_pepper_verifier().await?,
+        ) {
+            (Some(pepper), Some(verifier)) => {
+                ai_memory_store::password::verify_password(pepper.to_owned(), verifier)
+                    .await
+                    .context("verifying the live API-key pepper against the backup")?
+            }
+            _ => false,
+        };
+        if !matches {
+            bail!(
+                "the backup's API keys were hashed with a different [auth].token_pepper than \
+                 the live config's; rerun with --with-config to restore the backup's \
+                 config.toml, or set the live config's token_pepper to the original (the live \
+                 data was not changed)"
+            );
+        }
+    }
+    drop(store);
 
     // 3. Exchange the live directories for the staged ones.
-    swap_into_place(data_dir, staging, previous)?;
+    swap_into_place(
+        data_dir,
+        staging,
+        previous,
+        placement == ConfigPlacement::Install,
+    )?;
     info!(into = %data_dir.display(), "restored data swapped into place");
-    Ok(())
+
+    Ok(match placement {
+        ConfigPlacement::Absent => ConfigOutcome::NotInArchive,
+        ConfigPlacement::Install => ConfigOutcome::Restored,
+        ConfigPlacement::Divert => {
+            let beside = data_dir.join(CONFIG_FROM_BACKUP_FILE);
+            save_archived_config(&staging.join(CONFIG_FILE), &beside).with_context(|| {
+                format!(
+                    "the restore completed and kept the live config.toml, but saving the \
+                     backup's config.toml to {} failed",
+                    beside.display()
+                )
+            })?;
+            ConfigOutcome::SavedBeside(beside)
+        }
+    })
+}
+
+/// Move the staged config beside the live one, owner-only: it can hold the
+/// API-key pepper and other credentials.
+fn save_archived_config(staged: &Path, beside: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(staged, beside)
 }
 
 /// Move the live entries aside into `previous`, move the staged entries
 /// into place, then discard `previous`. Every step is a same-filesystem
 /// rename; if one fails, the moves already made are reversed so the data
 /// dir ends up as it started.
-fn swap_into_place(data_dir: &Path, staging: &Path, previous: &Path) -> Result<()> {
+fn swap_into_place(
+    data_dir: &Path,
+    staging: &Path,
+    previous: &Path,
+    install_config: bool,
+) -> Result<()> {
     std::fs::create_dir(previous).with_context(|| format!("creating {}", previous.display()))?;
 
     // Entries moved from the data dir into `previous`, and staged entries
@@ -160,12 +340,13 @@ fn swap_into_place(data_dir: &Path, staging: &Path, previous: &Path) -> Result<(
             }
         }
         let live_config = data_dir.join(CONFIG_FILE);
-        if staging.join(CONFIG_FILE).is_file() && live_config.exists() {
+        if install_config && live_config.exists() {
             std::fs::rename(&live_config, previous.join(CONFIG_FILE))
                 .with_context(|| format!("moving {} aside", live_config.display()))?;
             moved_aside.push(CONFIG_FILE);
         }
-        for name in REPLACED_DIRS.iter().chain(std::iter::once(&CONFIG_FILE)) {
+        let config = install_config.then_some(&CONFIG_FILE);
+        for name in REPLACED_DIRS.iter().chain(config) {
             let staged = staging.join(name);
             if staged.exists() {
                 std::fs::rename(&staged, data_dir.join(name))
@@ -286,6 +467,7 @@ fn validate_restore_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::{ApiCredentialId, NewUser, UserRole};
 
     fn archive_with_entry(path: &str, entry_type: tar::EntryType) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -567,6 +749,62 @@ mod tests {
         std::fs::read(tmp.path().join("db/memory.sqlite")).unwrap()
     }
 
+    /// A snapshot holding one API key, with the pepper verifier bound to
+    /// `pepper`, or none (a pre-verifier backup) when it is `None`.
+    async fn api_key_sqlite_bytes(pepper: Option<&str>) -> Vec<u8> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "legacy-restore-user".into(),
+                    name: None,
+                    email: None,
+                },
+                UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .create_api_credential(
+                ApiCredentialId::new(),
+                user_id,
+                "legacy-key".into(),
+                [0xA5; 32],
+                Some("...test".into()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .api_credential_pepper_verifier()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if let Some(pepper) = pepper {
+            let verifier = ai_memory_store::password::hash_password(pepper.to_owned())
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .writer
+                    .bind_api_credential_pepper_verifier(verifier)
+                    .await
+                    .unwrap()
+            );
+        }
+        let snapshot = tmp.path().join("legacy-snapshot.sqlite");
+        store.reader.snapshot_to(snapshot.clone()).await.unwrap();
+        drop(store);
+        std::fs::read(snapshot).unwrap()
+    }
+
     /// A gzipped tarball holding the given regular files.
     fn gz_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write as _;
@@ -604,14 +842,16 @@ mod tests {
         path
     }
 
-    #[test]
-    fn restore_force_keeps_live_data_when_the_tarball_is_not_a_gzip_stream() {
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_tarball_is_not_a_gzip_stream() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "bad.tar.gz", b"this is not a gzip stream");
 
-        let err = restore_data_dir(data.path(), &from, true).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("extracting"),
@@ -620,15 +860,17 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_force_keeps_live_data_when_the_tarball_is_truncated() {
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_tarball_is_truncated() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
         let whole = good_archive();
         let from = write_tarball(scratch.path(), "cut.tar.gz", &whole[..whole.len() / 2]);
 
-        let err = restore_data_dir(data.path(), &from, true).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("extracting"),
@@ -637,8 +879,8 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_force_keeps_live_data_when_an_entry_is_outside_the_allowed_layout() {
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_an_entry_is_outside_the_allowed_layout() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
@@ -655,7 +897,9 @@ mod tests {
             ]),
         );
 
-        let err = restore_data_dir(data.path(), &from, true).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("unexpected path"),
@@ -664,8 +908,8 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_force_keeps_live_data_when_the_restored_store_cannot_open() {
+    #[tokio::test]
+    async fn restore_force_keeps_live_data_when_the_restored_store_cannot_open() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
@@ -678,7 +922,9 @@ mod tests {
             ]),
         );
 
-        let err = restore_data_dir(data.path(), &from, true).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("opening restored store"),
@@ -687,14 +933,16 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_refuses_a_populated_data_dir_without_force() {
+    #[tokio::test]
+    async fn restore_refuses_a_populated_data_dir_without_force() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        let err = restore_data_dir(data.path(), &from, false).unwrap_err();
+        let err = restore_data_dir(data.path(), &from, false, false)
+            .await
+            .unwrap_err();
 
         assert!(
             err.to_string().contains("pass --force"),
@@ -703,14 +951,18 @@ mod tests {
         assert_live_data_untouched(data.path());
     }
 
-    #[test]
-    fn restore_force_replaces_the_live_data_with_the_archive() {
+    #[tokio::test]
+    async fn restore_force_with_config_replaces_the_live_data_and_config() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        restore_data_dir(data.path(), &from, true).unwrap();
+        let outcome = restore_data_dir(data.path(), &from, true, true)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConfigOutcome::Restored);
+        assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
 
         assert_eq!(
             std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
@@ -744,8 +996,53 @@ mod tests {
         drop(Store::open(data.path()).unwrap());
     }
 
-    #[test]
-    fn restore_keeps_the_live_config_when_the_archive_carries_none() {
+    /// A backup's config can run commands, so by default the live one stays
+    /// and the archived one is saved beside it, owner-only, for review.
+    #[tokio::test]
+    async fn restore_keeps_a_live_config_and_saves_the_archived_one_beside_it() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let archived = b"[auto_improve.eval]\nenabled = true\ncommand = [\"/bin/false\"]\n";
+        let db = migrated_sqlite_bytes();
+        let from = write_tarball(
+            scratch.path(),
+            "code.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", db.as_slice()),
+                ("config.toml", archived),
+            ]),
+        );
+
+        let outcome = restore_data_dir(data.path(), &from, true, false)
+            .await
+            .unwrap();
+
+        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
+        assert_eq!(outcome, ConfigOutcome::SavedBeside(beside.clone()));
+        assert_eq!(
+            std::fs::read(data.path().join("config.toml")).unwrap(),
+            b"# old config\n",
+            "the live config must not be replaced without --with-config"
+        );
+        assert_eq!(std::fs::read(&beside).unwrap(), archived);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&beside).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the archived config can hold credentials");
+        }
+        // The data itself is restored.
+        assert_eq!(
+            std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
+            b"new page"
+        );
+        assert!(restore_scratch_dirs(data.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_the_live_config_when_the_archive_carries_none() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let scratch = tempfile::TempDir::new().unwrap();
@@ -759,8 +1056,12 @@ mod tests {
             ]),
         );
 
-        restore_data_dir(data.path(), &from, true).unwrap();
+        let outcome = restore_data_dir(data.path(), &from, true, true)
+            .await
+            .unwrap();
 
+        assert_eq!(outcome, ConfigOutcome::NotInArchive);
+        assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
         assert_eq!(
             std::fs::read(data.path().join("config.toml")).unwrap(),
             b"# old config\n"
@@ -772,19 +1073,162 @@ mod tests {
         assert!(restore_scratch_dirs(data.path()).is_empty());
     }
 
-    #[test]
-    fn restore_into_an_empty_data_dir_needs_no_force() {
+    #[tokio::test]
+    async fn restore_into_an_empty_data_dir_needs_no_force() {
         let data = tempfile::TempDir::new().unwrap();
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        restore_data_dir(data.path(), &from, false).unwrap();
+        let outcome = restore_data_dir(data.path(), &from, false, false)
+            .await
+            .unwrap();
 
         assert_eq!(
             std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
             b"new page"
         );
         assert!(data.path().join("db/memory.sqlite").is_file());
+        // With no live config to keep, the archived one is restored in place.
+        assert_eq!(outcome, ConfigOutcome::Restored);
+        assert_eq!(
+            std::fs::read(data.path().join("config.toml")).unwrap(),
+            b"# restored config\n"
+        );
+        assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
         assert!(restore_scratch_dirs(data.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_api_key_restore_requires_original_pepper_confirmation() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = api_key_sqlite_bytes(None).await;
+        let from = write_tarball(
+            scratch.path(),
+            "legacy.tar.gz",
+            &gz_tarball(&[("db/memory.sqlite", db.as_slice())]),
+        );
+
+        let refused = restore_data_dir_with_legacy_pepper(
+            data.path(),
+            &from,
+            true,
+            false,
+            Some("original-pepper"),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("--accept-legacy-api-key-pepper"),
+            "unexpected error: {refused:#}"
+        );
+        assert_live_data_untouched(data.path());
+
+        restore_data_dir_with_legacy_pepper(
+            data.path(),
+            &from,
+            true,
+            false,
+            Some("original-pepper"),
+            true,
+        )
+        .await
+        .unwrap();
+        let restored = Store::open(data.path()).unwrap();
+        let verifier = restored
+            .reader
+            .api_credential_pepper_verifier()
+            .await
+            .unwrap()
+            .expect("confirmed pepper must be sealed into the restored database");
+        assert!(
+            ai_memory_store::password::verify_password("original-pepper".into(), verifier)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Keeping the live config must not leave a server that refuses to start
+    /// on the restored API keys. A pepper mismatch is refused before anything
+    /// changes and names `--with-config`; with the flag, or with the
+    /// original pepper live, the restore goes through.
+    #[tokio::test]
+    async fn keeping_the_live_config_requires_its_pepper_to_match_the_restored_keys() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = api_key_sqlite_bytes(Some("archive-pepper")).await;
+        let archived = b"[auth]\ntoken_pepper = \"archive-pepper\"\n";
+        let from = write_tarball(
+            scratch.path(),
+            "keys.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", db.as_slice()),
+                ("config.toml", archived),
+            ]),
+        );
+
+        for live_pepper in [Some("live-pepper"), None] {
+            let data = tempfile::TempDir::new().unwrap();
+            seed_live_data(data.path());
+            let refused = restore_data_dir_with_legacy_pepper(
+                data.path(),
+                &from,
+                true,
+                false,
+                live_pepper,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                refused.to_string().contains("--with-config"),
+                "unexpected error: {refused:#}"
+            );
+            assert_live_data_untouched(data.path());
+            assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
+        }
+
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let outcome = restore_data_dir_with_legacy_pepper(
+            data.path(),
+            &from,
+            true,
+            true,
+            Some("live-pepper"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ConfigOutcome::Restored);
+        assert_eq!(
+            std::fs::read(data.path().join("config.toml")).unwrap(),
+            archived
+        );
+
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let outcome = restore_data_dir_with_legacy_pepper(
+            data.path(),
+            &from,
+            true,
+            false,
+            Some("archive-pepper"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ConfigOutcome::SavedBeside(data.path().join(CONFIG_FROM_BACKUP_FILE))
+        );
+        assert_eq!(
+            std::fs::read(data.path().join("config.toml")).unwrap(),
+            b"# old config\n"
+        );
     }
 }

@@ -49,12 +49,17 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 /// kneedle construction). The result is then clamped to `max_eps` so an operator
 /// keeps a hard conservative ceiling: A3 errs toward NOT merging.
 ///
-/// Returns `None` when there are too few points to form a `k`-distance
-/// (`points.len() <= k`), which the caller treats as "nothing to cluster".
+/// Returns `None` only when there is nothing a distance can be measured
+/// across (`k == 0` or fewer than two points), which the caller treats as
+/// "nothing to cluster". A set of exactly `min_pts` points is a cluster the
+/// density floor admits by definition — with the default `min_pts = 2`, "a
+/// pair of near-duplicates is the smallest thing worth collapsing" — so it
+/// must still yield an eps. The `max_eps` clamp below is what keeps A3
+/// conservative, not a refusal to measure.
 #[must_use]
 pub fn adaptive_eps(points: &[Vec<f32>], k: usize, max_eps: f32) -> Option<f32> {
     let n = points.len();
-    if k == 0 || n <= k {
+    if k == 0 || n < 2 {
         return None;
     }
     // k-th nearest-neighbour distance for every point.
@@ -68,7 +73,10 @@ pub fn adaptive_eps(points: &[Vec<f32>], k: usize, max_eps: f32) -> Option<f32> 
             .collect();
         dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         // `dists` excludes self, so the k-th nearest neighbour is index k-1.
-        k_distances.push(dists[k - 1]);
+        // With fewer than `k` neighbours available, the farthest one is the
+        // densest honest estimate; clamping here is what lets a set of exactly
+        // `k` points (a pair, by default) produce an eps at all.
+        k_distances.push(dists[(k - 1).min(dists.len() - 1)]);
     }
     k_distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -212,6 +220,52 @@ mod tests {
         );
     }
 
+    /// A cold set of exactly `min_pts` near-duplicates is the smallest thing
+    /// the default density floor is meant to collapse, so it must yield an eps
+    /// and cluster. Before this, `adaptive_eps` returned `None` for `n <= k`,
+    /// so a pair alone was silently never merged — while the same pair with
+    /// any third page present collapsed fine.
+    #[test]
+    fn a_pair_of_near_duplicates_yields_an_eps_and_clusters() {
+        let points = vec![vec![1.0, 0.0, 0.0], vec![0.99, 0.01, 0.0]];
+
+        let eps = adaptive_eps(&points, 2, 0.5).expect("a pair must produce an eps");
+        assert!(eps <= 0.5, "the conservative ceiling still applies: {eps}");
+
+        let clusters = dbscan(&points, eps, 2);
+        assert_eq!(clusters.len(), 1, "the pair collapses: {clusters:?}");
+        let mut members = clusters[0].clone();
+        members.sort_unstable();
+        assert_eq!(members, vec![0, 1]);
+    }
+
+    /// The ceiling, not the point count, is what keeps A3 from over-merging: a
+    /// distant pair still must not cluster under a tight `max_eps`.
+    #[test]
+    fn a_distant_pair_stays_unclustered_under_a_tight_ceiling() {
+        let points = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+
+        let eps = adaptive_eps(&points, 2, 0.15).expect("a pair still produces an eps");
+        assert!(eps <= 0.15, "clamped to the ceiling: {eps}");
+
+        let clusters = dbscan(&points, eps, 2);
+        assert!(
+            clusters.is_empty(),
+            "an orthogonal pair is noise, not a merge: {clusters:?}"
+        );
+    }
+
+    /// Fewer than two points has no distance to measure.
+    #[test]
+    fn adaptive_eps_needs_two_points() {
+        assert_eq!(adaptive_eps(&[vec![1.0, 0.0]], 2, 0.5), None);
+        assert_eq!(adaptive_eps(&[], 2, 0.5), None);
+        assert_eq!(
+            adaptive_eps(&[vec![1.0, 0.0], vec![0.9, 0.1]], 0, 0.5),
+            None
+        );
+    }
+
     #[test]
     fn deterministic_across_runs() {
         let points = vec![
@@ -259,12 +313,6 @@ mod tests {
         ];
         let eps = adaptive_eps(&points, 2, 0.05).expect("eps");
         assert!(eps <= 0.05, "ceiling honoured: {eps}");
-    }
-
-    #[test]
-    fn too_few_points_yields_no_eps() {
-        assert_eq!(adaptive_eps(&[vec![1.0, 0.0]], 2, 0.5), None);
-        assert_eq!(adaptive_eps(&[], 2, 0.5), None);
     }
 
     #[test]

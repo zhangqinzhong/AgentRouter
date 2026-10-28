@@ -467,6 +467,7 @@ mod slow {
         "cursor",
         "claude-desktop",
         "gemini-cli",
+        "qwen-code",
         "openclaw",
         "omp",
         "antigravity-cli",

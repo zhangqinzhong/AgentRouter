@@ -133,6 +133,7 @@ async fn render(
         .collect();
 
     let mailbox_capped = mailbox_total > mailbox.len() as u64;
+    let graph_href = crate::templates::graph_href(&workspace, &project);
     let html = ProjectView {
         workspace,
         project,
@@ -143,6 +144,7 @@ async fn render(
         mailbox_total,
         mailbox_capped,
         sessions,
+        graph_href,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

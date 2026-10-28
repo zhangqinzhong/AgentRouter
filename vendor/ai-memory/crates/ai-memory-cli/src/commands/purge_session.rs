@@ -112,6 +112,8 @@ fn preview_message(outcome: &PreviewOutcome, label: &str) -> Option<String> {
 /// UUID, the server is unreachable, or the server returns a non-2xx
 /// response (including `404` for a session outside the named scope).
 pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
 

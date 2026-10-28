@@ -79,7 +79,8 @@ ai-memory-relay flush --queue-dir "$HOME/.ai-memory-relay"
 ai-memory-relay status --queue-dir "$HOME/.ai-memory-relay"
 ```
 
-`enqueue` validates the whole array and commits it in one transaction. Each body
+`enqueue` validates the whole array and commits it in one transaction. A leading
+UTF-8 byte-order mark in the file is skipped. Each body
 must be an object with explicit `session_id` and `cwd` strings. Use the harness's
 native identity and canonical hook event names. Sensitive identities are refused
 without renaming them. Shared private capture helpers scrub new body text and

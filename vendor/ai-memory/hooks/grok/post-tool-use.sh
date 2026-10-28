@@ -31,13 +31,12 @@ fi
 
 # Subagent payloads must not take the parent's handoff — same key set as
 # the native router (`commands/hook.rs::payload_is_subagent`): subagentType,
-# subagent_type, agent_type, agent_id, parentSessionId.
-case "$PAYLOAD" in
-    *'"subagentType"'*|*'"subagent_type"'*|*'"agent_type"'*|*'"agent_id"'*|*'"parentSessionId"'*|*'\"subagentType\"'*)
-        printf '{}\n'
-        exit 0
-        ;;
-esac
+# subagent_type, agent_type, agent_id, parentSessionId. Keyed, so a tool
+# result that merely quotes one of those names cannot suppress the fetch.
+if ai_memory_payload_is_subagent "$PAYLOAD"; then
+    printf '{}\n'
+    exit 0
+fi
 BRIEF_QS=$(ai_memory_briefing_qs "$CWD")
 HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=grok${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
 if [ -n "$HANDOFF" ]; then

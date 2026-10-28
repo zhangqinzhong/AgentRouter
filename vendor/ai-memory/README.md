@@ -159,9 +159,12 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Meta Muse Code | Supported |
 | CodeBuddy Code | Hooks-only |
 | IBM Bob | Supported |
+| Qwen Code | Supported |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
-| DeepSeek Harness (DSH) | MCP-only |
+| DeepSeek Harness (DSH) | Hooks + MCP |
+| Cline CLI | Hooks + MCP |
+| FreeBuff | MCP-only |
 | Prime Agent | MCP-only |
 | Hermes Agent | Supported |
 | GrizzyBot | Supported |
@@ -390,16 +393,19 @@ docker run -d --name ai-memory \
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
 #    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent opencode2`, `--agent gemini-cli`,
-#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent droid`, `--agent muse`, `--agent omp`,
+#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent droid`, `--agent muse`, `--agent cline`, `--agent qwen-code`, `--agent omp`,
 #    `--agent oh-my-pi`, `--client cursor`,
-#    `--client gemini-cli`, `--client grok`, `--client kiro-cli`, etc.
+#    `--client gemini-cli`, `--client grok`, `--client kiro-cli`,
+#    `--client cline`, `--client freebuff`, etc.
 #    for additional agents; full list in docs/install.md.
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
 On Linux and macOS, the Docker wrapper runs `install-hooks` through its
-checksum-verified native host client. The installed hooks therefore enforce
+checksum-verified native host client. Global options may precede the command,
+for example `ai-memory --config /path/to/config.toml run codex`; the native
+client receives the complete argument list. The installed hooks therefore enforce
 client-side capture controls such as `[capture] ignore_paths` and allowlist
 mode before an event reaches the spool or network. Set
 `AI_MEMORY_HOOK_PLATFORM=posix` explicitly only when you need the legacy shell
@@ -479,6 +485,15 @@ off" mean to read that file first when the three managed-run variables are
 present. A switch on another machine still gets the server's portable ledger
 and handoff, but cannot read a native transcript that exists only on the first
 machine.
+
+Without the managed launcher, a harness cut off the same way leaves no handoff
+at all, so the next one could pick up an older handoff or session page. When the
+newest captured work in the project is in another of your sessions that never
+ended and left no handoff after that work, the next session start carries a
+one-line notice that names that session. The agent then reads its newest prompts and
+tool results with `memory_read_session_observations`. The same session is
+listed first in `memory_briefing`'s `recent_sessions`, and `memory_handoff_list`
+names it as `newer_unended_session`.
 
 If that variable is absent on a real same-machine switch, run
 `type -a ai-memory` and `ai-memory --version` in the launching shell. This path
@@ -585,12 +600,26 @@ prompts, tool calls, and session boundaries; session end turns them into
 readable wiki pages; the next session starts with a handoff.
 
 - Ask "where did we leave off?" to continue from the pending handoff.
+- Import a local PDF, DOCX, PPTX, XLSX, Markdown file, or VTT/SRT transcript as
+  attributed, sanitized memory with the optional
+  [`ai-memory-importer`](companions/ai-memory-importer) `document` command.
 - Ask "have we discussed X?" or "search memory for Y" to query the wiki.
-- Ask "catch me up" for a prose digest of recent project activity.
+- Narrow a large wiki before ranking with `memory_query` filters such as
+  `path_prefix: "procedures/"`, `tag: "rust"`, `kind: "decision"`, or
+  `tier: "procedural"`.
+- Inspect content-free per-workload LLM call, outcome, latency, and usage
+  telemetry with `ai-memory status --json`; it diagnoses the configured
+  provider but does not route different workloads to different models.
+- Ask "catch me up" for a prose digest of recent project activity, or run
+  `ai-memory recent` (`--global` for every project) to list the newest pages.
+- Search Chinese, Japanese and Korean text without spaces: zero-LLM search
+  matches unspaced Han, Kana and Hangul substrings.
 - Run `ai-memory bootstrap` once when adopting an existing project with
   months of history.
 - Start the server with `--enable-web` for a read-only browser view of
-  the wiki and a JSON API under `/api/v1`. On a server with a bearer token
+  the wiki, a link graph at `/web/graph`, a root/operator managed-workstream
+  overview at `/web/workstreams`,
+  and a JSON API under `/api/v1`. On a server with a bearer token
   and no user accounts (every fresh install), the browser asks for a username
   and password: any username, and the contents of
   `<data_dir>/auth-tokens/default` as the password.
@@ -634,6 +663,10 @@ a reverse proxy. Capture is sanitized at a typed privacy boundary before
 anything is stored, and per-repository `[capture]` rules can exclude
 paths or invert to allowlist mode. A repository can also route its capture
 to a different server than the one the hooks were installed against.
+Human login beyond loopback requires an HTTPS posture by default. Operators
+who explicitly accept plaintext passwords, cookies, credentials, and memory
+traffic on a private LAN can opt in with `serve --allow-insecure-human-auth`;
+the server never enables that exception implicitly.
 
 The full model is in [`docs/security.md`](docs/security.md),
 [`docs/users.md`](docs/users.md), and
@@ -723,6 +756,13 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), [team-wiki sync](companions/ai-memory-wikisync), the [TypeScript client SDK](companions/ai-memory-ts) and the [desktop installer](companions/ai-memory-desktop) (unsigned preview). |
 | [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
+
+Dated `design-*`, `research-*`, `issues-*`, `desktop/`, and `benchmarks/`
+files are evidence and design records, not current operating instructions.
+Their status or snapshot banner says whether work shipped, remains proposed,
+or has been superseded. Use the user guides and `ARCHITECTURE.md` for current
+behavior; the older records remain only when current design rationale links to
+them.
 
 ### Community articles
 

@@ -57,8 +57,9 @@ ai-memory-wikisync sync ... --apply --propagate-deletes
   the `git add` / `git commit` / `git push` commands you may run yourself.
   The tool never runs git, never commits, and never pushes.
 - `--include FAMILY` is a strict, explicit allowlist of top-level wiki
-  directories (`_rules`, `decisions`, …). At least one is required and a
-  bare `*` is refused: only what you name is exported.
+  families: a directory (`_rules`, `decisions`, …) or a top-level Markdown
+  page with that stem (`roadmap` selects `roadmap.md`). At least one is
+  required and a bare `*` is refused: only what you name is exported.
 - Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` (plus
   `AI_MEMORY_SERVER_URL` for the server origin). Tokens are never logged
   and never written to disk.
@@ -123,6 +124,12 @@ This section describes `plan` and `export`; `sync` adds the rules under
   a missing line is shown as `<end of file>`. The
   whole batch is then refused and nothing is written. `--force` overwrites the
   divergent files with server content.
+- **Edits during export are preserved.** Before each replacement, `export
+  --apply` rechecks the file against the bytes the plan read. A file edited,
+  created or removed during the server requests is left alone, even with
+  `--force`, and the run exits non-zero. Earlier files may already have been
+  exported; the state stays at the previous successful batch so the next run
+  compares those files again.
 - **Never deletes.** `plan` and `export` never delete local files or server
   pages, including brand-new local files inside an allowlisted family.
   Only `sync --propagate-deletes` deletes (see below).

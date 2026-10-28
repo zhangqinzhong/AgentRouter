@@ -17,8 +17,10 @@ maintainer will follow up; do not put vulnerability details in that issue.
 ## Threat model
 
 ai-memory is a **single-tenant workstation/homelab service**. It supports
-multiple attributed users, but every authenticated user belongs to the same
-trust domain and can read the same project memory. The following describes
+multiple attributed users. Projects are `open` by default, so every
+authenticated user can read the same project memory; a root operator can
+mark a project `restricted` so only root, its creator, and granted database
+users reach it (see "Per-project isolation" below). The following describes
 what the project is and is not designed to defend against.
 
 ### In scope
@@ -33,11 +35,31 @@ what the project is and is not designed to defend against.
   not chmodded automatically. Windows uses its filesystem ACLs rather than
   POSIX mode bits.
 
+  The hook spool (`<data_dir>/hook-spool/`) holds each captured lifecycle
+  event until the server accepts it. Each file carries the event body as the
+  harness sent it, before the server's privacy strip runs (the client scrubs
+  only a field that exceeds its size cap and the opt-in assistant excerpt),
+  plus a copy of the static hook bearer when the event authenticates with one;
+  an OIDC event stores no token and resolves it at delivery. Files are `0600`
+  in a `0700` directory. A drain at session boundaries delivers and deletes
+  them; an event that cannot be delivered is dropped after 7 days, and the
+  spool is capped at 10,000 files. `ai-memory backup` does not include the
+  spool, but a filesystem-level copy of the data directory does.
+
+  An `ai-memory backup` archive includes `<data_dir>/config.toml` verbatim,
+  which may hold the API-key pepper and other inline credentials; protect
+  the archive as a secret (see
+  [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md#backup)). `restore` keeps
+  an existing live config unless `--with-config` is passed.
+
 - **Network exposure when binding to non-loopback addresses.** If you run
   `ai-memory serve --bind 0.0.0.0:…` you are exposing the MCP and admin
   routes to your local network. Protect this with:
-  - `AI_MEMORY_AUTH_TOKEN` / `ai-memory generate-auth-token` (bearer token
-    checked on every request).
+  - `AI_MEMORY_AUTH_TOKEN` / `ai-memory generate-auth-token` (a bearer
+    token checked on every authenticated surface). `/healthz`, `/auth/login`,
+    `/auth/recovery`, `/favicon.ico`, and the custom `/web` static assets are
+    public by design; the builtin wiki browser and `/api/v1` stay behind
+    auth.
   - Firewall rules or a reverse proxy with TLS.
 
   The server fails closed before serving unauthenticated non-loopback HTTP.
@@ -62,17 +84,28 @@ what the project is and is not designed to defend against.
   access; browsers intentionally withhold Secure cookies over HTTP.
 
 - **Host-header DNS rebinding.** The HTTP server enforces an
-  `AI_MEMORY_ALLOWED_HOSTS` allowlist (defaulting to `127.0.0.1` and
-  `localhost`). Requests with a `Host` header not in the list are rejected
+  `AI_MEMORY_ALLOWED_HOSTS` allowlist (defaulting to `localhost`, `127.0.0.1`,
+  and `::1`). Requests with a `Host` header not in the list are rejected
   with 403.
 
-- **Request body size.** Inbound HTTP bodies are capped at 10 MB to prevent
-  trivial memory exhaustion.
+- **Request body size.** Inbound HTTP bodies are capped to prevent trivial
+  memory exhaustion: 10 MB on `/mcp`, `/hook`, and `/workstream/*`, and
+  32 MB on the `/admin/*` routes, whose `/admin/bootstrap` can carry a large
+  JSON array of sources. The remaining routes (web, `/api/v1`, `/auth/*`)
+  use axum's 2 MB default.
 
-- **Authentication and administrative authorization.** A static root bearer
-  token, database-user tokens, and optional OIDC hook-edge tokens form the
-  documented auth ladder. The first database user makes every `/admin/*`
-  route root-only; DB-user tokens provide attribution but never admin access.
+- **Authentication and administrative authorization.** The documented auth
+  ladder (`docs/users.md`) is: anonymous when no root bearer is configured,
+  the static root bearer, a proxy-asserted user (a distinct
+  `[auth].actor_proxy_bearer_token` plus trusted `X-Memory-Actor-*` headers,
+  which is root only on an exact `root_issuer` + `root_subject` match), and
+  database-user `aim_` tokens, which attribute writes but never grant admin
+  access; an unknown bearer gets 401. The server itself does not validate
+  OIDC tokens. `ai-memory auth login oidc-device` stores a per-developer
+  token for an external OIDC-aware gateway or bridge in front of the server,
+  which must translate it into one of the rungs above (`docs/sso.md`). The
+  first database user (or a configured proxy bearer) makes every `/admin/*`
+  route root-only.
 
 - **Per-project isolation.** Wiki files and SQLite rows are namespaced by
   `(workspace_id, project_id)`. A purge operation for project A cannot
@@ -86,6 +119,17 @@ what the project is and is not designed to defend against.
   protect against links already present when an operation runs; they do not
   claim descriptor-relative protection against a concurrently malicious process
   running as the same operating-system user.
+
+  On a multi-user server, per-project access modes gate entry on top of that
+  boundary: every project is `open` until an operator restricts it
+  (`ai-memory project access --mode restricted`), after which only root, the
+  project's creator, and users holding a grant (`ai-memory user grant`) may
+  reach it, and refusals are explicit 403s rather than empty results. Grants
+  apply to database users. Root and single-operator installs are never
+  gated, and a user asserted by the trusted-proxy bearer is not subject to
+  per-project grants: that identity maps to no database `UserId` to key a
+  grant on, so in a trusted-proxy deployment the proxy itself is the
+  authorization boundary (`docs/users.md`).
 
 - **Entity text remains bounded local data.** Consolidator output and
   hand-edited `entities:` frontmatter cross the same normalization boundary:
@@ -147,8 +191,11 @@ what the project is and is not designed to defend against.
 
 ### Out of scope for v1
 
-- **Tenant isolation and per-user ACLs.** Database users provide attribution,
-  not private memory. There are no per-user or per-project ACLs; run separate
+- **Private memory and per-page ACLs.** Database users provide attribution,
+  not private memory. Per-project access modes and grants decide which
+  projects a database user may reach, but inside a project every reader sees
+  every page: there is no per-page RBAC, no private per-user pages, and no
+  per-project restriction applied to proxy-asserted identities. Run separate
   servers/data directories for users who must not see one another's data.
 - **Encryption at rest.** The data directory is a plain filesystem tree.
 - **Remote sync security.** If you push the wiki git repository to a remote,

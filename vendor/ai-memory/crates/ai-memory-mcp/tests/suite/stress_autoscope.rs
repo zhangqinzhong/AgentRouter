@@ -161,6 +161,7 @@ impl Harness {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             ingest_gates: ai_memory_hooks::IngestGates::default(),
+            cwd_probes: ai_memory_hooks::CwdProbes::default(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
             profile_notify: None,
@@ -171,6 +172,7 @@ impl Harness {
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+            skip_wiki_checkpoints: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),
