@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## 1.12.0 - 2026-10-27
+
+### Features
+- Add Settings → Data sources for additional Claude Code and Codex directories, shared by usage collection and the session workspace.
+- Add Muse Code and OpenSquilla usage collection and expand ZCode, OpenCode, Kimi and oh-my-pi session analytics.
+- Bundle ai-memory 3.2.5 and recognize newer Codex, Claude Code and Antigravity CLI records.
+
+### Fixes
+- Share Windows AppData collection settings with native sessions and keep workers inside the configured runtime home.
+- Preserve OMP historical totals during migration, include new messages and files, and keep incomplete JSONL tails available for the next scan.
+- Keep MiMo sessions after temporary database read failures and retry incomplete inventories.
+- Resolve official Kimi model configuration from the correct installation directory.
+- Include Codex compaction usage, long-context and observed speed-tier costs in date-filtered session statistics.
+- Read both Codex archive extensions and remove sibling encodings together during cleanup.
+- Match the bundled memory version to the runtime supervisor so the upgraded service can start.
+
+### Maintenance
+- Resolve draft publication by release ID, resume verified uploads and test publication lifecycle guards.
+- Install the macOS XcodeGen prerequisite and compile the WidgetKit extension in PR checks.
+- Validate compatibility-based version increments, release notes and RC promotion; verify every platform artifact before publishing a release.
+
+
 ## 1.12.0-rc.4 - 2026-10-27
 
 ### Maintenance
