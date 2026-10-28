@@ -51,3 +51,22 @@ test('custom Codex stores and legacy scanRoots use the same discovery contract',
     assert.ok(roots.codexStores.includes(path.join(root, 'sessions')));
   } finally { db.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test('Windows runtime sources share the native AppData index and profiles, while injected homes remain isolated', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-windows-locations-'));
+  const appData = path.join(home, 'AppData/Roaming'), config = path.join(appData, 'agentrouter');
+  const custom = path.join(home, 'isolated-claude'), profile = path.join(config, 'profiles/company/custom/claude/projects');
+  fs.mkdirSync(path.join(custom, 'projects'), { recursive: true }); fs.mkdirSync(profile, { recursive: true });
+  const index = path.join(config, 'sessions/index.sqlite'); fs.mkdirSync(path.dirname(index), { recursive: true });
+  const db = new DatabaseSync(index); db.exec('CREATE TABLE custom_roots(agent TEXT,path TEXT,added_at INTEGER)');
+  db.prepare('INSERT INTO custom_roots VALUES (?,?,0)').run('claude-code', custom);
+  const env = { AR_INTERNAL_HOME_DIR: home, AR_INTERNAL_APP_DATA_DIR: appData };
+  try {
+    const roots = await collectionRoots({ home, env, platform: 'win32' });
+    assert.ok(roots.claudeProjects.includes(path.join(custom, 'projects')));
+    assert.ok(roots.claudeProjects.includes(profile));
+    const injected = await collectionRoots({ home: path.join(home, 'test-home'), env, platform: 'win32' });
+    assert.ok(!injected.claudeProjects.includes(path.join(custom, 'projects')));
+    assert.ok(!injected.claudeProjects.includes(profile));
+  } finally { db.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
