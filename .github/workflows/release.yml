@@ -69,6 +69,8 @@ jobs:
           cache: npm
       - run: rustup toolchain install 1.93.0 --profile minimal && rustup default 1.93.0
       - run: npm ci
+      - name: Install macOS build tools
+        run: brew install xcodegen
       - run: node build/verify-release-version.mjs
       - name: Validate native source
         run: |

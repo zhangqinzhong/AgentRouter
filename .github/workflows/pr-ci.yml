@@ -49,5 +49,9 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - name: Install macOS build tools
+        run: brew install xcodegen
       - run: node build/check-native-parity.mjs
       - run: node build/test-native.mjs
+      - name: Build WidgetKit extension
+        run: node --input-type=module -e 'import { buildNativeWidget } from "./build/native-widget.mjs"; buildNativeWidget();'

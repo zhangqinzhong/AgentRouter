@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.12.0-rc.3 - 2026-10-27
+
+### Maintenance
+- Restore the macOS XcodeGen build prerequisite and compile the WidgetKit extension in pull-request checks.
+
 ## 1.12.0-rc.2 - 2026-10-27
 
 ### Fixes
