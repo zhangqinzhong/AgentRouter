@@ -1,0 +1,5 @@
+{
+  "baseVersion": "1.11.0",
+  "change": "minor",
+  "reason": "Add shared custom collection directories and new local usage/session sources while retaining configuration compatibility."
+}
