@@ -326,11 +326,17 @@ impl HomeRoutes {
 }
 
 impl PathSelector {
+    /// A drive-letter or UNC root names a filesystem that compares names
+    /// case-insensitively, so its components must fold ASCII case.
+    fn is_windows(&self) -> bool {
+        matches!(self.root, PathRoot::Drive(_) | PathRoot::Unc(_, _))
+    }
+
     fn same_selector(&self, other: &Self) -> bool {
         if !self.root.same_root(&other.root) || self.components.len() != other.components.len() {
             return false;
         }
-        let windows = matches!(self.root, PathRoot::Drive(_) | PathRoot::Unc(_, _));
+        let windows = self.is_windows();
         self.components
             .iter()
             .zip(&other.components)
@@ -373,7 +379,7 @@ impl PathSelector {
         if !self.root.same_root(&cwd.root) || self.components.len() > cwd.components.len() {
             return false;
         }
-        let windows = matches!(self.root, PathRoot::Drive(_) | PathRoot::Unc(_, _));
+        let windows = self.is_windows();
         self.components
             .iter()
             .zip(&cwd.components)
@@ -385,6 +391,27 @@ impl PathSelector {
                 }
             })
     }
+}
+
+/// Whether `root` contains `candidate`, comparing whole components and
+/// folding ASCII case under a Windows root — the rule [`PathSelector`]
+/// already applies to the home marker's path routes.
+///
+/// `pub(crate)`: `server_profiles::resolve` admits a marker against a
+/// profile's `roots` with the same rule, so one checkout cannot be routed by
+/// a path route yet refused by a root that covers it. `Path::starts_with`
+/// alone compares components byte-exactly, which on a case-insensitive
+/// filesystem rejects `C:\work\team-b` against a root spelled
+/// `C:\Work\team-b`. A path that is not a Windows selector keeps the
+/// byte-exact comparison rather than being folded.
+pub(crate) fn path_contains(root: &Path, candidate: &Path) -> bool {
+    if let Ok(root_selector) = parse_absolute_selector(&root.to_string_lossy())
+        && root_selector.is_windows()
+        && let Ok(candidate_selector) = parse_absolute_selector(&candidate.to_string_lossy())
+    {
+        return root_selector.contains(&candidate_selector);
+    }
+    candidate.starts_with(root)
 }
 
 fn parse_absolute_selector(raw: &str) -> Result<PathSelector, ()> {
@@ -2562,5 +2589,39 @@ project = "infra" # this is fine
         let selection =
             find_server_selection(tmp.path().to_str().unwrap(), Some(tmp.path())).unwrap();
         assert_eq!(selection.name, None);
+    }
+
+    /// A profile's `roots` must admit a checkout whose drive-letter cwd
+    /// differs from the registered root only in case — the spelling a
+    /// harness reports on a case-insensitive filesystem. The selector logic
+    /// is textual, so these assertions hold on every host.
+    #[test]
+    fn path_contains_folds_case_under_a_windows_root_only() {
+        assert!(path_contains(
+            Path::new(r"C:\Work\team-b"),
+            Path::new(r"C:\work\team-b\repo")
+        ));
+        assert!(path_contains(
+            Path::new(r"\\Server\Share\Work"),
+            Path::new(r"\\server\share\work\repo")
+        ));
+        // Folding case must not also loosen the component boundary.
+        assert!(!path_contains(
+            Path::new(r"C:\Work\team-b"),
+            Path::new(r"C:\work\team-bb\repo")
+        ));
+        assert!(!path_contains(
+            Path::new(r"C:\Work\team-b"),
+            Path::new(r"D:\work\team-b\repo")
+        ));
+        // Control: a POSIX root stays case-sensitive.
+        assert!(!path_contains(
+            Path::new("/work/Team-B"),
+            Path::new("/work/team-b/repo")
+        ));
+        assert!(path_contains(
+            Path::new("/work/team-b"),
+            Path::new("/work/team-b/repo")
+        ));
     }
 }

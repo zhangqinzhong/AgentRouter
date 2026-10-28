@@ -183,6 +183,52 @@ pub(crate) const IBM_BOB_EVENTS: [(&str, &str); 5] = [
     ("Stop", "stop.sh"),
 ];
 
+/// DeepSeek Harness (DSH) lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-the-Claude-Code-hooks.json, POSIX hook-script-filename)`.
+///
+/// DSH has no native hook protocol: capture runs through the official
+/// `@deepseek-ai/dsh-hooks-claude-code` bridge, which consumes a Claude Code
+/// `hooks.json` and delivers exactly these seven events — `PreCompact` and
+/// `SessionEnd` are not delivered, and `SessionStart` runs detached, so the
+/// bundle never fetches a handoff and finished sessions close with
+/// `ai-memory finalize-session --agent dsh`. Adding a hook event means
+/// updating this list AND adding the matching `.sh` and `.ps1` files under
+/// `hooks/dsh/`; the install-hooks parity test fails if the bundle drifts.
+pub(crate) const DSH_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
+/// Qwen Code lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-~/.qwen/settings.json, native hook-event script stem)`;
+/// Qwen has no script bundle, so the `.sh` name only carries the event
+/// token the native command is rendered with.
+///
+/// Qwen Code's hook vocabulary is Claude Code's plus `PostToolUseFailure`
+/// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
+/// `PostToolUseFailure` fires instead of `PostToolUse` when a tool throws
+/// and is aliased to `post-tool-use`. Subagent events are included: Qwen
+/// documents `SubagentStart`/`SubagentStop` for user-spawned agents
+/// (`Bash`, `Explorer`, `Plan`). Qwen fires a real `SessionEnd`, so no
+/// `finalize-session` step is needed.
+pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
 /// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
 /// seconds, like the Claude Code plugins it loads. The capture POST is
 /// fire-and-forget; `SessionStart` also fetches a handoff.
@@ -798,6 +844,36 @@ pub(crate) fn build_grok_payload(
     )
 }
 
+/// DeepSeek Harness (DSH) hook payload: a Claude Code `hooks.json` document
+/// the official `@deepseek-ai/dsh-hooks-claude-code` bridge consumes via its
+/// `configPath` setting. Commands are rendered for the current platform
+/// (native `ai-memory hook --event … --agent dsh` commands by default, so
+/// capture gets the local spool and capture-policy v1 enforcement; script
+/// commands under an `AI_MEMORY_HOOK_PLATFORM` override). The payload only
+/// covers [`DSH_EVENTS`] — no `PreCompact` or `SessionEnd`.
+#[must_use]
+pub(crate) fn build_dsh_hooks_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DSH_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::current(),
+            "dsh",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
 /// Zero's hook events → ai-memory event names (issue #156). Zero has no
 /// user-prompt or pre-compact equivalents; its `specialistStart`/`Stop`
 /// map onto the subagent events the router already tracks for Claude Code.
@@ -968,25 +1044,61 @@ pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 /// (same reasoning as Kiro v2's `max_output_size`).
 pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// Hermes Agent lifecycle events ai-memory hooks. Each pair is
+/// Hermes Agent tool events ai-memory hooks. Each pair is
 /// `(event-name-in-~/.hermes/config.yaml, native `hook --event` value)`.
 ///
-/// Verified against Hermes v0.21.4 (`agent/shell_hooks.py`): a configured
+/// Verified against Hermes v0.22.2 (`agent/shell_hooks.py`): a configured
 /// `command` is split into argv by `shlex.split` and executed **without a
 /// shell**, with the event JSON on stdin — so the generated block invokes the
 /// native `hook` subcommand, the same shape Zero and ZCode use, and no
-/// `.sh`/`.ps1` bundle is staged. Only the two tool events are wired: their
-/// payload carries `tool_name` / `tool_input`, the envelope the router already
-/// maps for `agent=hermes`. Session lifecycle stays with the memory-provider
-/// plugin (`on_session_end`), so a hook-driven `session-end` cannot
-/// double-close a Hermes session.
-pub(crate) const HERMES_EVENTS: [(&str, &str); 2] = [
+/// `.sh`/`.ps1` bundle is staged. Hermes fires a shell hook for every event it
+/// defines, with one stdin envelope (`hook_event_name`, `tool_name`,
+/// `tool_input`, `session_id`, `cwd`, `extra`).
+pub(crate) const HERMES_TOOL_EVENTS: [(&str, &str); 2] = [
     ("pre_tool_call", "pre-tool-use"),
     ("post_tool_call", "post-tool-use"),
 ];
 
+/// Hermes session lifecycle events, mapped by meaning rather than name:
+///
+/// - `on_session_start` fires on a new session's first turn. Hermes ignores
+///   its stdout, so it only records the start; the handoff is never fetched
+///   there, because that fetch claims it.
+/// - `pre_llm_call` fires before every turn with the prompt in
+///   `extra.user_message`. Its `{"context": ...}` stdout carries any pending
+///   handoff into the turn, including after a native Hermes session resumes.
+/// - `on_session_end` fires at the end of **every turn**, not of the session,
+///   so it is a turn boundary (`stop`).
+/// - `on_session_finalize` is the real end: CLI exit, `/new`, gateway
+///   shutdown. A gateway session that expires idle is never finalized, which
+///   `ai-memory finalize-session --agent hermes` covers.
+///
+/// `post_llm_call` (assistant text) and `subagent_*` are not wired: assistant
+/// capture is native-only, and a delegated child is not a session of its own.
+pub(crate) const HERMES_LIFECYCLE_EVENTS: [(&str, &str); 4] = [
+    ("on_session_start", "session-start"),
+    ("pre_llm_call", "user-prompt-submit"),
+    ("on_session_end", "stop"),
+    ("on_session_finalize", "session-end"),
+];
+
+/// Which Hermes events the generated `hooks:` block wires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HermesHookSet {
+    /// Tool and lifecycle events: ai-memory owns the whole Hermes session.
+    Full,
+    /// Tool events only. The community ai-memory memory-provider plugin
+    /// already posts prompts and session ends and claims the handoff, so a
+    /// second lifecycle path would capture each prompt twice and race it for
+    /// the handoff.
+    ToolsOnly,
+}
+
 /// Wall-clock bound written into each Hermes hook entry. Capture POSTs are
-/// fire-and-forget, so this only bounds a hung `hook` invocation.
+/// fire-and-forget and the prompt-time handoff fetch has its own short
+/// timeout, so this only bounds a hung `hook` invocation. Hermes bounds a
+/// blocking hook's callback at 30 s by default, and `pre_llm_call` holds
+/// the turn while it runs, so the entry stays well under that.
 pub(crate) const HERMES_HOOK_TIMEOUT_SECONDS: u64 = 20;
 
 /// The ready-to-paste `hooks:` block for `~/.hermes/config.yaml`.
@@ -1004,6 +1116,7 @@ pub(crate) fn build_hermes_hooks_yaml(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    hook_set: HermesHookSet,
 ) -> String {
     build_hermes_hooks_yaml_for_platform(
         server_url,
@@ -1014,7 +1127,18 @@ pub(crate) fn build_hermes_hooks_yaml(
             data_dir,
             project_strategy,
         ),
+        hook_set,
     )
+}
+
+/// The events [`build_hermes_hooks_yaml`] wires for `hook_set`, tool events
+/// first.
+pub(crate) fn hermes_events(hook_set: HermesHookSet) -> Vec<(&'static str, &'static str)> {
+    let mut events = HERMES_TOOL_EVENTS.to_vec();
+    if hook_set == HermesHookSet::Full {
+        events.extend(HERMES_LIFECYCLE_EVENTS);
+    }
+    events
 }
 
 /// Platform-forced variant, so a test can pin POSIX/Windows instead of
@@ -1023,9 +1147,10 @@ fn build_hermes_hooks_yaml_for_platform(
     server_url: &str,
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
+    hook_set: HermesHookSet,
 ) -> String {
     let mut out = String::from("hooks:\n");
-    for (hermes_event, our_event) in HERMES_EVENTS {
+    for (hermes_event, our_event) in hermes_events(hook_set) {
         // The native platforms derive the event token from the script stem, so
         // the synthetic filename carries the ai-memory event name.
         let command = hook_command(
@@ -1238,6 +1363,35 @@ pub(crate) fn build_ibm_bob_hooks_payload(
         HookCommandContext::new(
             HookCommandPlatform::native(),
             "ibm-bob",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Qwen Code's `~/.qwen/settings.json`. The
+/// `hooks` key holds Claude Code's nested shape (`"Event": [{"matcher": "",
+/// "hooks": [{"type": "command", "command": …}]}]`). Qwen runs each
+/// `command` with the Claude Code-shaped event JSON on stdin
+/// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>),
+/// so every entry invokes the native `ai-memory hook` command; there is no
+/// script bundle. An empty matcher fires on every tool and every
+/// SessionStart source.
+pub(crate) fn build_qwen_code_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &QWEN_CODE_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "qwen-code",
             data_dir,
             project_strategy,
         ),
@@ -1463,8 +1617,16 @@ pub(crate) const ANTIGRAVITY_TOOL_EVENTS: [(&str, &str); 2] = [
     ("PostToolUse", "post-tool-use.sh"),
 ];
 
-pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 2] =
-    [("PreInvocation", "session-start.sh"), ("Stop", "stop.sh")];
+/// `SessionStart` starts a conversation and delivers the handoff.
+/// `PreInvocation` fires before every model call; its invocation zero starts
+/// a user turn, where the native hook recovers the turn's prompts from the
+/// transcript, and stands in for `SessionStart` on builds that have none.
+/// `Stop` ends one execution loop; a finished, idle one is a turn checkpoint.
+pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 3] = [
+    ("SessionStart", "session-start.sh"),
+    ("PreInvocation", "pre-invocation.sh"),
+    ("Stop", "stop.sh"),
+];
 
 /// Build the Antigravity CLI (`agy`) `hooks.json` payload.
 ///
@@ -1472,8 +1634,8 @@ pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 2] =
 /// maps hook-group names to their event configurations. Each group
 /// can contain any subset of the supported events. Tool events
 /// (`PreToolUse`, `PostToolUse`) use the nested shape with matcher;
-/// lifecycle events (`PreInvocation`, `Stop`) use a flat handler
-/// list where matcher is ignored.
+/// lifecycle events (`SessionStart`, `PreInvocation`, `Stop`) use a flat
+/// handler list where matcher is ignored.
 ///
 /// The output is `{ "ai-memory": { <events> } }`.
 pub(crate) fn build_antigravity_payload_with_data_dir(
@@ -2440,6 +2602,22 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Quote one argument for the native shell used by copy-pasteable commands.
+pub(crate) fn native_shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        if s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | ':' | '%' | '+' | '=' | ',')
+        }) {
+            s.to_owned()
+        } else {
+            powershell_quote(s)
+        }
+    } else {
+        shell_quote(s)
+    }
+}
+
 fn powershell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -2873,7 +3051,10 @@ async function drainHookSpool(): Promise<void> {
         "X-AI-Memory-Client": AGENT,
       };
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
+      // Bun reads HTTP(S)_PROXY and ALL_PROXY even for a loopback URL;
+      // `proxy: false` connects directly. Node's fetch ignores the key.
       const resp = await fetch(entry.url, {
+        proxy: false,
         method: "POST",
         headers,
         body: entry.body,
@@ -3002,6 +3183,13 @@ fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
                 || call.contains("mcpHeaders(")
                 || call.contains("        headers,\n"),
             "{name}: a fetch without the client marker:\n{call}"
+        );
+        // Bun's fetch sends even a loopback request through an environment
+        // proxy, which a sandbox with an empty NO_PROXY (ai-jail) answers
+        // with a 4xx; the native hook and the shell bundle skip proxies too.
+        assert!(
+            call.contains("proxy: false,"),
+            "{name}: a fetch that can reach an environment proxy:\n{call}"
         );
     }
     assert!(
@@ -4163,24 +4351,53 @@ if (inheritOnly) {
         assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
     }
 
-    /// The public entry point must emit a complete `hooks:` map with both tool
-    /// events, whatever platform it renders for (the suite runs on Windows too).
+    /// The public entry point must emit a complete `hooks:` map, whatever
+    /// platform it renders for (the suite runs on Windows too): every tool and
+    /// lifecycle event in full, the tool events alone beside the plugin.
     #[test]
-    fn hermes_hooks_yaml_covers_both_tool_events() {
-        let yaml = build_hermes_hooks_yaml("http://127.0.0.1:49374", None, None, None);
-        assert!(yaml.starts_with("hooks:\n"));
-        for (event, _) in HERMES_EVENTS {
-            assert!(yaml.contains(&format!("  {event}:\n")), "missing {event}");
-            assert!(
-                yaml.contains("    - command: '"),
-                "command must be a single-quoted YAML scalar"
+    fn hermes_hooks_yaml_wires_the_full_lifecycle_or_the_tool_events_only() {
+        let full = build_hermes_hooks_yaml(
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            HermesHookSet::Full,
+        );
+        let tools = build_hermes_hooks_yaml(
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            HermesHookSet::ToolsOnly,
+        );
+        for (yaml, events) in [
+            (&full, hermes_events(HermesHookSet::Full)),
+            (&tools, hermes_events(HermesHookSet::ToolsOnly)),
+        ] {
+            assert!(yaml.starts_with("hooks:\n"));
+            for (event, _) in &events {
+                assert!(yaml.contains(&format!("\n  {event}:\n")), "missing {event}");
+            }
+            assert_eq!(yaml.matches("    - command: '").count(), events.len());
+            assert_eq!(
+                yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
+                    .count(),
+                events.len()
             );
         }
+        assert_eq!(hermes_events(HermesHookSet::Full).len(), 6);
         assert_eq!(
-            yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
-                .count(),
-            HERMES_EVENTS.len()
+            hermes_events(HermesHookSet::ToolsOnly),
+            HERMES_TOOL_EVENTS.to_vec()
         );
+        for (event, our_event) in HERMES_LIFECYCLE_EVENTS {
+            assert!(!tools.contains(event), "{event} must stay with the plugin");
+            assert!(!tools.contains(&format!("--event {our_event} ")));
+        }
+        // Assistant text is native-only, and subagents are not sessions.
+        for unwired in ["post_llm_call", "subagent_start", "subagent_stop"] {
+            assert!(!full.contains(unwired), "{unwired}");
+        }
     }
 
     /// Hermes splits `command` with `shlex.split` and runs it with no shell, so
@@ -4197,8 +4414,9 @@ if (inheritOnly) {
                 Some(Path::new("/data")),
                 Some("repo-root"),
             ),
+            HermesHookSet::Full,
         );
-        for (_, our_event) in HERMES_EVENTS {
+        for (_, our_event) in hermes_events(HermesHookSet::Full) {
             assert!(
                 yaml.contains(&format!("hook --event {our_event} --agent hermes")),
                 "missing the native command for {our_event}"
@@ -4463,6 +4681,35 @@ if (inheritOnly) {
             assert!(definition.get("matcher").is_none(), "event: {event}");
             let command = definition["hooks"][0]["command"].as_str().unwrap();
             assert!(command.contains("--agent command-code"), "{command}");
+        }
+    }
+
+    #[test]
+    fn qwen_code_profile_uses_nested_native_commands() {
+        let value = build_qwen_code_hooks_payload(
+            "http://memory:49374",
+            None,
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+
+        assert_eq!(value["hooks"].as_object().unwrap().len(), 10);
+        for (event, script) in QWEN_CODE_EVENTS {
+            let definition = &value["hooks"][event][0];
+            assert_eq!(definition["matcher"], "", "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            let event_name = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!("hook --event {event_name} --agent qwen-code")),
+                "{event}: {command}"
+            );
+            let expected_strategy = if cfg!(windows) {
+                r#"--project-strategy "repo-root""#
+            } else {
+                "--project-strategy repo-root"
+            };
+            assert!(command.contains(expected_strategy), "{command}");
+            assert!(!command.contains(".sh"), "{command}");
         }
     }
 
@@ -4765,12 +5012,56 @@ $payload = [Console]::In.ReadToEnd()
             "Stop must record a stop observation, not synthesize session-end handoffs: {stop_cmd}"
         );
 
-        // All expected events present
-        for expected in ["PreToolUse", "PostToolUse", "PreInvocation", "Stop"] {
-            assert!(
-                group.contains_key(expected),
-                "missing Antigravity event {expected}"
-            );
+        // All expected events present, each lifecycle event on its own
+        // script: SessionStart starts the conversation, PreInvocation marks
+        // a turn (and stands in for SessionStart on builds without it).
+        assert_eq!(
+            group.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "PreToolUse",
+                "PostToolUse",
+                "SessionStart",
+                "PreInvocation",
+                "Stop"
+            ]
+        );
+        for (event, script) in [
+            ("SessionStart", "session-start.sh"),
+            ("PreInvocation", "pre-invocation.sh"),
+        ] {
+            let cmd = group[event][0]["command"].as_str().unwrap();
+            // The script path's separator and quoting follow the platform
+            // (`'...\session-start.sh'` on Windows), so compare the file name.
+            let file = cmd
+                .trim_end_matches(['\'', '"'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap();
+            assert_eq!(file, script, "{event}: {cmd}");
+        }
+    }
+
+    /// The native command's event token is the script stem, so the native
+    /// hook tells SessionStart and PreInvocation apart by their tokens.
+    #[test]
+    fn antigravity_native_commands_carry_distinct_start_tokens() {
+        let v = build_antigravity_payload_for_platform(
+            Path::new("/host/hooks/antigravity-cli"),
+            "http://localhost:49374",
+            None,
+            HookCommandPlatform::PosixNative,
+            "antigravity-cli",
+            None,
+            None,
+        );
+        for (event, token) in [
+            ("SessionStart", "--event session-start "),
+            ("PreInvocation", "--event pre-invocation "),
+            ("Stop", "--event stop "),
+        ] {
+            let cmd = v["ai-memory"][event][0]["command"].as_str().unwrap();
+            assert!(cmd.contains(token), "{event}: {cmd}");
+            assert!(cmd.contains("--agent antigravity-cli"), "{event}: {cmd}");
         }
     }
 

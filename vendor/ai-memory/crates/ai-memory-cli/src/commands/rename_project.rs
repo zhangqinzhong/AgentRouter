@@ -19,6 +19,9 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// Returns an error when the server is unreachable or returns a non-2xx
 /// response (e.g. 404 workspace/project not found, 422 name taken or invalid).
 pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
+    super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     // Rename happens inside one workspace, so the marker resolves it the same
     // way it does for every other command. `--to` stays literal: it names the

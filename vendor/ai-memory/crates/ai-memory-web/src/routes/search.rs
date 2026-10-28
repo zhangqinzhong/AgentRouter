@@ -144,6 +144,7 @@ pub(crate) async fn handler(
     let filter = PageFilter {
         kind: kind.as_deref(),
         tier,
+        ..PageFilter::default()
     };
     let internal = |error: ai_memory_store::StoreError| {
         tracing::error!(%error, "web search failed");

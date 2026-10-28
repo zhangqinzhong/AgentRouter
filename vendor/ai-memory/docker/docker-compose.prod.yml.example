@@ -8,8 +8,8 @@
 #   - References an image from a registry instead of building inline.
 #   - Binds to 0.0.0.0 so the LAN can reach the MCP endpoint.
 #   - Reads secrets from .env.production rather than inlining them.
-#   - Volume mounts a host path (under /var/opt/docker/...) so backups
-#     can rsync the wiki + db without going through Docker volume APIs.
+#   - Volume mounts a host path (under /var/opt/docker/...) for persistent data.
+#     Use `ai-memory backup` online, or stop the container before copying it.
 
 name: ai-memory
 
@@ -31,8 +31,8 @@ services:
       # "127.0.0.1:49374:49374".
       - "0.0.0.0:49374:49374"
     volumes:
-      # Data lives on the host. Back up with: rsync, btrfs snapshots,
-      # restic — anything that can read this directory.
+      # Data lives on the host. Use `ai-memory backup` online; stop the
+      # container before copying this directory with rsync or restic.
       - /var/opt/docker/utils/ai-memory/data:/data
     env_file:
       - .env.production

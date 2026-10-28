@@ -741,6 +741,32 @@ fn install_ps1_keeps_its_safety_checks() {
     );
     assert_eq!(script.trim_end().lines().last(), Some("Install-AiMemory"));
     assert!(!script.contains("raw.githubusercontent.com"));
+
+    // A plain-http GitHub base must be refused, and the refusal must not be
+    // nested inside a branch that already requires https. That nesting is what
+    // made it unreachable: both arms of
+    // `$base -eq $defaultBase -or StartsWith('https://github.com/')` imply
+    // `https://`, so the inner `-not StartsWith('https://')` could never fire,
+    // and an `http://github.com/...` base matched neither arm and skipped the
+    // check entirely.
+    assert!(script.contains("[Uri]::TryCreate($base"));
+    assert!(script.contains("$baseUri.Scheme -eq 'http'"));
+    assert!(script.contains("$baseUri.Host.TrimEnd('.') -eq 'github.com'"));
+    assert!(
+        !script.contains("StartsWith('https://github.com/'"),
+        "the GitHub refusal must not be gated on an https-only branch again"
+    );
+    assert!(
+        script.contains("refusing a non-https GitHub URL"),
+        "the refusal keeps its operator-facing message"
+    );
+    // Scoped to GitHub on purpose: `tests/install_ps1.ps1` serves its fixture
+    // releases over plain http from loopback, and the header documents a
+    // non-GitHub base as the operator's own trust decision.
+    assert!(
+        !script.contains("-match '(?i)^http://'"),
+        "refusing every plain-http base would break the loopback test harness"
+    );
 }
 
 #[test]
@@ -1276,6 +1302,77 @@ fn powershell_wrapper_trims_paths_with_single_character_separators() {
     );
 }
 
+// The helper container has no host harnesses, so both Docker wrappers
+// intercept the managed launch/discovery commands and run them through a
+// native client on the host (#1545). The two lists must stay identical, and
+// every surface that refuses or explains a missing client must point at the
+// same documented Windows installer.
+#[test]
+fn docker_wrappers_intercept_the_same_native_host_commands() {
+    let expected = [
+        "run",
+        "show",
+        "continue",
+        "resume",
+        "workstreams",
+        "rename-workstream",
+    ];
+
+    let posix = read_repo("bin/ai-memory");
+    let case_line = posix
+        .lines()
+        .find(|line| {
+            line.starts_with("  run | show | continue | resume | workstreams | rename-workstream)")
+        })
+        .expect("POSIX wrapper native host command case arm");
+    let posix_list: Vec<&str> = case_line
+        .trim()
+        .trim_end_matches(')')
+        .split('|')
+        .map(str::trim)
+        .collect();
+    assert_eq!(posix_list, expected, "POSIX wrapper intercept list drifted");
+
+    let powershell = read_repo("bin/ai-memory.ps1");
+    let (array_body, _) = powershell
+        .split_once("$NativeHostCommands = @(")
+        .expect("PowerShell wrapper native host command array")
+        .1
+        .split_once(')')
+        .expect("PowerShell wrapper native host command array terminator");
+    let ps1_list: Vec<&str> = array_body
+        .lines()
+        .filter_map(|line| {
+            let item = line.trim().trim_end_matches(',').trim();
+            item.strip_prefix('"')?.strip_suffix('"')
+        })
+        .collect();
+    assert_eq!(
+        ps1_list, expected,
+        "PowerShell wrapper must intercept exactly the commands bin/ai-memory does"
+    );
+
+    let installer =
+        "https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1";
+    assert!(
+        powershell.contains(installer),
+        "the PowerShell wrapper's missing-client refusal must name the documented installer"
+    );
+    assert!(
+        posix.contains(installer),
+        "the POSIX wrapper's native-Windows refusal must name the documented installer"
+    );
+    let run_cmd = read_repo("crates/ai-memory-cli/src/commands/run.rs");
+    assert!(
+        run_cmd.contains(installer),
+        "the Windows missing-harness advice must name the documented installer"
+    );
+    assert!(
+        run_cmd.contains("Docker users should run `ai-memory upgrade` to refresh the host wrapper"),
+        "the non-Windows missing-harness advice must stay on `ai-memory upgrade`"
+    );
+}
+
 // The PowerShell counterpart of run_wrapper_on_fake_macos: a fake `docker.cmd`
 // records the argv the wrapper built. No `uname` shadowing is needed because
 // the Windows arm under test is selected by running on Windows at all.
@@ -1310,6 +1407,10 @@ fn run_powershell_wrapper_with_server_url(args: &[&str], server_url: Option<&str
         .args(args)
         .env("AI_MEMORY_DOCKER", &docker)
         .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
+        // This helper asserts container argv. `install-hooks` defaults to the
+        // native host client now; opt into the documented script fallback so
+        // that subcommand still exercises the container-routing contract.
+        .env("AI_MEMORY_HOOK_PLATFORM", "windows")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env_remove("AI_MEMORY_DATA_DIR");
     match server_url {
@@ -1319,11 +1420,90 @@ fn run_powershell_wrapper_with_server_url(args: &[&str], server_url: Option<&str
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
-        "PowerShell wrapper failed: stdout={} stderr={}",
+        "PowerShell wrapper failed for {args:?}: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     std::fs::read_to_string(docker_args).unwrap()
+}
+
+/// Runs `bin/ai-memory.ps1` with a fake native client (`AI_MEMORY_NATIVE_BIN`)
+/// and a fake container engine, returning the wrapper's exit code plus what
+/// each side saw. Native-host commands must reach only the native client, so
+/// an empty engine log is itself an assertion input; the fake client exits
+/// with a marker code so the wrapper's exit-code pass-through is visible.
+#[cfg(windows)]
+fn run_powershell_wrapper_with_fake_native(
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let native_args = tmp.path().join("native-args.txt");
+    let docker_args = tmp.path().join("docker-args.txt");
+    let native = tmp.path().join("native.cmd");
+    std::fs::write(
+        &native,
+        concat!(
+            "@echo off\r\n",
+            ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo argv: %*\r\n",
+            "if defined AI_MEMORY_SERVER_URL ",
+            ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo server-url: %AI_MEMORY_SERVER_URL%\r\n",
+            "if not defined AI_MEMORY_SERVER_URL ",
+            ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo server-url: unset\r\n",
+            "if defined AI_MEMORY_RUN_AUTOWIRE ",
+            ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo autowire: %AI_MEMORY_RUN_AUTOWIRE%\r\n",
+            "if not defined AI_MEMORY_RUN_AUTOWIRE ",
+            ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo autowire: unset\r\n",
+            "if defined AI_MEMORY_AUTH__BEARER_TOKEN_FILE ",
+            ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo bearer-file: %AI_MEMORY_AUTH__BEARER_TOKEN_FILE%\r\n",
+            "exit /b %AI_MEMORY_TEST_NATIVE_EXIT%\r\n",
+        ),
+    )
+    .unwrap();
+    let docker = tmp.path().join("docker.cmd");
+    std::fs::write(
+        &docker,
+        concat!(
+            "@echo off\r\n",
+            ">>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\n",
+            "echo %* | findstr /c:\"auth-tokens/default\" >nul && echo test-volume-token\r\n",
+            "exit /b 0\r\n",
+        ),
+    )
+    .unwrap();
+
+    let mut command = Command::new(ai_memory_test_support::powershell_exe());
+    command
+        // Same execution-policy note as run_powershell_wrapper above.
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repo_root().join("bin/ai-memory.ps1"))
+        .args(args)
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_NATIVE_BIN", &native)
+        .env("AI_MEMORY_TEST_NATIVE_ARGS", &native_args)
+        .env("AI_MEMORY_TEST_NATIVE_EXIT", "7")
+        .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
+        .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env("LOCALAPPDATA", tmp.path())
+        .env_remove("AI_MEMORY_DATA_DIR")
+        .env_remove("AI_MEMORY_SERVER_URL")
+        .env_remove("AI_MEMORY_RUN_AUTOWIRE");
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let output = command.output().unwrap();
+    (
+        output.status.code(),
+        std::fs::read_to_string(&native_args).unwrap_or_default(),
+        std::fs::read_to_string(&docker_args).unwrap_or_default(),
+    )
 }
 
 #[test]
@@ -3400,6 +3580,219 @@ mod slow {
         assert!(
             args.contains("-e AI_MEMORY_SERVER_URL"),
             "an explicit AI_MEMORY_SERVER_URL must still be forwarded by name; got {args}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wrapper_upgrades_after_valid_global_options_only() {
+        for args in [
+            &["upgrade"][..],
+            &["--config", "C:\\tmp\\config with spaces.toml", "upgrade"],
+            &["--config=C:\\tmp\\config.toml", "upgrade"],
+            &["--data-dir", "C:\\tmp\\data", "upgrade"],
+            &["--data-dir=C:\\tmp\\data", "upgrade"],
+        ] {
+            let docker = run_powershell_wrapper(args);
+            assert!(
+                docker.starts_with("pull "),
+                "valid global options must not hide the wrapper-only upgrade; args={args:?}, docker={docker}"
+            );
+        }
+
+        for args in [
+            &["--unknown", "upgrade"][..],
+            &["--help", "upgrade"],
+            &["--config", "--help", "upgrade"],
+            &["--data-dir=", "upgrade"],
+            &["--CONFIG", "C:\\tmp\\config.toml", "upgrade"],
+            &["--DATA-DIR=C:\\tmp\\data", "upgrade"],
+            &["--config", "C:\\tmp\\config.toml", "UPGRADE"],
+        ] {
+            let docker = run_powershell_wrapper(args);
+            assert!(
+                docker.starts_with("run "),
+                "invalid or help options must not trigger an image pull; args={args:?}, docker={docker}"
+            );
+        }
+
+        // `powershell.exe -File` consumes a bare `-` before the script sees it,
+        // so exercise this valid config value through a PowerShell command.
+        let script = repo_root()
+            .join("bin/ai-memory.ps1")
+            .display()
+            .to_string()
+            .replace('\'', "''");
+        let output = Command::new(ai_memory_test_support::powershell_exe())
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+            ])
+            .arg(format!("& '{script}' --config '-' upgrade"))
+            .env("AI_MEMORY_DOCKER", "Write-Output")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).starts_with("pull"),
+            "a single dash is a valid config value: status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // #1545: the helper container has no host harnesses, so the managed
+    // launch/discovery commands must run through the native Windows client —
+    // never the container engine — with the child's exit code preserved.
+    #[cfg(windows)]
+    #[test]
+    fn windows_wrapper_routes_native_host_commands_through_the_native_client() {
+        let cases: &[&[&str]] = &[
+            &["run", "claude"],
+            &["run", "--new", "docs", "codex"],
+            &["show", "--json"],
+            &["continue", "--yolo"],
+            &["resume"],
+            &["workstreams", "--limit", "5"],
+            &[
+                "rename-workstream",
+                "--from",
+                "typo-nmae",
+                "--to",
+                "refactor-db",
+            ],
+            // Global options precede the subcommand in real invocations too.
+            &["--config", "C:\\tmp\\config.toml", "run", "codex"],
+        ];
+        for args in cases {
+            let (code, native_log, docker_log) = run_powershell_wrapper_with_fake_native(args, &[]);
+            assert_eq!(
+                code,
+                Some(7),
+                "wrapper must exit with the native client's code for {args:?}"
+            );
+            assert!(
+                native_log.contains(&format!("argv: {}", args.join(" "))),
+                "native client must receive the full argv for {args:?}; got {native_log}"
+            );
+            assert!(
+                docker_log.is_empty(),
+                "native host command {args:?} must not reach the container engine; got {docker_log}"
+            );
+        }
+
+        // The child inherits AI_MEMORY_SERVER_URL untouched: unset means the
+        // client's own host-loopback default applies (never the container's
+        // host.docker.internal alias), and an explicit value wins.
+        let (_, native_log, _) = run_powershell_wrapper_with_fake_native(&["run", "claude"], &[]);
+        assert!(
+            native_log.contains("server-url: unset"),
+            "the wrapper must not inject a server URL into native host commands; got {native_log}"
+        );
+        assert!(
+            native_log.contains("autowire: false"),
+            "the wrapper must keep container-rendered wiring authoritative unless the \
+             operator set AI_MEMORY_RUN_AUTOWIRE; got {native_log}"
+        );
+
+        let (_, native_log, _) = run_powershell_wrapper_with_fake_native(
+            &["run", "claude"],
+            &[("AI_MEMORY_SERVER_URL", "http://192.168.1.50:49374")],
+        );
+        assert!(
+            native_log.contains("server-url: http://192.168.1.50:49374"),
+            "an explicit AI_MEMORY_SERVER_URL must reach the native client; got {native_log}"
+        );
+
+        let (_, native_log, _) = run_powershell_wrapper_with_fake_native(
+            &["run", "claude"],
+            &[("AI_MEMORY_RUN_AUTOWIRE", "true")],
+        );
+        assert!(
+            native_log.contains("autowire: true"),
+            "an explicit AI_MEMORY_RUN_AUTOWIRE must win; got {native_log}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_hooks_refreshes_the_volume_bearer_for_managed_launches() {
+        let (code, native_log, docker_log) = run_powershell_wrapper_with_fake_native(
+            &["install-hooks", "--agent", "claude-code"],
+            &[],
+        );
+        assert_eq!(code, Some(7));
+        assert!(
+            native_log.contains("argv: install-hooks --agent claude-code"),
+            "native install must receive the original argv; got {native_log}"
+        );
+        assert!(
+            native_log.contains("bearer-file:"),
+            "native install must receive the refreshed bearer path; got {native_log}"
+        );
+        assert!(
+            docker_log.contains("auth-tokens/default"),
+            "setup must read the configured bearer from the named volume; got {docker_log}"
+        );
+    }
+
+    // Without the native client the wrapper must refuse clearly (pointing at
+    // the documented installer) instead of silently falling back to the
+    // helper container, where the command used to die with a misleading
+    // "executable not found in the host PATH" (#1545).
+    #[cfg(windows)]
+    #[test]
+    fn windows_wrapper_refuses_native_host_commands_without_the_native_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let docker_args = tmp.path().join("docker-args.txt");
+        let docker = tmp.path().join("docker.cmd");
+        std::fs::write(
+            &docker,
+            "@echo off\r\n>>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+
+        let mut command = Command::new(ai_memory_test_support::powershell_exe());
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(repo_root().join("bin/ai-memory.ps1"))
+            .args(["run", "claude"])
+            .env("AI_MEMORY_DOCKER", &docker)
+            .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
+            // A temp LOCALAPPDATA holds no installed client, standing in for
+            // "the installer never ran" regardless of the host machine.
+            .env("LOCALAPPDATA", tmp.path())
+            .env_remove("AI_MEMORY_NATIVE_BIN")
+            .env_remove("AI_MEMORY_SERVER_URL");
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "a missing native client must fail instead of entering the container"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("install.ps1"),
+            "the refusal must name the documented installer; got {stderr}"
+        );
+        assert!(
+            stderr.contains("AI_MEMORY_NATIVE_BIN"),
+            "the refusal must name the override; got {stderr}"
+        );
+        let docker_log = std::fs::read_to_string(&docker_args).unwrap_or_default();
+        assert!(
+            docker_log.is_empty(),
+            "a missing native client must not fall back to the container; got {docker_log}"
         );
     }
 

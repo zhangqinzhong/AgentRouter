@@ -70,7 +70,11 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
     }
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    // Carry while the value would still *render* as 1024.0 or more at one
+    // decimal. Stopping at `value < 1024.0` leaves 1023.95..1024.0 to round
+    // up at format time, printing a magnitude that belongs to the next unit
+    // (1 MiB − 6 bytes came out as `1024.0 KiB`).
+    while (value * 10.0).round() >= 10240.0 && unit < UNITS.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }
@@ -89,5 +93,17 @@ mod tests {
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    /// A size just under a unit boundary rounds up at one decimal, so it must
+    /// carry to the next unit rather than print a magnitude that unit cannot
+    /// hold. `status` reported `1024.0 KiB on disk` for a 1 MiB − 6 database.
+    #[test]
+    fn human_bytes_carries_a_value_that_would_round_up_to_the_next_unit() {
+        assert_eq!(human_bytes(1024 * 1024 - 6), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024 - 24), "1.0 GiB");
+        // Controls: a value that does not reach the boundary stays put.
+        assert_eq!(human_bytes(1024 * 1024 - 600), "1023.4 KiB");
+        assert_eq!(human_bytes(1023), "1023 B");
     }
 }

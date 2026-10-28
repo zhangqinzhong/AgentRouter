@@ -347,7 +347,7 @@ impl Consolidator {
         // session id) is shared by every attempt of this invocation; a
         // re-entry after a crash or a new queue claim is a NEW operation
         // with a new id.
-        let operation_id = LlmOperationId::new();
+        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation);
         let request = assemble_single_request(&plan, &projected, self.budgets);
         debug!(
             session = %session_id,
@@ -801,7 +801,7 @@ impl Consolidator {
         // fresh id is shared by every attempt of this invocation; a
         // re-entry after a crash or a new queue claim is a new operation
         // with a new id.
-        let operation_id = LlmOperationId::new();
+        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation);
         let request = assemble_batch_request(&plan, &projected, self.budgets);
         debug!(
             session = %session_id,
@@ -2314,6 +2314,7 @@ mod tests {
         let error = ConsolidatorError::Llm(LlmError::Provider {
             status: 400,
             body: REDACTION_SENTINEL.into(),
+            retry_after: None,
         });
         let summary = redacted_error_summary(&error);
         assert_eq!(summary, "consolidation failed: class=provider status=400");
@@ -2328,6 +2329,7 @@ mod tests {
         let provider = ConsolidatorError::Llm(LlmError::Provider {
             status: 400,
             body: REDACTION_SENTINEL.into(),
+            retry_after: None,
         });
         let serde_error = ConsolidatorError::Serde(REDACTION_SENTINEL.into());
         let provider_summary = redacted_error_summary(&provider);
@@ -4670,6 +4672,7 @@ mod tests {
                     ScriptedFailure::Transient => LlmError::Provider {
                         status: 503,
                         body: "This model is currently experiencing high demand.".into(),
+                        retry_after: None,
                     },
                     ScriptedFailure::Deterministic => LlmError::Auth("expired".into()),
                 });
@@ -4916,6 +4919,14 @@ mod tests {
             );
             assert_fresh_gateway_form(single1[0]);
             assert_fresh_gateway_form(single2[0]);
+            assert_eq!(
+                single1[0].workload(),
+                ai_memory_llm::LlmWorkload::Consolidation
+            );
+            assert_eq!(
+                single2[0].workload(),
+                ai_memory_llm::LlmWorkload::Consolidation
+            );
             assert_ne!(
                 single1[0].to_string(),
                 session.to_string(),
@@ -4978,6 +4989,14 @@ mod tests {
             );
             assert_fresh_gateway_form(multi1[0]);
             assert_fresh_gateway_form(multi2[0]);
+            assert_eq!(
+                multi1[0].workload(),
+                ai_memory_llm::LlmWorkload::Consolidation
+            );
+            assert_eq!(
+                multi2[0].workload(),
+                ai_memory_llm::LlmWorkload::Consolidation
+            );
             assert_ne!(
                 multi1[0].to_string(),
                 session.to_string(),

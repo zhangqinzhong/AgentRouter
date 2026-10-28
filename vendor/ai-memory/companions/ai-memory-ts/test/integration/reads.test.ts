@@ -82,7 +82,7 @@ describe("read tools", () => {
     assert.equal(feedback.signal, "helpful");
   });
 
-  it("observations in a project with no completed session is InvalidParamsError", async () => {
+  it("observations in a project with no session is InvalidParamsError", async () => {
     await memory.pages.write({ path: "notes/x.md", body: "# X", scope: { workspace: "it-reads", project: "empty" } });
     await assert.rejects(
       memory.observations({ scope: { workspace: "it-reads", project: "empty" } }),

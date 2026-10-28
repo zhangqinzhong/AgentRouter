@@ -116,7 +116,7 @@ Order is fixed; each step gates the next:
 1. **Proactive backup, first, always.** The migration compresses the
    entire data dir (wiki, SQLite DB, manifests) to
    `~/ai-memory-backup-pre-2.0-<date>.tar.gz` (outside the data dir),
-   verifies the archive is listable and size-sane, and **aborts if the
+   fsyncs it, verifies the archive is listable and size-sane, and **aborts if the
    backup cannot be written or verified**. The archive path is recorded
    in the wiki meta manifest.
 2. **In-place frontmatter rewrite.** Same page id, same version row,

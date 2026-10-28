@@ -1,12 +1,14 @@
 # Design: tiered L0/L1/L2 SessionStart brief
 
-**Status:** Draft (2026-10-13). Open questions resolved. Eventual path:
-[`docs/design-tiered-session-brief.md`](design-tiered-session-brief.md).
+**Status:** Implemented in 3.1 by PR
+[#1264](https://github.com/akitaonrails/ai-memory/pull/1264); this is the
+design of record. The baseline, rollout, and PR-plan sections below describe
+the proposal as reviewed, not unfinished work. Current behavior is summarized
+in [`ARCHITECTURE.md`](ARCHITECTURE.md#data-flow).
 
-This is the remaining landscape R7 work: consume extractive L0/L1/L2
-tiers on the opted-in SessionStart project brief. Additive rendering on
-the next minor after 3.0.0. Verified against `main` at `dbe928e3`
-(`release: v3.0.0`).
+This completed the remaining landscape R7 work: consume extractive L0/L1/L2
+tiers on the opted-in SessionStart project brief. The proposal baseline was
+verified against `main` at `dbe928e3` (`release: v3.0.0`).
 
 Ideas only from OpenViking's progressive-disclosure tiers and Letta-code
 MemFS directory deferral. Do not vendor either tree (OpenViking is AGPLv3).
@@ -142,7 +144,7 @@ They do not agree on clip size or prose granularity.
 
 | Site | Order | Prose fallback | Clip |
 |---|---|---|---|
-| Profile digest `ProfileEntry::from_page` (`profile.rs` ~452-475) | `summary` then `abstract` then first prose **line** (then title) | `first_prose_line`: skips headings, `---`, ADR metadata fields | 240 **bytes**, no ellipsis (`ENTRY_STATEMENT_MAX_BYTES`) |
+| Profile digest `ProfileEntry::from_page` (`profile.rs` ~452-475) | `summary` then `abstract` then first prose **line** (then title) | `first_prose_line`: skips headings, `---`, ADR metadata fields | 240 **bytes**, ellipsis (`ENTRY_STATEMENT_MAX_BYTES`) |
 | A2 compaction `summary_line` (`crates/ai-memory-consolidate/src/compaction.rs` ~68-91) | `summary` then `abstract` then first non-empty, non-heading **paragraph** | collapse whitespace | `MAX_SUMMARY_LEN = 500` bytes, ellipsis |
 | V61 / wiki `frontmatter_abstract` (`wiki.rs` ~3099, duplicated in `embed.rs`) | `abstract` only | none | store cap `MAX_PAGE_ABSTRACT_LEN = 1024` (`page.rs` ~166) |
 
@@ -232,7 +234,7 @@ Restated from `AGENTS.md` because they bound the packing:
 5. **Pages shared, batons owned (#16).** The brief does not filter pages
    by `author_id`. Slot visibility stays the existing
    `SlotVisibility::for_viewer` SQL predicate.
-6. **MCP tool count frozen at 23.** No `memory_brief_expand`. Footer
+6. **MCP tool count was frozen at 23 for this proposal.** No `memory_brief_expand`. Footer
    already points at follow-up tools.
 7. **Wiki mutations stay on `Wiki::write_page` / `apply_batch`.** This
    design does not write wiki files. It only reads latest rows.
@@ -893,7 +895,8 @@ must not call it.
 
 ### D. New MCP tool `memory_brief_expand`
 
-Breaks the 23-tool freeze. Duplicates `memory_read_page` (by path) and
+Would have broken the then-current 23-tool freeze. Duplicates
+`memory_read_page` (by path) and
 `memory_query` (by search). The footer already names follow-up. Rejected.
 
 ### E. Persist compiled L0/L1 sidecar files (OpenViking `.abstract.md` / `.overview.md`)

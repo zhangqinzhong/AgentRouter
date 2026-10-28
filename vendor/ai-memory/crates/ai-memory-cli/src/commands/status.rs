@@ -193,23 +193,46 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
 /// outage runs. Goes to stderr like the spool block above, so `--json`
 /// consumers' stdout stays a single object.
 fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool) {
+    for line in offline_recovery_hint_lines(config, spool, json) {
+        eprintln!("{line}");
+    }
+}
+
+/// The hint's lines, or empty when there is nothing to say. Split out from
+/// the `eprintln!` wrapper so both renderings are assertable without a
+/// running server.
+///
+/// An unreadable journal is reported in BOTH renderings. It is what opens
+/// this gate in the first place (it defeats the early return), and a journal
+/// we cannot parse reports `0` pending: staying silent about the error turned
+/// the human line into `repair unrecorded runs (0 journaled)` and the
+/// `--json` object into an all-clear, for a journal that is actually broken.
+/// The online path at `status/presentation.rs` and `journal_error` in
+/// [`json_report`] already treat it as reportable; this matches their label
+/// and key.
+fn offline_recovery_hint_lines(config: &Config, spool: &SpoolHealth, json: bool) -> Vec<String> {
     let (journal_pending, _, _, journal_error) = super::recovery::journal_summary(&config.data_dir);
     if spool.pending == 0 && journal_pending == 0 && journal_error.is_none() {
-        return;
+        return Vec::new();
     }
     if json {
-        eprintln!(
-            "recovery hint (server unreachable): {{\"journal_pending\": {journal_pending},\
-             \"spool_pending\": {}}}",
-            spool.pending
-        );
-        return;
+        let rendered = serde_json::json!({
+            "journal_pending": journal_pending,
+            "journal_error": journal_error,
+            "spool_pending": spool.pending,
+        });
+        return vec![format!("recovery hint (server unreachable): {rendered}")];
     }
-    eprintln!(
+    let mut lines = Vec::new();
+    if let Some(error) = &journal_error {
+        lines.push(format!("  error:      {error}"));
+    }
+    lines.push(format!(
         "  run `{}` once the server is back to deliver queued events and \
          repair unrecorded runs ({journal_pending} journaled)",
         fix_lines::RECOVER
-    );
+    ));
+    lines
 }
 
 /// The missing logon binary while the server is down, on stderr like the
@@ -726,6 +749,73 @@ mod tests {
         assert!(line.contains("openai-compat/local-router"));
         assert!(line.contains("circuit open until"));
         assert!(!line.contains("last error"));
+    }
+
+    /// A `Config` whose data dir is `dir`, so the journal read under test
+    /// hits a temp dir rather than the developer's real install.
+    fn config_for(dir: &std::path::Path) -> Config {
+        Config {
+            data_dir: dir.to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn offline_recovery_hint_reports_an_unreadable_journal_to_humans() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            super::super::recovery::journal_path(temp.path()),
+            b"not json",
+        )
+        .unwrap();
+        let lines =
+            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), false);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("error:"),
+            "an unreadable journal must be named, not reported as `0 journaled`: {rendered}"
+        );
+        assert!(
+            rendered.contains("recovery-journal.json"),
+            "the error must say which file failed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn offline_recovery_hint_json_reports_an_unreadable_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            super::super::recovery::journal_path(temp.path()),
+            b"not json",
+        )
+        .unwrap();
+        let lines =
+            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), true);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let payload = lines[0].split_once(": ").expect("prefix then object").1;
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["journal_pending"], 0);
+        assert!(
+            value["journal_error"].is_string(),
+            "a monitoring consumer must not read `journal_pending: 0` as an \
+             all-clear while the journal is unreadable: {value}"
+        );
+    }
+
+    #[test]
+    fn offline_recovery_hint_stays_quiet_on_a_healthy_install() {
+        let temp = tempfile::tempdir().unwrap();
+        for json in [false, true] {
+            assert!(
+                offline_recovery_hint_lines(
+                    &config_for(temp.path()),
+                    &SpoolHealth::default(),
+                    json
+                )
+                .is_empty(),
+                "nothing queued and no journal error must print nothing (json={json})"
+            );
+        }
     }
 
     #[test]

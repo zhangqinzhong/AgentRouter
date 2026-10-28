@@ -11,6 +11,7 @@
 //! that exists only while the app runs would stop the server from starting.
 
 use std::ffi::OsString;
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -224,6 +225,41 @@ pub fn early_exit_message(exe: &Path, stderr: &str) -> String {
     }
 }
 
+/// Read the child's `stdout` line by line, handing each line to `on_line`,
+/// while its `stderr` is read on a thread of its own. Returns everything
+/// `stderr` carried, for [`early_exit_message`].
+///
+/// Both streams have to be read at the same time. A piped stream nobody reads
+/// fills its pipe buffer (64 KiB on Linux and macOS) and then blocks the
+/// child's next write for good, and `setup --web` writes its log lines to
+/// stderr for as long as it serves the page, at whatever level the operator's
+/// `log_level` or `RUST_LOG` selects. Reading stderr only once stdout ends
+/// therefore deadlocks: the child blocks on a log line with a full stderr
+/// pipe, so it never prints the page's address and never exits, and the
+/// installer waits on a stdout line that can no longer arrive.
+///
+/// # Errors
+/// Whatever `on_line` returns; a stdout line that cannot be read ends the
+/// read as end of output would.
+pub fn read_output<O, E, F>(stdout: O, stderr: E, mut on_line: F) -> Result<String>
+where
+    O: std::io::Read,
+    E: std::io::Read + Send + 'static,
+    F: FnMut(&str) -> Result<()>,
+{
+    let draining = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    for line in std::io::BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        on_line(&line)?;
+    }
+    Ok(draining.join().unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +421,80 @@ mod tests {
         let path = std::env::join_paths([PathBuf::from("relative"), dir.clone()]).unwrap();
         assert_eq!(find_on_path(Some(path)), Some(dir.join(EXE_NAME)));
         assert_eq!(find_on_path(None), None);
+    }
+
+    /// `setup --web` logs to its stderr for as long as it serves the page, so
+    /// a child that writes more than a pipe buffer holds must still get its
+    /// stdout read. Reading stderr only after the stdout loop deadlocks: the
+    /// child blocks on its next log line and never prints the address, and the
+    /// installer hangs on "Starting the setup page…" for good.
+    #[test]
+    fn a_child_flooding_stderr_still_gets_its_stdout_read() {
+        use std::io::Write as _;
+
+        // Past any platform's pipe buffer (64 KiB on Linux and macOS).
+        const FLOOD: usize = 1 << 20;
+        let url = format!("http://127.0.0.1:53535/s/{}/", "ab".repeat(32));
+        let printed = url.clone();
+        let (out_reader, mut out_writer) = std::io::pipe().unwrap();
+        let (err_reader, mut err_writer) = std::io::pipe().unwrap();
+
+        // Stands in for the child: it logs heavily before it gets as far as
+        // printing the page's address.
+        let child = std::thread::spawn(move || {
+            const LINE: &[u8] = b"2026-01-01 ai_memory::setup_web: serving the setup page\n";
+            let mut written = 0;
+            while written < FLOOD {
+                err_writer.write_all(LINE).unwrap();
+                written += LINE.len();
+            }
+            writeln!(out_writer, "starting").unwrap();
+            writeln!(out_writer, "{printed}").unwrap();
+        });
+
+        // The read runs on its own thread so a regression fails on the
+        // timeout instead of hanging the suite.
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut found = None;
+            let errors = read_output(out_reader, err_reader, |line| {
+                found = found.take().or_else(|| setup_url(line));
+                Ok(())
+            });
+            let _ = done.send((found, errors));
+        });
+
+        let (found, errors) = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("reading the child's stdout blocked on its unread stderr");
+        child.join().unwrap();
+        assert_eq!(found.as_deref(), Some(url.as_str()));
+        let errors = errors.unwrap();
+        assert!(
+            errors.len() >= FLOOD,
+            "the whole of the child's stderr is kept for the early-exit message, got {} bytes",
+            errors.len()
+        );
+    }
+
+    /// An error from `on_line` is returned, and stops the read where it is.
+    #[test]
+    fn an_error_on_a_stdout_line_stops_the_read() {
+        let (out_reader, mut out_writer) = std::io::pipe().unwrap();
+        let (err_reader, err_writer) = std::io::pipe().unwrap();
+        drop(err_writer);
+        {
+            use std::io::Write as _;
+            writeln!(out_writer, "first").unwrap();
+            writeln!(out_writer, "second").unwrap();
+        }
+        let mut seen = Vec::new();
+        let error = read_output(out_reader, err_reader, |line| {
+            seen.push(line.to_owned());
+            bail!("no")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "no");
+        assert_eq!(seen, ["first"]);
     }
 }

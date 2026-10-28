@@ -1,8 +1,11 @@
 //! An external producer may replace capture without replacing native context delivery.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -117,6 +120,144 @@ fn capture_inspection_reports_external_ownership_without_side_effects() {
     assert_eq!(report["scope_resolution"], "explicit");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("orchestrator-a"));
     assert!(!tmp.as_path().join("data").exists());
+}
+
+/// Runs one `user-prompt-submit` with `prompt` against `server`, owned
+/// externally throughout.
+fn external_prompt(root: &Path, server: &str, prompt: &str) -> Output {
+    let mut child = hermetic(BIN)
+        .args(["--data-dir"])
+        .arg(root.join("data"))
+        .args([
+            "hook",
+            "--agent",
+            "claude-code",
+            "--event",
+            "user-prompt-submit",
+            "--server-url",
+            server,
+        ])
+        .env("AI_MEMORY_HOME", root)
+        .env("HOME", root)
+        .env("AI_MEMORY_CAPTURE_OWNER", "example.runtime")
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"session_id":"external-recap-test", "cwd":root, "prompt":prompt})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success(), "{result:?}");
+    result
+}
+
+/// A one-shot `GET` stub that answers with `body`. It stops on the returned
+/// flag rather than on a timeout, so a run that issues no request at all can
+/// be asserted on without waiting one out.
+fn serve_one_request(
+    body: &'static str,
+) -> (
+    String,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<Option<String>>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let served = std::thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        if socket.read_exact(&mut byte).is_err() {
+                            break;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes());
+                    let _ = socket.shutdown(std::net::Shutdown::Write);
+                    return Some(String::from_utf8_lossy(&request).into_owned());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if flag.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accepting the stub request: {error}"),
+            }
+        }
+    });
+    (format!("http://{address}"), stop, served)
+}
+
+/// Delivering the compaction recap is context delivery, like `SessionStart`'s
+/// handoff, so an external capture owner must not suppress it: the recap
+/// reaches the model through the `UserPromptSubmit` envelope for every agent
+/// whose `user_prompt_injects_context` is true. The exemption stays scoped to
+/// that delivery — an ordinary prompt under the same owner still early-returns
+/// without touching the server — and it leaks no capture, because every
+/// enqueue and drain on the path is separately gated on `!external_capture`.
+#[test]
+fn external_capture_still_delivers_the_compaction_recap() {
+    const RECAP: &str = "RECAP_SENTINEL";
+    for (prompt, delivers) in [("reload context", true), ("an ordinary prompt", false)] {
+        let guard = tempfile::tempdir().unwrap();
+        let root = guard.path().to_path_buf();
+        let (server, stop, served) = serve_one_request(RECAP);
+
+        let output = external_prompt(&root, &server, prompt);
+
+        stop.store(true, Ordering::SeqCst);
+        let request = served.join().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if delivers {
+            let request = request.unwrap_or_else(|| {
+                panic!("the recap GET never reached the server; stdout was {stdout:?}")
+            });
+            assert!(request.starts_with("GET /recap?"), "{request}");
+            let envelope: Value = serde_json::from_str(stdout.trim()).unwrap();
+            assert_eq!(
+                envelope["hookSpecificOutput"]["hookEventName"],
+                "UserPromptSubmit"
+            );
+            assert_eq!(envelope["hookSpecificOutput"]["additionalContext"], RECAP);
+        } else {
+            assert_eq!(request, None, "{prompt:?} must not request a recap");
+            assert_eq!(stdout, "{}\n", "{prompt:?} must early-return");
+        }
+        let spooled = std::fs::read_dir(root.join("data/hook-spool"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(spooled, 0, "{prompt:?} must leave capture to its owner");
+    }
 }
 
 mod slow {

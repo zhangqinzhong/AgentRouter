@@ -254,7 +254,10 @@ describe("handoffs", () => {
   it("begin, list, accept and cancel send wire names and decode results", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_handoff_begin", () => ({ handoff_id: payloads.HANDOFF_ID }));
-    server.tools.set("memory_handoff_list", () => ({ handoffs: [payloads.handoffRow] }));
+    server.tools.set("memory_handoff_list", () => ({
+      handoffs: [payloads.handoffRow],
+      newer_unended_session: payloads.briefing.recent_sessions[0],
+    }));
     server.tools.set("memory_handoff_accept", (args) =>
       args["handoff_id"] === "gone"
         ? { handoff: null, status: "none_pending" }
@@ -288,6 +291,8 @@ describe("handoffs", () => {
     const listed = await memory.handoffs.list({ limit: 5 });
     assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app", limit: 5 });
     assert.equal(listed.handoffs[0]?.summary, "Left off here");
+    assert.equal(listed.newerUnendedSession?.agentKind, "open-code");
+    assert.equal(listed.newerUnendedSession?.ended, false);
 
     const claimed = await memory.handoffs.accept({ handoffId: payloads.HANDOFF_ID });
     assert.equal(claimed.status, "claimed");
@@ -378,6 +383,9 @@ describe("reads", () => {
     });
     assert.equal(briefing.activity7d.pagesUpdated, 1);
     assert.equal(briefing.recentPages[0]?.kind, "note");
+    assert.equal(briefing.recentSessions[0]?.sessionId, "09db5007-256a-5d22-970e-c9deb0081218");
+    assert.equal(briefing.recentSessions[0]?.ended, false);
+    assert.equal(briefing.recentSessions[0]?.current, false);
   });
 
   it("explore without a provider returns the briefing and a reason", async () => {
@@ -532,6 +540,10 @@ describe("wire names", () => {
         asOf: "2026-01-01T00:00:00Z",
         answer: true,
         reasoning: "low",
+        kind: "decision",
+        tier: "semantic",
+        pathPrefix: "decisions/",
+        tag: "t",
       }),
       memory.query({ query: "q", scopes: [SCOPE] }),
       memory.query({ query: "q", global: true }),

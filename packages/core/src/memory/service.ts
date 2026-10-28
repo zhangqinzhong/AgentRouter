@@ -15,7 +15,7 @@ import { MemoryClients } from "./clients";
 import { memoryReadPath, MemoryTransport } from "./transport";
 
 const execute = promisify(execFile);
-export const MEMORY_VERSION = "3.1.2";
+export const MEMORY_VERSION = "3.2.5";
 const defaultSettings: MemorySettings = { autoStart: false, semanticSearch: false };
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function waitForExit(child: ChildProcess, timeout: number): Promise<void> {

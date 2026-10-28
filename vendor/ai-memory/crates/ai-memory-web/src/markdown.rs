@@ -709,28 +709,14 @@ fn has_external_or_unsafe_scheme(target: &str) -> bool {
         || lower.starts_with("file:")
 }
 
-/// Escape text for insertion into an HTML template while preserving the
-/// fixed `<mark>` tags emitted by SQLite FTS snippets.
+/// Escape an internal FTS snippet for insertion into an HTML template.
+///
+/// SQLite wraps matches in control delimiters that the durable sanitizer
+/// forbids in page content. Only those unforgeable delimiters become
+/// `<mark>` tags; literal markup from a page is always escaped.
 #[must_use]
 pub fn escape_snippet(snippet: &str) -> String {
-    escape_html(snippet)
-        .replace("&lt;mark&gt;", "<mark>")
-        .replace("&lt;/mark&gt;", "</mark>")
-}
-
-fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
+    ai_memory_store::highlighted_snippet_html(snippet)
 }
 
 /// Drop the leading H1 from a markdown body when it repeats `title`.
@@ -911,9 +897,43 @@ mod tests {
 
     #[test]
     fn escapes_search_snippet_but_keeps_marks() {
-        let out = escape_snippet("<script>x</script> <mark>hit</mark>");
+        let out = escape_snippet(&format!(
+            "<script>x</script> {}hit{}",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        ));
         assert!(out.contains("&lt;script&gt;x&lt;/script&gt;"));
         assert!(out.contains("<mark>hit</mark>"));
+    }
+
+    #[test]
+    fn a_literal_mark_tag_in_page_text_stays_text() {
+        assert_eq!(
+            escape_snippet("use <mark> here <mark>hit</mark>"),
+            "use &lt;mark&gt; here &lt;mark&gt;hit&lt;/mark&gt;"
+        );
+        assert_eq!(escape_snippet("see <mark> here"), "see &lt;mark&gt; here");
+        assert_eq!(escape_snippet("a </mark> b"), "a &lt;/mark&gt; b");
+        let highlighted = format!(
+            "{}a{} x {}b{}",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END,
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        );
+        assert_eq!(
+            escape_snippet(&highlighted),
+            "<mark>a</mark> x <mark>b</mark>"
+        );
+        let escaped_inside = format!(
+            "{}a&b{} <script>",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        );
+        assert_eq!(
+            escape_snippet(&escaped_inside),
+            "<mark>a&amp;b</mark> &lt;script&gt;"
+        );
     }
 
     #[test]

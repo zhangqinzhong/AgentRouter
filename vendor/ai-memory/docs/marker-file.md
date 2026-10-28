@@ -294,10 +294,14 @@ falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
 `[recall] default_global` applies to an agent's unscoped `memory_query` and
-`memory_recent` calls. The `ai-memory search` terminal command does not read
-it: that command stays scoped to the current project and searches every
-project only when you pass `--global` (see
-[usage.md](usage.md#search-from-the-terminal)).
+`memory_recent` calls. A `memory_query` with `as_of` is not broadened: it
+reads the current project as it stood at that instant, and an explicit
+`global=true` with `as_of` is refused. The `ai-memory search` and
+`ai-memory recent` terminal commands do not read it: those commands stay
+scoped to the current project and cover every project only when you pass
+`--global` (see
+[usage.md](usage.md#search-from-the-terminal) and
+[usage.md](usage.md#recent-pages-from-the-terminal)).
 
 `default_global` and `inject_on_session_start` accept a truthy value
 (`true` / `1` / `yes` / `on`, quoted or bare; section-style keys are
@@ -897,7 +901,11 @@ The normal capture contract is intentionally narrow: supported Claude Code,
 OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
 and a PostToolUse outcome class. `PreToolUse` never retains commands,
-arguments, paths, input bodies, or arbitrary tool names. `PostToolUse` appends
+arguments, paths, input bodies, or arbitrary tool names. The one name kept is
+an MCP tool's: a call named `mcp__<server>__<tool>` (Claude Code, Codex, Hermes
+Agent) stays in the `unknown` family, with no input or output, and adds
+`mcp_server` and `mcp_tool` lines when the whole name is at most 64 ASCII
+letters, digits, `_` or `-`. `PostToolUse` appends
 its existing tool-response/error excerpt and caps the complete rendered body at
 2,000 UTF-8-safe bytes. Antigravity's successful file-edit events fall back to
 the bounded replacement or written-content field in `toolCall.args` because its

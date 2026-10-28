@@ -42,8 +42,8 @@ use crate::cli::{
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
-    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_grok_payload,
-    build_pool_settings_yaml, hook_script_for_current_platform,
+    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_dsh_hooks_payload,
+    build_grok_payload, build_pool_settings_yaml, hook_script_for_current_platform,
 };
 use crate::commands::{install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -111,7 +111,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
     // Hermes also runs the native `hook` command directly (no shell), so there
     // are no scripts to stage — setup-agent prints the YAML block instead.
     if matches!(args.agent, AgentChoice::Hermes) {
-        emit_hermes(&args)?;
+        let plugin_dir = install_hooks::hermes_plugin_dir(&config.runtime_env);
+        print!("{}", hermes_setup_output(&args, plugin_dir.as_deref()));
         return Ok(());
     }
     // Droid has no script bundle either: its hooks.json runs the native
@@ -133,6 +134,16 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
     // IBM Bob's settings run the native hook command directly too.
     if matches!(args.agent, AgentChoice::IbmBob) {
         emit_ibm_bob(&args)?;
+        return Ok(());
+    }
+    if matches!(args.agent, AgentChoice::Cline) {
+        bail!(
+            "Cline discovers generated hook files in the host user's hook directory; run `ai-memory install-hooks --agent cline --apply` on that host"
+        );
+    }
+    // Qwen Code too: ~/.qwen/settings.json runs the native `hook` command.
+    if matches!(args.agent, AgentChoice::QwenCode) {
+        emit_qwen_code(&args)?;
         return Ok(());
     }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
@@ -220,6 +231,7 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
         AgentChoice::Pool => emit_pool(&emit_root, &args),
+        AgentChoice::Dsh => emit_dsh(&emit_root, &args),
         AgentChoice::CopilotCli => {
             emit_other(&emit_root, agent_sub, &args, &[COPILOT_CLI_PROFILE.events]);
         }
@@ -234,7 +246,9 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Droid
         | AgentChoice::Muse
         | AgentChoice::CodeBuddy
-        | AgentChoice::IbmBob => {
+        | AgentChoice::IbmBob
+        | AgentChoice::Cline
+        | AgentChoice::QwenCode => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -310,27 +324,34 @@ fn emit_zcode(args: &SetupAgentArgs) -> Result<()> {
 /// runs the ai-memory binary directly with the JSON payload on stdin. The
 /// binary must be reachable on the host that runs Hermes — for docker-wrapper
 /// setups install the native binary or point `command` at the wrapper.
-fn emit_hermes(args: &SetupAgentArgs) -> Result<()> {
+///
+/// The community memory-provider plugin is looked for where this command
+/// runs. Inside a container that is not the host's Hermes home, which is why
+/// the full block also says which entries to drop beside the plugin.
+fn hermes_setup_output(args: &SetupAgentArgs, plugin_dir: Option<&Path>) -> String {
+    let hook_set = install_hooks::hermes_hook_set(plugin_dir);
     let block = crate::commands::render_shared::build_hermes_hooks_yaml(
         &args.server_url,
         args.auth_token.as_deref(),
         None,
         None,
+        hook_set,
     );
-    println!("# Hermes Agent — merge the `hooks:` block into ~/.hermes/config.yaml");
-    println!("# The `command` must be an ai-memory binary reachable on the host that");
-    println!("# runs Hermes; prefer `ai-memory install-hooks --agent hermes` from");
-    println!("# that host so the path is resolved for you.");
+    let mut out = String::new();
+    out.push_str("# Hermes Agent — merge the `hooks:` block into ~/.hermes/config.yaml\n");
+    out.push_str("# The `command` must be an ai-memory binary reachable on the host that\n");
+    out.push_str("# runs Hermes; prefer `ai-memory install-hooks --agent hermes` from\n");
+    out.push_str("# that host so the path is resolved for you.\n");
     if args.auth_token.is_some() {
-        println!("#       Treat the config as sensitive (chmod 600).");
+        out.push_str("#       Treat the config as sensitive (chmod 600).\n");
     }
-    println!("# NOTE: Hermes splits each `command` with shlex.split and runs it with");
-    println!("#       no shell, so the generated line is argv, not a shell command.");
-    println!("# NOTE: tool observations only — session lifecycle stays with the");
-    println!("#       ai-memory memory-provider plugin.");
-    println!();
-    println!("{block}");
-    Ok(())
+    out.push_str("# NOTE: Hermes splits each `command` with shlex.split and runs it with\n");
+    out.push_str("#       no shell, so the generated line is argv, not a shell command.\n");
+    out.push_str(&install_hooks::hermes_hook_set_notes(hook_set, plugin_dir));
+    out.push('\n');
+    out.push_str(&block);
+    out.push('\n');
+    out
 }
 
 /// Print the event map for `~/.factory/hooks.json` (#1240). No scripts are
@@ -423,6 +444,29 @@ fn emit_ibm_bob(args: &SetupAgentArgs) -> Result<()> {
     println!("# ~/.bob/settings/settings.json. The `command` must be an ai-memory");
     println!("# binary reachable on the host that runs Bob; prefer");
     println!("# `ai-memory install-hooks --agent ibm-bob --apply` from that host.");
+    if args.auth_token.is_some() {
+        println!("#       Treat settings.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print the `hooks` block for `~/.qwen/settings.json`. No scripts are
+/// staged: each entry runs the native `hook` command.
+fn emit_qwen_code(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_qwen_code_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing Qwen Code hook config")?;
+    println!("# Qwen Code — merge under the `hooks` key of");
+    println!("# ~/.qwen/settings.json. The `command` must be an ai-memory");
+    println!("# binary reachable on the host that runs Qwen Code; prefer");
+    println!("# `ai-memory install-hooks --agent qwen-code --apply` from that host.");
     if args.auth_token.is_some() {
         println!("#       Treat settings.json as sensitive (chmod 600).");
     }
@@ -629,6 +673,41 @@ fn emit_pool(emit_root: &Path, args: &SetupAgentArgs) {
     print!("{snippet}");
 }
 
+/// Print DSH's generated Claude Code `hooks.json` plus the Cordis patch
+/// fragment that points the `@deepseek-ai/dsh-hooks-claude-code` bridge at
+/// it. The staged `.sh`/`.ps1` scripts are the artifact; the bridge reads the
+/// hooks.json via `configPath` after the operator merges the patch into
+/// `$DSH_HOME/profiles/<profile>/cordis.patch.yml`.
+fn emit_dsh(emit_root: &Path, args: &SetupAgentArgs) {
+    let payload = build_dsh_hooks_payload(
+        emit_root,
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    println!("# DeepSeek Harness (DSH) — DSH has no fixed agent config file.");
+    println!("# Hook scripts (must be reachable from the host that runs DSH):");
+    println!("#   {}", emit_root.display());
+    println!("# AI-memory server: {}", args.server_url);
+    if args.auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("#       Treat the hook config as sensitive (chmod 600).");
+    }
+    println!("# NOTE: the bridge delivers exactly seven events — no PreCompact or");
+    println!("#       SessionEnd, and SessionStart runs detached, so capture works");
+    println!("#       but handoff injection does not. Recover handoffs via the MCP");
+    println!("#       memory_handoff_accept tool, and close finished sessions with");
+    println!("#       `ai-memory finalize-session --agent dsh`.");
+    println!();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).expect("static hook payload serializes")
+    );
+    println!();
+    print!("{}", install_hooks::dsh_bridge_patch_fragment(emit_root));
+}
+
 fn emit_devin(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     print!("{}", render_devin_setup_output(emit_root, args)?);
     Ok(())
@@ -817,6 +896,49 @@ fn source_candidates(explicit: Option<&Path>, sub: &str, exe: Option<PathBuf>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hermes_setup_args() -> SetupAgentArgs {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::try_parse_from([
+            "ai-memory",
+            "setup-agent",
+            "--agent",
+            "hermes",
+            "--to",
+            "/host/hooks",
+        ])
+        .unwrap();
+        let crate::cli::Command::SetupAgent(args) = cli.command else {
+            panic!("expected setup-agent");
+        };
+        args
+    }
+
+    /// `setup-agent --agent hermes` renders the same two blocks as
+    /// `install-hooks`: the whole lifecycle, or the tool events alone when the
+    /// community plugin is installed.
+    #[test]
+    fn hermes_setup_output_follows_the_plugin_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("plugins").join("ai-memory");
+        let full = hermes_setup_output(&hermes_setup_args(), Some(&plugin));
+        assert!(full.contains("pre_llm_call:") && full.contains("on_session_finalize:"));
+        assert!(full.contains("pre_tool_call:") && full.contains("post_tool_call:"));
+        assert!(full.contains("keep only pre_tool_call"));
+
+        std::fs::create_dir_all(&plugin).unwrap();
+        let tools = hermes_setup_output(&hermes_setup_args(), Some(&plugin));
+        assert!(tools.contains("pre_tool_call:") && tools.contains("post_tool_call:"));
+        for event in [
+            "on_session_start:",
+            "pre_llm_call:",
+            "on_session_end:",
+            "on_session_finalize:",
+        ] {
+            assert!(!tools.contains(event), "{event}");
+        }
+        assert!(tools.contains("memory-provider plugin is installed at"));
+    }
 
     #[test]
     fn source_candidates_include_binary_sibling_for_flat_tarball() {

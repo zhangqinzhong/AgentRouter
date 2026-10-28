@@ -260,6 +260,43 @@ pub fn api_credentials_exist(conn: &Connection) -> StoreResult<bool> {
     .map_err(StoreError::from)
 }
 
+/// Return the Argon2id verifier bound to the native-key pepper, when one has
+/// been recorded.
+///
+/// # Errors
+/// SQL failures.
+pub fn api_credential_pepper_verifier(conn: &Connection) -> StoreResult<Option<String>> {
+    conn.query_row(
+        "SELECT verifier FROM api_credential_pepper_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+/// Bind the verifier for the configured native-key pepper.
+///
+/// An upgraded database may have credentials but no verifier yet, so the
+/// initial insert is always allowed. Once a verifier exists, replacement is
+/// allowed only while `api_credentials` is empty. Enforcing that condition in
+/// this writer-thread statement keeps a future caller from rotating the
+/// verifier out from under existing hashes.
+///
+/// # Errors
+/// SQL failures.
+pub fn bind_api_credential_pepper_verifier(conn: &Connection, verifier: &str) -> StoreResult<bool> {
+    let changed = conn.execute(
+        "INSERT INTO api_credential_pepper_state (singleton, verifier, updated_at) \
+         VALUES (1, ?1, ?2) \
+         ON CONFLICT(singleton) DO UPDATE SET \
+             verifier = excluded.verifier, updated_at = excluded.updated_at \
+         WHERE NOT EXISTS (SELECT 1 FROM api_credentials)",
+        params![verifier, Timestamp::now().as_microsecond()],
+    )?;
+    Ok(changed == 1)
+}
+
 fn row_to_credential(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiCredential> {
     let id_bytes: Vec<u8> = row.get(0)?;
     let id = ApiCredentialId::from_slice(&id_bytes).map_err(|e| {
@@ -433,7 +470,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 83, "update the pin when adding a migration");
+        assert_eq!(version, 88, "update the pin when adding a migration");
         let cols: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('users') \
@@ -443,6 +480,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cols, 0, "V79 drops the 1.x token columns");
+    }
+
+    #[test]
+    fn pepper_verifier_can_bind_legacy_keys_but_cannot_rotate_under_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        let mut user = NewUser {
+            username: "pepper-owner".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id =
+            users::insert_human_user(&conn, &user, UserRole::User, Some("phc"), false).unwrap();
+        let credential_id = ApiCredentialId::new();
+        insert_api_credential(
+            &conn,
+            credential_id,
+            user_id,
+            "legacy",
+            &[7_u8; TOKEN_HASH_LEN],
+            None,
+        )
+        .unwrap();
+
+        assert!(bind_api_credential_pepper_verifier(&conn, "original-phc").unwrap());
+        assert!(!bind_api_credential_pepper_verifier(&conn, "replacement-phc").unwrap());
+        assert_eq!(
+            api_credential_pepper_verifier(&conn).unwrap().as_deref(),
+            Some("original-phc")
+        );
+
+        conn.execute("DELETE FROM api_credentials", []).unwrap();
+        assert!(bind_api_credential_pepper_verifier(&conn, "replacement-phc").unwrap());
+        assert_eq!(
+            api_credential_pepper_verifier(&conn).unwrap().as_deref(),
+            Some("replacement-phc")
+        );
     }
 
     fn column_count(conn: &Connection, table: &str, column: &str) -> i64 {

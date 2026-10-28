@@ -239,7 +239,12 @@ function computeRowCost(row) {
   ) return reportedCost;
   const pricing = getRowPricing(row);
   const reasoningIncludedInOutput =
-    row.source === "codex" || row.source === "acode" || row.source === "every-code";
+    row.source === "codex" ||
+    row.source === "acode" ||
+    row.source === "every-code" ||
+    row.source === "omo" ||
+    row.source === "cline" ||
+    row.source === "muse";
   const reasoningCost = reasoningIncludedInOutput
     ? 0
     : (row.reasoning_output_tokens || 0) * (pricing.output || 0);
@@ -255,34 +260,34 @@ function computeRowCost(row) {
   const model = String(row?.model || "").toLowerCase();
   const usesOpenAILongContextTier =
     model === "gpt-5.6" || model.includes("gpt-5.6-sol") || model.includes("gpt-6-astra") ||
-    model.includes("gpt-6.1-sol");
-  if (!usesOpenAILongContextTier) return baseCost;
-
+    model.includes("gpt-6-sol") || model.includes("gpt-6.1-sol");
   const bounded = (value, total) => Math.min(
-    Math.max(0, Number(value) || 0),
-    Math.max(0, Number(total) || 0),
+    Math.max(0, Number(value) || 0), Math.max(0, Number(total) || 0),
   );
-  // The parser records only usage from requests whose cache-inclusive input
-  // exceeded 272K. OpenAI prices the whole such request at 2x input and 1.5x
-  // output, so add the premium over the standard-rate base exactly once.
-  const longInput = bounded(row.long_context_input_tokens, row.input_tokens);
-  const longCached = bounded(row.long_context_cached_input_tokens, row.cached_input_tokens);
-  const longCacheWrite = bounded(
-    row.long_context_cache_creation_input_tokens,
-    row.cache_creation_input_tokens,
-  );
-  const longOutput = bounded(row.long_context_output_tokens, row.output_tokens);
-  const longReasoning = reasoningIncludedInOutput
-    ? 0
-    : bounded(row.long_context_reasoning_output_tokens, row.reasoning_output_tokens);
-  const longContextPremium = (
-    longInput * (pricing.input || 0) +
-    longCached * (pricing.cache_read || 0) +
-    longCacheWrite * (pricing.cache_write || 0) +
-    0.5 * longOutput * (pricing.output || 0) +
-    0.5 * longReasoning * (pricing.output || 0)
-  ) / 1_000_000;
-  return baseCost + longContextPremium;
+  const fields = ["input_tokens", "cached_input_tokens", "cache_creation_input_tokens", "output_tokens", "reasoning_output_tokens"];
+  const rates = [pricing.input || 0, pricing.cache_read || 0, pricing.cache_write || 0,
+    pricing.output || 0, reasoningIncludedInOutput ? 0 : pricing.output || 0];
+  const subsetCost = (prefix, longContext = false, tierPrefix = "") => fields.reduce((sum, field, index) => {
+    let tokens = bounded(row[`${prefix}${field}`], row[field]);
+    // An intersection cannot exceed either participating subset.
+    if (tierPrefix) tokens = Math.min(tokens,
+      bounded(row[`long_context_${field}`], row[field]),
+      bounded(row[`${tierPrefix}${field}`], row[field]));
+    return sum + tokens * rates[index] * (longContext && index >= 3 ? 0.5 : 1);
+  }, 0) / 1_000_000;
+  const longPremium = usesOpenAILongContextTier ? subsetCost("long_context_", true) : 0;
+  let cost = baseCost + longPremium;
+  // Speed multiplies the rate for the observed request's context tier. Unknown
+  // service tiers stay at the base rate; never infer them from a model name.
+  for (const tier of ["priority", "ultrafast"]) {
+    const multiplier = Number(pricing[`${tier}_multiplier`]);
+    if (!Number.isFinite(multiplier) || multiplier <= 1) continue;
+    const prefix = `${tier}_`;
+    const tierLongPremium = usesOpenAILongContextTier
+      ? subsetCost(`${prefix}long_context_`, true, prefix) : 0;
+    cost += (multiplier - 1) * (subsetCost(prefix) + tierLongPremium);
+  }
+  return cost;
 }
 
 // Backwards-compatible MODEL_PRICING export. Test at

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::auth_file::{load_entry, now_ms, save_entry};
 use crate::error::{LlmError, LlmResult};
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 
 /// A credential-bearing HTTP endpoint validated as TLS-protected, except for
 /// explicit loopback development servers. Keeping the parsed URL behind this
@@ -176,7 +176,23 @@ where
         .map_err(LlmError::from)?;
     let status = resp.status();
     if !status.is_success() {
-        let body = provider_error_body(resp).await;
+        let error = provider_error(resp).await;
+        let LlmError::Provider {
+            body, retry_after, ..
+        } = error
+        else {
+            return Err(error);
+        };
+        // A rate-limited or overloaded token endpoint has not rejected the
+        // grant, so it must stay transient and must not print a re-login hint
+        // for a refresh token that is still valid.
+        if LlmError::status_is_transient(status.as_u16()) {
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body: format!("{failure_label}: {body}"),
+                retry_after,
+            });
+        }
         return Err(LlmError::Auth(format!(
             "{failure_label} ({status}): {body}. {relogin_hint}"
         )));
@@ -235,6 +251,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.access_token, "fresh-access");
+    }
+
+    #[tokio::test]
+    async fn refresh_grant_treats_a_rate_limited_endpoint_as_transient() {
+        for (wire, code) in [
+            ("429 Too Many Requests", 429u16),
+            ("503 Service Unavailable", 503),
+        ] {
+            let endpoint = serve_once(wire, r#"{"error":"slow_down"}"#).await;
+            let endpoint = credential_endpoint("test token endpoint", &endpoint).unwrap();
+            let client = reqwest::Client::new();
+
+            let err = refresh_grant::<TestResponse>(
+                &client,
+                &endpoint,
+                "refresh-x",
+                "client-y",
+                "test refresh failed",
+                "Run `test login` again.",
+            )
+            .await
+            .expect_err("a throttled token endpoint must fail");
+
+            assert!(
+                err.is_transient(),
+                "{wire} has not rejected the grant: {err:?}"
+            );
+            assert_eq!(err.http_status(), Some(code), "{wire}: {err:?}");
+            assert!(
+                err.to_string().contains("test refresh failed"),
+                "{wire} must name the failing exchange: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Run `test login` again."),
+                "{wire} must not tell the operator to re-login: {err}"
+            );
+        }
     }
 
     #[tokio::test]

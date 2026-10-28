@@ -109,13 +109,20 @@ foreach ($Entry in $WrapperAssets.GetEnumerator()) {
 }
 Get-ChildItem "$UserBin\ai-memory.*" | Unblock-File
 
-# Put the wrapper directory on your user PATH for future terminals.
-$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ';') -notcontains $UserBin) {
+# Put the wrapper directory on your user PATH for future terminals. Read and
+# write the registry value as is: [Environment]::GetEnvironmentVariable expands
+# its %VAR% entries, and SetEnvironmentVariable would save them expanded, as
+# REG_SZ.
+$EnvKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+$UserPath = $EnvKey.GetValue("Path", "", "DoNotExpandEnvironmentNames")
+if (($UserPath -split ';' | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }) -notcontains $UserBin) {
     $NewUserPath = (($UserPath, $UserBin) | Where-Object { $_ }) -join ";"
-    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+    $EnvKey.SetValue("Path", $NewUserPath, "ExpandString")
+    # Removing a variable that does not exist broadcasts the change to Explorer.
+    [Environment]::SetEnvironmentVariable("ai-memory-path-notify", [NullString]::Value, "User")
     $env:Path = "$env:Path;$UserBin"
 }
+$EnvKey.Dispose()
 
 # Start the server with Docker Desktop. The image default allowlist includes
 # host.docker.internal so wrapper thin-client commands (status, search, …) are
@@ -154,6 +161,52 @@ the CLI to render hook commands for the native Windows agent:
 After upgrading the wrapper/image, rerun `install-hooks --agent <agent> --apply`
 for each native Windows agent so existing hook entries receive the current
 command form.
+
+### Managed launches (`run`, `continue`, `show`, …) use the native client
+
+`ai-memory run <harness>`, `continue`, `resume`, `show`, `workstreams` and
+`rename-workstream` execute on the host: the helper container cannot see your
+checkouts, your `claude` or `codex` CLIs, or their native session stores. The
+wrapper intercepts those subcommands and runs the native Windows client
+instead of the container (the same interception the Linux/macOS wrapper
+performs), so managed launches work while the server stays in Docker.
+
+The Docker image and the wrapper do not install that client. Install it once
+from the release zip
+([Scenario C](#scenario-c-prebuilt-release-binary-no-toolchain)):
+
+```powershell
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+```
+
+`install.ps1` unpacks `ai-memory.exe` to `%LOCALAPPDATA%\Programs\ai-memory`
+and puts that directory on your `PATH`; the wrapper finds it there, or
+wherever `AI_MEMORY_NATIVE_BIN` points. Without it the intercepted commands
+stop with a message naming that installer. They never fall back into the
+container, which has no host CLIs.
+
+- The native client inherits `AI_MEMORY_SERVER_URL`. Leave it unset and it
+  talks to `http://127.0.0.1:49374`, the port the container publishes on the
+  host; a remote-server URL wins, as with every other wrapper command.
+- When the container server has auth enabled (a fresh install mints a root
+  bearer into the volume), run `install-hooks --agent <agent> --apply` once.
+  The wrapper refreshes a host copy at
+  `%LOCALAPPDATA%\ai-memory\server-token`; later managed launches reuse it
+  without starting a helper container. An explicit `AI_MEMORY_AUTH_TOKEN`,
+  `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`, or bind-mounted `AI_MEMORY_DATA_DIR`
+  still wins. Rerun `install-hooks` after rotating the volume token.
+- A managed launch does not rewire hooks or MCP: what `install-hooks` and
+  `install-mcp` rendered through the container stays in place (the wrapper
+  sets `AI_MEMORY_RUN_AUTOWIRE=false` for the intercepted commands unless you
+  set the variable yourself). Export `AI_MEMORY_RUN_AUTOWIRE=true` to let
+  `run` rewire a harness around the native client instead.
+- Upgrading in this scenario: `ai-memory upgrade` pulls the image only,
+  including when `--config` or `--data-dir` precedes `upgrade`. It does not
+  refresh the wrapper or install a native client. Refresh the
+  wrapper scripts by re-running the install block at the top of this
+  scenario, and the native client with its own `ai-memory.exe upgrade`
+  ([Scenario C](#scenario-c-prebuilt-release-binary-no-toolchain)). Then
+  rerun `install-hooks --agent <agent> --apply` as noted above.
 
 Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `command-code`, `devin`, `kimi-code`, `kiro-cli`, `cursor`, or `gemini-cli`.
@@ -212,12 +265,17 @@ Invoke-WebRequest `
 Expand-Archive "$env:TEMP\ai-memory.zip" -DestinationPath $Dest -Force
 Get-ChildItem "$Dest\ai-memory.exe" | Unblock-File
 
-# Put it on PATH for future terminals (optional but convenient).
-$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ';') -notcontains $Dest) {
-    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$Dest", "User")
+# Put it on PATH for future terminals (optional but convenient). The registry
+# value is read and written as is, so its %VAR% entries stay unexpanded.
+$EnvKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+$UserPath = $EnvKey.GetValue("Path", "", "DoNotExpandEnvironmentNames")
+if (($UserPath -split ';' | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }) -notcontains $Dest) {
+    $EnvKey.SetValue("Path", "$UserPath;$Dest", "ExpandString")
+    # Removing a variable that does not exist broadcasts the change to Explorer.
+    [Environment]::SetEnvironmentVariable("ai-memory-path-notify", [NullString]::Value, "User")
     $env:Path = "$env:Path;$Dest"
 }
+$EnvKey.Dispose()
 
 # Wire MCP + lifecycle hooks against your server.
 & "$Dest\ai-memory.exe" install-mcp --client claude-code --apply
@@ -711,10 +769,12 @@ large-backlog instances can raise them with whole-minute overrides. Unlike
 apply to the agent's environment (no re-`install-hooks` needed):
 
 Native hooks accept well-formed JSON with or without one leading UTF-8 BOM, as
-some PowerShell pipelines add that marker when writing to a native process. Any
-other malformed stdin is not spooled or sent; the hook prints a fixed warning
-to stderr, returns `{}` on stdout, and exits successfully so it cannot break the
-host agent. The warning never includes payload contents.
+some PowerShell pipelines add that marker when writing to a native process. The
+server's `/hook` ingress skips the same marker, so a shell-bundle hook that
+forwards it unchanged is still stored. Any other malformed stdin is not spooled
+or sent; the hook prints a fixed warning to stderr, returns `{}` on stdout, and
+exits successfully so it cannot break the host agent. The warning never
+includes payload contents.
 
 | Env var | Built-in default | Max override | What it caps |
 |---|---:|---:|---|

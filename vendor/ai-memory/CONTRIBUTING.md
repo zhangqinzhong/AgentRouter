@@ -131,14 +131,12 @@ The full rules are in [`AGENTS.md`](AGENTS.md), the single
 canonical agent/contributor rules file (`CLAUDE.md` is just a pointer to
 it). Short version:
 
-1. Work milestone by milestone. Do not start M(n+1) until every "Done when"
-   bullet in M(n) passes (see `docs/design-decisions.md`).
-2. No dead code, no half-built features. Stubs are documented with
-   `// M<n> TODO` in the module doc-comment.
+1. Keep changes small and scoped to the task; avoid adjacent feature work.
+2. No dead code or half-built features. Document future work in `docs/`
+   design notes rather than shipping unreachable stubs.
 3. Write tests before claiming done. Parsers, ID derivation, and
    retention/decay math especially.
-4. Do not refactor outside the milestone. Only touch what the current
-   milestone requires.
+4. Avoid opportunistic refactors or speculative abstractions.
 5. Comments explain *why*, never *what*. No comments that restate the line
    above them.
 6. The core stays Rust-only. The server, its built-in web UI and everything
@@ -151,15 +149,18 @@ it). Short version:
 ## Cross-cutting invariants
 
 Never violate any of the invariants in [`AGENTS.md`](AGENTS.md) (see the
-"Rust Engineering Rules" and "Project Maintenance Rules" sections).
+"Cross-cutting invariants" and "Project maintenance rules" sections).
 Highlights for contributors:
 
 - All SQLite writes go through the single writer actor (`WriterHandle`).
-- Config is read once at startup; never call `std::env::var` outside `Config::load`.
+- ai-memory settings are read once by `Config::load()` and passed down.
+  Process and third-party harness environment reads use injectable lookups.
 - Atomic file writes only: tmp + rename + fsync; never write in-place.
-- Every wiki page is namespaced by `(workspace_id, project_id)`.
-- The CLI is always a thin HTTP client to the running server. It never
-  opens the SQLite file or the wiki directory directly.
+- Every wiki page is identified by `(workspace_id, project_id, path)`.
+- Keep server-facing CLI commands thin HTTP clients. Offline lifecycle
+  operations (`reset`, `restore`, `reindex`, and `uninstall --purge-data`)
+  access disk directly and must retain their live-process guards. `backup`
+  uses the running server's online SQLite backup API.
 
 ## Versioning and deprecation policy
 
@@ -195,9 +196,9 @@ than the following major release.
 - **Pick the base branch from that impact.** A fix targets `main`. A new
   capability (flag, subcommand, MCP tool, config key, agent harness,
   provider, companion) targets the standing feature branch, currently
-  `release/3.1`. A fix to code that exists only on the feature branch
+  `release/3.3`. A fix to code that exists only on the feature branch
   targets that branch too.
 - **Check what already landed first.** Before opening a PR, look for the
-  issue's closing commit and search `git log origin/main origin/release/3.1`
+  issue's closing commit and search `git log origin/main origin/release/3.3`
   for the feature or fix. A closed issue usually means the work shipped;
   a PR that redoes it gets closed, however good it is.

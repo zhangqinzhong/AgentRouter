@@ -8,6 +8,35 @@
 > Source project: `basicmachines-co/basic-memory` (Python, MCP-native, markdown-on-disk).
 > Studied as inspiration *and* as the manual-write-note model we explicitly
 > diverge from.
+>
+> **Historical snapshot, refreshed 2026-10-18.** Sections 1-8 describe the
+> version originally inspected and preserve file/line evidence from that
+> checkout. They are not a claim about current `main`. The latest stable
+> release is v0.23.2; the project's default branch carries an unreleased
+> v0.24 changelog. Current changes are summarized below.
+
+## 2026-10-18 delta
+
+basic-memory has moved beyond several limitations in the original snapshot.
+Its Claude Code plugin now supports session-start briefings, pre-compaction
+checkpoints, and opt-in capture guidance. Stable releases also include a local
+cross-encoder reranker and a cloud Teams product.
+
+The unreleased v0.24 changelog goes further: optimistic writes with
+`expected_checksum`, native OKF v0.2 export/check with generated `index.md`
+and `log.md`, cross-project search, structured filters (type, date, category,
+metadata, path prefix, and valid time), document extraction with provenance,
+temporal qualifiers, a wiki projection, locked notes, more harness
+integrations, and real-time cloud collaboration. Those items are on `main`,
+not in the latest stable release, so this report does not treat them as
+shipped stable behavior.
+
+The useful new comparisons for ai-memory are structured pre-rank filters and
+optional document ingestion. ai-memory already ships the underlying ideas in
+OKF v0.2, conditional writes, temporal reads, attribution, lifecycle capture,
+and git-markdown truth. A document path should remain an importer companion;
+live cloud co-editing and a hosted personal knowledge base serve a different
+buyer.
 
 ## 1. Purpose & Scope
 
@@ -109,4 +138,10 @@ For agent handoffs, there is no special handshake; basic-memory treats all MCP c
 7. **The Markdown source-of-truth tradeoff.** Filesystem latency, checksum recomputation, FTS5 rebuilds, and circuit-breaker retry tracking (`sync_service.py:179-281`) are a lot of infrastructure just to keep a DB consistent with files. For agent memory where the files exist only because LLMs wrote them, this is overhead with no payoff. Keep the DB as primary and only export Markdown on demand.
 8. **Tool surface is wide (~25 tools).** Agents have to pick among `write_note`/`edit_note`/`move_note`/`delete_note`/`read_note`/`view_note`/`read_content`/`search`/`search_notes`/`build_context`/`recent_activity`/`list_directory`/`list_memory_projects`/`canvas`/`schema_*`. Even with hints, that's a lot of context burned describing tools. Aim for a smaller, more orthogonal set.
 
-**Bottom line**: borrow the *graph + observations + wiki-link* primitives, the *memory:// URI* navigation, the *typed-client + composition-root* layering, the *MCP annotations*, and the *file-as-portable-export* idea, but invert the capture model (ambient, not invoked), add a lifecycle (decay/consolidation/summarization), keep the DB primary, add agent/session provenance, and ship a much narrower MCP tool surface.
+**Original bottom line (historical):** borrow the *graph + observations +
+wiki-link* primitives, the *memory:// URI* navigation, the *typed-client +
+composition-root* layering, the *MCP annotations*, and the
+*file-as-portable-export* idea; invert the capture model, add a lifecycle and
+agent/session provenance, and keep the tool surface narrow. The old suggestion
+to keep the database primary is superseded: ai-memory's established invariant
+is markdown-in-git as source of truth with SQLite as a derived index.

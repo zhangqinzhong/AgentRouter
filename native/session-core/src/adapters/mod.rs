@@ -499,9 +499,11 @@ pub fn create_adapter_roster_for(store: &crate::db::Store) -> AdapterRoster {
     if let Some(config) = store.db_dir().and_then(|dir|dir.parent().map(std::path::Path::to_path_buf)) {
         if let Ok(profiles) = std::fs::read_dir(config.join("profiles")) {
             for profile in profiles.flatten() {
-                for (agent, subdir) in [(AgentId::ClaudeCode,"claude/projects"),(AgentId::Codex,"codex"),(AgentId::Grok,"grok")] {
-                    let root=profile.path().join(subdir);
-                    if root.is_dir() && !customs.contains(&(agent,root.clone())) { customs.push((agent,root)); }
+                for prefix in ["", "custom"] {
+                    for (agent, subdir) in [(AgentId::ClaudeCode,"claude/projects"),(AgentId::Codex,"codex"),(AgentId::Grok,"grok")] {
+                        let root=profile.path().join(prefix).join(subdir);
+                        if root.is_dir() && !customs.contains(&(agent,root.clone())) { customs.push((agent,root)); }
+                    }
                 }
             }
         }

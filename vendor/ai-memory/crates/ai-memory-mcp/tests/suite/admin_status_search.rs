@@ -1,4 +1,5 @@
-//! Integration tests for `GET /admin/status` and `GET /admin/search`.
+//! Integration tests for `GET /admin/status`, `GET /admin/search`, and
+//! `GET /admin/recent`.
 //!
 //! Exercises the read-only admin surface end-to-end through the axum
 //! router: build an `AdminState` over a real on-disk store + wiki,
@@ -888,4 +889,234 @@ async fn search_limit_is_clamped_to_100() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// A listing with no scope (`ai-memory recent --global`) covers every
+/// project and says where each hit lives; a scoped listing is unchanged.
+#[tokio::test]
+async fn global_recent_tags_each_hit_with_its_workspace_and_project() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_admin_state(&tmp).await;
+    seed_page_in(
+        &store,
+        "default",
+        "alpha",
+        "Alpha notes",
+        "notes/alpha.md",
+        "recent notes for alpha",
+    )
+    .await;
+    seed_page_in(
+        &store,
+        "acme",
+        "beta",
+        "Beta notes",
+        "notes/beta.md",
+        "recent notes for beta",
+    )
+    .await;
+    // Re-upsert alpha so it is strictly newer than beta.
+    seed_page_in(
+        &store,
+        "default",
+        "alpha",
+        "Alpha notes",
+        "notes/alpha.md",
+        "recent notes for alpha, revised",
+    )
+    .await;
+    let app = admin_router(state);
+
+    let (status, body) = get(app.clone(), "/admin/recent", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(hits.len(), 2, "both projects appear on a global listing");
+    assert_eq!(hits[0]["path"], "notes/alpha.md");
+    assert_eq!(hits[0]["workspace"], "default");
+    assert_eq!(hits[0]["project"], "alpha");
+    assert_eq!(hits[1]["path"], "notes/beta.md");
+    assert_eq!(hits[1]["workspace"], "acme");
+    assert_eq!(hits[1]["project"], "beta");
+    for hit in &hits {
+        assert!(hit["id"].is_string(), "recent hits keep their id: {hit}");
+        assert!(hit["title"].is_string() && hit["snippet"].is_string());
+        hit["updated_at"]
+            .as_str()
+            .expect("updated_at is a string")
+            .parse::<jiff::Timestamp>()
+            .expect("updated_at is RFC 3339");
+        assert!(hit.get("rank").is_none(), "recent does not leak FTS rank");
+    }
+
+    let (status, body) = get(app, "/admin/recent?workspace=acme&project=beta", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(hits.len(), 1, "a scoped listing stays in its project");
+    assert_eq!(hits[0]["path"], "notes/beta.md");
+    assert!(hits[0].get("workspace").is_none() && hits[0].get("project").is_none());
+}
+
+/// The global listing reads every project as the operator, so it must stay
+/// behind the root-only admin gate once the deployment distinguishes
+/// operators: a DB user or proxy-asserted user who could reach it would read a
+/// restricted project they hold no grant on. Root (the control) still sees it.
+#[tokio::test]
+async fn global_recent_never_reaches_a_non_root_caller() {
+    for trusted_proxy in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let (mut state, store) = make_admin_state(&tmp).await;
+        state.trusted_proxy_identity = trusted_proxy;
+        seed_page_in(
+            &store,
+            "default",
+            "open",
+            "Open notes",
+            "notes/open.md",
+            "recent open notes",
+        )
+        .await;
+        let secret = seed_page_in(
+            &store,
+            "default",
+            "secret",
+            "Secret notes",
+            "notes/secret-sentinel.md",
+            "recent restricted notes",
+        )
+        .await;
+        store
+            .writer
+            .set_access_mode(secret, AccessMode::Restricted)
+            .await
+            .unwrap();
+        if !trusted_proxy {
+            store
+                .writer
+                .create_human_user(
+                    NewUser {
+                        username: "alice".into(),
+                        name: None,
+                        email: None,
+                    },
+                    ai_memory_core::UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let app = admin_router(state).layer(axum::middleware::from_fn(
+            |mut request: Request<Body>, next: axum::middleware::Next| async move {
+                let level = match request
+                    .headers()
+                    .get("x-level")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some("root") => AuthLevel::Root,
+                    Some("user") => AuthLevel::User,
+                    _ => AuthLevel::Anonymous,
+                };
+                request.extensions_mut().insert(level);
+                request.extensions_mut().insert(ActorContext::anonymous());
+                next.run(request).await
+            },
+        ));
+
+        for (level, expected) in [
+            (Some("user"), StatusCode::FORBIDDEN),
+            (None, StatusCode::UNAUTHORIZED),
+        ] {
+            let (status, body) = get(app.clone(), "/admin/recent", level).await;
+            assert_eq!(status, expected, "proxy={trusted_proxy} level={level:?}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("secret-sentinel") && !body.contains("restricted notes"),
+                "proxy={trusted_proxy} level={level:?} leaked a hit: {body}"
+            );
+        }
+
+        let (status, body) = get(app, "/admin/recent", Some("root")).await;
+        assert_eq!(status, StatusCode::OK, "proxy={trusted_proxy}");
+        let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let mut projects: Vec<&str> = hits
+            .iter()
+            .map(|hit| hit["project"].as_str().unwrap())
+            .collect();
+        projects.sort_unstable();
+        assert_eq!(projects, ["open", "secret"], "proxy={trusted_proxy}");
+    }
+}
+
+#[tokio::test]
+async fn recent_with_empty_results_returns_empty_array() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_admin_state(&tmp).await;
+    let app = admin_router(state);
+
+    let (status, body) = get(app, "/admin/recent", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(hits.is_empty());
+}
+
+#[tokio::test]
+async fn recent_rejects_partial_scope_instead_of_global_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_admin_state(&tmp).await;
+    seed_page(
+        &store,
+        "Secret notes",
+        "notes/secret-sentinel.md",
+        "must not leak through a partial scope",
+    )
+    .await;
+    let app = admin_router(state);
+
+    let (status, body) = get(app, "/admin/recent?workspace=default", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("workspace and project must be provided together"),
+        "unexpected error body: {body}"
+    );
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("secret-sentinel"),
+        "partial scope must not leak a hit: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn recent_unknown_scope_is_404_and_does_not_leak_other_projects() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_admin_state(&tmp).await;
+    seed_page(
+        &store,
+        "Secret notes",
+        "notes/secret-sentinel.md",
+        "must not leak through an unknown project",
+    )
+    .await;
+    let app = admin_router(state);
+
+    let (status, body) = get(app, "/admin/recent?workspace=default&project=missing", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let rendered = String::from_utf8_lossy(&body);
+    assert!(
+        !rendered.contains("secret-sentinel"),
+        "unknown scope must not leak a hit: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn recent_limit_is_clamped_to_100() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_admin_state(&tmp).await;
+    let app = admin_router(state);
+
+    let (status, _) = get(app, "/admin/recent?limit=9999999", None).await;
+    assert_eq!(status, StatusCode::OK);
 }

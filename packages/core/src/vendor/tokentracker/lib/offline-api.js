@@ -1376,7 +1376,8 @@ if (p === "/functions/tokentracker-session-insights") {
         const { buildSessionAnalytics, summarizeSessions } = require("./session-analytics");
         const sessions = await buildSessionAnalytics({ home, force: refresh });
         const includeSessions = ["1", "true"].includes(url.searchParams.get("include_sessions"));
-        const result = summarizeSessions(sessions, { from, to, includeSessions });
+        const timeZone = url.searchParams.get("tz") || url.searchParams.get("timeZone") || undefined;
+        const result = summarizeSessions(sessions, { from, to, includeSessions, timeZone });
         json(res, { from, to, ...result });
       } catch (error) {
         json(res, { available: false, error: error?.message || "Session analytics failed" }, 500);
@@ -1389,11 +1390,13 @@ if (p === "/functions/tokentracker-sessions") {
       const refresh = ["1", "true"].includes(url.searchParams.get("refresh"));
       const limitParam = parseInt(url.searchParams.get("limit") || "0", 10);
       const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 2000) : 0;
+      // 分桶按调用方时区判定日期：缺了它，跨零点的会话会被算到 UTC 的前一天
+      const timeZone = url.searchParams.get("tz") || url.searchParams.get("timeZone") || undefined;
       const home = path.resolve(qp, "..", "..", "..");
       try {
         const { buildSessionAnalytics, listSessionsForBrowser } = require("./session-analytics");
         const sessions = await buildSessionAnalytics({ home, force: refresh });
-        const result = listSessionsForBrowser(sessions, { from, to, limit });
+        const result = listSessionsForBrowser(sessions, { from, to, limit, timeZone });
         json(res, { from, to, ...result });
       } catch (error) {
         console.warn("[local-api] session browser failed:", error?.message || error);

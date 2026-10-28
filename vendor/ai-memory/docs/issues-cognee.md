@@ -1,5 +1,11 @@
 # cognee - Issue & PR Pain-Point Synthesis
 
+> **Historical snapshot (2026-05-21).** This file is retained because the
+> architecture cites these concrete failure modes; issue states and version
+> claims below are not current product guidance. See
+> [`research-2026-landscape.md`](research-2026-landscape.md) for the latest
+> reviewed competitor state.
+>
 > Source: GitHub `topoteretes/cognee`. Captured 2026-05-21.
 > Tracker character: ~40% feature requests (high comment counts), ~40% bugs
 > closed fast by next release, ~20% truly hard still-open bugs at architectural seams.

@@ -188,20 +188,70 @@ struct AutoSessionCandidate {
 #[derive(Debug, Default)]
 struct HeartbeatHealth {
     consecutive_failures: u64,
+    last_failure_kind: Option<HeartbeatFailureKind>,
+    /// Set while the harness owns the terminal: a line written to stderr then
+    /// lands inside its TUI (the prompt box, mid-render), so notices are held
+    /// until the harness exits.
+    defer_notices: bool,
+    first_deferred: Option<String>,
+    last_deferred: Option<String>,
+    deferred_count: u64,
 }
 
 impl HeartbeatHealth {
-    fn record_failure(&mut self) -> bool {
-        let first = self.consecutive_failures == 0;
+    fn deferring() -> Self {
+        Self {
+            defer_notices: true,
+            ..Self::default()
+        }
+    }
+
+    fn notify(&mut self, notice: String) {
+        if !self.defer_notices {
+            eprintln!("{notice}");
+            return;
+        }
+        self.deferred_count = self.deferred_count.saturating_add(1);
+        if self.first_deferred.is_none() {
+            self.first_deferred = Some(notice);
+        } else {
+            self.last_deferred = Some(notice);
+        }
+    }
+
+    /// The held notices, bounded to the first and the latest so a server that
+    /// flapped all day does not replay hundreds of lines.
+    fn into_deferred(self) -> Vec<String> {
+        let mut lines: Vec<String> = self.first_deferred.into_iter().collect();
+        let skipped = self.deferred_count.saturating_sub(2);
+        if skipped > 0 {
+            lines.push(format!(
+                "ai-memory: ({skipped} more managed workstream notices while the harness ran)"
+            ));
+        }
+        lines.extend(self.last_deferred);
+        lines
+    }
+
+    fn record_failure(&mut self, kind: HeartbeatFailureKind) -> bool {
+        let changed = self.last_failure_kind != Some(kind);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        first
+        self.last_failure_kind = Some(kind);
+        changed
     }
 
     fn record_success(&mut self) -> bool {
         let recovered = self.consecutive_failures > 0;
         self.consecutive_failures = 0;
+        self.last_failure_kind = None;
         recovered
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatFailureKind {
+    Unreachable,
+    Rejected,
 }
 
 fn resolve_opencode_for_launch(
@@ -1196,6 +1246,8 @@ async fn run_once_with_wiring(
             ));
         }
     };
+    // The harness owns the terminal from here until it exits.
+    let mut heartbeat_health = HeartbeatHealth::deferring();
     if (harness == ManagedHarness::Crush || grok_context.is_some())
         && let Err(error) = post_empty_with_retry(
             &endpoint,
@@ -1204,19 +1256,18 @@ async fn run_once_with_wiring(
         )
         .await
     {
-        eprintln!(
+        heartbeat_health.notify(format!(
             "ai-memory: {error}; the context may be delivered again on the next {} run",
             harness.as_str()
-        );
+        ));
     }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
-    let mut heartbeat_health = HeartbeatHealth::default();
-    let status = loop {
+    let waited = loop {
         tokio::select! {
-            result = child.wait() => break acquired_try!(result.context("waiting for managed harness")),
+            result = child.wait() => break result,
             _ = heartbeat.tick() => {
                 let _ = send_managed_heartbeat(
                     &endpoint,
@@ -1226,6 +1277,10 @@ async fn run_once_with_wiring(
             }
         }
     };
+    for notice in heartbeat_health.into_deferred() {
+        eprintln!("{notice}");
+    }
+    let status = acquired_try!(waited.context("waiting for managed harness"));
     let exit_code = status.code().unwrap_or(1);
 
     let server_status = if plan.mode == LaunchMode::Session {
@@ -2088,13 +2143,21 @@ async fn capture_interrupts(interrupted: CancellationToken) {
 /// finished, cancelled, or expired by a later prepare. Reporting it as an
 /// outage sends the operator looking for a server that never went away.
 fn heartbeat_failure_notice(error: &anyhow::Error) -> String {
+    if heartbeat_failure_kind(error) == HeartbeatFailureKind::Rejected {
+        format!("ai-memory: managed workstream heartbeat rejected: {error:#}; retrying quietly")
+    } else {
+        "ai-memory: server unavailable; managed workstream heartbeat will retry quietly".to_string()
+    }
+}
+
+fn heartbeat_failure_kind(error: &anyhow::Error) -> HeartbeatFailureKind {
     if error
         .chain()
         .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some())
     {
-        format!("ai-memory: managed workstream heartbeat rejected: {error:#}; retrying quietly")
+        HeartbeatFailureKind::Rejected
     } else {
-        "ai-memory: server unavailable; managed workstream heartbeat will retry quietly".to_string()
+        HeartbeatFailureKind::Unreachable
     }
 }
 
@@ -2119,14 +2182,15 @@ async fn send_managed_heartbeat_with_timeout(
         .and_then(|result| result);
     match &result {
         Ok(()) if health.record_success() => {
-            eprintln!(
+            health.notify(
                 "ai-memory: server connection restored; managed workstream heartbeat resumed"
+                    .to_string(),
             );
         }
         Ok(()) => {}
-        Err(error) if health.record_failure() => {
+        Err(error) if health.record_failure(heartbeat_failure_kind(error)) => {
             tracing::debug!(error = %error, "managed workstream heartbeat became unavailable");
-            eprintln!("{}", heartbeat_failure_notice(error));
+            health.notify(heartbeat_failure_notice(error));
         }
         Err(_) => {}
     }
@@ -3437,10 +3501,24 @@ fn ensure_executable_available(
         return Ok(());
     }
     Err(anyhow!(
-        "managed {} executable `{}` was not found in the host PATH; install it or pass `--executable`. Docker users should run `ai-memory upgrade` to refresh the host wrapper",
+        "managed {} executable `{}` was not found in the host PATH; install it or pass `--executable`. {}",
         harness.as_str(),
-        program.to_string_lossy()
+        program.to_string_lossy(),
+        docker_host_client_hint(),
     ))
+}
+
+/// The Docker-wrapper advice appended to a missing-harness error, split by OS
+/// because the two wrappers upgrade differently (#1545): the POSIX wrapper's
+/// `upgrade` re-downloads its checksum-verified native host client, while the
+/// PowerShell wrapper's `upgrade` only pulls the image, so a Windows Docker
+/// user needs the native client's installer instead.
+fn docker_host_client_hint() -> &'static str {
+    if cfg!(windows) {
+        "Docker Desktop users: managed launches run through the native Windows client, not the container; install it with `irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex` (docs/windows.md)"
+    } else {
+        "Docker users should run `ai-memory upgrade` to refresh the host wrapper"
+    }
 }
 
 /// Whether this harness's default executable resolves through `PATH`.
@@ -4531,6 +4609,7 @@ pub(crate) fn harness_from_journal_name(name: &str) -> Option<ManagedHarness> {
         "kiro-v3" => Some(ManagedHarness::KiroV3),
         "grok" => Some(ManagedHarness::Grok),
         "antigravity" => Some(ManagedHarness::Antigravity),
+        "copilot" => Some(ManagedHarness::Copilot),
         _ => None,
     }
 }
@@ -4556,6 +4635,65 @@ mod tests {
 
     fn plan(warn: bool, mode: JailMode) -> JailPlan {
         JailPlan { warn, mode }
+    }
+
+    /// Every harness a journal entry can name.
+    const EVERY_MANAGED_HARNESS: &[ManagedHarness] = &[
+        ManagedHarness::Claude,
+        ManagedHarness::Codex,
+        ManagedHarness::OpenCode,
+        ManagedHarness::OpenCode2,
+        ManagedHarness::Pi,
+        ManagedHarness::Crush,
+        ManagedHarness::Omp,
+        ManagedHarness::Kimi,
+        ManagedHarness::CommandCode,
+        ManagedHarness::Kiro,
+        ManagedHarness::KiroV3,
+        ManagedHarness::Grok,
+        ManagedHarness::Antigravity,
+        ManagedHarness::Copilot,
+    ];
+
+    /// The exact spelling `append_journal_entry` records for each harness,
+    /// pinned here so a rename cannot silently orphan existing journals. This
+    /// match is also the compile-time lever: a new `ManagedHarness` variant
+    /// fails to build until it is given a journal name and listed in
+    /// `EVERY_MANAGED_HARNESS` above, which drags it into the round trip.
+    const fn journal_name(harness: ManagedHarness) -> &'static str {
+        match harness {
+            ManagedHarness::Claude => "claude",
+            ManagedHarness::Codex => "codex",
+            ManagedHarness::OpenCode => "opencode",
+            ManagedHarness::OpenCode2 => "opencode2",
+            ManagedHarness::Pi => "pi",
+            ManagedHarness::Crush => "crush",
+            ManagedHarness::Omp => "omp",
+            ManagedHarness::Kimi => "kimi",
+            ManagedHarness::CommandCode => "command-code",
+            ManagedHarness::Kiro => "kiro",
+            ManagedHarness::KiroV3 => "kiro-v3",
+            ManagedHarness::Grok => "grok",
+            ManagedHarness::Antigravity => "antigravity",
+            ManagedHarness::Copilot => "copilot",
+        }
+    }
+
+    #[test]
+    fn the_journal_round_trips_every_managed_harness_name() {
+        for &harness in EVERY_MANAGED_HARNESS {
+            let name = journal_name(harness);
+            assert_eq!(
+                harness.as_str(),
+                name,
+                "{harness:?} no longer writes {name:?} into the recovery journal"
+            );
+            assert_eq!(
+                harness_from_journal_name(name),
+                Some(harness),
+                "the recovery journal writes {name:?} for {harness:?} but cannot parse it back"
+            );
+        }
     }
 
     #[test]
@@ -5814,12 +5952,44 @@ mod tests {
     fn heartbeat_health_reports_each_outage_and_recovery_once() {
         let mut health = HeartbeatHealth::default();
 
-        assert!(health.record_failure());
-        assert!(!health.record_failure());
-        assert!(!health.record_failure());
+        assert!(health.record_failure(HeartbeatFailureKind::Unreachable));
+        assert!(!health.record_failure(HeartbeatFailureKind::Unreachable));
+        assert!(health.record_failure(HeartbeatFailureKind::Rejected));
+        assert!(!health.record_failure(HeartbeatFailureKind::Rejected));
         assert!(health.record_success());
         assert!(!health.record_success());
-        assert!(health.record_failure());
+        assert!(health.record_failure(HeartbeatFailureKind::Unreachable));
+    }
+
+    #[test]
+    fn deferred_heartbeat_notices_wait_for_the_harness_to_exit() {
+        assert!(HeartbeatHealth::deferring().into_deferred().is_empty());
+
+        let mut health = HeartbeatHealth::deferring();
+        health.notify("outage 1".to_string());
+        health.notify("restored 1".to_string());
+        health.notify("outage 2".to_string());
+        health.notify("restored 2".to_string());
+
+        assert_eq!(
+            health.into_deferred(),
+            [
+                "outage 1".to_string(),
+                "ai-memory: (2 more managed workstream notices while the harness ran)".to_string(),
+                "restored 2".to_string(),
+            ]
+        );
+
+        let mut health = HeartbeatHealth::deferring();
+        health.notify("outage".to_string());
+        assert_eq!(health.into_deferred(), ["outage".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_notices_print_immediately_when_nothing_owns_the_terminal() {
+        let mut health = HeartbeatHealth::default();
+        health.notify("outage".to_string());
+        assert!(health.into_deferred().is_empty());
     }
 
     #[tokio::test]
@@ -8134,6 +8304,52 @@ mod tests {
         .unwrap();
         assert!(orphaned.is_none());
         assert_eq!(explicit.expected_session_id.as_deref(), Some("chosen"));
+    }
+
+    /// Codex compresses a rollout idle for a week to `.jsonl.zst`. The launch
+    /// still resumes that linked session instead of treating it as missing.
+    #[test]
+    fn compressed_codex_rollout_is_resumed_not_orphaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let day = temp.path().join(".codex/sessions/2026/10/05");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&day).unwrap();
+        let id = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e5";
+        let record = serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}});
+        let compressed = day.join(format!("rollout-2026-10-05T20-43-00-{id}.jsonl.zst"));
+        std::fs::write(
+            &compressed,
+            ruzstd::encoding::compress_to_vec(
+                format!("{record}\n").as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        let env = EffectiveChildEnv::default();
+        let plan = || {
+            build_preflighted_launch_plan(
+                ManagedHarness::Codex,
+                None,
+                Vec::new(),
+                Some(id),
+                false,
+                temp.path(),
+                &cwd,
+                &env,
+            )
+            .unwrap()
+        };
+
+        let (resumed, orphaned) = plan();
+        assert!(orphaned.is_none());
+        assert!(resumed.args.iter().any(|arg| arg == "resume"));
+        assert_eq!(resumed.expected_session_id.as_deref(), Some(id));
+
+        std::fs::remove_file(&compressed).unwrap();
+        let (fresh, orphaned) = plan();
+        assert_eq!(orphaned.as_deref(), Some(id));
+        assert!(!fresh.args.iter().any(|arg| arg == "resume"));
     }
 
     /// A linked session missing from this launch's store is only replaced

@@ -23,9 +23,9 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::error::LlmResult;
-use crate::provider::{LlmProvider, complete_structured};
+use crate::provider::{LlmProvider, complete_structured_with_operation_id};
 use crate::text::truncate_with_ellipsis;
-use crate::types::{ChatMessage, ChatRequest, Role};
+use crate::types::{ChatMessage, ChatRequest, LlmOperationId, LlmWorkload, Role};
 
 /// One candidate handed to a reranker.
 #[derive(Debug, Clone)]
@@ -203,7 +203,12 @@ impl Reranker for LlmReranker {
             max_tokens: 4_000,
             temperature: Some(0.0),
         };
-        let response: LlmRerankResponse = complete_structured(&*self.provider, request).await?;
+        let response: LlmRerankResponse = complete_structured_with_operation_id(
+            &*self.provider,
+            request,
+            LlmOperationId::for_workload(LlmWorkload::Rerank),
+        )
+        .await?;
         Ok(map_judgements(&response.scores, candidates))
     }
 }
@@ -599,6 +604,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingProvider {
         request: std::sync::Mutex<Option<ChatRequest>>,
+        operation_id: std::sync::Mutex<Option<LlmOperationId>>,
     }
 
     #[async_trait]
@@ -634,6 +640,16 @@ mod tests {
                     .collect::<Vec<_>>()
             }))
         }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<serde_json::Value> {
+            *self.operation_id.lock().unwrap() = Some(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
     }
 
     #[tokio::test]
@@ -663,6 +679,10 @@ mod tests {
         assert_eq!(input["candidates"][0]["candidate"], 1);
         assert_eq!(input["candidates"][0]["title"], candidates[0].title);
         assert_eq!(input["candidates"][0]["text"], candidates[0].snippet);
+        assert_eq!(
+            provider.operation_id.lock().unwrap().unwrap().workload(),
+            LlmWorkload::Rerank
+        );
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ import type {
   ApiPage,
   ApiSearchHit,
   Briefing,
+  SessionActivity,
   Handoff,
   Message,
   Observation,
@@ -230,6 +231,22 @@ export function briefing(value: unknown, where: string): Briefing {
     rules: list(o, "rules", where, pageSummary),
     slots: list(o, "slots", where, pageSummary),
     recentPages: requiredList(o, "recent_pages", where, pageSummary),
+    recentSessions: list(o, "recent_sessions", where, sessionActivity),
+    raw: o,
+  };
+}
+
+/** A `SessionActivity` row: one session's newest captured work. */
+export function sessionActivity(value: unknown, where: string): SessionActivity {
+  const o = record(value, where);
+  return {
+    sessionId: str(o, "session_id", where),
+    agentKind: str(o, "agent_kind", where),
+    cwd: optStr(o, "cwd", where),
+    lastActivityAt: str(o, "last_activity_at", where),
+    ended: bool(o, "ended", where),
+    handedOff: flag(o, "handed_off"),
+    current: flag(o, "current"),
     raw: o,
   };
 }

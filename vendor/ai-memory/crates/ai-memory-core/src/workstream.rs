@@ -497,6 +497,28 @@ pub struct WorkstreamEvent {
     pub occurred_at: Option<String>,
 }
 
+impl WorkstreamEvent {
+    /// Label for this event when rendered as historical evidence.
+    ///
+    /// Adapters set `role` on tool events too, so a role-first label makes a
+    /// past tool call read like an assistant action still to run. The kind
+    /// therefore wins for completed evidence, and the role only labels the
+    /// kinds where it carries the author.
+    #[must_use]
+    pub fn display_label(&self) -> &str {
+        match self.kind {
+            WorkstreamEventKind::ToolCall => "historical tool call (completed evidence)",
+            WorkstreamEventKind::ToolResult => "historical tool result (completed evidence)",
+            WorkstreamEventKind::Checkpoint => {
+                self.role.as_deref().unwrap_or("repository checkpoint")
+            }
+            WorkstreamEventKind::Compaction => self.role.as_deref().unwrap_or("native compaction"),
+            WorkstreamEventKind::Annotation => self.role.as_deref().unwrap_or("import note"),
+            WorkstreamEventKind::Message => self.role.as_deref().unwrap_or("message"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

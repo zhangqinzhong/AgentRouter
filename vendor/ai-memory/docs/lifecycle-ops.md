@@ -24,7 +24,7 @@ on a homelab box where mistakes are harder to undo.
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
 | MCP `memory_restore_page` | ✅ yes | no (writes a new current version; the replaced one stays reachable) | yes (restore another checkpoint) | Lists a page's checkpoints, or writes one back through the `memory_write_page` path. Admin only, like `restore-page`. See [below](#mcp-memory_restore_page). |
 | `backup-agents --to` / `restore-agents --from <tarball>` | ✅ yes (client-side; never touches the server or its data dir) | no | yes (`restore-agents --apply` keeps timestamped copies of overwritten files) | Agent-config assets, not wiki/db: MCP configs (redacted unless `--include-secrets`), hook configs, instructions, skills, plugins. `restore-agents` is a dry run by default; `--apply` writes to disk and `--force` overwrites existing or differing targets. Non-MCP assets are restored verbatim and may contain secrets, so only `--apply` an archive whose source you trust. |
-| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. |
+| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. Keeps an existing `config.toml` and saves the backup's as `config.toml.from-backup` unless `--with-config` is passed. |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
 
@@ -33,15 +33,27 @@ on a homelab box where mistakes are harder to undo.
 whose name is ambiguous: an empty legacy twin row left by an older migration
 can carry another project's old name, and the name lookup refuses it.
 `list-projects` prints each project's id. The id is looked up inside the
-workspace the command names. Sending both the name and the id, or neither, is
-a `400`, so is a malformed UUID, and an id that names no project in that
-workspace is a `404`. `--confirm`, the preview and every other guard behave
-the same as with a name.
+workspace the command names. On the admin endpoints, sending both the name and
+the id, or neither, is a `400`, so is a malformed UUID, and an id that names no
+project in that workspace is a `404`. The CLI refuses both flags together before
+sending anything, and with neither it resolves the project the way other
+commands do: the `.ai-memory.toml` marker's `project`, then the git remote, then
+the directory name. `--confirm`, the preview and every other guard behave the
+same as with a name.
+
+That derived target is a deprecation, not a promise: `purge-project --confirm`
+without `--project`/`--project-id` prints the project it resolved and the
+command that names it, and it will be refused in 4.0, because the one thing a
+purge must not do is guess between "the checkout I am standing in" and "the
+project I meant" (#1642). An explicitly empty flag is already refused: `--project
+""` used to pass the "was it named" check and then resolve as if it had not been
+passed, which is how an unset variable in a script reached a real delete.
 
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See
-[CLAUDE.md §16](../CLAUDE.md) for the invariant.
+[AGENTS.md, invariant 9](../AGENTS.md#cross-cutting-invariants-do-not-violate)
+for the live-process guard.
 
 
 ## What "deleted" means (`purge-session`, `purge-project`, `delete-workspace`)
@@ -614,11 +626,18 @@ destination promotes its legacy name first, the response includes
 `manifest_warning` when that committed promotion's manifest refresh/checkpoint
 fails; the CLI prints it.
 
-**What does NOT migrate (merge case only):** in the `copy-purge` path the
-source's `sessions`, `observations`, and `handoffs` (the raw episodic
-capture log) are dropped by the purge, and the moved pages start a fresh
-supersession chain (the real page history lives in the wiki's git
-mirror). The `true-move` path has no such loss.
+**What does NOT migrate (merge case only):** the `copy-purge` path copies
+only the source's latest pages and their embeddings. The purge then drops
+everything else the source project owns, the same set `purge-project`
+deletes: its `sessions`, `observations`, and `handoffs` (the raw episodic
+capture log), its managed workstreams with their native sessions, runs,
+events and `raw/workstreams/` segments, the cross-project messages it sent
+or received, auto-improvement and profile-harvest state, session-consolidation
+jobs, ingest deduplication keys, entities, page feedback, per-session purge tombstones and
+project grants. The moved pages start a fresh supersession chain (the real
+page history lives in the wiki's git mirror). The append-only audit trail
+remains, with references to the removed source ids. The `true-move` path has
+no such loss.
 
 > **Operational caveat: moving the project the current session writes
 > to.** Lifecycle hooks stamp a bounded observation on every supported tool-lifecycle event into the
@@ -1120,13 +1139,54 @@ What happens on the server:
 
 1. SQLite online-backup API copies the live WAL DB to a temp file,
    a guaranteed consistent snapshot without stopping the writer.
-2. Server tar-gzips the snapshot + the wiki tree + `config.toml`.
+2. Server tar-gzips the snapshot + the wiki tree + `<data_dir>/config.toml`
+   when that file exists.
 3. Response body IS the gzipped tarball
    (`Content-Type: application/gzip`).
 
 CLI writes the response body to `--to`. For a homelab user
 this is the standard "snapshot before doing something dangerous"
 move: `ai-memory backup` first, then proceed.
+
+This tarball is an online **data snapshot**, not a complete host image. It
+intentionally excludes `auth-tokens/`, the hook-side `auth-token` and
+`auth-header` files, `raw/`, logs, models, and a config passed from outside the
+data dir with `--config`. The included `<data_dir>/config.toml` is archived
+verbatim and may itself contain inline root/proxy/recovery credentials, the
+API-key pepper, or sensitive LLM headers. Always protect the snapshot as a
+secret-bearing artifact. It is also code-bearing: a config can name commands
+the server runs (`[auto_improve.eval]`), send consolidated memory to another
+host (LLM provider URLs and headers, admission webhooks) and weaken redaction
+(`[sanitize]`), so `restore` adopts it only when asked (see below). Excluding
+the separate credential files limits the
+copied auth material; omitting `raw/` avoids racing the actively appended
+managed-workstream ledger. The SQLite snapshot still contains the searchable
+managed-workstream events, but loses their immutable source copy.
+
+For a move to another host, carry these beside the snapshot through a
+separately encrypted or otherwise access-controlled backup:
+
+- the config file the service actually loads, especially
+  `[auth].token_pepper`; packaged systemd units keep it outside the data dir;
+- `auth-tokens/` if existing root bearers must keep working (otherwise run
+  `ai-memory auth enable` and rewire clients with the replacement);
+- `raw/` when the immutable managed-workstream source ledger must be retained.
+
+Do not copy hook credential files as the destination's wiring. Run
+`install-hooks --apply` and `install-mcp --apply` there so paths, server URLs,
+and credentials match the new host. Treat both the ordinary snapshot and the
+separate material as sensitive: wiki content and SQLite can contain private
+session data even though the archive excludes bearer files.
+
+Current databases carry an Argon2id verifier for the API-key pepper. If a
+restored database contains native API credentials but the destination loads a
+different pepper, `serve` refuses instead of starting with keys that can never
+authenticate. A database first opened by a version that predates this verifier
+cannot prove which pepper created its existing hashes; for those older
+snapshots, restoring the original external config remains mandatory. Restore
+refuses such a database until the operator supplies that original pepper and
+adds `--accept-legacy-api-key-pepper`, which seals a verifier into the staged
+database before the live data is changed.
 
 Restoring a backup follows the inverse:
 
@@ -1146,7 +1206,7 @@ HTTP admin API).
 ### `restore`
 
 ```bash
-ai-memory restore --from <tarball> --data-dir <path> --force
+ai-memory restore --from <tarball> --data-dir <path> --force [--with-config]
 ```
 
 Direct-disk operation. Refuses if any other `ai-memory` process is
@@ -1158,12 +1218,24 @@ Order of operations:
 2. Extract the tarball into a staging directory beside the live data
    (`<data_dir>/.restore-staging-<stamp>/`), validating every entry.
 3. Open the staged store so pending migrations run and the SQLite
-   snapshot is verified, still without touching the live data.
-4. Swap: rename the live `wiki/` and `db/` (and `config.toml`, when the
-   archive carries one) aside, rename the staged copies into place, then
-   delete the previous data. Each move is a same-filesystem rename; if
-   one fails, the moves already made are reversed.
-5. Print a one-line summary.
+   snapshot is verified, still without touching the live data. A legacy
+   database with API keys but no pepper verifier stops here unless the original
+   pepper is configured and `--accept-legacy-api-key-pepper` was passed. When
+   the live config is being kept (step 4) and the database holds API keys, the
+   configured pepper must match the one the keys were hashed with, or the
+   restore stops here too.
+4. Swap: rename the live `wiki/` and `db/` aside, rename the staged copies
+   into place, then delete the previous data. Each move is a same-filesystem
+   rename; if one fails, the moves already made are reversed. The archive's
+   `config.toml`, when it carries one, replaces the live config only with
+   `--with-config` or when the data dir has none. Otherwise the live config
+   stays and the archived one is saved as `<data_dir>/config.toml.from-backup`
+   (`0600` on Unix), replacing an earlier copy there.
+5. Print a summary, including where the backup's config went.
+
+A backup's `config.toml` can run commands and redirect data. Restore it, with
+`--with-config` or by adopting `config.toml.from-backup`, only from an archive
+you trust; review it first otherwise.
 
 The live data is therefore untouched until the archive has proven usable.
 A restore that fails in steps 2–3 leaves `wiki/` and `db/` exactly as they
@@ -1180,6 +1252,18 @@ Failure modes:
   a snapshot the current binary cannot open** (for example a backup taken
   by a newer release) → exits with the error; the existing `wiki/` and
   `db/` are left as they were.
+- **Migration history has a gap** → an earlier migration is unrecorded
+  although a later one was applied. The staged store is refused, just as at
+  normal startup. Keep the backup and report the history for review;
+  `--force` does not bypass this check or repair the missing migration.
+- **The live config's pepper does not match the backup's API keys** (live
+  config kept) → rerun with `--with-config` to restore the backup's config, or
+  set the live `[auth].token_pepper` to the original. The live data is left as
+  it was.
+- **Legacy backup has API keys but no pepper verifier** → restore the original
+  `[auth].token_pepper` through the current config/environment and rerun with
+  `--accept-legacy-api-key-pepper`. This flag confirms provenance; it cannot
+  determine whether an unknown pepper is correct.
 - **A rename in the swap fails and cannot be reversed** → exits with an
   `INCONSISTENT STATE` message naming the
   `<data_dir>/.restore-previous-<stamp>/` directory that still holds the
@@ -1314,6 +1398,42 @@ ai-memory move-session <session-id> --to my-project --confirm
 ai-memory move-session --from-project tmp --to my-project --confirm
 ai-memory purge-project --project tmp --confirm
 ```
+
+### Wiki git history unreadable after a crash
+
+Every repository handle the server opens carries `core.fsyncObjectFiles = true`
+from `wiki/.git/ai-memory.gitconfig`, a file the git CLI never reads, so libgit2
+syncs each object and ref before renaming it into place while `git status` in
+the wiki stays free of git's deprecation warning for that key. Setting
+`core.fsyncObjectFiles = false` in `wiki/.git/config` turns it off.
+Before that, a power loss or kernel crash could keep a ref update while the
+objects it names were never written: zero-length files under `.git/objects`,
+`HEAD` pointing at one of them, and every later checkpoint failing with
+`failed to parse loose object: invalid header`. The pages on disk are not
+affected; only their history stops. At startup the server logs an `ERROR`
+("wiki git history is unreadable") when `HEAD` does not resolve to a readable
+commit.
+
+The working tree is the source of truth, so repair points the branch back at
+the newest intact commit and lets the next checkpoint record everything since.
+Stop the server first, then from `<data_dir>/wiki`:
+
+```bash
+git fsck --full                        # names the empty objects and the bad ref
+mkdir -p ../wiki-empty-objects         # move them out, don't delete them
+find .git/objects -type f -empty -exec mv {} ../wiki-empty-objects/ \;
+# Newest reflog entry whose commit and tree still read back:
+for oid in $(awk '{print $2}' .git/logs/HEAD | tac); do
+  git cat-file -e "$oid^{tree}" 2>/dev/null && echo "$oid" && break
+done
+git update-ref refs/heads/main <oid>   # the branch `git symbolic-ref HEAD` names
+rm .git/index && git reset -q          # rebuild the index; pages are untouched
+git reflog expire --stale-fix --expire=never --all
+git fsck --full                        # clean (a dangling blob is harmless)
+```
+
+Start the server again; the next checkpoint commits the pages written after
+that commit.
 
 ## Why this matters: the flat-wiki incident
 

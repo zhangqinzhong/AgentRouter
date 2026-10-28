@@ -12,7 +12,7 @@ import { closeSync, openSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 export interface ServerOptions {
   /** Mount `/api/v1` (`--enable-api`). Default true. */
@@ -38,7 +38,12 @@ export interface ServerHandle {
   stop(): Promise<void>;
 }
 
-/** The binary under test, from `AI_MEMORY_BIN`. */
+/**
+ * The binary under test, from `AI_MEMORY_BIN`. A relative path is resolved
+ * against the directory the tests run from: the server is spawned with its
+ * own temporary `cwd`, where `../../target/debug/ai-memory` would not exist,
+ * and a failed spawn never emits the `exit` the harness waits on.
+ */
 export function serverBinary(): string {
   const bin = process.env["AI_MEMORY_BIN"];
   if (bin === undefined || bin === "") {
@@ -46,7 +51,7 @@ export function serverBinary(): string {
       "AI_MEMORY_BIN must name a built ai-memory binary (cargo build --bin ai-memory)",
     );
   }
-  return bin;
+  return resolve(bin);
 }
 
 async function freePort(): Promise<number> {

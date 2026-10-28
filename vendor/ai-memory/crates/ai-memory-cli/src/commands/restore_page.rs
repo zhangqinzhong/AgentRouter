@@ -59,7 +59,7 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
         workspace,
         project,
         resp.restored_from,
-        &resp.page_id[..resp.page_id.len().min(8)]
+        super::write_page::short_page_id(&resp.page_id)
     );
     if let Some(pre) = resp.pre_checkpoint {
         println!("pre-restore checkpoint: {pre}");

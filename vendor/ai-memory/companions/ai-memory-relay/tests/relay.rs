@@ -407,6 +407,26 @@ fn a_reopened_queue_recognizes_an_acknowledged_event() {
 }
 
 #[test]
+fn an_input_file_with_a_utf8_byte_order_mark_is_enqueued() {
+    let root = fixture("bom-input");
+    let dir = bind(&root, "http://127.0.0.1:9");
+    let path = root.join("in.json");
+    let mut bytes = b"\xEF\xBB\xBF".to_vec();
+    bytes.extend(
+        serde_json::to_vec(&serde_json::json!([event(
+            "e-bom",
+            "claude-code",
+            "session-start",
+            "s-1"
+        )]))
+        .unwrap(),
+    );
+    std::fs::write(&path, bytes).unwrap();
+    relay::enqueue(&dir, &path).unwrap();
+    assert_eq!(pending_count(&dir), 1);
+}
+
+#[test]
 fn an_unauthenticated_rejection_keeps_everything_pending() {
     let root = fixture("auth-rejected");
     let server = stub(vec![Reply::Json(401, r#"{"error":"unauthorized"}"#.into())]);

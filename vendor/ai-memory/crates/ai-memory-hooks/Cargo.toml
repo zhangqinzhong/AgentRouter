@@ -33,6 +33,8 @@ uuid.workspace = true
 axum.workspace = true
 sha2.workspace = true
 
+libc.workspace = true
+
 [dev-dependencies]
 ai-memory-test-support.workspace = true
 tempfile.workspace = true
@@ -40,6 +42,8 @@ git2.workspace = true
 ai-memory-llm.workspace = true
 async-trait.workspace = true
 rusqlite.workspace = true
+# Drive the real `/hook` route in the idle-end race tests.
+tower.workspace = true
 
 [lints]
 workspace = true

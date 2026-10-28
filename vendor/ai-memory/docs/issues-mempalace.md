@@ -1,5 +1,11 @@
 # MemPalace - Issue & Architecture Synthesis
 
+> **Historical snapshot (2026-05-24).** This file is retained because the
+> architecture cites these concrete failure modes; issue states and version
+> claims below are not current product guidance. See
+> [`research-2026-landscape.md`](research-2026-landscape.md) for the latest
+> reviewed competitor state.
+>
 > Source: GitHub `MemPalace/mempalace`.
 > Captured 2026-05-24. Repo: 52.7k stars, MIT, Python, created 2026-04-05,
 > v3.3.5, 241 open issues, ~1600 PRs in ~7 weeks. The maintainers publish

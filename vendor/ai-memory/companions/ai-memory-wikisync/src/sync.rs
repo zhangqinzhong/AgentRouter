@@ -79,6 +79,8 @@ pub struct PlannedWrite {
     pub title: String,
     pub body: String,
     pub etag: Option<String>,
+    /// Hash of the repository file the plan read, or `None` if it was absent.
+    pub expected_disk: Option<String>,
 }
 
 /// A destination file that diverged, with a bounded diff summary.
@@ -190,8 +192,8 @@ pub fn diff_summary(disk: Option<&[u8]>, server: Option<&[u8]>) -> String {
     let Some(server) = server else {
         return "server content unchanged since the last export (revalidated by ETag)".to_string();
     };
-    let local_lines = disk.iter().filter(|byte| **byte == b'\n').count();
-    let server_lines = server.iter().filter(|byte| **byte == b'\n').count();
+    let local_lines = line_count(disk);
+    let server_lines = line_count(server);
     // Compare the first missing line too, even when the shared prefix is identical.
     let first_difference = disk
         .split(|byte| *byte == b'\n')
@@ -222,6 +224,14 @@ pub fn diff_summary(disk: Option<&[u8]>, server: Option<&[u8]>) -> String {
         preview(local_line),
         preview(server_line),
     )
+}
+
+/// Lines in a file's bytes. Content not ending in a newline still has a
+/// final line, which the first-difference position below also counts, so
+/// the two numbers in one summary cannot contradict each other.
+fn line_count(bytes: &[u8]) -> usize {
+    let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
+    newlines + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
 }
 
 fn preview(line: Option<&[u8]>) -> String {
@@ -327,6 +337,24 @@ pub(crate) fn read_disk(dest_root: &Path, path: &str) -> Result<Option<Vec<u8>>>
     }
 }
 
+/// Write `bytes` over a repository file only while it is still the file the
+/// plan classified: `expected` is that file's hash, or `None` when there was
+/// no file. Returns `false`, writing nothing, when an edit landed after the
+/// plan. The check and atomic replacement are deliberately adjacent.
+pub(crate) fn write_if_unchanged(
+    dest_root: &Path,
+    rel: &str,
+    expected: Option<&str>,
+    bytes: &[u8],
+) -> Result<bool> {
+    let current = read_disk(dest_root, rel)?;
+    if current.as_deref().map(state::sha256_hex).as_deref() != expected {
+        return Ok(false);
+    }
+    atomic_write(dest_root, rel, bytes)?;
+    Ok(true)
+}
+
 /// Fetch and classify every allowlisted page. In [`Mode::Apply`] (and only
 /// when allowed past the divergence guard) also performs the write batch
 /// and persists the new state atomically.
@@ -406,7 +434,18 @@ async fn run_batch(
     let applied = mode == Mode::Apply && (report.divergent.is_empty() || args.force);
     if applied {
         for write in &report.writes {
-            atomic_write(dest_root, &write.path, write.body.as_bytes())?;
+            if !write_if_unchanged(
+                dest_root,
+                &write.path,
+                write.expected_disk.as_deref(),
+                write.body.as_bytes(),
+            )? {
+                bail!(
+                    "{} changed in the repository during this run; left untouched. \
+                     Earlier exports may have completed; export state was not advanced",
+                    write.path
+                );
+            }
         }
         // Only after the whole batch is on disk does the state move: a
         // crash mid-batch leaves the old state, and the next run's
@@ -472,6 +511,7 @@ fn record_decision(
                 title: page.title,
                 body,
                 etag,
+                expected_disk: disk.map(state::sha256_hex),
             });
         }
         Classification::Divergent(reason) => {
@@ -499,6 +539,7 @@ fn record_decision(
                         title: page.title.clone(),
                         body: body.clone(),
                         etag,
+                        expected_disk: disk.map(state::sha256_hex),
                     });
                 }
             }
@@ -714,6 +755,41 @@ mod tests {
             );
             assert!(summary.ends_with(&expected), "{summary}");
         }
+    }
+
+    #[test]
+    fn diff_summary_counts_a_final_unterminated_line() {
+        type Case<'a> = (&'a [u8], &'a [u8], &'a str);
+        let cases: &[Case<'_>] = &[
+            (
+                b"one",
+                b"one\nextra",
+                "local 3 bytes/1 lines vs server 9 bytes/2 lines",
+            ),
+            (
+                b"one\n",
+                b"one\nextra\n",
+                "local 4 bytes/1 lines vs server 10 bytes/2 lines",
+            ),
+            // Control: an empty file has no final line to count.
+            (
+                b"",
+                b"extra",
+                "local 0 bytes/0 lines vs server 5 bytes/1 lines",
+            ),
+        ];
+        for (disk, server, expected) in cases {
+            let summary = diff_summary(Some(disk), Some(server));
+            assert!(summary.starts_with(expected), "{summary}");
+        }
+
+        // A difference inside both files must not sit past a reported count.
+        let summary = diff_summary(Some(b"---\n---\nbody"), Some(b"---\n---\nbodyX"));
+        assert!(
+            summary.starts_with("local 12 bytes/3 lines vs server 13 bytes/3 lines"),
+            "{summary}"
+        );
+        assert!(summary.contains("first difference at line 3"), "{summary}");
     }
 
     #[test]

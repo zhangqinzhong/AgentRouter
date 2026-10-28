@@ -542,6 +542,8 @@ ai-memory list-projects              # every workspace/project the server knows 
 ai-memory project init               # pin this checkout's scope in a .ai-memory.toml
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
+ai-memory search "wal mode"          # FTS5 lookup in this project
+ai-memory recent                     # newest wiki pages in this project
 ai-memory write-page …               # save a durable page
 ai-memory handoffs                   # list open handoffs for the project
 ai-memory message list               # cross-project inbox
@@ -631,7 +633,9 @@ contract.
   empty store) so it isn't starting from nothing. It runs automatically in the
   background; you can trigger or preview it yourself with `ai-memory backfill`
   (`--dry-run` to see what it would import), or turn it off with
-  `AI_MEMORY_BACKFILL_ON_START=false`.
+  `AI_MEMORY_BACKFILL_ON_START=false`. A single transcript record over 1 MiB
+  (usually a screenshot in a tool result) is skipped and counted on stderr;
+  the rest of that session is still imported.
 - **A search misses something you saved**: confirm the scope. Memory is
   per-project; a page saved in project A is not returned in project B unless it
   was written to the global scope or you query with an explicit scope.

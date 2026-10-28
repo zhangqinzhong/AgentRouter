@@ -12,7 +12,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::openai_compat::{first_json_object, strip_reasoning_blocks};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 use crate::types::{
     ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
 };
@@ -211,6 +211,11 @@ enum AnthropicToolChoice {
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
     model: String,
+    /// Why the model stopped. `"max_tokens"` is the only value either
+    /// completion path reads, and the field is absent from the error shape,
+    /// so it defaults.
+    #[serde(default)]
+    stop_reason: Option<String>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
 }
@@ -297,6 +302,22 @@ impl LlmProvider for AnthropicProvider {
     ) -> LlmResult<serde_json::Value> {
         let body = self.build_request(&request, Some(schema));
         let response: AnthropicResponse = self.post(&body, operation_id).await?;
+        // A `max_tokens` stop on the structured path means the model ran out
+        // of output budget part-way through the answer, so a `tool_use`
+        // block's `input` is whatever JSON had been produced by then. The
+        // batch types this feeds leave every field but `updates`
+        // `#[serde(default)]` and the Anthropic tool schema does not enforce
+        // required fields, so a short object still deserializes and the caller
+        // cannot tell the answer from a complete one. Terminal, and reported
+        // as the same class `openai.rs` uses for `finish_reason = "length"`: a
+        // retry re-truncates at the same budget. `complete` is deliberately
+        // left alone — prose cut at the budget is a usable answer there.
+        if response.stop_reason.as_deref() == Some("max_tokens") {
+            return Err(LlmError::TruncatedResponse {
+                model: self.model.clone(),
+                completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+            });
+        }
         let forced = self.forces_result_tool();
         let mut text = Vec::new();
         for c in response.content {
@@ -427,13 +448,8 @@ impl AnthropicProvider {
             );
         }
         let resp = headers.apply(builder).json(body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<R>(resp).await
     }

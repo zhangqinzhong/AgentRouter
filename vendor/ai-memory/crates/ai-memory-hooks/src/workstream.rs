@@ -4803,11 +4803,19 @@ mod tests {
             )
             .await
             .unwrap();
-        // The twin an earlier name-only run created under the derived name.
-        store
-            .writer
-            .get_or_create_project(workspace_id, "victorcesc-unknown-system", None)
-            .await
+        // The twin an earlier name-only run created under the derived name,
+        // inserted directly: the capture path under test no longer mints it, so
+        // this has to stand in for the row an older release left behind.
+        rusqlite::Connection::open(store.db_path())
+            .unwrap()
+            .execute(
+                "INSERT INTO projects (id, workspace_id, name, created_at) \
+                 VALUES (?1, ?2, 'victorcesc-unknown-system', 0)",
+                rusqlite::params![
+                    ai_memory_core::ProjectId::new().as_bytes().to_vec(),
+                    workspace_id.as_bytes().to_vec()
+                ],
+            )
             .unwrap();
 
         // By name alone the derived name names both projects.

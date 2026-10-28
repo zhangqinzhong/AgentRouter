@@ -8,6 +8,7 @@ const SPECIAL_PROVIDER_NAMES = {
   pigithubcopilot: "Pi · GitHub Copilot",
   picopilot: "Pi · Copilot",
   dots: "Dots",
+  muse: "Muse Code",
   pidots: "Pi · Dots",
   lmstudio: "LM Studio",
   unsloth: "Unsloth Studio",

@@ -25,12 +25,14 @@
 //! explicit `write` grant on it, whatever its access mode. Creating it first
 //! grants nothing: the first writer must not become a permanent one.
 //!
-//! ## Never fail closed on a resolution gap (#678)
+//! ## Compatibility gaps are not store failures
 //!
 //! A `restricted` project with **zero** grants still admits root and the
 //! project creator — an operator is never locked out of their own data. If the
-//! grants table cannot be read (an older schema mid-migration), the decision
-//! degrades to `open` with a loud warning rather than denying every read.
+//! Unknown projects and access-mode values remain compatible with older/newer
+//! callers by reading as `open`. A store failure while reading an existing
+//! project's access mode or grants propagates and refuses the request: an
+//! authorization dependency must never fail open.
 //!
 //! ## Invariant #16
 //!
@@ -254,9 +256,9 @@ struct ProjectRow {
 }
 
 /// Read `projects.access_mode`, `projects.created_by` and whether the project
-/// is the reserved global scope, degrading to [`AccessMode::Open`] with no
-/// creator on any read failure and for an unknown project. Never fails closed.
-fn read_project_row(conn: &Connection, project_id: ProjectId) -> ProjectRow {
+/// is the reserved global scope. An unknown project remains compatible with
+/// older callers by reading as [`AccessMode::Open`]; store failures propagate.
+fn read_project_row(conn: &Connection, project_id: ProjectId) -> StoreResult<ProjectRow> {
     match conn.query_row(
         "SELECT p.access_mode, p.created_by, p.name, w.name \
          FROM projects p JOIN workspaces w ON w.id = p.workspace_id WHERE p.id = ?1",
@@ -270,27 +272,17 @@ fn read_project_row(conn: &Connection, project_id: ProjectId) -> ProjectRow {
             ))
         },
     ) {
-        Ok((mode, creator, project, workspace)) => ProjectRow {
+        Ok((mode, creator, project, workspace)) => Ok(ProjectRow {
             access_mode: AccessMode::from_db(mode.as_deref()),
             creator: creator.and_then(|raw| UserId::from_slice(&raw).ok()),
             reserved_global: is_reserved_global(&workspace, &project),
-        },
-        Err(rusqlite::Error::QueryReturnedNoRows) => ProjectRow {
+        }),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ProjectRow {
             access_mode: AccessMode::Open,
             creator: None,
             reserved_global: false,
-        },
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "could not read projects.access_mode; degrading project authz to open",
-            );
-            ProjectRow {
-                access_mode: AccessMode::Open,
-                creator: None,
-                reserved_global: false,
-            }
-        }
+        }),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -342,8 +334,7 @@ fn is_reserved_global(workspace: &str, project: &str) -> bool {
 }
 
 /// Look up a caller's grant on a project. Returns the failure so the caller can
-/// decide how to degrade (a restricted project degrades to open when its grants
-/// cannot be read).
+/// preserve the reserved global scope's read-open/write-denied degraded mode.
 fn read_grant(
     conn: &Connection,
     workspace_id: WorkspaceId,
@@ -370,12 +361,11 @@ fn read_grant(
 /// `open` short-circuits without touching `project_grants`. The caller is the
 /// creator when [`ProjectPrincipal::is_creator`] says so or the project's
 /// `created_by` is their [`ProjectPrincipal::user_id`]. A `restricted`
-/// project whose grants cannot be read degrades to `open` with a warning rather
-/// than denying every caller (#678).
+/// project's grant lookup failure propagates and refuses the request.
 ///
 /// # Errors
-/// Propagates only failures that are not the grant-read degrade path; the
-/// access-mode read itself never errors (it degrades to open).
+/// Propagates store failures while retaining compatibility for an unknown
+/// project or access-mode token.
 pub fn resolve_project_authz(
     conn: &Connection,
     workspace_id: WorkspaceId,
@@ -389,7 +379,7 @@ pub fn resolve_project_authz(
         project_id,
         principal,
         distinguishes_operators,
-        Resolution::DegradeToOpen,
+        Resolution::Compatible,
     )
 }
 
@@ -420,8 +410,8 @@ pub(crate) fn resolve_project_authz_strict(
 /// How [`resolve`] treats a gap in what it can read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resolution {
-    /// Degrade to `open` and log (#678).
-    DegradeToOpen,
+    /// Preserve compatibility for absent rows and unknown access-mode tokens.
+    Compatible,
     /// Fail the request.
     Strict,
 }
@@ -435,11 +425,11 @@ fn resolve(
     resolution: Resolution,
 ) -> StoreResult<ProjectAuthz> {
     let ProjectRow {
-        mut access_mode,
+        access_mode,
         creator,
         reserved_global,
     } = match resolution {
-        Resolution::DegradeToOpen => read_project_row(conn, project_id),
+        Resolution::Compatible => read_project_row(conn, project_id)?,
         Resolution::Strict => {
             let row = read_project_row_strict(conn, workspace_id, project_id)?;
             distinguishes_operators |= crate::users::users_exist(conn)?;
@@ -474,16 +464,7 @@ fn resolve(
                     );
                     None
                 }
-                Err(err) => {
-                    // The grants table cannot be read: degrade to open rather
-                    // than lock everyone out of a restricted project (#678).
-                    tracing::warn!(
-                        error = %err,
-                        "could not read project_grants; degrading project authz to open",
-                    );
-                    access_mode = AccessMode::Open;
-                    None
-                }
+                Err(err) => return Err(err.into()),
             },
             None => None,
         }
@@ -571,6 +552,57 @@ mod tests {
         let lenient =
             resolve_project_authz(&conn, global.workspace_id, unknown, &principal, true).unwrap();
         assert_eq!(lenient.access_mode, AccessMode::Open);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_restricted_project_fails_instead_of_opening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(tmp.path()).unwrap();
+        let workspace = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(workspace, "secret", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(project, AccessMode::Restricted)
+            .await
+            .unwrap();
+        let user = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "outsider".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let principal = ProjectPrincipal::user(user);
+        let conn = Connection::open(store.db_path()).unwrap();
+
+        let control = resolve_project_authz(&conn, workspace, project, &principal, true).unwrap();
+        assert_eq!(control.access_mode, AccessMode::Restricted);
+        assert!(control.authorize(ProjectAccess::Read).is_err());
+
+        conn.execute_batch("ALTER TABLE project_grants RENAME TO unavailable_grants;")
+            .unwrap();
+        assert!(resolve_project_authz(&conn, workspace, project, &principal, true).is_err());
+        conn.execute_batch("ALTER TABLE unavailable_grants RENAME TO project_grants;")
+            .unwrap();
+
+        conn.execute_batch("ALTER TABLE projects RENAME TO unavailable_projects;")
+            .unwrap();
+        assert!(resolve_project_authz(&conn, workspace, project, &principal, true).is_err());
     }
 
     /// GHSA-7qj3-7wqw-m5w6: writing the reserved global scope needs root or a

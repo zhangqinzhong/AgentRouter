@@ -17,6 +17,7 @@
 //! - `GET  /admin/activity/by-client` — MCP tool-call counts per client (server-wide).
 //! - `GET  /admin/audit-log`      — paginated read of the append-only `audit_log`.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
+//! - `GET  /admin/recent`         — most recently updated wiki pages.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
 //! - `POST /admin/forget-sweep`   — run the M8 retention sweep.
@@ -598,6 +599,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `GET  /admin/activity/by-client`
 /// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
+/// - `GET  /admin/recent`
 /// - `GET  /admin/read-page`
 /// - `POST /admin/reorg`
 /// - `POST /admin/lint`
@@ -688,6 +690,7 @@ pub fn admin_router_with_sweep_tuning(
         )
         .route("/admin/audit-log", get(handle_audit_log))
         .route("/admin/search", get(handle_search))
+        .route("/admin/recent", get(handle_recent))
         .route("/admin/read-page", get(handle_read_page))
         .route("/admin/reorg", post(handle_reorg))
         .route("/admin/lint", post(handle_lint))
@@ -1740,7 +1743,7 @@ impl From<ai_memory_store::PageHitWithMeta> for GlobalSearchHit {
             id: hit.id,
             path: hit.path,
             title: hit.title,
-            snippet: hit.snippet,
+            snippet: ai_memory_store::highlighted_snippet_html(&hit.snippet),
             rank: hit.rank,
             workspace: hit.workspace_name,
             project: hit.project_name,
@@ -1794,6 +1797,132 @@ async fn handle_search(
             }),
     };
     match search_result {
+        Ok(hits) => (StatusCode::OK, Json(hits)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// recent
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/recent?limit=…`.
+#[derive(Debug, Deserialize)]
+struct RecentQuery {
+    /// Workspace name to list within. Must be provided together with `project`.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Project name to list within. Must be provided together with `workspace`.
+    #[serde(default)]
+    project: Option<String>,
+    /// Max number of pages to return. Capped at 100 server-side.
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+/// One hit of `GET /admin/recent`.
+///
+/// Recency has no FTS rank, so `updated_at` is RFC 3339 instead of the
+/// store's reused `PageHit::rank` (updated_at microseconds as REAL). A
+/// global listing also names the workspace and project; a scoped listing
+/// omits those fields.
+#[derive(Debug, Serialize)]
+struct RecentHit {
+    id: ai_memory_core::PageId,
+    path: ai_memory_core::PagePath,
+    title: String,
+    snippet: String,
+    updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+}
+
+fn iso_from_rank_us(rank: f64) -> String {
+    // `recent_pages_*` store `updated_at` microseconds in `PageHit::rank`.
+    // Unix µs in 2026 sit well below the 53-bit integer mantissa.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let us = rank.round() as i64;
+    jiff::Timestamp::from_microsecond(us)
+        .map(|ts| ts.to_string())
+        .unwrap_or_default()
+}
+
+impl From<ai_memory_store::PageHit> for RecentHit {
+    fn from(hit: ai_memory_store::PageHit) -> Self {
+        Self {
+            id: hit.id,
+            path: hit.path,
+            title: hit.title,
+            snippet: hit.snippet,
+            updated_at: iso_from_rank_us(hit.rank),
+            workspace: None,
+            project: None,
+        }
+    }
+}
+
+impl From<ai_memory_store::PageHitWithMeta> for RecentHit {
+    fn from(hit: ai_memory_store::PageHitWithMeta) -> Self {
+        Self {
+            id: hit.id,
+            path: hit.path,
+            title: hit.title,
+            snippet: hit.snippet,
+            updated_at: iso_from_rank_us(hit.rank),
+            workspace: Some(hit.workspace_name),
+            project: Some(hit.project_name),
+        }
+    }
+}
+
+async fn handle_recent(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<RecentQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.clamp(1, 100);
+    let recent_result = match (
+        trimmed_opt(query.workspace.as_deref()),
+        trimmed_opt(query.project.as_deref()),
+    ) {
+        (Some(workspace), Some(project)) => {
+            match lookup_ws_proj_no_create(&state, workspace, project).await {
+                Ok((ws, proj)) => state
+                    .reader
+                    .recent_pages_for_project(ws, proj, limit)
+                    .await
+                    .and_then(|hits| {
+                        let hits: Vec<RecentHit> = hits.into_iter().map(Into::into).collect();
+                        Ok(serde_json::to_value(&hits)?)
+                    }),
+                Err(e) => return e,
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "workspace and project must be provided together"
+                })),
+            );
+        }
+        // Cross-project: every hit names its repository. `OPERATOR` reads
+        // every project because this route is root-only once the deployment
+        // distinguishes operators (`require_root_for_multiuser_admin`).
+        _ => state
+            .reader
+            .recent_pages_global(limit, OPERATOR)
+            .await
+            .and_then(|hits| {
+                let hits: Vec<RecentHit> = hits.into_iter().map(Into::into).collect();
+                Ok(serde_json::to_value(&hits)?)
+            }),
+    };
+    match recent_result {
         Ok(hits) => (StatusCode::OK, Json(hits)),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -9247,7 +9376,7 @@ mod tests {
         ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
     };
     use ai_memory_core::{Sanitized, Sanitizer};
-    use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmOperationId, LlmResult, LlmWorkload};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -9539,6 +9668,7 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
+        assert_eq!(json["providers"]["llm_workloads"], serde_json::json!([]));
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
         // 2.0 item 7: the report carries the wedged-writer gauge and the
         // wiki-format state — a fresh store is natively conformant (no
@@ -9546,6 +9676,79 @@ mod tests {
         assert!(json["write_queue"].is_array(), "{json}");
         assert_eq!(json["wiki_format"]["okf_migrated"], false);
         assert!(json["wiki_format"]["backup_archive"].is_null());
+    }
+
+    #[tokio::test]
+    async fn status_reports_bounded_content_free_llm_workload_telemetry() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let provider_health = ProviderHealth::default();
+        let llm = provider_health.wrap_llm_provider(
+            Arc::new(FakeAutoImproveLlm),
+            "fake-auto-improve",
+            "fake-model",
+            None,
+        );
+        llm.complete_with_operation_id(
+            ChatRequest::user_prompt("private prompt").with_max_tokens(16),
+            LlmOperationId::for_workload(LlmWorkload::QueryAnswer),
+        )
+        .await
+        .unwrap();
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: Some(llm),
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health,
+            decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let workloads = json["providers"]["llm_workloads"].as_array().unwrap();
+        assert_eq!(workloads.len(), LlmWorkload::ALL.len());
+        let query_answer = workloads
+            .iter()
+            .find(|entry| entry["workload"] == "query-answer")
+            .unwrap();
+        assert_eq!(query_answer["calls"], 1);
+        assert_eq!(query_answer["successes"], 1);
+        assert_eq!(query_answer["errors"], 0);
+        assert_eq!(query_answer["status"], "ok");
+        assert_eq!(query_answer["usage_reported_calls"], 0);
+        let encoded = serde_json::to_string(workloads).unwrap();
+        assert!(!encoded.contains("private prompt"));
     }
 
     /// The MCP-only complement: per-client tool-call counters served
@@ -11011,6 +11214,213 @@ mod tests {
                 .expect("scope dir")
         };
         uuid_dir(&uuid_dir(&data_dir.join("wiki")))
+    }
+
+    /// Restoring the pre-OKF checkpoint every migrated install carries must
+    /// not reintroduce a pre-migration file: the restore writes the page to
+    /// disk, and `export-okf` reads the disk, so a verbatim restore refuses
+    /// every later export of that project with "run the server once to
+    /// migrate" — advice the one-shot wiki migration will never act on again.
+    #[tokio::test]
+    async fn export_okf_survives_a_restore_from_a_pre_okf_checkpoint() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        // A pre-migration file, checkpointed exactly as the OKF migration's
+        // own git checkpoint captured one.
+        let proj_dir = scratch_project_dir(tmp.path());
+        let legacy = proj_dir.join("notes/legacy.md");
+        std::fs::write(&legacy, "---\ntitle: Legacy\n---\nno type here").unwrap();
+        let pre_okf_rev = post_commit(&router, "pre-okf-migration checkpoint").await;
+        // Then the migration conformed it, so the export works today.
+        std::fs::write(
+            &legacy,
+            "---\ntype: Note\ntitle: Legacy\ngenerated:\n  at: \"2026-09-01T00:00:00Z\"\n---\nno type here",
+        )
+        .unwrap();
+        post_commit(&router, "okf-migration: conform wiki to OKF v0.2").await;
+        assert_eq!(export_okf_status(&router).await, StatusCode::OK);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/restore-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "path": "notes/legacy.md",
+                            "rev": pre_okf_rev,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "restore-page failed");
+
+        assert_eq!(
+            export_okf_status(&router).await,
+            StatusCode::OK,
+            "a restored page left the bundle non-conformant, permanently \
+             breaking export-okf for this project"
+        );
+    }
+
+    /// An already-conformant page restores to the same bytes it was
+    /// checkpointed with: conforming the restore must not rewrite history
+    /// that needed no rewriting.
+    #[tokio::test]
+    async fn restoring_a_conformant_page_keeps_the_checkpointed_bytes() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "first").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        let page = proj_dir.join("notes/a.md");
+        let checkpointed = std::fs::read(&page).unwrap();
+        let rev = post_commit(&router, "checkpoint").await;
+
+        post_write_page(&router, "default", "scratch", "notes/a.md", "second").await;
+        post_commit(&router, "later").await;
+        assert_ne!(std::fs::read(&page).unwrap(), checkpointed);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/restore-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "path": "notes/a.md",
+                            "rev": rev,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "restore-page failed");
+
+        assert_eq!(
+            std::fs::read(&page).unwrap(),
+            checkpointed,
+            "restoring an already-conformant page rewrote its bytes"
+        );
+    }
+
+    /// The same promise when the checkpoint is older than the restore: the
+    /// test above passes only when its writes and the restore fall in one
+    /// second, because the restore used to inherit `generated.at` from the
+    /// file it replaces and otherwise stamped the current time.
+    #[tokio::test]
+    async fn restoring_an_old_conformant_page_keeps_its_generated_at() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "first").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        let page = proj_dir.join("notes/a.md");
+        let written = std::fs::read_to_string(&page).unwrap();
+        let at_line = written
+            .lines()
+            .find(|line| line.trim_start().starts_with("at: "))
+            .unwrap_or_else(|| panic!("no generated.at line in:\n{written}"));
+        let indent = &at_line[..at_line.len() - at_line.trim_start().len()];
+        let checkpointed =
+            written.replacen(at_line, &format!("{indent}at: 2026-09-01T00:00:00Z"), 1);
+        std::fs::write(&page, &checkpointed).unwrap();
+        let rev = post_commit(&router, "checkpoint").await;
+
+        post_write_page(&router, "default", "scratch", "notes/a.md", "second").await;
+        post_commit(&router, "later").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/restore-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "path": "notes/a.md",
+                            "rev": rev,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "restore-page failed");
+
+        assert_eq!(
+            std::fs::read_to_string(&page).unwrap(),
+            checkpointed,
+            "the restore re-stamped generated.at instead of keeping the checkpoint's"
+        );
+    }
+
+    /// `POST /admin/commit`, returning the oid of the resulting HEAD
+    /// checkpoint. A write-page already checkpoints itself, so the commit
+    /// here may legitimately have nothing left to stage.
+    async fn post_commit(router: &Router, message: &str) -> String {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "message": message })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "commit setup failed");
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/checkpoints?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "checkpoint listing failed");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json[0]["oid"]
+            .as_str()
+            .expect("at least one checkpoint")
+            .to_string()
+    }
+
+    /// Status of `POST /admin/export-okf` for the seeded scratch project.
+    async fn export_okf_status(router: &Router) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
     }
 
     /// A bundle with a non-conformant page must fail the export rather
@@ -14067,6 +14477,7 @@ mod tests {
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/audit-log", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
+            ("GET", "/admin/recent", serde_json::Value::Null),
             (
                 "GET",
                 "/admin/read-page?workspace=default&project=scratch&path=notes/x.md",

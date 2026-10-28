@@ -1,7 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { resolveRuntimeConfigDir } from "../runtime/app-paths";
+import { queryLocalCollector } from "../collector/service";
+import { resolveRuntimeAppPath, resolveRuntimeConfigDir } from "../runtime/app-paths";
 
 const allowed = new Set([
   "list",
@@ -229,6 +230,10 @@ export async function sessionWorkspace(
       marketplace: path.join(path.dirname(binary()), "session-marketplace"),
       index: path.join(resolveRuntimeConfigDir(), "sessions", "index.sqlite"),
     };
+  if (q.op === "collection-refresh") return await queryLocalCollector("/functions/tokentracker-local-sync", { sessions: "1" }) as Record<string, any>;
+  if (["location-add", "location-remove", "location-state"].includes(q.op) && typeof q.path === "string") {
+    q.path = q.path === "~" ? resolveRuntimeAppPath("home") : /^~[/\\]/.test(q.path) ? path.join(resolveRuntimeAppPath("home"), q.path.slice(2)) : q.path;
+  }
   if (q.op === "status") return { scanning, scannedAt, error: scanError };
   if (!allowed.has(q.op)) throw new Error("Unknown session operation");
   if (q.op === "list" && !watcher && Date.now() - lastStart > 30_000) {

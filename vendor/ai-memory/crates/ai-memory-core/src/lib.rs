@@ -17,7 +17,7 @@ pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
 pub mod latency;
-pub use latency::{LatencyHistogram, LatencySnapshot, LatencyTimer};
+pub use latency::{LATENCY_BUCKET_BOUNDS_US, LatencyHistogram, LatencySnapshot, LatencyTimer};
 pub mod log_ledger;
 pub mod message;
 pub mod observation;
@@ -29,7 +29,8 @@ pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;
 pub use scaffolding::{
-    looks_like_codex_instructions, looks_like_markup_block, looks_like_scaffolding,
+    is_codex_memory_agent_cwd, looks_like_codex_instructions, looks_like_codex_memory_agent_prompt,
+    looks_like_markup_block, looks_like_scaffolding,
 };
 pub mod routing_snippet;
 pub mod sanitize;

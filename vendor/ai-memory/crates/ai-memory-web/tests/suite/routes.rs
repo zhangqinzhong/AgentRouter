@@ -3048,32 +3048,61 @@ async fn actor_scoped_api_responses_are_never_reused_across_credentials() {
         .unwrap();
 
     let app = api_router(store.reader.clone(), wiki.clone());
-    for uri in [
-        "/workspaces/default/projects/scratch/briefing",
-        "/workspaces/default/overview",
-        "/workspaces/default/projects/scratch/overview",
-        "/workspaces/default/projects/scratch/handoffs",
+    // `/search` is listed for both of its registrations: the owner filter
+    // reaches the hybrid ranker from either verb, so both bodies are
+    // actor-scoped.
+    for (method, uri, body) in [
+        (
+            Method::GET,
+            "/workspaces/default/projects/scratch/briefing",
+            None,
+        ),
+        (Method::GET, "/workspaces/default/overview", None),
+        (
+            Method::GET,
+            "/workspaces/default/projects/scratch/overview",
+            None,
+        ),
+        (
+            Method::GET,
+            "/workspaces/default/projects/scratch/handoffs",
+            None,
+        ),
+        (
+            Method::GET,
+            "/search?q=anything&workspace=default&project=scratch",
+            None,
+        ),
+        (
+            Method::POST,
+            "/search",
+            Some(r#"{"q":"anything","workspace":"default","project":"scratch"}"#),
+        ),
     ] {
-        let resp = app
-            .clone()
-            .oneshot(api_req_actor(
-                uri,
-                Some(ai_memory_core::ActorContext {
-                    user: Some("alice".into()),
-                    ..ai_memory_core::ActorContext::default()
-                }),
-                Some(ai_memory_core::AuthLevel::User),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let mut builder = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .extension(ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            })
+            .extension(ai_memory_core::AuthLevel::User);
+        let req = match body {
+            Some(json) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                builder.body(Body::from(json)).unwrap()
+            }
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{method} {uri}");
         let cache = resp
             .headers()
             .get(header::CACHE_CONTROL)
             .expect("actor-scoped responses need Cache-Control")
             .to_str()
             .unwrap();
-        assert_eq!(cache, "private, no-store", "{uri}");
+        assert_eq!(cache, "private, no-store", "{method} {uri}");
     }
 }
 
@@ -4254,6 +4283,83 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
         );
     }
 
+    // The HTML graph and the in-project graph use the same both-ends-readable
+    // rule. A scoped `/graph?workspace=&project=` call is not a way to see
+    // the far end of an edge the viewer cannot read.
+    for viewer in [Some(alice), Some(bob)] {
+        let (status, body) = get(web.clone(), "/graph", viewer).await;
+        assert_eq!(status, StatusCode::OK, "{viewer:?}");
+        assert!(
+            !shows(&body, "alpha-plan"),
+            "{viewer:?} sees the HTML edge: {body}"
+        );
+        assert!(
+            !shows(&body, "beta-plan"),
+            "{viewer:?} sees the HTML edge: {body}"
+        );
+        assert!(
+            !shows(&body, "client-work"),
+            "{viewer:?} HTML graph leaked client-work: {body}"
+        );
+    }
+    for viewer in [Some(carol), None] {
+        let (status, body) = get(web.clone(), "/graph", viewer).await;
+        assert_eq!(status, StatusCode::OK, "{viewer:?}");
+        assert!(
+            shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
+            "{viewer:?} lost the HTML edge: {body}"
+        );
+    }
+
+    let (status, body) = get(web.clone(), "/w/shared/alpha/graph", Some(bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        !shows(&body, "alpha-plan"),
+        "bob's 403 leaked alpha: {body}"
+    );
+    let (status, body) = get(
+        api.clone(),
+        "/workspaces/shared/projects/alpha/graph",
+        Some(bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!shows(&body, "alpha-plan"), "{body}");
+
+    let (status, body) = get(web.clone(), "/w/shared/beta/graph", Some(bob)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(shows(&body, "beta-plan"), "{body}");
+    assert!(
+        !shows(&body, "alpha-plan"),
+        "bob's project graph leaked alpha: {body}"
+    );
+
+    let (status, body) = get(
+        api.clone(),
+        "/graph?workspace=shared&project=beta",
+        Some(bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !shows(&body, "alpha-plan") && !shows(&body, "beta-plan"),
+        "bob scoped graph leaked the hidden far end: {body}"
+    );
+    let (status, body) = get(
+        api.clone(),
+        "/graph?workspace=shared&project=beta",
+        Some(carol),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
+        "carol lost a scoped edge she can read: {body}"
+    );
+    let (status, body) = get(api.clone(), "/graph?workspace=shared", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(shows(&body, "together"), "{body}");
+
     // A page's link panel is the same edge seen from one page. The panel,
     // not the body: beta's own text names the link, and that text is bob's to
     // read. What must not appear is the resolved far end — alpha's title,
@@ -4988,7 +5094,7 @@ async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
 #[tokio::test]
 async fn header_links_sit_in_a_main_nav_and_mark_the_current_section() {
     let (_tmp, store, wiki) = setup().await;
-    // /pending and /health are root-only.
+    // /workstreams, /pending and /health are root-only.
     let app = router(store.reader.clone(), wiki).layer(axum::middleware::from_fn(
         |mut req: Request<Body>, next: axum::middleware::Next| async move {
             req.extensions_mut().insert(ai_memory_core::AuthLevel::Root);
@@ -5002,12 +5108,17 @@ async fn header_links_sit_in_a_main_nav_and_mark_the_current_section() {
     };
 
     // (uri, section whose link is the current one)
-    let cases = [("/", ""), ("/pending", "pending"), ("/health", "health")];
+    let cases = [
+        ("/", ""),
+        ("/workstreams", "workstreams"),
+        ("/pending", "pending"),
+        ("/health", "health"),
+    ];
     for (uri, current) in cases {
         let (status, body) = get_body(&app, uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
         assert!(body.contains(r#"<nav aria-label="Main""#), "{uri}: nav");
-        for href in ["pending", "health"] {
+        for href in ["workstreams", "pending", "health"] {
             assert_eq!(
                 tag(&body, href).contains(r#"aria-current="page""#),
                 href == current,

@@ -107,6 +107,10 @@ jobs:
               - 'crates/ai-memory-cli/src/commands/render_shared.rs'
               - 'crates/ai-memory-cli/src/commands/service_host.rs'
               - 'crates/ai-memory-cli/src/commands/user_service.rs'
+              # The Windows wrapper launcher and its packaging fixtures: a
+              # wrapper change is Windows-only code that no Linux job runs.
+              - 'bin/ai-memory.ps1'
+              - 'crates/ai-memory-cli/tests/suite/packaging.rs'
               - 'hooks/**'
               - 'tests/hooks/**'
               - 'install.ps1'

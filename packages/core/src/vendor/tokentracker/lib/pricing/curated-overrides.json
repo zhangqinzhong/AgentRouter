@@ -3,9 +3,50 @@
     "note": "Curated price overrides. Always wins over LiteLLM. Two reasons to live here: (1) self-defined alias names that LiteLLM will never carry (kiro-*, hy3-*, composer-*, kimi-for-coding, free-tier OpenRouter routes); (2) prices we want to pin even if LiteLLM has the model (e.g. cache_write fields LiteLLM often omits). Units: USD per million tokens. Edit this file to override pricing without redeploying.",
     "units": "usd_per_million_tokens",
     "deepseek_v4_pricing_note": "Official DeepSeek V4 pricing verified on 2026-08-21. Peak hours are 01:00-04:00 and 06:00-10:00 UTC; all other hours are off-peak at half price. Exact entries store peak rates. computeRowCost applies the time-of-use discount from each row's UTC hour_start.",
-    "iflytek_maas_pricing_note": "iFlytek MaaS inference prices supplied for AStudio on 2026-08-31. AStudio homepage: https://agent.xfyun.cn/. Official pricing source: https://maas.xfyun.cn/modelSquare. Source values are RMB per million tokens, converted at 7.2 RMB/USD, then rounded to two decimal places for billing. Models without a dedicated cache-hit price use the normal input rate; cache writes also use the normal input rate. iFlytek MaaS prices are source-scoped and do not inherit DeepSeek time-of-use discounts."
+    "iflytek_maas_pricing_note": "iFlytek MaaS inference prices supplied for AStudio on 2026-08-31. AStudio homepage: https://agent.xfyun.cn/. Official pricing source: https://maas.xfyun.cn/modelSquare. Source values are RMB per million tokens, converted at 7.2 RMB/USD, then rounded to two decimal places for billing. Models without a dedicated cache-hit price use the normal input rate; cache writes also use the normal input rate. iFlytek MaaS prices are source-scoped and do not inherit DeepSeek time-of-use discounts. Spark-X2.5 entries (spark-x2.5, spark-x2.5-4b, spark-x2.5-1.7b) were read from the model square on 2026-10-08; spark-x2.5 is listed at a limited-time 30% rate (0.96 / 3.6 / 0.14 RMB input / output / cache-hit, list price 3.2 / 12 / 0.48), and the two small models are free."
   },
   "exact": {
+    "claude-opus-5-5": {
+      "input": 4,
+      "output": 20,
+      "cache_read": 0.2,
+      "cache_write": 5,
+      "note": "Official Anthropic pricing verified 2026-10-11: https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    "claude-opus-5.5": {
+      "input": 4,
+      "output": 20,
+      "cache_read": 0.2,
+      "cache_write": 5,
+      "note": "Official Anthropic pricing verified 2026-10-11: https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    "claude-sonnet-5-5": {
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.1,
+      "cache_write": 2.5,
+      "note": "Official Anthropic pricing verified 2026-10-11: https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    "claude-sonnet-5.5": {
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.1,
+      "cache_write": 2.5,
+      "note": "Official Anthropic pricing verified 2026-10-11: https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    "k3-256k": {
+      "input": 3,
+      "output": 15,
+      "cache_read": 0.3,
+      "note": "Bare alias emitted by Kimi Code (modelAlias \"kimi-code/k3\" -> \"k3\"). Same rates as kimi-k3."
+    },
+    "cline-gateway-models": {
+      "input": 0,
+      "output": 0,
+      "cache_read": 0,
+      "cache_write": 0,
+      "note": "Cline's own gateway namespaces (`cline-free/*` free tier, `cline-pass/*` flat-rate Cline Pass). Cline's shipped model catalog declares pricing 0 for every id in both namespaces, so a turn there has no marginal per-token cost — same convention as PI_SUBSCRIPTION_SOURCES. The fuzzy entries at the top of `fuzzy` route both prefixes here BEFORE the model names can match a public rate (`cline-pass/glm-5.3` must not bill GLM-5.3 list price, `cline-free/deepseek-v4.1-flash` must not bill DeepSeek). Verified against Cline 0.0.32 (/Applications/Cline.app model catalog + `usageDelta` cost, which stays 0 for both namespaces). A Cline turn that DOES report a positive per-call cost is honoured first because `cline` is listed in SOURCES_WITH_AUTHORITATIVE_COST in pricing/index.js. Remove or re-point these entries when Cline publishes per-token pricing for either namespace."
+    },
     "claude-fable-5": {
       "input": 10,
       "output": 50,
@@ -35,10 +76,10 @@
       "note": "Opus 4.8 not yet in LiteLLM. Pin to the standard Opus tier (same as 4.6/4.7); remove once LiteLLM carries it."
     },
     "claude-sonnet-5": {
-      "input": 3,
-      "output": 15,
-      "cache_read": 0.3,
-      "cache_write": 3.75,
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.2,
+      "cache_write": 2.5,
       "note": "Sonnet 5. LiteLLM added this model on ~2026-06-30 with matching rates, but pin explicitly so pricing is correct immediately rather than depending on the 24h local pricing-cache refresh cycle."
     },
     "claude-haiku-4-5": {
@@ -48,19 +89,45 @@
       "cache_write": 1.25,
       "note": "Canonical undated alias emitted by Cursor. Pin to the same rates as claude-haiku-4-5-20251001 so local cost does not depend on which dated LiteLLM aliases are present in the current cache."
     },
+    "claude-haiku-5-5": {
+      "input": 0.1,
+      "output": 0.5,
+      "cache_read": 0.01,
+      "cache_write": 0.125,
+      "note": "Official Anthropic Haiku 5.5 short-context (prompts <=100K) USD/MTok verified 2026-10-22: https://platform.claude.com/docs/en/about-claude/pricing. Prompts over 100K use 5x rates; computeRowCost does not yet split that long-prompt tier. Cache write is the 5-minute rate."
+    },
+    "claude-haiku-5.5": {
+      "input": 0.1,
+      "output": 0.5,
+      "cache_read": 0.01,
+      "cache_write": 0.125,
+      "note": "Dotted alias for claude-haiku-5-5. Same short-context rates."
+    },
     "gpt-6-astra": {
       "input": 10,
       "output": 50,
       "cache_read": 1,
       "cache_write": 12.5,
-      "note": "Official Standard USD/MTok rates verified 2026-09-07: https://developers.openai.com/api/docs/models/gpt-6-astra. Requests above 272K input tokens use 2x input/cache and 1.5x output rates; computeRowCost applies this only to observed long-context request subsets. Cloud aggregates use Standard short-context estimates because they do not retain per-request context or service tier. Reasoning-effort suffixes use the same base rates."
+      "priority_multiplier": 2,
+      "ultrafast_multiplier": 6,
+      "note": "Official Standard USD/MTok rates verified 2026-09-07: https://developers.openai.com/api/docs/models/gpt-6-astra. Requests above 272K input tokens use 2x input/cache and 1.5x output rates; computeRowCost applies this only to observed long-context request subsets. priority_multiplier is the Fast tier, whose published table (20/2/25/100 short, 40/4/50/150 long, verified 2026-09-12) is exactly 2x the Standard rate of the same context tier — it multiplies, it does not replace, the long-context premium. The 2.5x figure in the Codex speed docs is a subscription-credit rate and must not be used here. computeRowCost applies it only to observed priority request subsets; usage whose service tier the logs never recorded stays Standard. Cloud aggregates use Standard short-context estimates because they do not retain per-request context or service tier. Reasoning-effort suffixes use the same base rates."
     },
     "gpt-6.1-sol": {
       "input": 2,
       "output": 10,
       "cache_read": 0.1,
       "cache_write": 2.5,
-      "note": "Official Standard USD/MTok rates verified 2026-10-02: https://developers.openai.com/api/docs/models/gpt-6.1-sol. Requests above 272K input use 2x input/cache and 1.5x output rates. Premiums apply only to observed request subsets."
+      "priority_multiplier": 2,
+      "ultrafast_multiplier": 6,
+      "note": "Official Standard USD/MTok rates verified 2026-10-02 (issue #737): https://developers.openai.com/api/docs/models/gpt-6.1-sol. Requests above 272K input use 2x input/cache and 1.5x output rates; Fast mode is 2x the applicable rates. Premiums apply only to observed request subsets. Cloud aggregates remain Standard short-context estimates."
+    },
+    "gpt-6-sol": {
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.2,
+      "cache_write": 2.5,
+      "priority_multiplier": 2,
+      "note": "Official Standard USD/MTok rates verified 2026-09-24: https://developers.openai.com/api/docs/models/gpt-6-sol. Same rules as gpt-6-astra: requests above 272K input tokens use 2x input/cache and 1.5x output for the full request, applied only to observed long-context request subsets; Fast mode is published as 2x the applicable rates (priority_multiplier). Reasoning-effort suffixes use the same base rates."
     },
     "gpt-5.6-sol": {
       "input": 4,
@@ -109,6 +176,48 @@
       "cache_write": 0.167,
       "note": "See hy3-preview-agent."
     },
+    "qwen3.8-flash": {
+      "input": 0.15,
+      "output": 0.47,
+      "cache_read": 0.016,
+      "cache_write": 0.2,
+      "note": "Alibaba Model Studio Singapore (International), USD per MTok, verified 2026-09-29: https://www.alibabacloud.com/help/en/model-studio/qwen3-8-flash . Reference API estimate; other regions/providers can have different rates. Issue #715."
+    },
+    "qwen3.8-max": {
+      "input": 2,
+      "output": 6,
+      "cache_read": 0.17,
+      "cache_write": 2.5,
+      "note": "Alibaba Model Studio Singapore (International), USD per MTok, verified 2026-10-25: https://www.alibabacloud.com/help/en/model-studio/model-pricing and https://www.alibabacloud.com/help/en/model-studio/qwen3-8-max . Reference API estimate; other regions/providers can have different rates. Issue #744."
+    },
+    "qwen3.8-max-0902": {
+      "input": 2,
+      "output": 6,
+      "cache_read": 0.17,
+      "cache_write": 2.5,
+      "note": "Alibaba Model Studio Singapore (International), USD per MTok, verified 2026-10-25: https://www.alibabacloud.com/help/en/model-studio/model-pricing and https://www.alibabacloud.com/help/en/model-studio/qwen3-8-max . Reference API estimate; other regions/providers can have different rates. Issue #744. Dated SKU qwen3.8-max-0902 shares Singapore International list rates."
+    },
+    "qwen3.8-max-2026-09-02": {
+      "input": 2,
+      "output": 6,
+      "cache_read": 0.17,
+      "cache_write": 2.5,
+      "note": "Alibaba Model Studio Singapore (International), USD per MTok, verified 2026-10-25: https://www.alibabacloud.com/help/en/model-studio/qwen3-8-max . Alias of qwen3.8-max-0902; same Singapore International list rates. Issue #744."
+    },
+    "hy4-preview": {
+      "input": 0.833,
+      "output": 2.5,
+      "cache_read": 0.042,
+      "cache_write": 0.833,
+      "note": "Tencent Hunyuan Hy4 preview (released 2026-08-28; WorkBuddy/CodeBuddy backend). Official TokenHub rate: 6 / 0.3 (cache hit) / 18 RMB per MTok in/read/out, converted at ~7.2 RMB/USD like hy3-preview. No published cache-write price, so cache_write = input. Issue #633."
+    },
+    "hy4-preview-agent": {
+      "input": 0.833,
+      "output": 2.5,
+      "cache_read": 0.042,
+      "cache_write": 0.833,
+      "note": "See hy4-preview. CodeBuddy's auto-router emits the -agent suffixed form."
+    },
     "composer-1": {
       "input": 1.25,
       "output": 10,
@@ -146,7 +255,7 @@
       "output": 10.0,
       "cache_read": 0.1,
       "cache_write": 0,
-      "note": "Google Gemini 4 Argon introductory list rate (through 2026-11-30) matching Cursor Other Models pool: $2/M input, $0.10/M cached input, $10/M output. Effort suffixes are stripped by normalizeCursorModel. Sources: https://cursor.com/docs/models-and-pricing and https://ai.google.dev/gemini-api/docs/pricing"
+      "note": "Google Gemini 4 Argon introductory list rate (through 2026-11-30) matching Cursor Other Models pool: $2/M input, $0.10/M cached input, $10/M output. Effort suffixes (-high/-medium/-low/-minimal) are stripped by normalizeCursorModel. Sources: https://cursor.com/docs/models-and-pricing and https://ai.google.dev/gemini-api/docs/pricing"
     },
     "MiniMax-M2.7": {
       "input": 0.3,
@@ -183,6 +292,20 @@
       "output": 1.32,
       "cache_read": 0.014,
       "cache_write": 0.44
+    },
+    "deepseek-v4.1-flash": {
+      "input": 0.3,
+      "output": 1.2,
+      "cache_read": 0.006,
+      "cache_write": 0.3,
+      "note": "DeepSeek V4.1 Flash (official API id deepseek-flash, released 2026-09-10). deepseek-v4.1-flash is the id reported by OpenRouter, Command Code and WorkBuddy. Peak rates per https://api-docs.deepseek.com/quick_start/pricing/ ($0.30 / $1.20 / $0.006 cache read per MTok); computeRowCost halves them off-peak like the other DeepSeek V4 entries."
+    },
+    "deepseek-flash": {
+      "input": 0.3,
+      "output": 1.2,
+      "cache_read": 0.006,
+      "cache_write": 0.3,
+      "note": "Official DeepSeek API id for DeepSeek-V4.1-Flash. Same rates as deepseek-v4.1-flash."
     },
     "deepseek-chat": {
       "input": 0.14,
@@ -229,7 +352,7 @@
       "output": 6.0,
       "cache_read": 0.5,
       "cache_write": 0,
-      "note": "Cursor Grok 4.7 base rate. Cursor Models & Pricing: $2/M input, $0.50/M cached input, $6/M output. Long-context premiums are not applied because Cursor rows do not expose a per-request long-context flag."
+      "note": "Cursor Grok 4.7 base rate. Cursor Models & Pricing: $2/M input, $0.50/M cached input, $6/M output. Long-context (>256k) premiums are not applied here yet because Cursor CSV rows do not expose per-request long-context flags."
     },
     "cursor-grok-4.7-fast": {
       "input": 4.0,
@@ -303,6 +426,48 @@
       "input": 0.95,
       "output": 4,
       "cache_read": 0.19
+    },
+    "kimi-k3.1-pro": {
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.2,
+      "cache_write": 2,
+      "note": "Kimi K3.1 Pro (API id kimi-k3.1-pro). Official USD list from https://platform.kimi.ai/ : $2/M input, $10/M output, $2/M cache write (default 5m TTL), $0.20/M cache hit. Flat 1M context; no context-length tiers. Verified 2026-10-25. Distinct from kimi-k3 ($3/$15)."
+    },
+    "kimi-k3.1-pro-highspeed": {
+      "input": 4,
+      "output": 20,
+      "cache_read": 0.2,
+      "cache_write": 4,
+      "note": "Kimi K3.1 Pro Highspeed (API id kimi-k3.1-pro-highspeed). Official USD list from https://platform.kimi.ai/ : $4/M input, $20/M output, $4/M cache write (default 5m TTL), $0.20/M cache hit. Same intelligence as K3.1 Pro at higher speed. Verified 2026-10-25."
+    },
+    "k3.1-pro": {
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.2,
+      "cache_write": 2,
+      "note": "Bare/compact alias for kimi-k3.1-pro. Same official rates."
+    },
+    "k3.1pro": {
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.2,
+      "cache_write": 2,
+      "note": "Compact alias (no hyphen) for kimi-k3.1-pro. Same official rates."
+    },
+    "k3.1-pro-highspeed": {
+      "input": 4,
+      "output": 20,
+      "cache_read": 0.2,
+      "cache_write": 4,
+      "note": "Bare alias for kimi-k3.1-pro-highspeed. Same official rates."
+    },
+    "k3.1pro-highspeed": {
+      "input": 4,
+      "output": 20,
+      "cache_read": 0.2,
+      "cache_write": 4,
+      "note": "Compact alias for kimi-k3.1-pro-highspeed. Same official rates."
     },
     "kimi-k3": {
       "input": 3,
@@ -406,6 +571,20 @@
       "output": 0,
       "cache_read": 0
     },
+    "muse-spark-1.2-contributor-free": {
+      "input": 0,
+      "output": 0,
+      "cache_read": 0,
+      "cache_write": 0,
+      "note": "Muse contributor free SKU. Also covered by matcher -free suffix; exact entry keeps status=free (issue #744)."
+    },
+    "muse-spark-1.3-contributor-free": {
+      "input": 0,
+      "output": 0,
+      "cache_read": 0,
+      "cache_write": 0,
+      "note": "Muse contributor free SKU. Also covered by matcher -free suffix; exact entry keeps status=free (issue #744)."
+    },
     "minimax-m2.1-free": {
       "input": 0,
       "output": 0,
@@ -477,6 +656,9 @@
   },
   "source_exact": {
     "acode": {
+      "spark-x2.5": { "input": 0.13, "output": 0.50, "cache_read": 0.02, "cache_write": 0.13 },
+      "spark-x2.5-4b": { "input": 0.00, "output": 0.00, "cache_read": 0.00, "cache_write": 0.00 },
+      "spark-x2.5-1.7b": { "input": 0.00, "output": 0.00, "cache_read": 0.00, "cache_write": 0.00 },
       "xopglm53": { "input": 1.11, "output": 3.89, "cache_read": 0.28, "cache_write": 1.11 },
       "xopdeepseekv4pro0813": { "input": 1.25, "output": 3.75, "cache_read": 0.04, "cache_write": 1.25 },
       "xopdeepseekv4flash0731": { "input": 0.14, "output": 0.28, "cache_read": 0.03, "cache_write": 0.14 },
@@ -542,12 +724,24 @@
   },
   "fuzzy": [
     {
-      "match": "gpt-6.1-sol",
-      "ref": "gpt-6.1-sol"
+      "match": "cline-free/",
+      "ref": "cline-gateway-models"
+    },
+    {
+      "match": "cline-pass/",
+      "ref": "cline-gateway-models"
     },
     {
       "match": "gpt-6-astra",
       "ref": "gpt-6-astra"
+    },
+    {
+      "match": "gpt-6.1-sol",
+      "ref": "gpt-6.1-sol"
+    },
+    {
+      "match": "gpt-6-sol",
+      "ref": "gpt-6-sol"
     },
     {
       "match": "gpt-5.6-sol",
@@ -574,8 +768,20 @@
       "ref": "hy3-preview-agent"
     },
     {
+      "match": "hy4",
+      "ref": "hy4-preview"
+    },
+    {
       "match": "composer",
       "ref": "composer-1"
+    },
+    {
+      "match": "haiku-5-5",
+      "ref": "claude-haiku-5-5"
+    },
+    {
+      "match": "haiku-5.5",
+      "ref": "claude-haiku-5.5"
     },
     {
       "match": "claude-opus-5-fast",
@@ -602,6 +808,14 @@
       "ref": "MiniMax-M2.7"
     },
     {
+      "match": "deepseek-v4.1-flash",
+      "ref": "deepseek-v4.1-flash"
+    },
+    {
+      "match": "deepseek-flash",
+      "ref": "deepseek-flash"
+    },
+    {
       "match": "deepseek-v4-flash",
       "ref": "deepseek-v4-flash"
     },
@@ -612,6 +826,30 @@
     {
       "match": "kimi-k2.7-code",
       "ref": "kimi-k2.7-code"
+    },
+    {
+      "match": "kimi-k3.1-pro-highspeed",
+      "ref": "kimi-k3.1-pro-highspeed"
+    },
+    {
+      "match": "k3.1-pro-highspeed",
+      "ref": "kimi-k3.1-pro-highspeed"
+    },
+    {
+      "match": "k3.1pro-highspeed",
+      "ref": "kimi-k3.1-pro-highspeed"
+    },
+    {
+      "match": "kimi-k3.1-pro",
+      "ref": "kimi-k3.1-pro"
+    },
+    {
+      "match": "k3.1-pro",
+      "ref": "kimi-k3.1-pro"
+    },
+    {
+      "match": "k3.1pro",
+      "ref": "kimi-k3.1-pro"
     },
     {
       "match": "kimi-k3",

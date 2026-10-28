@@ -72,11 +72,11 @@ project. Root-authorized recovery can pass `any_owner: true` to
 that switch.
 
 Handoffs are next-session transfer, not a live message bus between agents that
-are still running. In particular, Antigravity CLI exposes `PreInvocation`
-before every model call; ai-memory fetches a handoff only on invocation zero,
-which is the hook contract's startup boundary. A handoff created later in that
-conversation stays open instead of being consumed by its creator's next model
-call.
+are still running. In particular, Antigravity fetches a handoff only once per
+conversation: on `SessionStart`, or on builds without it, on the first turn's
+`PreInvocation` with invocation zero. Its later turns and model calls never
+fetch one, so a handoff created later in that conversation stays open instead
+of being consumed by its creator's next model call.
 
 If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_cancel` and the `handoff_id` returned by
@@ -222,6 +222,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it; a `memory_read_page` by exact path still returns it, marked `expired: true`. TTL outranks `pinned`. |
 | "Search expired notes for X" | `memory_query` with `include_expired: true` | Opts an explicit project, sibling-scope, or global search into expired historical pages; ordinary searches exclude them. |
+| "Search only Rust release runbooks" | `memory_query` with `path_prefix: "procedures/"`, `tag: "rust"`, and optionally `kind` / `tier` | Narrows every page retrieval stream before ranking. Filters also constrain global, time-travel, profile, and `pin_first` results. A filtered miss has no raw-observation fallback because observations have no page metadata. |
 | "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits, plus a top-level `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`; streams that did not run are left out). A global query reports only its distinct FTS stream and `fts_ms`. |
 | Improve top project/scopes search relevance | Set `AI_MEMORY_RERANKER=llm` on a server with an LLM provider | Sends the bounded query plus up to 30 bounded titles/snippets to the provider for at most one final relevance pass. Invalid, partial, failed, timed-out, or concurrency-saturated requests preserve the normal order; `global=true` and supplemental global-preference hits are unchanged. |
 | "Undo that change" / "bring back the page I deleted" | `memory_restore_page` | Call it without `rev` to list the page's checkpoints, then with the chosen `rev` to write that version back as the current one. The replaced version stays reachable. Admin only on a multi-user server; see [lifecycle-ops](lifecycle-ops.md#mcp-memory_restore_page). |
@@ -274,6 +275,28 @@ operator can run it. A DB user searches across the projects they may read with
 `[recall] default_global` marker setting changes what an agent's unscoped
 `memory_query` reads; it does not change this command, which stays
 project-scoped unless you pass `--global`.
+
+## Recent pages from the terminal
+
+`ai-memory recent` lists the most recently updated wiki pages, newest first.
+It is the terminal counterpart of the agent's `memory_recent` tool: no query
+string, just recency.
+
+```bash
+ai-memory recent                                      # current project (cwd / marker)
+ai-memory recent --workspace acme --project api
+ai-memory recent --global                             # every project
+ai-memory recent --global --json -n 20
+```
+
+Each line shows the page path, an RFC 3339 `updated_at`, and a relative age,
+then the title and a short snippet. `--global` labels every hit with its
+`workspace/project`, and `--json` adds `workspace` and `project` fields to
+each hit. `--global` cannot be combined with `--workspace` or `--project`.
+
+The command calls `GET /admin/recent`, so on a multi-user server only the root
+operator can run it. `[recall] default_global` does not change this command;
+it stays project-scoped unless you pass `--global`.
 
 ## Historical memory and live code intelligence
 
@@ -472,6 +495,7 @@ ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
 ai-memory install-skills --scope global --agent copilot-cli
 ai-memory install-skills --scope global --agent hermes
+ai-memory install-skills --scope global --agent antigravity
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
@@ -486,7 +510,10 @@ handoff rule `$GROK_HOME/rules/ai-memory-handoff.md` (default
 `--target-dir` do not. For GitHub Copilot CLI, project-local skills go under the
 repository's `.github/skills` and global under `$COPILOT_HOME/skills` (default
 `~/.copilot/skills`); Copilot CLI already loads `AGENTS.md`, so it shares the
-`AGENTS.md` instruction target.
+`AGENTS.md` instruction target. Google Antigravity reads workspace skills from
+`.agents/skills` and has two global roots, `~/.gemini/config/skills` for the
+App and IDE and `~/.gemini/antigravity-cli/skills` for the CLI; a global
+`--agent antigravity` install writes both, and `uninstall` sweeps both.
 
 Project-local skill roots are `.claude/skills` for Claude-compatible installs,
 `.agents/skills` for cross-client installs, `.devin/skills` for Devin, and
@@ -629,7 +656,12 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and search. On a project, page,
+breadcrumbs, rendered markdown, metadata, search, a link graph, and an
+operator view of managed workstreams.
+The header **Graph** link opens `/web/graph` (cross-project wikilinks);
+each project page links to `/web/w/<ws>/<proj>/graph` (pages in that
+project and the resolved links between them). Both are a server-rendered
+SVG plus a table, with no JavaScript. On a project, page,
 namespace, history or session view the header search box searches that project;
 elsewhere it searches every project with FTS5, like
 `memory_query(global=true)`, and the search page's "Search in" selector picks
@@ -641,7 +673,13 @@ namespace listing leave out a page whose `expires_at` TTL has passed, as search
 does; its own URL still opens it. The search on a project page ranks with
 the same hybrid ranker as `memory_query` for that project, and its "Explain
 ranking" box shows each hit's stream ranks, RRF contributions, authority and rerank score, plus the per-stream timings.
-Root also gets `/web/health`: hook counters (429s included), the writer queue,
+Root also gets `/web/workstreams`: a bounded, attention-first overview of
+managed workstreams across projects. It derives `active`, `interrupted`,
+`completed`, and `empty` only from run leases, exit state, and imported
+event counts; it does not interpret transcript prose or expose checkout paths,
+repository fingerprints, lease owners, or native session ids. This operator
+aggregate does not change `ai-memory resume`, whose discovery remains scoped
+to the current checkout. Root also gets `/web/health`: hook counters (429s included), the writer queue,
 the local spool and recovery journal, the consolidation queue, embedder and
 provider state, and the failing checks with the command that fixes each. Each page links
 to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version, newest

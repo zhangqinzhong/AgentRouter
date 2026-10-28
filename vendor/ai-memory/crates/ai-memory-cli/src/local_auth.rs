@@ -107,10 +107,7 @@ impl AuthPosture {
     /// `server_open` is whether the server is known to answer without a
     /// credential.
     pub(crate) fn classify(server_open: bool, server_url: &str) -> Self {
-        match (
-            server_open,
-            crate::commands::hook_spool::is_loopback_url(server_url),
-        ) {
+        match (server_open, crate::http_client::is_loopback_url(server_url)) {
             (false, _) => Self::Token,
             (true, true) => Self::NoneLoopback,
             (true, false) => Self::None,

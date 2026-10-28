@@ -24,6 +24,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::cli::{AuthEnableArgs, InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::install_mcp::{self, mcp_server_url_from_base};
+use crate::commands::path_util::display_path;
 use crate::config::Config;
 use crate::local_auth::{self, HookCredential};
 use crate::server_profiles::{self, ProfileName};
@@ -164,19 +165,19 @@ fn record_token_file(config_path: &Path) -> Result<bool> {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            return Err(e).with_context(|| format!("reading {}", config_path.display()));
+            return Err(e).with_context(|| format!("reading {}", display_path(config_path)));
         }
     };
     let mut doc: toml_edit::DocumentMut = existing
         .as_deref()
         .unwrap_or_default()
         .parse()
-        .with_context(|| format!("parsing {}", config_path.display()))?;
+        .with_context(|| format!("parsing {}", display_path(config_path)))?;
     let auth = doc
         .entry("auth")
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_like_mut()
-        .with_context(|| format!("`auth` in {} is not a table", config_path.display()))?;
+        .with_context(|| format!("`auth` in {} is not a table", display_path(config_path)))?;
     if auth.get("bearer_token_file").is_some() {
         return Ok(false);
     }
@@ -194,29 +195,31 @@ fn record_token_file(config_path: &Path) -> Result<bool> {
     };
     if let Some(parent) = config_path.parent() {
         crate::commands::path_util::create_private_dir(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+            .with_context(|| format!("creating {}", display_path(parent)))?;
     }
     // The atomic write's temp file is owner-only; an existing config keeps
     // the mode it had (a packaged one may be group-readable on purpose).
     ai_memory_wiki::write_atomic(config_path, doc.to_string().as_bytes())
-        .with_context(|| format!("writing {}", config_path.display()))?;
+        .with_context(|| format!("writing {}", display_path(config_path)))?;
     #[cfg(unix)]
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("restoring the mode of {}", config_path.display()))?;
+            .with_context(|| format!("restoring the mode of {}", display_path(config_path)))?;
     }
     Ok(true)
 }
 
 /// Clients `install-mcp --apply` writes a config file for. Pi has no MCP
-/// config (its extension reads the hook credential file) and DeepSeek
-/// Harness is print-only, so neither has an entry to re-point.
+/// config (its extension reads the hook credential file), and DeepSeek
+/// Harness and Hermes Agent are print-only, so none has an entry to
+/// re-point. Hermes' entry is a bridge carrying no token, so a new token
+/// needs no edit there either.
 fn rewirable_clients() -> impl Iterator<Item = McpClient> {
     <McpClient as clap::ValueEnum>::value_variants()
         .iter()
         .copied()
-        .filter(|client| !matches!(client, McpClient::Pi | McpClient::Dsh))
+        .filter(|client| !matches!(client, McpClient::Pi | McpClient::Dsh | McpClient::Hermes))
 }
 
 /// The endpoint without a `?flavor=` (or any) query, normalised to `/mcp`.
@@ -309,7 +312,7 @@ fn print_outcome(outcome: &EnableOutcome) {
         } else {
             "kept"
         },
-        outcome.token_path.display()
+        display_path(&outcome.token_path)
     );
     println!(
         "config: {} {}",
@@ -318,7 +321,7 @@ fn print_outcome(outcome: &EnableOutcome) {
         } else {
             "already names the token file:"
         },
-        outcome.config_path.display()
+        display_path(&outcome.config_path)
     );
     match outcome.hooks {
         Some(HookCredential::Seeded) => {
@@ -336,7 +339,7 @@ fn print_outcome(outcome: &EnableOutcome) {
         match &line.wiring {
             Wiring::Rewired => println!(
                 "mcp {client}: re-registered in {} so it reads the token without holding it",
-                line.path.display()
+                display_path(&line.path)
             ),
             Wiring::OtherServer(url) => {
                 println!("mcp {client}: targets {url}, another server; left unchanged");

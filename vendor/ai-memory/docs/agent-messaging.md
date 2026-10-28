@@ -144,7 +144,10 @@ design, confirm a merge) uses this same mailbox. The server already stores an
 optional one-line `subject` and a `body` on every message. This section is the
 convention both sides share so a companion and every orchestrator encode a
 decision the same way. The tools stay `memory_message_send` and
-`memory_message_list`. [#1281](https://github.com/akitaonrails/ai-memory/issues/1281)
+`memory_message_list`. The still-open structured-protocol proposal is
+[`design-message-decisions.md`](design-message-decisions.md) / issue
+[#1281](https://github.com/akitaonrails/ai-memory/issues/1281); none of that
+proposal's fields or authorization rules exists yet.
 
 The server stores that text as opaque message content. Correlation, options,
 and who may answer live in the text plus the provenance the list already

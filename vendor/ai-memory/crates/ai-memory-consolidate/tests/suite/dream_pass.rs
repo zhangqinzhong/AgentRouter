@@ -181,6 +181,86 @@ async fn write(fx: &Fixture, path: &str, body: &str) -> PageId {
         .unwrap()
 }
 
+/// `write`, plus a frontmatter `summary:` and `abstract:` — the shape a page
+/// has when something upstream (or an operator) gave it a descriptor.
+async fn write_with_summary(fx: &Fixture, path: &str, body: &str, summary: &str) -> PageId {
+    fx.wiki
+        .write_page(WritePageRequest {
+            workspace_id: fx.ws,
+            project_id: fx.proj,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({
+                "title": path,
+                "summary": summary,
+                "abstract": summary,
+            }),
+            body: body.to_string(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: Some(path.to_string()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap()
+}
+
+fn frontmatter_map(raw: &str) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::from_str(raw).unwrap() {
+        serde_json::Value::Object(m) => m,
+        other => panic!("frontmatter_json is not an object: {other}"),
+    }
+}
+
+fn latest_frontmatter(fx: &Fixture, path: &str) -> serde_json::Map<String, serde_json::Value> {
+    let conn = rusqlite::Connection::open(fx.tmp.path().join("db/memory.sqlite")).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT frontmatter_json FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![fx.ws.as_bytes(), fx.proj.as_bytes(), path],
+            |row| row.get(0),
+        )
+        .unwrap();
+    frontmatter_map(&raw)
+}
+
+fn superseded_frontmatter(
+    fx: &Fixture,
+    path: &str,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let conn = rusqlite::Connection::open(fx.tmp.path().join("db/memory.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT frontmatter_json FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 0 \
+             ORDER BY created_at",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map(params![fx.ws.as_bytes(), fx.proj.as_bytes(), path], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap();
+    rows.map(|r| frontmatter_map(&r.unwrap())).collect()
+}
+
+/// What a non-FTS retrieval path says about a page: the recency stream's
+/// descriptor, built by `page_descriptor_expr` like every other such stream.
+async fn project_descriptor(fx: &Fixture, path: &str) -> String {
+    fx.store
+        .reader
+        .recent_pages_for_project(fx.ws, fx.proj, 20)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|hit| hit.path.as_str() == path)
+        .unwrap_or_else(|| panic!("{path} is not in the recency stream"))
+        .snippet
+}
+
 fn backdate_latest(fx: &Fixture, path: &str, days: i64) {
     let conn = rusqlite::Connection::open(fx.tmp.path().join("db/memory.sqlite")).unwrap();
     conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
@@ -285,8 +365,7 @@ async fn flag_on_merges_cluster_via_llm() {
     let fx = seed_fixture(true).await;
     write(&fx, "sessions/a.md", DUP_A).await;
     write(&fx, "sessions/b.md", DUP_B).await;
-    // A third, far-away cold page: the adaptive k-distance elbow needs more than
-    // `min_pts` points to form (exactly as A3 does). It is noise, not a cluster.
+    // A third, far-away cold page: it is noise, not a cluster.
     write(&fx, "sessions/far.md", K8S_A).await;
     for p in ["sessions/a.md", "sessions/b.md", "sessions/far.md"] {
         backdate_latest(&fx, p, COLD_DAYS);
@@ -357,6 +436,50 @@ async fn flag_on_merges_cluster_via_llm() {
             .iter()
             .any(|(kind, src)| kind == "reconsolidation" && src.starts_with("b2_dream:")),
         "page_evidence records the merge sources: {evidence:?}"
+    );
+}
+
+/// B2 shares A3's `adaptive_eps`, so it shares the pair fix: a cold set of
+/// exactly two near-duplicates, with no third page to give the k-distance
+/// elbow a neighbour, still forms one cluster and reaches the LLM merge.
+#[tokio::test]
+async fn flag_on_merges_a_pair_with_no_other_cold_page() {
+    let fx = seed_fixture(true).await;
+    write(&fx, "sessions/a.md", DUP_A).await;
+    write(&fx, "sessions/b.md", DUP_B).await;
+    for p in ["sessions/a.md", "sessions/b.md"] {
+        backdate_latest(&fx, p, COLD_DAYS);
+    }
+
+    let llm = FakeMergeLlm::new();
+    let calls = llm.calls.clone();
+    let report = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &dream_on(),
+        &DreamCancel::new(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.clusters_considered, 1,
+        "the pair is a cluster: {report:?}"
+    );
+    assert_eq!(report.clusters_merged, 1, "the merge applied: {report:?}");
+    assert_eq!(report.pages_superseded, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "LLM called exactly once");
+    let survivor_body = latest_body(&fx, &report.merges[0].survivor);
+    assert!(
+        survivor_body.contains("crates/ai-memory-store/src/ops.rs")
+            && survivor_body.contains("crates/ai-memory-store/src/reader.rs"),
+        "survivor keeps every source fact: {survivor_body}"
     );
 }
 
@@ -528,5 +651,197 @@ async fn cancel_stops_before_next_cluster() {
         superseded_row_count(&fx),
         2,
         "only the first cluster was written (survivor + 1 loser); the rest is untouched"
+    );
+}
+
+/// The dream pass builds the same merge stub as A3 and had the same defect:
+/// the merged-away page's `summary:` rode onto a page whose body is now a
+/// two-line merge note. `page_descriptor_expr` prefers that summary over the
+/// body on every non-FTS retrieval path, so the stub advertised a fix that had
+/// moved to the survivor.
+#[tokio::test]
+async fn merge_stub_drops_the_loser_summary_and_abstract() {
+    let fx = seed_fixture(true).await;
+    write_with_summary(
+        &fx,
+        "sessions/a.md",
+        DUP_A,
+        "Fixed the flaky sweep test by guarding the upsert in ops.rs.",
+    )
+    .await;
+    write_with_summary(
+        &fx,
+        "sessions/b.md",
+        DUP_B,
+        "Fixed the flaky sweep test by guarding the upsert in ops.rs.",
+    )
+    .await;
+    write(&fx, "sessions/far.md", K8S_A).await;
+    for p in ["sessions/a.md", "sessions/b.md", "sessions/far.md"] {
+        backdate_latest(&fx, p, COLD_DAYS);
+    }
+
+    let llm = FakeMergeLlm::new();
+    let report = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &dream_on(),
+        &DreamCancel::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.clusters_merged, 1, "the merge applied: {report:?}");
+    let merge = &report.merges[0];
+    let loser_path = merge.merged[0].clone();
+
+    let fm = latest_frontmatter(&fx, &loser_path);
+    assert!(
+        !fm.contains_key("summary"),
+        "the stub carries no summary of content that moved: {fm:?}"
+    );
+    assert!(
+        !fm.contains_key("abstract"),
+        "and no abstract, so it is not re-embedded into the abstract stream: {fm:?}"
+    );
+    // Control: the merge markers are still written, so the removal above did
+    // not simply discard the stub's whole frontmatter.
+    assert_eq!(fm.get("compacted"), Some(&serde_json::Value::Bool(true)));
+    assert_eq!(
+        fm.get("merged_into").and_then(serde_json::Value::as_str),
+        Some(merge.survivor.as_str())
+    );
+
+    // Control: the pre-merge summary is still reachable through supersession,
+    // so the test cannot pass because the summary was never written at all.
+    let history = superseded_frontmatter(&fx, &loser_path);
+    assert!(
+        history.iter().any(|fm| fm
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.contains("guarding the upsert"))),
+        "the pre-merge frontmatter stays in the chain: {history:?}"
+    );
+
+    // What retrieval now says about the stub: the merge note, not the fix.
+    let descriptor = project_descriptor(&fx, &loser_path).await;
+    assert!(
+        descriptor.contains("merged into"),
+        "the stub describes itself as a merge note: {descriptor}"
+    );
+    assert!(
+        !descriptor.contains("guarding the upsert"),
+        "and no longer promises the fix that moved to the survivor: {descriptor}"
+    );
+}
+
+/// Fake provider whose merged body carries a cross-scope wikilink into a
+/// project that does not exist. The merge prompt forbids inventing one, but a
+/// prompt is not a guarantee (#1218), and the member bodies are injected
+/// verbatim, so a `[[project:path]]` reaches the survivor either way.
+struct FakeGhostLinkLlm;
+
+impl LlmProvider for FakeGhostLinkLlm {
+    fn name(&self) -> &'static str {
+        "fake-ghost"
+    }
+    fn model(&self) -> &str {
+        "dream-merge"
+    }
+    fn complete<'life0, 'async_trait>(
+        &'life0 self,
+        _request: ChatRequest,
+    ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            Ok(ChatResponse {
+                text: "unused".into(),
+                usage: None,
+                model: "dream-merge".into(),
+            })
+        })
+    }
+    fn complete_structured_raw<'life0, 'async_trait>(
+        &'life0 self,
+        _request: ChatRequest,
+        _schema: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "title": "Dream Merge",
+                "body_markdown": "Dream-merged coherent page covering \
+                     crates/ai-memory-store/src/ops.rs and \
+                     crates/ai-memory-store/src/reader.rs. \
+                     See [[ghost:notes/missing.md]] for the rest.",
+            }))
+        })
+    }
+}
+
+/// #1218: a cross-scope link in the merged body must be de-linked before the
+/// survivor is written, exactly as the consolidator and bootstrap writes
+/// already do. Otherwise the dream pass mints a dangling cross-project edge
+/// that `dangling_cross_project_links` reports on every later lint run and
+/// nothing in the pipeline can clear.
+#[tokio::test]
+async fn dream_merge_delinks_an_unresolvable_cross_scope_link() {
+    let fx = seed_fixture(true).await;
+    write(&fx, "sessions/a.md", DUP_A).await;
+    write(&fx, "sessions/b.md", DUP_B).await;
+    for p in ["sessions/a.md", "sessions/b.md"] {
+        backdate_latest(&fx, p, COLD_DAYS);
+    }
+
+    let report = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&FakeGhostLinkLlm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &dream_on(),
+        &DreamCancel::new(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.clusters_merged, 1, "the merge applied: {report:?}");
+    assert_eq!(report.skipped, 0, "the guard de-links, it does not skip");
+
+    // The label survives as prose; the brackets — and the edge — do not.
+    let survivor_body = latest_body(&fx, &report.merges[0].survivor);
+    assert!(
+        survivor_body.contains("ghost:notes/missing.md"),
+        "the label stays readable: {survivor_body}"
+    );
+    assert!(
+        !survivor_body.contains("[["),
+        "the unresolvable link is de-linked: {survivor_body}"
+    );
+
+    // And the lint pass has nothing to report.
+    let dangling = fx
+        .store
+        .reader
+        .dangling_cross_project_links(fx.ws, fx.proj)
+        .await
+        .unwrap();
+    assert!(
+        dangling.is_empty(),
+        "no dangling cross-project edge was minted: {dangling:?}"
     );
 }

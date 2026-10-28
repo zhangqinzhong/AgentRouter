@@ -133,6 +133,11 @@
   `additionalContext`. Without the rule, ask Grok to list and then accept the
   handoff. Zero still must call `memory_handoff_list` then
   `memory_handoff_accept`.
+- **"What changed in this project recently?"** From a shell, `ai-memory recent`
+  lists the newest wiki pages, with RFC 3339 timestamps and relative ages.
+  Add `--global` to cover every project, or `--json` for a machine-readable
+  list. The agent's `memory_recent` tool is the same recency listing inside a
+  session.
 - **"What did we decide about X six weeks ago?"** Use `memory_query X` from
   the agent for FTS5 fused with entity matches and linked-page expansion (plus
   vector similarity when an embedder is configured). For a quick terminal-only

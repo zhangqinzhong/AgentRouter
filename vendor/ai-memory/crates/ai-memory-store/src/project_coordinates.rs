@@ -174,6 +174,19 @@ pub(crate) fn matches(
         .collect()
 }
 
+/// Whether this connection's schema carries the derived coordinate keys
+/// (`canonical_name`/`legacy_name`, V76).
+///
+/// Every project-coordinate query indexes those columns, so it cannot run
+/// against a store an in-flight migration has not reached yet — which is what
+/// the migration fixtures do when they build a project row on the old schema.
+/// The lookup falls back to a plain insert there, exactly as it always did.
+pub(crate) fn supports_coordinates(conn: &Connection) -> StoreResult<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM pragma_table_info('projects') WHERE name = 'legacy_name'")?
+        .exists([])?)
+}
+
 pub(crate) fn resolve(
     conn: &Connection,
     workspace_id: WorkspaceId,

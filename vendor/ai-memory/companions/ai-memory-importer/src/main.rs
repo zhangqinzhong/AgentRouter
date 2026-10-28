@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use url::Url;
 use walkdir::WalkDir;
 
 mod agentmemory;
+mod document;
 mod mcp;
 #[cfg(test)]
 mod test_http;
@@ -45,6 +47,8 @@ enum Commands {
     AgentmemoryVault(agentmemory::vault::VaultArgs),
     /// Import an agentmemory `ExportData` JSON file.
     AgentmemoryExport(agentmemory::export::ExportArgs),
+    /// Extract one bounded local document into an attributed wiki page.
+    Document(document::DocumentArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -308,6 +312,7 @@ async fn main() -> Result<()> {
         Commands::ExternalConversation(args) => run_conversation(args).await,
         Commands::AgentmemoryVault(args) => agentmemory::vault::run(args).await,
         Commands::AgentmemoryExport(args) => agentmemory::export::run(args).await,
+        Commands::Document(args) => document::run(args).await,
     }
 }
 
@@ -951,8 +956,10 @@ fn write_manifest(path: &Path, entries: &[ManifestEntry]) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent
         && !parent.exists()
     {
         bail!(
@@ -960,23 +967,22 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             parent.display()
         );
     }
-    let tmp = temp_path_for(path)?;
-    fs::write(&tmp, bytes)?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(err.into())
-        }
-    }
-}
-
-fn temp_path_for(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("manifest path must include a file name"))?;
-    Ok(path.with_file_name(format!(".{file_name}.tmp")))
+    let directory = parent.unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
 }
 
 fn plan_omc_wiki(
@@ -1485,6 +1491,38 @@ mod tests {
                 {"role": "assistant", "content": "To make backpressure explicit."}
             ]
         })
+    }
+
+    #[test]
+    fn atomic_manifest_write_replaces_existing_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("manifest.json");
+        atomic_write(&path, b"first").unwrap();
+        atomic_write(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_manifest_write_does_not_follow_legacy_predictable_temp_symlink() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("manifest.json");
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&victim, temp.path().join(".manifest.json.tmp")).unwrap();
+
+        atomic_write(&path, b"manifest").unwrap();
+
+        assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
+        assert_eq!(fs::read(path).unwrap(), b"manifest");
     }
 
     #[test]

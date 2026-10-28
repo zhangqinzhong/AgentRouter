@@ -80,6 +80,30 @@ fn purge_summary_line(verb: &str, label: &str, report: &serde_json::Value) -> St
     line
 }
 
+/// The exact command that performs the purge the refusal just previewed.
+///
+/// Rebuilt from `args` rather than hand-written, the same way
+/// `move_session::apply_command` does, so the printed command cannot drift
+/// from the request the preview was computed with. Every flag the operator
+/// passed has to reappear here: the preview above was computed WITH
+/// `force`/`compact`, so a command that silently dropped them would not
+/// reproduce the operation the operator was just shown — and a dropped
+/// `--force` means the server answers the pasted command with a 409 `managed
+/// run lease is active`, which is the exact condition `--force` exists to
+/// override.
+fn confirm_command(workspace: &str, target_flag: &str, args: &PurgeProjectArgs) -> String {
+    let workspace = super::render_shared::native_shell_quote(workspace);
+    let mut cmd = format!("ai-memory purge-project --workspace {workspace} {target_flag}");
+    if args.force {
+        cmd.push_str(" --force");
+    }
+    if args.compact {
+        cmd.push_str(" --compact");
+    }
+    cmd.push_str(" --confirm");
+    cmd
+}
+
 /// Decide what to print, if anything, before the refusal — pure, so it is
 /// unit-tested without a server. `fallback_label` is used only when the
 /// server's own report has no `label` field.
@@ -92,6 +116,29 @@ fn preview_message(outcome: &PreviewOutcome, fallback_label: &str) -> Option<Str
         PreviewOutcome::Refused { status, body } => Some(refused_message(*status, body)),
         PreviewOutcome::Ignored | PreviewOutcome::OlderServer | PreviewOutcome::Unreachable => None,
     }
+}
+
+/// Warning printed when `--confirm` is used without naming the target.
+///
+/// The derived name is correct only when the operator is standing in the
+/// checkout they mean. `--confirm` typed from the wrong directory deletes
+/// that directory's project, and nothing in the request distinguishes the two
+/// cases, so the command names what it resolved and how to say it explicitly
+/// (#1642). Enforcing the explicit name outright would remove an existing
+/// invocation, so this stays a deprecation until the next major.
+fn derived_target_warning(
+    workspace: &str,
+    target_flag: &str,
+    target_label: &str,
+    args: &PurgeProjectArgs,
+) -> String {
+    format!(
+        "warning: purge-project --confirm without --project or --project-id is deprecated and \
+         will be refused in ai-memory 4.0.\n\
+         This directory resolves to {workspace}/{target_label}\n\n\
+         If that is the project to purge, name it:\n\n  {}",
+        confirm_command(workspace, target_flag, args),
+    )
 }
 
 /// Run the `purge-project` subcommand.
@@ -122,16 +169,19 @@ fn preview_message(outcome: &PreviewOutcome, fallback_label: &str) -> Option<Str
 /// preview surfaced), the server is unreachable, or the server returns a
 /// non-2xx response.
 pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
     // An id target skips name resolution entirely: `resolve_scope` would
     // auto-derive a project name from the CWD, which is exactly the ambiguity
     // `--project-id` exists to sidestep. The workspace still resolves the
     // normal way (marker, else `default`), since the server needs it to scope
     // the id lookup.
-    let (workspace, project, project_id) = match args.project_id {
+    let (workspace, project, project_id) = match &args.project_id {
         Some(id) => (
             super::resolve_workspace(config, args.workspace.as_deref())?,
             None,
-            Some(id),
+            Some(id.clone()),
         ),
         None => {
             let (ws, project) =
@@ -143,8 +193,20 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
     // the preview's fallback label. A `--project-id` run has no resolved name
     // to print, so the id stands in.
     let (target_flag, target_label) = match (&project, &project_id) {
-        (Some(project), _) => (format!("--project {project}"), project.clone()),
-        (None, Some(id)) => (format!("--project-id {id}"), id.clone()),
+        (Some(project), _) => (
+            format!(
+                "--project {}",
+                super::render_shared::native_shell_quote(project)
+            ),
+            project.clone(),
+        ),
+        (None, Some(id)) => (
+            format!(
+                "--project-id {}",
+                super::render_shared::native_shell_quote(id)
+            ),
+            id.clone(),
+        ),
         (None, None) => bail!("one of --project or --project-id is required"),
     };
 
@@ -165,14 +227,20 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
         }
         bail!(
             "purge-project is destructive and irreversible.\n\
-             Re-run with --confirm to proceed:\n\n  \
-             ai-memory purge-project --workspace {} {} --confirm",
-            workspace,
-            target_flag,
+             Re-run with --confirm to proceed:\n\n  {}",
+            confirm_command(&workspace, &target_flag, &args),
         );
     }
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    // The name was derived, not typed: say so before the irreparable step, and
+    // name the exact command that would have been unambiguous (#1642).
+    if args.project.is_none() && args.project_id.is_none() {
+        eprintln!(
+            "{}",
+            derived_target_warning(&workspace, &target_flag, &target_label, &args)
+        );
+    }
     let report: serde_json::Value = post_json(
         &endpoint,
         "/admin/purge-project",
@@ -246,6 +314,62 @@ mod tests {
             "compacted": false,
             "dry_run": dry_run,
         })
+    }
+
+    fn args() -> PurgeProjectArgs {
+        PurgeProjectArgs {
+            force: false,
+            workspace: Some("default".into()),
+            project: Some("my-project".into()),
+            project_id: None,
+            confirm: false,
+            compact: false,
+        }
+    }
+
+    /// The command the refusal hands the operator must round-trip every flag
+    /// they passed. The preview printed just above it was computed WITH
+    /// `force`, so a command missing `--force` does not reproduce the
+    /// operation the operator was shown — it gets a 409 `managed run lease is
+    /// active` from the server, on exactly the condition `--force` suppresses.
+    #[test]
+    fn confirm_command_repeats_force_and_compact() {
+        let mut a = args();
+        a.force = true;
+        a.compact = true;
+        assert_eq!(
+            confirm_command("default", "--project my-project", &a),
+            "ai-memory purge-project --workspace default --project my-project \
+             --force --compact --confirm"
+        );
+    }
+
+    /// And the mirror: a run with neither flag must not start emitting flags
+    /// nobody asked for — pasting `--force` into a plain purge would silently
+    /// widen it to delete a live run's lease.
+    #[test]
+    fn confirm_command_omits_flags_the_operator_did_not_pass() {
+        let mut a = args();
+        a.project = None;
+        a.project_id = Some("0192b6a1-4c2e-7d3f-8a5b-1234567890ab".into());
+        assert_eq!(
+            confirm_command(
+                "default",
+                "--project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                &a
+            ),
+            "ai-memory purge-project --workspace default \
+             --project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab --confirm"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn confirm_command_quotes_free_form_scope_names() {
+        assert_eq!(
+            confirm_command("team space", "--project 'api; echo nope'", &args()),
+            "ai-memory purge-project --workspace 'team space' --project 'api; echo nope' --confirm"
+        );
     }
 
     /// Pins the exact wording and field order a script would grep for.
@@ -484,5 +608,112 @@ mod tests {
         let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
         assert!(matches!(outcome, PreviewOutcome::Unreachable));
         assert!(preview_message(&outcome, "default/scratch").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // #1642: `--confirm` without a named target.
+    //
+    // Making the name mandatory removes an invocation a script may rely on,
+    // so this ships as a deprecation: the purge still happens, and it now says
+    // what it resolved and how to name it. An explicitly empty flag, which
+    // silently resolved to the same derived target, is refused outright.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn derived_target_warning_names_the_resolved_project_and_the_command() {
+        let mut a = args();
+        a.project = None;
+        a.confirm = true;
+        let warning = derived_target_warning("default", "--project api", "api", &a);
+        assert!(
+            warning.contains("deprecated and will be refused in ai-memory 4.0"),
+            "the warning must say when it starts refusing: {warning}"
+        );
+        assert!(
+            warning.contains("This directory resolves to default/api"),
+            "the warning must name the target the delete would reach: {warning}"
+        );
+        assert!(
+            warning.contains("ai-memory purge-project --workspace default --project api --confirm"),
+            "the warning must hand over the unambiguous command: {warning}"
+        );
+    }
+
+    /// The empty string is the whole bypass: `resolve_scope` reads it as
+    /// absent, so `--project ""` used to purge the derived target while
+    /// looking like a named run. Nothing may reach the wire.
+    #[tokio::test]
+    async fn an_empty_project_flag_is_refused_before_any_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, hits) = spawn_counting_server().await;
+        let mut a = args();
+        a.project = Some(String::new());
+        a.project_id = None;
+        a.confirm = true;
+        let error = run(&config_for(&tmp, url), a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            *hits.lock().await,
+            0,
+            "the refusal must precede the request"
+        );
+    }
+
+    /// The behaviour this release keeps: a confirmed purge whose target came
+    /// from the checkout still runs, and lands on the derived project.
+    #[tokio::test]
+    async fn a_confirmed_purge_with_a_derived_target_still_purges() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::write(checkout.join(".ai-memory.toml"), "project = \"scratch\"\n").unwrap();
+        let (url, hits) = spawn_counting_server().await;
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            server_url: url,
+            runtime_env: crate::config::RuntimeEnv::with_host_cwd_for_tests(
+                checkout.to_str().unwrap(),
+            ),
+            ..Config::default()
+        };
+        let mut a = args();
+        a.project = None;
+        a.workspace = None;
+        a.confirm = true;
+        run(&config, a).await.unwrap();
+        assert_eq!(*hits.lock().await, 1, "the confirmed purge must be sent");
+    }
+
+    /// Serves the purge report and counts the requests that reached it.
+    async fn spawn_counting_server() -> (String, std::sync::Arc<tokio::sync::Mutex<u32>>) {
+        let hits = std::sync::Arc::new(tokio::sync::Mutex::new(0_u32));
+        let counter = std::sync::Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/admin/purge-project",
+            axum::routing::post(move || {
+                let counter = std::sync::Arc::clone(&counter);
+                async move {
+                    *counter.lock().await += 1;
+                    axum::Json(serde_json::json!({
+                        "label": "default/scratch",
+                        "pages_deleted": 1, "sessions_deleted": 0, "observations_deleted": 0,
+                        "handoffs_deleted": 0, "embeddings_deleted": 0,
+                        "collateral_observations_deleted": 0, "collateral_handoffs_denulled": 0,
+                        "workstreams_deleted": 0, "managed_runs_deleted": 0,
+                        "workstream_ids": [], "files_deleted": [], "files_failed": [],
+                        "compacted": false, "dry_run": false,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), hits)
     }
 }

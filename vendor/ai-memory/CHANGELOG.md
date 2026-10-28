@@ -11,6 +11,1271 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.2.5] - 2026-10-25
+
+### Fixed
+
+- `ai-memory backup` and `ai-memory backup-agents` now carry a size that
+  would round to `1024.00` of the current unit into the next one. A backup
+  of 1 MiB - 5 bytes was printed as `1024.00 KiB` (#1705).
+- The OKF migration dialog now carries an archive size that would round to
+  `1024.0` of the current unit into the next one. An archive of 1 MB - 51
+  bytes was printed as `1024.0 KB` (#1706).
+
+## [3.2.4] - 2026-10-25
+
+### Security
+
+- A restricted project now stays closed when its access-mode or grant query
+  fails. The common authorization resolver previously degraded these store
+  failures to an open project, so an unrelated authenticated user could gain
+  access during a database fault. Unknown projects and forward-unknown access
+  modes retain their compatibility behavior, and normal root, creator and
+  grant access is unchanged.
+- Human-auth endpoints now log unexpected store and task failures server-side
+  and return a stable `authentication unavailable` response. Login and
+  recovery previously returned raw SQLite or task error text before the caller
+  authenticated; password-change conflicts also no longer expose store errors.
+
+### Fixed
+
+- `ai-memory move-session` now refuses explicitly empty scope flags
+  (`--from-project`, `--from-workspace`, `--to-workspace`, and `--to`) before
+  sending any request. Passing an empty string like `--from-project ""` previously
+  bypassed the flag check while falling back to deriving the project from the
+  current working directory, which triggered an unintended batch move of all
+  sessions from the current repository (#1698).
+
+- `ai-memory delete-page` now refuses explicitly empty scope flags (`--workspace`
+  and `--project`) as well as an empty `--path` before sending any request.
+  Passing an empty `--project ""` previously bypassed the flag check while falling
+  back to deriving the project from the current working directory, which risked
+  deleting the page from the local repository (#1700).
+
+- `ai-memory rename-workstream` now refuses explicitly empty scope flags
+  (`--workspace` and `--project`) as well as empty workstream names (`--from`
+  and `--to`) before inspecting the repository or sending any request.
+  Passing an empty `--project ""` previously bypassed the flag check while
+  falling back to resolving the project from the current working directory (#1702).
+
+- Fixed `ai-memory setup` treating another service's HTTP 200 response as a
+  healthy ai-memory server. Setup now checks the bounded `/healthz` JSON,
+  reports an occupied address with port/configuration remedies, and skips
+  MCP/admin probes when the health response is unrecognized (#1647).
+
+- Preserved repository edits saved while `ai-memory-wikisync export --apply`
+  fetched server pages. Export now rechecks each file before replacing it,
+  as two-way sync already did, and refuses a changed file even with `--force`
+  without advancing its export state (#986).
+
+- Codex's own memory-writing agent no longer appears as captured sessions.
+  Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
+  (the default `~/.codex/memories`) to consolidate its memory; the hooks
+  captured each run as a normal session, so one project of 78 sessions and
+  ~2,600 observations existed for work nobody did, and it returned with the
+  next run after a purge. Those events are now accepted and stored nowhere,
+  recognized by the directory (any `…/.codex/memories`) or by the agent's
+  `## Memory Writing Agent` prompt header, and transcript imports
+  (`backfill`, the `run` ledger, `recover`) skip them for the same reason
+  (#1674).
+
+- `memory_query(answer=true)` now validates model-generated citation paths
+  against the snippets supplied in that request. Unknown paths and paths
+  shared by distinct page versions withhold the answer, while retrieval hits
+  remain available with an `answer_unavailable` note. Repeated citations are
+  deduplicated in model order; the default query path makes no added calls
+  (#1682).
+- `ai-memory write-page` and `restore-page` now print the last eight
+  characters of the page id instead of the first eight. Page ids are UUIDv7,
+  so the first eight are a timestamp prefix that every page written within
+  about a minute shares, and the printed `page_id` was the same for all of
+  them. The web UI already shortens ids this way (#1693).
+
+## [3.2.3] - 2026-10-24
+
+### Changed
+
+- `ai-memory hook` and `ai-memory hook-drain` now run on a single-threaded
+  tokio runtime. Both are spawned once per agent event and answer one request,
+  and the multi-threaded default started a worker thread per CPU before the
+  command did any work: on a 32-core machine every hook call paid to spawn and
+  join 32 threads for one short HTTP request. Every other subcommand keeps the
+  multi-threaded runtime (#1669).
+
+- `purge-project --confirm` without `--project`/`--project-id` now prints the
+  project it resolved from the current directory and the equivalent command
+  that names it, before the irreversible request. Naming the target will be
+  required in 4.0: from the wrong directory the derived name is the one project
+  nobody meant to delete, and a flag that spells it out is the only way to tell
+  the two cases apart (#1642).
+
+### Fixed
+
+- A capture whose `.ai-memory.toml` names a promoted project's old name (its
+  v2 basename, now the project's `legacy_name`) no longer creates a second,
+  empty project under that name. The read path already resolved the old name
+  to the promoted project, so the twin made every later lookup of that name
+  fail as ambiguous until it was purged — and the next capture from the same
+  checkout created it again. The capture path now reuses the project the read
+  path resolves, and refuses an already-ambiguous name instead of adding a
+  third row (#1657).
+- The cross-project profile no longer promotes an agent task brief into a
+  default for every project. Two more filters now apply: a prompt that wraps a
+  transcript or asks for a verbatim reply is the signature of a program
+  driving the agent through its SDK, and none of it is harvested; and a
+  sentence that switches off one of the agent's own capabilities ("Do not use
+  any tools.", "Never call browser_close") only becomes a preference when it
+  states cross-project scope. Two scripted one-shot prompts had reached
+  `min_projects` and shipped "do not use any tools" as a `tools` default with
+  confidence 0.95, which made agents ask for facts instead of looking them up
+  in the wiki they were already in (#1648).
+- `purge-project --project ""`, and an empty `--project-id`/`--workspace`/
+  `--from`/`--to-workspace` on `move-project`, `purge-session` and
+  `rename-project`, are now refused before anything is sent. An empty flag
+  passed the "was the target named" check and then resolved as if it had been
+  omitted, so a script that passed an unset variable reached the project its
+  current directory resolved to — a real purge from an explicit-looking
+  invocation (#1642).
+- `ai-memory workstream-search` now labels a historical tool call or tool
+  result as completed evidence, as the managed-workstream docs describe. Its
+  text output used the event's role, which every transcript adapter sets to
+  `assistant` on a tool call, so a past command read like an assistant action
+  still to run (#1629).
+- `install-hooks --agent grok` run from the home directory no longer stops
+  with "Grok project configuration ~/.grok/config.toml may override
+  GROK_HOME". With the default `GROK_HOME` that file is Grok's own user
+  config, which Grok reads only as the user layer (`grok inspect` reports no
+  project layer there), so it is no longer mistaken for a project overlay. A
+  real overlay is still refused, including `~/.grok/config.toml` when
+  `GROK_HOME` points elsewhere (#1636).
+- The OpenCode, OpenCode 2, OpenClaw, Pi and OMP integrations installed with
+  `--capture-mode allowlist` no longer send the handoff (or OpenCode's recap)
+  request from a repository without a `.ai-memory.toml` marker. They already
+  dropped its capture, but the server answers that request by resolving the
+  directory into a project, so opening one of these agents in an unmarked
+  directory left an empty project named after it. The native hook already
+  returned before the request; these integrations call the server directly
+  (#1641).
+- An auto-improve full-page proposal is now rejected when its body has two
+  identical headings or more than one H1, the two checks the patch path
+  already applies to every body it materializes. A full-page proposal is
+  auto-approved whenever approval is not required, and the page it wrote was
+  then permanently un-patchable: the patch path refuses on the target's own
+  duplicate headings before it materializes any edit, so no later proposal
+  could repair it (#1635).
+- `memory_feedback` now answers a path with no current page in the resolved
+  project with `invalid_params` (-32602) rather than `internal_error`
+  (-32603). An absent caller-supplied target is the request being wrong, not
+  the server failing, and -32603 tells a client to retry a path that can
+  never succeed. This was the last tool reporting an absent target as a
+  server fault; genuine store failures are still `internal_error`, and the
+  message is unchanged (#1634).
+- A Qwen Code `UserPromptSubmit` body is now capped and scrubbed before the
+  native hook spools it. The per-event cap covered `prompt`, `message` and
+  `text`, but Qwen's prompt arrives in `submitted_prompt` — the field the
+  harness-specific extraction reads — so a Qwen prompt reached the local spool
+  and the server at full length with no client-side redaction pass. The field
+  is now capped alongside its siblings; nothing falls back to the generic
+  `prompt`, so submission provenance is unchanged (#1633).
+- The forget sweep now keeps an already-compacted page terminal when
+  `compact_cold_episodic` is off — the default everywhere. The guard that made
+  a page carrying the V65 `compacted_at` marker "neither re-compacted nor
+  evicted" sat inside the compaction arm only, so with compaction off such a
+  page was tombstoned and then hard-deleted. The marker is not A2's alone: the
+  A3 cold-cluster dedup merge-note stub and the B2 dream pass both stamp
+  `compacted: true` under their own flags, so the durable residue a merge chose
+  to keep could be destroyed without anyone enabling compaction. A
+  non-compacted cold page is still evicted exactly as before (#1632).
+- A project whose every page has passed its TTL is read as new again when
+  the profile digest sizes itself. The newness probe was the one `pages` read
+  in the profile module without the expiry guard its three siblings apply, so
+  such a project still counted as having memory: it got the smaller
+  established-project digest and lost the note offering
+  `ai-memory profile apply`, with no live page left to show for it (#1631).
+- The first start after the 3.2.0 upgrade no longer slows down as the
+  one-time CJK index backfill (V87) progresses. Each batch filtered the source
+  table from its first row again, so the pass probed every row it had already
+  indexed once more per batch: quadratic in the row count, and hours of
+  startup on a store with 1.6 million observations while `serve` answered
+  nothing. Each batch now resumes after the last rowid it indexed, so every
+  row is examined once (#1652).
+- Restoring a page from a checkpoint (`/admin/restore-page`) no longer
+  rewrites the restored file's `generated.at` to the current time when the
+  checkpoint is already OKF-conformant. The restore now keeps the
+  checkpoint's own timestamp when conformance leaves the rest of its
+  frontmatter unchanged and the file on disk holds other content, so a
+  checkpoint emitted by ai-memory restores byte for byte whatever the clock.
+  When the file on disk already holds the same content, its timestamp is kept
+  so file and row stay aligned; checkpoints that need conformance still go
+  through the existing inheritance and stamping rules (#1671).
+- The native Windows Docker wrapper now recognizes `upgrade` after valid
+  `--config` or `--data-dir` global options and pulls the image instead of
+  forwarding `upgrade` into the helper container. Unknown and malformed
+  options still reach the CLI parser (#1667).
+- `ai-memory run codex` no longer starts a new session when Codex has
+  compressed the linked rollout. Codex keeps a rollout it has not written for
+  a week as `rollout-*.jsonl.zst`, which the launcher did not recognize, so it
+  reported the session as missing and repointed the workstream to a fresh one.
+  The compressed copy is now read for the resume, the pre-launch baseline and
+  the transcript import, and the plain file wins when both exist. `backfill`
+  and the session listings see compressed Codex sessions too (#1653).
+- Updated tokio to 1.54.1 in the server, relay, importer and wikisync
+  lockfiles. 1.52.3 and the 1.53.x releases before 1.53.3 fall inside
+  RUSTSEC-2026-0386, an unsound advisory for `AsyncFd` constructors that
+  nothing here calls, and the `cargo-deny` gate failed on every pull request
+  from the moment the advisory was assigned (#1658).
+- A write that names an ambiguous project now reports the workspace it was
+  resolved in. The refusal read "project 'api' is ambiguous in workspace 'the
+  resolved workspace'" on the write path (`ai-memory run`, explicit MCP
+  writes, profile writes), while the read path already named the workspace
+  (#1657).
+- `ai-memory user list` and `ai-memory api-key list` now size their columns
+  by terminal display width rather than bytes, as `list-projects` and the
+  grants tables already do. An accented username, display name or key label
+  no longer widens its column with phantom padding, and a double-width CJK
+  name no longer shifts the cells after it (#1625).
+
+- `install.sh` now runs its smoke test of the downloaded binary from beside
+  the install directory (`~/.local/lib`), not from the temporary work
+  directory. On a host whose `/tmp` or `TMPDIR` is mounted `noexec`, nothing
+  can be executed there, so the install stopped with "the downloaded binary
+  does not run on this machine" for a release that runs from where it is
+  installed. A binary that really does not run is still refused, naming the
+  directory it was tried from, and its staged copy is removed (#1623).
+- The document importer no longer drops a VTT or SRT cue that follows two
+  blank lines (or any even number of them). The subtitle reader split cues on
+  a single blank line, so the extra one was left at the top of the next block,
+  and a block that started with an empty line was skipped whole. A WebVTT file
+  whose header was followed by two blank lines lost its first cue, or was
+  rejected as containing no extractable text when that was its only cue.
+  WebVTT allows any number of blank lines between blocks; the reader now skips
+  them before reading a block.
+- The example auto-improve eval scorers in `docs/examples/auto-improve-eval/`
+  no longer reject pages written in a language other than English. They
+  required `## Purpose`/`## Overview` and `## Steps`/`## Checklist` headings in
+  procedures and English imperatives in rules, and read the Portuguese and
+  Spanish word "todo" as a TODO placeholder, so a correct procedure in
+  Portuguese or Japanese failed. They now check structure only: an H1, an
+  upper-case TODO/TBD, a `##` section and a list of steps, text beyond the
+  heading and its length counted in characters. `score_proposal.sh` no longer
+  embeds Python: it is the same scorer in POSIX `sh` and `awk`, so it runs in
+  the official Docker image, which has no `python3`. The docs no longer call
+  the Python scorer dependency-free and say how to point the eval command at a
+  script inside the container (#1640).
+- Kimi Code gets the compiled project brief on the first prompt of a session
+  only, also in a checkout outside `$HOME` whose only `[briefing]` opt-in is
+  the operator-home marker. The handoff request takes the home marker as its
+  fallback for any cwd, but the once-per-session gate looked for a marker with
+  a walk that stops at the checkout root outside `$HOME`. The gate stayed
+  shut, no brief marker was written, and every prompt asked for the brief
+  again. The gate now reads the same marker as the request (#1665).
+- The startup warning about unusable proxy variables now also fires when the
+  user name or password in `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (or a
+  lower-case spelling) holds an unencoded `#`, `/` or `?`. The URI grammar
+  ends the host at that character, so the client sent provider and login
+  requests to a host made of the start of the credentials, such as
+  `alice:18080` for `http://alice:18080#k@proxy.example:3128`, and the failure
+  looked like a connection error to a host nobody configured. The warning
+  names the variable and the character, not the value, and the network
+  behaviour is unchanged (#1637).
+
+## [3.2.2] - 2026-10-22
+
+### Fixed
+
+- Fallback-provider circuits now honor bounded retry hints instead of retrying
+  a quota-exhausted candidate every 30 seconds. HTTP `Retry-After` takes
+  precedence; Gemini's `google.rpc.RetryInfo.retryDelay` is read from the full
+  scrubbed error body before its diagnostic text is cut to 1 KiB. Hints are
+  clamped to 30 seconds through one hour, remain scoped to one chain entry, and
+  never enlarge the logged provider body (#1619).
+- Fixed the PowerShell Docker wrapper leaving native managed commands without
+  the root bearer stored in a named volume. Native `install-hooks` now refreshes
+  a host copy under the user's local app-data directory once, and `run`,
+  `show`, `continue`, `resume`,
+  `workstreams`, and `rename-workstream` reuse it without starting a container;
+  explicit token and bind-mounted data-dir settings still take precedence
+  (#1603).
+- Fixed Antigravity print-mode managed runs recording no user prompt because
+  `agy --prompt` does not append to shared `history.jsonl`. When that history
+  yields no prompt, export now reads only explicit `USER_INPUT` records from
+  the conversation's bounded, containment-checked brain transcript (#1605).
+- Kept Claude Code's combined SessionStart context below its fixed 10,000
+  character inline limit. Profile and handoff sections are independently
+  bounded, must-see handoff/continuity/inbox notices take priority, and an
+  omitted managed ledger leaves a `workstream-search` pointer instead of
+  pushing the entire response into an unread file (#1606).
+
+- Corrected the startup error for a gap in SQLite migration history. A
+  skipped earlier migration is now reported as missing from the history,
+  instead of claiming the store is newer than the binary. The store still
+  refuses to open until its migration history can be reviewed (#1612).
+
+- Fixed the POSIX Docker wrapper routing host commands into the helper
+  container when `--config` or `--data-dir` preceded the command. Managed
+  launches, MCP bridges and lifecycle hooks now retain their native host
+  route and complete argument list with either global-option syntax (#1602).
+
+- Fixed native transcript imports dropping a whole session when one JSONL
+  record exceeded the 1 MiB per-record cap, as a Claude Code screenshot in a
+  tool result does: `ai-memory backfill` imported nothing from the session,
+  and an `ai-memory run` recorded its transcript import as failed. The record
+  is now skipped as an extraction loss, its tail read in bounded chunks that
+  still count toward the 64 MiB source cap, and the rest of the session is
+  imported; a record still being written is left for the next read, not
+  skipped half-way. The transcript baseline steps over it the same way, so a
+  degraded run's recovery cursor and its exact replay agree. An annotation
+  marks the gap, and shows in a managed run's ledger as an import note, so the
+  capture policy fails closed: a tool result without a call id (Kimi, Grok)
+  later in the same turn is treated as an orphan, since the skipped record may
+  have been its call under an ignored path. `backfill` and `recover` print how
+  many records they skipped on stderr, `backfill` also under `--quiet`
+  (#1613).
+
+- The `user grants` and `project grants` tables now measure terminal display
+  cells, so accented and double-width CJK workspace, project and user names
+  keep the `USERNAME` and `LEVEL` columns aligned.
+  ([#1564](https://github.com/akitaonrails/ai-memory/pull/1564))
+- The LLM dream pass no longer writes a cross-scope wikilink that does not
+  resolve. Every other consolidation write runs its proposed bodies through the
+  cross-scope link guard, but the dream pass never did, so a `[[project:path]]`
+  carried in from a cluster member's body — or invented by the model — reached
+  the merged survivor and minted a dangling cross-project edge that the lint
+  pass reported on every later run and nothing could clear.
+  ([#1566](https://github.com/akitaonrails/ai-memory/pull/1566))
+- The desktop installer no longer hangs on "Starting the setup page" when
+  `ai-memory setup --web` logs heavily. It read the child's stdout for the
+  whole run and its stderr only afterwards, so once that unread pipe filled
+  (64 KiB) the child blocked on its next log line and never printed the page's
+  address, leaving the window on the status line with no error. Both streams
+  are now read at the same time.
+  ([#1567](https://github.com/akitaonrails/ai-memory/pull/1567))
+- The importer no longer carries a UTF-8 BOM into an imported text or Markdown
+  document. `document --file notes.md` on a file saved with a BOM — what
+  Notepad, VS Code's `utf8bom` encoding and Excel's "CSV UTF-8" export all
+  write — stored a body beginning `\u{feff}# Overview`, so the first heading
+  stopped being a heading. Nothing downstream removed it, since U+FEFF is
+  neither whitespace nor a control character, and the transcript extractor in
+  the same file already stripped it.
+  ([#1568](https://github.com/akitaonrails/ai-memory/pull/1568))
+- A workbook that contains a chartsheet now imports its worksheets instead of
+  failing outright. OOXML lists chartsheets and dialogsheets as `<sheet>`
+  elements alongside worksheets and only the relationship type tells them
+  apart, so a chart tab created by Excel's "Move Chart -> New sheet" had no
+  worksheet relationship and aborted the whole extraction; a workbook of only
+  chartsheets still reports that it contains no worksheets.
+  ([#1569](https://github.com/akitaonrails/ai-memory/pull/1569))
+- Skip an oversized session-header record instead of failing the read when the size cap's boundary cuts a multi-byte character, so one unreadable transcript no longer aborts discovery or lookup for the other sessions beside it ([#1570](https://github.com/akitaonrails/ai-memory/pull/1570))
+- `/api/v1/search` no longer tells the browser it may reuse a search response
+  for 30 seconds. The handler takes an owner filter that reaches the hybrid
+  ranker, so both the ranking and each hit's observation snippet depend on who
+  asked, and a credential switch at the same URL inside that window could be
+  answered from the browser cache without the filtering path running. The
+  endpoint now sends `private, no-store`, as every other owner-scoped route in
+  the same module already does.
+  ([#1571](https://github.com/akitaonrails/ai-memory/pull/1571))
+- `ai-memory recover` now recovers a GitHub Copilot CLI session. The recovery
+  journal records `copilot` for a degraded or finish-failed `ai-memory run
+  copilot`, but the reader had no entry for that name, so recovery reported
+  `journal names unsupported harness 'copilot'` and retained the entry on every
+  rerun, leaving the transcript unrecovered. The same gap keyed the quarantined
+  hook events with `copilot` instead of `copilot-cli` and sent an exportable
+  Copilot transcript down the spool-only path.
+  ([#1572](https://github.com/akitaonrails/ai-memory/pull/1572))
+- `ai-memory status` now reports an unreadable recovery journal while the
+  server is down. The offline recovery hint read the journal error, used it to
+  decide whether to print anything, then printed neither branch's copy of it:
+  a truncated `recovery-journal.json` left the human line saying `repair
+  unrecorded runs (0 journaled)` and the `--json` line saying
+  `{"journal_pending": 0, "spool_pending": 0}`, a machine-readable all-clear
+  for a journal that cannot be parsed.
+  ([#1573](https://github.com/akitaonrails/ai-memory/pull/1573))
+- `purge-project` now keeps `--force` and `--compact` in the re-run command its
+  refusal prints. The dry-run preview above it is computed with the operator's
+  own flags, but the printed command dropped them, so pasting it after a
+  `--force` run came back as a 409 `managed run lease is active` — the exact
+  condition `--force` overrides — and a `--compact` run quietly reverted to a
+  logical delete ([#1574](https://github.com/akitaonrails/ai-memory/pull/1574))
+- `move-project` now keeps `--force` and `--on-conflict` in the re-run command
+  its refusal prints. Both flags are honoured in the request the command
+  builds, but the printed command dropped them, so pasting it after an
+  `--on-conflict overwrite` run fell back to the `block` default and came back
+  as a 409 listing the conflicting paths instead of merging them, while a
+  dropped `--force` put the active-project guard back in place
+  ([#1575](https://github.com/akitaonrails/ai-memory/pull/1575))
+- The compaction recap now reaches Claude Code, Codex and Qwen Code while an
+  external producer owns capture. A `reload context` prompt is answered
+  through the `UserPromptSubmit` context envelope, but that delivery path was
+  missing from the set exempt from `AI_MEMORY_CAPTURE_OWNER` suppression, so
+  the hook returned an empty response before it could fetch the recap. Every
+  enqueue and drain on the path stays gated on the external owner, so the
+  exemption delivers context without capturing anything.
+  ([#1576](https://github.com/akitaonrails/ai-memory/pull/1576))
+- Fixed the SessionEnd consolidation queue retrying a provider failure that a
+  later attempt cannot clear. The queue's terminality check hand-enumerated
+  only the deterministic structured-response shapes, so a rejected or expired
+  credential, an unconfigured provider, a schema failure and a
+  malformed-request `4xx` were all retried: one expired API key burned the
+  full five-attempt cap — five complete consolidation prompts over 7.5
+  minutes — for every ended session, logging "queued for retry" four times.
+  The check now defers to `LlmError::is_transient`, the predicate the
+  in-process consolidation and bootstrap retry loops already use, so only a
+  `429`, a `5xx` or a transport timeout/connect failure keeps the bounded
+  backoff and every deterministic failure settles the job terminal with the
+  heuristic session page left in place
+  ([#1581](https://github.com/akitaonrails/ai-memory/pull/1581))
+- Fixed the document importer's subtitle reader dropping WebVTT cues whose
+  identifiers begin with `NOTE` and rejecting CR-only WebVTT files as empty.
+  It now distinguishes comment tokens from cue identifiers and normalizes
+  CR, LF, and CRLF before splitting VTT/SRT cues. (#1601)
+
+- Fixed the profile digest cutting an entry's line at 240 bytes with no
+  sign of the cut: a `summary`, `abstract` or first prose line over the limit
+  was clipped mid-word, so the agent read part of a rule as the whole rule.
+  The line now ends in `…` inside the same 240 bytes, and
+  `docs/cross-project-profile.md` states the limit next to `summary`.
+  (#1608)
+- `install-mcp --client freebuff --apply --auth-token` now stores the key in
+  `<data_dir>/auth-token`, where the hooks keep theirs, and writes the FreeBuff
+  entry with `--data-dir` and no token, as it already did for the Claude Code
+  (`--session-aware`) and Muse bridge entries. FreeBuff's entry is always the
+  session-less `mcp-bridge` and already carried that `--data-dir`, but the key
+  was written into `~/.agents/mcp.json` as `env.AI_MEMORY_AUTH_TOKEN`, outside
+  the data dir's file permissions and outliving a rotation. The key still stays
+  in the entry whenever the bridge would not reach it: a configured bearer that
+  would win, a different key already stored for the hooks, hooks that sign in
+  with OIDC, a failed store, a different endpoint, the Docker helper, or a
+  snippet that is only printed.
+  ([#1593](https://github.com/akitaonrails/ai-memory/pull/1593))
+- `install-mcp --client codex` now prints the same table name `--apply` writes.
+  The printed snippet hand-interpolated `[mcp_servers.<name>]`, so `--name
+  ai.memory` printed a header a TOML reader resolves as three nested tables
+  rather than one server, and `--name "my memory"` printed an invalid header
+  that breaks the whole `config.toml` it is pasted into — while `--apply`
+  quoted the key correctly all along. The printed table is now built with the
+  apply path's own `toml_edit` writer; output for an ordinary name is
+  unchanged.
+  ([#1594](https://github.com/akitaonrails/ai-memory/pull/1594))
+- Every command except `hook` and `mcp-bridge` now warns, naming the variable
+  but not its value, when `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (or a
+  lower-case spelling) is set to something the HTTP client cannot use: bytes
+  that are not UTF-8, such as a Latin-1 password, a URI with an unencoded
+  space or non-ASCII character, or an unsupported scheme. The client skips
+  such a value and connects directly, so provider and login requests used to
+  time out on a network that blocks direct egress, or bypass a required proxy
+  where it does not, with nothing pointing at the proxy setting.
+  ([#1565](https://github.com/akitaonrails/ai-memory/pull/1565))
+- `init`, `auth` and `auth enable` print paths on Windows without the `\?# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+This file holds the current major line. Earlier lines are archived per major
+version in [`docs/changelog/`](docs/changelog/):
+[2.x](docs/changelog/2.x.md), [1.x](docs/changelog/1.x.md) and [0.x](docs/changelog/0.x.md).
+
+  verbatim prefix of the canonical data dir, in their output and their errors,
+  as the hook and service commands already did, and so does the
+  `ai-memory starting` line every command logs. A path copied from those
+  messages now works in `cmd` and in scripts that look for it.
+  ([#1565](https://github.com/akitaonrails/ai-memory/pull/1565))
+
+- Corrected the Docker rollback instructions to retag the prior digest and recreate the service without pulling the newer tag. ([#1585](https://github.com/akitaonrails/ai-memory/pull/1585))
+
+- Corrected Docker backup instructions to use an online server snapshot or stop the container before copying its data. ([#1586](https://github.com/akitaonrails/ai-memory/pull/1586))
+
+- Corrected the multi-user migration command to pass the pepper length with `--bytes`. ([#1587](https://github.com/akitaonrails/ai-memory/pull/1587))
+
+- Corrected the API smoke test to use the running server’s configured bearer instead of a newly generated token. ([#1588](https://github.com/akitaonrails/ai-memory/pull/1588))
+- Fixed restoring a page from a checkpoint leaving a pre-OKF file on disk.
+  `restore-page` wrote the checkpointed bytes verbatim while the three
+  sibling write paths conform theirs, and the row it indexes is conformed at
+  the store's write choke point either way — so only the file was left
+  behind. Restoring the pre-OKF checkpoint every migrated install carries
+  then broke `export-okf` for the whole project with "run the server once to
+  migrate", which the one-shot wiki migration never does again, and made
+  every `serve` boot re-archive the data dir once the migration archive was
+  deleted. The restore now conforms the file like the siblings do;
+  conformance is idempotent modulo `generated.at`, which it inherits from the
+  file on disk, so an already-conformant page still restores byte-exact.
+  ([#1595](https://github.com/akitaonrails/ai-memory/pull/1595))
+- Fixed `memory_query` skipping its raw-observation fallback (`raw_hits`)
+  whenever an embedder was configured, which the default local embeddings
+  are. The vector stream has no similarity floor, so an unrelated page
+  kept `hits` non-empty, and an observation from a session with no page
+  yet (still open, or ended without SessionEnd) could not be found, while
+  the same store with `embedding_provider = "none"` returned it. The
+  fallback now runs unless a page matched the query's own terms through
+  page FTS, the entity stream or the observation stream; page ranking is
+  unchanged (#1600).
+
+- An empty structured answer from a Responses-API model is now reported as
+  empty content rather than a JSON parse error. The `opencode`, `openai-oauth`
+  and `codex` paths defaulted a missing `output_text` to an empty string and
+  handed it to the parser, so the operator saw `serde: EOF while parsing a
+  value at line 1 column 0`, naming neither the model nor the cause.
+  ([#1529](https://github.com/akitaonrails/ai-memory/pull/1529))
+- Detected `core.hooksPath` when a git config set it on the same physical
+  line as the `[core]` section header, so `ai-memory-wikisync install-hook`
+  no longer writes a `.git/hooks/post-merge` that git would never run.
+  ([#1530](https://github.com/akitaonrails/ai-memory/pull/1530))
+- Counted a file's final line in `ai-memory-wikisync` diff summaries when it
+  does not end in a newline, so the `bytes/lines` figures no longer contradict
+  the `first difference at line N` printed beside them.
+  ([#1531](https://github.com/akitaonrails/ai-memory/pull/1531))
+- `ai-memory run` now refuses an `--env`/`--env-file` entry whose key carries
+  whitespace. `--env-file` lines are trimmed as a whole, not per half, so the
+  common dotenv spelling `KEY = value` produced a key with a trailing space —
+  an entry no shell or harness can read, so the override silently did nothing.
+  ([#1532](https://github.com/akitaonrails/ai-memory/pull/1532))
+- Discovered a repository page whose `--include` family names a bare top-level
+  page (`README.md`), which `ai-memory-wikisync sync` previously left out of the
+  repository side entirely, so a newly created one was never imported.
+  ([#1533](https://github.com/akitaonrails/ai-memory/pull/1533))
+- A Copilot `/responses` answer stopped by `max_output_tokens` is now reported
+  as a truncated response naming the model and its output-token count, instead
+  of an unexpected response shape reading "no error detail" — `error` is null
+  on an incomplete answer, so nothing explained the stop and the class implied
+  an unparseable reply rather than a `max_tokens` to raise.
+  ([#1534](https://github.com/akitaonrails/ai-memory/pull/1534))
+- Omitted TTL-expired pages from the page count in `memory_briefing` and
+  `memory_explore`. Every page list in a briefing already hid them, and the
+  project cards have since 3.1.x, so a project with an expired page reported
+  more latest pages than any list in the same response could show. The
+  all-versions total is unchanged, as is `ai-memory status`.
+  ([#1535](https://github.com/akitaonrails/ai-memory/pull/1535))
+
+- `memory_read_page` now reads a blank `path` or `query` as omitted, as its
+  sibling arguments already do. An empty or whitespace-only `query` searched
+  for an empty FTS expression and reported the inevitable miss as an internal
+  error (-32603), which a looping client reads as "retry"; an empty `path`
+  failed as "invalid path: empty path" and never tried the `query` passed
+  beside it. Both now reach the instructive "exactly one of `path` or `query`"
+  refusal, and a blank `path` beside a real `query` runs the search.
+  ([#1536](https://github.com/akitaonrails/ai-memory/pull/1536))
+- Reported a wiki page renamed away with an external tool, which arrives as a
+  rename event rather than a removal, so the next auto-commit drops it from the
+  tree instead of leaving a checkpoint naming a page that no longer exists.
+  ([#1537](https://github.com/akitaonrails/ai-memory/pull/1537))
+- Omitted TTL-expired pages from the 7- and 30-day activity counters in
+  `memory_briefing`. A page written with a short TTL made a project look
+  active while the brief's own recent-page list was empty, which is the
+  signal an agent uses to decide how much context to pull. Session and
+  observation counters have no TTL and are unchanged.
+  ([#1539](https://github.com/akitaonrails/ai-memory/pull/1539))
+
+- Kept literal `<mark>` tags from a page's own text out of search-result
+  markup, including balanced pairs that previously looked identical to SQLite
+  highlights. FTS now uses internal delimiters that sanitized page content
+  cannot forge, and only presentation boundaries turn them into HTML.
+  ([#1540](https://github.com/akitaonrails/ai-memory/pull/1540))
+- `install.ps1` now refuses a plain-http GitHub release base. The scheme check
+  sat inside a condition whose arms already implied https, so it could never
+  fire, and an `http://github.com/...` base matched neither arm and skipped it
+  entirely — while the archive and its checksum are fetched from that same
+  origin, so the checksum proved nothing against an on-path rewrite.
+  ([#1541](https://github.com/akitaonrails/ai-memory/pull/1541))
+- An unspaced-CJK search carrying `AND`, `NOT` or `NEAR` no longer returns the
+  pages the operator excluded. The auxiliary CJK stream discarded every boolean
+  operator and `OR`-joined the CJK runs it found, and because that stream is
+  unioned into the primary one, `東京 NOT 大阪` fused the 大阪-only pages back in
+  and ranked them as if they had been asked for. The stream now declines such a
+  query, so unspaced-CJK recall narrows to the pre-feature answer for it instead
+  of inverting; `OR` queries are unaffected.
+  ([#1542](https://github.com/akitaonrails/ai-memory/pull/1542))
+- An `openai-oauth` answer the Codex backend stopped at its output-token
+  budget is now a terminal truncation instead of a retryable `502`. The
+  streaming parser read `response.incomplete` as a provider fault, so the
+  fallback chain advanced to the next candidate and opened a circuit, and the
+  SessionEnd consolidation job kept re-sending the same prompt on its backoff
+  schedule, each attempt truncating again at the same budget.
+  ([#1543](https://github.com/akitaonrails/ai-memory/pull/1543))
+
+- `memory_read_page` now answers a missing read target with `invalid params`
+  (-32602) instead of an internal error (-32603). A page absent under the
+  resolved scope, and a query that matched nothing, are caller-fixable: the
+  store answered, there is simply nothing there, and a client reads -32603 as
+  "retry". `memory_status` and `memory_read_session_observations` already
+  answer -32602 for an unknown project or session. The messages and the
+  auto-resolved-scope hint are unchanged, and a genuine disk or store failure
+  on the same path still answers -32603.
+  ([#1544](https://github.com/akitaonrails/ai-memory/pull/1544))
+- An OpenCode subagent session's end no longer hands the next session a
+  sub-task baton. The generated plugin forwarded the session's `parentID` as
+  the `agent_id` subagent marker on `session.created` but not on
+  `session.deleted`, so the `session-end` request carried no marker, the
+  router did not recognize a child session, and it published a summary page
+  and an open handoff that the next root session in that checkout consumed.
+  ([#1546](https://github.com/akitaonrails/ai-memory/pull/1546))
+- `install-mcp --client opencode --flavor <dialect>` now writes the flavored
+  URL into the OpenCode entry. Both OpenCode entry builders read the server
+  URL directly instead of the flavored one, so the flag was silently dropped
+  for a client its own documentation names: a Vertex-routed install got a bare
+  URL and 400'd every `tools/list`. OpenCode installs that do not pass
+  `--flavor` are unchanged.
+  ([#1547](https://github.com/akitaonrails/ai-memory/pull/1547))
+
+- A `title:` or `body:` filter on an unspaced-CJK search now narrows the
+  auxiliary CJK stream too. The stream read `:` as a plain run separator and
+  dropped the qualifier, so its MATCH searched every indexed column including
+  the path, and because that stream is unioned into the primary one,
+  `title:支付服务` returned pages holding the term only in their body or path.
+  ([#1548](https://github.com/akitaonrails/ai-memory/pull/1548))
+- An Anthropic structured answer the model stopped at `max_tokens` is now a
+  terminal truncation instead of a successful result. The provider did not read
+  `stop_reason`, so a `tool_use` block holding only the JSON produced before the
+  budget ran out was returned as a complete answer: a consolidation or bootstrap
+  chunk could write a fraction of its pages and report success. On models that
+  reject a forced `tool_choice` the same stop reported "no tool_use block"
+  instead. Non-structured completions are unchanged — prose cut at the budget is
+  still returned.
+  ([#1549](https://github.com/akitaonrails/ai-memory/pull/1549))
+- Counted a page needing only an L0 abstract embedding in `ai-memory embed
+  --dry-run` and `/admin/embed`. A page whose body vector was already current
+  appeared in neither the would-embed nor the up-to-date total, so the dry run
+  reported no work for a scope where a live run writes abstract embeddings.
+  ([#1550](https://github.com/akitaonrails/ai-memory/pull/1550))
+
+- The PowerShell `session-start` hooks for Claude Code, Command Code and Devin
+  now wrap the handoff in the same `hookSpecificOutput` envelope their POSIX
+  peers emit. On Windows the baton was written as bare text, so the harness
+  logged "Hook output does not start with {, treating as plain text" on every
+  start and the handoff arrived unstructured instead of as `additionalContext`.
+  ([#1551](https://github.com/akitaonrails/ai-memory/pull/1551))
+- The Japanese iteration mark 々 (and the other letters of CJK Symbols and
+  Punctuation) now stay inside a CJK run. They terminated one, so a word like
+  日々 was indexed as two single characters and searching it emitted a bare
+  `"日"` that matched every page containing 日 while 日々 itself was unfindable
+  as a unit. Indexing changes with this, so existing rows keep their old terms
+  until they are rewritten or the index is rebuilt by a compaction.
+  ([#1552](https://github.com/akitaonrails/ai-memory/pull/1552))
+- `memory_write_page` now refuses a relation target whose `project:` or
+  `workspace/project:` scope holds a character the link reader cannot parse,
+  such as a space in `my project:notes/x`. The write boundary used a looser
+  character class than the reader, so the colon stayed inside the page path on
+  read and the write created an edge to a path no page write can ever produce —
+  a `links` row that could never be resolved.
+  ([#1553](https://github.com/akitaonrails/ai-memory/pull/1553))
+
+- `memory_handoff_cancel` now answers a well-formed `handoff_id` that resolves
+  to nothing in scope with `invalid params` (-32602) instead of an internal
+  error (-32603). The lookup succeeded and found no row, so the id is the
+  caller's to fix, and a client reads -32603 as "retry". The same function
+  already answered a malformed id with -32602, and `memory_handoff_accept`
+  reports an unknown id as `{"handoff": null}`. The message is unchanged and
+  still identical for an absent id and for another operator's, so cancelling
+  reveals no more than before.
+  ([#1554](https://github.com/akitaonrails/ai-memory/pull/1554))
+- `ai-memory run` no longer loses a native session selector that sits behind a
+  non-UTF-8 argument. The scan over the forwarded arguments ended at the first
+  argument that was not valid UTF-8 instead of skipping it, so a run pinned with
+  an explicit `--session`/`--resume` kept no expected session id and fell back
+  to post-exit transcript discovery.
+  ([#1555](https://github.com/akitaonrails/ai-memory/pull/1555))
+- Dropped the merged-away page's `summary:` and `abstract:` from the merge
+  stub left behind by cold-cluster dedup and the dream pass. Retrieval
+  prefers a frontmatter summary over the body, so the brief and the
+  non-keyword hit lists described the stub as if it still held content that
+  had moved to the survivor. The pre-merge frontmatter stays reachable
+  through the supersession chain; compaction is unchanged.
+  ([#1556](https://github.com/akitaonrails/ai-memory/pull/1556))
+
+- The OKF migration now conforms a page nested under a project bundle whose
+  file is named `index.md`. Only the bundle root's own `index.md` is reserved,
+  but the skip matched on the basename at any depth, so the database row was
+  conformed while its file kept pre-OKF frontmatter — and markdown being the
+  source of truth, the next reindex de-conformed the page again.
+  ([#1557](https://github.com/akitaonrails/ai-memory/pull/1557))
+- A root Grok session no longer loses its handoff because a tool used one of
+  the subagent marker key names. The shell `post-tool-use` hook matched
+  `agent_id` and its siblings as substrings of the whole raw payload, so a key
+  of that name nested in `tool_input` or in a structured tool result, or a
+  blank top-level value, suppressed the fetch. The gate now reads top-level
+  keys with a non-empty string value, like the native router and the
+  PowerShell bundle already did.
+  ([#1558](https://github.com/akitaonrails/ai-memory/pull/1558))
+- `ai-memory list-projects` now sizes its columns by terminal display width
+  rather than bytes. Accented names no longer add phantom padding, and
+  double-width CJK project or workspace names no longer shift later columns.
+  ([#1559](https://github.com/akitaonrails/ai-memory/pull/1559))
+
+- A byte size just under a unit boundary now carries to the next unit instead
+  of printing a magnitude that unit cannot hold. The scaling loop stopped at
+  `value < 1024.0` while the result is rendered with one decimal, so a
+  database of 1 MiB minus six bytes made `ai-memory status` report
+  `1024.0 KiB on disk` rather than `1.0 MiB`; `reclaim-ledger-versions` could
+  likewise print `1024.0 KiB -> 1.0 MiB` for a six-byte difference.
+  ([#1562](https://github.com/akitaonrails/ai-memory/pull/1562))
+
+- A popped message can no longer pass its own text off as `ai-memory`'s. The
+  human rendering of `message pop` printed the sender's subject above the
+  security notice and the body between two literal fence lines, neither
+  escaped, so a newline in the subject forged lines in the provenance block
+  and an `---- end of body ----` line in the body closed the fence early. The
+  subject now renders on one line, body fence markers are neutralized, and
+  terminal control sequences are stripped; both JSON paths remain structural.
+  ([#1563](https://github.com/akitaonrails/ai-memory/pull/1563))
+
+- Hardened the privacy strip. It now matches credentials across invisible
+  formatting characters while storing text that matches nothing byte for
+  byte, so emoji sequences and scripts that need joiners are untouched. It
+  also redacts PGP private keys and private-key blocks that have no end line,
+  as long as a key-body line follows the header, so prose that only names a
+  header is kept. Tag characters outside an emoji flag, a byte-order mark
+  after the start of the text and the invisible math operators are stripped.
+  The allowlist no longer exempts private keys, and blank `[sanitize]
+  allowlist` entries are ignored with a warning at startup. The client scrub
+  shared by the relay and importer companions follows the same rules.
+  Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
+- Tightened how client commands decide that a server URL is on this machine
+  before using the install's root token. The check now reads the host the
+  HTTP client would connect to and refuses any URL that carries user
+  information. `ai-memory upgrade` uses the same check for its remote-server
+  note. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
+- `ai-memory restore` no longer replaces an existing live `config.toml` with
+  the backup's by default, because a config can run commands and redirect
+  data. The backup's copy is saved beside it as `config.toml.from-backup`
+  (owner-only) with a notice; pass the new `--with-config` flag to restore it
+  in place as before. A data dir with no config still gets the backup's. When
+  the live config is kept and the restored database holds API keys, its pepper
+  must match them, or the restore stops before changing anything and names
+  `--with-config`. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
+- `install-mcp --client codex` now makes Codex ask before running ai-memory's
+  destructive tools. The read tools still run without a prompt; every tool
+  annotated destructive (deleting or restoring a page, the forget sweep,
+  accepting or cancelling a handoff, popping or cancelling messages, recall
+  feedback) gets a per-tool `approval_mode = "prompt"`, and a re-install keeps
+  per-tool settings you already chose. Re-run `install-mcp --client codex
+  --apply` to update an existing entry. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
+- A server profile's `roots` now admit a checkout whose Windows cwd differs
+  from the registered root only in case. `Path::starts_with` compares
+  components byte-exactly, so a root added as `C:\Work\team-b` refused
+  `C:\work\team-b\repo` and every event captured there was dropped as
+  `rejected-outside-roots`, even though the home marker's own path routes
+  already fold case under a drive-letter or UNC root. POSIX roots stay
+  case-sensitive.
+  ([#1538](https://github.com/akitaonrails/ai-memory/pull/1538))
+
+### Security
+
+- A malformed OAuth entry in `auth.json` no longer prints the stored value in
+  its error. When a field held a value of the wrong type, such as a token
+  written into `expires` by a hand edit or a provisioning script, the parse
+  error quoted the token, and from there it reached terminals, CI logs and
+  captured hook output. The error now names the type it found with the value
+  replaced by `<redacted>`.
+  ([#1565](https://github.com/akitaonrails/ai-memory/pull/1565))
+
+## [3.2.1] - 2026-10-22
+
+### Fixed
+
+- Fixed a 3.2.0 regression that serialized local document embedding and
+  dropped the vector stream from queries that raced a document embed: the
+  local embedder's capacity was hardcoded to two slots (one document, one
+  query), and a query finding both busy degraded instantly to lexical
+  search. The scheduler is now sized from the CPU (half the available
+  parallelism, clamped to between 2 and 6 slots, documents capped at
+  capacity minus one so a slot stays query-reserved), and a query waits up
+  to 250 ms for a slot before degrading. On the affected LongMemEval-S
+  question set this restores query latency (p50/p95 66/87 ms vs 3.2.0's
+  118/295) and ingest throughput; the reported hit@5 delta (0.947 → 0.938)
+  traces to rank-boundary questions that flip between identical runs, not
+  a deterministic ranking change (#1580).
+
+- Fixed `ai-memory run` (and `show`, `continue`, `resume`, `workstreams`,
+  `rename-workstream`) failing on Windows Docker installs with "managed
+  claude executable `claude` was not found in the host PATH": the PowerShell
+  wrapper sent every subcommand into the Linux helper container, which has no
+  host CLIs. It now intercepts the same six commands `bin/ai-memory` does and
+  runs them through the native Windows client, resolved from
+  `AI_MEMORY_NATIVE_BIN` or the documented
+  `%LOCALAPPDATA%\Programs\ai-memory` install location, inheriting
+  `AI_MEMORY_SERVER_URL` (an explicit value wins) and exiting with the
+  child's code. A missing client fails with the documented installer command
+  instead of entering the container; the POSIX wrapper's Git Bash refusal
+  points at the same installer; and the missing-harness error's Docker
+  advice is now OS-aware: on Windows it names the native-client installer
+  rather than `ai-memory upgrade`, which in the `.ps1` wrapper only pulls
+  the image. Managed launches keep the hook/MCP wiring rendered through the
+  container (the wrapper sets `AI_MEMORY_RUN_AUTOWIRE=false` for the
+  intercepted commands unless the operator set it). (#1545)
+
+- Corrected four statements in `SECURITY.md` that no longer matched the
+  code, plus two clarifications in the same sections (#1561). The
+  `AI_MEMORY_ALLOWED_HOSTS` default is `localhost`, `127.0.0.1`, and `::1`;
+  request bodies are capped at 10 MB on `/mcp`, `/hook` and `/workstream/*`,
+  32 MB on `/admin/*`, and 2 MB elsewhere; the auth ladder is anonymous,
+  root bearer, proxy-asserted user, and `aim_` database-user tokens (the
+  server itself never validates OIDC tokens, and the doc no longer says it
+  does); and the "no per-user or per-project ACLs" claim became the current
+  truth about per-project access modes and grants, including that
+  proxy-asserted identities are not subject to them. The bearer-check note
+  now lists the routes that are public by design (`/healthz`, `/auth/login`,
+  `/auth/recovery`, `/favicon.ico`, custom `/web` static assets).
+- Completed the egress inventory in `DATA_HANDLING.md` and documented the
+  default first-start behavior it omitted (#1560). A default install now
+  says plainly that the local embedder downloads its three model files
+  (~87 MB, sha256-pinned) from `huggingface.co` in the background on first
+  start, that nothing stored is sent, and how to avoid it
+  (`embedding_provider = "none"` or offline pre-seeding). The export table
+  gained the rows it was missing: the `llm_provider` pipeline (including
+  the `codex`, `copilot` and `cursor` CLI-backed providers), the `copilot`
+  embedding provider, and `[[admission_webhooks]]`, plus notes on
+  `ai-memory upgrade`'s GitHub release query, the OAuth/OIDC login flows,
+  and remote `server_url` topologies. `docs/airgapped-install.md`'s
+  runtime summary was corrected to match.
+
+## [3.2.0] - 2026-10-21
+
+### Added
+
+- Added a pointer to a session that was cut off without ending, so the next
+  harness continues from where the work stopped. A harness stopped by a quota
+  limit, a crash or a closed terminal never runs its session end and leaves no
+  handoff, so an older handoff or session page used to win. When the newest
+  captured work in a project belongs to another of the operator's sessions that
+  never ended and left no handoff after that work, session start now adds a
+  one-line notice naming that session's agent and id (no captured text) and
+  pointing at `memory_read_session_observations`. `memory_briefing` gains
+  `recent_sessions` (newest work first, with `ended`, `handed_off` and
+  `current`), and `memory_handoff_list` gains `newer_unended_session` when such
+  a session is newer than every open handoff. `memory_read_session_observations`
+  also accepts a harness's native session id, such as an OpenCode `ses_…` id.
+  The routing block and the handoff and retrieval skills tell agents to read
+  that session first, and the TypeScript SDK decodes both new fields.
+
+- Added first-party Qwen Code lifecycle and MCP support. `install-mcp --client
+  qwen-code` (aliases `qwen`, `qwencode`) writes a Streamable HTTP `httpUrl`
+  entry into `~/.qwen/settings.json`; a token-file install gets a stdio
+  `mcp-bridge` instead of embedding the bearer. `install-hooks --agent
+  qwen-code` merges ten Claude-shaped events (including `PostToolUseFailure`
+  and subagent start/stop) as native `ai-memory hook` commands with no script
+  bundle. `SessionStart` injects the prior handoff as
+  `hookSpecificOutput.additionalContext`; Qwen's own `SessionEnd` closes the
+  session. User-prompt capture uses Qwen's provenance-bearing
+  `submitted_prompt`, never an automated continuation in `prompt`. Capture
+  exclusions cover Qwen's Gemini-like tools. Qwen-only agent backups include
+  its settings, both documented global skill roots, `QWEN.md`, and `AGENTS.md`.
+  `setup` detects `~/.qwen`. There is no `ai-memory run qwen` adapter. ([#1487](https://github.com/akitaonrails/ai-memory/pull/1487))
+- Added zero-LLM substring retrieval for unspaced Han, Kana, and Hangul text.
+  Pages and observations gain transactionally maintained derived unigram/bigram
+  FTS indexes; existing unicode61 search and ranking remain unchanged for
+  Latin-only queries, while CJK matches participate in project, scoped,
+  global, temporal, raw-observation, and observation-evidence retrieval.
+  Upgraded stores backfill missing derived rows before accepting traffic, and
+  compaction rebuilds the auxiliary indexes with the existing FTS set.
+  ([#1433](https://github.com/akitaonrails/ai-memory/issues/1433))
+- Added a first-party Hermes Agent lifecycle and an `install-mcp --client
+  hermes` client. The `hooks:` block `install-hooks --agent hermes` prints now
+  also wires `on_session_start`, `pre_llm_call` (the prompt, never the
+  conversation history), `on_session_end` as a turn boundary and
+  `on_session_finalize` as the session end, and each primary-session
+  `pre_llm_call` checks for a pending handoff and brings it into that turn as
+  `{"context": ...}`. This includes a resumed native Hermes session. Hermes
+  events route by `TERMINAL_CWD` when it names an existing directory (in a
+  gateway, for the default profile only), and a delegated child's lifecycle
+  events are dropped. When the
+  community memory-provider plugin is installed, only the tool events are
+  printed. `install-mcp --client hermes` prints an `mcp_servers:` entry for the
+  session-less stdio bridge with no token in it, and refuses `--apply` ([#1454](https://github.com/akitaonrails/ai-memory/pull/1454)).
+- Added bounded local document extraction to the optional
+  `ai-memory-importer` companion. Its dry-run-first `document` command accepts
+  UTF-8 text/Markdown, text-layer PDF, DOCX, PPTX, XLSX, VTT, and
+  SRT; emits attributed, client-sanitized markdown; caps source, archive,
+  extracted text, PDF streams, sheets, and actual XLSX cells; and uses deterministic digest paths plus
+  conditional MCP writes for idempotent reruns without overwriting an existing
+  foreign page. OCR, images, and raw audio/video remain explicitly out of
+  scope.
+- Added passive per-workload LLM telemetry to `ai-memory status --json` and
+  `GET /admin/status`. The closed workload set covers consolidation, reranking,
+  auto-improvement, bootstrap, query answers, lint, profile maintenance, dream
+  merges, and experience abstraction, with process-lifetime calls, outcomes,
+  latency buckets, coarse token estimates, and provider-reported usage where available.
+  It records no prompt or output text and does not change provider/model
+  routing; public per-workload profiles remain deferred until measurements
+  justify their configuration and authentication surface.
+- Added structured pre-rank filters to `memory_query`: case-insensitive
+  `kind` and exact-array `tag`, typed `tier`, and literal `path_prefix`.
+  Filters apply consistently to project/scopes hybrid streams, cross-project
+  global FTS, `as_of` history, supplemental profile hits, and `pin_first`.
+  Filtered misses omit raw observations because those rows carry no page
+  metadata.
+- Added a read-only managed-workstream operations page at
+  `/web/workstreams`. On multi-user servers it is root-only; single-operator
+  installs retain their existing admin access. The bounded overview orders
+  live and interrupted work first and derives `active`, `interrupted`,
+  `completed`, and `empty` only from trusted run lifecycle fields and imported
+  event counts. It exposes no checkout paths, repository fingerprints, lease
+  owners, native session ids, source metadata, or transcript content, and it
+  does not broaden checkout-local `resume` discovery.
+- Added `ai-memory recent` and `GET /admin/recent` to list the most recently
+  updated wiki pages, newest first. The listing is scoped to the current
+  project by default (cwd / marker, or `--workspace`/`--project`); `--global`
+  covers every project and labels each hit with its workspace and project.
+  Each hit carries an RFC 3339 `updated_at` instead of an FTS rank. The admin
+  route is root-only on a multi-user server, the same as `/admin/search`.
+  ([#1379](https://github.com/akitaonrails/ai-memory/pull/1379))
+- Added an explicit `serve --allow-insecure-human-auth` (or
+  `AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) escape hatch for operators who
+  knowingly run password login over plain HTTP on a private LAN.
+  It is off by default, does not bypass the separate unauthenticated-exposure
+  guard, and prints an unconditional warning that passwords, API credentials,
+  session cookies, and memory data cross the network unencrypted. (#1383)
+- Added first-party Cline CLI lifecycle and MCP support. `install-hooks
+  --agent cline --apply` writes Cline's nine supported event files globally or
+  per project, refuses user-owned and symlinked targets, and keeps embedded
+  bearer credentials owner-only. `install-mcp --client cline --apply` writes
+  Cline's top-level transport fields and explicitly selects Streamable HTTP.
+  Detached start hooks recover handoffs through MCP; yolo mode disables hooks.
+  Also added `install-mcp --client freebuff --apply`, which registers the
+  sessionless stdio bridge in `~/.agents/mcp.json` without starting another
+  ai-memory server. (#1335)
+- Added `[ingest] drop_events` (env `AI_MEMORY_INGEST__DROP_EVENTS`), an
+  opt-in list of hook event kinds the server drops before storing them, next
+  to the existing `drop_tool_use_id_prefixes` and `drop_tool_names`. A dropped
+  event gets the same 202, `dropped_by_policy` metric and log as the other
+  policy drops, before the rate limiter, the ingest semaphore and the
+  sanitizer. Subagent classification precedes every id, name, and kind matcher,
+  so a matching marked event still seeds tracking for its unmarked tail. The
+  default drops nothing. `Config::load` checks each value
+  against the typed event kind and rejects unknown kinds and `session-start`
+  and `session-end`, which open and close sessions. The motivating case is
+  `pre-tool-use`: in one production store about 87% of those observations had
+  an empty body, and each pairs with a `post-tool-use` that carries the
+  content. With `pre-tool-use` dropped, a session whose only work was a tool
+  call that never finished now ends as lifecycle-only. (#1339)
+- Added opt-in `[sessions] idle_end_after_hours` (env
+  `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS`; default `0`, off; range
+  `1..=8760`). When it is set, the `serve` maintenance tick ends open sessions
+  with no activity for that many hours, such as a harness that crashed or a
+  terminal closed before `SessionEnd` fired. A substantive session gets its
+  `sessions/<id>.md` summary page, attributed to the session's owner, and its
+  consolidation job. A boundary-only session ends lifecycle-only and releases
+  the handoff it had accepted. The tick creates no handoff of its own and skips
+  sessions bound to an active managed run. A real `SessionEnd` or checkpoint
+  that lands while the tick runs wins, and the tick leaves that session alone.
+  `ended_at` is the time of the tick; the session's last activity goes in the
+  audit row. (#1338)
+- Added first-party DeepSeek Harness (DSH) lifecycle capture. `install-hooks
+  --agent dsh` (aliases `deepseek-harness`, `deepseek_harness`) stages the
+  new `hooks/dsh` bundle, writes a generated Claude Code `hooks.json`, and
+  prints a Cordis patch fragment that mounts DSH's official
+  `@deepseek-ai/dsh-hooks-claude-code` bridge on
+  `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (the patch file itself is
+  never auto-written). DSH sessions are stored as `agent=dsh`, and its bridge
+  forwards Claude Code-shaped tool payloads, so `[capture] ignore_paths`
+  exclusions apply to its file, search and shell calls (Windows `pwsh`, POSIX
+  `bash`) like any other Claude-shaped adapter; the reserved Code Mode
+  `run_code` transport that its `headless` profile calls is treated as inline
+  program source. The bridge
+  delivers exactly seven events (no `PreCompact` or `SessionEnd`) and runs
+  `SessionStart` detached, so finished sessions close with
+  `finalize-session --agent dsh` and pending handoffs are recovered via
+  `memory_handoff_list` / `memory_handoff_accept`. (#1337)
+- Added an Antigravity skill root family. `install-skills --agent antigravity`
+  (aliases `antigravity-cli`, `agy`; also `install-instructions
+  --skills-agent antigravity`) writes the managed Agent Skills to both global
+  roots Antigravity reads, `~/.gemini/config/skills` (App and IDE) and
+  `~/.gemini/antigravity-cli/skills` (CLI), or to the workspace
+  `.agents/skills` with `--scope project`. `ai-memory setup` now uses it for
+  Antigravity, which until now got its skills only in `~/.agents/skills`, a
+  directory Antigravity does not read globally, and `uninstall --only skills`
+  sweeps both roots. MCP-driven routing refresh and `backup-agents` expose and
+  preserve the same roots, including the shared project `.agents/skills`.
+  (#1357)
+
+- Added a read-only wiki link graph in `/web`. The header **Graph** link opens
+  `/web/graph`, a server-rendered map of resolved wikilinks whose endpoints sit
+  in different projects, plus a table of those edges. Each project page links
+  to `/web/w/<workspace>/<project>/graph`, which shows that project's latest
+  unexpired pages and the resolved same-project links between them as an SVG
+  and a table. Both pages are HTML with no JavaScript.
+  `GET /api/v1/graph` now accepts `workspace` and `project` together to return
+  only edges that touch that project (passing only one of them is `400`), and
+  `GET /api/v1/workspaces/{workspace}/projects/{project}/graph` returns the
+  in-project node and edge lists. A project graph keeps at most 120 pages,
+  preferring those with the most same-project neighbours and then the most
+  recently updated; the store applies that cap before loading nodes or their
+  selected edges into the process. Expired pages stay hidden. An edge still
+  requires both ends to be readable. ([#1378](https://github.com/akitaonrails/ai-memory/pull/1378))
+- Added Antigravity hook parity with Claude Code and Codex for the `agy` CLI,
+  the desktop App and the IDE. `install-hooks --agent antigravity-cli` now
+  wires the native `SessionStart`, which injects the handoff as an
+  `injectSteps` system message that stays in the conversation, where the
+  ephemeral message it replaces was dropped after the first turn.
+  `PreInvocation` gets its own `pre-invocation` handler: on builds without
+  `SessionStart`, the first turn's call stands in for it, once per
+  conversation. The native hook now reads each turn's prompts from the
+  conversation's own transcript (`transcriptPath`, only under
+  `~/.gemini/<app>/brain/<conversationId>/`, no symlinks out of it, 8 MiB per
+  hook and a 100 ms filesystem deadline) and records them as user prompts,
+  so summaries and handoffs carry them. A timed-out read leaves its cursor
+  untouched and retries on the next hook. A `Stop` that finished the turn
+  (`NO_TOOL_CALL` or `model_stop`) with
+  `fullyIdle: true` writes a turn checkpoint, the path OpenCode 2 uses: the
+  summary page and one handoff are refreshed and the conversation stays open,
+  so `finalize-session` is no longer needed for normal use. It remains the
+  explicit close, hands the baton over without the 10-minute quiet period,
+  queues opt-in consolidation, and skips its `history.jsonl` prompt replay
+  for a conversation whose prompts were already captured. Rerun
+  `install-hooks --agent antigravity-cli --apply` to add `SessionStart`;
+  existing native-hook installs get the prompts and checkpoints without it.
+  A turn checkpoint never ends a conversation, even a turn with no captured
+  prompt or tool call, so a handoff it claimed at start is never offered
+  again; the conversation start is claimed atomically, so a concurrent
+  `SessionStart` and first `PreInvocation` cannot both claim a handoff;
+  prompt ingest keys include the prompt's time and text, so a rewind that
+  reuses step numbers keeps its new prompts; and the transcript is opened
+  with `O_NOFOLLOW | O_NONBLOCK` and, on Linux, checked against the opened
+  descriptor's real path. (#1416)
+
+### Security
+- Updated `rustls-webpki` 0.103.15 → 0.103.16 for
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382), in
+  which certificate verification may accept distrusted intermediates, and
+  `webpki-root-certs` 1.0.9 → 1.0.10 for
+  [RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383), whose
+  bundled roots still trusted distrusted emSign intermediates. The importer,
+  relay and wiki sync companions take the same `rustls-webpki` bump.
+
+### Fixed
+- Memory health no longer counts a link from a superseded or TTL-expired page
+  version as a reference. A page whose only inbound link was removed by a later
+  edit was reported as linked, because the old version's `links` row survives
+  the edit and is repointed at the new latest id, so the orphan count and
+  detail list disagreed with the page's own backlinks.
+  ([#1526](https://github.com/akitaonrails/ai-memory/pull/1526))
+- A `title:` or `body:` search filter whose term carries a second colon, such
+  as `title:10:30`, now keeps its column. FTS5 read the inner `10` as a column
+  name and rejected the whole expression, so the query degraded to the quoted
+  bag of words: the filter was dropped and every column was searched for the
+  literal word `title`.
+  ([#1521](https://github.com/akitaonrails/ai-memory/pull/1521))
+- `memory_query` no longer discards `as_of` on a global query. An explicit
+  `global` with `as_of` is now refused, as the error message always claimed,
+  and a repo on `[recall] default_global` no longer broadens an `as_of` query
+  to global and answers it with present-day rows.
+  ([#1519](https://github.com/akitaonrails/ai-memory/pull/1519))
+- A `429` or `5xx` from a token endpoint is now a transient provider error
+  rather than an auth failure. The Copilot token exchange, which GitHub
+  rate-limits per account, and the shared `openai-oauth`/OIDC refresh both
+  reported throttling as a credential problem, so the fallback chain stopped
+  instead of trying the next provider and the operator was told to log in
+  again for a grant that was never rejected.
+  ([#1520](https://github.com/akitaonrails/ai-memory/pull/1520))
+- The Gemini embedder now cuts a long input to the same 8 KB head as the
+  OpenAI, Copilot and local embedders. It sent the whole page, while the
+  default `gemini-embedding-001` takes at most 2,048 input tokens, and a
+  refused page embedding is only logged, so a long page could end up with no
+  vector. Voyage is unchanged: its API shortens an over-long input itself.
+  ([#1513](https://github.com/akitaonrails/ai-memory/pull/1513))
+- `memory_auto_improve` now reports an exhausted implicit queue (every
+  completed session already has a review run) as invalid params instead of an
+  internal error, matching `memory_consolidate` for the same dead end. A client
+  no longer reads the routine end of the queue as a server fault and retries it.
+  ([#1518](https://github.com/akitaonrails/ai-memory/pull/1518))
+- The wiki's git objects and refs are now synced to disk. libgit2 renamed them
+  into place without fsync, so a power loss could keep a ref naming a commit
+  whose object was never written, and every later checkpoint failed. Every
+  repository handle ai-memory opens now turns on `core.fsyncObjectFiles` from
+  `.git/ai-memory.gitconfig`, a file only libgit2 reads, so `.git/config` is
+  untouched and the git CLI shows no deprecation warning; an explicit `false`
+  in `.git/config` is kept. Startup logs an `ERROR` when `HEAD` does not
+  resolve to a readable commit, and a failed bootstrap auto-commit is logged
+  instead of dropped. `docs/lifecycle-ops.md` describes the repair for a
+  history already damaged.
+  ([#1511](https://github.com/akitaonrails/ai-memory/issues/1511))
+- `memory_read_session_observations` without a `session_id` now reads the
+  session with the newest captured work instead of the newest one that ended.
+  A harness cut off without ending (a quota limit, an aborted turn, a crash)
+  never ends its session, so the agent taking its work over used to get some
+  older session, often from another checkout. The default now skips the
+  caller's own session, prefers a session in the caller's cwd, and falls back
+  to the latest completed session only when nothing worked in the last 30
+  days. It stays owner-filtered and bound to the resolved project. (#1512)
+- A server whose hook router could not read an event's working directory no
+  longer stops answering. Resolving a new cwd runs git discovery on it, and on
+  macOS a LaunchAgent binary without Full Disk Access can block indefinitely
+  on a protected folder or an external volume; that `open()` ran on an async
+  worker and took the HTTP accept loop down with it, so `/mcp`, `/hook` and
+  `/web` timed out while the hook spool grew. Those probes now run on the
+  blocking pool behind four permits and a 2-second deadline, and an event whose
+  cwd cannot be read in time is dropped with a warning instead of stalling the
+  server or being routed on a guess. `docs/macos.md` now explains the Full Disk
+  Access grant. (#1514)
+- Cold-cluster dedup (A3) and the opt-in dream pass (B2) now merge a cold set
+  of exactly `min_pts` near-duplicates. The adaptive eps returned nothing when
+  the cold set had no more points than the density floor, so with the default
+  `min_pts = 2` a lone pair of near-identical cold pages was never merged,
+  while the same pair next to any unrelated third cold page was. The
+  conservative `max_eps` ceiling still decides whether a pair is close enough
+  to merge.
+  ([#1528](https://github.com/akitaonrails/ai-memory/pull/1528))
+- Reserved local-embedding capacity for interactive search queries instead of
+  allowing concurrent page writes and backfill work to occupy every inference
+  slot. Excess queries fall back immediately to non-vector retrieval, and a
+  cancelled request retains its slot until its non-cancellable CPU inference
+  actually ends. An opt-in real-model contention probe records idle,
+  unbounded-load, and bounded-load p50/p95 query latency; hosted embedding
+  providers are unchanged.
+- A resumed session that had already ended (`claude --resume` after a clean
+  exit, for example) now still gets its session-start context. An ended
+  session may not take a handoff, and that refused claim used to fail the whole
+  session-start fetch whenever any handoff was open, so the session started
+  with no profile digest, brief or inbox notice at all. The refusal now costs
+  only the claim, and the handoff stays open.
+- The pre-migration backup archive is now flushed and fsynced, along with its
+  directory entry, before it is verified. The buffered tail of the archive was
+  written when the writer was dropped, which discarded any error such as a full
+  disk, and the file was never put on stable storage, while the verify pass
+  re-read it from the page cache and cleared a destructive in-place migration
+  to run. ([#1525](https://github.com/akitaonrails/ai-memory/pull/1525))
+- Wiki commits no longer stage a write that is still in flight. A batch write
+  keeps one `.ai-memory-tmp.` staging file per page on disk across an await,
+  and auto-commit does not hold the mutation lock, so a checkpoint landing in
+  that window committed page bodies that were never installed, and a batch
+  that then failed left the rolled-back content in wiki history. A page parked
+  under `.ai-memory-delete.` during a delete, or under
+  `.ai-memory-tmp.move-session.` during a session move, is left out the same
+  way. ([#1524](https://github.com/akitaonrails/ai-memory/pull/1524))
+- The `/hook` ingress now skips a leading UTF-8 byte-order mark, as the native
+  hook client already did. Some PowerShell pipelines add that marker when
+  writing to a native process, and the POSIX shell hook bundle forwards the
+  payload byte for byte, so such an event was answered with 400 and lost
+  without notice. `ai-memory-relay enqueue --file` skips the marker too.
+  ([#1523](https://github.com/akitaonrails/ai-memory/pull/1523))
+- The POSIX shell hook bundle, the PowerShell bundle under PowerShell 7 and the
+  generated TypeScript integrations under Bun (OpenCode) no longer send
+  their requests through an environment proxy (`http_proxy`, `HTTPS_PROXY`,
+  `ALL_PROXY`), as the native hook client and the bridge already did. In a
+  sandbox that exports a proxy with an empty `NO_PROXY`, the filtering proxy
+  answered the loopback event POST with a 4xx, which the hooks treat as a
+  permanent rejection, so the observation was dropped instead of spooled and a
+  resuming session got no handoff. A server reachable only through a forward
+  proxy needs a direct route; see `docs/https-via-proxy.md`.
+  ([#1517](https://github.com/akitaonrails/ai-memory/pull/1517))
+
+- `mcp-bridge` and the `setup` self-check no longer send requests to the
+  server through `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, as the hooks
+  already did. A sandbox such as ai-jail exports a proxy with an empty
+  `NO_PROXY`, and its filtering proxy answered the bridge's loopback
+  `initialize` with 405, so Claude Code reported `CONNECTION_CLOSED`.
+  ([#1504](https://github.com/akitaonrails/ai-memory/pull/1504))
+
+- Bound native API-key hashes to their configured pepper with a persisted
+  Argon2id verifier. A restored database with existing keys now refuses to
+  serve under a different `[auth].token_pepper` instead of silently making
+  every key return 401; pepper rotation remains allowed while no keys exist.
+  A pre-verifier backup containing keys fails restore until the operator
+  supplies the original pepper and explicitly confirms it with
+  `--accept-legacy-api-key-pepper`.
+  ([#1495](https://github.com/akitaonrails/ai-memory/issues/1495))
+
+- Defined `ai-memory backup` as an online data snapshot rather than a complete
+  host image, documented the separately protected config, root credentials and
+  raw ledgers a host move may require, and corrected the missing-token startup
+  remedy so it no longer implies the snapshot contains `auth-tokens/`.
+  ([#1494](https://github.com/akitaonrails/ai-memory/issues/1494))
+
+- Accepted the exact CRLF migration checksums written by Windows-native
+  releases before v3.1.2 and replaced them transactionally with the current
+  LF checksums before strict migration validation. Unknown migration changes
+  still fail closed. Bare hook reinstallation also preserves the Windows
+  exec-form `--capture-assistant` opt-in instead of looking only inside the
+  command string. ([#1499](https://github.com/akitaonrails/ai-memory/issues/1499))
+
+- Held `ai-memory run` heartbeat notices while the harness owns the terminal
+  and printed them after it exits, so a server outage no longer writes into the
+  harness TUI. Only the first and latest notices are replayed, with a count of
+  the rest. A transport outage that changes into a server-side lease rejection
+  is reported as a new state instead of being hidden as the same failure.
+  ([#1500](https://github.com/akitaonrails/ai-memory/issues/1500))
+
+- Dropped stopwords from the quoted bag of words a search falls back to when
+  its text looks like FTS5 syntax but does not parse, such as a question
+  ending in `(prod)`. The fallback OR-joined `what`, `is`, `the` and `of`
+  with the content words; it now filters through the configured
+  `[search.fts] stopwords` list like a bare query, keeps the words the user
+  quoted, and keeps every word when all of them are stopwords.
+
+- Corrected `docs/lifecycle-ops.md` on two points. The `move-project` merge
+  drops everything the source project owns, the same set `purge-project`
+  deletes. This includes managed workstreams, cross-project messages,
+  auto-improvement and profile-harvest state, consolidation jobs, ingest keys,
+  entities, page feedback, per-session purge tombstones and project grants as well as
+  sessions, observations and handoffs. The `400` for sending both a project
+  name and an id, or neither, applies to the admin endpoints; the CLI resolves
+  a missing project from the marker, the git remote, then the directory name.
+  ([#1493](https://github.com/akitaonrails/ai-memory/issues/1493))
+
+- Named the install's data dir in the `mcp-bridge` entries `install-mcp`
+  writes for Claude Code and the session-less stdio bridge when the install
+  was given one (`--data-dir`, `AI_MEMORY_DATA_DIR` or `data_dir` in the
+  config), as Muse's entry and the install's hooks already did. The bridge
+  read the default data dir's config and token instead, so on a host whose
+  server uses the default data dir it authenticated with the server's root
+  bearer.
+  ([#1489](https://github.com/akitaonrails/ai-memory/issues/1489))
+
+- Let `ai-memory mcp-bridge` send the key `install-hooks --apply --auth-token`
+  stored in `<data_dir>/auth-token` when no bearer is configured, ahead of the
+  loopback root token discovery, so a remote
+  client whose hooks hold a native API key wires the MCP bridge without
+  copying the key. `install-mcp --apply --auth-token` now stores the key there
+  for the Claude Code (`--session-aware`) and Muse bridge entries and leaves
+  it out of the harness config, where it outlived a key rotation; existing
+  entries keep working. `uninstall --only hooks` keeps the stored key while
+  such a bridge entry remains. ([#1490](https://github.com/akitaonrails/ai-memory/issues/1490))
+
+- Kept the bridge from sending a discovered root key to a non-loopback
+  server, rejected a malformed stored user key instead of falling through to
+  root, made failed installs roll back newly stored credentials, and included
+  the absolute data dir in Claude Code's printed session-aware command as well
+  as its JSON entry.
+  ([#1490](https://github.com/akitaonrails/ai-memory/issues/1490))
+
+- Moved the commented `[run.profiles.work.env]` and `[ingest]` examples in the
+  default config, the `config.toml` that `ai-memory init` writes and the
+  native packages install, below its top-level keys. A TOML table header owns
+  every key after it, so uncommenting one of those tables and a top-level
+  example below it, such as `reranker`, `capture_assistant` or
+  `gemini_safe_schemas`, put that key inside the table: `[ingest]` ignored it
+  without a warning, and the run profile's env map either failed the config
+  load or exported the key to the harness. A config written by an earlier
+  release keeps its layout; move an uncommented table there below the last
+  top-level key.
+  ([#1506](https://github.com/akitaonrails/ai-memory/issues/1506))
+
+- Kept the user PATH's `%VAR%` entries and its `REG_EXPAND_SZ` type when
+  `install.ps1` and the desktop installer add their directory to it, and in
+  the manual PATH steps in `docs/windows.md`. They read the value with
+  `[Environment]::GetEnvironmentVariable`, which expands every variable, and
+  wrote it back with `SetEnvironmentVariable`, which stores it as `REG_SZ`.
+  An entry such as `%JAVA_HOME%\bin` stopped following its variable, and one
+  whose variable the installer did not have stayed as literal text that
+  Windows never expands. A PATH an earlier install already rewrote keeps its
+  expanded entries.
+  ([#1509](https://github.com/akitaonrails/ai-memory/issues/1509))
+
+- A tool hook for an MCP tool now keeps the tool's identity. Claude Code, Codex
+  and Hermes Agent name such a call `mcp__<server>__<tool>`; it stays in the
+  `unknown` family, so its arguments and result are still never stored, but the
+  observation now adds `mcp_server` and `mcp_tool` lines when the name is at
+  most 64 ASCII letters, digits, `_` or `-`. Before, a session's MCP calls
+  were recorded only as `tool unknown`.
+  ([#1522](https://github.com/akitaonrails/ai-memory/issues/1522))
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed
@@ -608,7 +1873,6 @@ version in [`docs/changelog/`](docs/changelog/):
   after the unlink. The deletion is permanent on disk; the wiki's git history
   keeps the blobs a checkpoint already captured. (#1322)
 
-
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question
   to ask one of them, "What do you remember about this project?", instead of
@@ -634,7 +1898,6 @@ version in [`docs/changelog/`](docs/changelog/):
   standing pages now sees all of them, fewer in full: pin a page, or give it
   an `abstract:`, to control what it shows. The change adds no marker key
   and no migration. (#1264)
-
 
 ### Fixed
 - Restored fresh source installs after crates.io yanked every `zip` release
@@ -1513,6 +2776,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+
 ### Security
 - Fixed HTTP Basic sign-in to the web UI minting a 30-day `ai_memory_auth`
   cookie that held the root bearer token. Basic sign-in sets no cookie now;
@@ -1524,7 +2788,13 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.5...HEAD
+[3.2.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.5
+[3.2.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.4
+[3.2.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.3
+[3.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.2
+[3.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.1
+[3.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.0
 [3.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.2
 [3.1.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.1
 [3.1.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.0

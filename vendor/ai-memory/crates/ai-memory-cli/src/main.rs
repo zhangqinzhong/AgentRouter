@@ -32,10 +32,19 @@ fn main() -> Result<()> {
 fn run() -> Result<()> {
     // The runtime is built by hand rather than with `#[tokio::main]` for the
     // sake of the `shutdown_timeout` below; the builder settings are the ones
-    // that attribute would have used.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    // that attribute would have used, except for the flavor: a hook call is one
+    // short request, and the multi-thread builder would spawn a worker per CPU
+    // to run it (#1669).
+    let argv: Vec<String> = std::env::args().collect();
+    let mut builder = match ai_memory_cli::runtime_flavor::RuntimeFlavor::for_argv(&argv) {
+        ai_memory_cli::runtime_flavor::RuntimeFlavor::CurrentThread => {
+            tokio::runtime::Builder::new_current_thread()
+        }
+        ai_memory_cli::runtime_flavor::RuntimeFlavor::MultiThread => {
+            tokio::runtime::Builder::new_multi_thread()
+        }
+    };
+    let runtime = builder.enable_all().build()?;
     let result = runtime.block_on(ai_memory_cli::run());
     // `run` has returned and dropped the handles it owned, but the store
     // writer's `Shutdown`-and-join does NOT run here: the maintenance

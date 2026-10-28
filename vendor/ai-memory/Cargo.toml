@@ -35,7 +35,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "3.1.2"
+version = "3.2.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -45,16 +45,16 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "3.1.2" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "3.1.2" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.1.2" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.1.2" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.1.2" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.1.2" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.1.2" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "3.1.2" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.1.2" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.1.2" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "3.2.5" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "3.2.5" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.2.5" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.2.5" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.2.5" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.2.5" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.2.5" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "3.2.5" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.2.5" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.2.5" }
 
 # (Workspace shared deps follow below)
 
@@ -102,6 +102,9 @@ clap_complete = "4"
 # option that keeps one code path across Linux, macOS, and Windows consoles
 # instead of a `#[cfg]` split over termios and the Win32 console API.
 crossterm = "0.29"
+# Terminal tables need display-cell widths: byte and scalar counts both
+# misalign names containing accented or double-width characters.
+unicode-width = "0.2"
 dirs = "5"
 # Format-preserving TOML editor for install-mcp --apply against
 # Codex's config.toml. Plain `toml` round-trips destroy comments;
@@ -157,6 +160,13 @@ flate2 = "1"
 # do not pull bzip2/`libbz2-rs-sys` (license not in deny allowlist); Deflate
 # covers PowerShell Compress-Archive release zips and Stored test fixtures.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+# Native transcript reading: Codex keeps a rollout it has not written for a
+# week as `.jsonl.zst`, so the workstream adapter needs a zstd decoder to find
+# and resume that session. Pure Rust, so the build needs no extra C library.
+# The `hash` feature only computes frame checksums and nothing here compares
+# them, so it stays off; frames that carry one still decode.
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 
 # Text munging / hook payload sanitisation.
 regex = "1"

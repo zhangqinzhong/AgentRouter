@@ -25,6 +25,17 @@ const KNOWN_SKIP_TYPES: &[&str] = &[
     "atis-latch",
     // Bridge connection bookkeeping, not transcript content.
     "bridge-session",
+    // 2.1 起的记账记录:会话名(改名或自动起名时与 custom-title / ai-title 一起写、同值,
+    // 不另当标题)、累计费用、请求元数据与按哈希去重存放的请求内容
+    "agent-name",
+    "cost-state",
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
+    // EnterWorktree 进出 worktree 时记下的工作目录。项目仍按会话起始的目录归:worktree
+    // 用完就删,恢复时 Claude Code 自己按 worktree-state 回到 worktree
+    "relocated",
+    "worktree-state",
 ];
 
 pub struct ClaudeAdapter {

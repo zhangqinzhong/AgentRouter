@@ -128,6 +128,9 @@ fn backup_and_restore_agents_round_trip() {
 
     let agents_md = project.path().join("AGENTS.md");
     fs::write(&agents_md, "# Project Rules\nCodex rules").unwrap();
+    let shared_skill = project.path().join(".agents/skills/shared/SKILL.md");
+    fs::create_dir_all(shared_skill.parent().unwrap()).unwrap();
+    fs::write(&shared_skill, "# Shared skill").unwrap();
 
     let opencode_config = home.path().join(".config/opencode/opencode.json");
     fs::create_dir_all(opencode_config.parent().unwrap()).unwrap();
@@ -236,6 +239,15 @@ fn backup_and_restore_agents_round_trip() {
 
     let restored_agents_md = fs::read_to_string(restore_project.path().join("AGENTS.md")).unwrap();
     assert_eq!(restored_agents_md, "# Project Rules\nCodex rules");
+    assert_eq!(
+        fs::read_to_string(
+            restore_project
+                .path()
+                .join(".agents/skills/shared/SKILL.md")
+        )
+        .unwrap(),
+        "# Shared skill"
+    );
 
     let restored_agy =
         fs::read_to_string(restore_home.path().join(".gemini/config/mcp_config.json")).unwrap();
@@ -255,6 +267,189 @@ fn backup_and_restore_agents_round_trip() {
                 .unwrap()
                 .exists()
         );
+    }
+}
+
+#[test]
+fn antigravity_backup_round_trips_every_documented_skill_root() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let fixtures = [
+        (
+            home.path().join(".gemini/config/skills/app/SKILL.md"),
+            "# App and IDE skill",
+        ),
+        (
+            home.path()
+                .join(".gemini/antigravity-cli/skills/cli/SKILL.md"),
+            "# CLI skill",
+        ),
+        (
+            project.path().join(".agents/skills/workspace/SKILL.md"),
+            "# Workspace skill",
+        ),
+    ];
+    for (path, body) in &fixtures {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let obsolete = project.path().join(".gemini/skills/obsolete/SKILL.md");
+    fs::create_dir_all(obsolete.parent().unwrap()).unwrap();
+    fs::write(&obsolete, "# Old undocumented root").unwrap();
+
+    let archive = project.path().join("antigravity.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            archive.to_str().unwrap(),
+            "--agents",
+            "antigravity",
+            "--include-secrets",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        backup.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--agents",
+            "antigravity",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(
+            restored_home
+                .path()
+                .join(".gemini/config/skills/app/SKILL.md")
+        )
+        .unwrap(),
+        "# App and IDE skill"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            restored_home
+                .path()
+                .join(".gemini/antigravity-cli/skills/cli/SKILL.md")
+        )
+        .unwrap(),
+        "# CLI skill"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            restored_project
+                .path()
+                .join(".agents/skills/workspace/SKILL.md")
+        )
+        .unwrap(),
+        "# Workspace skill"
+    );
+    assert!(
+        !restored_project
+            .path()
+            .join(".gemini/skills/obsolete/SKILL.md")
+            .exists(),
+        "the undocumented legacy project path must not be archived"
+    );
+}
+
+#[test]
+fn qwen_backup_round_trips_every_documented_asset() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let fixtures = [
+        (
+            home.path().join(".qwen/settings.json"),
+            r#"{"mcpServers":{"ai-memory":{"httpUrl":"http://localhost"}}}"#,
+        ),
+        (
+            home.path().join(".qwen/skills/qwen/SKILL.md"),
+            "# Qwen skill",
+        ),
+        (
+            home.path().join(".agents/skills/shared/SKILL.md"),
+            "# Shared skill",
+        ),
+        (project.path().join("QWEN.md"), "# Qwen instructions"),
+        (project.path().join("AGENTS.md"), "# Shared instructions"),
+    ];
+    for (path, body) in &fixtures {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("qwen.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            archive.to_str().unwrap(),
+            "--agents",
+            "qwen-code",
+            "--include-secrets",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        backup.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--agents",
+            "qwen-code",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+
+    for (path, body) in [
+        (
+            restored_home.path().join(".qwen/settings.json"),
+            fixtures[0].1,
+        ),
+        (
+            restored_home.path().join(".qwen/skills/qwen/SKILL.md"),
+            fixtures[1].1,
+        ),
+        (
+            restored_home.path().join(".agents/skills/shared/SKILL.md"),
+            fixtures[2].1,
+        ),
+        (restored_project.path().join("QWEN.md"), fixtures[3].1),
+        (restored_project.path().join("AGENTS.md"), fixtures[4].1),
+    ] {
+        assert_eq!(fs::read_to_string(path).unwrap(), body);
     }
 }
 
@@ -879,6 +1074,15 @@ fn backup_agents_does_not_follow_config_or_asset_root_symlinks() {
     fs::create_dir_all(&external_plugins).unwrap();
     fs::write(external_plugins.join("payload"), b"outside plugin").unwrap();
     symlink(&external_plugins, home.path().join(".claude/plugins")).unwrap();
+    let external_skills = outside.path().join("skills");
+    fs::create_dir_all(&external_skills).unwrap();
+    fs::write(
+        external_skills.join("SKILL.md"),
+        b"outside Antigravity skill",
+    )
+    .unwrap();
+    fs::create_dir_all(home.path().join(".gemini/config")).unwrap();
+    symlink(&external_skills, home.path().join(".gemini/config/skills")).unwrap();
     let archive = project.path().join("backup.tar.gz");
 
     let output = command_with_env(home.path(), project.path())
@@ -889,7 +1093,7 @@ fn backup_agents_does_not_follow_config_or_asset_root_symlinks() {
     assert!(output.status.success());
     assert!(
         !archive.exists(),
-        "symlink-only assets must not be archived"
+        "symlink-only Claude and Antigravity assets must not be archived"
     );
 }
 

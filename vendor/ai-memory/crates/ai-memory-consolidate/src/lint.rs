@@ -20,7 +20,10 @@ const LINT_SYSTEM_PROMPT: &str = include_str!("../prompts/lint_system.md");
 use crate::EmbeddingCoord;
 use crate::cold_cluster::cosine_distance;
 use ai_memory_core::{PageId, PagePath, ProjectId, Tier, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload, Role,
+    complete_structured_with_operation_id,
+};
 use ai_memory_store::{DecayCandidate, ReaderPool};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use jiff::Timestamp;
@@ -708,7 +711,12 @@ async fn contradiction_pass(
         max_tokens: 32_000,
         temperature: Some(0.1),
     };
-    let report: LintReport = complete_structured(&*provider, request).await?;
+    let report: LintReport = complete_structured_with_operation_id(
+        &*provider,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Lint),
+    )
+    .await?;
     Ok(report.findings)
 }
 

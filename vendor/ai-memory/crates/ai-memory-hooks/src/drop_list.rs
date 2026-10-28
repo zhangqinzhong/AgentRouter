@@ -1,11 +1,14 @@
-//! Server-side drop list for tool events (`[ingest]`, #1241).
+//! Server-side ingest drop list (`[ingest]`, #1241).
 //!
-//! An operator can name tool calls the server should never store, whatever the
-//! client sends: tool-use ids by prefix (Claude Code marks plugin tool calls
-//! with their own id prefix) and tool names exactly. A matching event is
-//! acknowledged like any other policy drop, before it reaches the sanitizer,
-//! the rate limiter, the ingest semaphore or storage. The lists are read once
-//! at startup and bounded, so the check stays cheap on the hook path.
+//! An operator can name what the server should never store, whatever the
+//! client sends: tool calls by tool-use id prefix (Claude Code marks plugin
+//! tool calls with their own id prefix) and tool names exactly, plus whole
+//! hook event kinds (`drop_events`). A matching event is acknowledged like
+//! any other policy drop. All lists run right after the subagent exclusion in
+//! both the single and the batch ingress, so a marked event always seeds tail
+//! tracking before a policy matcher can drop it, and before it reaches the rate
+//! limiter, the ingest semaphore, the sanitizer or storage. The lists are read
+//! once at startup and bounded, so the checks stay cheap on the hook path.
 
 use crate::payload::{HookEnvelope, HookEvent};
 
@@ -14,11 +17,21 @@ pub const MAX_DROP_ENTRIES: usize = 64;
 /// Longest entry, in characters.
 pub const MAX_DROP_ENTRY_CHARS: usize = 128;
 
-/// Tool events the server drops by tool-use id prefix or exact tool name.
+/// Tool events the server drops by tool-use id prefix or exact tool name,
+/// plus whole hook event kinds dropped outright (`drop_events`). A matching
+/// event is acknowledged like any other policy drop, before it reaches the
+/// sanitizer, the rate limiter, the ingest semaphore or storage. The lists
+/// are read once at startup and bounded, so the checks stay cheap on the hook
+/// path.
+///
+/// Both checks run after the subagent exclusion, so a marked subagent event
+/// still seeds the tracking set its unmarked tail is dropped against even when
+/// its tool id, tool name, or event kind is listed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IngestDropList {
     tool_use_id_prefixes: Vec<String>,
     tool_names: Vec<String>,
+    drop_events: IngestDropEvents,
 }
 
 impl IngestDropList {
@@ -28,16 +41,27 @@ impl IngestDropList {
     /// Returns a message naming the offending list when either holds more than
     /// [`MAX_DROP_ENTRIES`] entries, or an entry that is blank, longer than
     /// [`MAX_DROP_ENTRY_CHARS`] characters, or contains a control character.
-    pub fn new(tool_use_id_prefixes: Vec<String>, tool_names: Vec<String>) -> Result<Self, String> {
+    /// A `drop_events` entry that is not a droppable hook event kind is
+    /// rejected with a message naming it.
+    pub fn new(
+        tool_use_id_prefixes: Vec<String>,
+        tool_names: Vec<String>,
+        drop_events: &[String],
+    ) -> Result<Self, String> {
         validate("drop_tool_use_id_prefixes", &tool_use_id_prefixes)?;
         validate("drop_tool_names", &tool_names)?;
+        let drop_events = IngestDropEvents::new(drop_events)?;
         Ok(Self {
             tool_use_id_prefixes,
             tool_names,
+            drop_events,
         })
     }
 
-    /// Whether this tool event is on the list. Only tool events can match.
+    /// Whether this event's tool id or name is on the tool drop lists.
+    ///
+    /// Matches only tool events (`pre-tool-use` / `post-tool-use`); whole-kind
+    /// drops (`drop_events`) are checked by [`Self::matches_event_kind`].
     #[must_use]
     pub fn matches(&self, env: &HookEnvelope) -> bool {
         if self.tool_use_id_prefixes.is_empty() && self.tool_names.is_empty() {
@@ -65,6 +89,117 @@ impl IngestDropList {
             return true;
         }
         name.is_some_and(|name| self.tool_names.contains(&name))
+    }
+
+    /// Whether this event's whole kind is dropped by `[ingest] drop_events`.
+    ///
+    /// Unlike [`Self::matches`] this ignores the tool id/name and looks only
+    /// at the event kind, so it applies to every tool, agent and payload
+    /// shape. The router runs it right after the subagent exclusion (so a
+    /// marked subagent event still seeds the tail tracking) and before the
+    /// rate limiter, the ingest semaphore, the sanitizer and storage.
+    #[must_use]
+    pub fn matches_event_kind(&self, env: &HookEnvelope) -> bool {
+        self.drop_events.matches(env)
+    }
+}
+
+/// Hook event kinds the server drops outright (`[ingest] drop_events`).
+///
+/// Unlike [`IngestDropList`] (which matches on a tool's id or name within a
+/// tool event), this drops a whole event *kind* whatever the client sends. The
+/// motivating case is `pre-tool-use`: on claude-code its body is at most
+/// `tool_family`/`tool_call_id` and is empty when the call carries no
+/// `tool_input`, while its 1:1 `post-tool-use` pair carries the content. An
+/// operator who wants to stop storing the redundant half can name the kind
+/// here. A matching event is acknowledged like any other policy drop, before
+/// it reaches the sanitizer, the rate limiter, the ingest semaphore or
+/// storage. The set is read once at startup and bounded, so the check stays
+/// cheap on the hook path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngestDropEvents {
+    kinds: Vec<HookEvent>,
+}
+
+/// The droppable kinds, as their canonical kebab-case wire names, for error
+/// and config docs.
+const DROPPABLE_KINDS: &str = "user-prompt, pre-tool-use, post-tool-use, \
+     pre-compact, post-compaction, notification, stop, subagent-start, \
+     subagent-stop";
+
+/// Whether an event kind may be named in `[ingest] drop_events`.
+///
+/// `session-start` and `session-end` are excluded: the router uses them to
+/// open and close a session, so dropping them would strand the session state
+/// machine (a session never opened, or never ended). The unrecognized-event
+/// bucket (`other`) is excluded too: naming it would drop every event without
+/// a typed kind — a much broader drop than an operator asking for one kind
+/// intends. A kind not listed here is intentionally non-droppable: when a new
+/// variant is added to [`HookEvent`], the reviewer must consciously decide
+/// whether it may be dropped rather than have it silently join the set.
+const fn is_droppable_event(event: HookEvent) -> bool {
+    matches!(
+        event,
+        HookEvent::UserPrompt
+            | HookEvent::PreToolUse
+            | HookEvent::PostToolUse
+            | HookEvent::PreCompact
+            | HookEvent::PostCompaction
+            | HookEvent::Notification
+            | HookEvent::Stop
+            | HookEvent::SubagentStart
+            | HookEvent::SubagentStop
+    )
+}
+
+impl IngestDropEvents {
+    /// Validate and build the drop set.
+    ///
+    /// Each value is parsed with the typed [`HookEvent::parse`] (never a free
+    /// string compare). Duplicates collapse to one kind. The set is bounded by
+    /// the number of droppable kinds, so no separate size limit is needed.
+    ///
+    /// # Errors
+    /// Returns a message naming the offending value when it is blank, not a
+    /// known hook event kind, or a kind that drives session state.
+    pub fn new(raw: &[String]) -> Result<Self, String> {
+        let mut kinds: Vec<HookEvent> = Vec::with_capacity(raw.len());
+        for value in raw {
+            if value.trim().is_empty() {
+                return Err("[ingest].drop_events has a blank entry".to_string());
+            }
+            let event = HookEvent::parse(value);
+            if !is_droppable_event(event) {
+                let reason = match event {
+                    HookEvent::SessionStart | HookEvent::SessionEnd => {
+                        "drives session state (the router opens and closes sessions with it) \
+                         and cannot be dropped"
+                    }
+                    HookEvent::Other => "is not a known hook event kind",
+                    // A kind outside the droppable set that is neither
+                    // session-state nor the unrecognized bucket: currently
+                    // none, but a newly added enum variant lands here so the
+                    // failure is explicit rather than silently droppable.
+                    _ => "cannot be dropped",
+                };
+                return Err(format!(
+                    "[ingest].drop_events: {value} {reason}. Droppable kinds: \
+                     {DROPPABLE_KINDS}"
+                ));
+            }
+            if !kinds.contains(&event) {
+                kinds.push(event);
+            }
+        }
+        Ok(Self { kinds })
+    }
+
+    /// Whether this event's kind is dropped. Unlike [`IngestDropList::matches`]
+    /// this ignores the tool id/name and looks only at the event kind, so it
+    /// applies to every tool, agent and payload shape.
+    #[must_use]
+    pub fn matches(&self, env: &HookEnvelope) -> bool {
+        !self.kinds.is_empty() && self.kinds.contains(&env.event)
     }
 }
 
@@ -117,6 +252,7 @@ mod tests {
         IngestDropList::new(
             vec!["toolu_plugin_".into()],
             vec!["mcp__noisy__poll".into()],
+            &[],
         )
         .unwrap()
     }
@@ -158,7 +294,8 @@ mod tests {
 
     #[test]
     fn each_agent_is_matched_on_its_own_tool_fields() {
-        let list = IngestDropList::new(vec!["plugin-".into()], vec!["noisy_poll".into()]).unwrap();
+        let list =
+            IngestDropList::new(vec!["plugin-".into()], vec!["noisy_poll".into()], &[]).unwrap();
         // OpenCode, Pi and OMP carry the call id as `callID` and the name as `tool`.
         let opencode = agent_event(
             "opencode",
@@ -213,6 +350,19 @@ mod tests {
             serde_json::json!({ "session_id": "s", "tool_name": "Read", "tool_use_id": "toolu_4" }),
         );
         assert!(!list.matches(&codebuddy_kept));
+        // Qwen Code sends the same Claude-shaped `tool_name` / `tool_use_id`.
+        let qwen = agent_event(
+            "qwen-code",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "write_file", "tool_input": { "file_path": "a" }, "tool_use_id": "plugin-5" }),
+        );
+        assert!(list.matches(&qwen));
+        let qwen_kept = agent_event(
+            "qwen-code",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "write_file", "tool_use_id": "toolu_5" }),
+        );
+        assert!(!list.matches(&qwen_kept));
         // Controls: the same agents with ordinary ids and names stay.
         let kept = agent_event(
             "opencode",
@@ -237,13 +387,126 @@ mod tests {
 
     #[test]
     fn entries_are_bounded_and_must_be_printable() {
-        assert!(IngestDropList::new(vec![" ".into()], Vec::new()).is_err());
-        assert!(IngestDropList::new(Vec::new(), vec!["a\nb".into()]).is_err());
+        assert!(IngestDropList::new(vec![" ".into()], Vec::new(), &[]).is_err());
+        assert!(IngestDropList::new(Vec::new(), vec!["a\nb".into()], &[]).is_err());
         assert!(
-            IngestDropList::new(vec!["x".repeat(MAX_DROP_ENTRY_CHARS + 1)], Vec::new()).is_err()
+            IngestDropList::new(vec!["x".repeat(MAX_DROP_ENTRY_CHARS + 1)], Vec::new(), &[])
+                .is_err()
         );
         let too_many = (0..=MAX_DROP_ENTRIES).map(|i| format!("t{i}")).collect();
-        assert!(IngestDropList::new(Vec::new(), too_many).is_err());
-        assert!(IngestDropList::new(vec!["x".repeat(MAX_DROP_ENTRY_CHARS)], Vec::new()).is_ok());
+        assert!(IngestDropList::new(Vec::new(), too_many, &[]).is_err());
+        assert!(
+            IngestDropList::new(vec!["x".repeat(MAX_DROP_ENTRY_CHARS)], Vec::new(), &[]).is_ok()
+        );
+    }
+
+    #[test]
+    fn drop_events_default_drops_nothing() {
+        let list = IngestDropEvents::default();
+        assert!(list.kinds.is_empty());
+        // Nothing is dropped by default: every kind, incl. pre-tool-use, matches no.
+        assert!(!list.matches(&event(
+            "pre-tool-use",
+            serde_json::json!({ "session_id": "s" })
+        )));
+        assert!(!list.matches(&event(
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s" })
+        )));
+    }
+
+    #[test]
+    fn drop_events_named_kind_matches_its_events_only() {
+        let list = IngestDropEvents::new(&["pre-tool-use".into()]).unwrap();
+        // The named kind is dropped, on any agent and any payload shape.
+        assert!(list.matches(&event(
+            "pre-tool-use",
+            serde_json::json!({ "session_id": "s" })
+        )));
+        assert!(list.matches(&agent_event(
+            "opencode",
+            "pre-tool-use",
+            serde_json::json!({ "sessionID": "s" })
+        )));
+        // Its 1:1 pair and every other kind are untouched.
+        assert!(!list.matches(&event(
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s" })
+        )));
+        assert!(!list.matches(&event(
+            "user-prompt",
+            serde_json::json!({ "session_id": "s", "prompt": "hi" })
+        )));
+        assert!(!list.matches(&event("session-start", serde_json::json!({}))));
+        assert!(!list.matches(&event(
+            "session-end",
+            serde_json::json!({ "session_id": "s" })
+        )));
+        assert!(!list.matches(&event("stop", serde_json::json!({ "session_id": "s" }))));
+    }
+
+    #[test]
+    fn drop_events_accepts_case_and_underscore_wire_spellings() {
+        // The typed parser, not a string compare: every accepted spelling of
+        // the same kind collapses to one entry and matches.
+        let list = IngestDropEvents::new(&[
+            "PreToolUse".into(),
+            "pre_tool_use".into(),
+            "pre-tool-use".into(),
+        ])
+        .unwrap();
+        assert_eq!(list.kinds.len(), 1, "duplicate kinds collapse");
+        assert!(list.matches(&event(
+            "preToolUse",
+            serde_json::json!({ "session_id": "s" })
+        )));
+    }
+
+    #[test]
+    fn drop_events_rejects_session_state_kinds() {
+        for value in [
+            "session-start",
+            "session-end",
+            "SessionStart",
+            "session_end",
+        ] {
+            let error = IngestDropEvents::new(&[value.into()]).unwrap_err();
+            assert!(
+                error.contains(value) && error.contains("session state"),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_events_rejects_unknown_and_unrecognized_bucket() {
+        for value in ["bogus", "", "other", "notification-2"] {
+            let error = IngestDropEvents::new(&[value.into()]).unwrap_err();
+            assert!(error.contains("drop_events"), "{value}: {error}");
+        }
+        // The error names the offending value for an operator to fix.
+        let error = IngestDropEvents::new(&["pre-tool-us".into()]).unwrap_err();
+        assert!(
+            error.contains("pre-tool-us"),
+            "unknown kinds name the value: {error}"
+        );
+        assert!(
+            error.contains("Droppable kinds"),
+            "and list the valid ones: {error}"
+        );
+    }
+
+    #[test]
+    fn drop_events_multiple_kinds() {
+        let list = IngestDropEvents::new(&["pre-tool-use".into(), "stop".into()]).unwrap();
+        assert!(list.matches(&event(
+            "pre-tool-use",
+            serde_json::json!({ "session_id": "s" })
+        )));
+        assert!(list.matches(&event("stop", serde_json::json!({ "session_id": "s" }))));
+        assert!(!list.matches(&event(
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s" })
+        )));
     }
 }

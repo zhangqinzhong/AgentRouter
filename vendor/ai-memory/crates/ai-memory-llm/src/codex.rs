@@ -20,8 +20,8 @@ use crate::codex_responses::{CODEX_RESPONSES_URL, CodexResponsesAuth, post_codex
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::openai_oauth::{
-    CodexResponsesRequest, CodexText, CodexTextFormat, build_request, extract_output_text,
-    into_chat_response,
+    CodexResponsesRequest, CodexText, CodexTextFormat, build_request, into_chat_response,
+    require_output_text,
 };
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort};
@@ -210,8 +210,12 @@ impl LlmProvider for CodexProvider {
                 self.reasoning_effort,
             ))
             .await?;
-        serde_json::from_str(&extract_output_text(&response).unwrap_or_default())
-            .map_err(LlmError::from)
+        // No content at all is a distinct terminal failure, not a JSON parse
+        // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
+        // an empty string to serde, so the caller saw "EOF while parsing a value
+        // at line 1 column 0", which names neither the model nor the cause.
+        let text = require_output_text(&response, &self.model)?;
+        serde_json::from_str(&text).map_err(LlmError::from)
     }
 }
 

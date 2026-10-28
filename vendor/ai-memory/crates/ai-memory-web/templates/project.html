@@ -13,7 +13,8 @@
   <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ project }}</span>
 </nav>
 
-<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-6">{{ workspace }}/{{ project }}</h1>
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ workspace }}/{{ project }}</h1>
+<p class="mb-6"><a href="{{ graph_href }}" class="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline">Link graph</a></p>
 
 <form action="search" method="get" class="mb-8 flex flex-wrap items-center gap-2" aria-label="Search this project">
   <input type="hidden" name="workspace" value="{{ workspace }}">

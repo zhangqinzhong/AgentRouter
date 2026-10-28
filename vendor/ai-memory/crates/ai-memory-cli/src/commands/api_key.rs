@@ -93,40 +93,48 @@ async fn list(ep: &ServerEndpoint, args: ApiKeyListArgs) -> Result<()> {
         println!("(no API credentials)");
         return Ok(());
     }
-    let id_w = resp
-        .credentials
+    write_credentials(&resp.credentials, &mut io::stdout().lock())
+}
+
+/// Lay out the credentials table using terminal display-cell widths. Labels
+/// are free text, so a byte count over-pads an accented label and misplaces
+/// every cell after a double-width one.
+fn write_credentials(credentials: &[CredentialRow], out: &mut impl Write) -> Result<()> {
+    let id_w = credentials
         .iter()
-        .map(|c| c.id.len())
+        .map(|c| unicode_width::UnicodeWidthStr::width(c.id.as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
-    let label_w = resp
-        .credentials
+    let label_w = credentials
         .iter()
-        .map(|c| c.label.len())
+        .map(|c| unicode_width::UnicodeWidthStr::width(c.label.as_str()))
         .max()
         .unwrap_or(5)
         .max(5);
-    println!(
-        "{:<id_w$}  {:<label_w$}  {:<8}  PREVIEW",
-        "ID",
-        "LABEL",
-        "STATUS",
-        id_w = id_w,
-        label_w = label_w,
-    );
-    for c in &resp.credentials {
-        println!(
-            "{:<id_w$}  {:<label_w$}  {:<8}  {}",
-            c.id,
-            c.label,
+    writeln!(
+        out,
+        "{}  {}  {:<8}  PREVIEW",
+        pad_cell("ID", id_w),
+        pad_cell("LABEL", label_w),
+        "STATUS"
+    )?;
+    for c in credentials {
+        writeln!(
+            out,
+            "{}  {}  {:<8}  {}",
+            pad_cell(&c.id, id_w),
+            pad_cell(&c.label, label_w),
             c.status(),
-            c.preview.as_deref().unwrap_or("-"),
-            id_w = id_w,
-            label_w = label_w,
-        );
+            c.preview.as_deref().unwrap_or("-")
+        )?;
     }
     Ok(())
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(unicode_width::UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 async fn rotate(ep: &ServerEndpoint, args: ApiKeyRotateArgs) -> Result<()> {
@@ -192,4 +200,69 @@ fn confirm(prompt: &str) -> Result<()> {
         bail!("aborted");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credential(label: &str) -> CredentialRow {
+        CredentialRow {
+            id: "k1".to_owned(),
+            user_id: "u1".to_owned(),
+            label: label.to_owned(),
+            preview: Some("aim_ab".to_owned()),
+            created_at: 0,
+            last_used_at: None,
+            expires_at: None,
+            revoked_at: None,
+        }
+    }
+
+    /// The display-cell offset at which `line` carries `cell`, or `None`.
+    fn cell_column(line: &str, cell: &str) -> Option<usize> {
+        line.find(cell)
+            .map(|byte| unicode_width::UnicodeWidthStr::width(&line[..byte]))
+    }
+
+    fn render(credentials: &[CredentialRow]) -> String {
+        let mut buf = Vec::new();
+        write_credentials(credentials, &mut buf).expect("rendering to a buffer cannot fail");
+        String::from_utf8(buf).expect("the table is utf-8")
+    }
+
+    #[test]
+    fn credentials_table_columns_line_up_past_ascii() {
+        // Under a byte-measured width the double-width label is padded to its
+        // byte count in characters, which pushes its STATUS and PREVIEW cells
+        // right of the ASCII row's.
+        let table = render(&[credential("記憶"), credential("ci")]);
+        let header = table.lines().next().expect("a header row");
+        let status_col = cell_column(header, "STATUS").expect("a STATUS column");
+        for line in table.lines().skip(1) {
+            assert_eq!(
+                cell_column(line, "active"),
+                Some(status_col),
+                "STATUS column moved on {line:?}:\n{table}"
+            );
+        }
+
+        // An accented label must not widen LABEL past what any row needs:
+        // STATUS follows LABEL by the widest label plus the separator.
+        let accented = render(&[credential("produção"), credential("ci")]);
+        let header = accented.lines().next().expect("a header row");
+        let label_col = cell_column(header, "LABEL").expect("a LABEL column");
+        let status_col = cell_column(header, "STATUS").expect("a STATUS column");
+        let widest_label = "produção".chars().count();
+        assert_eq!(status_col, label_col + widest_label + 2, "{accented}");
+
+        // Control: ASCII rows line up under either measure, so the rows above
+        // are what carry the assertions.
+        let ascii = render(&[credential("prod"), credential("ci")]);
+        let ascii_header = ascii.lines().next().expect("a header row");
+        let ascii_status = cell_column(ascii_header, "STATUS").expect("a STATUS column");
+        for line in ascii.lines().skip(1) {
+            assert_eq!(cell_column(line, "active"), Some(ascii_status), "{ascii}");
+        }
+    }
 }

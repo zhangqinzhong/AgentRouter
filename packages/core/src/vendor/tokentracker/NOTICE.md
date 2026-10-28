@@ -34,7 +34,30 @@ lists all managed/default rollout files on each scan, including older sessions.
 Overview usage now reads the same local source scope as the usage page; gateway
 metrics remain separate internally for system status and request diagnostics.
 
+Pricing overrides refreshed from upstream v1.4.12 (2026-10-26):
+`lib/pricing/curated-overrides.json` only; the seed snapshot and the
+LiteLLM fetcher were already identical and stay untouched.
+
+Session layer re-synced to upstream v1.4.12 (2026-10-26):
+`session-analytics.js` and `rollout.js` now carry the upstream v27 sidecar,
+including OpenCode/Kimi/OMP sources and the incomplete-inventory guard.
+Re-applied AgentRouter adaptations: `ar_profile` tagging, profile roots from
+`local-sources.profileHomes`, the `~/.agentrouter/collector` queue path, the
+`getSessionTranscript` bridge, and the MiMo native-database session source
+(`readMimoDbMessages`, mimo only — ZCode now comes from the upstream source).
+
+Session-layer dependencies synced with the v1.4.12 resync (2026-10-26):
+`codex-rollout-parser.js` (compaction onUsage, long-context priced delta),
+`jsonl-lines.js` (per-record cap + oversized flag), `codex-service-tier.js`
+(new), and `offline-api.js` (timezone passthrough). Without these the new
+session layer produced buckets the usage queue disagreed with.
+
 October 2026 targeted backports (base import remains unchanged):
+- `987f5ec3`: ZCode sessions from `~/.zcode/cli/db/db.sqlite`. The db is rescanned
+  per stat instead of cached per row, because one db yields many rows; the WSL
+  branch of the upstream resolver is omitted until `wsl-probe` exposes
+  `shouldProbeWsl`/`pickWin32Path`.
+
 - `9cffe8e1`: Claude user-message identity follows fork lineage, including legacy count repair.
 - `4c27f7b7`, `5b01653a`, `07f0e0e3`: OpenCode fingerprint owner correctness only;
   AgentRouter retains its own JSON cursor coordinator, without upstream cursor shards.

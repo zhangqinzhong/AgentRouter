@@ -27,6 +27,8 @@ mod brief_tiers;
 pub mod capture_policy;
 pub mod drop_list;
 mod grants;
+pub mod hermes;
+pub mod idle_end;
 mod json_repair;
 pub mod log;
 pub mod payload;
@@ -36,7 +38,9 @@ pub mod synth;
 pub mod workstream;
 
 pub use antigravity::{
-    MAX_ANTIGRAVITY_OUTPUT_BYTES, enrich_antigravity_step_output, is_output_eligible,
+    MAX_ANTIGRAVITY_OUTPUT_BYTES, TranscriptCursor, TranscriptPrompt, TranscriptRead,
+    antigravity_conversation_id, antigravity_transcript_path, enrich_antigravity_step_output,
+    is_output_eligible, read_transcript_prompts,
 };
 
 // Re-export the sanitizer types from core so callers that grew up
@@ -55,15 +59,19 @@ pub use capture_policy::{
     glob_segment_matches, glob_walk, repository_admits_capture, tool_call_payload, valid_call_id,
 };
 pub use drop_list::IngestDropList;
+pub use hermes::{hermes_is_delegated_child, hermes_is_first_turn, shape_hermes_lifecycle_body};
+pub use idle_end::{
+    IDLE_END_BATCH, IDLE_END_INTERVAL_SECS, IdleEndTickInput, IdleEndTickOutcome, run_idle_end_tick,
+};
 pub use json_repair::replace_lone_surrogate_escapes;
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
     USER_PROMPT_EXCERPT_MAX_BYTES, agent_from_payload, cap_lifecycle_body_for_client,
-    hook_payload_context, user_prompt_text,
+    hook_payload_context, user_prompt_text, user_prompt_text_for_agent,
 };
 pub use recap::RECAP_BUDGET_MIN;
 pub use router::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
+    CwdProbes, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
     DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, IngestGates, IngestRateLimiter, ProjectCache,
     ProjectCacheStore, SubagentSessionSet, SubagentSessions, hook_router,
 };

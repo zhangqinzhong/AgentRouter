@@ -5,7 +5,7 @@ eyebrow: Detailed configuration
 lead: The embedded ai-memory runtime shares project knowledge, session history, and handoffs across coding clients.
 ---
 
-The Memory page embeds the [ai-memory](https://github.com/akitaonrails/ai-memory) v3.1.2 runtime and brings the project knowledge base, session capture, handoffs, and client integration into native pages. It does not embed the upstream web UI; upstream source, license, and provenance live in the repository under `vendor/ai-memory` and `vendor/ai-memory.UPSTREAM.md`.
+The Memory page embeds the [ai-memory](https://github.com/akitaonrails/ai-memory) v3.2.5 runtime and brings the project knowledge base, session capture, handoffs, and client integration into native pages. It does not embed the upstream web UI; upstream source, license, and provenance live in the repository under `vendor/ai-memory` and `vendor/ai-memory.UPSTREAM.md`.
 
 ## Enabling and lifecycle
 

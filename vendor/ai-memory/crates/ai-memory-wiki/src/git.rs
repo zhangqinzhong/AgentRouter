@@ -16,6 +16,10 @@
 //! They are append-only logs that reach hundreds of megabytes, git stores each
 //! new version as a whole blob, and nothing reads them back from git; see
 //! [`is_ledger_file`].
+//!
+//! Every repository handle turns on libgit2's fsync for `.git` through a
+//! config file only libgit2 reads, so a crash cannot leave a ref naming an
+//! object whose bytes never reached disk; see [`attach_libgit2_config`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -23,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use git2::{ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::{WikiError, WikiResult};
 
@@ -175,6 +179,7 @@ fn open_validated_repository(root: &Path) -> Result<Repository, OpenRepositoryEr
             reason: "wiki repository metadata escapes the in-root .git directory",
         }));
     }
+    attach_libgit2_config(&repo).map_err(OpenRepositoryError::Git)?;
     Ok(repo)
 }
 
@@ -185,15 +190,135 @@ fn map_open_error(error: OpenRepositoryError) -> WikiError {
     }
 }
 
-fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<()> {
+/// The validated repository, or `None` when libgit2 cannot open it and the
+/// Windows git CLI fallback will serve it instead.
+fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<Option<Repository>> {
     match open_validated_repository(root) {
-        Ok(_) => Ok(()),
+        Ok(repo) => Ok(Some(repo)),
         Err(OpenRepositoryError::Git(error))
             if cfg!(windows) && should_try_commit_cli_fallback(&error) =>
         {
-            validate_cli_fallback_root(root)
+            validate_cli_fallback_root(root).map(|()| None)
         }
         Err(error) => Err(map_open_error(error)),
+    }
+}
+
+/// The config key that makes libgit2 fsync each loose object, ref and reflog
+/// (and the directory it lands in) before renaming it into place.
+const FSYNC_OBJECT_FILES: &str = "core.fsyncObjectFiles";
+
+/// Config file in the wiki's `.git` that only libgit2 reads: git looks for
+/// `config` (and `config.worktree`) there, never for this name.
+const LIBGIT2_CONFIG_FILE: &str = "ai-memory.gitconfig";
+
+const LIBGIT2_CONFIG: &str = "\
+# Written by ai-memory and read only by its libgit2 handles (#1511).
+[core]
+\tfsyncObjectFiles = true
+";
+
+/// Write [`LIBGIT2_CONFIG_FILE`] into the wiki's `.git` unless it already
+/// holds [`LIBGIT2_CONFIG`]. Runs once per adapter, at startup.
+fn write_libgit2_config(git_dir: &Path) -> WikiResult<()> {
+    let path = git_dir.join(LIBGIT2_CONFIG_FILE);
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == LIBGIT2_CONFIG.as_bytes()) {
+        return Ok(());
+    }
+    // Inside `.git`, which a commit never stages, so there is nothing to report.
+    #[allow(clippy::disallowed_methods)]
+    crate::atomic::write_atomic(&path, LIBGIT2_CONFIG.as_bytes())?;
+    Ok(())
+}
+
+/// Give this handle libgit2's fsync for `.git`, unless the repository's own
+/// config turns it off.
+///
+/// libgit2 writes objects and refs to a temp file and renames it, without
+/// fsync by default. After a crash the rename, and the ref update that names
+/// the new commit, can survive while the object's bytes never reached disk:
+/// zero-length loose objects and a HEAD that no longer reads, so every later
+/// checkpoint fails (#1511). The process-wide `GIT_OPT_ENABLE_FSYNC_GITDIR`
+/// covers the same writes, but git2 has no safe wrapper for it and the
+/// workspace forbids `unsafe`. Writing the key to `.git/config` would make the
+/// git CLI warn that it is deprecated on every command an operator runs in the
+/// wiki, so it goes in [`LIBGIT2_CONFIG_FILE`], added to this handle's live
+/// config at the app level.
+///
+/// Why this reaches the fsync decision (vendored libgit2 1.9.3):
+/// `Repository::config` returns the handle's own config object, not a
+/// snapshot, and libgit2 reads `core.fsyncObjectFiles` from that object
+/// through the configmap cache when it first loads the object database
+/// (`git_odb__set_caps`) and the refdb (`refdb_fs` backend). Opening a
+/// repository loads neither, so the cached value is still unset here; this
+/// runs before any caller touches the handle.
+///
+/// The app level outranks every file git itself reads, so an explicit
+/// `false` in `.git/config` is checked first and kept. The app backend also
+/// becomes the handle's preferred writer; ai-memory never writes config
+/// through a handle.
+fn attach_libgit2_config(repo: &Repository) -> Result<(), git2::Error> {
+    let mut config = repo.config()?;
+    let local = match config.open_level(git2::ConfigLevel::Local) {
+        Ok(local) => local.get_bool(FSYNC_OBJECT_FILES).ok(),
+        Err(error) if error.code() == ErrorCode::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if local == Some(false) {
+        return Ok(());
+    }
+    config.add_file(
+        &repo.path().join(LIBGIT2_CONFIG_FILE),
+        git2::ConfigLevel::App,
+        false,
+    )
+}
+
+/// `Ok` when HEAD is unborn (a fresh repository) or resolves to a commit
+/// whose tree reads back; the error otherwise, such as libgit2's
+/// "failed to parse loose object" for an object a crash left empty.
+fn readable_head(repo: &Repository) -> Result<(), git2::Error> {
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    head.peel_to_commit()?.tree()?;
+    Ok(())
+}
+
+/// Startup checks on the wiki repository. Neither fails the server: the
+/// markdown on disk is the source of truth and keeps being served, but a
+/// history that cannot take a commit is reported once, loudly, instead of
+/// only as a warning from each checkpoint that fails.
+fn check_repository_durability(root: &Path, repo: &Repository) {
+    match repo
+        .config()
+        .and_then(|config| config.get_bool(FSYNC_OBJECT_FILES))
+    {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            root = %root.display(),
+            "{FSYNC_OBJECT_FILES} is false in the wiki repository's config; a crash can leave \
+             its history with empty objects"
+        ),
+        Err(error) => warn!(
+            root = %root.display(),
+            %error,
+            "could not read the wiki repository's fsync setting; a crash can leave its history \
+             with empty objects"
+        ),
+    }
+    if let Err(error) = readable_head(repo) {
+        error!(
+            root = %root.display(),
+            %error,
+            "wiki git history is unreadable: HEAD does not resolve to a readable commit, so \
+             every checkpoint will fail until it is repaired. Pages on disk are not affected. \
+             See \"Wiki git history unreadable after a crash\" in docs/lifecycle-ops.md"
+        );
     }
 }
 
@@ -285,18 +410,17 @@ impl GitAdapter {
     /// Propagates any underlying libgit2 error.
     pub fn open_or_init(root: &Path) -> WikiResult<Self> {
         crate::confinement::initialize_root(root)?;
-        let git_dir = root.join(".git");
-        match std::fs::symlink_metadata(&git_dir) {
-            Ok(_) => {
-                validate_repository_or_allow_cli_fallback(root)?;
-                debug!(root = %root.display(), "wiki repo already initialised");
-            }
+        match std::fs::symlink_metadata(root.join(".git")) {
+            Ok(_) => debug!(root = %root.display(), "wiki repo already initialised"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 debug!(root = %root.display(), "initialising wiki repo");
                 init_repo(root)?;
-                validate_repository_or_allow_cli_fallback(root)?;
             }
             Err(error) => return Err(error.into()),
+        }
+        write_libgit2_config(&crate::confinement::inspect_git_directory(root)?)?;
+        if let Some(repo) = validate_repository_or_allow_cli_fallback(root)? {
+            check_repository_durability(root, &repo);
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -922,7 +1046,7 @@ fn stage_working_tree(root: &Path, index: &mut git2::Index) -> Result<Vec<PathBu
         ["*"].iter(),
         IndexAddOption::DEFAULT,
         Some(&mut |path: &Path, _: &[u8]| {
-            if is_ledger_file(root, path) {
+            if is_ledger_file(root, path) || is_in_flight_write(path) {
                 return 1;
             }
             touched.push(path.to_path_buf());
@@ -930,6 +1054,26 @@ fn stage_working_tree(root: &Path, index: &mut git2::Index) -> Result<Vec<PathBu
         }),
     )?;
     Ok(touched)
+}
+
+/// True when `rel`'s basename belongs to a write still in flight: a
+/// `.ai-memory-tmp.` staging file or a `.ai-memory-delete.` parked page.
+///
+/// These exist only between a write starting and its rename, so committing one
+/// records a page body that may never be installed. `Wiki::apply_batch` holds
+/// one staging file per page across an `await`, and `commit_all` takes only the
+/// commit lock, never the mutation lock, so a checkpoint can land in that
+/// window. A parked page is also reported by name: `rename_checked` marks the
+/// `.ai-memory-delete.` quarantine and the `.ai-memory-tmp.move-session.` name
+/// written, so the reported-file branch of [`stage_paths`] checks this too.
+/// The watcher drops both for its own reasons: `is_tempfile` matches the
+/// `.ai-memory-tmp.` prefix, and a quarantine name carries no `.md` suffix.
+fn is_in_flight_write(rel: &Path) -> bool {
+    rel.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(".ai-memory-tmp.") || name.starts_with(".ai-memory-delete.")
+        })
 }
 
 /// True when `rel` (relative to the wiki root) is a raw hook event ledger:
@@ -1009,7 +1153,9 @@ fn stage_paths(
             index.add_all(
                 [spec.as_str()].iter(),
                 IndexAddOption::DISABLE_PATHSPEC_MATCH,
-                Some(&mut |path: &Path, _: &[u8]| i32::from(is_ledger_file(root, path))),
+                Some(&mut |path: &Path, _: &[u8]| {
+                    i32::from(is_ledger_file(root, path) || is_in_flight_write(path))
+                }),
             )?;
             untrack_ledgers(root, index, Some(&spec))?;
         } else if abs.is_file() {
@@ -1017,7 +1163,7 @@ fn stage_paths(
                 if index.get_path(rel, 0).is_some() {
                     index.remove_path(rel)?;
                 }
-            } else {
+            } else if !is_in_flight_write(rel) {
                 index.add_path(rel)?;
             }
         } else if index.get_path(rel, 0).is_some() {
@@ -1946,6 +2092,80 @@ mod tests {
         (tmp, root, adapter)
     }
 
+    /// `apply_batch` keeps one `.ai-memory-tmp.*` staging file per page on disk
+    /// across an await, and `commit_all` takes only the commit lock — so a
+    /// sweep landing in that window must not capture a write in flight.
+    #[test]
+    fn a_sweep_never_stages_an_in_flight_atomic_write() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        write(&root, "ws/proj/b.md", "b");
+        write(
+            &root,
+            "ws/proj/.ai-memory-tmp.aB3x9Q",
+            "a body still being written",
+        );
+        write(
+            &root,
+            "ws/proj/.ai-memory-delete.b.md",
+            "a page parked for deletion",
+        );
+
+        assert!(
+            adapter
+                .commit_all("sweep with writes in flight")
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(head_blob(&adapter, "ws/proj/b.md").as_deref(), Some("b"));
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.aB3x9Q"), None);
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-delete.b.md"), None);
+    }
+
+    /// The same for a path-scoped commit, whose directory pathspec reaches
+    /// `stage_paths`' own `add_all` rather than the sweep's.
+    #[test]
+    fn a_path_scoped_commit_never_stages_an_in_flight_atomic_write() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        write(&root, "ws/proj/c.md", "c");
+        write(
+            &root,
+            "ws/proj/.ai-memory-tmp.cD4y0R",
+            "a body still being written",
+        );
+        adapter.mark_written(&root.join("ws/proj"));
+
+        adapter.commit_all("scoped with a write in flight").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.cD4y0R"), None);
+    }
+
+    /// `quarantine_file` and `move_session_page` park a page under a staging
+    /// name with `rename_checked`, which reports that exact path, so the
+    /// reported-file branch of `stage_paths` must skip it as well.
+    #[test]
+    fn a_reported_staging_file_is_never_staged() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        let parked = [
+            "ws/proj/.ai-memory-delete.Xy12Ab",
+            "ws/proj/.ai-memory-tmp.move-session.s1.md",
+        ];
+        for rel in parked {
+            write(&root, rel, "a page between two renames");
+            adapter.mark_written(&root.join(rel));
+        }
+        write(&root, "ws/proj/c.md", "c");
+        adapter.mark_written(&root.join("ws/proj/c.md"));
+
+        adapter.commit_all("scoped with pages parked").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        for rel in parked {
+            assert_eq!(head_blob(&adapter, rel), None, "{rel} was committed");
+        }
+    }
+
     #[test]
     fn a_commit_stages_the_reported_paths_only() {
         let (_tmp, root, adapter) = committed(&[("page-7.md", "page 7"), ("page-8.md", "page 8")]);
@@ -2694,5 +2914,113 @@ mod tests {
             .file_at_rev(&first.to_string(), Path::new("a.md"))
             .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "one");
+    }
+
+    fn local_fsync_setting(root: &Path) -> Option<bool> {
+        Repository::open(root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .get_bool(FSYNC_OBJECT_FILES)
+            .ok()
+    }
+
+    fn fsync_setting(repo: &Repository) -> Option<bool> {
+        repo.config().unwrap().get_bool(FSYNC_OBJECT_FILES).ok()
+    }
+
+    /// What the git CLI prints for `status`, or `None` without git on PATH.
+    fn git_status_stderr(root: &Path) -> Option<String> {
+        let output = git_command(root).arg("status").output().ok()?;
+        assert!(output.status.success(), "git status failed: {output:?}");
+        Some(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    /// #1511: without it libgit2 renames objects and refs into place unsynced,
+    /// and a crash left a ref naming an empty commit object. The setting lives
+    /// on ai-memory's handles only, never in `.git/config`, where git warns
+    /// that the key is deprecated on every command.
+    #[test]
+    fn every_wiki_handle_turns_on_git_object_fsync_without_touching_git_config() {
+        let tmp = tempdir();
+        let fresh = tmp.path().join("fresh");
+        let existing = tmp.path().join("existing");
+        // A repository an older version created gets it on the next open.
+        Repository::init(&existing).unwrap();
+
+        for root in [&fresh, &existing] {
+            let adapter = GitAdapter::open_or_init(root).unwrap();
+            write(root, "page.md", "page");
+            adapter.commit_all("checkpoint").unwrap().unwrap();
+
+            let slot = adapter.writing();
+            let kept = &slot.as_ref().expect("the commit keeps its handle").repo;
+            assert_eq!(fsync_setting(kept), Some(true));
+            drop(slot);
+            let validated = open_validated_repository(root).ok().unwrap();
+            assert_eq!(fsync_setting(&validated), Some(true));
+
+            assert_eq!(local_fsync_setting(root), None);
+            assert_eq!(fsync_setting(&Repository::open(root).unwrap()), None);
+            let git_config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+            assert!(!git_config.to_ascii_lowercase().contains("fsyncobjectfiles"));
+            if let Some(stderr) = git_status_stderr(root) {
+                assert!(
+                    !stderr.contains("deprecated"),
+                    "git status warned: {stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_fsync_opt_out_in_git_config_is_kept() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        Repository::init(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool(FSYNC_OBJECT_FILES, false)
+            .unwrap();
+
+        GitAdapter::open_or_init(&root).unwrap();
+
+        let validated = open_validated_repository(&root).ok().unwrap();
+        assert_eq!(fsync_setting(&validated), Some(false));
+        assert_eq!(local_fsync_setting(&root), Some(false));
+    }
+
+    /// The crash shape from #1511: HEAD names a commit whose loose object is
+    /// empty. Startup still opens the wiki, the check reports it, and a
+    /// checkpoint returns the error instead of passing for a clean tree.
+    #[test]
+    fn an_empty_head_commit_object_is_reported_not_swallowed() {
+        let (_tmp, root, _adapter) = committed(&[("page.md", "page")]);
+        let repo = Repository::open(&root).unwrap();
+        readable_head(&repo).unwrap();
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let object = root.join(".git/objects").join(&head[..2]).join(&head[2..]);
+        let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&object, permissions).unwrap();
+        std::fs::write(&object, b"").unwrap();
+        drop(repo);
+
+        let reopened = GitAdapter::open_or_init(&root).unwrap();
+        assert!(readable_head(&Repository::open(&root).unwrap()).is_err());
+        write(&root, "page.md", "page, edited after the crash");
+        assert!(reopened.commit_all("after the crash").is_err());
+    }
+
+    #[test]
+    fn a_fresh_repository_has_a_readable_head() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        GitAdapter::open_or_init(&root).unwrap();
+        readable_head(&Repository::open(&root).unwrap()).unwrap();
     }
 }

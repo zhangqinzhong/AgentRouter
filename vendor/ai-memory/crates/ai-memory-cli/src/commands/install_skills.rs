@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
+    AGENTS_SKILL_DIR, ANTIGRAVITY_APP_SKILL_DIR, ANTIGRAVITY_CLI_SKILL_DIR, ANTIGRAVITY_HOME_DIR,
+    CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
     GROK_HANDOFF_RULE_CONTENT, GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER,
     GROK_RULES_DIR, GROK_SKILL_DIR, HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill,
     SKILLS_DIR,
@@ -308,6 +309,23 @@ fn resolve_target_roots_for_platform(
                 platform,
             )?]
         }
+        // Antigravity reads workspace skills from the cross-agent root.
+        InstallSkillsAgent::Antigravity if args.scope == InstallSkillsScope::Project => {
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::Agents,
+                cwd,
+                home,
+                appdata,
+                agent_home,
+                claude_config_dir,
+                platform,
+            )?]
+        }
+        InstallSkillsAgent::Antigravity => antigravity_global_skill_roots(
+            home.context("could not locate $HOME for global skill install")?,
+        )
+        .to_vec(),
         InstallSkillsAgent::Both => vec![
             agent_root(
                 args.scope,
@@ -333,6 +351,18 @@ fn resolve_target_roots_for_platform(
     };
 
     Ok(roots.into_iter().map(TargetRoot::new).collect())
+}
+
+/// Antigravity's global skill roots under `home`: `~/.gemini/config/skills`,
+/// which the App and IDE read, and `~/.gemini/antigravity-cli/skills`, which
+/// the CLI reads. Antigravity documents `.agents/skills` only as a workspace
+/// root (<https://antigravity.google/docs/skills/>).
+pub(super) fn antigravity_global_skill_roots(home: &Path) -> [PathBuf; 2] {
+    let antigravity = home.join(ANTIGRAVITY_HOME_DIR);
+    [
+        antigravity.join(ANTIGRAVITY_APP_SKILL_DIR).join(SKILLS_DIR),
+        antigravity.join(ANTIGRAVITY_CLI_SKILL_DIR).join(SKILLS_DIR),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -659,6 +689,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(root_names(&global_grok), ["/home/alice/.grok/skills"]);
+    }
+
+    /// Antigravity's global skills go to the two roots its docs list, one per
+    /// product, never `~/.agents/skills`; its workspace root is the shared
+    /// `.agents/skills` (<https://antigravity.google/docs/skills/>).
+    #[test]
+    fn antigravity_skill_roots_are_the_documented_workspace_and_global_roots() {
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+
+        let project = resolve_target_roots(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::Antigravity),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&project), ["/repo/.agents/skills"]);
+
+        let global = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Antigravity),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(
+            root_names(&global),
+            [
+                "/home/alice/.gemini/config/skills",
+                "/home/alice/.gemini/antigravity-cli/skills"
+            ]
+        );
+
+        let error = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Antigravity),
+            cwd,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("$HOME"), "{error}");
     }
 
     #[test]

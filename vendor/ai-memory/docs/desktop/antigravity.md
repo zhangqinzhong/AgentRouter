@@ -46,10 +46,14 @@ Official: <https://antigravity.google/docs/hooks/>
 - Config: workspace **`.agents/hooks.json`** or global
   **`~/.gemini/config/hooks.json`** (both read by 2.0, CLI, and IDE);
   plugin-bundled hooks also supported.
-- Events: `PreToolUse`, `PostToolUse` (matcher = tool name regex:
-  `run_command`, `view_file`, `write_to_file`, `replace_file_content`,
-  `grep_search`, `invoke_subagent`, …), `PreInvocation`, `PostInvocation`
-  (around each model call), `Stop`.
+- Events: `SessionStart` (once per new conversation, before the first model
+  call; documented in the hook reference bundled with `agy` 1.4.0 and App
+  2.24.0, absent from `agy` 1.3.0), `PreToolUse`, `PostToolUse` (matcher =
+  tool name regex: `run_command`, `view_file`, `write_to_file`,
+  `replace_file_content`, `grep_search`, `invoke_subagent`, …),
+  `PreInvocation`, `PostInvocation` (around each model call), `Stop`
+  (`terminationReason`, `fullyIdle`). No event marks a conversation's end, and
+  none carries the user's prompt.
 - Payload (stdin JSON, camelCase): `conversationId`, `workspacePaths`,
   **`transcriptPath`**, `artifactDirectoryPath`, `modelName`, plus
   `toolCall`, `stepIdx`, etc. Handlers are shell commands with a `timeout`
@@ -63,9 +67,14 @@ Official: <https://antigravity.google/docs/hooks/>
 `~/.gemini/config/hooks.json`, which the IDE also loads, so global
 capture likely already extends to IDE sessions, with the IDE distinguishable
 by its `transcriptPath` prefix (`antigravity-ide/brain/...`). Differences to
-handle: no `SessionStart`/`SessionEnd` events (session boundaries must be
-inferred from PreInvocation/Stop), and `cwd` comes as `workspacePaths[]`
-rather than a single `cwd`. Needs a live verification pass on the IDE.
+handle: no `SessionEnd` event (a finished `Stop` is a turn checkpoint
+instead), no prompt in any payload (read from the transcript), older builds
+without `SessionStart` (the first turn's `PreInvocation` stands in), and `cwd`
+comes as `workspacePaths[]` rather than a single `cwd`. Needs a live
+verification pass on the IDE. Implemented in 3.2
+([#1415](https://github.com/akitaonrails/ai-memory/issues/1415),
+[#1416](https://github.com/akitaonrails/ai-memory/pull/1416)); see
+[`plan.md`](plan.md#phase-1--antigravity-ide-capture-parity-smallest-new-code-step).
 
 **Verified with the CLI (`agy` 1.3.0, 2026-10-08; see
 `verification-2026-10.md`):** a workspace `.agents/hooks.json` runs with no

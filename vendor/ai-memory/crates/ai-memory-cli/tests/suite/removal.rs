@@ -1335,6 +1335,88 @@ fn install_skills_then_uninstall_only_skills_round_trips() {
     );
 }
 
+/// `install-skills --scope global --agent antigravity` writes the managed
+/// skills into both roots Antigravity reads, `~/.gemini/config/skills` (App
+/// and IDE) and `~/.gemini/antigravity-cli/skills` (CLI), and not into
+/// `~/.agents/skills`. A re-run changes nothing, and `uninstall --only skills`
+/// takes the skills back out of both roots while the user's own skill and
+/// Antigravity's MCP config beside them stay.
+#[test]
+fn antigravity_global_skills_install_idempotently_and_uninstall_from_both_roots() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let roots = [
+        home.path().join(".gemini/config/skills"),
+        home.path().join(".gemini/antigravity-cli/skills"),
+    ];
+    let user_skill = roots[0].join("user-skill/SKILL.md");
+    write_file(&user_skill, "---\nname: user-skill\n---\nkeep me\n");
+    let mcp_config = home.path().join(".gemini/config/mcp_config.json");
+    write_file(&mcp_config, "{}\n");
+
+    let install = || {
+        command_with_home(home.path())
+            .args([
+                "install-skills",
+                "--scope",
+                "global",
+                "--agent",
+                "antigravity",
+            ])
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+    let first = install();
+    assert!(
+        first.status.success(),
+        "install-skills failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    for root in &roots {
+        for skill in MANAGED_SKILLS {
+            assert!(
+                root.join(skill.relative_path).is_file(),
+                "{}",
+                root.join(skill.relative_path).display()
+            );
+        }
+    }
+    assert!(!home.path().join(".agents/skills").exists());
+
+    let second = install();
+    assert!(
+        second.status.success(),
+        "re-run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(
+        stdout.matches("already up to date").count(),
+        roots.len() * MANAGED_SKILLS.len(),
+        "{stdout}"
+    );
+
+    let uninstall = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills", "--apply", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    for root in &roots {
+        for skill in MANAGED_SKILLS {
+            assert!(!root.join(skill.relative_path).exists());
+        }
+    }
+    assert!(user_skill.exists(), "the user's own skill must survive");
+    assert!(mcp_config.exists(), "Antigravity's MCP config must survive");
+}
+
 #[test]
 fn uninstall_only_skills_leaves_custom_target_dir_for_manual_cleanup() {
     let _guard = cli_test_lock();
@@ -2310,6 +2392,156 @@ fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
             path.display()
         );
     }
+}
+
+/// `install-mcp --apply --auth-token` for Claude Code stores the key where the
+/// hooks keep theirs and writes the bridge entry without it, so the stored
+/// key is the bridge's too: `--only hooks` keeps it while that entry remains,
+/// and the full uninstall still removes it.
+#[test]
+fn an_explicit_bridge_key_is_stored_and_outlives_only_hooks_removal() {
+    const KEY: &str = "aim_bridge_key_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&[
+        "install-mcp",
+        "--client",
+        "claude-code",
+        "--session-aware",
+        "--auth-token",
+        KEY,
+        "--apply",
+    ]);
+    run(&["install-hooks", "--agent", "claude-code", "--apply"]);
+    let claude = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+    assert!(
+        !claude.contains(KEY),
+        "the key stayed in ~/.claude.json: {claude}"
+    );
+    assert!(claude.contains("mcp-bridge"), "{claude}");
+    let stored = home.path().join(".ai-memory-data").join("auth-token");
+    assert_eq!(std::fs::read_to_string(&stored).unwrap().trim(), KEY);
+
+    run(&["uninstall", "--only", "hooks", "--apply", "--yes"]);
+    assert!(
+        stored.exists(),
+        "--only hooks stranded the bridge without its key"
+    );
+
+    run(&["uninstall", "--apply", "--yes"]);
+    assert!(!stored.exists(), "the full uninstall must remove the key");
+}
+
+/// FreeBuff's entry is always the session-less `mcp-bridge`, so
+/// `install-mcp --client freebuff --apply --auth-token` stores the key where
+/// the hooks keep theirs and writes `~/.agents/mcp.json` without an `env`
+/// token, the same redirect Claude Code's and Muse's bridge entries get.
+#[test]
+fn an_explicit_freebuff_bridge_key_is_stored_outside_the_client_config() {
+    const KEY: &str = "aim_freebuff_key_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&[
+        "install-mcp",
+        "--client",
+        "freebuff",
+        "--auth-token",
+        KEY,
+        "--apply",
+    ]);
+    let config = home.path().join(".agents").join("mcp.json");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        !written.contains(KEY),
+        "the key stayed in ~/.agents/mcp.json: {written}"
+    );
+    assert!(written.contains("mcp-bridge"), "{written}");
+    let entry: serde_json::Value = serde_json::from_str(&written).unwrap();
+    let entry = &entry["mcpServers"]["ai-memory"];
+    assert_eq!(
+        entry["env"].get("AI_MEMORY_AUTH_TOKEN"),
+        None,
+        "the entry still carries an env token: {written}"
+    );
+    let data_dir = home.path().join(".ai-memory-data");
+    let stored = data_dir.join("auth-token");
+    assert_eq!(std::fs::read_to_string(&stored).unwrap().trim(), KEY);
+    let args: Vec<&str> = entry["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    let canonical = std::fs::canonicalize(&data_dir).unwrap();
+    assert!(
+        args.windows(2).any(|pair| pair[0] == "--data-dir"
+            && std::fs::canonicalize(pair[1]).is_ok_and(|named| named == canonical)),
+        "the entry does not name the data dir the key went into: {args:?}"
+    );
+}
+
+/// Without `--apply` nothing is stored: a printed FreeBuff snippet is the
+/// operator's to place, so it still carries the key inline. This is the guard
+/// that keeps the redirect above from reaching the print path.
+#[test]
+fn a_printed_freebuff_snippet_keeps_the_key_inline() {
+    const KEY: &str = "aim_freebuff_printed_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let output = command_with_home(home.path())
+        .args(["install-mcp", "--client", "freebuff", "--auth-token", KEY])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snippet = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        snippet.contains(KEY),
+        "the printed snippet dropped the key the operator has to place: {snippet}"
+    );
+    assert!(
+        !home
+            .path()
+            .join(".ai-memory-data")
+            .join("auth-token")
+            .exists(),
+        "printing stored the key"
+    );
+    assert!(
+        !home.path().join(".agents").join("mcp.json").exists(),
+        "printing wrote the client config"
+    );
 }
 
 /// Meta Muse Code: `install-mcp` and `install-hooks` both merge into

@@ -1431,10 +1431,17 @@ async fn canonical_target_conflict_rolls_back_the_promotion() {
     let legacy = resolve(&store, ws, &remote("github.com/acme/api"), "api", None)
         .await
         .0;
-    let conflict = store
-        .writer
-        .get_or_create_project(ws, "acme-api", None)
-        .await
+    // A plain row under the canonical name, as an install that ran before the
+    // capture path stopped minting twins would already hold. Creating it
+    // through the writer would now bind it to the identity row above, which is
+    // the fix under test, not the state this test is about.
+    let conflict = ProjectId::new();
+    rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, 'acme-api', 0)",
+            rusqlite::params![conflict.as_bytes().to_vec(), ws.as_bytes().to_vec()],
+        )
         .unwrap();
     let error =
         create_explicit_scope_guarded(&store.reader, &store.writer, "default", "acme-api", None)
@@ -1646,6 +1653,37 @@ async fn an_ambiguous_name_names_its_holders_but_not_a_restricted_one() {
     assert!(!error.to_string().contains("acme-widget"));
 }
 
+#[tokio::test]
+async fn an_ambiguous_name_on_the_write_path_names_the_workspace() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    store
+        .writer
+        .get_or_create_project(ws, "widget", None)
+        .await
+        .unwrap();
+    resolve_capture(
+        &store,
+        ws,
+        &remote("github.com/acme/widget"),
+        IdentityStyle::Path,
+        "acme-widget",
+        None,
+    )
+    .await;
+
+    let error =
+        create_explicit_scope_guarded(&store.reader, &store.writer, "default", "widget", None)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "project 'widget' is ambiguous in workspace 'default': it is the name of \
+         project 'widget' and the legacy key of project 'acme-widget'"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_legacy_and_canonical_resolve_or_create_converge_on_one_uuid() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1695,4 +1733,149 @@ async fn reads_of_a_path_named_project_stay_no_create() {
             "a lookup of the folder name finds nothing and creates nothing"
         );
     }
+}
+
+/// A capture whose marker names a promoted project's legacy key lands in that
+/// project instead of minting a twin (#1657).
+///
+/// The read path already resolves the legacy key — `lookup_existing_scope`
+/// answers the promoted row — so the capture path creating a second row under
+/// the same name left the name ambiguous for both, and every later explicit
+/// call failed with `ProjectNameAmbiguous` until the twin was purged. The
+/// capture path now reuses the row the read path picks.
+#[tokio::test]
+async fn a_capture_naming_a_promoted_projects_legacy_key_reuses_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let owner = user(&store, "promotion-owner").await;
+    let project = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/api"),
+        "api",
+        Some(owner),
+    )
+    .await
+    .0;
+    let promoted = create_explicit_scope_guarded(
+        &store.reader,
+        &store.writer,
+        "default",
+        "acme-api",
+        Some(owner),
+    )
+    .await
+    .unwrap();
+    assert_eq!(promoted.scope.project_id, project);
+    assert_eq!(row(&store, project).0, "acme-api");
+
+    // What the router's marker branch calls, with the marker's `project` key.
+    let (id, created) = store
+        .writer
+        .get_or_create_project_as(ws, "api", None, Some(owner))
+        .await
+        .unwrap();
+
+    assert_eq!(id, project, "the capture must not mint a second project");
+    assert!(!created, "nothing was created");
+    assert_eq!(
+        lookup_existing_scope(&store.reader, "default", "api")
+            .await
+            .unwrap()
+            .project_id,
+        project,
+        "the name still resolves, which a twin would have made ambiguous"
+    );
+    let count: i64 = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "one project, not a twin");
+}
+
+/// A capture under a name that is genuinely new still creates the project, so
+/// the legacy-key fallback does not turn capture into a read-only path.
+#[tokio::test]
+async fn a_capture_of_a_new_name_still_creates_its_project() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let owner = user(&store, "new-project-owner").await;
+
+    let (id, created) = store
+        .writer
+        .get_or_create_project_as(ws, "brand-new", None, Some(owner))
+        .await
+        .unwrap();
+
+    assert!(created);
+    assert_eq!(row(&store, id).0, "brand-new");
+    let creator: Option<Vec<u8>> = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT created_by FROM projects WHERE id = ?1",
+            [id.as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        creator.as_deref(),
+        Some(owner.as_bytes().as_slice()),
+        "a created project must still record its creator"
+    );
+}
+
+/// Control: when a row already carries the exact name, the capture still
+/// lands there and creates nothing. The legacy-key fallback runs only after
+/// the exact-name lookup misses, so a name that is only a name keeps its old
+/// behaviour — here a twin left behind by the pre-fix code, which the operator
+/// purges by id; the fallback must not turn three rows into four.
+#[tokio::test]
+async fn a_capture_of_an_existing_exact_name_still_lands_there() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    let owner = user(&store, "ambiguous-owner").await;
+    let project = resolve(
+        &store,
+        ws,
+        &remote("github.com/acme/widget"),
+        "widget",
+        Some(owner),
+    )
+    .await
+    .0;
+    create_explicit_scope_guarded(
+        &store.reader,
+        &store.writer,
+        "default",
+        "acme-widget",
+        Some(owner),
+    )
+    .await
+    .unwrap();
+    assert_eq!(row(&store, project).0, "acme-widget");
+    let twin = ProjectId::new();
+    rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, 'widget', 0)",
+            rusqlite::params![twin.as_bytes().to_vec(), ws.as_bytes().to_vec()],
+        )
+        .unwrap();
+
+    let (id, created) = store
+        .writer
+        .get_or_create_project_as(ws, "widget", None, Some(owner))
+        .await
+        .unwrap();
+
+    assert_eq!(id, twin, "the exact-name row still answers to its own name");
+    assert!(!created);
+    let count: i64 = rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "no third row");
 }

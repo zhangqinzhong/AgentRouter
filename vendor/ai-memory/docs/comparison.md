@@ -55,7 +55,8 @@ LongMemEval-S hit@5 **0.666** zero-LLM and **0.815** with the default local
 embeddings in the published 2.6 line. The observation stream in 3.0
 (on by default) raises zero-LLM to **0.951** and local embeddings
 to **0.945** on all 470 questions, measured on one build with the stream off
-and on. With capture skipped and each raw session indexed whole (component
+and on. The latest release run (3.2.1) measures **0.951** zero-LLM and
+**0.949** local ([report](benchmarks/longmemeval-s-3.2.1-release.md)). With capture skipped and each raw session indexed whole (component
 mode, ranking only), zero-LLM FTS scores 0.972; the
 [decomposition report](benchmarks/longmemeval-s-decomposition-2026-10-12.md)
 explains the difference.
@@ -95,46 +96,47 @@ setup.
 ## Maturity and maintenance
 
 This is a crowded, fast-moving field, and nearly every tool compared here is
-actively maintained. As of 2026-10-13, the tools re-checked that day had
-commits in October, with two exceptions: Letta's original server is retired
-(its work continues in Letta Code), and memvid has had no commits since
-2026-07-14. Coding-agent memory now sits at the top of the star chart:
+actively maintained. As of 2026-10-18, the tools re-checked that day had
+recent October work except for the quiet projects named below. Letta's
+original server is retired (its work continues in Letta Code), but its GitHub
+repository is an active redirect with the old source on an `archive` branch.
+memvid has had no commits since 2026-07-14. Coding-agent memory sits at the top of the star chart:
 claude-mem leads, MemPalace is third, and most of the app-memory leaders
 (Mem0, Hindsight, OpenViking, Supermemory, Cognee) ship coding-agent plugins.
 
 | Project | Stars (~) | Latest release | Maintenance |
 |---|---|---|---|
-| claude-mem | 100.3k | v13.37.0 (2026-10-13) | active |
-| Mem0 | 67.1k | core v2.2.1 (2026-09-25) | active |
-| MemPalace | 59.5k | v3.10.0 | active |
+| claude-mem | 101.6k | v14.0.1 (2026-10-17) | active |
+| Mem0 | 67.4k | core v2.2.1 (2026-09-25) | active |
+| MemPalace | 59.6k | v3.11.0 (2026-10-14) | active |
 | Hindsight | 49.1k | v1.0.0 (2026-10-13) | active |
-| OpenViking | 39.8k | v0.5.0 (2026-10-09) | active |
-| Cognee | 32.2k | v1.6.3 (2026-10-07) | active |
-| Zep/Graphiti | 31.7k | v0.30.2 (2026-09-08) | active |
-| Supermemory | 31.2k | server-v0.0.9 (2026-10-12) | active |
-| agentmemory | 29.4k | v0.9.30 (2026-10-06) | active |
-| TencentDB Agent Memory | 28.6k | v2.0.2 (2026-10-09) | active |
-| Letta (V1 server) | 25.1k | 0.16.8, frozen | retired (archived 2026-08-16) |
-| Letta Code | 3.6k | v0.34.13 (2026-10-13) | active |
-| Memori | 17.1k | not re-read | not re-read |
-| memvid | 16.6k | not re-read | no commits since 2026-07-14 |
-| memU | 14.5k | PyPI `memu-cli` 0.11.0b3 (2026-08-21) | active |
-| EverOS | 13.4k | v1.4.1 (2026-09-24) | active |
-| MemOS | 11.8k | v2.0.34 | not re-read |
-| Honcho | 7.2k | tag v3.2.0 | active (as of 2026-09-18) |
-| Engram | 6.8k | v2.0.0 (2026-09-18) | active (as of 2026-09-22) |
-| basic-memory | 4.0k | 2026-08-25 | active (as of 2026-09-18) |
-| mcp-memory-service | 2.0k | 2026-09-14 | active (as of 2026-09-18) |
-| LangMem | 1.7k | PyPI-only | active (as of 2026-09-18) |
-| Caura | 0.5k | backend-v3.17.2 (2026-09-19) | active (as of 2026-09-22) |
-| LiquidLM | closed-source | `@liquidlm/cli` 0.1.5 (2026-09-17) | active (young, solo; as of 2026-09-22) |
+| OpenViking | 40.3k | v0.5.0 (2026-10-09) | active |
+| Cognee | 32.5k | v1.6.5 (2026-10-16) | active |
+| Zep/Graphiti | 32.0k | v0.31.1 (2026-10-15) | active |
+| Supermemory | 31.3k | server-v0.0.9 (2026-10-12) | active |
+| agentmemory | 29.7k | v0.9.30 (2026-10-06) | active |
+| TencentDB Agent Memory | 29.6k | v2.0.3-beta.1 (2026-10-13) | active |
+| Letta (V1 server) | 25.2k | 0.16.8, frozen | retired; source on `archive` branch |
+| Letta Code | 3.7k | v0.34.16 (2026-10-16) | active |
+| Memori | 17.2k | v3.3.6 (2026-05-28) | quiet since 2026-10-03 |
+| memvid | 16.6k | v2.0.140 (2026-05-27) | no commits since 2026-07-14 |
+| memU | 14.6k | PyPI `memu-cli` 0.10.0 stable | active |
+| EverOS | 13.5k | v1.4.2 (2026-10-14) | active |
+| MemOS | 11.9k | v2.0.34 (2026-09-23) | active; no change after cutoff |
+| Honcho | 7.7k | v3.3.0 (2026-10-14) | active |
+| Engram | 7.4k | v3.4.0 (2026-10-12) | active |
+| basic-memory | 4.3k | v0.23.2; v0.24 unreleased | active |
+| mcp-memory-service | 2.0k | v12.1.1 (2026-10-16) | active |
+| LangMem | 1.7k | PyPI 0.0.30 | quiet |
+| Caura | 0.5k | backend-v3.34.5 (2026-10-18) | active |
+| LiquidLM | closed-source | `@liquidlm/cli` 0.1.6 stable | active |
 
 Adjacent tools, not memory systems: codebase-memory-mcp (~46.5k, a code
 graph), qmd (~30.4k, markdown search), context-mode (~27.9k, survives
 compaction with a hook-fed per-project SQLite FTS5 store) and beads (~27.8k,
 an issue tracker with `bd remember`).
 
-Full figures, sources, and per-tool caveats: [`research-2026-landscape.md`](research-2026-landscape.md#popularity-and-maintenance-signal-as-of-2026-10-13).
+Full figures, sources, and per-tool caveats: [`research-2026-landscape.md`](research-2026-landscape.md#popularity-and-maintenance-signal-as-of-2026-10-18).
 
 ## How the field validates the approach
 
@@ -228,8 +230,11 @@ ships something ai-memory does not, it is named.
   of SQLite + Chroma, the same memory under 20+ harnesses, claim-once
   handoffs, cross-project messaging, and per-project multi-user auth without
   a paid cloud tier. You give up its to-do tools, the bridge that answers
-  Claude Code's and Codex's native memory-folder reads from its store, and
-  the past observations it shows when the agent opens a file.
+  Claude Code's and Codex's native memory-folder reads from its store, the
+  past observations it shows when the agent opens a file, and v14's polished
+  local “My Work” dashboard. TeamBrain adds optional paid shared-work and
+  collision views; ai-memory shares project memory without that cloud layer
+  but has no equivalent human work queue yet.
 - **From MemPalace:** you keep hook capture for Claude Code, Codex and Cursor
   and a shared server. You gain git-versioned markdown pages as the source
   of truth, claim-once handoffs, typed cross-project messaging, and the auth
@@ -359,7 +364,11 @@ ships something ai-memory does not, it is named.
   embeddings). You give up (for now) memU's turnkey skill-distillation
   packaging, its `memu-agent detect` for unknown agents, and its hosted cloud,
   and EverOS's ANN vector index, optional Milvus backend and published
-  end-to-end benchmark.
+  end-to-end benchmark. EverOS v1.4.2 also reserves query-embedding capacity
+  from background writes. ai-memory now does the same for in-process local
+  inference, backed by an opt-in real-model contention probe; hosted embedding
+  providers keep their existing concurrency, and the reranker remains bounded
+  and fail-open.
 - **From Caura (governed multi-agent fleet memory):** a different buyer. Caura
   optimizes org-scale fleet governance (agent/team/org visibility scopes, four
   trust tiers, an audit log, PII flagging) on Postgres+pgvector with LLM
@@ -369,7 +378,10 @@ ships something ai-memory does not, it is named.
   cross-fleet trust governance across hundreds of agents, use Caura; if you want
   file-first, zero-LLM, single-binary project memory, use ai-memory. (Caura's
   trust-tier governance is a real capability we do not match; see
-  [`competitive-parity.md`](competitive-parity.md).)
+  [`competitive-parity.md`](competitive-parity.md).) Caura's beta
+  collaboration extension also adds live peer discovery, presence, leases,
+  correlated replies, and runtime wake helpers. That is fleet orchestration,
+  not durable project memory, and external effects remain at-least-once.
 - **From TencentDB Agent Memory (proxy fan-in server):** you trade a Node
   three-service proxy that intercepts each harness's API base URL (distilling
   Chat Memory / Skill / Wiki / CodeGraph assets) for a file-first binary that
@@ -382,17 +394,35 @@ ships something ai-memory does not, it is named.
 
 ## Where we're behind, or different by choice
 
-- **Distribution through plugin directories.** Cognee's Claude Code plugin is
-  listed in Anthropic's official plugin directory, and Mem0, Supermemory and
-  OpenViking ship native plugins per agent. ai-memory
-  installs with `install.sh` and `ai-memory setup` (3.0) or `install-hooks`,
-  not from a plugin marketplace.
-- **An installer that detects and wires every agent.** `ai-memory setup`
-  (3.0) wires MCP, hooks and Agent Skills for each detected agent on Linux and
-  macOS; 3.1 brought the same two-command install and a per-user service step to
-  Windows (`install.ps1` + a logon entry that starts `ai-memory service-host`).
-  Hindsight's coding-agent package covers 16+ agents, and memU's `memu-agent
-  detect` finds unknown agents' transcripts.
+- **Workstream operations are now visible to operators.** `/web/workstreams`
+  presents trusted lifecycle states for managed workstreams without exposing
+  checkout paths, native session ids, or transcript content. It deliberately
+  does not infer blocked or review-ready states from untrusted prose.
+- **Structured page filters are available before ranking.** `memory_query`
+  accepts kind, tier, literal path prefix, and exact-array tag filters across
+  normal, scoped, global, historical, profile, and pinned results. `as_of`
+  remains the valid-time control. Author filtering is intentionally deferred
+  until null root/anonymous attribution has explicit semantics.
+- **Local foreground embedding is isolated from background writes.** A
+  real-model probe demonstrated CPU contention, so local document inference is
+  limited to one slot and a second slot remains available for query embedding.
+  Hosted providers retain their existing concurrency policy; the LLM reranker
+  remains separately bounded and fail-open.
+- **Per-workload LLM behavior is measured before it is routed.** Root-only
+  status JSON reports bounded calls, outcomes, latency, estimated tokens, and
+  provider-reported usage for each closed internal workload. It records no
+  prompt or output text. Provider/model selection remains global until real
+  measurements and quality evaluation justify a larger configuration surface.
+- **Document extraction is optional and text-first.** The standalone importer
+  turns one explicit local text/Markdown, text-layer PDF, DOCX, PPTX, XLSX,
+  VTT, or SRT file into attributed, sanitized markdown with
+  bounded parsing and a conditional write. Unlike hosted multimodal products,
+  it has no connectors, OCR, image understanding, or raw media transcription.
+- **Marketplace reach is narrower than harness support.** ai-memory now ships
+  its own Claude Code and Codex marketplace plugins and `ai-memory setup`
+  detects and wires installed agents across Linux, macOS, and Windows. It is
+  not listed in Anthropic's official directory, and long-tail agents still use
+  setup/MCP recipes where no native plugin format exists.
 - **No end-to-end QA number.** We publish retrieval hit@5; Mem0, Zep,
   Hindsight and EverOS publish end-to-end QA accuracy with a reader and a
   judge model. Our opt-in `answer=true` synthesis (2.4) has only an early,
@@ -412,7 +442,8 @@ ships something ai-memory does not, it is named.
   card showing the user which memories were injected.
 - **Retrieval through capture, and no local reranker.** Through the shipped
   pipeline, LongMemEval-S hit@5 is 0.815 with local embeddings and 0.666
-  zero-LLM (2.6); the 3.0 observation stream raises them to 0.945 and 0.951. Ranking
+  zero-LLM (2.6); the 3.0 observation stream raises them to 0.945 and 0.951
+  (3.2.1: 0.949 and 0.951). Ranking
   the same raw sessions whole scores 0.972 zero-LLM. The
   [decomposition](benchmarks/longmemeval-s-decomposition-2026-10-12.md) traced
   the gap to capture, and within capture not to the 2 KB privacy cap (pages holding exactly the captured text
@@ -433,7 +464,7 @@ ships something ai-memory does not, it is named.
 
   | Tool | Number | Kind | Setup |
   |---|---|---|---|
-  | ai-memory 3.0 | LongMemEval-S hit@5 0.951 FTS / 0.945 local (2.6: 0.666 / 0.815) | Retrieval through capture | In-repo harness, all 470 questions; component mode FTS 0.972 |
+  | ai-memory 3.2 | LongMemEval-S hit@5 0.951 FTS / 0.949 local (3.0: 0.951 / 0.945; 2.6: 0.666 / 0.815) | Retrieval through capture | In-repo harness, all 470 questions; component mode FTS 0.972 |
   | MemPalace | 96.6% R@5 raw, 98.4% held-out (450 q) | Retrieval only | Different harness |
   | agentmemory | 95.2% `recall_any@5`; 2026-10-09 baseline 96.2% any-hit, 84.68% strict recall-all@5 | Retrieval, component | Whole raw sessions, reranker disabled; the authors say the baseline supports no competitive claim |
   | Mem0 | LongMemEval 94.4, LoCoMo 92.5, BEAM 64.1 (1M) / 48.6 (10M) | End-to-end QA, LLM-judged | Managed platform, top-200 budget; harness defaults to gpt-4o reader and judge; headline models not stated |

@@ -314,7 +314,8 @@ See open question 4.
   plugin update themselves (documented in `docs/install.md`).
 - **`uninstall`:** offer `claude plugin uninstall ai-memory@ai-memory`.
 
-None of this touches the MCP tool surface, so the tool count stays at 23.
+None of this touched the MCP tool surface, so that implementation kept the
+then-current count at 23.
 
 ### 4. Configuration surface
 
@@ -326,7 +327,7 @@ install.
 | Server URL | `userConfig.server_url` (string) | empty (shipped; proposed `http://127.0.0.1:49374`) | Read by the launcher from `CLAUDE_PLUGIN_OPTION_SERVER_URL`; MCP gets `${user_config.server_url}`. Empty means the `server_url` of the ai-memory config, for hooks and MCP alike |
 | Binary path | `userConfig.ai_memory_bin` (string) | `ai-memory` | For installs off `PATH` |
 | Data dir | `userConfig.data_dir` (string) | empty | Only for a non-default data dir |
-| Token | **none in the plugin** | — | Hooks read `<data_dir>/auth-token`, the OIDC `auth.json` or a server profile; `mcp-bridge` reads the bearer `Config::load` resolves. Same files `setup`, `install-hooks --auth-token` and `auth login` already write |
+| Token | **none in the plugin** | — | Hooks read `<data_dir>/auth-token`, the OIDC `auth.json` or a server profile; `mcp-bridge` uses configured auth, then the same stored hook key, then loopback-only discovered root auth. The discovered root key never leaves loopback. Same files `setup`, `install-hooks --auth-token` and `auth login` already write |
 | Project override, capture mode, `ignore_paths`, briefing, server routing | `.ai-memory.toml` marker, persisted capture mode, `servers.toml` profiles | as today | The native hook already enforces all of these. Nothing is duplicated into plugin settings |
 
 Keeping the token out of the plugin keeps one credential store for hooks, MCP

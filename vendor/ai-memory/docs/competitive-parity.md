@@ -1,6 +1,6 @@
 # Competitive parity & migration-worthiness
 
-A self-critical internal audit, September 2026, refreshed 2026-10-13 with
+A self-critical internal audit, September 2026, refreshed 2026-10-18 with
 the research and gap decisions below. Companion to the public
 [`comparison.md`](comparison.md) (the fair pitch) and
 [`research-2026-landscape.md`](research-2026-landscape.md) (what each competitor
@@ -47,7 +47,7 @@ None of the competitors below has more than one or two of these; none has all.
   #16), self-hosted, with no paid tier.
 - **Reproducible retrieval benchmarks**: LongMemEval-S hit@5 0.815 local and
   0.666 zero-LLM through the shipped 2.6 pipeline, 0.951 zero-LLM and 0.945 local with the 3.0
-  observation stream, and a published pipeline-vs-component decomposition
+  observation stream (3.2.1: 0.951 and 0.949, the 3.2.0 local drop recovered — it was boundary-question noise, see the 3.2.1 report), and a published pipeline-vs-component decomposition
   ([`benchmarks/`](benchmarks/README.md)). Others publish numbers too (Mem0,
   Zep, Hindsight, EverOS, MemPalace, agentmemory), mostly end-to-end QA with
   their own reader and judge models. The edge is reproducibility; we claim no
@@ -55,17 +55,17 @@ None of the competitors below has more than one or two of these; none has all.
 
 ## Migration verdicts, by competitor
 
-Refreshed 2026-10-13. Coding-agent memory is now the most-starred part of the
+Refreshed 2026-10-18. Coding-agent memory is now the most-starred part of the
 field, and several app-memory products (Mem0, Supermemory, Hindsight,
 OpenViking, Cognee) ship coding-agent plugins, so they appear here as
 coding-agent competitors as well as in their original camps.
 
 | From | Migrate to ai-memory? | You gain | You give up |
 |---|---|---|---|
-| **claude-mem** (hook capture, LLM observer) | **Yes** for zero-LLM, multi-harness or team use; **not obviously** for a solo Claude Code user happy with it | Zero-LLM capture (it compresses every observation with an LLM), git-markdown truth instead of SQLite FTS5 + Chroma, claim-once handoffs, cross-project messaging, per-project multi-user auth without a paid cloud tier | Its to-do tools, three-step progressive search, the bridge that answers Claude Code's and Codex's native memory-folder reads from its store, and past observations surfaced when the agent reads a file |
+| **claude-mem** (hook capture, LLM observer) | **Yes** for zero-LLM, multi-harness or team use; **not obviously** for a solo Claude Code user happy with it | Zero-LLM capture (it compresses every observation with an LLM), git-markdown truth instead of SQLite FTS5 + Chroma, claim-once handoffs, cross-project messaging, per-project multi-user auth without a paid cloud tier | Its to-do tools, three-step progressive search, native-memory bridge, file observations, and v14's polished local “My Work” queue; TeamBrain adds paid shared-work/collision views |
 | **MemPalace** (hook capture, team server) | **Partly**: overlapping goals, different substrate | Git-markdown truth, claim-once handoffs, typed cross-project messaging, the auth ladder | Its temporal graph and team server as shipped. Its 96.6% / 98.4% R@5 is retrieval-only like our hit@5, but on a different harness, so neither number ranks the tools |
 | **mcp-memory-service** (fact rows + hook capture) | **Yes** if you liked hook capture + typed edges + published numbers | Files-as-truth (not opaque fact rows), handoffs, cross-project messaging, `as_of` temporal, a reproducible number, and (new on 2.4) its aging set at parity done zero-LLM/reversible/off-by-default (per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access boosts, 0.4–0.75-band contradiction flagging) | Cloud/multi-backend replication (Cloudflare/Milvus), graph viz. (Belief-strength + clustering consolidation are no longer a give-up: ai-memory now ships both, clustering as a zero-LLM default-off pass, belief-strength off and eval-gated) |
-| **basic-memory** (file-first markdown) | **Yes** for multi-harness coding continuity; **no** for a personal Obsidian KB with live team co-edit | Ambient capture (no `write_note` ceremony), full lifecycle, handoffs/messaging, git-versioned truth, published numbers | Local zero-cost reranking, real-time collaborative editing, Postgres backend, `build_context` graph-walk, hosted mobile/web UX |
+| **basic-memory** (file-first markdown) | **Yes** for multi-harness coding continuity; **no** for a personal Obsidian KB with live team co-edit | Ambient capture (no `write_note` ceremony), full lifecycle, handoffs/messaging, git-versioned truth, published numbers, native OKF v0.2, conditional writes, temporal reads, structured query filters, and bounded document extraction in the optional importer | Local zero-cost reranking, real-time collaborative editing, Postgres backend, `build_context` graph-walk, hosted mobile/web UX, and its broader document/connectors surface. Its v0.24 features remain unreleased as of this comparison |
 | **agentmemory** (hook capture, KV store) | **Yes** for operability + data ownership | Self-contained binary (no `iii-engine` sidecar, no ELv2 runtime), files-as-truth, SQL indexes committed in-txn, zero-LLM summaries and handoffs, typed claim-once handoffs, a multi-user auth ladder (DB tokens, OIDC), native Windows without a manual sidecar download (3.1 `install.ps1` + `setup`), and a 3.0 importer for its vault and `ExportData`. Both now default to auth on for new installs (theirs since 0.9.30, ours in 3.0) | Browser edit/forget (the 3.0 web UI adds page history/diff, a session timeline, a recall trace and a health panel, but stays read-only by design), the iii console's OTEL traces (we ship explain timings + Prometheus `/admin/metrics` in 3.0), a P2P mesh-sync primitive (`ai-memory-wikisync` is our git-based answer), the opt-in local cross-encoder reranker, an npm/`npx` install (ours is a two-command native install on Linux, macOS and Windows in 3.0/3.1, no npm package), ~31 more tools (54, all visible by default; mostly speculative). Benchmarks are not like-for-like: their 95.2% LongMemEval-S is a component measurement with the reranker disabled (their 2026-10-09 baseline adds 84.68% strict recall-all@5, which they say supports no competitive claim), ours is end-to-end |
 | **Claude Code built-in memory** | **Yes** for teams / multi-machine / multi-harness; **not obviously** for a solo dev on one machine in Claude only | Cross-machine, cross-harness, team sharing, tool-lifecycle capture, real search | Zero setup: it's already on with no server to run (our one structural disadvantage for the solo case; 3.0's `install.sh` + `ai-memory setup` cut ours to two commands on Linux and macOS, but there is still a server) |
 | **Hindsight** (pages-over-facts; coding-agent package) | **Yes** for zero-LLM, files-as-truth, or claim-once handoffs; **no** if you want its end-to-end QA numbers, git-history ingestion, or 16+ agent installer | Zero-LLM default (Hindsight needs an LLM, local or by subscription), markdown files as the source of truth (its markdown is a one-way mirror of Postgres), one binary, claim-once handoffs, cross-project messaging, and (new on 2.4) a belief-strength `confidence` + an opt-in "dream" rewrite that borrow their model but never delete a source and keep the zero-LLM default | Its published end-to-end QA accuracy, git-history ingestion, hooks for 16+ coding agents with one shared bank per repo, a reranker on by default, image/file ingestion, user/team/company scopes inside a bank, and belief-strength that *actually moves ranking by default* (ours ships but is off and eval-gated) |
@@ -78,9 +78,9 @@ coding-agent competitors as well as in their original camps.
 | **Honcho** (Plastic Labs) | **No: different problem.** It models the *human* (theory-of-mind peer representations); we remember the *project* | If you (mis)used it for coding continuity: file-first git truth, zero-LLM, single-binary self-host, per-project scoping, no mandatory LLM egress | Its user-psychology reasoning engine (Deriver/Dreamer/Dialectic), published user-recall benchmarks, managed cloud, none of which a coding-memory user needs |
 | **LiquidLM** (solo-built hosted memory API, Supermemory camp) | **Weak: different job.** It's a cloud "second brain" with multimodal RAG; we're automatic, file-first coding memory | Data ownership (markdown+git, no opaque cloud), zero-LLM default, single-binary self-host, automatic hook capture, per-project team sharing, no API/subscription spend | Its multimodal ingestion (video/audio/PDF/Office), polished web app + grounded chat, managed hosting, GitHub-sync connector, and out-of-the-box rerank |
 | **Engram** (self-hosted coding-agent store, issue #810) | **Yes**, same lane | Files-as-truth git-markdown wiki (vs SQLite-as-truth + git-synced compressed chunks), **automatic lifecycle-hook capture** (vs agent-driven `mem_*` MCP saves), typed claim-once handoffs + cross-project messaging, multi-user page sharing, published numbers | Engram's zero-config Go binary is equally lean; you give up its managed Cloud replication add-on. A near-tie on posture; the switch is about capture model + wiki-vs-rows, not moat depth |
-| **EverOS** (file-first, LLM-leaning, issue #810) | **Yes** for zero-LLM/single-binary/team; **no** if you want its vector tier, user-track modeling, or end-to-end QA numbers | Zero-LLM default (EverOS's minimal tier still needs an LLM for the core flow), one self-contained binary (vs a Python stack), cross-harness lifecycle capture, typed handoffs/messaging | EverOS's ANN vector index and optional Milvus backend, its published end-to-end benchmarks (LoCoMo 94.42, LongMemEval-S 94.00, with exact models recorded per result file), its first-class user `episodes/profile` track, and its packaged offline "memory evolution" UX |
+| **EverOS** (file-first, LLM-leaning, issue #810) | **Yes** for zero-LLM/single-binary/team; **no** if you want its vector tier, user-track modeling, or end-to-end QA numbers | Zero-LLM default (EverOS's minimal tier still needs an LLM for the core flow), one self-contained binary (vs a Python stack), cross-harness lifecycle capture, typed handoffs/messaging | EverOS's ANN vector index and optional Milvus backend, its published end-to-end benchmarks (LoCoMo 94.42, LongMemEval-S 94.00), its first-class user `episodes/profile` track, packaged offline “memory evolution,” and v1.4.2's explicit foreground/background embedding-capacity split |
 | **memU** (LLM-wiki + skill distillation, issue #810) | **Partly**: same file-first instinct, different default | Zero-LLM capture/retrieval by default (memU's distill flow is LLM-required), one binary (vs Python + sidecars patching host instruction files), MCP + hooks, git-versioned truth | memU's turnkey **skill-distillation-into-Markdown** packaging, `memu-agent detect` for unknown agents, and its hosted cloud (memu.so). Our nearest equivalent is the opt-in experience/auto-improve pass, not a one-command skill distiller |
-| **Caura** (governed fleet memory, issue #810) | **No: different buyer** (org-scale multi-agent governance) | If you (mis)used it for one project: file-first git truth, zero-LLM, single-binary self-host, per-project scoping, no LLM egress | Its **fleet-governance layer** (org/team/agent visibility scopes and **four cross-fleet trust tiers**), which ai-memory does **not** match (see the gaps below); plus its managed platform and self-reported LoCoMo/LongMemEval numbers |
+| **Caura** (governed fleet memory, issue #810) | **No: different buyer** (org-scale multi-agent governance and live peer orchestration) | If you (mis)used it for one project: file-first git truth, zero-LLM, single-binary self-host, per-project scoping, no LLM egress | Its **fleet-governance layer** (org/team/agent visibility scopes and four trust tiers) plus the beta bus's peer discovery, presence, leases, correlated replies, and runtime wake helpers; ai-memory intentionally does not run a live agent fleet |
 | **TencentDB Agent Memory** (proxy fan-in server, issue #810) | **Mostly no: different capture model** | Hook/MCP capture into a file-first wiki you own (vs a base-URL proxy intercepting traffic), zero-LLM default (its v2 hub needs an LLM), one binary vs a Node three-service stack, typed handoffs | Its zero-code proxy integration, the v2 hub's per-asset access control, and its **CodeGraph** codebase index (adjacent code-intelligence we don't do). Note: needs no Tencent DB (SQLite default); the name misleads |
 | **Mem0/Zep app SDKs; Supermemory/OpenViking hosted products; LiquidLM, Honcho, Caura** | different buyer (app/user personalization, hosted context DB / RAG-as-a-service, user-modeling, org-scale fleet governance), **not migration targets** for those products; their coding plugins are covered above | — | — |
 
@@ -88,8 +88,8 @@ Net: for a **self-hosted, multi-harness, team, zero-LLM, data-ownership**
 coding-memory use case, ai-memory does the basics and adds things none of them
 fully have, so migration is justified. The gap has narrowed: hook capture and
 git-backed markdown are now common, and several tools ship things we do not
-(plugin-directory distribution, git-history ingestion, recall on every
-prompt, end-to-end QA numbers). The premise does *not* hold for app/user
+(official-directory reach, git-history ingestion, recall on every prompt,
+human work queues, end-to-end QA numbers). The premise does *not* hold for app/user
 personalization (Mem0/Supermemory/LiquidLM), user-modeling /
 theory-of-mind (Honcho), enterprise graph queries (Zep Cloud), agent-building
 runtimes (Letta), or a solo dev happy with Claude's built-in or with a
@@ -101,7 +101,9 @@ rather than overclaim.
 The main finding: ai-memory did **not** cargo-cult this field. Of the ideas it
 took, most are at parity-or-better; the exceptions are **scoped-but-unfinished
 substrate**, each deliberately gated behind "prove it with an eval first." The
-remaining risk is that borrowed ideas sit **dormant** until the eval harness (R2) that would justify activating them gets built.
+remaining risk is that opt-in ideas stay **dormant** because the retrieval
+eval has not shown enough benefit to justify activating them by default; the
+next evidence gap is reproducible end-to-end QA.
 
 | Borrowed idea | From | Verdict | Detail |
 |---|---|---|---|
@@ -127,10 +129,11 @@ remaining risk is that borrowed ideas sit **dormant** until the eval harness (R2
 | LLM merge/rewrite "dream" pass | Hindsight (Dreamer) / Supermemory ("dreaming") | **SHIPPED, opt-in/off (parity of mechanism, unproven)** | 2.4 (#816) rewrites cold clusters into one page via the gated `apply_batch` path, `dry_run` first, JSON-schema output; **never deletes a source** (superseded with a merge-note stub, `restore-page` recovers), off by default, provider-less stores keep the zero-LLM A3 path. Off until an R2 quality delta is shown |
 | bi-temporal-lite | Zep/Graphiti | **BEHIND by design** | Ingestion-time only; world-time validity deferred (because dating facts needs an LLM and breaks the zero-LLM path) |
 
-## Honest gaps (consolidated) and recommended adjustments
+## Prior gaps and current status
 
-These are documented recommendations only. **Nothing here is scheduled or to be
-implemented without a separate decision.** Ordered by leverage.
+This ledger records what earlier audits asked for, what shipped, and what is
+still open. Open items remain recommendations until a separate decision
+schedules them.
 
 1. **R2 reproducible eval harness, built (#771/#772) and run.** It was the
    meta-blocker: belief-strength ranking, typed-edge rank weighting, and a
@@ -219,20 +222,19 @@ implemented without a separate decision.** Ordered by leverage.
    belief-strength confidence, and the LLM dream pass), audited row-by-row in
    the borrowed-ideas table above; the design of record is
    [`design-memory-aging.md`](design-memory-aging.md).
-   MCP tool behavior hints now ship across the 23-tool surface (title plus
+   MCP tool behavior hints now ship across the 24-tool surface (title plus
    read-only/destructive/idempotent/open-world), with the runtime auth and
    scope checks remaining authoritative because annotations are untrusted
    metadata. **Still unshipped:** typed-edge **rank** weighting and a
    `contradicts` authority cap (A5 flags, it doesn't yet rank);
-   a read-only graph visualization in `/web`; a first-class TS SDK story for
-   ecosystem parity.
+   a read-only graph visualization in `/web`.
    Deliberately out of scope: Honcho's theory-of-mind user-modeling engine and
    LiquidLM's opaque-cloud / LLM-mandatory / multimodal-second-brain substrate
    (all off-mission for file-first, zero-LLM coding memory; the global-scope
    preferences page already covers the useful user-prefs slice).
 7. **Fix doc staleness the audit surfaced** (accuracy, not features):
-   `research-basic-memory.md` understates basic-memory's shipped cross-encoder
-   reranking + Teams tier. The agentmemory items were corrected on 2026-10-12:
+   `research-basic-memory.md` now distinguishes stable v0.23.2 from the
+   broader unreleased v0.24 changelog. The agentmemory items were corrected on 2026-10-12:
    `comparison.md`, `benchmarks/README.md` and `evals/README.md` no longer
    attribute the `0.967` (the grep baseline on their 15-query
    `coding-agent-life-v1` corpus) to LongMemEval-S, where they publish 95.2%
@@ -253,7 +255,10 @@ implemented without a separate decision.** Ordered by leverage.
    its banks carry user/team/company scopes, and its LLM can be local;
    EverOS publishes benchmarks and an MCP server and was listed twice (as
    EverMemOS); memU's releases ship on PyPI; and the "smaller, less
-   VC-amplified niche" positioning no longer holds.
+   VC-amplified niche" positioning no longer holds. The 2026-10-18 pass then
+   corrected Letta's retirement wording, current releases, ai-memory's own
+   marketplace/install coverage, and the recommendations that had already
+   shipped.
 8. **Fleet-scale trust governance: a real gap vs Caura (issue #810).** Our
    multi-user story is per-project (`pages shared, batons owned`, invariant #16)
    with a root→DB-user→OIDC auth ladder and an audit log, and it is deliberately
@@ -275,6 +280,11 @@ invariants), **ALREADY** (we have it and should say so).
 
 | Capability seen in the field | Verdict | Why |
 |---|---|---|
+| Human workstream operations view (claude-mem v14 “My Work”) | SHIPPED (3.2) | `/web/workstreams` shows bounded active, interrupted, completed, and empty lifecycle state to the root/operator without exposing checkout paths, native session ids, or transcript content. It does not invent attention/review states from prose or become a second task system |
+| Foreground query capacity isolated from embedding backfill (EverOS v1.4.2) | SHIPPED (3.2) for local inference | A real-model probe measured eight-worker query p50/p95 rising from 36/41 ms idle to 74/76 ms. Limiting local document inference to one slot while reserving one query slot reduced loaded latency to 39/51 ms. Hosted providers keep their existing concurrency; provider failures still degrade to lexical/entity/graph retrieval |
+| Structured pre-rank filters (Mem0; basic-memory v0.24 unreleased) | SHIPPED (3.2), except author | `memory_query` applies bounded kind, tier, literal path-prefix and exact-array tag predicates before every page-ranking stream, including global, historical, profile and pinned results. `as_of` is the valid-time control. Author stays deferred until null root/anonymous attribution has explicit semantics |
+| Per-operation LLM provider/model profiles (Graphiti v0.31; Hindsight `main`) | TELEMETRY SHIPPED (3.2); ROUTING MEASURE-FIRST | Root-only status now measures calls, outcomes, latency, estimated tokens, reported usage and health for a fixed workload set without storing content. Labels remain routing-inert. Add public profiles only after real measurements plus quality evaluation show a benefit worth the config/auth surface |
+| Document extraction (basic-memory v0.24 unreleased; hosted memory APIs) | SHIPPED (3.2) as an optional companion | One explicit local text/Markdown, text-layer PDF, DOCX, PPTX, XLSX, VTT, or SRT file becomes attributed, sanitized markdown through a bounded, dry-run-first Unix importer and conditional MCP write. OCR, images, raw media, connectors, and multimodal embeddings remain out of scope |
 | Retrieval recall through capture (several tools rank whole raw sessions) | SHIPPED (3.0) | The 2026-10-12 decomposition showed our zero-LLM session page indexed only 80-character turn titles; the observation stream recovered it (FTS hit@5 0.662 → 0.951, local 0.800 → 0.945, all 470). Chasing another tool's headline number is declined: those numbers measure different things |
 | Local zero-LLM cross-encoder reranker | MEASURE-FIRST | Fits the zero-LLM invariant (a local model, not an LLM). Bar before building: hit@5 at least +0.03 on both FTS and local paths over the shipped ranking, p95 at most +100 ms on the reference host and measured on a low-end ARM host; default-on only if the keyless path gains. Measured headroom is small after the stream (component-mode FTS 0.972 vs pipeline 0.951) |
 | Editable browser viewer (edit / forget / bulk forget) | DECLINE | The web UI is read-only by design (`frontend-api.md` §10); wiki mutations go only through `Wiki::write_page`/`apply_batch`; agents already edit and forget via MCP (`memory_write_page` with `expected_page_id`, `memory_delete_page`) and the CLI |
@@ -290,7 +300,7 @@ invariants), **ALREADY** (we have it and should say so).
 | Larger capture caps | Keep ours (2 KB / 16 KiB) | Privacy boundary (invariant 6); the decomposition showed the caps were not the cause (pages holding exactly the captured text scored 0.968) |
 | PaaS deploy templates (Fly, Railway, Render, Coolify) | DECLINE for now (a demand-gated docs recipe at most) | Non-loopback already refuses to run without auth; a hosted path is not our product |
 | Redis or other external store backends | DECLINE | Invariants 2 and 3 (single-writer SQLite; indexes in the same transaction) and markdown as truth |
-| Harness long tail (Droid, Warp, Cline, Kilo, Goose, Qwen Code, Aider, …) | SHIPPED (3.0) as MCP recipes for six more clients (Warp, Cline, Kilo Code, Goose, Qwen Code, OpenHuman), plus first-class Droid; hooks only where the harness has a lifecycle API (Droid accepted, #1240) | Any MCP client reaches us over HTTP |
+| Harness long tail (Droid, Warp, Cline, Kilo, Goose, Qwen Code, Aider, …) | SHIPPED as first-class Droid, Cline CLI, and Qwen Code support plus MCP recipes for Warp, Kilo Code, Goose and OpenHuman; hooks only where the harness has a lifecycle API | Any MCP client reaches us over HTTP |
 | Image / vision memory | DECLINE | Off-mission; the sanitizer boundary is text-only |
 | Bidirectional bridge with a harness's own `MEMORY.md` | DECLINE (bidirectional); one-way import ADOPT | Two sources of truth contradict our routing rule against harness-local stores |
 | Obsidian vault export | ALREADY | The wiki is already markdown in git; open `<data_dir>/wiki/<ws>/<project>` as a vault |
@@ -302,26 +312,23 @@ invariants), **ALREADY** (we have it and should say so).
 
 ### Step up, borrow, ignore
 
-From the 2026-10-13 research. Each line names the tools that ship the
+From the 2026-10-18 research. Each line names the tools that ship the
 capability. Items marked *verify first* depend on our own current behavior,
 which should be checked before any work is scoped.
 
 **Step up** (gaps a coding-agent user notices):
 
-1. **Plugin-directory listing and one-command marketplace installs** for
-   Claude Code and Codex (Cognee is listed in Anthropic's plugin directory;
-   Mem0, Supermemory and OpenViking ship native plugins).
-2. **An installer that detects and wires every installed agent** (Hindsight
-   covers 16+ agents; memU's `memu-agent detect` finds unknown ones).
-   *Verify first*: how much of this `ai-memory setup` already covers.
-3. **One reproducible end-to-end QA number** beside hit@5, with reader,
+1. **Foreground embedding isolation backed by a contention benchmark**
+   (EverOS v1.4.2) is now shipped for the in-process local model. The manual
+   probe remains in-tree so the capacity can be rechecked on other CPU classes.
+2. **One reproducible end-to-end QA number** beside hit@5, with reader,
    judge, context tokens and latency stated, and more benchmarks than
    LongMemEval (Mem0, Zep, Hindsight and EverOS publish QA numbers; Hindsight's
    AMB harness is open, so an adapter is worth considering). Most numbers
    published in the field are QA numbers.
-4. **Git-history ingestion on first run**, zero-LLM and sanitized
+3. **Git-history ingestion on first run**, zero-LLM and sanitized
    (Hindsight), so a new repository starts with its commit history as context.
-5. **Answer harness-native memory reads from our store** (claude-mem's bridge
+4. **Answer harness-native memory reads from our store** (claude-mem's bridge
    for Claude Code and Codex memory folders). Careful: this touches trust
    and routing, and the gap decisions above decline a bidirectional bridge.
 
@@ -343,7 +350,12 @@ undelivered event for a later drain.
 - A statusline indicator (Cognee): shows capture is alive.
 - An opt-in local cross-encoder reranker (Hindsight, basic-memory,
   agentmemory), gated on the recall-eval bar in the table above.
-- Per-step model routing (Graphiti's `LLMRuntime`): cheaper consolidation.
+- Per-step model routing (Graphiti's `LLMRuntime`) only if the shipped workload
+  telemetry plus quality evaluation demonstrate cheaper or faster operation
+  without a meaningful quality loss.
+- A dry-run-first unified audit/repair command (MemPalace v3.11): consolidate
+  the checks already spread across `doctor`, lint, reindex, health, and backup
+  only if one operator workflow is demonstrably simpler.
 - A read-only MCP mode per connection (OpenViking gateway, hosted Zep):
   safer shared servers.
 - Opt-in recall on every prompt (Supermemory, OpenViking gateway).
@@ -362,9 +374,10 @@ undelivered event for a later drain.
 - Past observations for a file when the agent reads it (claude-mem).
 
 **Ignore** (off-mission or conflicts with an invariant): user profiles,
-data connectors, graph/ontology queries, kanban boards, proxy capture,
+data connectors in core, graph/ontology queries, generic kanban boards, proxy capture,
 mounted filesystems, harness-owned self-editing memory, multimodal memory,
-hosted clouds, ANN indexes, temporal graphs, and to-do tools. Per-asset ACLs
+hosted clouds, ANN indexes, temporal graphs, live fleet presence/wake buses,
+and to-do tools. Per-asset ACLs
 (TencentDB v2, OpenViking) are also out of scope but recorded as a real gap
 next to Caura's trust tiers.
 

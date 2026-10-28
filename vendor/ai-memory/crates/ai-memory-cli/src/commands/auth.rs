@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::cli::{AuthArgs, AuthCommand, AuthProviderChoice};
+use crate::commands::path_util::display_path;
 use crate::config::Config;
 
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -108,7 +109,7 @@ async fn login_oidc_device(
 
     println!("oidc-device: logged in");
     println!("issuer: {issuer}");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -149,7 +150,7 @@ fn logout_oidc_device(config: &Config) -> Result<()> {
     let path = config.oidc_device_token_path();
     OidcToken::remove(&path).map_err(anyhow::Error::from)?;
     println!("oidc-device: logged out");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -180,7 +181,7 @@ async fn login_openai_oauth(config: &Config, timeout_secs: u64) -> Result<()> {
     if let Some(account_id) = token.extra.account_id.as_deref() {
         println!("account: {account_id}");
     }
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -188,7 +189,7 @@ fn logout_openai_oauth(config: &Config) -> Result<()> {
     let path = config.openai_oauth_token_path();
     OpenAiOAuthToken::remove(&path).map_err(anyhow::Error::from)?;
     println!("openai-oauth: logged out");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -216,7 +217,7 @@ async fn login_copilot(
     let path = config.copilot_token_path();
     token.save(&path).map_err(anyhow::Error::from)?;
     println!("copilot: logged in");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -224,7 +225,7 @@ fn logout_copilot(config: &Config) -> Result<()> {
     let path = config.copilot_token_path();
     CopilotToken::remove(&path).map_err(anyhow::Error::from)?;
     println!("copilot: logged out");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -237,11 +238,11 @@ fn status(config: &Config) -> Result<()> {
                 println!("account: {account_id}");
             }
             println!("expires in: {}", format_duration_until(token.expires_at_ms));
-            println!("token file: {}", openai_path.display());
+            println!("token file: {}", display_path(&openai_path));
         }
         None => {
             println!("openai-oauth: not logged in");
-            println!("token file: {}", openai_path.display());
+            println!("token file: {}", display_path(&openai_path));
         }
     }
 
@@ -274,11 +275,11 @@ fn status(config: &Config) -> Result<()> {
             if let Some(api_base_url) = token.api_base_url.as_deref() {
                 println!("api base: {api_base_url}");
             }
-            println!("token file: {}", copilot_path.display());
+            println!("token file: {}", display_path(&copilot_path));
         }
         None => {
             println!("copilot: not logged in");
-            println!("token file: {}", copilot_path.display());
+            println!("token file: {}", display_path(&copilot_path));
         }
     }
 
@@ -288,11 +289,11 @@ fn status(config: &Config) -> Result<()> {
             println!("oidc-device: logged in");
             println!("issuer: {}", token.extra.issuer);
             println!("expires in: {}", format_duration_until(token.expires_at_ms));
-            println!("token file: {}", oidc_path.display());
+            println!("token file: {}", display_path(&oidc_path));
         }
         None => {
             println!("oidc-device: not logged in");
-            println!("token file: {}", oidc_path.display());
+            println!("token file: {}", display_path(&oidc_path));
         }
     }
     Ok(())

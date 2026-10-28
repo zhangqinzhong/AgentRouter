@@ -2634,6 +2634,16 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
   }
 };
 
+Object.assign(appCopy.zh.text, {
+  "Data sources": "数据来源",
+  "Manage extra Claude Code and Codex directories for usage and sessions.": "管理 Claude Code 和 Codex 的额外用量与会话目录。",
+  "Data directory": "数据目录", "Add directory": "添加目录", "Collection directories": "采集目录",
+  "Default directories and AgentRouter profiles are detected automatically.": "默认目录和 AgentRouter 配置档案会自动识别。",
+  "Refresh usage": "刷新用量", "Updating local usage…": "正在更新本地用量…",
+  "Custom directory": "自定义目录", "Auto-detected": "自动识别", "Directory not found": "目录不存在",
+  "Collect from": "采集目录",
+  "Only locally recorded usage is collected. Removing a directory keeps its files and previously collected usage.": "仅采集客户端保存在本地的用量记录。移除目录不会删除原始文件或已采集的用量。",
+});
 Object.assign(appCopy.zh.text, memoryCopyZh);
 export const AppI18nContext = createContext<AppCopy>(appCopy.en);
 

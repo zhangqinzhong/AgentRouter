@@ -1,3 +1,4 @@
+import { DataSourcesSettingsPage } from "./data-sources";
 import { normalizePageDefaultRanges, PAGE_DEFAULT_RANGE_OPTIONS } from "@agentrouter/core/config/page-default-ranges";
 import type { PageDefaultRanges } from "@agentrouter/core/contracts/app";
 import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
@@ -119,6 +120,7 @@ export function AppSettingsPage({
       initialPage={initialPage}
       onBackToProfile={onBackToProfile}
       renderPage={(activePage) => {
+        if (activePage === "data-sources") return <DataSourcesSettingsPage />;
         if (activePage === "general") {
           return (
             <GeneralSettingsPage
@@ -229,15 +231,16 @@ function SettingsLayout({
     setActivePage(initialPage);
   }, [initialPage]);
 
+  const t = useAppText();
   const pages: Array<{ id: SettingsPageId; icon: typeof Palette; label: string }> = [
     { id: "appearance", icon: Palette, label: copy.settings.appearance },
     { id: "general", icon: Settings, label: copy.settings.general },
+    { id: "data-sources", icon: Database, label: t("Data sources") },
     { id: "observability", icon: Activity, label: copy.settings.observability },
     { id: "toolhub", icon: KeyRound, label: copy.settings.toolHub },
     { id: "bots", icon: Boxes, label: copy.settings.bots },
     ...(traySupported ? [{ id: "tray" as const, icon: Gauge, label: copy.settings.tray }] : [])
   ];
-  const t = useAppText();
 
   return (
     <div className={documentPageClassName}>

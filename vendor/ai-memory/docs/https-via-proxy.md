@@ -37,8 +37,12 @@ Bearer deployments may still bind authenticated plain HTTP and receive a loud
 warning because those credentials remain sniffable. Human authentication is
 stricter: a non-loopback listener refuses startup unless
 `AI_MEMORY_AUTH__SECURE_COOKIE=true`, which is the operator's explicit signal
-that a trusted HTTPS proxy owns the browser-facing edge. Non-Secure human
-cookies are supported only on an actual loopback listener.
+that a trusted HTTPS proxy owns the browser-facing edge. The only exception is
+the explicit `serve --allow-insecure-human-auth` escape hatch (environment
+`AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) for an operator who knowingly
+accepts plaintext passwords, credentials, session cookies, and memory data on
+a private LAN. The option is disabled by default, does not bypass the
+unauthenticated-exposure guard, and prints an unconditional warning.
 
 ## Pick a path
 
@@ -554,6 +558,16 @@ The only thing to mind: **`AI_MEMORY_ALLOWED_HOSTS` must include the
 public hostname**, not just `localhost`. The host-allowlist middleware
 runs before any header rewriting, so it sees the proxy's forwarded
 `Host: memory.example.com` and would reject it otherwise.
+
+### Clients connect directly, never through a forward proxy
+
+The hooks (native, shell, PowerShell 7 and the TypeScript integrations) and
+`ai-memory mcp-bridge` ignore `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so a
+sandbox that exports a filtering proxy cannot swallow their requests. A
+server that a client machine can reach only through an outbound forward proxy
+is therefore out of reach for them. Give the server an address the client can
+reach directly, such as a reverse proxy on the network edge or a tunnel like
+Path 3.
 
 ## Don't paper over the security gap
 

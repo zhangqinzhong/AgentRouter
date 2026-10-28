@@ -73,21 +73,25 @@ chmod 0755 "${FAKE_DOCKER}"
 
 run_upgrade_case() {
   local name="$1" owns="$2" case_dir log output
+  shift 2
   case_dir="${TMP_ROOT}/${name}"
   log="${case_dir}/docker.log"
   output="${case_dir}/output.log"
   mkdir -p "${case_dir}/home" "${case_dir}/cache"
   : >"${case_dir}/docker-compose.yml"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"${case_dir}/native-client"
+  chmod 0755 "${case_dir}/native-client"
 
   (
     cd "${case_dir}"
     HOME="${case_dir}/home" \
     XDG_CACHE_HOME="${case_dir}/cache" \
     AI_MEMORY_DOCKER="${FAKE_DOCKER}" \
+    AI_MEMORY_NATIVE_BIN="${case_dir}/native-client" \
     AI_MEMORY_SKIP_SELF_UPGRADE=1 \
     AI_MEMORY_WRAPPER_TEST_LOG="${log}" \
     AI_MEMORY_TEST_COMPOSE_OWNS="${owns}" \
-      "${ROOT}/bin/ai-memory" upgrade >"${output}" 2>&1
+      "${ROOT}/bin/ai-memory" "$@" upgrade >"${output}" 2>&1
   )
 }
 
@@ -107,6 +111,9 @@ assert_contains "${TMP_ROOT}/compose/docker.log" "compose up -d"
 if [ -e "${TMP_ROOT}/compose/cache/ai-memory/recreate-ai-memory.sh" ]; then
   fail "Compose-owned container unexpectedly produced a standalone recreation script"
 fi
+
+run_upgrade_case prefixed 1 --config '/tmp/ai memory.toml'
+assert_contains "${TMP_ROOT}/prefixed/docker.log" "compose up -d"
 
 # ---- multi-arch manifest version-check tests -----------------------------
 
@@ -293,6 +300,8 @@ cat >"${HOOK_NATIVE}" <<'NATIVE'
 #!/usr/bin/env bash
 printf 'argv: %s\n' "$*" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
 printf 'stdin: %s\n' "$(cat)" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
+printf 'arg: <%s>\n' "$@" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
+exit "${AI_MEMORY_TEST_NATIVE_EXIT:-0}"
 NATIVE
 chmod 0755 "${HOOK_NATIVE}"
 
@@ -337,12 +346,87 @@ run_hook_case "${HOOK_NATIVE}" hook-drain </dev/null
 assert_contains "${HOOK_CASE_DIR}/native.log" "argv: hook-drain"
 assert_no_container "hook-drain"
 
+# A global option before the command must not send host work or capture to a
+# helper container. Inspect each argument separately so paths with spaces and
+# harness arguments remain intact, and preserve the native child's exit code.
+for subcommand in run show continue resume workstreams rename-workstream install-hooks mcp-bridge hook hook-drain; do
+  for option in config data-dir; do
+    for form in separate equals; do
+      prefix=("--${option}" '/tmp/ai memory')
+      if [ "${form}" = equals ]; then
+        prefix=("--${option}=/tmp/ai memory")
+      fi
+      args=("${prefix[@]}" "${subcommand}" '--' 'argument with spaces')
+      : >"${HOOK_CASE_DIR}/native.log"
+      : >"${HOOK_CASE_DIR}/docker.log"
+      native_status=0
+      # The bind-mounted data directory needs no volume-token refresh during
+      # install-hooks; the entire invocation must stay on the host.
+      printf '{"session_id":"prefixed"}' | AI_MEMORY_DATA_DIR="${HOOK_CASE_DIR}/home" \
+        AI_MEMORY_TEST_NATIVE_EXIT=7 run_hook_case "${HOOK_NATIVE}" "${args[@]}" \
+        || native_status=$?
+      [ "${native_status}" -eq 7 ] || fail "${args[*]} returned ${native_status}, want native exit 7"
+      printf 'arg: <%s>\n' "${args[@]}" >"${HOOK_CASE_DIR}/expected-args"
+      grep '^arg: ' "${HOOK_CASE_DIR}/native.log" >"${HOOK_CASE_DIR}/actual-args"
+      cmp "${HOOK_CASE_DIR}/expected-args" "${HOOK_CASE_DIR}/actual-args" \
+        || fail "native argv changed for ${args[*]}"
+      assert_contains "${HOOK_CASE_DIR}/native.log" 'stdin: {"session_id":"prefixed"}'
+      assert_no_container "${args[*]}"
+    done
+  done
+done
+
+# A value or search query named like a host command is not the subcommand.
+: >"${HOOK_CASE_DIR}/native.log"
+: >"${HOOK_CASE_DIR}/docker.log"
+run_hook_case "${HOOK_NATIVE}" --config run search hook </dev/null
+[ ! -s "${HOOK_CASE_DIR}/native.log" ] || fail "a config value was intercepted as a host command"
+assert_contains "${HOOK_CASE_DIR}/docker.log" '--config run search hook'
+
+# Help, version and malformed arguments must reach the CLI without running
+# wrapper-only upgrade side effects, even when followed by that command name.
+for option in --help --version --not-an-option; do
+  for prefix in none config data-dir; do
+    args=("${option}" upgrade)
+    if [ "${prefix}" != none ]; then
+      args=("--${prefix}" "${args[@]}")
+    fi
+    : >"${HOOK_CASE_DIR}/native.log"
+    : >"${HOOK_CASE_DIR}/docker.log"
+    run_hook_case "${HOOK_NATIVE}" "${args[@]}" </dev/null
+    [ ! -s "${HOOK_CASE_DIR}/native.log" ] || fail "${args[*]} reached a host command"
+    assert_not_contains "${HOOK_CASE_DIR}/docker.log" 'pull '
+    assert_contains "${HOOK_CASE_DIR}/docker.log" "${args[*]}"
+  done
+done
+
+for option in config data-dir; do
+  for form in separate equals; do
+    args=("--${option}" '' upgrade)
+    if [ "${form}" = equals ]; then
+      args=("--${option}=" upgrade)
+    fi
+    : >"${HOOK_CASE_DIR}/docker.log"
+    run_hook_case "${HOOK_NATIVE}" "${args[@]}" </dev/null
+    assert_not_contains "${HOOK_CASE_DIR}/docker.log" 'pull '
+    assert_contains "${HOOK_CASE_DIR}/docker.log" "${args[*]}"
+  done
+done
+
+# The explicit compatibility path still uses the helper with a prefix.
+: >"${HOOK_CASE_DIR}/docker.log"
+AI_MEMORY_HOOK_PLATFORM=posix run_hook_case "${HOOK_NATIVE}" \
+  --data-dir '/tmp/ai memory' install-hooks --agent claude-code --apply </dev/null
+[ ! -s "${HOOK_CASE_DIR}/native.log" ] || fail "explicit compatibility install reached native client"
+assert_contains "${HOOK_CASE_DIR}/docker.log" 'install-hooks --agent claude-code --apply'
+: >"${HOOK_CASE_DIR}/docker.log"
+
 # Without a usable native client the hook drops the event, says why on stderr,
 # and still exits 0 at once; it never falls back to the container.
 : >"${HOOK_CASE_DIR}/native.log"
 hook_status=0
 printf '{}' | run_hook_case "${HOOK_CASE_DIR}/missing-ai-memory" \
-  hook --agent claude-code --event session-start 2>"${HOOK_CASE_DIR}/missing.err" \
+  --config /tmp/memory.toml hook --agent claude-code --event session-start 2>"${HOOK_CASE_DIR}/missing.err" \
   || hook_status=$?
 [ "${hook_status}" -eq 0 ] || fail "hook without a native client exited ${hook_status}, want 0"
 assert_contains "${HOOK_CASE_DIR}/missing.err" "AI_MEMORY_NATIVE_BIN is not executable"

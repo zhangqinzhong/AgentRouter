@@ -1,5 +1,11 @@
 # basic-memory - Issue & PR Pain-Point Synthesis
 
+> **Historical snapshot (2026-05-21).** This file is retained because the
+> architecture cites these concrete failure modes; issue states and version
+> claims below are not current product guidance. See
+> [`research-2026-landscape.md`](research-2026-landscape.md) for the latest
+> reviewed competitor state.
+>
 > Source: GitHub `basicmachines-co/basic-memory`. Captured 2026-05-21.
 > Tracker is unusually high-signal: small team, deep technical replies.
 > Dominant themes: sync correctness, multi-project routing, embedding install hell.

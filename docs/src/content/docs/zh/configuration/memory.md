@@ -5,7 +5,7 @@ eyebrow: 详细配置
 lead: 内嵌 ai-memory 运行时，跨编程客户端共享项目知识、会话历史与任务交接。
 ---
 
-记忆页内嵌 [ai-memory](https://github.com/akitaonrails/ai-memory) v3.1.2 运行时，把项目知识库、会话采集、任务交接和客户端接入整合成原生页面。它不内嵌上游的 web 界面；上游源码、许可证与版本溯源见仓库 `vendor/ai-memory` 与 `vendor/ai-memory.UPSTREAM.md`。
+记忆页内嵌 [ai-memory](https://github.com/akitaonrails/ai-memory) v3.2.5 运行时，把项目知识库、会话采集、任务交接和客户端接入整合成原生页面。它不内嵌上游的 web 界面；上游源码、许可证与版本溯源见仓库 `vendor/ai-memory` 与 `vendor/ai-memory.UPSTREAM.md`。
 
 ## 启用与生命周期
 

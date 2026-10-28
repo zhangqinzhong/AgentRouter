@@ -213,6 +213,14 @@ interface QueryBase {
   includeExpired?: boolean;
   /** Attach score provenance to hits (diagnostics). */
   explain?: boolean;
+  /** Keep only pages of this kind (ASCII case-insensitive; custom kinds allowed). */
+  kind?: string;
+  /** Keep only pages in this memory tier. */
+  tier?: Tier;
+  /** Keep only pages whose project-relative path starts with this literal prefix. */
+  pathPrefix?: string;
+  /** Keep only pages whose frontmatter `tags` contain this exact tag (ASCII case-insensitive). */
+  tag?: string;
 }
 
 /** Search one project: the call's `scope` or the client default. */
@@ -426,6 +434,32 @@ export interface Briefing {
   readonly slots: readonly PageSummary[];
   /** Most recently updated pages. */
   readonly recentPages: readonly PageSummary[];
+  /**
+   * Sessions with the newest captured work, newest first (`memory_briefing`
+   * only; empty from `/api/v1`). An entry with `ended: false` that is not
+   * `current` was cut off (a quota limit, a crash) or is still running.
+   */
+  readonly recentSessions: readonly SessionActivity[];
+  /** The server's decoded JSON. */
+  readonly raw: Raw;
+}
+
+/** One session's newest captured work, from `memory_briefing` or `memory_handoff_list`. */
+export interface SessionActivity {
+  /** Session id; pass it to {@link AiMemoryClient.observations}. */
+  readonly sessionId: string;
+  /** Agent kind as stored (`claude-code`, `open-code`, ...). */
+  readonly agentKind: string;
+  /** Captured session cwd, if any. */
+  readonly cwd: string | undefined;
+  /** Time of the session's newest prompt, tool, stop or compaction observation. */
+  readonly lastActivityAt: string;
+  /** Whether the session ended at or after that work. */
+  readonly ended: boolean;
+  /** Whether a handoff from the session was written at or after that work. */
+  readonly handedOff: boolean;
+  /** The caller's own session (`memory_briefing` only, when the client forwards its id). */
+  readonly current: boolean;
   /** The server's decoded JSON. */
   readonly raw: Raw;
 }
@@ -475,7 +509,11 @@ export type ObservationKind =
 
 /** Arguments of {@link AiMemoryClient.observations}. */
 export interface ObservationsArgs extends ScopedArgs {
-  /** Session id. Omit for the latest completed session in the project. */
+  /**
+   * Session id. Omit for the newest other session with captured work in the
+   * project, ended or cut off (the caller's cwd first), or the latest
+   * completed one when nothing worked in the last 30 days.
+   */
   sessionId?: string;
   /** Maximum observations (server default 50, clamped to 200). */
   limit?: number;
@@ -629,6 +667,11 @@ export interface ListHandoffsArgs extends ScopedArgs {
 export interface ListHandoffsResult {
   /** Open handoffs this caller may claim. */
   readonly handoffs: readonly Handoff[];
+  /**
+   * A session that never ended and holds newer work than every open handoff,
+   * when there is one: read it before relying on an older handoff.
+   */
+  readonly newerUnendedSession: SessionActivity | undefined;
   /** The server's decoded JSON. */
   readonly raw: Raw;
 }

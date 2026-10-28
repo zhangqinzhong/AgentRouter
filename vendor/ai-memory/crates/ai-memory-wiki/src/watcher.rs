@@ -242,9 +242,23 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         if is_git_internal(wiki.root(), raw_path) {
             continue;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(raw_path) else {
-            // Likely a transient state (mv, atomic rename in flight).
-            continue;
+        let metadata = match std::fs::symlink_metadata(raw_path) {
+            Ok(metadata) => metadata,
+            // A rename away from a watched path arrives as
+            // `Modify(Name(RenameMode::From))`, not as a `Remove`, and its
+            // path is already gone. Unreported, the next path-scoped commit
+            // keeps the old blob in its tree, so a checkpoint taken in that
+            // window records a page that no longer exists. Reporting a path
+            // that was merely mid-rename is harmless: staging re-adds a file
+            // that still exists.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !is_tempfile(raw_path) {
+                    wiki.git().mark_written(raw_path);
+                }
+                continue;
+            }
+            // Likely a transient state (an atomic rename in flight).
+            Err(_) => continue,
         };
         let ft = metadata.file_type();
         if crate::confinement::is_link_like(&metadata) {
@@ -1403,6 +1417,50 @@ mod tests {
                 .iter()
                 .any(|p| p.components().any(|c| c.as_os_str() == ".git")),
             "{reported:?}"
+        );
+    }
+
+    /// A page renamed away with an external tool arrives as
+    /// `Modify(Name(RenameMode::From))`, never as a `Remove`; the next
+    /// commit must still drop it from the tree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renamed_away_page_is_reported_and_dropped_from_the_tree() {
+        let (_tmp, _store, wiki, ws, proj) = setup().await;
+        let proj_dir = wiki.root().join(ws.to_string()).join(proj.to_string());
+        let notes = proj_dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let gone = notes.join("a.md");
+        let kept = notes.join("b.md");
+        std::fs::write(&gone, "renamed away\n").unwrap();
+        std::fs::write(&kept, "still here\n").unwrap();
+        let rel = |p: &Path| p.strip_prefix(wiki.root()).unwrap().to_path_buf();
+        wiki.git().mark_written(&gone);
+        wiki.git().mark_written(&kept);
+        wiki.commit_all("seed").unwrap().expect("seed commit");
+        // Control: the page is in the tree before the rename.
+        wiki.git().file_at_rev("HEAD", &rel(&gone)).unwrap();
+
+        // `mv notes/a.md /tmp/`: the path is gone before the event arrives.
+        std::fs::remove_file(&gone).unwrap();
+        let event = notify_debouncer_full::DebouncedEvent::new(
+            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::From,
+            )))
+            .add_path(gone.clone()),
+            std::time::Instant::now(),
+        );
+        handle_event(&wiki, event).await;
+
+        let reported = wiki.git().written_paths();
+        assert!(reported.contains(&rel(&gone)), "{reported:?}");
+        wiki.commit_all("after the rename")
+            .unwrap()
+            .expect("a commit that drops the page");
+        assert!(wiki.git().file_at_rev("HEAD", &rel(&gone)).is_err());
+        // Control: the commit dropped only the page that vanished.
+        assert_eq!(
+            wiki.git().file_at_rev("HEAD", &rel(&kept)).unwrap(),
+            b"still here\n"
         );
     }
 

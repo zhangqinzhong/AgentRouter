@@ -205,7 +205,9 @@ agentmemory has this informally (`/handoff` skill); we make it explicit from day
 
 ## 10. MCP tool surface - narrow on purpose
 
-basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a result. The current v1 surface is still deliberately narrow:
+basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a
+result. The original v1 surface was deliberately narrow; the current additive
+surface is listed in [`ARCHITECTURE.md`](ARCHITECTURE.md#mcp-tool-surface-24-tools):
 
 | Tool | Purpose | Annotation |
 |---|---|---|

@@ -28,6 +28,8 @@ mod local_auth;
 mod logging;
 mod marker;
 mod process_guard;
+mod proxy_env;
+pub mod runtime_flavor;
 mod server_profiles;
 mod terminal;
 
@@ -81,10 +83,15 @@ pub async fn run() -> Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         server_url = %config.server_url,
-        data_dir = %config.data_dir.display(),
+        data_dir = %commands::path_util::display_path(&config.data_dir),
         bind = %config.bind,
         "ai-memory starting",
     );
+    // The bridge only talks to the local server with proxies disabled, and an
+    // MCP client would surface the warning on every session start.
+    if !matches!(command, Command::McpBridge(_)) {
+        proxy_env::warn_unusable(&config.runtime_env);
+    }
 
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
@@ -136,6 +143,7 @@ pub async fn run() -> Result<()> {
             commands::audit_contamination::run(&config, args).await
         }
         Command::Search(args) => commands::search::run(&config, args).await,
+        Command::Recent(args) => commands::recent::run(&config, args).await,
         Command::ReadPage(args) => commands::read_page::run(&config, args).await,
         Command::WritePage(args) => commands::write_page::run(&config, args).await,
         Command::DeletePage(args) => commands::delete_page::run(&config, args).await,
@@ -148,7 +156,7 @@ pub async fn run() -> Result<()> {
         Command::Backup(args) => commands::backup::run(&config, args).await,
         Command::BackupAgents(args) => commands::backup_agents::run(&config, args),
         Command::ExportOkf(args) => commands::export_okf::run(&config, args).await,
-        Command::Restore(args) => commands::restore::run(&config, args),
+        Command::Restore(args) => commands::restore::run(&config, args).await,
         Command::RestoreAgents(args) => commands::restore_agents::run(&config, args),
         Command::Reindex(args) => commands::reindex::run(&config, args).await,
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),

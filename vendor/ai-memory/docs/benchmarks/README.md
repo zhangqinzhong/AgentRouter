@@ -13,6 +13,14 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-10-25** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.4 release)** | **0.951** | [longmemeval-s-3.2.4-release.md](longmemeval-s-3.2.4-release.md) |
+| **2026-10-25** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.4 release)** | **0.945** | [longmemeval-s-3.2.4-release.md](longmemeval-s-3.2.4-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.2 release)** | **0.951** | [longmemeval-s-3.2.2-release.md](longmemeval-s-3.2.2-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.2 release)** | **0.945** | [longmemeval-s-3.2.2-release.md](longmemeval-s-3.2.2-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.1 release)** | **0.951** | [longmemeval-s-3.2.1-release.md](longmemeval-s-3.2.1-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.1 release)** | **0.949** | [longmemeval-s-3.2.1-release.md](longmemeval-s-3.2.1-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.0 release)** | **0.951** | [longmemeval-s-3.2.0-release.md](longmemeval-s-3.2.0-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.0 release)** | **0.938** | [longmemeval-s-3.2.0-release.md](longmemeval-s-3.2.0-release.md) |
 | **2026-10-20** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.1.2 release)** | **0.951** | [longmemeval-s-3.1.2-release.md](longmemeval-s-3.1.2-release.md) |
 | **2026-10-20** | LongMemEval-S (v1) | **local embeddings + observation stream (3.1.2 release)** | **0.947** | [longmemeval-s-3.1.2-release.md](longmemeval-s-3.1.2-release.md) |
 | **2026-10-16** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.1 release)** | **0.951** | [longmemeval-s-3.1.0-release.md](longmemeval-s-3.1.0-release.md) |
@@ -21,11 +29,36 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 | **2026-10-15** | LongMemEval-S (v1) | **local embeddings + observation stream (3.0.1 release)** | **0.943** | [longmemeval-s-3.0.1-release.md](longmemeval-s-3.0.1-release.md) |
 | **2026-10-13** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.0.0 release; on by default)** | **0.951** | [longmemeval-s-3.0.0-release.md](longmemeval-s-3.0.0-release.md) |
 | **2026-10-13** | LongMemEval-S (v1) | **local embeddings + observation stream (3.0.0 release; on by default)** | **0.945** | [longmemeval-s-3.0.0-release.md](longmemeval-s-3.0.0-release.md) |
-| 2026-09-21 | LongMemEval-S (v1) | local embeddings (2.4 RC, current release) | 0.815 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
+| 2026-09-21 | LongMemEval-S (v1) | local embeddings (historical 2.4 RC) | 0.815 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-21 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (2.4 RC) | 0.666 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 3.2.4 patch-release run found FTS identical to 3.2.2 at every accuracy
+cutoff and local embeddings unchanged at `hit@5` overall and on every slice.
+Local `hit@1` and `hit@10` improved. See the
+[3.2.4 release report](longmemeval-s-3.2.4-release.md) for provenance and the
+load-sensitive latency and ingest comparison.
+
+The 3.2.2 patch-release run found FTS identical to 3.2.1 on every question.
+Local embeddings moved from 0.949 to 0.945 `hit@5`, inside the pre-registered
+overall noise band; the two changed questions remain within the top ten, and
+`hit@10` improved from 0.968 to 0.974. See the
+[3.2.2 release report](longmemeval-s-3.2.2-release.md) for provenance, every
+slice, and the explicit threshold assessment.
+
+The 3.2.1 patch-release run recovered 3.2.0's local embedding accuracy and
+documented the remaining boundary-question variation. See the
+[3.2.1 release report](longmemeval-s-3.2.1-release.md) for the capacity-fix
+measurement and controlled latency follow-up.
+
+The 2026-10-22 minor-release run found FTS identical to 3.1.2 on every
+question. Local embeddings fell from 0.947 to 0.938 `hit@5` (five questions
+lost, one gained), with higher query latency and 75% longer ingest. That is
+outside the +/-0.005 noise band and is tracked as a possible regression for
+the next release. See the [3.2.0 release report](longmemeval-s-3.2.0-release.md)
+for every slice, ingest performance, the suspected commit and provenance.
 
 The 2026-10-20 patch-release run found no retrieval regression against 3.1.
 FTS is identical at every accuracy cutoff. Local embeddings improved from
@@ -147,3 +180,77 @@ baseline-vs-baseline determinism check is clean (all accuracy/token deltas `0.00
   expectation first keeps a run from being read in whichever way suits it;
   a result that misses it still follows the release policy. The idea came
   from #1255.
+
+## Running it fast
+
+The full release benchmark is two runs (zero-LLM FTS and local embeddings)
+over all 470 scored questions. Profiling the ingest path in October 2026
+found most wall clock went to wiki git checkpointing, which retrieval
+never reads: every SessionEnd runs `commit_all`, each commit walks a wiki
+tree and object database that keep growing across the run, and the
+per-event `log.md` append queues behind the same commit mutex. On a
+100-question prefix those two phases were 55% and 38% of server-side
+ingest time. The two changes below follow from that, and neither touches
+a published number.
+
+### Skip wiki checkpoints (release runs)
+
+`AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1`, passed to the eval server via
+the harness's general `--server-env` escape, makes the server skip the
+SessionEnd wiki auto-commits. Retrieval never reads git history (the
+markdown files and the SQLite index are the source of truth), so
+accuracy, query latency and context tokens are unchanged. Verified on the
+16- and 100-question prefixes: every hit@k and recall@k matched a default
+run to the last digit, and the 100-question FTS wall clock fell from
+155.9 s to 12.1 s. The variable appears in the report's config line
+(`env:AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1`), so a run that used it
+says so. Accuracy, latency and context-token numbers stay comparable with
+earlier releases; only ingest wall clock differs, because runs before
+October 2026 paid for the commits. The variable is an eval-only escape, not
+a supported product configuration: no product path sets it, and its only
+reader is the server's startup check.
+
+```bash
+ai-memory-eval retrieval \
+  --server-bin target/release/ai-memory \
+  --concurrency 6 --http-timeout-secs 900 \
+  --server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true \
+  --server-env AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1
+
+ai-memory-eval retrieval \
+  --server-bin target/release/ai-memory \
+  --concurrency 6 --http-timeout-secs 900 \
+  --embeddings local \
+  --server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true \
+  --server-env AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1
+```
+
+### Run the two modes back to back, not at the same time
+
+Two harness processes are fully independent (separate server, temp data
+dir and run dir), and concurrent runs score identically to serial ones:
+a concurrent and a serial 100-question pair showed zero ranking
+differences. But with checkpoints skipped the FTS run takes minutes,
+while the local run saturates the CPU with embedding work. Sharing the
+machine slowed the local leg by 20–45% in repeated trials on the
+32-thread benchmark box, so run FTS first, then local. Concurrent
+execution only pays on hardware with real core headroom.
+
+### Iteration runs (never the release comparison)
+
+`--sample N` (first N questions, one slice), `--stratify N` (first N per
+question type, every slice) and `--question-id a,b,c` (chosen questions)
+exist for iteration and smoke runs; `evals/README.md` documents each. A
+working loop is `--stratify 5` (30 scored questions, every slice) for
+direction, then the failing questions by id. Release comparisons stay
+full-470 per the release policy above; a subset number never lands in
+`docs/benchmarks/`.
+
+### What to expect
+
+On the benchmark hardware (Ryzen 9 7950X3D, 32 threads), with checkpoints
+skipped: the FTS run finishes in a couple of minutes (~5,400 items/s
+sustained on a 282-question prefix); the local-embeddings run is bounded
+by the embedder at roughly 19 pages/s and lands near half an hour. Expect
+about ±15% of run-to-run spread on wall clock when the machine has other
+work on it; accuracy noise is the ±0.005 band above, not wall clock.

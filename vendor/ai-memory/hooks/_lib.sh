@@ -287,6 +287,45 @@ ai_memory_extract_session_id() {
     done
 }
 
+# True when the payload claims to be a subagent/child session: a known marker
+# key at the TOP LEVEL holding a non-empty string. Parity with the native
+# router (`commands/hook.rs::payload_is_subagent`) and the PowerShell
+# `Test-AiMemorySubagentPayload`, both of which read keyed values. The depth
+# walk is what makes it a payload check rather than a text search: tool input
+# and tool output routinely quote these key names (reading a source file that
+# names them is enough), and a session must not lose its handoff over that.
+ai_memory_payload_is_subagent() {
+    printf '%s' "${1:-$(cat)}" | LC_ALL=C awk '
+        { buf = buf $0 "\n" }
+        END {
+            split("subagentType subagent_type agent_type agent_id parentSessionId", names, " ")
+            for (n in names) marker[names[n]] = 1
+            len = length(buf)
+            depth = 0
+            want = "key"
+            for (i = 1; i <= len; i++) {
+                c = substr(buf, i, 1)
+                if (c == "{" || c == "[") { depth++; if (depth == 1) want = "key"; continue }
+                if (c == "}" || c == "]") { depth--; continue }
+                if (c == ",") { if (depth == 1) want = "key"; continue }
+                if (c != "\"") continue
+                tok = ""
+                for (i++; i <= len; i++) {
+                    c = substr(buf, i, 1)
+                    if (c == "\\") { tok = tok substr(buf, i, 2); i++; continue }
+                    if (c == "\"") break
+                    tok = tok c
+                }
+                if (depth != 1) continue
+                if (want == "key") { key = tok; want = "value"; continue }
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", tok)
+                if (marker[key] && tok != "") exit 0
+                want = "key"
+            }
+            exit 1
+        }'
+}
+
 # Antigravity's PreInvocation hook fires before every model call. Only the
 # documented invocationNum=0 boundary represents the startup event that
 # ai-memory maps to SessionStart. Missing or malformed counters fail closed so
@@ -933,7 +972,7 @@ ai_memory_post_hook() {
     _ambody=$(cat)
     _amhdr=$(ai_memory_auth_header_file || printf '')
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --noproxy '*' --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
@@ -941,13 +980,13 @@ ai_memory_post_hook() {
     elif [ -n "$_amhdr" ]; then
         # `-H @file`: curl reads the header from disk, so the bearer never
         # appears in curl's argv the way an inline `-H` would (#552).
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --noproxy '*' --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H @"$_amhdr" \
             --data-binary @- 2>/dev/null) || _amcode=000
     else
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --noproxy '*' --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             --data-binary @- 2>/dev/null) || _amcode=000
@@ -985,12 +1024,12 @@ ai_memory_get_handoff() {
     esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
+        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
     elif [ -n "$_amhdr" ]; then
-        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
+        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
     else
-        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
+        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
     fi
 }
 
@@ -1208,13 +1247,13 @@ ai_memory_drain_spool() {
         if [ -n "$_amdtok" ]; then
             _amdhdr="$_amddir/.drain-header.$$"
             (umask 077; printf 'Authorization: Bearer %s\n' "$_amdtok" >"$_amdhdr") 2>/dev/null || continue
-            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --noproxy '*' --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
                 -w '%{http_code}' -X POST "$_amdurl" \
                 -H "Content-Type: application/json" -H @"$_amdhdr" \
                 --data-binary @- 2>/dev/null) || _amdcode=000
             rm -f "$_amdhdr" 2>/dev/null || true
         else
-            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --noproxy '*' --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
                 -w '%{http_code}' -X POST "$_amdurl" \
                 -H "Content-Type: application/json" \
                 --data-binary @- 2>/dev/null) || _amdcode=000

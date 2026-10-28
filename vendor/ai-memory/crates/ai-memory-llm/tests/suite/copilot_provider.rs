@@ -33,6 +33,90 @@ fn responses(content: &str) -> serde_json::Value {
     json!({"status":"completed","model":"responses-model","output":[{"type":"message","content":[{"type":"output_text","text":content}]}],"usage":{"input_tokens":2,"output_tokens":3}})
 }
 
+/// A `/responses` answer stopped by `max_output_tokens` is a truncation the
+/// operator can act on, not an unexpected shape. `error` is null on an
+/// incomplete response, so the old message always ended "no error detail" and
+/// told the operator nothing — and `unexpected-shape` is the wrong class for a
+/// stop that raising `max_tokens` fixes.
+#[tokio::test]
+async fn an_incomplete_responses_answer_is_a_truncated_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata("responses", &["/responses"])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "error": null,
+            "model": "responses-model",
+            "output": [{ "type": "reasoning", "content": [] }],
+            "usage": { "input_tokens": 2, "output_tokens": 4096 },
+        })))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server, "responses")
+        .complete(ai_memory_llm::ChatRequest::user_prompt("hi"))
+        .await
+        .expect_err("a truncated answer must not be returned as text");
+
+    assert_eq!(err.class(), "truncated-response", "{err:?}");
+    assert!(
+        !err.is_transient(),
+        "raising max_tokens is the fix, not a retry"
+    );
+    match &err {
+        LlmError::TruncatedResponse {
+            model,
+            completion_tokens,
+        } => {
+            assert_eq!(model, "responses");
+            assert_eq!(*completion_tokens, Some(4096));
+        }
+        other => panic!("expected TruncatedResponse, got {other:?}"),
+    }
+}
+
+/// The control: any OTHER non-completed status keeps the existing
+/// unexpected-shape classification, so this change is scoped to the one stop
+/// reason the operator can act on.
+#[tokio::test]
+async fn another_incomplete_reason_stays_an_unexpected_shape() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata("responses", &["/responses"])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "content_filter" },
+            "error": null,
+            "model": "responses-model",
+            "output": [],
+            "usage": { "input_tokens": 2, "output_tokens": 0 },
+        })))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server, "responses")
+        .complete(ai_memory_llm::ChatRequest::user_prompt("hi"))
+        .await
+        .expect_err("a non-completed status must still fail");
+
+    assert_eq!(err.class(), "unexpected-shape", "{err:?}");
+}
+
 #[tokio::test]
 async fn metadata_selects_chat_and_preserves_chat_wire_format() {
     let server = MockServer::start().await;

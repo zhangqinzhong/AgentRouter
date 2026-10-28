@@ -7,6 +7,14 @@
 > you already have a working tarball routine, treat this as an additional
 > layer.
 
+The on-box tarball is an online **data snapshot**, not a complete host-move
+archive. It contains `wiki/`, a consistent SQLite snapshot, and only the
+`config.toml` located inside the data dir. It deliberately omits root and hook
+credential files, external service configuration, `raw/`, logs, and models.
+For a host move, follow the companion-material checklist in
+[`docs/lifecycle-ops.md#backup`](lifecycle-ops.md#backup); keep secrets in a
+separately protected backup and reinstall hooks/MCP wiring on the destination.
+
 Ai-memory's wiki directory is a real git repository. Every consolidation pass
 writes a checkpoint through libgit2 (see cross-cutting invariant #10 in
 [`AGENTS.md`](../AGENTS.md) and the wiki design notes in
@@ -142,24 +150,25 @@ Two caveats:
   synthesized. Treat the remote the same way you treat any project source:
   private repository, restrictive access controls.
 
-## Backing up the whole data dir (mirror + push)
+## Backing up a wiki/config mirror plus SQLite snapshot
 
-For a full-install backup (wiki, raw ledger, sanitized config), the
-supported pattern is a scheduled rsync into a mirror git repository, followed
-by a git push. This avoids running git operations against the live wiki
-repository (which the server writes to) while still giving you a single
-remote with the full recoverable state.
+For a scheduled off-site copy, mirror the wiki and selected config into a
+private git repository, then ask the running server for a separate consistent
+SQLite snapshot. The mirror is intentionally incomplete; the snapshot carries
+the DB-only state that `reindex` cannot reconstruct. Either copy may contain
+secrets or private memory and must be protected accordingly.
 
 A worked example lives at
 [`docs/examples/backup/`](examples/backup/README.md) and consists of:
 
 - `ai-memory-snapshot.sh`: an idempotent rsync + `git commit && git push` +
-  tarball script driven by six environment variables.
+  online `ai-memory backup` script driven by environment variables.
 - `ai-memory-backup.service`: a `systemd --user` oneshot unit that runs it.
 - `ai-memory-backup.timer`: a daily user timer with a randomised delay and
   `Persistent=true` so a missed run after a reboot still fires.
 - `.gitignore`: an exclusion list to drop into the root of the mirror
-  repository so derived state and secrets never land in commits.
+  repository so derived state and common standalone secret files do not land
+  in commits. It cannot remove secrets stored inline in `config.toml`.
 
 The high-level flow, one invocation per day (adjust the timer for a different
 cadence):
@@ -174,9 +183,10 @@ cadence):
    changed; skip if there is no delta.
 4. `git push origin main` with a timeout so a hung network does not block the
    next run.
-5. `tar czf $TARBALL_DIR/ai-memory-$(date +%F).tar.gz` a copy of the same
-   tree, so the DB and models can be recovered without a `reindex` after a
-   catastrophic disk loss.
+5. Run `ai-memory backup --to
+   $TARBALL_DIR/ai-memory-$(date +%F).tar.gz` so SQLite is copied through its
+   online backup API rather than racing the live WAL. Models are not included;
+   redownload them after recovery.
 6. Rotate old tarballs and old script logs on a retention window (30 days by
    default).
 
@@ -211,11 +221,14 @@ out-of-scope for v1). What that means in practice:
 - **Least-privilege push credential.** Prefer an SSH deploy key or a
   fine-grained personal-access token scoped to the mirror repository only.
   Rotate on the same cadence you rotate other long-lived push credentials.
-- **Explicit secret exclusion.** The example script rejects any file matching
+- **Explicit secret exclusion.** The example script excludes files matching
   `SECRET_EXCLUDES` (`*.env`, `auth.json`, `.secrets`, `*.pem`, `*.key`, `*.crt` by default), and the
   suggested mirror-repo `.gitignore` matches the same set. Add anything else
   install-specific (private CA bundles, host-side certificates, cloud
-  credential files) to both lists.
+  credential files) to both lists. These path rules do not inspect TOML:
+  `[auth]` tokens, `token_pepper`, or sensitive LLM headers stored inline in
+  `config.toml` will be committed. Remove them from the mirror or encrypt and
+  access-control the repository as a secret store.
 - **Encryption at rest is out of scope for ai-memory.** If your threat model
   requires it, either put the mirror on an encrypted remote (`git-crypt`,
   GitLab's group-level encryption, a self-hosted Gitea over TLS with disk

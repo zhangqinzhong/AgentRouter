@@ -10,7 +10,7 @@ use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::types::{
@@ -635,13 +635,8 @@ impl OpenAiProvider {
             }
         };
         let resp = request.json(body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<OpenAiResponse>(resp).await
     }
@@ -1644,6 +1639,38 @@ mod tests {
         assert!(
             requests[0].headers.get(REQUEST_ID_HEADER).is_none(),
             "the official provider must not gain the openai-compat header"
+        );
+    }
+
+    #[tokio::test]
+    async fn official_structured_completion_classifies_whitespace_as_empty_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-empty",
+                "choices": [{
+                    "message": { "content": "  \n\t" },
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(SecretString::from("sk-test"), "gpt-empty")
+            .unwrap()
+            .with_base_url(server.uri());
+
+        let error = provider
+            .complete_structured_raw(
+                ChatRequest::user_prompt("return JSON"),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+            .await
+            .expect_err("whitespace-only output must be empty content");
+
+        assert_eq!(error.class(), "empty-content");
+        assert!(
+            matches!(error, crate::error::LlmError::EmptyContent { model } if model == "gpt-empty")
         );
     }
 }

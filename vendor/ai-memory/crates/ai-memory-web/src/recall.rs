@@ -102,7 +102,7 @@ pub(crate) async fn search_scopes(
                     |(hit, _)| RerankCandidate {
                         id: hit.id.to_string(),
                         title: hit.title.clone(),
-                        snippet: hit.snippet.clone(),
+                        snippet: ai_memory_store::plain_snippet(&hit.snippet),
                     },
                     |(_, details), relevance| {
                         if let Some(details) = details.as_mut() {

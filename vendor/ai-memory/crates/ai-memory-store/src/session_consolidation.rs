@@ -2,7 +2,7 @@
 
 use ai_memory_core::{ProjectId, SessionId, WorkspaceId};
 use jiff::Timestamp;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::error::{StoreError, StoreResult};
@@ -113,6 +113,44 @@ fn enqueue_eligible(
     session_id: SessionId,
     eligibility: EnqueueEligibility,
 ) -> StoreResult<bool> {
+    let tx = conn.transaction()?;
+    let inserted = enqueue_eligible_in_tx(&tx, workspace_id, project_id, session_id, eligibility)?;
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// [`enqueue`] inside a caller-owned transaction: the job insert commits or
+/// rolls back WITH the caller's effect, so a failed enqueue can never leave
+/// an ended session behind without its consolidation job.
+///
+/// Returns `true` only when a new generation was inserted. A duplicate
+/// generation, missing session, mismatched scope, open session, or
+/// observation-less session returns `false` without creating work.
+///
+/// # Errors
+/// Propagates SQL errors; the caller rolls back its own transaction.
+pub fn enqueue_in_tx(
+    tx: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+) -> StoreResult<bool> {
+    enqueue_eligible_in_tx(
+        tx,
+        workspace_id,
+        project_id,
+        session_id,
+        EnqueueEligibility::EndedSession,
+    )
+}
+
+fn enqueue_eligible_in_tx(
+    tx: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    eligibility: EnqueueEligibility,
+) -> StoreResult<bool> {
     let ended_predicate = match eligibility {
         EnqueueEligibility::EndedSession => "AND s.ended_at IS NOT NULL",
         EnqueueEligibility::AnySession => "",
@@ -131,7 +169,6 @@ fn enqueue_eligible(
          HAVING COUNT(o.id) > 0"
     );
     let now = Timestamp::now().as_microsecond();
-    let tx = conn.transaction()?;
     let inserted = tx.execute(
         &sql,
         params![
@@ -155,7 +192,6 @@ fn enqueue_eligible(
            )",
         params![now, session_id.as_bytes()],
     )?;
-    tx.commit()?;
     Ok(inserted == 1)
 }
 

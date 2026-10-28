@@ -75,6 +75,7 @@ enum DeleteKind {
     OpenClawManifest,
     OpenClawEntrypoint,
     KiroCliV3Hooks,
+    ClineHook,
     ManagedSkill,
     GrokHandoffRule,
     AutowireSentinel,
@@ -91,6 +92,7 @@ impl DeleteKind {
             Self::OpenClawManifest => "OpenClaw plugin manifest",
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
             Self::KiroCliV3Hooks => "Kiro CLI v3 hook file",
+            Self::ClineHook => "Cline CLI hook file",
             Self::ManagedSkill => "managed Agent Skill",
             Self::GrokHandoffRule => "managed Grok first-turn handoff rule",
             Self::AutowireSentinel => "auto-wire sentinel",
@@ -280,6 +282,10 @@ fn build_plan(
                 install_hooks::ibm_bob_settings_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
+            (
+                install_hooks::qwen_code_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
         ]);
         for (path, shape) in hook_files {
             if !path.exists() {
@@ -380,6 +386,22 @@ fn build_plan(
             );
         }
 
+        let mut cline_hook_dirs = vec![install_hooks::cline_hooks_path_in(env.var_os("HOME"))?];
+        cline_hook_dirs.push(cwd.join(".cline").join("hooks"));
+        cline_hook_dirs.sort();
+        cline_hook_dirs.dedup();
+        for dir in cline_hook_dirs {
+            for (event, _) in install_hooks::CLINE_HOOK_EVENTS {
+                for extension in ["sh", "ps1"] {
+                    push_generated_delete(
+                        &mut plan,
+                        dir.join(format!("{event}.{extension}")),
+                        DeleteKind::ClineHook,
+                    );
+                }
+            }
+        }
+
         let plugin = install_hooks::opencode_plugin_path()?;
         push_generated_delete(&mut plan, plugin, DeleteKind::OpenCodePlugin);
 
@@ -443,11 +465,14 @@ fn build_plan(
             KiroCli,
             CommandCode,
             IbmBob,
+            QwenCode,
             CopilotCli,
             Droid,
             Swival,
             Muse,
             PrimeAgent,
+            Cline,
+            Freebuff,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -470,7 +495,8 @@ fn build_plan(
             } else if matches!(client, Muse) {
                 vec![install_hooks::muse_settings_path(env)?]
             } else {
-                let Ok(path) = install_mcp::mcp_config_path(client) else {
+                let Ok(path) = install_mcp::mcp_config_path_with(client, &|name| env.var_os(name))
+                else {
                     continue;
                 };
                 vec![path]
@@ -586,7 +612,7 @@ fn skill_roots(
     copilot_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(12);
+    let mut roots = Vec::with_capacity(14);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
@@ -604,6 +630,9 @@ fn skill_roots(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
         push_unique_skill_root(&mut roots, copilot_root.join(SKILLS_DIR));
+        for root in super::install_skills::antigravity_global_skill_roots(home) {
+            push_unique_skill_root(&mut roots, root);
+        }
     }
     // Windows global Devin installs live under %APPDATA%\devin\skills, not
     // $HOME/.devin/skills — sweep it too or uninstall orphans those skills.
@@ -675,6 +704,11 @@ fn apply_change(
                 remove_empty_skill_dirs(path)?;
             }
             if *kind == DeleteKind::GrokHandoffRule
+                && let Some(parent) = path.parent()
+            {
+                remove_dir_if_empty(parent)?;
+            }
+            if *kind == DeleteKind::ClineHook
                 && let Some(parent) = path.parent()
             {
                 remove_dir_if_empty(parent)?;
@@ -835,13 +869,21 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
 
     uninstall_plugins(&plugins, &user_service::SystemRunner);
 
-    // Removing the hooks removes the only readers of the stored bearer, so
-    // leaving it on disk would strand a live credential (#552). An uninstall
-    // that keeps the hooks (`--only mcp|instructions|skills`) keeps it: the
-    // native hook, the shell hooks and the generated TypeScript integrations
-    // (the Pi one also bridges MCP) all still read it. Best-effort: an
-    // unremovable file must not fail a teardown that otherwise succeeded.
-    if hooks_removed && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir) {
+    // Removing the hooks removes the readers of the stored bearer, so leaving
+    // it on disk would strand a live credential (#552). An uninstall that
+    // keeps the hooks (`--only mcp|instructions|skills`) keeps it: the native
+    // hook, the shell hooks and the generated TypeScript integrations (the Pi
+    // one also bridges MCP) all still read it. So does `--only hooks` while a
+    // Claude Code or Muse bridge entry remains, since the bridge reads the same
+    // file and `install-mcp --apply --auth-token` leaves the key out of those
+    // entries. Best-effort: an unremovable file must not fail a teardown that
+    // otherwise succeeded.
+    let bridge_keeps_key = args.only == Some(crate::cli::UninstallOnly::Hooks)
+        && install_mcp::bridge_entry_remains(name.as_deref().unwrap_or("ai-memory"));
+    if hooks_removed
+        && !bridge_keeps_key
+        && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir)
+    {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
             config.data_dir.display()
@@ -1521,6 +1563,12 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                                     .all(install_hooks::is_ai_memory_kiro_v3_hook_entry)
                         })
             }),
+        DeleteKind::ClineHook => {
+            content.contains("Generated by ai-memory install-hooks --agent cline")
+                && content.contains("'ai-memory'")
+                && content.contains("'hook'")
+                && content.contains("'--agent' 'cline'")
+        }
         DeleteKind::ManagedSkill => content.contains(MANAGED_MARKER),
         DeleteKind::GrokHandoffRule => content.contains(GROK_HANDOFF_RULE_MARKER),
     }
@@ -1534,6 +1582,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::ClaudeDesktop
         | McpClient::Cursor
         | McpClient::GeminiCli
+        | McpClient::QwenCode
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::KimiCode
@@ -1544,7 +1593,9 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Droid
         | McpClient::Swival
         | McpClient::Devin
-        | McpClient::PrimeAgent => Some(&["mcpServers"]),
+        | McpClient::PrimeAgent
+        | McpClient::Cline
+        | McpClient::Freebuff => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::OpenCode2 => Some(&["mcp", "servers"]),
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
@@ -1553,7 +1604,9 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         // Muse reads `mcpServers` or the legacy `mcp_servers`;
         // `strip_mcp_json` sweeps both.
         McpClient::Muse => Some(&["mcpServers"]),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh | McpClient::Hermes => {
+            None
+        }
     }
 }
 
@@ -1570,6 +1623,9 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
         if entry.get(field).and_then(|v| v.as_str()) == Some(url) {
             return true;
         }
+    }
+    if entry.pointer("/transport/url").and_then(|v| v.as_str()) == Some(url) {
+        return true;
     }
     // Our stdio bridge, in any client's shape (`command` + `args`, or
     // OpenCode's single `command` array), aimed at this server.
@@ -2069,8 +2125,9 @@ mod tests {
         let without = skill_roots(cwd, Some(home), None, None, None, None);
         assert_eq!(
             without.len(),
-            10,
-            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot × project+global)"
+            12,
+            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot × \
+             project+global, plus Antigravity's two global roots)"
         );
         assert!(
             without.contains(&cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR)),
@@ -2219,6 +2276,24 @@ mod tests {
             default_home.contains(&PathBuf::from("/home/alice/.copilot/skills")),
             "{default_home:?}"
         );
+    }
+
+    #[test]
+    fn skill_roots_sweep_both_antigravity_global_roots() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+        );
+        for root in [
+            "/home/alice/.gemini/config/skills",
+            "/home/alice/.gemini/antigravity-cli/skills",
+        ] {
+            assert!(roots.contains(&PathBuf::from(root)), "{root}: {roots:?}");
+        }
     }
 
     #[test]
@@ -2631,6 +2706,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_cline_hook_detection_requires_the_full_signature() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("TaskStart.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n# Generated by ai-memory install-hooks --agent cline.\nexec 'other' 'hook' '--agent' 'cline'\n",
+        )
+        .unwrap();
+        assert!(!generated_file_is_ours(&path, DeleteKind::ClineHook));
+
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n# Generated by ai-memory install-hooks --agent cline.\nexec 'ai-memory' 'hook' '--agent' 'cline'\n",
+        )
+        .unwrap();
+        assert!(generated_file_is_ours(&path, DeleteKind::ClineHook));
+    }
+
+    #[test]
     fn generated_openclaw_package_detection_requires_our_shape() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("package.json");
@@ -2934,6 +3028,15 @@ mod tests {
             "command": ["ai-memory", "mcp-bridge", "--no-session-id", "--server-url", url],
             "enabled": true,
         });
+        let cline = serde_json::json!({
+            "transport": {
+                "type": "stdio",
+                "command": "ai-memory",
+                "args": ["mcp-bridge", "--no-session-id", "--server-url", url],
+            },
+            "disabled": false,
+            "autoApprove": [],
+        });
         assert!(mcp_entry_is_ours(
             "ai-memory",
             &bridge(url),
@@ -2943,6 +3046,12 @@ mod tests {
         assert!(mcp_entry_is_ours(
             "ai-memory",
             &opencode,
+            Some("ai-memory"),
+            url
+        ));
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &cline,
             Some("ai-memory"),
             url
         ));

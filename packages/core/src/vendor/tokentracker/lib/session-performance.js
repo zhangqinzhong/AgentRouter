@@ -48,10 +48,16 @@ function accumulator() {
   }
   function request(model, outputTokens, start, end) {
     const duration = start !== null && end !== null ? end - start : 0;
+    record(model, outputTokens, duration);
+  }
+  function requestDuration(model, outputTokens, durationMs) {
+    record(model, outputTokens, durationMs);
+  }
+  function record(model, outputTokens, duration) {
     if (outputTokens < MIN_OUTPUT || duration < MIN_DURATION_MS || duration > MAX_DURATION_MS) return;
     add(model, { estimated_output_tokens: outputTokens, estimated_duration_ms: duration, estimated_request_count: 1 });
   }
-  return { add, request, finish: () => ({ performance: total, byModel }) };
+  return { add, request, requestDuration, finish: () => ({ performance: total, byModel }) };
 }
 
 function createClaudePerformanceCollector() {
@@ -206,9 +212,26 @@ function createCodexPerformanceCollector() {
   return { consume, consumeUsage, finish: totals.finish };
 }
 
+// ZCode's CLI DB stores per-request wall-clock counters directly in its
+// model_usage table (duration_ms, time_to_first_token_ms) instead of an event
+// stream, so this collector is a thin adapter: each completed request becomes
+// one duration-bounded sample, never a token total (those come from the
+// shared usage reader so the browser cannot drift from the usage card).
+function createZcodePerformanceCollector() {
+  const totals = accumulator();
+  function consumeUsage({ model, outputTokens, durationMs, timeToFirstTokenMs } = {}) {
+    totals.requestDuration(model, nonNegative(outputTokens), nonNegative(durationMs));
+    if (typeof timeToFirstTokenMs === "number" && Number.isFinite(timeToFirstTokenMs) && timeToFirstTokenMs >= 0) {
+      totals.add(null, { first_response_total_ms: timeToFirstTokenMs, first_response_sample_count: 1 });
+    }
+  }
+  return { consumeUsage, finish: totals.finish };
+}
+
 module.exports = {
   normalizePerformance,
   mergePerformance,
   createClaudePerformanceCollector,
   createCodexPerformanceCollector,
+  createZcodePerformanceCollector,
 };

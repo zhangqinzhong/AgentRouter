@@ -438,6 +438,33 @@ preserves the normal order. `global=true` and supplemental global-preference
 hits keep their existing non-RRF ranking. Concurrent provider calls are capped
 at four; saturated queries keep their local ranking without waiting.
 
+## Workload telemetry
+
+`ai-memory status --json` (the root-protected `GET /admin/status` response)
+includes `providers.llm_workloads` whenever an LLM provider is configured. Its
+closed labels are `unspecified`, `consolidation`, `rerank`, `auto-improve`,
+`bootstrap`, `query-answer`, `lint`, `profile`, `dream`, and `experience`.
+Each row reports process-lifetime calls, successes and errors, total/max
+latency, fixed-bucket p50/p95 upper bounds, last outcome, and token counts. The
+counters are process-local and reset on restart; the server constructs the
+configured provider wrapper once at startup and has no runtime provider reload.
+
+`estimated_input_tokens` and `estimated_output_tokens` use a deliberately
+coarse four-characters-per-token estimate so structured and plain calls remain
+comparable. `reported_input_tokens` and `reported_output_tokens` count only
+responses for which the provider supplied usage; `usage_reported_calls` shows
+that coverage. Structured-output provider adapters currently return decoded
+JSON without usage, so their reported counters can remain zero even when the
+estimate is nonzero.
+
+The telemetry stores no prompt, completion, scope, project, or caller-supplied
+label. A fallback chain is measured as one provider-interface invocation, not
+as one call per internal candidate attempt; an outer caller retry is another
+invocation. Workload labels do not select a
+provider or model: all operations still use the configured global provider and
+fallback chain. Per-workload routing remains measure-first and has no public
+configuration surface.
+
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`,
 `openai-compat`, or `copilot` when you want vector retrieval in addition to

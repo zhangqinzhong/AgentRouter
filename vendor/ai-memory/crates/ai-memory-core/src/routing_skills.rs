@@ -35,6 +35,16 @@ pub const GITHUB_SKILL_DIR: &str = ".github";
 pub const COPILOT_SKILL_DIR: &str = ".copilot";
 /// Hermes Agent Skill directory below a project or home root.
 pub const HERMES_SKILL_DIR: &str = ".hermes";
+/// Google Antigravity's directory below the home root. Its global skills live
+/// in two directories under it, one per product; workspace skills use
+/// [`AGENTS_SKILL_DIR`] (<https://antigravity.google/docs/skills/>).
+pub const ANTIGRAVITY_HOME_DIR: &str = ".gemini";
+/// Below [`ANTIGRAVITY_HOME_DIR`]: the Antigravity App and IDE global skills
+/// parent, `~/.gemini/config`.
+pub const ANTIGRAVITY_APP_SKILL_DIR: &str = "config";
+/// Below [`ANTIGRAVITY_HOME_DIR`]: the Antigravity CLI global skills parent,
+/// `~/.gemini/antigravity-cli`.
+pub const ANTIGRAVITY_CLI_SKILL_DIR: &str = "antigravity-cli";
 /// Leaf directory that contains individual Agent Skill directories.
 pub const SKILLS_DIR: &str = "skills";
 
