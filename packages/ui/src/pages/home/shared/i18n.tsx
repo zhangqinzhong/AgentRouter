@@ -2642,6 +2642,14 @@ Object.assign(appCopy.zh.text, {
   "Refresh usage": "刷新用量", "Updating local usage…": "正在更新本地用量…",
   "Custom directory": "自定义目录", "Auto-detected": "自动识别", "Directory not found": "目录不存在",
   "Collect from": "采集目录",
+  "Local usage and sessions from your clients.": "采集客户端保存在本机的用量与会话。",
+  "Session records": "会话记录", "Archived sessions": "归档会话", "Remove directory": "移除目录",
+  "Removing a directory keeps its files and collected usage.": "移除后保留原始文件和已采集用量。",
+  "Default directory": "默认目录", "Undetected directories": "未发现的目录", "locations": "个位置",
+  "Custom collection directories": "自定义采集目录",
+  "No custom directories added": "尚未添加自定义目录",
+  "Partially enabled": "部分开启", "No directories found": "未发现采集目录",
+  "Collection enabled": "已开启", "Collection disabled": "已关闭", "Configuration profile": "配置档案",
   "Only locally recorded usage is collected. Removing a directory keeps its files and previously collected usage.": "仅采集客户端保存在本地的用量记录。移除目录不会删除原始文件或已采集的用量。",
 });
 Object.assign(appCopy.zh.text, memoryCopyZh);
