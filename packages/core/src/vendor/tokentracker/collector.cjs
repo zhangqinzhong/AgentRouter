@@ -60,7 +60,7 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
     if(endpoint.endsWith('usage-trend')) return require('./trend.cjs').queryTrend(query,(path,params)=>queryEndpoint(path,params));
     if(endpoint.endsWith('usage-category-breakdown')) {
       const {getCategoryBreakdown}=require('./context.cjs');
-      return getCategoryBreakdown({home,...query});
+      return getCategoryBreakdown({home,dataDir,...query});
     }
     if(endpoint.endsWith('usage-limits')) {
       if(query.refresh==='1' && !query.provider) resetUsageLimitsCache();
@@ -101,6 +101,9 @@ async function compactQueue(file) {
   let raw;try{raw=await fs.readFile(file,'utf8')}catch(e){if(e.code==='ENOENT')return;throw e}
   const latest=new Map();
   for(const line of raw.split('\n')) {if(!line.trim())continue;const row=JSON.parse(line);const key=JSON.stringify([row.project_key??null,row.source,row.model,row.hour_start]);latest.set(key,row);}
-  const temp=file+'.compact';await fs.writeFile(temp,[...latest.values()].map(row=>JSON.stringify(row)+'\n').join(''),{mode:0o600});await fs.rename(temp,file);
+  const compacted=[...latest.values()].map(row=>JSON.stringify(row)+'\n').join('');
+  // Preserve file identity and the aggregation cache when nothing changed.
+  if(compacted===raw)return;
+  const temp=file+'.compact';await fs.writeFile(temp,compacted,{mode:0o600});await fs.rename(temp,file);
 }
 module.exports={createCollector,compactQueue};

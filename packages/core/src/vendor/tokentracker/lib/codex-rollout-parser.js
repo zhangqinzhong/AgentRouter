@@ -44,10 +44,7 @@ const {
 const DISCOVERY_FULL_AUDIT_INTERVAL_MS = 60 * 1000;
 const CODEX_ROLLOUT_TEXT_MAX_BYTES = 256 * 1024 * 1024;
 
-async function readCodexRolloutText(filePath, { maxOutputBytes = CODEX_ROLLOUT_TEXT_MAX_BYTES } = {}) {
-  if (typeof filePath !== "string" || !/\.jsonl\.zstd?$/i.test(filePath)) {
-    return fs.readFile(filePath, "utf8");
-  }
+async function readCompressedCodexSnapshot(filePath, maxOutputBytes = CODEX_ROLLOUT_TEXT_MAX_BYTES) {
   // The snapshot decoder lives in rollout.js (reused by the sync parser);
   // require lazily so this module stays loadable without pulling the whole
   // rollout graph at import time.
@@ -60,9 +57,11 @@ async function readCodexRolloutText(filePath, { maxOutputBytes = CODEX_ROLLOUT_T
     error.code = "EIO";
     throw error;
   }
-  // Snapshot lines keep their "\n" terminators; the tail element may be an
-  // unterminated final line — join preserves exactly that.
-  return snapshot.lines.join("\n");
+  return snapshot;
+}
+async function readCodexRolloutText(filePath, { maxOutputBytes = CODEX_ROLLOUT_TEXT_MAX_BYTES } = {}) {
+  if (typeof filePath !== "string" || !/\.jsonl\.zstd?$/i.test(filePath)) return fs.readFile(filePath, "utf8");
+  return (await readCompressedCodexSnapshot(filePath, maxOutputBytes)).lines.join("\n");
 }
 const MAX_DISCOVERY_INVENTORIES = 32;
 const DISCOVERY_INVENTORIES = new Map();
@@ -592,6 +591,7 @@ async function parseCodexRolloutFile(filePath, {
   endOffset = null,
   resumeState = null,
   captureResumeState = false,
+  captureBounds = false,
   captureContentHash = false,
   contentHashState = null,
   sourceHandle = null,
@@ -625,6 +625,8 @@ async function parseCodexRolloutFile(filePath, {
     if (!contentHasher) contentHasher = crypto.createHash("sha256");
   }
 
+  let observedThrough = isResuming ? resumeState.observedThrough || null : null;
+  let observedThroughMs = observedThrough ? Date.parse(observedThrough) : -Infinity;
   let sessionId = isResuming ? resumeState.sessionId || null : null;
   let cwd = isResuming ? resumeState.cwd || null : null;
   let model = isResuming ? resumeState.model || null : null;
@@ -1065,7 +1067,10 @@ async function parseCodexRolloutFile(filePath, {
     if (!usageRecord) noteLineAfterUsageRecord(usageRecordState, obj?.type === "compacted");
     const ts = typeof obj?.timestamp === "string" ? obj.timestamp : null;
     if (!ts) continue;
-    const inRequestedRange = isTimestampInRequestedDayRange(ts, { from, to, timeZoneContext });
+    if (captureBounds) {
+      const timestampMs = Date.parse(ts);
+      if (timestampMs > observedThroughMs) { observedThroughMs = timestampMs; observedThrough = ts; }
+    }
 
     if (obj.type === "session_meta") {
       const p = obj.payload || {};
@@ -1114,6 +1119,9 @@ async function parseCodexRolloutFile(filePath, {
       continue;
     }
 
+    const tokenCount = extractTokenCount(obj);
+    if (!usageRecord && !tokenCount) continue;
+    const inRequestedRange = isTimestampInRequestedDayRange(ts, { from, to, timeZoneContext });
     if (usageRecord) {
       const delta = normalizeUsage(usageRecord.usage);
       noteUsageRecord(
@@ -1133,7 +1141,6 @@ async function parseCodexRolloutFile(filePath, {
       continue;
     }
 
-    const tokenCount = extractTokenCount(obj);
     if (tokenCount) {
       const info = tokenCount.info;
       const lastUsage = info?.last_token_usage;
@@ -1204,6 +1211,7 @@ async function parseCodexRolloutFile(filePath, {
       byOutput: finalizeExecRows(byExecOutput),
     },
   };
+  if (captureBounds) result.observedThrough = observedThrough;
   if (captureResumeState && filePaths.length === 1) {
     result.resumeState = {
       sessionId,
@@ -1219,6 +1227,7 @@ async function parseCodexRolloutFile(filePath, {
       agentNickname,
       agentRole,
       sessionLineageCaptured,
+      ...(captureBounds ? {observedThrough} : {}),
       prevTotals: usageDeltaState.lastTotal,
       tokenUsageBaselines: snapshotUsageBaselines(usageDeltaState),
       pendingToolNames,
@@ -1375,14 +1384,15 @@ async function* readCodexObjectsFull(filePath, diagnostics, fileIndex, {
   // into lines. `readProgress` stays null so callers never persist a fake
   // byte cursor for them.
   if (typeof filePath === "string" && /\.jsonl\.zstd?$/i.test(filePath)) {
-    const text = await readCodexRolloutText(filePath);
+    const snapshot = await readCompressedCodexSnapshot(filePath);
+    // UTF-8 was validated by the snapshot decoder. Avoid joining, splitting,
+    // encoding and decoding gigabytes of archive strings a second time.
+    if (diagnostics) diagnostics.compressed_bytes_read = Number(diagnostics.compressed_bytes_read || 0) + snapshot.size;
     let lineIndex = 0;
-    const lines = text.split("\n");
-    for (let index = 0; index < lines.length; index += 1) {
-      const isLast = index + 1 >= lines.length;
-      if (isLast && lines[index] === "") continue;
-      const lineBuffer = Buffer.from(lines[index], "utf8");
-      const obj = parseCodexLine(lineBuffer, diagnostics);
+    for (const line of snapshot.lines) {
+      if (!line || line === "\r") continue;
+      let obj = null;
+      try { if (diagnostics) diagnostics.json_parse_calls += 1; obj = JSON.parse(line); } catch {}
       if (obj) {
         yield { obj, fileIndex, lineIndex };
         lineIndex += 1;

@@ -1,4 +1,5 @@
-import {execFileSync} from 'node:child_process';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import os from 'node:os';
 import {queryLocalCollector} from './service';
 export type LocalUsageRange = {from:string;to:string;tz?:string;since?:string};
@@ -7,6 +8,7 @@ export type LocalUsagePageData = {
   totals: Record<string,number|string>;
   sources: Array<Record<string,unknown>>;
   firstActivityDay?: string;
+  collectionState?: "loading" | "ready" | "error";
 };
 export type LocalUsageOverviewPeriod = "day" | "hour";
 export type LocalUsageOverviewData = LocalUsagePageData & {
@@ -21,19 +23,27 @@ export type LocalUsageTrendQuery = LocalUsageRange & {
 export type LocalUsageHeatmapQuery = {weeks?:number;tz?:string};
 export type LocalUsageProfile = {displayName:string;username:string;avatar:string|null};
 
-function localUsageProfile():LocalUsageProfile{
+const execFileAsync=promisify(execFile);
+let cachedProfile: {at:number;value:Promise<LocalUsageProfile>} | undefined;
+function localUsageProfile():Promise<LocalUsageProfile>{
+  if(cachedProfile&&Date.now()-cachedProfile.at<300000)return cachedProfile.value;
+  const value=readLocalUsageProfile();
+  cachedProfile={at:Date.now(),value};
+  return value;
+}
+async function readLocalUsageProfile():Promise<LocalUsageProfile>{
   let username='user';
   try{username=os.userInfo().username||process.env.USER||'user';}catch{username=process.env.USER||'user';}
   let displayName=username;
   let avatar:string|null=null;
   if(process.platform==='darwin'){
     try{
-      const raw=execFileSync('dscl',['.','-read',`/Users/${username}`,'RealName'],{encoding:'utf8',timeout:2000});
+      const {stdout:raw}=await execFileAsync('dscl',['.','-read',`/Users/${username}`,'RealName'],{encoding:'utf8',timeout:2000});
       const name=raw.replace(/^RealName:\s*/u,'').split('\n').map((line)=>line.trim()).filter(Boolean).at(-1);
       if(name)displayName=name;
     }catch{/* keep username */}
     try{
-      const raw=execFileSync('dscl',['.','-read',`/Users/${username}`,'JPEGPhoto'],{encoding:'utf8',timeout:2000,maxBuffer:6*1024*1024});
+      const {stdout:raw}=await execFileAsync('dscl',['.','-read',`/Users/${username}`,'JPEGPhoto'],{encoding:'utf8',timeout:2000,maxBuffer:6*1024*1024});
       const hex=raw.replace(/^JPEGPhoto:\s*/u,'').replace(/[^0-9a-fA-F]/g,'');
       if(hex.length>=8&&hex.length%2===0)avatar=`data:image/jpeg;base64,${Buffer.from(hex,'hex').toString('base64')}`;
     }catch{/* initials fallback in UI */}
@@ -98,15 +108,15 @@ export function rollingWindow(period:LocalUsagePeriod,tz:string,now:Date=new Dat
 export async function getLocalUsagePage(range:LocalUsageRange):Promise<LocalUsagePageData>{
   if(!range || (range.from!==''&&!validDay(range.from)) || !validDay(range.to) || range.from>range.to)throw new Error('Invalid usage date range');
   if(range.since!==undefined&&range.since!==''&&!Number.isFinite(Date.parse(range.since)))throw new Error('Invalid usage date range');
-  const query={from:range.from,to:range.to,tz:zone(range.tz),...(range.since?{since:range.since}:{})};
+  const query={from:range.from,to:range.to,tz:zone(range.tz),background:'1',...(range.since?{since:range.since}:{})};
   // Same collector and aggregation contract as the native menu. Gateway
   // request usage is deliberately not added to these local-session totals.
   const [summary,models,daily]=await Promise.all([
     queryLocalCollector('/functions/tokentracker-usage-summary',query),
     queryLocalCollector('/functions/tokentracker-usage-model-breakdown',query),
     queryLocalCollector('/functions/tokentracker-usage-daily',query)
-  ]) as [{totals:LocalUsagePageData['totals']},{sources:LocalUsagePageData['sources']},{data:Array<{day:string;total_tokens:number}>}];
-  return {totals:summary.totals,sources:models.sources,firstActivityDay:daily.data.find(row=>Number(row.total_tokens)>0)?.day};
+  ]) as [{totals:LocalUsagePageData['totals'];collectionState?:LocalUsagePageData['collectionState']},{sources:LocalUsagePageData['sources']},{data:Array<{day:string;total_tokens:number}>}];
+  return {totals:summary.totals,sources:models.sources,collectionState:summary.collectionState,firstActivityDay:daily.data.find(row=>Number(row.total_tokens)>0)?.day};
 }
 
 export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalUsageOverviewPeriod, filter?:{source?:string;model?:string}):Promise<LocalUsageOverviewData>{
@@ -135,15 +145,15 @@ export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalU
 // future-hour filter discard yesterday's tail, which is real in-window data.
 export async function getLocalUsageTrend(query:LocalUsageTrendQuery):Promise<Record<string,unknown>>{
   return queryLocalCollector('/functions/tokentracker-usage-trend', {
-    period: query.period, tz: zone(query.tz), from: query.from || '', to: query.to || ''
+    period: query.period, tz: zone(query.tz), background:'1', from: query.from || '', to: query.to || ''
   }) as Promise<Record<string,unknown>>;
 }
 
 export async function getLocalUsageHeatmap(query:LocalUsageHeatmapQuery={}):Promise<Record<string,unknown>>{
   const weeks=Number.isFinite(query.weeks)?Math.floor(Number(query.weeks)):52;
   if(weeks<1||weeks>104)throw new Error('Invalid heatmap range');
-  const heatmap=await queryLocalCollector('/functions/tokentracker-usage-heatmap',{weeks:String(weeks),tz:zone(query.tz)}) as Record<string,unknown>;
-  return {...heatmap,profile:localUsageProfile()};
+  const heatmap=await queryLocalCollector('/functions/tokentracker-usage-heatmap',{weeks:String(weeks),tz:zone(query.tz),background:'1'}) as Record<string,unknown>;
+  return {...heatmap,profile:await localUsageProfile()};
 }
 
 export async function getLocalUsageSessions(query:LocalUsageSessionsQuery={}):Promise<Record<string,unknown>>{

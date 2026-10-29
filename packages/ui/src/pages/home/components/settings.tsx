@@ -120,7 +120,7 @@ export function AppSettingsPage({
       initialPage={initialPage}
       onBackToProfile={onBackToProfile}
       renderPage={(activePage) => {
-        if (activePage === "data-sources") return <DataSourcesSettingsPage />;
+        if (activePage === "data-sources") return <DataSourcesSettingsPage configDir={appInfo.configDir} profiles={profiles} />;
         if (activePage === "general") {
           return (
             <GeneralSettingsPage
