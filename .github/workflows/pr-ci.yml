@@ -36,7 +36,7 @@ jobs:
       - run: npm run test:core
       - run: npm run test:ui
       - run: npx playwright install --with-deps chromium
-      - run: npx playwright test tests/e2e/overview-trend-tooltip.spec.ts tests/e2e/data-sources.spec.ts --project=chromium
+      - run: npx playwright test tests/e2e/overview-trend-tooltip.spec.ts tests/e2e/data-sources.spec.ts tests/e2e/statistics-loading.spec.ts --project=chromium
       - run: npm run test:architecture
       - run: npm run test:gateway-stream
   native:

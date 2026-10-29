@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatDateUTC } from "../lib/date-range";
 import { getLocalDayKey } from "../lib/timezone";
 
@@ -15,6 +15,8 @@ export function useTrendData({
   const [range, setRange] = useState(() => ({ from, to }));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [collecting, setCollecting] = useState(false);
+  const requestRevision = useRef(0);
   const mode = useMemo(() => {
     if (period === "day") return "hourly";
     if (period === "total" || period === "year") return "monthly";
@@ -22,6 +24,7 @@ export function useTrendData({
   }, [period]);
 
   const refresh = useCallback(async () => {
+    const revision = ++requestRevision.current;
     const api = typeof window !== "undefined" ? window.agentrouter : null;
     if (!api?.getLocalUsageTrend) {
       setRows([]);
@@ -41,6 +44,8 @@ export function useTrendData({
         months,
         tz,
       });
+      if (revision !== requestRevision.current) return;
+      setCollecting(response?.collectionState === "loading");
       const nextFrom = response?.from || response?.day || from || null;
       const nextTo = response?.to || response?.day || to || null;
       let nextRows = Array.isArray(response?.data) ? response.data : [];
@@ -63,22 +68,31 @@ export function useTrendData({
       setRows(nextRows);
       setRange({ from: nextFrom, to: nextTo });
     } catch (err) {
+      if (revision !== requestRevision.current) return;
+      setCollecting(false);
       setError(err instanceof Error ? err.message : String(err));
       setRows([]);
     } finally {
-      setLoading(false);
+      if (revision === requestRevision.current) setLoading(false);
     }
   }, [from, months, now, period, timeZone, to, tzOffsetMinutes, mode]);
 
   useEffect(() => {
     void refresh();
+    return () => { requestRevision.current++; };
   }, [refresh]);
+
+  useEffect(() => {
+    if (!collecting || loading) return;
+    const timer = setTimeout(() => void refresh(), 1500);
+    return () => clearTimeout(timer);
+  }, [collecting, loading, refresh]);
 
   return {
     rows,
     from: range.from || from,
     to: range.to || to,
-    loading,
+    loading: loading || collecting,
     error,
     refresh,
   };

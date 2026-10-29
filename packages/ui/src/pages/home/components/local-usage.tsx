@@ -48,6 +48,8 @@ export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_P
    return()=>{active=false};
  },[rangeKey,revision]);
  useEffect(()=>{const timer=setInterval(()=>setRevision(v=>v+1),60000);return()=>clearInterval(timer)},[]);
+ useEffect(()=>{if(data?.collectionState!=='loading')return;const timer=setTimeout(()=>setRevision(v=>v+1),1500);return()=>clearTimeout(timer)},[data]);
+ const updating=loading||data?.collectionState==='loading';
  const fleet=useMemo(()=>buildFleetData({sources:data?.sources??[]},{copyFn:copy}),[data,language]);
  const tokens=Number(data?.totals.billable_total_tokens??data?.totals.total_tokens??0);
  const display=formatTokenCount(tokens,{forceFull:full,locale:numberLocale});
@@ -58,7 +60,7 @@ export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_P
     summaryValue={display} summaryFullValue={formatTokenCount(tokens,{forceFull:true,locale:numberLocale})} onToggleSummaryFormat={()=>setFull(v=>!v)} summaryLabel={language==='zh'?'TOKEN 总数':'TOTAL TOKENS'}
     summaryCostValue={data?new Intl.NumberFormat(numberLocale,{style:'currency',currency:'USD'}).format(Number(data.totals.total_cost_usd??0)):''}
     onCostInfo={()=>setCostOpen(true)}
-    fleetData={fleet} onRefresh={()=>setRevision(v=>v+1)} loading={loading} summaryLoading={loading||(!data&&!error)} providersLoading={loading||(!data&&!error)} hasSummary={!!data}
+    fleetData={fleet} onRefresh={()=>setRevision(v=>v+1)} loading={updating} summaryLoading={updating||(!data&&!error)} providersLoading={updating||(!data&&!error)} hasSummary={!!data&&(tokens>0||!updating)}
     from={period==='total'?(data?.firstActivityDay??range.to):range.from} to={range.to} customFrom={custom.from} customTo={custom.to}
     customRangeOpen={calendarOpen} onCustomRangeOpenChange={setCalendarOpen} onCustomRangeApply={(from,to)=>setCustom({from,to})}/>
    <CostAnalysisModal isOpen={costOpen} onClose={()=>setCostOpen(false)} fleetData={fleet}/>

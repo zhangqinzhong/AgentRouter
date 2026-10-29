@@ -13,7 +13,7 @@ async function queryTrend(query,read,now=new Date()){
   const valid=s=>typeof s==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(s)&&Number.isFinite(Date.parse(s))&&new Date(s).toISOString().slice(0,10)===s;
   if(!valid(from)||!valid(to)||from>to)throw Error('Invalid usage date range');
  }
- const params={from,to,tz,...(since?{since}:{})};
+ const params={from,to,tz,...(since?{since}:{}),...(query.background==='1'?{background:'1'}:{})};
  const views={summary:'summary',models:'model-breakdown',projects:'project-usage-summary'};
  if(query.view){if(!views[query.view])throw Error('Invalid trend view');return read('/functions/tokentracker-'+(query.view==='projects'?'project-usage-summary':'usage-'+views[query.view]),params)}
  const grain=period==='day'?'hour':period==='total'||period==='year'?'month':'day';
@@ -31,6 +31,6 @@ async function queryTrend(query,read,now=new Date()){
   data.push(byKey.get(key)||{[grain]:key,total_tokens:0,billable_total_tokens:0});
   if(grain==='month')d.setUTCMonth(d.getUTCMonth()+1);else d=new Date(d.getTime()+(grain==='hour'?3600000:86400000));
  }
- return {from,to,period,generatedAt:now.toISOString(),data};
+ return {from,to,period,generatedAt:now.toISOString(),data,...(response.collectionState?{collectionState:response.collectionState}:{})};
 }
 module.exports={queryTrend};

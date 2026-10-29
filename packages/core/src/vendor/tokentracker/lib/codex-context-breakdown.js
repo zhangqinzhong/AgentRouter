@@ -11,6 +11,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const {readContextShard,writeContextShard} = require("./codex-context-cache");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -111,6 +112,7 @@ function mergeParsedSessionResults(previous, delta) {
   };
 
   return {
+    observedThrough: delta.observedThrough || previous.observedThrough || null,
     sessionId: delta.sessionId || previous.sessionId,
     cwd: delta.cwd || previous.cwd,
     model: delta.model || previous.model,
@@ -169,7 +171,7 @@ function buildDateRange({ period, date }) {
 const CACHE = new Map();
 const PARSED_GROUP_CACHE = new Map();
 const CACHE_TTL_MS = 60_000;
-const CACHE_SCHEMA_VERSION = "codex-context-v8-ar-upstream-models";
+const CACHE_SCHEMA_VERSION = "codex-context-v9-durable-aggregates";
 const MAX_PARSED_GROUP_CACHE_ENTRIES = 4096;
 const PREFIX_HASH_READ_BYTES = 1024 * 1024;
 
@@ -388,6 +390,7 @@ async function computeCodexContextBreakdown({
   exhaustive = false,
   nowMs = Date.now(),
   includeDiagnostics = false,
+  cacheDir = null,
 } = {}) {
   let fromKey = from;
   let toKey = to;
@@ -412,6 +415,7 @@ async function computeCodexContextBreakdown({
     opened_files: 0,
     parsed_files: 0,
     parse_cache_hits: 0,
+    disk_cache_hits: 0,
     incremental_parse_hits: 0,
     incremental_parse_fallbacks: 0,
     bytes_read: 0,
@@ -462,7 +466,16 @@ async function computeCodexContextBreakdown({
       ? parsedGroupCacheKey(entries, { from: fromKey, to: toKey, timeZoneContext })
       : null;
     const signature = parsedGroupSignature(entries);
-    const cachedGroup = parsedCacheKey ? PARSED_GROUP_CACHE.get(parsedCacheKey) : null;
+    let cachedGroup = parsedCacheKey ? PARSED_GROUP_CACHE.get(parsedCacheKey) : null;
+    const shardKey = parsedCacheKey ? parsedGroupCacheKey(entries, {from:fromKey,to:fromKey?toKey:null,timeZoneContext}) : null;
+    if (cacheDir && shardKey && cachedGroup?.signature !== signature) {
+      const saved = await readContextShard(cacheDir, shardKey, {signature,from:fromKey,to:toKey,timeZoneContext});
+      if (saved) {
+        cachedGroup = {signature,parsed:saved};
+        rememberParsedGroup(parsedCacheKey,cachedGroup);
+        diagnostics.disk_cache_hits += 1;
+      }
+    }
     let parsed = null;
     if (cachedGroup?.signature === signature) {
       // Cacheable groups are partitioned by rollout UUID, so their token event
@@ -493,6 +506,7 @@ async function computeCodexContextBreakdown({
             endOffset: singleEntry.stat.size,
             resumeState: cachedGroup.resumeState,
             captureResumeState: true,
+            captureBounds: true,
             captureContentHash: true,
             contentHashState: cachedGroup.contentHashState,
             sourceHandle: resumeHandle,
@@ -564,6 +578,7 @@ async function computeCodexContextBreakdown({
               seenTokenEvents: filePaths.length === 1 ? new Set() : seenTokenEvents,
               endOffset: freshEndOffset,
               captureResumeState: Boolean(singleEntry),
+              captureBounds: true,
               captureContentHash: appendHashEligible,
               sourceHandle: freshHandle,
             },
@@ -575,6 +590,9 @@ async function computeCodexContextBreakdown({
       }
 
       parsed = captured.parsed;
+      if (cacheDir && shardKey && entries.every(entry => {
+        try { return statIdentity(entry.filePath, fs.statSync(entry.filePath)) === statIdentity(entry.filePath, entry.stat); } catch { return false; }
+      })) await writeContextShard(cacheDir, shardKey, {signature,from:fromKey,to:toKey,parsed});
       if (parsedCacheKey) {
         rememberParsedGroup(parsedCacheKey, {
           signature,

@@ -235,6 +235,7 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
  const [error,setError]=useState('');
  const [loading,setLoading]=useState(true);
  const [revision,setRevision]=useState(0);
+ const [snapshotRevision,setSnapshotRevision]=useState(0);
  const [hoveredCell,setHoveredCell]=useState<BuiltCell>();
  const [tooltipPos,setTooltipPos]=useState({x:0,y:0,shiftX:0,flipY:false});
  const hideTimeoutRef=useRef<ReturnType<typeof setTimeout>|null>(null);
@@ -245,9 +246,19 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
  useEffect(()=>{let active=true;setLoading(true);setError('');
   const api=window.agentrouter;
   if(!api?.getLocalUsageHeatmap){setError(t('Local usage data is unavailable.'));setLoading(false);return;}
+  void api.getLocalUsageHeatmap({weeks:53,tz:timeZone}).then((data)=>{if(active)setHeatmap(data as HeatmapPayload)}).catch((e)=>{if(active)setError(e instanceof Error?e.message:String(e))}).finally(()=>{if(active)setLoading(false)});
+  return()=>{active=false};
+ },[revision,snapshotRevision,timeZone,t]);
+ useEffect(()=>{
+  if(heatmap?.collectionState!=='loading')return;
+  const timer=setTimeout(()=>setSnapshotRevision(v=>v+1),1500);
+  return()=>clearTimeout(timer);
+ },[heatmap]);
+ // Secondary transcript analyses are independent of the heatmap's snapshot polling.
+ useEffect(()=>{let active=true;setToolsLoading(true);
+  const api=window.agentrouter;if(!api)return;
   const to=new Date();
   const toDay=`${to.getFullYear()}-${String(to.getMonth()+1).padStart(2,'0')}-${String(to.getDate()).padStart(2,'0')}`;
-  void api.getLocalUsageHeatmap({weeks:53,tz:timeZone}).then((data)=>{if(active)setHeatmap(data as HeatmapPayload)}).catch((e)=>{if(active)setError(e instanceof Error?e.message:String(e))}).finally(()=>{if(active)setLoading(false)});
   if(api.getLocalUsagePage)void api.getLocalUsagePage({from:'',to:toDay,tz:timeZone}).then((page)=>{if(active)setLifetime(Number(page?.totals?.billable_total_tokens??page?.totals?.total_tokens??0)||0)}).catch(()=>{});
   if(api.getLocalUsageSessions)void api.getLocalUsageSessions({from:'',to:toDay,tz:timeZone,limit:2000}).then((result)=>{
    if(!active)return;
