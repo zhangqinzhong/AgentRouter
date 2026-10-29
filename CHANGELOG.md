@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.12.1 - 2026-10-29
+
+### Fixes
+- Show only manually added collection directories in Data sources, keep switches aligned, and preserve automatic collection of default and managed-profile directories.
+- Avoid forcing a full usage rebuild when enabling or disabling one directory; retain unavailable custom locations for removal.
+- Preserve displayed statistics while collection runs and prevent stale trend requests from replacing newer filters.
+
+### Performance
+- Cache verified Codex session aggregates across restarts and reuse unchanged historical sessions across midnight; reparse changed files and recover safely from corrupt caches.
+- Avoid redundant decoding of compressed Codex archives and unnecessary timezone conversion for non-usage records.
+- Isolate transcript analysis from ordinary usage queries, reuse unchanged aggregate files, and cache asynchronous macOS profile lookups.
+
 ## 1.12.0 - 2026-10-27
 
 ### Features
