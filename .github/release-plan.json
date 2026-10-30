@@ -1,5 +1,5 @@
 {
-  "baseVersion": "1.12.0",
-  "change": "patch",
-  "reason": "Fix slow local statistics loading and misleading collection-directory controls without changing supported sources or configuration contracts."
+  "baseVersion": "1.12.1",
+  "change": "minor",
+  "reason": "Add local Claude desktop subscription quota snapshots for isolated profiles without additional API requests."
 }

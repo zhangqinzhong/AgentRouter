@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.13.0-rc.1 - 2026-10-29
+
+### Features
+- Display Claude Official subscription quota in the menu bar and overview using account- and organization-matched local desktop snapshots.
+- Show snapshot age and leave unknown reset times unset; no additional Claude API requests or credential extraction.
+
 ## 1.12.1 - 2026-10-29
 
 ### Fixes
