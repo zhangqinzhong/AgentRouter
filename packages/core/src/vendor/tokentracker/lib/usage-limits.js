@@ -3837,6 +3837,9 @@ async function fetchUsageLimitsUncached({
     selected("codex") ? readCodexAuthBundle({ home, env }) : null,
   ]);
   const claudeToken = claudeOauth?.accessToken || null;
+  const desktopClaudeUsage = selected("claude") && !claudeToken
+    ? await require("./claude-desktop-usage").readClaudeDesktopUsage({home,nowMs}).catch(() => null)
+    : null;
   const claudeTokenExpiresAtMs = claudeOauth?.expiresAtMs ?? null;
   const claudePlanType = claudeSubscription?.planType || null;
 
@@ -4025,6 +4028,8 @@ async function fetchUsageLimitsUncached({
   let claude;
   if (!selected("claude")) {
     claude = { configured: false };
+  } else if (desktopClaudeUsage) {
+    claude = desktopClaudeUsage;
   } else if (!claudeToken) {
     // Claude Code blanks `accessToken`/`refreshToken` in place when its login expires
     // (macOS Keychain item and .credentials.json alike) instead of removing the entry,
@@ -4248,7 +4253,7 @@ async function fetchUsageLimitsUncached({
 
   const data = {
     fetched_at: new Date(nowMs).toISOString(),
-    claude: withPlanLabel(claude, claudePlanType, "Claude"),
+    claude: desktopClaudeUsage ? {...claude, plan_label:"Official"} : withPlanLabel(claude, claudePlanType, "Claude"),
     codex: withPlanLabel(codex, codex.plan_type, "Codex"),
     cursor: withPlanLabel(cursorLimits, cursorLimits.membership_type, "Cursor"),
     // Kimi's subType (TYPE_PURCHASE/TYPE_EVENT) is the credit *source*, not a plan

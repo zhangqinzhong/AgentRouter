@@ -50,7 +50,7 @@ export function localQuotaSnapshots(raw: unknown): ProviderAccountSnapshot[] {
       details:(Array.isArray(resets.credits)?resets.credits:[]).map((c,i)=>({id:String(i),label:`Reset ${i+1}`,effectiveAt:timestamp(record(c).granted_at),expiresAt:timestamp(record(c).expires_at),status:String(record(c).status || '')})) });
     if (!meters.length && !p.error) continue;
     const remaining = meters.filter(m=>m.unit==='%').map(m=>m.remaining ?? 100);
-    result.push({ provider: brand, displayName: p.plan_label ? `${brand}${key === "grokbot" ? " ·" : ""} ${p.plan_label}` : brand, localSource:key,
+    result.push({ provider: brand, displayName: p.source === 'claude_desktop_cache' ? 'Claude Official' : p.plan_label ? `${brand}${key === "grokbot" ? " ·" : ""} ${p.plan_label}` : brand, localSource:key,
       credentialId:'local-subscription', source:'standard', meters,
       status:p.error || p.stale ? 'error' : remaining.some(n=>n<=10) ? 'critical' : remaining.some(n=>n<=25) ? 'warning' : 'ok',
       message:typeof p.error==='string'?p.error:p.stale?'Showing saved quota.':undefined,
