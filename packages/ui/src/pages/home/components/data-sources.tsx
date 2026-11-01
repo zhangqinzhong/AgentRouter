@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronRight, FolderOpen, LoaderCircle, Plus, RefreshCw, Trash2 } from "@/components/ui/icons";
+import { ChevronRight, FolderOpen, Plus, RefreshCw, Trash2 } from "@/components/ui/icons";
 import type { ProfileConfig } from "@agentrouter/core/contracts/app";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,6 +7,7 @@ import { Switch } from "@/components/ui/switch";
 import { SelectControl } from "../shared/controls";
 import { useAppText } from "../shared/i18n";
 import { ProviderIcon } from "@/vendor/tokentracker/ui/dashboard/components/ProviderIcon";
+import { Spinner } from "@/components/ui/spinner";
 
 type Source = { agent: string; name: string; paths: string[]; enabled: boolean; available: boolean };
 type Snapshot = { sources: Source[]; locations: Array<[string, string]> };
@@ -132,7 +133,7 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
     <header className="flex flex-wrap items-start justify-between gap-3">
       <div><h2 className="text-base font-semibold tracking-tight">{t("Data sources")}</h2><p className="mt-1.5 text-xs text-muted-foreground">{t("Custom collection directories")}</p></div>
       <div className="flex items-center gap-1.5">
-        <Button type="button" variant="ghost" size="iconSm" aria-label={t(collecting ? "Updating local usage…" : "Refresh usage")} title={t("Refresh usage")} disabled={collecting || busy} onClick={() => { setError(""); void collect(); }}>{collecting ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}</Button>
+        <Button type="button" variant="ghost" size="iconSm" aria-label={t(collecting ? "Updating local usage…" : "Refresh usage")} title={t("Refresh usage")} disabled={collecting || busy} onClick={() => { setError(""); void collect(); }}>{collecting ? <Spinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}</Button>
         <Button type="button" variant="outline" size="sm" aria-expanded={adding} onClick={() => setAdding(value => !value)}><Plus className="h-3.5 w-3.5" />{t("Add directory")}</Button>
       </div>
     </header>
@@ -148,7 +149,7 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
       <div className="flex justify-end gap-2"><Button type="button" size="sm" variant="ghost" onClick={() => setAdding(false)}>{t("Cancel")}</Button><Button type="submit" size="sm" disabled={busy || collecting || !directory.trim()}>{t("Add")}</Button></div>
     </form>}
     {error && <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{error}</div>}
-    {!snapshot ? <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><LoaderCircle className="h-4 w-4 animate-spin" />{t("Loading…")}</div> :
+    {!snapshot ? <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Spinner />{t("Loading…")}</div> :
       !groups.length ? <p className="rounded-xl border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">{t("No custom directories added")}</p> : clients.map(client => {
         const locations = groups.filter(group => group.agent === client.agent);
         if (!locations.length) return null;

@@ -2,12 +2,13 @@ import {
   AddProfileDraft, AddProviderDraft, AppConfig, Button, Check, ChevronLeft,
   ChevronRight, cn, findProviderPreset, GatewayProviderProbeResult, GatewayStatus, Gauge, getNextOnboardingStep,
   isOnboardingProfileReady, isOnboardingProviderReady, Layers3, LucideIcon, mergeProviderModelLists, motion, motionEase,
-  LoaderCircle, onboardingMascotSpriteUrl, OnboardingReadinessOptions, OnboardingStepId, onboardingStepOrder, type ProfileAgentOption, providerDraftHasReadyCredentialPool, ProviderConnectivityCheckReport, reducedMotionTransition, splitLines, useAppText, useEffect, useReducedMotion,
+  onboardingMascotSpriteUrl, OnboardingReadinessOptions, OnboardingStepId, onboardingStepOrder, type ProfileAgentOption, providerDraftHasReadyCredentialPool, ProviderConnectivityCheckReport, reducedMotionTransition, splitLines, useAppText, useEffect, useReducedMotion,
   useState,
   UserRound, X
 } from "../shared/index";
 import { AddProviderForm, ProviderConnectivityCheckDialog, providerSetupStepIds, type ProviderSetupStepId } from "./providers";
 import { AddProfileForm } from "./profiles";
+import { Spinner } from "@/components/ui/spinner";
 
 type OnboardingMascotTone = "cyan" | "orange" | "violet";
 
@@ -323,7 +324,7 @@ export function OnboardingView({
 
               <div className="mt-5 flex shrink-0 items-center justify-end gap-3 border-t border-border/60 pt-4 max-[640px]:items-stretch">
                 <Button disabled={nextDisabled} onClick={() => void goToNextStep()} type="button">
-                  {providerSubmitLoading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : activeStep === "enter" ? <Check className="h-4 w-4" /> : null}
+                  {providerSubmitLoading ? <Spinner /> : activeStep === "enter" ? <Check className="h-4 w-4" /> : null}
                   {providerSubmitLoading ? t("Loading") : activeStep === "enter" ? t("Let's start") : t("Next step")}
                   {!providerSubmitLoading && activeStep !== "enter" ? <ChevronRight className="h-4 w-4" /> : null}
                 </Button>

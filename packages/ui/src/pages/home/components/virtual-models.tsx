@@ -5,7 +5,7 @@ import {
   clampNumber, cn, createMcpServerDraftFromConfig, createRouteModelOptions, defaultFusionWebSearchProvider, Dialog, DialogBody, DialogContent, DialogFooter,
   DialogHeader, DialogTitle, ExtensionInstallDraft, Field, FolderOpen, formatPluginDependencies,
   createFusionWebSearchEnvRows, createKeyValueDraftRow, customFusionToolName, fusionToolExecutionFlagsFromTools, fusionToolOptions,
-  fusionWebSearchProviderOptions, GatewayMcpServerConfig, GatewayMcpToolInfo, GatewayProviderConfig, Input, isBuiltInFusionToolName, isFusionImageGenerationToolName, isFusionVideoGenerationToolName, isFusionVisionToolName, isFusionWebSearchToolName, KeyValueRowsControl, LoaderCircle,
+  fusionWebSearchProviderOptions, GatewayMcpServerConfig, GatewayMcpToolInfo, GatewayProviderConfig, Input, isBuiltInFusionToolName, isFusionImageGenerationToolName, isFusionVideoGenerationToolName, isFusionVisionToolName, isFusionWebSearchToolName, KeyValueRowsControl, 
   mcpServerConfigFromDraft, mcpServerEndpointSummary, mcpServerTransportOptions,
   mcpStdioMessageModeOptions, normalizeFusionToolName, Pencil,
   PluginMarketplaceEntry, pluginSurfaceSummary, Plus, PopoverContent, RouteTargetControl, Search, selectedFusionToolNames,
@@ -17,6 +17,7 @@ import {
 import { PopoverPortal } from "@/components/ui/popover";
 import { createGrokMediaModelOptions } from "@agentrouter/core/media/models";
 import { ROUTER_FALLBACK_MAX_RETRY_COUNT } from "@agentrouter/core/contracts/app";
+import { Spinner } from "@/components/ui/spinner";
 
 const useClientLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
@@ -1219,7 +1220,7 @@ function FusionToolSelectControl({
                           title={mcpServerEndpointSummary(server)}
                           type="button"
                         >
-                          {state?.loading ? <LoaderCircle className="h-3 w-3 animate-spin" /> : t("Discover tools")}
+                          {state?.loading ? <Spinner className="h-3 w-3" /> : t("Discover tools")}
                         </button>
                       </div>
                       <div className="ml-3 border-l border-border/70 pl-2">
@@ -1254,7 +1255,7 @@ function FusionToolSelectControl({
                         })}
                         {state?.loading && tools.length === 0 ? (
                           <div className="flex items-center gap-2 px-2 py-2 text-label text-muted-foreground">
-                            <LoaderCircle className="h-3 w-3 animate-spin" />
+                            <Spinner className="h-3 w-3" />
                             <span>{t("Discover tools")}</span>
                           </div>
                         ) : null}

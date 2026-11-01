@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { FolderPlus, LoaderCircle } from "@/components/ui/icons";
+import { FolderPlus } from "@/components/ui/icons";
 import { Button } from "@/components/ui/button";
 import type { MemoryProjectInstallation, MemoryProjectPlan, MemoryProjectSetup, MemoryRequest } from "@agentrouter/core/contracts/memory";
 import { useAppText } from "../shared/i18n";
+import { Spinner } from "@/components/ui/spinner";
 
 const control = "mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-body";
 async function call<T>(request: MemoryRequest): Promise<T> { if (!window.agentrouter?.memory) throw new Error("Memory service is unavailable."); return await window.agentrouter.memory(request) as T; }
@@ -41,7 +42,7 @@ export function MemoryProjectSetupPanel() {
         <label className="text-xs text-muted-foreground">{t("Project name")}<input aria-label={t("Project name")} className={control} value={setup.project} onChange={(e) => update("project", e.target.value)} /></label>
         <label className="text-xs text-muted-foreground">{t("Instruction format")}<select className={control} value={setup.family} onChange={(e) => update("family", e.target.value)}><option value="agents">Codex / ZCode / OpenCode / Cursor</option><option value="claude-code">Claude Code</option><option value="grok">Grok</option><option value="devin">Devin</option></select></label>
       </div>
-      <Button size="sm" variant="outline" disabled={busy || !setup.directory.trim() || !setup.workspace.trim() || !setup.project.trim()} onClick={() => void preview()}>{busy && <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />}{t("Preview project connection")}</Button>
+      <Button size="sm" variant="outline" disabled={busy || !setup.directory.trim() || !setup.workspace.trim() || !setup.project.trim()} onClick={() => void preview()}>{busy && <Spinner className="mr-2" />}{t("Preview project connection")}</Button>
     </fieldset>
     {error && <p role="alert" className="mt-3 break-words text-sm text-destructive">{error}</p>}
     {notice && <p role="status" className="mt-3 text-sm text-emerald-600">{notice}</p>}

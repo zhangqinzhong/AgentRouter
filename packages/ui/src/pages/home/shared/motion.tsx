@@ -5,8 +5,9 @@ import { cn } from "@/lib/utils";
 import type { ViewId } from "./types";
 import { viewUsesInternalScroll } from "./providers";
 
-export const motionEase = [0.22, 1, 0.36, 1] as const;
-export const reducedMotionTransition = { duration: 0.12, ease: "easeOut" } as const;
+import { motionEase, reducedMotionTransition } from "@/lib/motion";
+
+export { motionEase, reducedMotionTransition };
 export const pageSpringTransition = { damping: 34, mass: 0.78, stiffness: 420, type: "spring" } as const;
 export const listSpringTransition = { damping: 32, mass: 0.62, stiffness: 500, type: "spring" } as const;
 export const disclosureSpringTransition = { damping: 36, mass: 0.7, stiffness: 480, type: "spring" } as const;

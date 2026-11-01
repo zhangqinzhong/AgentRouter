@@ -1,6 +1,7 @@
 import { createContext, useContext } from "react";
 import { useResolvedAppLanguage } from "../../shared/i18n";
 import type { ReactNode } from "react";
+import { EmptyState } from "@/components/ui/empty-state";
 export const card =
   "min-w-0 rounded-2xl border border-border/70 bg-card p-5 shadow-sm";
 export const control =
@@ -101,9 +102,7 @@ export function Segments<T extends string>({
 export function Empty() {
   const m = useM();
   return (
-    <div className="flex min-h-32 items-center justify-center text-sm text-muted-foreground">
-      {m("该时段暂无请求", "No requests in this period")}
-    </div>
+    <EmptyState>{m("该时段暂无请求", "No requests in this period")}</EmptyState>
   );
 }
 

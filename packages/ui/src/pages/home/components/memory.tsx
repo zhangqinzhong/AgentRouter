@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { BrainCircuit, ChevronLeft, FileText, LoaderCircle, Play, Plus, RefreshCw, Search, Square, Terminal } from "@/components/ui/icons";
+import { BrainCircuit, ChevronLeft, FileText, Play, Plus, RefreshCw, Search, Square, Terminal } from "@/components/ui/icons";
 import { MemoryModelSettingsPanel } from "./memory-model-settings";
 import { MemoryProjectSetupPanel } from "./memory-project-setup";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import mimoIcon from "@/assets/provider-icons/xiaomi-mimo.png";
 import { useAppText } from "../shared/i18n";
 import { documentPageClassName, PageHeader } from "./page-primitives";
 import { memoryPreviewLines } from "./memory-preview";
+import { Spinner } from "@/components/ui/spinner";
 
 type Tab = "library" | "search" | "sessions" | "handoffs" | "clients" | "maintenance" | "settings";
 const tabs: Array<[Tab, string]> = [["library", "Project memory"], ["clients", "Clients"], ["settings", "Settings"]];
@@ -67,7 +68,7 @@ function MemoryClientTargetRow({ client, target, kind, busy, preview, previewErr
           <div className={`mt-1 text-label ${configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>{t(configured ? "Configured · reload client" : "Not configured or changed")}</div>
           <code className="mt-1 block break-all text-2xs text-muted-foreground">{file}</code>
         </div>
-        <Button size="sm" variant={open ? "secondary" : "ghost"} aria-expanded={open} disabled={!!busy && !open} onClick={() => open ? onClose() : onAction("preview")}>{busy === `preview:${row}` && <LoaderCircle className="mr-1 h-3 w-3 animate-spin" />}{t(open ? "Collapse" : "Preview")}</Button>
+        <Button size="sm" variant={open ? "secondary" : "ghost"} aria-expanded={open} disabled={!!busy && !open} onClick={() => open ? onClose() : onAction("preview")}>{busy === `preview:${row}` && <Spinner className="mr-1 h-3 w-3" />}{t(open ? "Collapse" : "Preview")}</Button>
         <Button size="sm" variant="outline" disabled={!!busy} onClick={() => onAction(configured ? "remove" : "install")}>{t(configured ? "Disconnect" : "Connect")}</Button>
       </div>
       {open ? <div ref={previewRef} className="mt-2 max-h-80 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-label leading-5">{memoryPreviewLines(preview?.before || "", preview?.text || "").map((line, index) => <div key={index} className={line.added ? "whitespace-pre text-red-600 dark:text-red-400" : "whitespace-pre text-foreground"}>{line.text || " "}</div>)}</div> : null}
@@ -228,14 +229,14 @@ export function MemoryView() {
     {notice && <div role="status" className="mb-4 border-l-2 border-emerald-500 pl-3 text-sm">{notice}</div>}
     {!running && tab !== "settings" ? <><MemoryEmpty unavailable={status?.state === "unavailable"} /><div className="mb-6 flex justify-center">      <Button size="sm" variant={running ? "outline" : "default"} disabled={!!busy || status?.state === "unavailable"} onClick={() => void perform("service", async () => {
         setStatus(await call<MemoryStatus>({ action: running ? "stop" : "start" })); await refresh();
-      })}>{busy === "service" ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : running ? <Square className="mr-2 h-3 w-3" /> : <Play className="mr-2 h-3 w-3" />}{t(running ? "Stop memory" : "Start memory")}</Button></div></> : null}
+      })}>{busy === "service" ? <Spinner className="mr-2" /> : running ? <Square className="mr-2 h-3 w-3" /> : <Play className="mr-2 h-3 w-3" />}{t(running ? "Stop memory" : "Start memory")}</Button></div></> : null}
     {running && ["library", "search", "sessions", "handoffs", "maintenance"].includes(tab) && <div className="mb-5 flex flex-wrap items-center gap-3">
       <select className={`${control} max-w-full min-w-48`} aria-label={t("Project")} value={keyOf(scope)} onChange={(e) => {
         const selected = projects.find((p) => keyOf(scopeOf(p)) === e.target.value);
         setScope(selected ? scopeOf(selected) : undefined);
       }}><option value="">{t("Select project")}</option>{projects.map((p) => <option key={keyOf(scopeOf(p))} value={keyOf(scopeOf(p))}>{projectLabel(p.workspace_name, p.project_name)}</option>)}</select>
       {tab === "library" && <Button size="sm" variant="outline" onClick={() => edit()}><Plus className="mr-1 h-4 w-4" />{t("New memory")}</Button>}
-      {loading && <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" />}
+      {loading && <Spinner className="text-muted-foreground" />}
     </div>}
 
     {running && inProject && <>
@@ -326,7 +327,7 @@ export function MemoryView() {
     {tab === "settings" && status && <section className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-sm font-medium">{t("Memory service")}</h2><p className="mt-1 break-all text-xs text-muted-foreground">{t("Data directory")}: {status.dataDir}</p></div>      <Button size="sm" variant={running ? "outline" : "default"} disabled={!!busy || status?.state === "unavailable"} onClick={() => void perform("service", async () => {
         setStatus(await call<MemoryStatus>({ action: running ? "stop" : "start" })); await refresh();
-      })}>{busy === "service" ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : running ? <Square className="mr-2 h-3 w-3" /> : <Play className="mr-2 h-3 w-3" />}{t(running ? "Stop memory" : "Start memory")}</Button></div>
+      })}>{busy === "service" ? <Spinner className="mr-2" /> : running ? <Square className="mr-2 h-3 w-3" /> : <Play className="mr-2 h-3 w-3" />}{t(running ? "Stop memory" : "Start memory")}</Button></div>
       <div className="space-y-3 border-b border-border/70 pb-5">
         <label className="flex items-center gap-2 text-sm"><Checkbox checked={status.settings.autoStart} disabled={!!busy} onCheckedChange={(autoStart) => void perform("settings", async () => setStatus(await call<MemoryStatus>({ action: "settings", settings: { ...status.settings, autoStart } })))} />{t("Start memory with AgentRouter")}</label>
         <label className="flex items-center gap-2 text-sm"><Checkbox checked={status.settings.semanticSearch} disabled={!!busy || running} onCheckedChange={(semanticSearch) => {
@@ -431,7 +432,7 @@ export function MemoryToolForm({ tool, scope, busy, onRun }: { tool: MemoryTool;
       </label>;
     })}</div>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    <Button size="sm" disabled={busy} type="submit">{busy && <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />}{t("Run operation")}</Button>
+    <Button size="sm" disabled={busy} type="submit">{busy && <Spinner className="mr-2" />}{t("Run operation")}</Button>
   </form>;
 }
 

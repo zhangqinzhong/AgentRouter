@@ -8,7 +8,7 @@ import {
   createKeyValueDraftRow,
   createRoutingRuleDraft, createRoutingRuleDraftFromRule,
   cn, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader,
-  DialogTitle, Field, GatewayProviderConfig, Info, Input, KeyValueRowsControl, LoaderCircle, motion,
+  DialogTitle, Field, GatewayProviderConfig, Info, Input, KeyValueRowsControl, motion,
   normalizeProfileScope, normalizeProfileSurface, Pencil, Plus, PopoverContent,
   profileAgentLabel, profileAgentOptions, ProfileConfig, type ProfileAgentOption, profileModelProviderOptions, profileOpenSurfaces, profileScopeLabel, profileScopeOptions, profileSummaryItems, profileSurfaceLabel, profileSurfaceOptions,
   Play, Power, RefreshCw, Search, Select, SelectControl, Settings, Terminal, Toggle, translateOptions, Trash2, useAppErrorText, useAppText, useLayoutEffect, type KeyValueDraftRow, type ProfileOpenSurface, type ProfileRuntimeStatus, type ReactDragEvent, type ReactNode, type VirtualModelProfileConfig,
@@ -20,6 +20,7 @@ import { PopoverPortal } from "@/components/ui/popover";
 import { Tooltip } from "@/components/ui/tooltip";
 import { ModelMultiSelector, ModelSelector } from "./model-selector";
 import { AddRoutingRuleDialog } from "./routing";
+import { Spinner } from "@/components/ui/spinner";
 
 const useClientLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
@@ -211,7 +212,7 @@ export function ProfileView({
                               iconKey={cliBusy ? "busy" : "terminal"}
                             >
                               {cliBusy ? (
-                                <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                                <Spinner className="h-3.5 w-3.5" />
                               ) : (
                                 <Terminal className="h-3.5 w-3.5" />
                               )}
@@ -246,7 +247,7 @@ export function ProfileView({
                               }
                             >
                               {appBusy ? (
-                                <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                                <Spinner className="h-3.5 w-3.5" />
                               ) : appRunning ? (
                                 <Power className="h-3.5 w-3.5" />
                               ) : (
@@ -465,7 +466,7 @@ export function ProfileOpenDialog({
               {mode === "choose" && surfaces.includes("app") ? (
                 <Button className="shrink-0" disabled={Boolean(busy)} onClick={appRunning ? onStopApp : onChooseApp} size="sm" type="button" variant="outline">
 	                  <AnimatedIconSwap iconKey={busy === "app" ? "busy" : appRunning ? "stop" : "play"}>
-	                    {busy === "app" ? <LoaderCircle className="h-4 w-4 animate-spin" /> : appRunning ? <Power className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+	                    {busy === "app" ? <Spinner /> : appRunning ? <Power className="h-4 w-4" /> : <Play className="h-4 w-4" />}
 	                  </AnimatedIconSwap>
                   {t(appActionLabel)}
                 </Button>
@@ -2302,7 +2303,7 @@ export function AddProfileDialog({
       <Button disabled={!canSubmit || submitting} onClick={() => void onSubmit()} type="button">
         {submitting || mode === "add" ? (
           <AnimatedIconSwap iconKey={submitting ? "submitting" : "add"}>
-            {submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+            {submitting ? <Spinner /> : <Plus className="h-4 w-4" />}
           </AnimatedIconSwap>
         ) : null}
         {mode === "edit" ? t("Save") : t("Add")}

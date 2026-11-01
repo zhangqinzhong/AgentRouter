@@ -9,6 +9,7 @@ import { PeriodRangeTabs } from "@/vendor/tokentracker/ui/dashboard/components/P
 import { ProviderAccountsSection } from "./overview-accounts";
 import { OverviewBreakdowns } from "./overview-breakdown";
 import { UsageTrendSection } from "./overview-trend";
+import { Spinner } from "@/components/ui/spinner";
 
 export type OverviewUsageFilters = {
   modelFilter: string;
@@ -319,7 +320,7 @@ export function OverviewStatisticsResetDialog({
             {t("Cancel")}
           </Button>
           <Button disabled={busy} onClick={onConfirm} type="button" variant="destructive">
-            {busy ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+            {busy ? <Spinner /> : <Trash2 className="h-4 w-4" />}
             {busy ? t("Resetting") : t("Reset")}
           </Button>
         </DialogFooter>

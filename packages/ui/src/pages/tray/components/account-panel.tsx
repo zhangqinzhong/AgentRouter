@@ -1,9 +1,10 @@
 import {
   accountMetersForDisplay, accountProgressClass, accountProgressColor, accountSnapshotKey, accountSnapshotLabel, compareAccountSnapshots, formatAccountMeterTitle, formatAccountMeterValue,
-  LoaderCircle, meterProgress, meterRemainingRatio, meterValidityProgress, ProviderAccountMeter, ProviderAccountSnapshot, RefreshCw, TrayComponentVariants,
+  meterProgress, meterRemainingRatio, meterValidityProgress, ProviderAccountMeter, ProviderAccountSnapshot, RefreshCw, TrayComponentVariants,
   useTrayText
 } from "../shared";
 import { RadialMetric } from "./widgets";
+import { Spinner } from "@/components/ui/spinner";
 
 export function AccountSummaryPanel({
   accountProviders,
@@ -52,7 +53,7 @@ export function AccountSummaryPanel({
           title={t("Refresh")}
           type="button"
         >
-          {refreshing ? <LoaderCircle className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+          {refreshing ? <Spinner className="h-3 w-3" /> : <RefreshCw className="h-3 w-3" />}
         </button>
       </div>
       <div className={selectedSnapshots.length > 1 ? "space-y-2" : ""}>

@@ -8,7 +8,7 @@ import {
   customProviderPresetId, defaultProviderAccountConfigForPreset, Dialog, DialogBody, DialogContent, DialogFooter,
   DialogHeader, DialogTitle, ExternalLink, Eye, EyeOff, Field, findProviderPreset, formatProviderAccountMeterValue, GatewayProviderConfig,
   GatewayProviderProbeResult, getProviderPresets, Globe, inferProviderNameFromBaseUrl, Info, Input, KeyRound, KeyValueRowsControl, Label,
-  Layers3, LoaderCircle, localAgentProviderIconUrls, mergeProviderModelLists, modelCatalogItemMatchesQuery,
+  Layers3, localAgentProviderIconUrls, mergeProviderModelLists, modelCatalogItemMatchesQuery,
   Pencil, Plus, PopoverContent, primaryProviderAccountMeter, primaryProviderPresetEndpoint,
   providerAccountConnectorApiKeySafetyIssue, providerAccountConnectorExample, ProviderAccountDraftMode, providerAccountModeOptions, ProviderAccountSnapshot,
   providerAccountConnectorsTextWithNewApiUserBalanceTemplate, providerAccountSnapshotCredentialLabel, providerAccountSnapshotLabel, ProviderAccountTestPath,
@@ -25,6 +25,7 @@ import { Tooltip, TooltipPortal } from "@/components/ui/tooltip";
 import { providerUrlWithDefaultScheme } from "@agentrouter/core/providers/url";
 import type { ChromeLoginImportJob, LocalAgentProviderCandidate, OpenRouterProviderCatalogItem, OpenRouterProviderCatalogRequest, ProviderAccountHttpJsonConnectorConfig, ProviderAccountWebContentJsonConnectorConfig } from "@agentrouter/core/contracts/app";
 import type { ReactNode } from "react";
+import { Spinner } from "@/components/ui/spinner";
 
 const useClientLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 const emptyProviderPlugins: unknown[] = [];
@@ -823,7 +824,7 @@ export function ProviderDeepLinkDialog({
                   <ProviderPresetIcon className="h-10 w-10 rounded-md" iconUrl={providerIconUrl} preset={providerPreset} />
                   {iconLoading ? (
                     <span className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full border border-border bg-background">
-                      <LoaderCircle className="h-2.5 w-2.5 animate-spin text-muted-foreground" />
+                      <Spinner className="h-2.5 w-2.5 text-muted-foreground" />
                     </span>
                   ) : null}
                 </div>
@@ -910,7 +911,7 @@ export function ProviderDeepLinkDialog({
           {provider || manifest ? (
             <Button disabled={actionLoading} onClick={() => void onSubmit()} type="button">
               <AnimatedIconSwap iconKey={actionLoading ? "busy" : "plus"}>
-                {actionLoading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                {actionLoading ? <Spinner /> : <Plus className="h-4 w-4" />}
               </AnimatedIconSwap>
               {actionLoading ? t("Loading") : provider ? t("Import") : t("Fetch manifest")}
             </Button>
@@ -1479,7 +1480,7 @@ function LocalAgentProviderImportPanel({
           <div className="mt-0.5 text-caption leading-5 text-muted-foreground">{t("AgentRouter scanned this computer for local Claude Code, Codex, Grok CLI, Kimi CLI, OpenCode CLI, and ZCode providers. Click Import to add one as a gateway provider.")}</div>
         </div>
         <Button aria-label={t("Scan local providers again")} disabled={loading || Boolean(importingId)} onClick={() => setScanAttempt((value) => value + 1)} size="sm" variant="outline">
-          {loading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          {loading ? <Spinner /> : <RefreshCw className="h-4 w-4" />}
           {t("Scan again")}
         </Button>
       </div>
@@ -1525,7 +1526,7 @@ function LocalAgentProviderImportPanel({
                   variant={candidate.importable ? "default" : "outline"}
                 >
                   <AnimatedIconSwap iconKey={importing ? "importing" : "import"}>
-                    {importing ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+                    {importing ? <Spinner className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
                   </AnimatedIconSwap>
                   {t("Import")}
                 </Button>
@@ -1816,7 +1817,7 @@ function ProviderConnectionStatusPanel({
               variant="outline"
             >
               <AnimatedIconSwap iconKey={connectivityLoading ? "checking" : "check"}>
-                {connectivityLoading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+                {connectivityLoading ? <Spinner className="h-3.5 w-3.5" /> : <ShieldCheck className="h-3.5 w-3.5" />}
               </AnimatedIconSwap>
               {t("Check Connection")}
             </Button>
@@ -1857,7 +1858,7 @@ function ProviderConnectionStatusRow({
         state === "warning" && "bg-amber-500/10 text-amber-700 dark:text-amber-300",
         state === "pending" && "bg-muted text-muted-foreground"
       )}>
-        {loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : state === "success" ? <Check className="h-3.5 w-3.5" /> : <Info className="h-3.5 w-3.5" />}
+        {loading ? <Spinner className="h-3.5 w-3.5" /> : state === "success" ? <Check className="h-3.5 w-3.5" /> : <Info className="h-3.5 w-3.5" />}
       </span>
       <div className="min-w-0 flex-1">
         <div className="truncate text-caption font-semibold text-foreground">{title}</div>
@@ -2297,7 +2298,7 @@ export function AddProviderForm({
                 <Input value={draft.baseUrl} onChange={(event) => onChange({ baseUrl: event.target.value, icon: "" }, true)} />
                 {customEndpoint ? (
                   <div className="flex min-h-4 items-center gap-1.5 text-caption leading-5 text-muted-foreground">
-                    {iconDetecting ? <LoaderCircle className="h-3 w-3 shrink-0 animate-spin" /> : null}
+                    {iconDetecting ? <Spinner className="h-3 w-3 shrink-0" /> : null}
                     <span className="min-w-0">
                       {iconDetecting
                         ? t("Detecting icon")
@@ -3129,7 +3130,7 @@ function ProviderUsageSettings({
                         {t("Open login browser")}
                       </Button>
                       <Button disabled={chromeImportLoading} size="sm" type="button" variant="outline" onClick={() => void startChromeImportFromBrowserConfig()}>
-                        {chromeImportLoading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
+                        {chromeImportLoading ? <Spinner className="h-3.5 w-3.5" /> : <KeyRound className="h-3.5 w-3.5" />}
                         {t("Import from Chrome")}
                       </Button>
                     </div>
@@ -3248,7 +3249,7 @@ function ProviderUsageSettings({
               <div className="sm:col-span-2 flex flex-wrap items-center gap-2">
                 <Button disabled={testLoading} onClick={() => void testUsageRequest()} size="sm" type="button" variant="outline">
                   <AnimatedIconSwap iconKey={testLoading ? "testing" : "check"}>
-                    {testLoading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+                    {testLoading ? <Spinner className="h-3.5 w-3.5" /> : <ShieldCheck className="h-3.5 w-3.5" />}
                   </AnimatedIconSwap>
                   {t(draft.accountMode === "browser" ? "Test browser request" : "Test usage request")}
                 </Button>
@@ -3298,7 +3299,7 @@ function ProviderUsageSettings({
               <div className="flex flex-wrap items-center gap-2">
                 <Button disabled={testLoading} onClick={() => void testUsageRequest()} size="sm" type="button" variant="outline">
                   <AnimatedIconSwap iconKey={testLoading ? "testing" : "check"}>
-                    {testLoading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+                    {testLoading ? <Spinner className="h-3.5 w-3.5" /> : <ShieldCheck className="h-3.5 w-3.5" />}
                   </AnimatedIconSwap>
                   {t("Test first JSON connector")}
                 </Button>
@@ -3631,7 +3632,7 @@ export function AddProviderDialog({
         ) : (
           <Button disabled={submitDisabled} onClick={() => void submit()} type="button">
             <AnimatedIconSwap iconKey={submitLoading ? "loading" : finalWizardSubmit ? "done" : mode}>
-              {submitLoading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : mode === "edit" || finalWizardSubmit ? <Check className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+              {submitLoading ? <Spinner /> : mode === "edit" || finalWizardSubmit ? <Check className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
             </AnimatedIconSwap>
             {submitLoading ? t("Loading") : submitLabel ?? (finalWizardSubmit ? t("Done") : mode === "edit" ? t("Save") : t("Add"))}
           </Button>
@@ -3813,7 +3814,7 @@ export function ProviderConnectivityCheckDialog({
           </Button>
           <Button disabled={running || selection.length === 0} onClick={() => void confirmCheck()} type="button">
             <AnimatedIconSwap iconKey={running ? "checking" : "start"}>
-              {running ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+              {running ? <Spinner /> : <ShieldCheck className="h-4 w-4" />}
             </AnimatedIconSwap>
             {t("Start check")}
           </Button>
@@ -4326,7 +4327,7 @@ function OpenRouterProviderBlacklistSelect({
           type="button"
         >
           <span className="min-w-0 flex-1 truncate">{label}</span>
-          {loading ? <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" /> : null}
+          {loading ? <Spinner className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
           <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} />
         </button>
         <PopoverPortal open={open}>
@@ -4378,7 +4379,7 @@ function OpenRouterProviderBlacklistSelect({
               <div className="overflow-auto" role="listbox" style={{ maxHeight: `${popoverLayout?.listHeight ?? 240}px` }}>
                 {loading && options.length === 0 ? (
                   <div className="flex items-center justify-center gap-2 px-2 py-6 text-caption text-muted-foreground">
-                    <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                    <Spinner className="h-3.5 w-3.5" />
                     <span>{t("Loading providers")}</span>
                   </div>
                 ) : filteredOptions.length > 0 ? (

@@ -1,8 +1,6 @@
 import * as React from "react";
-import {
-  AnimatePresence, AppToast, Button, Check, CircleAlert, cn, LoaderCircle, motion, motionEase, reducedMotionTransition,
-  useAppText, useReducedMotion, X
-} from "../shared/index";
+import { Button, Check, CircleAlert, cn, useAppText, X } from "../shared/index";
+import { Spinner } from "@/components/ui/spinner";
 
 export function PersistenceFeedback({ actionError, contained = false, disconnected, error, inline = false, onDismissAction, onRetry, state }: {
   actionError: string;
@@ -35,7 +33,7 @@ export function PersistenceFeedback({ actionError, contained = false, disconnect
           : "pointer-events-auto fixed left-1/2 top-5 z-[10000] w-max max-w-[calc(100vw-24px)] -translate-x-1/2 rounded-lg border shadow-lg"
     )} role={message ? "alert" : "status"}>
       <div className="flex items-center gap-3">
-        {message ? <CircleAlert className="h-4 w-4 shrink-0 text-destructive" /> : state === "saving" ? <LoaderCircle className="h-4 w-4 shrink-0 animate-spin" /> : <Check className="h-4 w-4 shrink-0 text-primary" />}
+        {message ? <CircleAlert className="h-4 w-4 shrink-0 text-destructive" /> : state === "saving" ? <Spinner className="shrink-0" /> : <Check className="h-4 w-4 shrink-0 text-primary" />}
         <span>{message || t(state === "saving" ? "Saving changes…" : "Changes saved.")}</span>
         {failed ? <Button onClick={onRetry} size="sm" variant="outline">{t("Retry saving")}</Button> : actionError && !disconnected ? <Button aria-label={t("Dismiss")} onClick={onDismissAction} size="iconSm" variant="ghost"><X className="h-4 w-4" /></Button> : null}
       </div>
@@ -43,36 +41,5 @@ export function PersistenceFeedback({ actionError, contained = false, disconnect
     </div>
   );
 }
-export function FeedbackStack({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="pointer-events-none fixed left-1/2 top-5 z-[10000] flex w-max max-w-[calc(100vw-24px)] -translate-x-1/2 flex-col items-center gap-3">
-      {children}
-    </div>
-  );
-}
-
-export function LightToast({ contained = false, toast }: { contained?: boolean; toast?: AppToast }) {
-  const shouldReduceMotion = useReducedMotion();
-
-  return (
-    <AnimatePresence initial={false}>
-      {toast ? (
-        <motion.div
-          animate={{ opacity: 1, y: 0 }}
-          className={cn(
-            "pointer-events-none flex items-center gap-2 rounded-full border border-border bg-popover px-3 py-2 text-caption font-medium text-popover-foreground shadow-lg",
-            contained ? "max-w-full" : "fixed left-1/2 top-5 z-[10000] max-w-[calc(100vw-24px)] -translate-x-1/2"
-          )}
-          exit={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: -8 }}
-          initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: -8 }}
-          key={toast.id}
-          role="status"
-          transition={shouldReduceMotion ? reducedMotionTransition : { duration: 0.16, ease: motionEase }}
-        >
-          <Check className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
-          <span className="truncate">{toast.message}</span>
-        </motion.div>
-      ) : null}
-    </AnimatePresence>
-  );
-}
+// Toasts live in the shared components; these names are kept for existing call sites.
+export { Toast as LightToast, ToastStack as FeedbackStack } from "@/components/ui/toast";

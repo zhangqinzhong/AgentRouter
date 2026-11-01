@@ -10,7 +10,7 @@ import {
   Checkbox, ChevronDown, CircleAlert, closestCenter, cn, compareProviderAccountSnapshots, CSS, Database, Dialog, DialogBody, DialogContent,
   DialogFooter, DialogHeader, DialogTitle, endpointFromHostPort, Field, formatAppError, formatProviderAccountMeterValue, formatSystemOption, Gauge,
   Globe,
-  createBotGatewayConfigDraft, createMcpServerDraft, createMcpServerDraftFromConfig, createMcpServerDraftFromUnknown, DndContext, DragEndEvent, GatewayMcpServerConfig, GatewayProviderConfig, Input, isBotGatewayConfigDraftSubmittable, KeyboardSensor, KeyRound, KeyValueRowsControl, languageDisplayName, Layers3, LoaderCircle,
+  createBotGatewayConfigDraft, createMcpServerDraft, createMcpServerDraftFromConfig, createMcpServerDraftFromUnknown, DndContext, DragEndEvent, GatewayMcpServerConfig, GatewayProviderConfig, Input, isBotGatewayConfigDraftSubmittable, KeyboardSensor, KeyRound, KeyValueRowsControl, languageDisplayName, Layers3, 
   mcpServerConfigFromDraft, mcpServerEndpointSummary, mcpServerTransportOptions, mcpStdioMessageModeOptions, McpServerDraft, normalizeBotGatewayAuthType, normalizeBotGatewayPlatform, normalizeProviderModelSelector, normalizeProxyUpstreamConfig, normalizeToolHubConfig, numberValue, Palette, Pencil, Plus, ProfileConfig, profileAgentLabel,
   PanelLeftOpen, Power, ProviderAccountMeter, ProviderAccountSnapshot, ReactNode, ResolvedLanguage, ResolvedTheme, Select, SelectControl,
   PointerSensor, rectSortingStrategy, Settings, SettingsPageId, SortableContext, sortableKeyboardCoordinates, themeDisplayName,
@@ -20,6 +20,7 @@ import {
 } from "../shared/index";
 import { ModelSelector } from "./model-selector";
 import trayLayeredIconUrl from "@/assets/tray-layered.png";
+import { Spinner } from "@/components/ui/spinner";
 
 const settingsPageContentWidthClassName = "w-full min-w-0";
 
@@ -1223,7 +1224,7 @@ function DataSettingsSection({
             </div>
           </div>
           <Button disabled={exporting} onClick={exportData} size="sm" type="button">
-            {exporting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+            {exporting ? <Spinner /> : <Database className="h-4 w-4" />}
             {exporting ? t("Exporting") : t("Export")}
           </Button>
         </div>
@@ -1859,7 +1860,7 @@ function BotConfigDialog({
         <DialogFooter>
           <Button disabled={busy} onClick={onClose} type="button" variant="outline">{t("Cancel")}</Button>
           <Button disabled={busy} onClick={() => void save()} type="button">
-            {busy ? <LoaderCircle className="h-4 w-4 animate-spin" /> : null}
+            {busy ? <Spinner /> : null}
             {t("Save")}
           </Button>
         </DialogFooter>

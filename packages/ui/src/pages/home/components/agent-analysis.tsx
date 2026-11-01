@@ -6,12 +6,13 @@ import {
   ChevronDown, ChevronRight, CircleAlert, cn, compactId, compactUserAgent,
   Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle,
   formatBytes, formatCompactNumber, formatDuration, formatLogDateTime, formatPercentFixed,
-  formatUsdCost, LoaderCircle,
+  formatUsdCost, 
   normalizeAgentFilterValue, ReactNode, RefreshCw, RequestLogEntry,
   Select, Tabs, TabsList, TabsTrigger, translateOptions, UsageStatsRange,
   useAppText, useEffect, useMemo, useState, X
 } from "../shared/index";
 import { LogExpandedDetails } from "./network-logs";
+import { Spinner } from "@/components/ui/spinner";
 
 export function AgentAnalysisView({
   agentFilter,
@@ -340,7 +341,7 @@ function AgentSessionRequestLogDialog({
             <div className="flex min-h-[360px] items-center justify-center px-4 py-8 text-center text-caption text-muted-foreground">
               {loading ? (
                 <div className="flex items-center gap-2">
-                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                  <Spinner />
                   <span>{t("Loading full payload...")}</span>
                 </div>
               ) : (

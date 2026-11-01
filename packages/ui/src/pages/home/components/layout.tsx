@@ -15,7 +15,7 @@ import { collapseSidebarToExpandInspectorMorph } from "@/lib/morph-icon";
 import {
   AnimatePresence, AppConfig, AppCopy, Button, Check, CircleAlert, cn, EndpointTitleBar,
   AppUpdateStatus, GatewayStatus, LucideIcon, motion, motionEase,
-  LoaderCircle, NavigationId, RefreshCw,
+  NavigationId, RefreshCw,
   reducedMotionTransition, Settings, ViewId,
   useAppText, ViewMotionShell, viewUsesInternalScroll
 } from "../shared/index";
@@ -30,6 +30,7 @@ import { ProfileView } from "./profiles";
 import { ModelsView, ProvidersView } from "./providers";
 import { RoutingView } from "./routing";
 import { VirtualModelsView } from "./virtual-models";
+import { Spinner } from "@/components/ui/spinner";
 
 export type MainNavigationItem = {
   icon: LucideIcon;
@@ -404,7 +405,7 @@ export function UpdateEntryButton({
       unstyled
     >
       {busy ? (
-        <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+        <Spinner className="h-3.5 w-3.5" />
       ) : status.state === "downloaded" ? (
         <Check className="h-3.5 w-3.5" />
       ) : (

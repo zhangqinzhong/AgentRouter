@@ -2,8 +2,8 @@
   "$comment": "Per-rule, per-file counts of existing UI guard violations. Counts may only go down; regenerate with `npm run check:ui -- --update-baseline` after fixing violations.",
   "totals": {
     "raw-color": 226,
-    "arbitrary-value": 528,
-    "palette-color": 411,
+    "arbitrary-value": 524,
+    "palette-color": 410,
     "primitive-import": 0,
     "native-control": 147
   },
@@ -30,7 +30,7 @@
       "packages/ui/src/pages/home/components/api-keys.tsx": 8,
       "packages/ui/src/pages/home/components/data-sources.tsx": 4,
       "packages/ui/src/pages/home/components/extensions.tsx": 12,
-      "packages/ui/src/pages/home/components/feedback.tsx": 6,
+      "packages/ui/src/pages/home/components/feedback.tsx": 2,
       "packages/ui/src/pages/home/components/layout.tsx": 7,
       "packages/ui/src/pages/home/components/local-heatmap.tsx": 22,
       "packages/ui/src/pages/home/components/memory.tsx": 4,
@@ -70,7 +70,6 @@
       "packages/ui/src/pages/home/components/agent-analysis.tsx": 73,
       "packages/ui/src/pages/home/components/api-keys.tsx": 5,
       "packages/ui/src/pages/home/components/data-sources.tsx": 3,
-      "packages/ui/src/pages/home/components/feedback.tsx": 1,
       "packages/ui/src/pages/home/components/layout.tsx": 1,
       "packages/ui/src/pages/home/components/local-heatmap.tsx": 3,
       "packages/ui/src/pages/home/components/local-trend.tsx": 2,

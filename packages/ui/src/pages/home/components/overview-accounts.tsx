@@ -11,6 +11,7 @@ import {
   GatewayProviderConfig, useAppText, useEffect, useMemo, useState, X
 } from "../shared/index";
 import { CreditCard, Rocket, WalletCards, Wifi } from "@/components/ui/icons";
+import { Spinner } from "@/components/ui/spinner";
 
 const providerAccountMeterLineLimit = 3;
 
@@ -57,7 +58,7 @@ export function ProviderAccountsSection({
         <div className="flex items-center gap-2">
           <Button aria-label={t("Refresh all accounts")} title={t("Refresh all accounts")} size="iconSm" variant="ghost"
             disabled={!onRefresh || refreshing || refreshingKeys.length > 0} onClick={() => void onRefresh?.()}>
-            {refreshing ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            {refreshing ? <Spinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
           </Button>
           <span className="shrink-0 text-label tabular-nums text-muted-foreground">{visibleAccounts.length}</span>
         </div>

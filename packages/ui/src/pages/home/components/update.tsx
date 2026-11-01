@@ -1,7 +1,8 @@
 import {
   AppCopy, AppUpdateStatus, Button, Check, CircleAlert, cn, Dialog, DialogBody,
-  DialogContent, DialogFooter, DialogHeader, DialogTitle, Download, LoaderCircle, RefreshCw, X
+  DialogContent, DialogFooter, DialogHeader, DialogTitle, Download, RefreshCw, X
 } from "../shared/index";
+import { Spinner } from "@/components/ui/spinner";
 
 export type UpdateActionBusy = "" | "check" | "download" | "install";
 
@@ -181,7 +182,7 @@ function updatePrimaryAction({
     const installing = status.state === "installing" || actionBusy === "install";
     return {
       disabled: installing || !canInstall,
-      icon: installing ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />,
+      icon: installing ? <Spinner /> : <Check className="h-4 w-4" />,
       label: t("Install and restart"),
       onClick: onInstall
     };
@@ -191,7 +192,7 @@ function updatePrimaryAction({
     const downloading = status.state === "downloading" || actionBusy === "download";
     return {
       disabled: downloading || !canDownload,
-      icon: downloading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />,
+      icon: downloading ? <Spinner /> : <Download className="h-4 w-4" />,
       label: status.state === "error" ? t("Retry download") : downloading ? t("Downloading update") : t("Download update"),
       onClick: onDownload
     };
@@ -201,7 +202,7 @@ function updatePrimaryAction({
     const checking = status.state === "checking" || actionBusy === "check";
     return {
       disabled: checking || !status.canCheck,
-      icon: checking ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />,
+      icon: checking ? <Spinner /> : <RefreshCw className="h-4 w-4" />,
       label: checking ? t("Checking for updates") : t("Check for updates"),
       onClick: onCheck
     };
