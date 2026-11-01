@@ -25,14 +25,14 @@ function render(node: React.ReactNode, language: "en" | "zh" = "zh") {
 function assertDocument(html: string, title: string, wide = false) {
   assert.match(html, /local-usage-page/);
   if (wide) {
-    assert.match(html, /max-w-\[1600px\]/);
+    assert.match(html, /max-w-wide/);
     // Wide table pages still keep page gutters — they must not glue to the window edges.
     assert.match(html, /px-5 pb-0 sm:px-9/);
-    assert.doesNotMatch(html, /max-w-\[1120px\]/);
+    assert.doesNotMatch(html, /max-w-page/);
   } else {
-    assert.match(html, /max-w-\[1120px\]/);
+    assert.match(html, /max-w-page/);
   }
-  assert.match(html, /<h1 class="text-\[24px\] font-semibold tracking-\[-0\.025em\]">/);
+  assert.match(html, /<h1 class="text-title font-semibold tracking-tight">/);
   assert.ok(html.includes(title), `Missing title: ${title}`);
   assert.doesNotMatch(html, /box-shadow:0 1px 2px rgba\(0,0,0,0\.04\)/);
   assert.doesNotMatch(html, /role="dialog"|aria-modal="true"/);

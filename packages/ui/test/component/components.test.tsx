@@ -83,7 +83,7 @@ test("Card primitives compose the expected document structure", () => {
 
   assert.match(html, /^<div /);
   assert.match(html, /settings-card/);
-  assert.match(html, /<h2 class="[^"]*text-\[13px\][^"]*">Provider settings<\/h2>/);
+  assert.match(html, /<h2 class="[^"]*text-body[^"]*">Provider settings<\/h2>/);
   assert.match(html, /<div class="p-4">Ready<\/div>/);
   assert.match(html, /var\(--card-inset-highlight\)/);
   assert.doesNotMatch(html, /rgba\(255,255,255,0\.5\)/);

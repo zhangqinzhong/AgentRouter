@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { ChevronRight, Folder } from "lucide-react";
+import { ChevronRight, Folder } from "@/components/ui/icons";
 import { useAppText } from "../shared/i18n";
 import { ProviderIcon } from "@/vendor/tokentracker/ui/dashboard/components/ProviderIcon";
 
@@ -170,7 +170,7 @@ function ScopeGroup({
     <div className="grid min-w-0 gap-0.5">
       <button
         aria-expanded={open}
-        className="flex h-8 min-w-0 items-center gap-1.5 rounded-md px-2 text-left text-[13px] font-medium text-muted-foreground hover:bg-muted/80 hover:text-foreground"
+        className="flex h-8 min-w-0 items-center gap-1.5 rounded-md px-2 text-left text-body font-medium text-muted-foreground hover:bg-muted/80 hover:text-foreground"
         onClick={onToggle}
         type="button"
       >
@@ -198,14 +198,14 @@ function ScopeRow({
   return (
     <button
       aria-current={active ? "true" : undefined}
-      className={`flex h-8 min-w-0 items-center gap-2 rounded-md pl-7 pr-2 text-left text-[13px] ${active ? "bg-card font-medium text-foreground shadow-[0_1px_3px_rgba(0,0,0,0.06)]" : "text-muted-foreground hover:bg-muted/80 hover:text-foreground"}`}
+      className={`flex h-8 min-w-0 items-center gap-2 rounded-md pl-7 pr-2 text-left text-body ${active ? "bg-card font-medium text-foreground shadow-[0_1px_3px_rgba(0,0,0,0.06)]" : "text-muted-foreground hover:bg-muted/80 hover:text-foreground"}`}
       onClick={onClick}
       title={label}
       type="button"
     >
       <span className="flex h-4 w-4 shrink-0 items-center justify-center">{mark}</span>
       <span className="min-w-0 flex-1 truncate">{label}</span>
-      <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{count}</span>
+      <span className="shrink-0 text-label tabular-nums text-muted-foreground">{count}</span>
     </button>
   );
 }

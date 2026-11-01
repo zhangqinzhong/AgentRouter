@@ -27,7 +27,7 @@ export function PersistenceFeedback({ actionError, contained = false, disconnect
   if (!message && state !== "saving" && !showSaved) return null;
   return (
     <div className={cn(
-      "border-border bg-popover px-4 py-3 text-[13px] text-popover-foreground",
+      "border-border bg-popover px-4 py-3 text-body text-popover-foreground",
       inline
         ? "shrink-0 border-t"
         : contained
@@ -39,7 +39,7 @@ export function PersistenceFeedback({ actionError, contained = false, disconnect
         <span>{message || t(state === "saving" ? "Saving changes…" : "Changes saved.")}</span>
         {failed ? <Button onClick={onRetry} size="sm" variant="outline">{t("Retry saving")}</Button> : actionError && !disconnected ? <Button aria-label={t("Dismiss")} onClick={onDismissAction} size="iconSm" variant="ghost"><X className="h-4 w-4" /></Button> : null}
       </div>
-      {failed && error ? <details className="mt-2 text-[12px] text-muted-foreground"><summary className="cursor-pointer">{t("Technical details")}</summary><p className="mt-1 max-h-24 overflow-auto break-words">{error}</p></details> : null}
+      {failed && error ? <details className="mt-2 text-caption text-muted-foreground"><summary className="cursor-pointer">{t("Technical details")}</summary><p className="mt-1 max-h-24 overflow-auto break-words">{error}</p></details> : null}
     </div>
   );
 }
@@ -60,7 +60,7 @@ export function LightToast({ contained = false, toast }: { contained?: boolean; 
         <motion.div
           animate={{ opacity: 1, y: 0 }}
           className={cn(
-            "pointer-events-none flex items-center gap-2 rounded-full border border-border bg-popover px-3 py-2 text-[12px] font-medium text-popover-foreground shadow-lg",
+            "pointer-events-none flex items-center gap-2 rounded-full border border-border bg-popover px-3 py-2 text-caption font-medium text-popover-foreground shadow-lg",
             contained ? "max-w-full" : "fixed left-1/2 top-5 z-[10000] max-w-[calc(100vw-24px)] -translate-x-1/2"
           )}
           exit={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: -8 }}

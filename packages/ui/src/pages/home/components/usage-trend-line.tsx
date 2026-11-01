@@ -246,13 +246,13 @@ function TrendHoverTooltip({
  const turns=Number(row.recorded_turns)||0;
  return (
   <div className="max-w-[280px] min-w-[220px] rounded-xl border border-oai-gray-200/50 bg-white/95 p-3.5 shadow-xl backdrop-blur-md dark:border-oai-gray-800/50 dark:bg-oai-gray-900/95">
-   <div className="border-b border-oai-gray-100 pb-1.5 text-[11px] font-semibold text-oai-gray-500 dark:border-oai-gray-800/80 dark:text-oai-gray-400">{timeLabel}</div>
+   <div className="border-b border-oai-gray-100 pb-1.5 text-label font-semibold text-oai-gray-500 dark:border-oai-gray-800/80 dark:text-oai-gray-400">{timeLabel}</div>
    <div className="mt-2 flex items-baseline gap-1">
     <span className="text-lg font-bold leading-none text-oai-gray-900 dark:text-white" title={formatTokenTooltip(tokens)}>{formatTokenCount(tokens)}</span>
-    <span className="text-[10px] font-semibold uppercase tracking-wider text-oai-gray-400">{copy('heatmap.unit.tokens')}</span>
+    <span className="text-2xs font-semibold uppercase tracking-wider text-oai-gray-400">{copy('heatmap.unit.tokens')}</span>
    </div>
    {(cost!=null||turns>0||conversations>0||requests>0)&&(
-    <div className="mt-2 flex items-center gap-3 text-[11px] text-oai-gray-500 dark:text-oai-gray-400">
+    <div className="mt-2 flex items-center gap-3 text-label text-oai-gray-500 dark:text-oai-gray-400">
      {cost!=null?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{formatUsdCurrency(cost)}</span> {t('Estimated cost')}</span>:null}
      {turns>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{turns.toLocaleString(getCopyLocale())}</span> {t('Recorded turns')}</span>:null}
      {turns<=0&&conversations>0?<span><span className="font-semibold text-oai-gray-700 dark:text-oai-gray-200">{conversations.toLocaleString(getCopyLocale())}</span> {copy('trend.zoom.tooltip.conversations')}</span>:null}
@@ -261,17 +261,17 @@ function TrendHoverTooltip({
    )}
    {segments.length>0?(
     <div className="mt-2 flex max-h-[150px] flex-col gap-1.5 overflow-y-auto border-t border-oai-gray-100 pt-2 dark:border-oai-gray-800/60">
-     <div className="text-[10px] font-semibold uppercase tracking-wider text-oai-gray-400">{copy('heatmap.tooltip.model_breakdown')}</div>
+     <div className="text-2xs font-semibold uppercase tracking-wider text-oai-gray-400">{copy('heatmap.tooltip.model_breakdown')}</div>
      {segments.map((segment)=>{
       const pct=Math.round((segment.value/tokens)*100);
       const color=getModelColor(segment.name);
       return (
        <div key={segment.name} className="flex flex-col gap-1">
-        <div className="flex items-center justify-between gap-3 text-[11px]">
+        <div className="flex items-center justify-between gap-3 text-label">
          <span className="max-w-[130px] truncate font-medium text-oai-gray-700 dark:text-oai-gray-200" title={segment.name}>{segment.name}</span>
          <div className="flex shrink-0 items-center gap-1.5">
           <span className="font-mono font-semibold text-oai-gray-900 dark:text-oai-gray-100" title={formatTokenTooltip(segment.value)}>{formatTokenCount(segment.value)}</span>
-          <span className="min-w-[28px] text-right text-[9px] font-medium text-oai-gray-400">{pct}%</span>
+          <span className="min-w-[28px] text-right text-micro font-medium text-oai-gray-400">{pct}%</span>
          </div>
         </div>
         <div className="h-1 overflow-hidden rounded-full bg-oai-gray-100 dark:bg-oai-gray-800/85">

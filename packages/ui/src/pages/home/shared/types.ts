@@ -1,6 +1,6 @@
 import {
   type LucideIcon
-} from "lucide-react";
+} from "@/components/ui/icons";
 import type {
   ApiKeyConfig,
   ApiKeyLimitConfig,

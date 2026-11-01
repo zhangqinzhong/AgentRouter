@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { BrainCircuit, ChevronLeft, FileText, LoaderCircle, Play, Plus, RefreshCw, Search, Square, Terminal } from "lucide-react";
+import { BrainCircuit, ChevronLeft, FileText, LoaderCircle, Play, Plus, RefreshCw, Search, Square, Terminal } from "@/components/ui/icons";
 import { MemoryModelSettingsPanel } from "./memory-model-settings";
 import { MemoryProjectSetupPanel } from "./memory-project-setup";
 import { Button } from "@/components/ui/button";
@@ -39,8 +39,8 @@ function memoryClientVariantLabel(client: MemoryClient, kind: "mcp" | "hooks"): 
   if (client.id === "kiro-cli-v3") return "Kiro Hooks v3";
   return kind === "mcp" ? "MCP" : "Hook";
 }
-const control = "h-9 rounded-md border border-border bg-background px-3 text-[13px] outline-none focus:ring-2 focus:ring-emerald-500/25";
-const textArea = "min-h-28 w-full rounded-md border border-border bg-background p-3 text-[13px] leading-6 outline-none focus:ring-2 focus:ring-emerald-500/25";
+const control = "h-9 rounded-md border border-border bg-background px-3 text-body outline-none focus:ring-2 focus:ring-emerald-500/25";
+const textArea = "min-h-28 w-full rounded-md border border-border bg-background p-3 text-body leading-6 outline-none focus:ring-2 focus:ring-emerald-500/25";
 
 async function call<T = unknown>(request: MemoryRequest): Promise<T> {
   if (!window.agentrouter?.memory) throw new Error("Memory service is unavailable in this build.");
@@ -63,14 +63,14 @@ function MemoryClientTargetRow({ client, target, kind, busy, preview, previewErr
     <div className="py-3">
       <div className="flex flex-wrap items-center gap-2">
         <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-medium">{t(memoryClientVariantLabel(client, kind))} <span className="ml-1 text-[10px] font-normal text-muted-foreground">{t(kind === "mcp" ? "Read and write memory" : "Capture sessions")}</span></div>
-          <div className={`mt-1 text-[11px] ${configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>{t(configured ? "Configured · reload client" : "Not configured or changed")}</div>
-          <code className="mt-1 block break-all text-[10px] text-muted-foreground">{file}</code>
+          <div className="text-body font-medium">{t(memoryClientVariantLabel(client, kind))} <span className="ml-1 text-2xs font-normal text-muted-foreground">{t(kind === "mcp" ? "Read and write memory" : "Capture sessions")}</span></div>
+          <div className={`mt-1 text-label ${configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}>{t(configured ? "Configured · reload client" : "Not configured or changed")}</div>
+          <code className="mt-1 block break-all text-2xs text-muted-foreground">{file}</code>
         </div>
         <Button size="sm" variant={open ? "secondary" : "ghost"} aria-expanded={open} disabled={!!busy && !open} onClick={() => open ? onClose() : onAction("preview")}>{busy === `preview:${row}` && <LoaderCircle className="mr-1 h-3 w-3 animate-spin" />}{t(open ? "Collapse" : "Preview")}</Button>
         <Button size="sm" variant="outline" disabled={!!busy} onClick={() => onAction(configured ? "remove" : "install")}>{t(configured ? "Disconnect" : "Connect")}</Button>
       </div>
-      {open ? <div ref={previewRef} className="mt-2 max-h-80 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-5">{memoryPreviewLines(preview?.before || "", preview?.text || "").map((line, index) => <div key={index} className={line.added ? "whitespace-pre text-red-600 dark:text-red-400" : "whitespace-pre text-foreground"}>{line.text || " "}</div>)}</div> : null}
+      {open ? <div ref={previewRef} className="mt-2 max-h-80 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-label leading-5">{memoryPreviewLines(preview?.before || "", preview?.text || "").map((line, index) => <div key={index} className={line.added ? "whitespace-pre text-red-600 dark:text-red-400" : "whitespace-pre text-foreground"}>{line.text || " "}</div>)}</div> : null}
       {previewError?.row === row ? <div role="alert" className="mt-2 border-l-2 border-destructive pl-3 text-sm text-destructive">{previewError.text}</div> : null}
     </div>
   );
@@ -222,7 +222,7 @@ export function MemoryView() {
     </PageHeader>
 
     <div role="tablist" aria-label={t("Memory sections")} className="mb-5 flex gap-1 overflow-x-auto border-b border-border/70">
-      {tabs.map(([id, label]) => <button key={id} role="tab" aria-selected={section === id} onClick={() => setTab(id)} className={`shrink-0 border-b-2 px-3 py-2 text-[13px] ${section === id ? "border-emerald-500 font-medium text-emerald-600" : "border-transparent text-muted-foreground hover:text-foreground"}`}>{t(label)}</button>)}
+      {tabs.map(([id, label]) => <button key={id} role="tab" aria-selected={section === id} onClick={() => setTab(id)} className={`shrink-0 border-b-2 px-3 py-2 text-body ${section === id ? "border-emerald-500 font-medium text-emerald-600" : "border-transparent text-muted-foreground hover:text-foreground"}`}>{t(label)}</button>)}
     </div>
     {(error || status?.lastError) && <div role="alert" className="mb-4 whitespace-pre-wrap break-words border-l-2 border-destructive pl-3 text-sm text-destructive">{error || status?.lastError}</div>}
     {notice && <div role="status" className="mb-4 border-l-2 border-emerald-500 pl-3 text-sm">{notice}</div>}
@@ -269,7 +269,7 @@ export function MemoryView() {
       <aside aria-label={t("Memory directory")} className="max-h-[560px] overflow-auto border-b border-border/70 bg-muted/15 p-3 md:border-b-0 md:border-r">
         <div className="mb-3 flex items-center justify-between px-2 text-xs text-muted-foreground"><span>{t("Memory directory")}</span><span>{pages.length}</span></div>
         {!pages.length && <p className="px-2 py-3 text-xs text-muted-foreground">{t(loading ? "Loading" : "No memories yet")}</p>}
-        {pages.map((p) => <button key={p.path} disabled={!!busy} onClick={() => scope && void openPage(scope, p.path)} className={`mb-1 flex w-full items-start gap-2 rounded-lg px-2 py-3 text-left hover:bg-muted/60 ${page?.path === p.path ? "bg-emerald-500/10" : ""}`}><FileText className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" /><span className="min-w-0"><span className="block break-words text-[13px] font-medium">{p.title || p.path}</span><span className="mt-1 block break-all text-[11px] text-muted-foreground">{p.path}</span></span></button>)}
+        {pages.map((p) => <button key={p.path} disabled={!!busy} onClick={() => scope && void openPage(scope, p.path)} className={`mb-1 flex w-full items-start gap-2 rounded-lg px-2 py-3 text-left hover:bg-muted/60 ${page?.path === p.path ? "bg-emerald-500/10" : ""}`}><FileText className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" /><span className="min-w-0"><span className="block break-words text-body font-medium">{p.title || p.path}</span><span className="mt-1 block break-all text-label text-muted-foreground">{p.path}</span></span></button>)}
       </aside>
       <div className="min-w-0 p-5 md:p-6">{page ? <section>
       <div className="mb-3 flex items-center gap-2"><Button size="sm" variant="ghost" onClick={() => setPage(undefined)}><ChevronLeft className="h-4 w-4" />{t("Back")}</Button><span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{page.workspace}/{page.project}/{page.path}</span><Button size="sm" variant="outline" onClick={() => edit(page)}>{t("Edit")}</Button></div>
@@ -287,18 +287,18 @@ export function MemoryView() {
     {running && tab === "search" && !page && <section>
       {!loading && !results.length && <p className="py-8 text-sm text-muted-foreground">{t("No matching memories.")}</p>}
       <div className="divide-y divide-border/60">{results.map((hit, i) => <button key={i} className="block w-full py-4 text-left hover:bg-muted/40" onClick={() => void openPage({ workspace: hit.workspace, project: hit.project }, hit.path)}>
-        <div className="text-sm font-medium">{hit.title || hit.path}</div><div className="my-1 text-[11px] text-muted-foreground">{hit.workspace}/{hit.project} · {hit.path}</div><p className="line-clamp-3 whitespace-pre-wrap text-[13px] text-muted-foreground"><MemorySnippet text={String(hit.snippet || "")} /></p>
+        <div className="text-sm font-medium">{hit.title || hit.path}</div><div className="my-1 text-label text-muted-foreground">{hit.workspace}/{hit.project} · {hit.path}</div><p className="line-clamp-3 whitespace-pre-wrap text-body text-muted-foreground"><MemorySnippet text={String(hit.snippet || "")} /></p>
       </button>)}</div>
     </section>}
     {running && tab === "sessions" && <MemorySessions entries={results} scope={scope} onError={setError} onChanged={() => setRefreshRevision((value) => value + 1)} />}
     {running && tab === "handoffs" && <div className="divide-y divide-border/60">
       {!results.length && !loading && <p className="py-8 text-sm text-muted-foreground">{t("No handoffs in this project.")}</p>}
-      {results.map((item, i) => <section key={item.id || i} className="space-y-2 py-4"><div className="flex gap-3 text-xs text-muted-foreground"><span>{item.agent}</span><span>{item.state}</span><span>{date(item.at)}</span></div><p className="whitespace-pre-wrap text-sm">{item.redacted ? t("This handoff is private.") : item.summary}</p>{item.next_steps?.length > 0 && <ul className="list-inside list-disc text-[13px]">{item.next_steps.map((s: string, j: number) => <li key={j}>{s}</li>)}</ul>}</section>)}
+      {results.map((item, i) => <section key={item.id || i} className="space-y-2 py-4"><div className="flex gap-3 text-xs text-muted-foreground"><span>{item.agent}</span><span>{item.state}</span><span>{date(item.at)}</span></div><p className="whitespace-pre-wrap text-sm">{item.redacted ? t("This handoff is private.") : item.summary}</p>{item.next_steps?.length > 0 && <ul className="list-inside list-disc text-body">{item.next_steps.map((s: string, j: number) => <li key={j}>{s}</li>)}</ul>}</section>)}
     </div>}
     {running && tab === "clients" && <section>
       <MemoryProjectSetupPanel />
       <h2 className="mb-2 text-sm font-semibold">{t("Client connection")}</h2>
-      <p className="mb-5 text-[13px] text-muted-foreground">{t("Connect your coding clients to project memory.")}</p>
+      <p className="mb-5 text-body text-muted-foreground">{t("Connect your coding clients to project memory.")}</p>
       <div className="grid grid-cols-1 gap-4">{clientGroups.map((group) => <section key={group.id} className="min-w-0 rounded-xl border border-border/70 bg-background p-4">
         <div className="mb-4 flex items-center gap-3"><MemoryClientIcon id={group.clients[0].id} /><h3 className="text-sm font-semibold">{group.label}</h3></div>
         {group.clients.map((client) => <div key={client.id} className="mb-4 last:mb-0">
@@ -306,15 +306,15 @@ export function MemoryView() {
           {client.id === "xiaomi-mimo" && <p className="mb-3 text-xs text-muted-foreground">{t("MiMo automatically captures completed turns and recalls them in new conversations.")}</p>}
           {["zcode", "grok", "zero"].includes(client.id) && <p className="mb-3 text-xs text-muted-foreground">{t(client.id === "zcode" ? "ZCode has no session-end event. Finish the session from Project memory > Sessions after your work is complete." : "This client retrieves handoffs through MCP; startup hook output is not injected.")}</p>}
           <div className="space-y-3">{client.targets.map((target) => <section key={target.id} className="rounded-lg border border-border/60 p-3">
-            <div className="mb-2 flex items-start justify-between gap-3"><div><h5 className="text-[13px] font-medium">{target.label}</h5><div className="mt-1 text-[11px] text-muted-foreground">{target.scope === "global" ? t("Global client configuration") : t("AgentRouter profile")}</div></div><span className="text-[10px] text-muted-foreground">{target.profileId || "global"}</span></div>
+            <div className="mb-2 flex items-start justify-between gap-3"><div><h5 className="text-body font-medium">{target.label}</h5><div className="mt-1 text-label text-muted-foreground">{target.scope === "global" ? t("Global client configuration") : t("AgentRouter profile")}</div></div><span className="text-2xs text-muted-foreground">{target.profileId || "global"}</span></div>
             <div className="divide-y divide-border/50">{(["mcp", "hooks"] as const).filter((kind) => kind === "mcp" ? target.mcpSupported : target.hooksSupported).map((kind) => <MemoryClientTargetRow key={kind} client={client} target={target} kind={kind} busy={busy} preview={clientPreview} previewError={clientPreviewError} previewRef={clientPreviewRef} onAction={(operation) => void clientAction(client, target, kind, operation)} onClose={() => setClientPreview((current) => current?.row === `${client.id}:${target.id}:${kind}` ? undefined : current)} t={t} />)}</div>
           </section>)}</div>
         </div>)}
       </section>)}</div>
-      <details className="mt-5 text-[13px] text-muted-foreground"><summary className="cursor-pointer hover:text-foreground">{t("Enable capture for a project")}</summary><p className="mt-2 leading-6">{t("Session capture requires a .ai-memory.toml file in the project root with its workspace and project names. Reload the client after connecting.")}</p></details>
+      <details className="mt-5 text-body text-muted-foreground"><summary className="cursor-pointer hover:text-foreground">{t("Enable capture for a project")}</summary><p className="mt-2 leading-6">{t("Session capture requires a .ai-memory.toml file in the project root with its workspace and project names. Reload the client after connecting.")}</p></details>
     </section>}
     {running && tab === "maintenance" && <section className="space-y-4">
-      <p className="text-[13px] text-muted-foreground">{t("All bundled memory operations remain available. Review the scope and parameters before applying changes.")}</p>
+      <p className="text-body text-muted-foreground">{t("All bundled memory operations remain available. Review the scope and parameters before applying changes.")}</p>
       <select className={`${control} w-full`} aria-label={t("Memory operation")} value={toolName} onChange={(e) => { setToolName(e.target.value); setToolResult(undefined); }}>{tools.map((tool) => <option key={tool.name} value={tool.name}>{tool.name.replace(/^memory_/, "").replaceAll("_", " ")}</option>)}</select>
       {tools.find((tool) => tool.name === toolName) && <MemoryToolForm key={toolName + keyOf(scope)} tool={tools.find((tool) => tool.name === toolName)!} scope={scope} busy={!!busy} onRun={(args) => void perform("tool", async () => {
         const tool = tools.find((item) => item.name === toolName)!;
@@ -344,7 +344,7 @@ export function MemoryView() {
         if (!window.confirm(t("Save memory configuration? A backup is kept. Provider settings may enable external model calls on next start."))) return;
         void perform("config", async () => { await call({ action: "saveConfig", content: config }); setNotice(t("Configuration saved. Changes take effect on next start.")); });
       }}>{t("Save configuration")}</Button></div>
-      <div><div className="mb-2 flex items-center justify-between"><h2 className="text-sm font-medium">{t("Service log")}</h2><Button variant="ghost" size="sm" onClick={() => void perform("logs", async () => setLogs(await call<string>({ action: "logs" })))}>{t("Refresh")}</Button></div><pre className="max-h-72 overflow-auto rounded-md border border-border p-3 text-[11px]">{logs || t("No log entries.")}</pre></div>
+      <div><div className="mb-2 flex items-center justify-between"><h2 className="text-sm font-medium">{t("Service log")}</h2><Button variant="ghost" size="sm" onClick={() => void perform("logs", async () => setLogs(await call<string>({ action: "logs" })))}>{t("Refresh")}</Button></div><pre className="max-h-72 overflow-auto rounded-md border border-border p-3 text-label">{logs || t("No log entries.")}</pre></div>
     </section>}
   </div>;
 }
@@ -357,7 +357,7 @@ export function MemoryEmpty({ unavailable }: { unavailable?: boolean }) {
 export function MemoryDocument({ text, omitHeading }: { text: string; omitHeading?: string }) {
   // Render text, not upstream HTML. Stored content never runs scripts or gets
   // access to AgentRouter's preload bridge.
-  return <article className="space-y-3 break-words text-[13px] leading-7">{text.split(/\n{2,}/).map((block, i) => {
+  return <article className="space-y-3 break-words text-body leading-7">{text.split(/\n{2,}/).map((block, i) => {
     if (i === 0 && block.replace(/^# /, "").trim() === omitHeading) return null;
     if (/^#{1,3} /.test(block)) return <h3 key={i} className="pt-2 text-base font-semibold">{block.replace(/^#{1,3} /, "")}</h3>;
     if (block.startsWith("```")) return <pre key={i} className="overflow-auto rounded-md bg-muted p-3 font-mono text-xs">{block.replace(/^```[^\n]*\n?/, "").replace(/\n?```$/, "")}</pre>;
@@ -389,8 +389,8 @@ function MemorySessions({ entries, scope, onError, onChanged }: { entries: any[]
       if (id === counter.current) { setSelected(sessionId); setDetail(value); }
     } catch (e) { onError(message(e)); }
   }
-  if (detail) return <section><Button size="sm" variant="ghost" onClick={() => { counter.current++; setDetail(undefined); }}><ChevronLeft className="h-4 w-4" />{t("Back")}</Button><div className="my-3 text-xs text-muted-foreground">{selected} · {detail.total} {t("events")}</div><div className="divide-y divide-border/60">{rows(detail).map((item, i) => <div key={i} className="py-3"><div className="mb-1 text-xs text-muted-foreground">{item.kind} · {date(item.created_at || item.at)}</div><pre className="whitespace-pre-wrap break-words text-[12px]">{typeof item.body === "string" ? item.body : JSON.stringify(item, null, 2)}</pre></div>)}</div><div className="mt-3 flex gap-2"><Button size="sm" variant="outline" disabled={!detail.offset} onClick={() => void load(selected, Math.max(0, detail.offset - 50))}>{t("Previous")}</Button><Button size="sm" variant="outline" disabled={detail.offset + detail.limit >= detail.total} onClick={() => void load(selected, detail.offset + 50)}>{t("Next")}</Button></div></section>;
-  return <div className="divide-y divide-border/60 border-y border-border/70">{!entries.length && <p className="py-8 text-sm text-muted-foreground">{t("No captured sessions in this project.")}</p>}{entries.map((item) => <div key={item.session_id} className="flex items-center gap-3"><button className="flex w-full items-center justify-between gap-4 px-2 py-3 text-left hover:bg-muted/45" onClick={() => void load(item.session_id)}><span className="min-w-0"><span className="block text-sm font-medium">{item.agent_kind}</span><span className="block truncate text-[11px] text-muted-foreground">{item.cwd || item.session_id}</span></span><span className="shrink-0 text-[11px] text-muted-foreground">{item.observation_count} {t("events")} · {date(item.started_at)}</span></button>{!item.ended_at && <Button size="sm" variant="outline" className="shrink-0" disabled={!!finishing} onClick={() => void finish(item)}>{t("Finish session")}</Button>}</div>)}</div>;
+  if (detail) return <section><Button size="sm" variant="ghost" onClick={() => { counter.current++; setDetail(undefined); }}><ChevronLeft className="h-4 w-4" />{t("Back")}</Button><div className="my-3 text-xs text-muted-foreground">{selected} · {detail.total} {t("events")}</div><div className="divide-y divide-border/60">{rows(detail).map((item, i) => <div key={i} className="py-3"><div className="mb-1 text-xs text-muted-foreground">{item.kind} · {date(item.created_at || item.at)}</div><pre className="whitespace-pre-wrap break-words text-caption">{typeof item.body === "string" ? item.body : JSON.stringify(item, null, 2)}</pre></div>)}</div><div className="mt-3 flex gap-2"><Button size="sm" variant="outline" disabled={!detail.offset} onClick={() => void load(selected, Math.max(0, detail.offset - 50))}>{t("Previous")}</Button><Button size="sm" variant="outline" disabled={detail.offset + detail.limit >= detail.total} onClick={() => void load(selected, detail.offset + 50)}>{t("Next")}</Button></div></section>;
+  return <div className="divide-y divide-border/60 border-y border-border/70">{!entries.length && <p className="py-8 text-sm text-muted-foreground">{t("No captured sessions in this project.")}</p>}{entries.map((item) => <div key={item.session_id} className="flex items-center gap-3"><button className="flex w-full items-center justify-between gap-4 px-2 py-3 text-left hover:bg-muted/45" onClick={() => void load(item.session_id)}><span className="min-w-0"><span className="block text-sm font-medium">{item.agent_kind}</span><span className="block truncate text-label text-muted-foreground">{item.cwd || item.session_id}</span></span><span className="shrink-0 text-label text-muted-foreground">{item.observation_count} {t("events")} · {date(item.started_at)}</span></button>{!item.ended_at && <Button size="sm" variant="outline" className="shrink-0" disabled={!!finishing} onClick={() => void finish(item)}>{t("Finish session")}</Button>}</div>)}</div>;
 }
 
 export function MemoryToolForm({ tool, scope, busy, onRun }: { tool: MemoryTool; scope?: MemoryScope; busy: boolean; onRun: (args: Record<string, unknown>) => void }) {
@@ -427,7 +427,7 @@ export function MemoryToolForm({ tool, scope, busy, onRun }: { tool: MemoryTool;
       return <label key={name} className={`${["body", "instructions", "task", "content"].includes(name) || ["object", "array"].includes(type) ? "sm:col-span-2" : ""} block text-xs font-medium`}><span>{name}{required.includes(name) ? " *" : ""}</span>
         {Array.isArray(schema.enum) || type === "boolean" ? <select className={`${control} mt-1 w-full`} value={values[name] || ""} onChange={(e) => setValues({ ...values, [name]: e.target.value })}><option value="">{t("Default")}</option>{(schema.enum || ["true", "false"]).map((v: any) => <option key={String(v)} value={String(v)}>{String(v)}</option>)}</select> :
           <textarea className={`${textArea} mt-1 min-h-16`} rows={["object", "array"].includes(type) ? 4 : 2} value={values[name] || ""} required={required.includes(name)} placeholder={type === "array" ? "[]" : type === "object" ? "{}" : ""} onChange={(e) => setValues({ ...values, [name]: e.target.value })} />}
-        <span className="mt-1 block text-[11px] font-normal leading-5 text-muted-foreground">{raw.description || schema.description}</span>
+        <span className="mt-1 block text-label font-normal leading-5 text-muted-foreground">{raw.description || schema.description}</span>
       </label>;
     })}</div>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}

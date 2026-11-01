@@ -1,4 +1,4 @@
-import { Layers3 } from "lucide-react";
+import { Layers3 } from "@/components/ui/icons";
 import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
 import { isValidLaunchAlias } from "@agentrouter/core/profiles/alias-validation";
 import { useDraftClose } from "./unsaved-changes";
@@ -115,7 +115,7 @@ export function ProfileView({
   return (
     <div className={documentPageClassName}>
         <PageHeader title={t("Agent profiles")}>
-          <span className="text-[12px] tabular-nums text-muted-foreground">{visibleProfiles.length.toLocaleString()}</span>
+          <span className="text-caption tabular-nums text-muted-foreground">{visibleProfiles.length.toLocaleString()}</span>
           <Button onClick={() => addProfile()} size="sm" type="button">
             <Plus className="h-3.5 w-3.5" />
             {t("Add profile")}
@@ -124,7 +124,7 @@ export function ProfileView({
         <div className="@container min-w-0 overflow-hidden rounded-xl border border-border/70 bg-muted/[0.28]">
           <div className="divide-y divide-border/60">
             {visibleProfiles.length === 0 ? (
-              <div className="flex h-32 items-center justify-center text-[12px] text-muted-foreground">
+              <div className="flex h-32 items-center justify-center text-caption text-muted-foreground">
                 {t("No profiles configured")}
               </div>
             ) : null}
@@ -158,10 +158,10 @@ export function ProfileView({
                   <div className="flex min-w-0 flex-1 items-start gap-3">
                     <AgentLogo agent={profile.agent} />
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-[13px] font-medium">
+                      <div className="truncate text-body font-medium">
                         {profile.name || t("Unnamed")}
                       </div>
-                  <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 text-[11px] leading-5">
+                  <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 text-label leading-5">
                     <span className="font-medium text-foreground">{t(profileAgentLabel(profile.agent))}</span>
                     <span aria-hidden="true" className="text-muted-foreground/50">·</span>
                     <span className="text-muted-foreground">{t(profileScopeLabel(scope))} / {t(profileSurfaceLabel(surface))}</span>
@@ -179,7 +179,7 @@ export function ProfileView({
                     ) : null}
                     </div>
                   {runtimeEntry?.botGateway && (runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || runtimeEntry.botGateway.outboxCount > 0) ? (
-                    <div className="mt-0.5 flex min-w-0 items-baseline gap-1.5 text-[11px] leading-5 text-muted-foreground" title={runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || ""}>
+                    <div className="mt-0.5 flex min-w-0 items-baseline gap-1.5 text-label leading-5 text-muted-foreground" title={runtimeEntry.botGateway.lastError || runtimeEntry.botGateway.lastEventAt || ""}>
                       <span aria-hidden="true" className="text-muted-foreground/50">·</span>
                       <span className="min-w-0 truncate">
                         {runtimeEntry.botGateway.lastError
@@ -298,7 +298,7 @@ export function ProfileView({
           </div>
 
           {applyError ? (
-            <div className="whitespace-pre-wrap rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+            <div className="whitespace-pre-wrap rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
               {t(applyError)}
             </div>
           ) : null}
@@ -326,8 +326,8 @@ function ManagedCompactSetting({
           <div className="flex min-w-0 items-center gap-2">
             <AgentLogo agent={agent} className="h-6 w-6 rounded-[5px]" />
             <div className="min-w-0">
-              <div className="truncate text-[13px] font-semibold">{title}</div>
-              <div className="mt-0.5 text-[12px] leading-5 text-muted-foreground">
+              <div className="truncate text-body font-semibold">{title}</div>
+              <div className="mt-0.5 text-caption leading-5 text-muted-foreground">
                 {t("Use AgentRouter context archive for this profile's auto compact requests.")}
               </div>
             </div>
@@ -370,11 +370,11 @@ export function DeleteProfileDialog({
 
         <DialogBody>
           <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-            <div className="flex items-start gap-2 text-[12px] font-medium text-destructive">
+            <div className="flex items-start gap-2 text-caption font-medium text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>{t("Delete this agent profile from the configuration?")}</span>
             </div>
-            <div className="mt-2 space-y-1 text-[11px] text-muted-foreground">
+            <div className="mt-2 space-y-1 text-label text-muted-foreground">
               <div className="truncate" title={name}>
                 <span className="font-medium text-foreground">{t("Name")}:</span> {name}
               </div>
@@ -461,7 +461,7 @@ export function ProfileOpenDialog({
           <div className="space-y-3">
             <div className="flex min-w-0 items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2">
               <AgentLogo agent={profile.agent} className="h-6 w-6 rounded-[5px]" />
-              <div className="min-w-0 flex-1 truncate text-[13px] font-semibold">{profile.name || profile.id}</div>
+              <div className="min-w-0 flex-1 truncate text-body font-semibold">{profile.name || profile.id}</div>
               {mode === "choose" && surfaces.includes("app") ? (
                 <Button className="shrink-0" disabled={Boolean(busy)} onClick={appRunning ? onStopApp : onChooseApp} size="sm" type="button" variant="outline">
 	                  <AnimatedIconSwap iconKey={busy === "app" ? "busy" : appRunning ? "stop" : "play"}>
@@ -491,7 +491,7 @@ export function ProfileOpenDialog({
               />
             )}
             {error ? (
-              <div className="whitespace-pre-wrap rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+              <div className="whitespace-pre-wrap rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
                 {t(error)}
               </div>
             ) : null}
@@ -538,9 +538,9 @@ function ProfileCliCommandBlock({
 }) {
   return (
     <div className="space-y-2">
-      <div className="text-[12px] font-medium text-muted-foreground">{t("CLI command")}</div>
+      <div className="text-caption font-medium text-muted-foreground">{t("CLI command")}</div>
       <div className="flex min-w-0 items-center gap-2 rounded-md border border-border bg-muted/20 p-2">
-        <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded-[5px] bg-background px-2 py-2 font-mono text-[12px] text-foreground">
+        <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded-[5px] bg-background px-2 py-2 font-mono text-caption text-foreground">
           {command || t("Loading")}
         </code>
         <Button aria-label={copied ? t("Copied") : t("Copy")} disabled={!command} onClick={onCopy} size="iconSm" title={copied ? t("Copied") : t("Copy")} type="button" variant={copied ? "default" : "outline"}>
@@ -643,7 +643,7 @@ function AgentSelectControl({
         aria-expanded={open}
         aria-haspopup="listbox"
         className={cn(
-          "flex h-8 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-3 text-left text-[12px] font-medium shadow-[inset_0_1px_1px_rgba(0,0,0,0.03)] outline-none transition-[background-color,border-color,box-shadow,color] hover:border-muted-foreground/45 focus-visible:border-primary/60 focus-visible:ring-2 focus-visible:ring-ring/25",
+          "flex h-8 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-3 text-left text-caption font-medium shadow-[inset_0_1px_1px_rgba(0,0,0,0.03)] outline-none transition-[background-color,border-color,box-shadow,color] hover:border-muted-foreground/45 focus-visible:border-primary/60 focus-visible:ring-2 focus-visible:ring-ring/25",
           open && "border-ring/35 bg-muted/40"
         )}
         onClick={() => setOpen((current) => !current)}
@@ -690,7 +690,7 @@ function AgentSelectControl({
                     <button
                       aria-selected={selected}
                       className={cn(
-                        "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
+                        "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
                         selected ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted"
                       )}
                       key={agent}
@@ -1004,8 +1004,8 @@ export function AddProfileForm({
               type="button"
             >
               <span className="min-w-0">
-                <span className="block truncate text-[12px] font-semibold text-foreground">{t("Advanced settings")}</span>
-                <span className={cn("mt-0.5 block truncate text-[11px]", advancedIssueCount > 0 ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>
+                <span className="block truncate text-caption font-semibold text-foreground">{t("Advanced settings")}</span>
+                <span className={cn("mt-0.5 block truncate text-label", advancedIssueCount > 0 ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>
                   {advancedSummary}
                 </span>
               </span>
@@ -1051,7 +1051,7 @@ export function AddProfileForm({
                     </Field>
                     {draft.agent === "codex" ? (
                       <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/20 px-3 py-2">
-                        <span className="text-[12px] font-medium">{t("Show all sessions")}</span>
+                        <span className="text-caption font-medium">{t("Show all sessions")}</span>
                         <Toggle checked={draft.showAllSessions} onChange={(showAllSessions) => onChange({ showAllSessions })} />
                       </div>
                     ) : null}
@@ -1110,13 +1110,13 @@ export function AddProfileForm({
         ) : null}
       </div>
       {validation.models ? (
-        <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-amber-700 dark:text-amber-300">
+        <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-caption text-amber-700 dark:text-amber-300">
           <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>{t(validation.models)}</span>
         </div>
       ) : null}
       {error ? (
-        <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+        <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
           {t(error)}
         </div>
       ) : null}
@@ -1187,9 +1187,9 @@ function ProfileRoutingSettings({
     <div className="sm:col-span-2 rounded-md border border-border bg-muted/20 p-3">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
-          <div className="text-[12px] font-semibold">{t("Profile routing")}</div>
+          <div className="text-caption font-semibold">{t("Profile routing")}</div>
           {draft.routingEnabled ? (
-            <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+            <div className="mt-0.5 truncate text-label text-muted-foreground">
               {`${draft.routingRules.length} ${t(draft.routingRules.length === 1 ? "route" : "routes")}`}
             </div>
           ) : null}
@@ -1203,7 +1203,7 @@ function ProfileRoutingSettings({
         <div className="mt-3 grid grid-cols-1 gap-3 border-t border-border/70 pt-3">
           <div className="rounded-md border border-border bg-background p-3">
             <div className="flex min-w-0 items-center justify-between gap-3">
-              <span className="text-[12px] font-medium">{t("Profile routes")}</span>
+              <span className="text-caption font-medium">{t("Profile routes")}</span>
               <Button onClick={openAddRuleDialog} size="sm" type="button" variant="outline">
                 <Plus className="h-3.5 w-3.5" />
                 {t("Add")}
@@ -1211,7 +1211,7 @@ function ProfileRoutingSettings({
             </div>
             <div className="mt-3 space-y-2 border-t border-border/70 pt-3">
               {draft.routingRules.length === 0 ? (
-                <div className="rounded-md border border-dashed border-border bg-muted/20 px-3 py-2 text-[12px] text-muted-foreground">
+                <div className="rounded-md border border-dashed border-border bg-muted/20 px-3 py-2 text-caption text-muted-foreground">
                   {t("No routing rules configured")}
                 </div>
               ) : draft.routingRules.map((rule, index) => (
@@ -1222,14 +1222,14 @@ function ProfileRoutingSettings({
                     type="button"
                   >
                     <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                      <span className="truncate text-[12px] font-semibold">{rule.name || t("Unnamed")}</span>
+                      <span className="truncate text-caption font-semibold">{rule.name || t("Unnamed")}</span>
                       <Badge variant={rule.enabled ? "success" : "outline"}>{t(rule.enabled ? "Enabled" : "Disabled")}</Badge>
                       <Badge variant="outline">{t(routerRuleTypeLabel(rule.type))}</Badge>
                     </div>
-                    <div className="mt-1 min-w-0 truncate text-[11px] text-muted-foreground" title={formatRouterRuleCondition(rule)}>
+                    <div className="mt-1 min-w-0 truncate text-label text-muted-foreground" title={formatRouterRuleCondition(rule)}>
                       {formatRouterRuleCondition(rule)}
                     </div>
-                    <div className="mt-0.5 min-w-0 truncate font-mono text-[11px] text-muted-foreground" title={formatRouterRuleTarget(rule)}>
+                    <div className="mt-0.5 min-w-0 truncate font-mono text-label text-muted-foreground" title={formatRouterRuleTarget(rule)}>
                       {formatRouterRuleTarget(rule)}
                     </div>
                   </button>
@@ -1279,7 +1279,7 @@ function ProfileEnhancedRouteSetting({
     <div className="sm:col-span-2 rounded-md border border-border bg-muted/20 p-3">
       <div className="flex min-w-0 items-center justify-between gap-3">
         <span className="flex min-w-0 items-center gap-1.5">
-          <span className="text-[12px] font-semibold">{t("Enhanced route")}</span>
+          <span className="text-caption font-semibold">{t("Enhanced route")}</span>
           <Tooltip
             aria-label={enhancedRouteDescription}
             className="h-5 w-5 items-center justify-center rounded-full text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
@@ -1324,7 +1324,7 @@ function ClaudeConfigEditor({
         <div className="min-w-0">
           <div className="flex min-w-0 items-center gap-2">
             <Settings className="h-4 w-4 shrink-0 text-muted-foreground" />
-            <span className="truncate text-[12px] font-semibold">{t("Claude settings")}</span>
+            <span className="truncate text-caption font-semibold">{t("Claude settings")}</span>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -1455,7 +1455,7 @@ function ClaudeConfigEditorContent({
           ] as const).map((item) => (
             <button
               className={cn(
-                "h-7 rounded-[5px] px-3 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
+                "h-7 rounded-[5px] px-3 text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
                 tab === item.value ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted/70 hover:text-foreground"
               )}
               key={item.value}
@@ -1496,7 +1496,7 @@ function ClaudeConfigEditorContent({
 
       <div className="min-h-0 flex-1 overflow-auto bg-background">
         {filteredOptions.length === 0 ? (
-          <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">
+          <div className="px-3 py-8 text-center text-caption text-muted-foreground">
             {t(tab === CLAUDE_CONFIG_SETTINGS_TAB ? "No matching Claude settings" : "No matching environment variables")}
           </div>
         ) : filteredOptions.map((option) => {
@@ -1515,14 +1515,14 @@ function ClaudeConfigEditorContent({
           return (
             <div className="grid min-w-0 gap-2 border-b border-border/60 p-3 last:border-b-0" key={`${tab}-${option.key}`}>
               <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                <code className="min-w-0 truncate rounded border border-border bg-muted/30 px-1.5 py-0.5 font-mono text-[11px] font-semibold">
+                <code className="min-w-0 truncate rounded border border-border bg-muted/30 px-1.5 py-0.5 font-mono text-label font-semibold">
                   {option.key}
                 </code>
                 {option.valueKind ? <Badge variant="outline">{option.valueKind}</Badge> : null}
                 {active ? <Badge variant="success">{t("Set")}</Badge> : null}
               </div>
               {description ? (
-                <div className="text-[11px] leading-4 text-muted-foreground">
+                <div className="text-label leading-4 text-muted-foreground">
                   {description}
                 </div>
               ) : null}
@@ -1538,7 +1538,7 @@ function ClaudeConfigEditorContent({
                   </div>
                 ) : (
                   <Input
-                    className="min-h-8 flex-1 font-mono text-[12px]"
+                    className="min-h-8 flex-1 font-mono text-caption"
                     disabled={managedOnly}
                     placeholder={managedOnly ? t("Managed settings can only be set by administrators.") : claudeConfigPlaceholder(option, tab)}
                     value={managedOnly ? "" : rawValue}
@@ -1835,7 +1835,7 @@ function createProfileRoutingRuleDraftFromRule(rule: RouterRule): AddRoutingRule
 }
 
 function ProfileFieldHint({ children }: { children: ReactNode }) {
-  return <div className="text-[11px] leading-4 text-amber-700 dark:text-amber-300">{children}</div>;
+  return <div className="text-label leading-4 text-amber-700 dark:text-amber-300">{children}</div>;
 }
 
 function firstProfileModelPlaceholder(providers: ReturnType<typeof profileModelProviderOptions>): string {
@@ -2082,7 +2082,7 @@ function BotGatewaySelectForm({
     <div className="rounded-md border border-border bg-muted/20 px-3 py-2">
       <div className="flex min-w-0 items-center justify-between gap-3">
         <span className="flex min-w-0 items-center gap-1.5">
-          <span className="text-[12px] font-medium">{t("Bot")}</span>
+          <span className="text-caption font-medium">{t("Bot")}</span>
           <Tooltip
             content={botScopeHint}
             contentClassName="w-[260px] max-w-[calc(100vw-64px)] whitespace-normal px-2 py-1.5 text-left font-medium leading-4 sm:w-[280px]"
@@ -2110,12 +2110,12 @@ function BotGatewaySelectForm({
           {selectedBot ? (
             <>
               <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2">
-                <span className="text-[12px] font-medium">{t("Forward agent messages")}</span>
+                <span className="text-caption font-medium">{t("Forward agent messages")}</span>
                 <Toggle checked={draft.botForwardAllAgentMessages} onChange={(botForwardAllAgentMessages) => onChange({ botForwardAllAgentMessages })} />
               </div>
               <div className="rounded-md border border-border bg-background p-3">
                 <div className="flex min-w-0 items-center justify-between gap-3">
-                  <span className="text-[12px] font-medium">{t("Handoff")}</span>
+                  <span className="text-caption font-medium">{t("Handoff")}</span>
                   <Toggle checked={draft.botHandoffEnabled} onChange={(botHandoffEnabled) => onChange({ botHandoffEnabled })} />
                 </div>
                 {draft.botHandoffEnabled ? (
@@ -2144,7 +2144,7 @@ function BotGatewaySelectForm({
                       onRefresh={() => void scanHandoffTargets("bluetooth")}
                       onSelect={(botHandoffPhoneBluetoothTargets) => onChange({ botHandoffPhoneBluetoothTargets })}
                     />
-                    <div className="sm:col-span-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] leading-4 text-amber-700 dark:text-amber-300">
+                    <div className="sm:col-span-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-label leading-4 text-amber-700 dark:text-amber-300">
                       {t("Phone presence targets are experimental and do not affect runtime handoff yet. Handoff currently uses screen lock and idle time.")}
                     </div>
                   </div>
@@ -2204,7 +2204,7 @@ function HandoffTargetPicker({
 
   return (
     <div className={cn("min-w-0 space-y-1", className)}>
-      <span className="block truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
+      <span className="block truncate text-label font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
       <div className="flex min-w-0 items-center gap-2">
         <Select
           className="min-w-0 flex-1"
@@ -2226,12 +2226,12 @@ function HandoffTargetPicker({
         </Button>
       </div>
       {selectedOption?.detail ? (
-        <div className="truncate text-[11px] text-muted-foreground" title={selectedOption.detail}>
+        <div className="truncate text-label text-muted-foreground" title={selectedOption.detail}>
           {selectedOption.detail}
         </div>
       ) : null}
       {scan.error ? (
-        <div className="break-words text-[11px] text-destructive">{scan.error}</div>
+        <div className="break-words text-label text-destructive">{scan.error}</div>
       ) : null}
     </div>
   );
@@ -2313,7 +2313,7 @@ export function AddProfileDialog({
   if (inline) {
     return (
       <>
-        <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
+        <div className="local-usage-page mx-auto w-full max-w-page px-5 py-6 sm:px-9 sm:py-8">
           <PageHeader title={mode === "edit" ? t("Edit Profile") : t("Add Profile")}>
             <Button disabled={submitting} onClick={close} type="button" variant="ghost">{t("Cancel")}</Button>
           </PageHeader>

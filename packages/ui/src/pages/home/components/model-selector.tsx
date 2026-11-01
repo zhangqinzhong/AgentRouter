@@ -181,7 +181,7 @@ export function ModelSelector({
     <div className="relative min-w-0" ref={rootRef}>
       <div
         className={cn(
-          "flex h-10 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-3 text-left text-[12px] shadow-[inset_0_1px_1px_rgba(0,0,0,0.03)] outline-none transition-[background-color,border-color,box-shadow,color] hover:border-muted-foreground/45 focus-visible:border-primary/60 focus-visible:ring-2 focus-visible:ring-ring/25",
+          "flex h-10 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-3 text-left text-caption shadow-[inset_0_1px_1px_rgba(0,0,0,0.03)] outline-none transition-[background-color,border-color,box-shadow,color] hover:border-muted-foreground/45 focus-visible:border-primary/60 focus-visible:ring-2 focus-visible:ring-ring/25",
           open && "border-ring/35 bg-muted/40",
           !value.trim() && "text-muted-foreground"
         )}
@@ -246,7 +246,7 @@ export function ModelSelector({
                 </div>
 
                 {providerOptions.length === 0 ? (
-                  <div className="mt-2 rounded-md border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-[12px] text-muted-foreground">
+                  <div className="mt-2 rounded-md border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-caption text-muted-foreground">
                     {t("No models configured")}
                   </div>
                 ) : (
@@ -256,14 +256,14 @@ export function ModelSelector({
                   >
                     <div className="min-w-0 overflow-auto border-r border-border bg-muted/30 p-1">
                       {filteredProviders.length === 0 ? (
-                        <div className="px-2 py-6 text-center text-[11px] text-muted-foreground">{t("No matching providers")}</div>
+                        <div className="px-2 py-6 text-center text-label text-muted-foreground">{t("No matching providers")}</div>
                       ) : null}
                       {filteredProviders.map((provider) => {
                         const active = provider.name === activeProvider?.name;
                         return (
                           <button
                             className={cn(
-                              "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-[12px] outline-none transition-colors hover:bg-background focus-visible:ring-2 focus-visible:ring-ring/25",
+                              "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-caption outline-none transition-colors hover:bg-background focus-visible:ring-2 focus-visible:ring-ring/25",
                               active && "bg-background text-primary"
                             )}
                             key={provider.name}
@@ -278,10 +278,10 @@ export function ModelSelector({
                     </div>
                     <div className="min-w-0 overflow-auto bg-background p-1">
                       {!activeProvider ? (
-                        <div className="px-2 py-10 text-center text-[12px] text-muted-foreground">{t("No matching models")}</div>
+                        <div className="px-2 py-10 text-center text-caption text-muted-foreground">{t("No matching models")}</div>
                       ) : null}
                       {activeProvider && filteredModels.length === 0 ? (
-                        <div className="px-2 py-10 text-center text-[12px] text-muted-foreground">{t("No matching models")}</div>
+                        <div className="px-2 py-10 text-center text-caption text-muted-foreground">{t("No matching models")}</div>
                       ) : null}
                       {activeProvider && filteredModels.map((model) => {
                         const selected = parsedValue.provider === activeProvider.name && parsedValue.model === model;
@@ -289,7 +289,7 @@ export function ModelSelector({
                         return (
                           <button
                             className={cn(
-                              "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-[12px] outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/25",
+                              "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-caption outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/25",
                               selected && "bg-primary/10 text-primary"
                             )}
                             key={`${activeProvider.name}/${model}`}
@@ -393,10 +393,10 @@ export function ModelMultiSelector({
       </div>
       <div className="border-y border-border/70">
         <div className="flex min-h-9 items-center justify-between gap-3 border-b border-border/60 px-2.5 py-1.5">
-          <span className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
+          <span className="text-label font-semibold uppercase tracking-widest text-muted-foreground">
             {t("Allowed model list")}
           </span>
-          <span className="flex items-center gap-2.5 text-[11px] text-muted-foreground">
+          <span className="flex items-center gap-2.5 text-label text-muted-foreground">
             <span className="tabular-nums">{selected.size.toLocaleString()} / {models.length.toLocaleString()}</span>
             {models.length > 0 ? (
               <button
@@ -411,7 +411,7 @@ export function ModelMultiSelector({
         </div>
         <div className="max-h-[300px] min-w-0 overflow-y-auto">
           {models.length === 0 ? (
-            <div className="px-3 py-6 text-center text-[12px] text-muted-foreground">
+            <div className="px-3 py-6 text-center text-caption text-muted-foreground">
               {t(providerOptions.length === 0 ? "No models configured" : "No matching models")}
             </div>
           ) : null}
@@ -437,11 +437,11 @@ export function ModelMultiSelector({
                 >
                   <Checkbox aria-hidden="true" checked={checked} className="pointer-events-none" disabled={locked} tabIndex={-1} />
                   <span className="min-w-0 flex-1">
-                    <span className={cn("block truncate text-[12px]", checked ? "font-medium text-foreground" : "text-foreground/90")}>
+                    <span className={cn("block truncate text-caption", checked ? "font-medium text-foreground" : "text-foreground/90")}>
                       {model.provider} / {model.displayName}
                     </span>
                     {model.displayName !== modelId ? (
-                      <span className="block truncate font-mono text-[10px] text-muted-foreground">{model.value}</span>
+                      <span className="block truncate font-mono text-2xs text-muted-foreground">{model.value}</span>
                     ) : null}
                   </span>
                 </button>

@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { FolderPlus, LoaderCircle } from "lucide-react";
+import { FolderPlus, LoaderCircle } from "@/components/ui/icons";
 import { Button } from "@/components/ui/button";
 import type { MemoryProjectInstallation, MemoryProjectPlan, MemoryProjectSetup, MemoryRequest } from "@agentrouter/core/contracts/memory";
 import { useAppText } from "../shared/i18n";
 
-const control = "mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[13px]";
+const control = "mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-body";
 async function call<T>(request: MemoryRequest): Promise<T> { if (!window.agentrouter?.memory) throw new Error("Memory service is unavailable."); return await window.agentrouter.memory(request) as T; }
 export function MemoryProjectSetupPanel() {
   const t = useAppText();
@@ -32,8 +32,8 @@ export function MemoryProjectSetupPanel() {
   }
   return <section className="mb-7 rounded-xl border border-border/70 p-5">
     <h2 className="flex items-center gap-2 text-sm font-semibold"><FolderPlus className="h-4 w-4" />{t("Project connection")}</h2>
-    <p className="mt-2 text-[13px] text-muted-foreground">{t("Choose which project to capture. Project instructions guide the agent to retrieve memory; skills provide the detailed workflow.")}</p>
-    {installed.length > 0 && <div className="my-4 divide-y divide-border/60">{installed.map((p) => <button key={`${p.directory}:${p.family}`} className="block w-full py-3 text-left" disabled={busy} onClick={() => { setSetup({ directory: p.directory, workspace: p.workspace, project: p.project, family: p.family }); setPlan(undefined); }}><span className="text-[13px] font-medium">{p.workspace} / {p.project}</span><span className={`ml-3 text-xs ${p.configured ? "text-emerald-600" : "text-amber-600"}`}>{t(p.configured ? "Project files configured" : "Project files changed")}</span><span className="mt-1 block break-all text-xs text-muted-foreground">{p.directory} · {p.family}</span></button>)}</div>}
+    <p className="mt-2 text-body text-muted-foreground">{t("Choose which project to capture. Project instructions guide the agent to retrieve memory; skills provide the detailed workflow.")}</p>
+    {installed.length > 0 && <div className="my-4 divide-y divide-border/60">{installed.map((p) => <button key={`${p.directory}:${p.family}`} className="block w-full py-3 text-left" disabled={busy} onClick={() => { setSetup({ directory: p.directory, workspace: p.workspace, project: p.project, family: p.family }); setPlan(undefined); }}><span className="text-body font-medium">{p.workspace} / {p.project}</span><span className={`ml-3 text-xs ${p.configured ? "text-emerald-600" : "text-amber-600"}`}>{t(p.configured ? "Project files configured" : "Project files changed")}</span><span className="mt-1 block break-all text-xs text-muted-foreground">{p.directory} · {p.family}</span></button>)}</div>}
     <fieldset disabled={busy} className="mt-4 space-y-3">
       <label className="block text-xs text-muted-foreground">{t("Project directory")}<input aria-label={t("Project directory")} className={control} placeholder="/path/to/project" value={setup.directory} onChange={(e) => update("directory", e.target.value)} /></label>
       <div className="grid gap-3 sm:grid-cols-3">
@@ -47,7 +47,7 @@ export function MemoryProjectSetupPanel() {
     {notice && <p role="status" className="mt-3 text-sm text-emerald-600">{notice}</p>}
     {plan && <div className="mt-4 space-y-3 border-t border-border/70 pt-4">
       <p className="text-xs text-muted-foreground">{t("Apply these project files to enable capture and startup briefings. Existing instructions are preserved; changed files are backed up.")}</p>
-      {plan.files.map((file) => <details key={file.path} className="rounded-md border border-border/60 p-3"><summary className="cursor-pointer break-all text-xs">{file.path} · {t(file.changed ? "Will update" : "Unchanged")}</summary><pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap break-words text-[11px]">{file.content}</pre></details>)}
+      {plan.files.map((file) => <details key={file.path} className="rounded-md border border-border/60 p-3"><summary className="cursor-pointer break-all text-xs">{file.path} · {t(file.changed ? "Will update" : "Unchanged")}</summary><pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap break-words text-label">{file.content}</pre></details>)}
       <Button size="sm" disabled={busy} onClick={() => void apply()}>{t("Enable project memory")}</Button>
     </div>}
   </section>;

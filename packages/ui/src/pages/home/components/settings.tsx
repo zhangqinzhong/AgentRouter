@@ -2,7 +2,7 @@ import { DataSourcesSettingsPage } from "./data-sources";
 import { normalizePageDefaultRanges, PAGE_DEFAULT_RANGE_OPTIONS } from "@agentrouter/core/config/page-default-ranges";
 import type { PageDefaultRanges } from "@agentrouter/core/contracts/app";
 import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft } from "@/components/ui/icons";
 import {
   Activity, AppConfig, AppCopy, AppInfo, AppLanguagePreference, Boxes, BotGatewayConfigDraft, botGatewayAuthSpecsForPlatform,
   botGatewayDefaultAuthType, botGatewayFieldsForAuth, botGatewayPickAuthFields, botGatewayPlatformLabel, botGatewayPlatformOptions,
@@ -34,7 +34,7 @@ function SettingsPanel({ children, className }: { children: ReactNode; className
 function SettingsControlRow({ children, label }: { children: ReactNode; label: string }) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 py-3.5">
-      <span className="text-[13px] font-medium">{label}</span>
+      <span className="text-body font-medium">{label}</span>
       <div className="w-full min-w-[180px] sm:w-[240px]">{children}</div>
     </div>
   );
@@ -283,7 +283,7 @@ function SettingsPageButton({
   return (
     <Button
       className={cn(
-        "flex h-9 shrink-0 items-center gap-2 rounded-lg px-2.5 text-left text-[13px] transition-colors lg:w-full",
+        "flex h-9 shrink-0 items-center gap-2 rounded-lg px-2.5 text-left text-body transition-colors lg:w-full",
         active
           ? "bg-foreground/[0.06] font-medium text-foreground"
           : "font-normal text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
@@ -332,10 +332,10 @@ function AppearanceSettingsPage({
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
       <SettingsPanel className="divide-y divide-border/60">
         <SettingsControlRow label={copy.settings.theme}>
-          <Select aria-label={copy.settings.theme} className="w-full text-[12px] shadow-none" onValueChange={onChangeTheme} options={themeOptions} value={themePreference} />
+          <Select aria-label={copy.settings.theme} className="w-full text-caption shadow-none" onValueChange={onChangeTheme} options={themeOptions} value={themePreference} />
         </SettingsControlRow>
         <SettingsControlRow label={copy.settings.language}>
-          <Select aria-label={copy.settings.language} className="w-full text-[12px] shadow-none" onValueChange={onChangeLanguage} options={languageOptions} value={languagePreference} />
+          <Select aria-label={copy.settings.language} className="w-full text-caption shadow-none" onValueChange={onChangeLanguage} options={languageOptions} value={languagePreference} />
         </SettingsControlRow>
       </SettingsPanel>
     </div>
@@ -399,10 +399,10 @@ export function PageDefaultRangeSettings({ config, updateConfig }: {
   };
   return <section className="grid gap-3">
     <h2 className="text-sm font-medium">{t("Default time ranges")}</h2>
-    <p className="text-[12px] text-muted-foreground">{t("Choose the initial time range for each page. Changes apply the next time you open that page.")}</p>
+    <p className="text-caption text-muted-foreground">{t("Choose the initial time range for each page. Changes apply the next time you open that page.")}</p>
     <SettingsPanel className="divide-y divide-border/60">
       {pages.map(([page, label]) => <SettingsControlRow key={page} label={t(label)}>
-        <Select aria-label={`${t(label)} · ${t("Default time range")}`} className="w-full text-[12px] shadow-none"
+        <Select aria-label={`${t(label)} · ${t("Default time range")}`} className="w-full text-caption shadow-none"
           value={String(ranges[page])}
           options={PAGE_DEFAULT_RANGE_OPTIONS[page].map(value => ({ value: String(value), label: t(labels[String(value)]) }))}
           onValueChange={value => updateConfig(current => ({ ...current,
@@ -727,7 +727,7 @@ function ToolHubSettingsPage({
   return (
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
       <div className="grid gap-1">
-        <p className="text-[12px] leading-5 text-muted-foreground">{copy.settings.toolHubDescription}</p>
+        <p className="text-caption leading-5 text-muted-foreground">{copy.settings.toolHubDescription}</p>
       </div>
       <SettingsPanel>
         <SettingsSwitchRow
@@ -780,7 +780,7 @@ function ToolHubSettingsPage({
           <div className="grid grid-cols-1 gap-3 px-4 py-4">
             <div className="flex min-w-0 items-center justify-between gap-3">
               <div className="min-w-0">
-                <div className="truncate text-[12px] font-semibold text-foreground">{t("MCP servers")}</div>
+                <div className="truncate text-caption font-semibold text-foreground">{t("MCP servers")}</div>
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 <Button onClick={openImportMcpJsonDialog} size="sm" type="button" variant="outline">
@@ -793,7 +793,7 @@ function ToolHubSettingsPage({
               </div>
             </div>
             {toolHub.mcpServers.length === 0 ? (
-              <div className="border-t border-border/70 py-5 text-[12px] text-muted-foreground">
+              <div className="border-t border-border/70 py-5 text-caption text-muted-foreground">
                 {t("No MCP servers configured")}
               </div>
             ) : (
@@ -801,8 +801,8 @@ function ToolHubSettingsPage({
                 {toolHub.mcpServers.map((server, index) => (
                   <div key={`${server.name}-${index}`} className="flex min-w-0 items-center gap-2 border-b border-border/60 py-3 transition-colors hover:bg-muted/45">
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-[12px] font-semibold text-foreground" title={server.name}>{server.name}</div>
-                      <div className="truncate text-[11px] text-muted-foreground" title={mcpServerEndpointSummary(server)}>
+                      <div className="truncate text-caption font-semibold text-foreground" title={server.name}>{server.name}</div>
+                      <div className="truncate text-label text-muted-foreground" title={mcpServerEndpointSummary(server)}>
                         {server.transport} · {mcpServerEndpointSummary(server)}
                       </div>
                     </div>
@@ -946,7 +946,7 @@ function ToolHubMcpServerDialog({
               </Field>
             </div>
             {error ? (
-              <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">{t(error)}</div>
+              <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">{t(error)}</div>
             ) : null}
           </div>
         </DialogBody>
@@ -996,7 +996,7 @@ function ToolHubMcpJsonDialog({
           <div className="grid grid-cols-1 gap-3">
             <Field label={t("MCP JSON")}>
               <Textarea
-                className="min-h-[260px] font-mono text-[12px]"
+                className="min-h-[260px] font-mono text-caption"
                 onChange={(event) => onChange(event.target.value)}
                 placeholder={[
                   '{',
@@ -1012,7 +1012,7 @@ function ToolHubMcpJsonDialog({
               />
             </Field>
             {error ? (
-              <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">{t(error)}</div>
+              <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">{t(error)}</div>
             ) : null}
           </div>
         </DialogBody>
@@ -1155,8 +1155,8 @@ function SettingsSwitchRow({
         <Icon className="h-4 w-4" />
       </span>
       <div className="min-w-0 flex-1">
-        <div className="text-[13px] font-semibold text-foreground">{label}</div>
-        <div className="mt-0.5 text-[11px] leading-4 text-muted-foreground">{description}</div>
+        <div className="text-body font-semibold text-foreground">{label}</div>
+        <div className="mt-0.5 text-label leading-4 text-muted-foreground">{description}</div>
       </div>
       <Switch aria-label={label} checked={checked} onCheckedChange={onChange} />
     </div>
@@ -1217,8 +1217,8 @@ function DataSettingsSection({
             <Database className="h-4 w-4" />
           </span>
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-semibold text-foreground">{t("Export data")}</div>
-            <div className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
+            <div className="text-body font-semibold text-foreground">{t("Export data")}</div>
+            <div className="mt-0.5 text-label leading-4 text-muted-foreground">
               {t("Export current configuration and SQLite data into a single JSON backup file. The export contains API keys and should be stored securely.")}
             </div>
           </div>
@@ -1228,12 +1228,12 @@ function DataSettingsSection({
           </Button>
         </div>
         {exportedFile ? (
-          <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-200">
+          <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-label text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-200">
             <span className="font-medium">{t("Exported")}:</span> <span className="break-all">{exportedFile}</span>
           </div>
         ) : null}
         {error ? (
-          <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] text-destructive">
+          <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-label text-destructive">
             {error}
           </div>
         ) : null}
@@ -1252,8 +1252,8 @@ function DataPathRow({
 }) {
   return (
     <div className="grid min-w-0 gap-1 rounded-md bg-muted/20 px-2 py-2 sm:grid-cols-[160px_minmax(0,1fr)] sm:items-center">
-      <div className="text-[11px] font-medium text-muted-foreground">{label}</div>
-      <div className="min-w-0 break-all font-mono text-[11px] text-foreground">{value}</div>
+      <div className="text-label font-medium text-muted-foreground">{label}</div>
+      <div className="min-w-0 break-all font-mono text-label text-foreground">{value}</div>
     </div>
   );
 }
@@ -1307,7 +1307,7 @@ function BotSettingsPage({
     <div className={cn(settingsPageContentWidthClassName, "grid grid-cols-1 gap-5")}>
       <div className="flex min-w-0 items-center justify-between gap-3">
         <div className="min-w-0">
-          <div className="text-[12px] text-muted-foreground">{t("Manage bots used by agent profiles.")}</div>
+          <div className="text-caption text-muted-foreground">{t("Manage bots used by agent profiles.")}</div>
         </div>
         <Button onClick={() => setEditor({ mode: "add" })} size="sm" type="button">
           {t("Add bot")}
@@ -1316,7 +1316,7 @@ function BotSettingsPage({
 
       <SettingsPanel className="divide-y divide-border/60">
         {botConfigs.length === 0 ? (
-          <div className="px-4 py-12 text-center text-[12px] text-muted-foreground">
+          <div className="px-4 py-12 text-center text-caption text-muted-foreground">
             {t("No bots configured")}
           </div>
         ) : null}
@@ -1325,8 +1325,8 @@ function BotSettingsPage({
           return (
             <div className="flex min-w-0 items-center justify-between gap-3 px-4 py-3.5 transition-colors hover:bg-muted/45" key={config.id}>
               <div className="min-w-0">
-                <div className="truncate text-[13px] font-semibold text-foreground">{config.name}</div>
-                <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                <div className="truncate text-body font-semibold text-foreground">{config.name}</div>
+                <div className="mt-0.5 truncate text-label text-muted-foreground">
                   {t(botGatewayPlatformLabel(config.botGateway.platform))}
                   {config.botGateway.authType ? ` / ${t(authMethodLabel(config.botGateway.platform, config.botGateway.authType))}` : ""}
                   {usedByProfiles.length > 0 ? ` · ${botUsageCountLabel(usedByProfiles.length, t)}` : ""}
@@ -1410,11 +1410,11 @@ function DeleteBotDialog({
         </DialogHeader>
         <DialogBody>
           <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-            <div className="flex items-start gap-2 text-[12px] font-medium text-destructive">
+            <div className="flex items-start gap-2 text-caption font-medium text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>{isBlocked ? t("This bot is being used by the following agents and cannot be deleted.") : t("Delete this bot?")}</span>
             </div>
-            <div className="mt-2 space-y-1 text-[11px] text-muted-foreground">
+            <div className="mt-2 space-y-1 text-label text-muted-foreground">
               <div className="truncate" title={config.name}>
                 <span className="font-medium text-foreground">{t("Name")}:</span> {config.name}
               </div>
@@ -1834,24 +1834,24 @@ function BotConfigDialog({
             </Field>
             {streamRepliesSupported ? (
               <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
-                <span className="text-[12px] font-medium">{t("Stream replies and progress")}</span>
+                <span className="text-caption font-medium">{t("Stream replies and progress")}</span>
                 <Switch checked={draft.botStreamReplies} onCheckedChange={(checked) => update({ botStreamReplies: checked })} />
               </div>
             ) : null}
             <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
-              <span className="text-[12px] font-medium">{t("Send and receive attachments")}</span>
+              <span className="text-caption font-medium">{t("Send and receive attachments")}</span>
               <Switch checked={draft.botMediaEnabled} onCheckedChange={(checked) => update({ botMediaEnabled: checked })} />
             </div>
             <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
               <div>
-                <div className="text-[12px] font-medium">{t("Allow Agent shell tools")}</div>
-                <div className="mt-0.5 text-[11px] text-muted-foreground">{t("Controls Agent tool permission; it does not add a Bot shell command.")}</div>
+                <div className="text-caption font-medium">{t("Allow Agent shell tools")}</div>
+                <div className="mt-0.5 text-label text-muted-foreground">{t("Controls Agent tool permission; it does not add a Bot shell command.")}</div>
               </div>
               <Switch checked={draft.botShellEnabled} onCheckedChange={(checked) => update({ botShellEnabled: checked })} />
             </div>
           </fieldset>
           {error ? (
-            <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+            <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
               {error}
             </div>
           ) : null}
@@ -2140,11 +2140,11 @@ export function TraySettingsPage({
     return (
       <SettingsPanel className={cn(settingsPageContentWidthClassName, "divide-y divide-border/60")}>
         <label className="flex items-center justify-between gap-4 px-4 py-3.5">
-          <span className="text-[13px] font-medium">{copy.settings.trayShowTokenUsage}</span>
+          <span className="text-body font-medium">{copy.settings.trayShowTokenUsage}</span>
           <Switch aria-label={copy.settings.trayShowTokenUsage} checked={trayShowTokenUsage} onCheckedChange={onChangeTrayShowTokenUsage} />
         </label>
         {onChangeTrayPetEnabled ? <label className="flex items-center justify-between gap-4 px-4 py-3.5">
-          <span className="text-[13px] font-medium">{copy.settings.trayPetEnabled}</span>
+          <span className="text-body font-medium">{copy.settings.trayPetEnabled}</span>
           <Switch aria-label={copy.settings.trayPetEnabled} checked={trayPetEnabled} onCheckedChange={onChangeTrayPetEnabled} />
         </label> : null}
       </SettingsPanel>
@@ -2181,12 +2181,12 @@ export function TraySettingsPage({
                   value={progressMeterValue}
                 />
               </Field>
-              <div className="basis-full text-[11px] font-medium text-muted-foreground">
+              <div className="basis-full text-label font-medium text-muted-foreground">
                 {copy.settings.trayBalanceProgressRequired}
               </div>
             </>
           ) : (
-            <div className="min-w-[240px] flex-1 rounded-md border border-dashed border-border bg-muted/30 px-3 py-2 text-[12px] text-muted-foreground">
+            <div className="min-w-[240px] flex-1 rounded-md border border-dashed border-border bg-muted/30 px-3 py-2 text-caption text-muted-foreground">
               {copy.settings.trayBalanceProgressNoData}
             </div>
           )
@@ -2194,7 +2194,7 @@ export function TraySettingsPage({
       </div>
       <div className="grid min-h-0 grid-cols-1 gap-6">
         <div className="flex min-h-0 flex-col border-y border-border/70">
-          <div className="shrink-0 border-b border-border/70 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          <div className="shrink-0 border-b border-border/70 px-3 py-2 text-label font-medium uppercase tracking-wide text-muted-foreground">
             {copy.settings.trayComponents}
           </div>
           <div className="min-h-0 flex-1 overflow-auto p-2">
@@ -2206,7 +2206,7 @@ export function TraySettingsPage({
                 return option.repeatable ? (
                   <Button
                     className={cn(
-                      "flex min-h-[46px] w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] font-medium transition-colors",
+                      "flex min-h-[46px] w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-caption font-medium transition-colors",
                       "text-muted-foreground hover:bg-muted hover:text-foreground"
                     )}
                     key={option.value}
@@ -2219,7 +2219,7 @@ export function TraySettingsPage({
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate">{option.label}</span>
-                      <span className="block truncate text-[10px] font-normal opacity-70">{option.description}</span>
+                      <span className="block truncate text-2xs font-normal opacity-70">{option.description}</span>
                     </span>
                     <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground">
                       +
@@ -2228,7 +2228,7 @@ export function TraySettingsPage({
                 ) : (
                   <div
                     className={cn(
-                      "flex min-h-[46px] w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] font-medium transition-colors",
+                      "flex min-h-[46px] w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-caption font-medium transition-colors",
                       enabledSingleton ? "bg-primary/5 text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"
                     )}
                     key={option.value}
@@ -2252,7 +2252,7 @@ export function TraySettingsPage({
                       type="button"
                     >
                       <span className="block truncate">{option.label}</span>
-                      <span className="block truncate text-[10px] font-normal opacity-70">{option.description}</span>
+                      <span className="block truncate text-2xs font-normal opacity-70">{option.description}</span>
                     </button>
                     <Switch
                       checked={enabledSingleton}
@@ -2266,7 +2266,7 @@ export function TraySettingsPage({
         </div>
 
         <div className="flex min-h-0 flex-col border-y border-border/70">
-          <div className="shrink-0 border-b border-border/70 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          <div className="shrink-0 border-b border-border/70 px-3 py-2 text-label font-medium uppercase tracking-wide text-muted-foreground">
             {copy.settings.trayPreview}
           </div>
           <div className="flex min-h-0 flex-1 justify-center overflow-auto p-3">
@@ -2286,7 +2286,7 @@ export function TraySettingsPage({
         </div>
 
         <div className="flex min-h-0 flex-col border-y border-border/70">
-          <div className="shrink-0 border-b border-border/70 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          <div className="shrink-0 border-b border-border/70 px-3 py-2 text-label font-medium uppercase tracking-wide text-muted-foreground">
             {copy.settings.trayComponentProperties}
           </div>
           <div className="min-h-0 flex-1 overflow-auto p-3">
@@ -2297,8 +2297,8 @@ export function TraySettingsPage({
                   <SelectedTrayCategoryIcon className="h-4 w-4" />
                 </span>
                 <div className="min-w-0">
-                  <div className="truncate text-[13px] font-semibold text-foreground">{selectedCategoryOption.label}</div>
-                  <div className="truncate text-[11px] text-muted-foreground">{trayWidgetTypeLabel(selectedWidget.type, copy)}</div>
+                  <div className="truncate text-body font-semibold text-foreground">{selectedCategoryOption.label}</div>
+                  <div className="truncate text-label text-muted-foreground">{trayWidgetTypeLabel(selectedWidget.type, copy)}</div>
                 </div>
               </div>
 
@@ -2327,7 +2327,7 @@ export function TraySettingsPage({
               </Button>
             </div>
             ) : (
-              <div className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-[12px] text-muted-foreground">
+              <div className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-caption text-muted-foreground">
                 {trayT("No widget selected")}
               </div>
             )}
@@ -2544,7 +2544,7 @@ function TrayAccountDataSelector({
       <button
         aria-expanded={open}
         aria-haspopup="listbox"
-        className="flex h-8 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-3 text-left text-[12px] text-foreground shadow-[inset_0_1px_1px_rgba(0,0,0,0.03)] outline-none transition-[background-color,border-color,box-shadow,color] hover:border-muted-foreground/45 focus:border-primary/60 focus:ring-2 focus:ring-ring/25"
+        className="flex h-8 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-3 text-left text-caption text-foreground shadow-[inset_0_1px_1px_rgba(0,0,0,0.03)] outline-none transition-[background-color,border-color,box-shadow,color] hover:border-muted-foreground/45 focus:border-primary/60 focus:ring-2 focus:ring-ring/25"
         onClick={() => setOpen((current) => !current)}
         type="button"
       >
@@ -2557,14 +2557,14 @@ function TrayAccountDataSelector({
           className="absolute left-0 top-[calc(100%+4px)] z-50 max-h-56 w-full min-w-[220px] overflow-y-auto rounded-md border border-border bg-popover p-1.5 text-popover-foreground shadow-card-elevated"
           role="listbox"
         >
-          <label className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[12px] font-medium transition-colors hover:bg-muted/50">
+          <label className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-caption font-medium transition-colors hover:bg-muted/50">
             <Checkbox checked={allSelected} onCheckedChange={(checked) => checked ? onChange([]) : undefined} />
             <span className="min-w-0 flex-1 truncate">{t("All accounts")}</span>
           </label>
           <div className="my-1 h-px bg-border/70" />
           {accountOptions.length > 0 ? (
             accountOptions.map((option) => (
-              <label className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[12px] transition-colors hover:bg-muted/50" key={option.value} role="option" aria-selected={selected.has(option.value)}>
+              <label className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-caption transition-colors hover:bg-muted/50" key={option.value} role="option" aria-selected={selected.has(option.value)}>
                 <Checkbox
                   checked={selected.has(option.value)}
                   onCheckedChange={(checked) => toggleAccount(option.value, checked)}
@@ -2573,7 +2573,7 @@ function TrayAccountDataSelector({
               </label>
             ))
           ) : (
-            <div className="px-2 py-1.5 text-[12px] text-muted-foreground">{t("No account data configured")}</div>
+            <div className="px-2 py-1.5 text-caption text-muted-foreground">{t("No account data configured")}</div>
           )}
         </div>
       ) : null}
@@ -2711,8 +2711,8 @@ function TrayWindowPreview({
         <div className="flex min-w-0 items-center gap-2">
           <TrayWindowHeaderIcon />
           <div className="min-w-0">
-            <div className="truncate text-[12px] font-semibold text-slate-50">88.4k {trayPreviewText(copy, "tokens", "tokens")}</div>
-            <div className="truncate text-[10px] font-medium text-slate-400">AgentRouter</div>
+            <div className="truncate text-caption font-semibold text-slate-50">88.4k {trayPreviewText(copy, "tokens", "tokens")}</div>
+            <div className="truncate text-2xs font-medium text-slate-400">AgentRouter</div>
           </div>
         </div>
         <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-white/10 bg-white/[.04] text-slate-300" aria-hidden="true">
@@ -2736,7 +2736,7 @@ function TrayWindowPreview({
         </SortableContext>
       </DndContext>
       {widgets.length === 0 ? (
-        <div className="flex min-h-[260px] items-center justify-center rounded-[10px] border border-white/10 bg-white/[.03] px-4 text-center text-[12px] font-medium text-slate-400">
+        <div className="flex min-h-[260px] items-center justify-center rounded-[10px] border border-white/10 bg-white/[.03] px-4 text-center text-caption font-medium text-slate-400">
           {copy.settings.trayPreviewEmpty}
         </div>
       ) : null}
@@ -2866,7 +2866,7 @@ function TrayPreviewSourceTabs({ copy }: { copy: AppCopy }) {
       {["All", "OpenAI", "Claude", "More"].map((label, index) => (
         <div
           className={cn(
-            "min-w-0 truncate rounded-md border px-2 py-1 text-center text-[10px] font-semibold",
+            "min-w-0 truncate rounded-md border px-2 py-1 text-center text-2xs font-semibold",
             index === 0 ? "border-teal-300/35 bg-teal-300/16 text-teal-50" : "border-white/10 bg-white/[.04] text-slate-300"
           )}
           key={label}
@@ -2882,8 +2882,8 @@ function TrayPreviewHeader({ copy }: { copy: AppCopy }) {
   return (
     <div className="mb-2 flex min-w-0 items-start justify-between gap-2 rounded-[8px] border border-white/10 bg-white/[.04] px-2.5 py-2">
       <div className="min-w-0">
-        <div className="truncate text-[13px] font-bold text-slate-50">{copy.settings.trayModuleHeader}</div>
-        <div className="mt-0.5 truncate text-[10px] font-medium text-slate-400">
+        <div className="truncate text-body font-bold text-slate-50">{copy.settings.trayModuleHeader}</div>
+        <div className="mt-0.5 truncate text-2xs font-medium text-slate-400">
           {trayPreviewText(copy, "Today", "Today")} - {trayPreviewText(copy, "All providers", "All providers", "全部供应商")}
         </div>
       </div>
@@ -2891,7 +2891,7 @@ function TrayPreviewHeader({ copy }: { copy: AppCopy }) {
         {["24h", "7d", "30d"].map((range) => (
           <span
             className={cn(
-              "h-5 rounded-[5px] px-1.5 text-[10px] font-bold",
+              "h-5 rounded-[5px] px-1.5 text-2xs font-bold",
               range === "30d" ? "bg-white/14 text-slate-50" : "text-slate-400"
             )}
             key={range}
@@ -2921,15 +2921,15 @@ function TrayPreviewAccount({
   return (
     <div className="mb-2 rounded-[8px] border border-white/10 bg-white/[.04] p-2">
       <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
-        <div className="truncate text-[11px] font-bold text-slate-100">{title}</div>
-        <span className="shrink-0 rounded-full bg-teal-300/15 px-1.5 py-0.5 text-[9px] font-bold text-teal-100">{trayPreviewText(copy, "ok", "ok")}</span>
+        <div className="truncate text-label font-bold text-slate-100">{title}</div>
+        <span className="shrink-0 rounded-full bg-teal-300/15 px-1.5 py-0.5 text-micro font-bold text-teal-100">{trayPreviewText(copy, "ok", "ok")}</span>
       </div>
       {variant === "compact" ? (
         <div className="grid grid-cols-2 gap-1.5">
           {meters.map((meter) => (
             <div className="min-w-0 rounded-md bg-white/[.04] px-2 py-1" key={meter.label}>
-              <div className="truncate text-[9px] font-medium text-slate-400">{meter.label}</div>
-              <div className="truncate text-[12px] font-bold text-slate-50">{meter.value}</div>
+              <div className="truncate text-micro font-medium text-slate-400">{meter.label}</div>
+              <div className="truncate text-caption font-bold text-slate-50">{meter.value}</div>
             </div>
           ))}
         </div>
@@ -2946,12 +2946,12 @@ function TrayPreviewAccount({
           {meters.map((meter) => (
             <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_48px] items-center gap-2" key={meter.label}>
               <div className="min-w-0">
-                <div className="truncate text-[10px] font-medium text-slate-400">{meter.label}</div>
+                <div className="truncate text-2xs font-medium text-slate-400">{meter.label}</div>
                 <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/10">
                   <div className="h-full rounded-full" style={{ backgroundColor: meter.color, width: `${meter.progress * 100}%` }} />
                 </div>
               </div>
-              <div className="truncate text-right text-[12px] font-bold text-slate-50">{meter.value}</div>
+              <div className="truncate text-right text-caption font-bold text-slate-50">{meter.value}</div>
             </div>
           ))}
         </div>
@@ -2959,8 +2959,8 @@ function TrayPreviewAccount({
       {variant === "bar" ? (
         <>
           <div className="flex min-w-0 items-end justify-between gap-2">
-            <div className="min-w-0 truncate text-[10px] font-medium text-slate-400">{meters[0].label}</div>
-            <div className="shrink-0 text-[13px] font-bold text-slate-50">{meters[0].value}</div>
+            <div className="min-w-0 truncate text-2xs font-medium text-slate-400">{meters[0].label}</div>
+            <div className="shrink-0 text-body font-bold text-slate-50">{meters[0].value}</div>
           </div>
           <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/10">
             <div className="h-full rounded-full bg-teal-300" style={{ width: `${meters[0].progress * 100}%` }} />
@@ -2987,8 +2987,8 @@ function TrayPreviewTokenFlow({
   return (
     <div className="mb-2 rounded-[8px] border border-white/10 bg-white/[.04] p-2">
       <div className="flex items-center justify-between gap-2">
-        <div className="truncate text-[11px] font-bold text-slate-100">{title}</div>
-        <div className="shrink-0 text-[10px] font-medium text-slate-400">42 {trayPreviewText(copy, "Requests", "req")}</div>
+        <div className="truncate text-label font-bold text-slate-100">{title}</div>
+        <div className="shrink-0 text-2xs font-medium text-slate-400">42 {trayPreviewText(copy, "Requests", "req")}</div>
       </div>
       <svg aria-hidden="true" className="mt-2 h-16 w-full overflow-visible" preserveAspectRatio="none" viewBox="0 0 260 72">
         {[20, 68, 116, 164, 212].map((x) => (
@@ -3046,8 +3046,8 @@ function TrayPreviewActivity({ copy }: { copy: AppCopy }) {
   return (
     <div className="min-w-0 rounded-[8px] border border-white/10 bg-white/[.04] p-2">
       <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="truncate text-[11px] font-bold text-slate-100">{copy.settings.trayModuleActivity}</div>
-        <div className="shrink-0 text-[10px] font-medium text-slate-400">{t("Tokens")}</div>
+        <div className="truncate text-label font-bold text-slate-100">{copy.settings.trayModuleActivity}</div>
+        <div className="shrink-0 text-2xs font-medium text-slate-400">{t("Tokens")}</div>
       </div>
       <div className="mb-2 grid grid-cols-4 gap-px overflow-hidden rounded-[7px] border border-white/8 bg-white/[.08]">
         {[
@@ -3059,7 +3059,7 @@ function TrayPreviewActivity({ copy }: { copy: AppCopy }) {
           <div className="min-w-0 bg-slate-950/35 px-1.5 py-1" key={item.label}>
             <div className="truncate text-[8px] font-semibold text-slate-400">{item.label}</div>
             <div className="flex min-w-0 items-baseline gap-1">
-              <span className="truncate text-[11px] font-bold text-slate-50">{item.value}</span>
+              <span className="truncate text-label font-bold text-slate-50">{item.value}</span>
               {item.unit ? <span className="shrink-0 text-[8px] font-medium text-slate-500">{item.unit}</span> : null}
             </div>
           </div>
@@ -3104,7 +3104,7 @@ function TrayPreviewActivity({ copy }: { copy: AppCopy }) {
           </div>
         </div>
       </div>
-      <div className="mt-2 flex items-center gap-1.5 text-[10px] font-medium text-slate-400">
+      <div className="mt-2 flex items-center gap-1.5 text-2xs font-medium text-slate-400">
         <span>{t("Less")}</span>
         {[0, 1, 2, 3, 4].map((value) => (
           <span aria-hidden="true" className="h-2.5 w-2.5 rounded-[3px]" key={value} style={{ backgroundColor: previewActivityColor(value) }} />
@@ -3141,7 +3141,7 @@ function TrayPreviewStats({
     return (
       <div className="mb-2 rounded-[8px] border border-white/10 bg-white/[.04] p-2">
         {stats.map((stat) => (
-          <div className="flex min-w-0 items-center justify-between gap-2 py-0.5 text-[10px]" key={stat.label}>
+          <div className="flex min-w-0 items-center justify-between gap-2 py-0.5 text-2xs" key={stat.label}>
             <span className="truncate font-medium text-slate-400">{stat.label}</span>
             <span className="shrink-0 font-bold text-slate-50">{stat.value}</span>
           </div>
@@ -3154,7 +3154,7 @@ function TrayPreviewStats({
     return (
       <div className="mb-2 flex flex-wrap gap-1.5">
         {stats.map((stat) => (
-          <div className="rounded-full border border-white/10 bg-white/[.05] px-2 py-1 text-[10px] font-bold text-slate-100" key={stat.label}>
+          <div className="rounded-full border border-white/10 bg-white/[.05] px-2 py-1 text-2xs font-bold text-slate-100" key={stat.label}>
             <span className="text-slate-400">{stat.label}</span> {stat.value}
           </div>
         ))}
@@ -3166,8 +3166,8 @@ function TrayPreviewStats({
     <div className="mb-2 grid grid-cols-2 gap-1.5">
       {stats.map((stat) => (
         <div className="min-w-0 rounded-[7px] border border-white/10 bg-white/[.04] px-2 py-1.5" key={stat.label}>
-          <div className="truncate text-[10px] font-medium text-slate-400">{stat.label}</div>
-          <div className="truncate text-[13px] font-bold text-slate-50">{stat.value}</div>
+          <div className="truncate text-2xs font-medium text-slate-400">{stat.label}</div>
+          <div className="truncate text-body font-bold text-slate-50">{stat.value}</div>
         </div>
       ))}
     </div>
@@ -3189,7 +3189,7 @@ function TrayPreviewTokenMix({
 
   return (
     <div className="min-w-0 rounded-[8px] border border-white/10 bg-white/[.04] p-2">
-      <div className="mb-2 truncate text-[11px] font-bold text-slate-100">{copy.settings.trayModuleTokenMix}</div>
+      <div className="mb-2 truncate text-label font-bold text-slate-100">{copy.settings.trayModuleTokenMix}</div>
       {variant === "donut" || variant === "pie" ? (
         <div className="grid grid-cols-[54px_minmax(0,1fr)] items-center gap-2">
           <PreviewShareChart rows={bars} variant={variant} />
@@ -3210,7 +3210,7 @@ function TrayPreviewTokenMix({
         <div className="space-y-1.5">
           {bars.map((bar) => (
             <div className="min-w-0" key={bar.label}>
-              <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-medium text-slate-400">
+              <div className="mb-1 flex items-center justify-between gap-2 text-2xs font-medium text-slate-400">
                 <span className="truncate">{bar.label}</span>
                 <span className="shrink-0">{bar.value}</span>
               </div>
@@ -3234,7 +3234,7 @@ function TrayPreviewRings({
 }) {
   return (
     <div className="min-w-0 rounded-[8px] border border-white/10 bg-white/[.04] p-2">
-      <div className="mb-2 truncate text-[11px] font-bold text-slate-100">{title}</div>
+      <div className="mb-2 truncate text-label font-bold text-slate-100">{title}</div>
       <div className="grid grid-cols-2 gap-2">
         {[
           { centerUnit: "requests", centerValue: "38", label: "74%", value: 74 },
@@ -3264,7 +3264,7 @@ function TrayPreviewModelShare({
 
   return (
     <div className="mb-2 min-w-0 rounded-[8px] border border-white/10 bg-white/[.04] p-2">
-      <div className="mb-2 truncate text-[11px] font-bold text-slate-100">{title}</div>
+      <div className="mb-2 truncate text-label font-bold text-slate-100">{title}</div>
       {variant === "donut" || variant === "pie" ? (
         <div className="grid grid-cols-[54px_minmax(0,1fr)] items-center gap-2">
           <PreviewShareChart rows={rows} variant={variant} />
@@ -3274,7 +3274,7 @@ function TrayPreviewModelShare({
       {variant === "list" ? (
         <div className="space-y-1">
           {rows.map((row, index) => (
-            <div className="flex min-w-0 items-center justify-between gap-2 text-[10px]" key={row.label}>
+            <div className="flex min-w-0 items-center justify-between gap-2 text-2xs" key={row.label}>
               <span className="min-w-0 truncate font-medium text-slate-300">{index + 1}. {row.label}</span>
               <span className="shrink-0 font-semibold text-slate-400">{row.value}</span>
             </div>
@@ -3284,11 +3284,11 @@ function TrayPreviewModelShare({
       {variant === "bars" ? (
         rows.map((row) => (
           <div className="mb-1.5 flex min-w-0 items-center gap-2 last:mb-0" key={row.label}>
-            <div className="min-w-0 flex-1 truncate text-[10px] font-medium text-slate-300">{row.label}</div>
+            <div className="min-w-0 flex-1 truncate text-2xs font-medium text-slate-300">{row.label}</div>
             <div className="h-1.5 w-14 overflow-hidden rounded-full bg-white/10">
               <div className={cn("h-full rounded-full", row.className)} style={{ width: row.value }} />
             </div>
-            <div className="w-7 shrink-0 text-right text-[10px] font-semibold text-slate-400">{row.value}</div>
+            <div className="w-7 shrink-0 text-right text-2xs font-semibold text-slate-400">{row.value}</div>
           </div>
         ))
       ) : null}
@@ -3345,7 +3345,7 @@ function PreviewRadialMetric({
         />
       </svg>
       <div className="absolute inset-0 flex min-w-0 flex-col items-center justify-center px-1 text-center leading-none">
-        <div className="max-w-full truncate text-[11px] font-bold text-slate-100">{centerValue ?? label}</div>
+        <div className="max-w-full truncate text-label font-bold text-slate-100">{centerValue ?? label}</div>
         {centerUnit ? <div className="mt-0.5 max-w-full truncate text-[8px] font-semibold uppercase text-slate-400">{centerUnit}</div> : null}
       </div>
     </div>
@@ -3397,7 +3397,7 @@ function PreviewShareLegend({ rows }: { rows: Array<{ color: string; label: stri
   return (
     <div className="min-w-0 space-y-1">
       {rows.map((row) => (
-        <div className="flex min-w-0 items-center gap-1.5 text-[9px] font-medium text-slate-400" key={row.label}>
+        <div className="flex min-w-0 items-center gap-1.5 text-micro font-medium text-slate-400" key={row.label}>
           <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: row.color }} />
           <span className="min-w-0 flex-1 truncate">{row.label}</span>
           <span className="shrink-0 text-slate-300">{row.value}</span>

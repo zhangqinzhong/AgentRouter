@@ -156,12 +156,12 @@ export function TrayApp() {
           ))}
         </section>
 
-        {loading ? <div className="mt-1.5 text-[11px] font-medium text-slate-300/55">{t("Syncing usage...")}</div> : null}
+        {loading ? <div className="mt-1.5 text-label font-medium text-slate-300/55">{t("Syncing usage...")}</div> : null}
 
-        {error ? <div className="mt-3 rounded-[12px] border border-rose-400/20 bg-rose-500/15 px-3 py-2 text-[12px] font-medium text-rose-100">{error}</div> : null}
+        {error ? <div className="mt-3 rounded-[12px] border border-rose-400/20 bg-rose-500/15 px-3 py-2 text-caption font-medium text-rose-100">{error}</div> : null}
 
         {!hasAnyVisibleModule && !error ? (
-          <div className="tray-panel-subtle flex min-h-[260px] items-center justify-center px-4 text-center text-[12px] font-medium text-slate-400">
+          <div className="tray-panel-subtle flex min-h-[260px] items-center justify-center px-4 text-center text-caption font-medium text-slate-400">
             {t("No tray modules enabled")}
           </div>
         ) : null}
@@ -209,8 +209,8 @@ function TrayRuntimeWidget({
     return (
       <div className="tray-panel flex min-w-0 items-start justify-between gap-2 px-3 py-2.5">
         <div className="min-w-0">
-          <h1 className="truncate text-[13px] font-bold text-slate-50">{selectedProvider ? formatProviderName(selectedProvider) : t("Usage Overview")}</h1>
-          <p className="mt-0.5 truncate text-[10px] font-medium text-slate-400">{formatUpdated(activeStats.generatedAt, t)}</p>
+          <h1 className="truncate text-body font-bold text-slate-50">{selectedProvider ? formatProviderName(selectedProvider) : t("Usage Overview")}</h1>
+          <p className="mt-0.5 truncate text-2xs font-medium text-slate-400">{formatUpdated(activeStats.generatedAt, t)}</p>
         </div>
         <TrayHeaderRangeSwitch range={selectedRange} onChange={onChangeRange} />
       </div>
@@ -279,7 +279,7 @@ function TrayHeaderRangeSwitch({
     <div className="tray-segmented flex shrink-0">
       {trayHeaderRanges.map((item) => (
         <button
-          className="tray-segmented-item h-5 px-1.5 text-[10px] font-semibold"
+          className="tray-segmented-item h-5 px-1.5 text-2xs font-semibold"
           data-active={range === item}
           key={item}
           type="button"

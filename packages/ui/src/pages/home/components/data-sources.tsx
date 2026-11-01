@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronRight, FolderOpen, LoaderCircle, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { ChevronRight, FolderOpen, LoaderCircle, Plus, RefreshCw, Trash2 } from "@/components/ui/icons";
 import type { ProfileConfig } from "@agentrouter/core/contracts/app";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -99,10 +99,10 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
         <summary className="flex cursor-pointer list-none items-start gap-3 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/25 [&::-webkit-details-marker]:hidden">
           <FolderOpen className="mt-0.5 h-[18px] w-[18px] shrink-0 text-muted-foreground/70" />
           <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2 text-[13px] font-medium leading-5">
+            <div className="flex flex-wrap items-center gap-2 text-body font-medium leading-5">
               <span>{group.name || t(group.kind === "custom" ? "Custom directory" : "Default directory")}</span>
-              {!available.length && <span className="text-[11px] font-normal text-amber-600 dark:text-amber-400">{t("Directory not found")}</span>}
-              {enabled && available.some(row => !row.enabled) && <span className="text-[11px] font-normal text-muted-foreground">{t("Partially enabled")}</span>}
+              {!available.length && <span className="text-label font-normal text-amber-600 dark:text-amber-400">{t("Directory not found")}</span>}
+              {enabled && available.some(row => !row.enabled) && <span className="text-label font-normal text-muted-foreground">{t("Partially enabled")}</span>}
             </div>
             <p className="mt-1 break-all text-xs leading-5 text-muted-foreground" title={group.root}>{shortPath(group.root)}</p>
           </div>
@@ -110,12 +110,12 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
         </summary>
         <div className="ml-[30px] mt-3 rounded-lg bg-muted/35 px-3 py-2.5">
           <ul className="space-y-3">{group.rows.filter(row => row.available || group.configuredPath).map(row => <li key={row.path} className="space-y-1">
-            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+            <div className="flex flex-wrap items-center gap-2 text-label">
               <span className={`h-1.5 w-1.5 rounded-full ${row.available && row.enabled ? "bg-emerald-500" : "bg-muted-foreground/30"}`} />
               <span className="font-medium">{t(row.path.replace(/\\/g,"/").endsWith("/archived_sessions") ? "Archived sessions" : "Session records")}</span>
               <span className="ml-auto text-muted-foreground">{t(!row.available ? "Directory not found" : row.enabled ? "Collection enabled" : "Collection disabled")}</span>
             </div>
-            <p className="break-all select-text font-mono text-[11px] leading-5 text-muted-foreground">{row.path}</p>
+            <p className="break-all select-text font-mono text-label leading-5 text-muted-foreground">{row.path}</p>
           </li>)}</ul>
           {group.configuredPath && <div className="mt-3 border-t border-border/50 pt-2">
             <Button type="button" size="sm" variant="ghost" className="-ml-2 text-destructive hover:bg-destructive/5 hover:text-destructive" aria-label={`${t("Remove")} ${group.root}`} disabled={busy || collecting}
@@ -153,7 +153,7 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
         const locations = groups.filter(group => group.agent === client.agent);
         if (!locations.length) return null;
         return <section key={client.agent} aria-label={client.name} className="space-y-2.5">
-          <header className="flex items-center gap-2.5 px-0.5 pt-1"><ProviderIcon provider={client.icon} size={20} /><h3 className="text-[13px] font-medium">{client.name}</h3><span className="ml-auto text-xs tabular-nums text-muted-foreground">{locations.length} {t("locations")}</span></header>
+          <header className="flex items-center gap-2.5 px-0.5 pt-1"><ProviderIcon provider={client.icon} size={20} /><h3 className="text-body font-medium">{client.name}</h3><span className="ml-auto text-xs tabular-nums text-muted-foreground">{locations.length} {t("locations")}</span></header>
           <div className="overflow-hidden rounded-xl border border-border/70 bg-background"><div className="divide-y divide-border/50">{locations.map(renderLocation)}</div>
           </div>
         </section>;

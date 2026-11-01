@@ -10,7 +10,7 @@ import {
   providerDisplayIcon, ProviderAccountMeter, ProviderAccountSnapshot, RefreshCw,
   GatewayProviderConfig, useAppText, useEffect, useMemo, useState, X
 } from "../shared/index";
-import { CreditCard, Rocket, WalletCards, Wifi } from "lucide-react";
+import { CreditCard, Rocket, WalletCards, Wifi } from "@/components/ui/icons";
 
 const providerAccountMeterLineLimit = 3;
 
@@ -39,12 +39,12 @@ export function ProviderAccountsSection({
       <section>
         <h2 className="mb-3 text-sm font-medium">{t("Account Balance")}</h2>
         {unconfigured ? (
-          <div className="flex flex-wrap items-center justify-between gap-3 border-y border-border/70 py-4 text-[13px]">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-y border-border/70 py-4 text-body">
             <span className="text-muted-foreground">{t("No account balance connectors configured")}</span>
             {onConfigure ? <Button onClick={onConfigure} size="sm" type="button" variant="outline">{t("Configure account usage")}</Button> : null}
           </div>
         ) : (
-          <p className="border-y border-border/70 py-4 text-[13px] text-muted-foreground">{t("No account balance connectors configured")}</p>
+          <p className="border-y border-border/70 py-4 text-body text-muted-foreground">{t("No account balance connectors configured")}</p>
         )}
       </section>
     );
@@ -59,7 +59,7 @@ export function ProviderAccountsSection({
             disabled={!onRefresh || refreshing || refreshingKeys.length > 0} onClick={() => void onRefresh?.()}>
             {refreshing ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
           </Button>
-          <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{visibleAccounts.length}</span>
+          <span className="shrink-0 text-label tabular-nums text-muted-foreground">{visibleAccounts.length}</span>
         </div>
       </div>
       <div className="divide-y divide-border/60 border-y border-border/70">
@@ -92,9 +92,9 @@ function ProviderAccountRow({
       <ProviderAccountLogo account={account} className="mt-0.5 h-8 w-8 rounded-lg" providers={providers} />
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-baseline justify-between gap-3">
-          <span className="min-w-0 truncate text-[13px] font-medium">{providerAccountSnapshotLabel(account)}</span>
+          <span className="min-w-0 truncate text-body font-medium">{providerAccountSnapshotLabel(account)}</span>
           {updatedAt ? (
-            <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground" title={formatProviderAccountRefreshTime(account, t)}>{updatedAt}</span>
+            <span className="shrink-0 text-2xs tabular-nums text-muted-foreground" title={formatProviderAccountRefreshTime(account, t)}>{updatedAt}</span>
           ) : null}
         </div>
         {account.localSource && account.message && meters.length > 0 ? <p className="mt-1 text-xs text-muted-foreground" role="status">{t(account.message)}</p> : null}
@@ -105,7 +105,7 @@ function ProviderAccountRow({
             ))}
           </div>
         ) : (
-          <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[12px] text-muted-foreground">
+          <div className="mt-1 flex min-w-0 items-center gap-1.5 text-caption text-muted-foreground">
             {account.status === "error" ? <CircleAlert aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-red-500" /> : null}
             <span className="min-w-0 truncate">{account.message || account.errors?.[0]?.message || t("Unavailable")}</span>
           </div>
@@ -224,7 +224,7 @@ function ProviderAccountLogo({
   }
 
   return (
-    <span className={cn("flex shrink-0 items-center justify-center border border-border bg-muted text-[10px] font-semibold text-muted-foreground", className)}>
+    <span className={cn("flex shrink-0 items-center justify-center border border-border bg-muted text-2xs font-semibold text-muted-foreground", className)}>
       {fallbackLabel || <WalletCards className="h-3.5 w-3.5" />}
     </span>
   );
@@ -327,9 +327,9 @@ function ProviderAccountMeterLine({
             {detailsOpen ? <ChevronDown aria-hidden="true" className="h-3.5 w-3.5" /> : <ChevronRight aria-hidden="true" className="h-3.5 w-3.5" />}
           </AnimatedIconSwap>
         ) : null}
-        <div className="min-w-0 truncate text-[12px] font-medium text-muted-foreground">{title}</div>
+        <div className="min-w-0 truncate text-caption font-medium text-muted-foreground">{title}</div>
       </div>
-      <div className="shrink-0 text-[13px] font-semibold tabular-nums tracking-tight">{formatProviderAccountMeterValue(meter, t)}</div>
+      <div className="shrink-0 text-body font-semibold tabular-nums tracking-tight">{formatProviderAccountMeterValue(meter, t)}</div>
     </>
   );
 
@@ -394,17 +394,17 @@ function ProviderAccountMeterDetails({
         const label = providerAccountMeterDetailLabel(detail, index, t);
         const status = providerAccountMeterDetailStatusLabel(detail.status, t);
         return (
-          <div className="min-w-0 rounded-md border border-border/70 bg-background/70 px-2.5 py-2 text-[10px] leading-tight text-muted-foreground" key={detail.id ?? `${meter.id}-${index}`}>
+          <div className="min-w-0 rounded-md border border-border/70 bg-background/70 px-2.5 py-2 text-2xs leading-tight text-muted-foreground" key={detail.id ?? `${meter.id}-${index}`}>
             <div className="flex min-w-0 items-start justify-between gap-3">
               <div className="min-w-0">
-                <div className="truncate text-[11px] font-medium text-foreground/80" title={label}>{label}</div>
+                <div className="truncate text-label font-medium text-foreground/80" title={label}>{label}</div>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
-                {status ? <div className="rounded-full bg-muted px-1.5 py-0.5 text-[9px] tracking-wide text-muted-foreground">{status}</div> : null}
+                {status ? <div className="rounded-full bg-muted px-1.5 py-0.5 text-micro tracking-wide text-muted-foreground">{status}</div> : null}
                 {detail.redeemable ? (
                   <Button
                     aria-label={`${t("Reset")} ${label}`}
-                    className="h-5 px-1.5 text-[10px]"
+                    className="h-5 px-1.5 text-2xs"
                     onClick={(event) => {
                       event.stopPropagation();
                       onReset(detail);
@@ -614,12 +614,12 @@ function CodexResetCreditDialog({
             <X className="h-3.5 w-3.5" />
           </Button>
           <div className="relative z-10 px-6 pb-3 pt-6 sm:px-8">
-            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+            <div className="flex items-center gap-2 text-label font-semibold uppercase tracking-[0.18em] text-muted-foreground">
               <CreditCard className="h-3.5 w-3.5" />
               {t("Manual reset credit")}
             </div>
             <h2 className="mt-1.5 text-[21px] font-semibold tracking-tight">{t("Choose a reset card")}</h2>
-            <p className="mt-1 text-[12px] text-muted-foreground">{t("Use the arrows to switch between available reset credits.")}</p>
+            <p className="mt-1 text-caption text-muted-foreground">{t("Use the arrows to switch between available reset credits.")}</p>
           </div>
           <div className="relative z-10 px-3 pb-2 sm:px-5">
             <div className="grid grid-cols-[36px_minmax(0,440px)_36px] items-center justify-center gap-1 sm:grid-cols-[40px_minmax(0,440px)_40px] sm:gap-3">
@@ -669,11 +669,11 @@ function CodexResetCreditDialog({
                             <img alt="Codex" className="h-5 w-5 rounded-full" draggable={false} src={codexLogoUrl} />
                           </div>
                           <div>
-                            <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-white">CODEX</div>
+                            <div className="text-label font-semibold uppercase tracking-[0.2em] text-white">CODEX</div>
                             <div className="text-[8px] uppercase tracking-[0.16em] text-white/45">RESET CREDIT</div>
                           </div>
                         </div>
-                        {detailStatus ? <span className="rounded-full border border-emerald-300/20 bg-emerald-300/10 px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.12em] text-emerald-200">{detailStatus}</span> : null}
+                        {detailStatus ? <span className="rounded-full border border-emerald-300/20 bg-emerald-300/10 px-2 py-1 text-micro font-semibold uppercase tracking-[0.12em] text-emerald-200">{detailStatus}</span> : null}
                       </div>
 
                       <div>
@@ -693,11 +693,11 @@ function CodexResetCreditDialog({
                       <div className="flex items-end justify-between gap-4">
                         <div className="min-w-0">
                           <div className="text-[7px] font-medium uppercase tracking-[0.18em] text-white/40">{t("Reset type")}</div>
-                          <div className="mt-0.5 truncate text-[10px] font-semibold uppercase tracking-[0.13em] text-white/85" title={detailLabel || undefined}>{detailLabel || "-"}</div>
+                          <div className="mt-0.5 truncate text-2xs font-semibold uppercase tracking-[0.13em] text-white/85" title={detailLabel || undefined}>{detailLabel || "-"}</div>
                         </div>
                         <div className="shrink-0 text-right">
                           <div className="text-[7px] font-medium uppercase tracking-[0.18em] text-white/40">{t("Valid thru")}</div>
-                          <div className="mt-0.5 font-mono text-[13px] font-semibold tracking-[0.12em]">{formatCodexResetCardExpiry(activeDetail?.expiresAt)}</div>
+                          <div className="mt-0.5 font-mono text-body font-semibold tracking-[0.12em]">{formatCodexResetCardExpiry(activeDetail?.expiresAt)}</div>
                         </div>
                       </div>
                     </div>
@@ -734,12 +734,12 @@ function CodexResetCreditDialog({
           </div>
 
           <div className="relative z-10 border-t border-border/70 bg-muted/20 px-6 py-5 sm:px-8">
-            <div className="mb-4 flex min-w-0 items-center justify-between gap-4 text-[11px]">
+            <div className="mb-4 flex min-w-0 items-center justify-between gap-4 text-label">
               <div className="min-w-0">
                 <div className="text-muted-foreground">{t("Expires")}</div>
                 <div className="mt-0.5 truncate font-medium text-foreground">{formatProviderAccountDetailDate(activeDetail?.expiresAt)}</div>
               </div>
-              <div className="shrink-0 rounded-full bg-muted px-2.5 py-1 text-[10px] font-medium text-muted-foreground">{activeIndex + 1} / {Math.max(cards.length, 1)}</div>
+              <div className="shrink-0 rounded-full bg-muted px-2.5 py-1 text-2xs font-medium text-muted-foreground">{activeIndex + 1} / {Math.max(cards.length, 1)}</div>
             </div>
             <Button
               className={cn(
@@ -752,7 +752,7 @@ function CodexResetCreditDialog({
             >
               <motion.span
                 animate={status === "resetting" ? { x: [-1, 1, -2, 2, 0], y: [0, -1, 1, -1, 0] } : {}}
-                className="relative z-10 flex items-center justify-center gap-2.5 text-[14px] font-bold uppercase tracking-[0.1em]"
+                className="relative z-10 flex items-center justify-center gap-2.5 text-body-sm font-bold uppercase tracking-[0.1em]"
                 transition={status === "resetting" ? { duration: 0.22, repeat: Infinity } : {}}
               >
                 {status === "idle" ? <><Rocket className="h-5 w-5" /><span>{t("Launch reset")}</span></> : null}
@@ -783,7 +783,7 @@ function CodexResetCreditDialog({
                 ) : null}
               </AnimatePresence>
             </Button>
-            {error ? <div className="mt-3 rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">{error}</div> : null}
+            {error ? <div className="mt-3 rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-label text-destructive">{error}</div> : null}
           </div>
         </DialogBody>
       </DialogContent>

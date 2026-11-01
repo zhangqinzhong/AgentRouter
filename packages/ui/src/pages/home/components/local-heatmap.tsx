@@ -118,28 +118,28 @@ function HeatmapHoverTooltip({
     style={{transform:`translateX(calc(-50% + ${pos.shiftX}px))`,animation:'tt-heatmap-pop 120ms ease-out forwards'}}
    >
     <div className="flex items-center justify-between border-b border-oai-gray-100 pb-1.5 dark:border-oai-gray-800/80">
-     <span className="text-[11px] font-semibold text-oai-gray-500 dark:text-oai-gray-400">{cell.day}</span>
-     <span className="rounded-full px-2 py-0.5 text-[10px] font-medium" style={{backgroundColor:`${badgeColor}22`,color:badgeColor,border:`1px solid ${badgeColor}44`}}>
+     <span className="text-label font-semibold text-oai-gray-500 dark:text-oai-gray-400">{cell.day}</span>
+     <span className="rounded-full px-2 py-0.5 text-2xs font-medium" style={{backgroundColor:`${badgeColor}22`,color:badgeColor,border:`1px solid ${badgeColor}44`}}>
       {copy('heatmap.tooltip.level',{level:cell.level})}
      </span>
     </div>
     <div className="flex items-baseline gap-1">
      <span className="text-lg font-bold leading-none text-oai-gray-900 dark:text-white" title={formatTokenTooltip(tokens)}>{formatTokenCount(tokens)}</span>
-     <span className="text-[10px] font-semibold uppercase tracking-wider text-oai-gray-400">{copy('heatmap.unit.tokens')}</span>
+     <span className="text-2xs font-semibold uppercase tracking-wider text-oai-gray-400">{copy('heatmap.unit.tokens')}</span>
     </div>
     {models.length>0?(
      <div className="mt-1.5 flex flex-col gap-1.5 border-t border-oai-gray-100 pt-2 dark:border-oai-gray-800/60">
-      <div className="text-[10px] font-semibold uppercase tracking-wider text-oai-gray-400 dark:text-oai-gray-500">{copy('heatmap.tooltip.model_breakdown')}</div>
+      <div className="text-2xs font-semibold uppercase tracking-wider text-oai-gray-400 dark:text-oai-gray-500">{copy('heatmap.tooltip.model_breakdown')}</div>
       <div className="flex max-h-[150px] flex-col gap-2 overflow-y-auto pr-1.5">
        {models.map(({name,val})=>{
         const pct=Math.round((val/Math.max(tokens,1))*100);
         return (
          <div key={name} className="flex flex-col gap-1">
-          <div className="flex items-center justify-between gap-3 text-[11px]">
+          <div className="flex items-center justify-between gap-3 text-label">
            <span className="max-w-[120px] truncate font-medium text-oai-gray-750 dark:text-oai-gray-200" title={name}>{name}</span>
            <div className="flex shrink-0 items-center gap-1.5">
             <span className="font-mono font-semibold text-oai-gray-900 dark:text-oai-gray-100" title={formatTokenTooltip(val)}>{formatTokenCount(val)}</span>
-            <span className="min-w-[28px] text-right text-[9px] font-medium text-oai-gray-450 dark:text-oai-gray-500">{pct}%</span>
+            <span className="min-w-[28px] text-right text-micro font-medium text-oai-gray-450 dark:text-oai-gray-500">{pct}%</span>
            </div>
           </div>
           <div className="h-1 w-full overflow-hidden rounded-full bg-oai-gray-100 dark:bg-oai-gray-800/85">
@@ -151,7 +151,7 @@ function HeatmapHoverTooltip({
       </div>
      </div>
     ):(
-     <p className="mt-1 border-t border-dashed border-oai-gray-100 pt-1.5 text-[11px] font-normal leading-relaxed text-oai-gray-600 dark:border-oai-gray-800/60 dark:text-oai-gray-300">
+     <p className="mt-1 border-t border-dashed border-oai-gray-100 pt-1.5 text-label font-normal leading-relaxed text-oai-gray-600 dark:border-oai-gray-800/60 dark:text-oai-gray-300">
       {tooltipInsight(cell.level,tokens)}
      </p>
     )}
@@ -203,7 +203,7 @@ function ToolRankList({tools}:{tools:HeatmapTool[]}){
         </span>
         <div className="min-w-0 flex-1">
          <div className="truncate font-medium" title={tool.name}>{label}</div>
-         {label!==tool.name?<div className="truncate font-mono text-[10px] text-muted-foreground">{tool.name}</div>:null}
+         {label!==tool.name?<div className="truncate font-mono text-2xs text-muted-foreground">{tool.name}</div>:null}
          <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
           <div
            className="h-full rounded-full motion-reduce:transition-none"
@@ -330,7 +330,7 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
  const displayName=String(profile.displayName||profile.username||t('Local usage'));
  const username=String(profile.username||'');
  return (
-  <div className="local-usage-page mx-auto flex h-full min-h-0 w-full max-w-[1120px] flex-col px-5 pb-0 sm:px-9">
+  <div className="local-usage-page mx-auto flex h-full min-h-0 w-full max-w-page flex-col px-5 pb-0 sm:px-9">
    <div className="shrink-0">
    {error?<div role="alert" className="mb-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}<button type="button" className="ml-3 underline" onClick={()=>setRevision((value)=>value+1)}>{t('Retry')}</button></div>:null}
    <div className="mb-6 flex items-center gap-4">
@@ -340,9 +340,9 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
      <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#216e39] text-lg font-semibold text-white">{initials(displayName)}</div>
     )}
     <div className="min-w-0">
-     <h1 className="truncate text-[24px] font-semibold tracking-[-0.025em]">{displayName}</h1>
+     <h1 className="truncate text-title font-semibold tracking-tight">{displayName}</h1>
      <p className="truncate text-sm text-muted-foreground">{username?`@${username}`:t('Local usage')}</p>
-     <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">{formatTimeZoneLabel({timeZone,offsetMinutes:getBrowserTimeZoneOffsetMinutes()})}</p>
+     <p className="mt-0.5 font-mono text-label text-muted-foreground">{formatTimeZoneLabel({timeZone,offsetMinutes:getBrowserTimeZoneOffsetMinutes()})}</p>
     </div>
    </div>
    <div className="mb-5 grid grid-cols-2 gap-x-8 gap-y-5 border-y border-border/70 py-5 sm:grid-cols-5">
@@ -354,7 +354,7 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
      {label:t('Longest task'),value:stats.task}
     ].map((item)=>(
      <div key={item.label} className="min-w-0">
-      <div className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground">{item.label}</div>
+      <div className="text-micro font-bold uppercase tracking-widest text-muted-foreground">{item.label}</div>
       <div className="mt-1 text-xl font-semibold tabular-nums tracking-tight">{item.value}</div>
      </div>
     ))}
@@ -364,11 +364,11 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
     <div ref={heatmapScrollRef} role="region" aria-label={t('Token activity')} tabIndex={0} className="w-full overflow-x-auto">
      <div className="relative mb-1 h-4 min-w-[720px]">
       {monthLabels.map((marker)=>(
-       <span key={`${marker.label}-${marker.index}`} className="absolute text-[10px] text-muted-foreground" style={{left:`${(marker.index/Math.max(built.weeks.length,1))*100}%`}}>{marker.label}</span>
+       <span key={`${marker.label}-${marker.index}`} className="absolute text-2xs text-muted-foreground" style={{left:`${(marker.index/Math.max(built.weeks.length,1))*100}%`}}>{marker.label}</span>
       ))}
      </div>
      <div className="flex min-w-[720px] gap-1">
-      <div className="flex flex-col justify-around py-[2px] text-[9px] text-muted-foreground">
+      <div className="flex flex-col justify-around py-[2px] text-micro text-muted-foreground">
        {WEEKDAYS.map((day,index)=>index%2===1?<span key={day}>{copy(`heatmap.day.${day}`)}</span>:<span key={day} className="h-[11px]"/>)}
       </div>
       <div className="grid flex-1 grid-flow-col grid-rows-7 gap-[3px] overflow-visible">
@@ -387,7 +387,7 @@ export const LocalHeatmapView=memo(function LocalHeatmapView(){
        )))}
       </div>
      </div>
-     <div className="mt-3 flex items-center justify-between text-[11px] text-muted-foreground">
+     <div className="mt-3 flex items-center justify-between text-label text-muted-foreground">
       <span>{copy('heatmap.legend.utc')}</span>
       <span className="flex items-center gap-1">{copy('heatmap.legend.less')}{GREEN.map((color)=><span key={color} className="h-2.5 w-2.5 rounded-[2px]" style={{backgroundColor:color}}/>)}{copy('heatmap.legend.more')}</span>
      </div>

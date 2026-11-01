@@ -17,8 +17,8 @@ export function TrayStatusStrip({ totalTokens }: { totalTokens: number }) {
       >
         <TrayWindowHeaderIcon />
         <div className="min-w-0">
-          <div className="truncate text-[12px] font-semibold text-slate-50">{formatCompactNumber(totalTokens)} {t("tokens")}</div>
-          <div className="truncate text-[10px] font-medium text-slate-400">AgentRouter</div>
+          <div className="truncate text-caption font-semibold text-slate-50">{formatCompactNumber(totalTokens)} {t("tokens")}</div>
+          <div className="truncate text-2xs font-medium text-slate-400">AgentRouter</div>
         </div>
       </button>
       <button

@@ -1,4 +1,4 @@
-import type {LucideIcon} from 'lucide-react';
+import type {LucideIcon} from '@/components/ui/icons';
 import {
   AppWindow,
   Bot,
@@ -21,7 +21,7 @@ import {
   Terminal,
   WandSparkles,
   Wrench
-} from 'lucide-react';
+} from '@/components/ui/icons';
 import {getCopyLocale} from '@/vendor/tokentracker/lib/copy';
 
 type ToolCopy={en:string;zh:string};

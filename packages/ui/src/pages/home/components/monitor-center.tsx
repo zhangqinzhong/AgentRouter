@@ -9,7 +9,7 @@ import {
   RefreshCw,
   ShieldCheck,
   Zap,
-} from "lucide-react";
+} from "@/components/ui/icons";
 import {
   Bar,
   BarChart,
@@ -528,7 +528,7 @@ function Summary({ report: r }: { report: MonitorReport }) {
               </b>
             </p>
           </div>
-          <details className="mt-3 text-[11px] text-muted-foreground">
+          <details className="mt-3 text-label text-muted-foreground">
             <summary className="cursor-pointer">
               {m("评分规则", "Scoring rules")}
             </summary>
@@ -598,7 +598,7 @@ function Summary({ report: r }: { report: MonitorReport }) {
               </BarChart>
             </ResponsiveContainer>
           </div>
-          <p className="mt-2 text-[11px] text-muted-foreground">
+          <p className="mt-2 text-label text-muted-foreground">
             {m("当前分钟尚未结束", "Current minute is incomplete")}
           </p>
         </Section>
@@ -655,7 +655,7 @@ function Summary({ report: r }: { report: MonitorReport }) {
               }
             />
             {tile.values.some((value) => value == null) ? (
-              <p className="mt-1 text-[10px] text-muted-foreground">
+              <p className="mt-1 text-2xs text-muted-foreground">
                 {tile.label === m("成功率", "Success rate")
                   ? m("空白时段无请求", "Gaps indicate no requests")
                   : m(
@@ -667,7 +667,7 @@ function Summary({ report: r }: { report: MonitorReport }) {
           </section>
         ))}
       </div>
-      <p className="text-[11px] text-muted-foreground">
+      <p className="text-label text-muted-foreground">
         {m(
           "环比：上一等长时段；“今天”对比昨日同时间段。流式与首字指标仅统计保留的日志样本。",
           "Comparison: previous equal-length period; today compares the same elapsed period yesterday. Streaming and TTFT use retained log samples.",

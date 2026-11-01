@@ -39,8 +39,8 @@ export function UsageDetailPanel({
             return (
               <div className="tray-panel flex min-w-0 items-start justify-between gap-2 px-3 py-2.5" key={`${widget.id}-${index}`}>
                 <div className="min-w-0">
-                  <h2 className="truncate text-[13px] font-bold text-slate-50">{t("Usage Detail")}</h2>
-                  <p className="mt-0.5 truncate text-[10px] font-medium text-slate-400">{rangeLabel(range, t)} - {provider ? formatProviderName(provider) : t("All providers")}</p>
+                  <h2 className="truncate text-body font-bold text-slate-50">{t("Usage Detail")}</h2>
+                  <p className="mt-0.5 truncate text-2xs font-medium text-slate-400">{rangeLabel(range, t)} - {provider ? formatProviderName(provider) : t("All providers")}</p>
                 </div>
                 <RangeSwitch range={range} onChange={onRangeChange} />
               </div>
@@ -83,7 +83,7 @@ export function UsageDetailPanel({
         })}
       </div>
       {!hasDetailModule ? (
-        <div className="tray-panel-subtle flex min-h-[260px] items-center justify-center px-4 text-center text-[12px] font-medium text-slate-400">
+        <div className="tray-panel-subtle flex min-h-[260px] items-center justify-center px-4 text-center text-caption font-medium text-slate-400">
           {t("No tray modules enabled")}
         </div>
       ) : null}

@@ -230,7 +230,7 @@ export function OnboardingView({
               <div className="flex h-8 shrink-0 items-center">
                 {previousStep || previousProviderSetupStep ? (
                   <Button
-                    className="inline-flex h-8 items-center gap-1.5 rounded-md px-1 text-[13px] font-medium text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25"
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md px-1 text-body font-medium text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25"
                     onClick={goToPreviousStep}
                     type="button"
                     unstyled
@@ -245,7 +245,7 @@ export function OnboardingView({
                 <OnboardingMascotSprite activeStep={activeStep} />
                 <div className="min-w-0">
                   <h2 className="text-[20px] font-semibold tracking-normal">{t(activeDetails.title)}</h2>
-                  <p className="mt-1 text-[12px] leading-5 text-muted-foreground">{t(activeDetails.description)}</p>
+                  <p className="mt-1 text-caption leading-5 text-muted-foreground">{t(activeDetails.description)}</p>
                 </div>
               </div>
 
@@ -369,7 +369,7 @@ function OnboardingProgress({
 
   return (
     <div className="relative shrink-0 border-b border-border/60 bg-card/95" aria-label={`${t("Step")} ${activeIndex + 1} / ${stepCount}`}>
-      <div className="mx-auto flex h-11 max-w-[920px] items-center justify-start overflow-x-auto px-3 text-[12px] font-medium sm:justify-center">
+      <div className="mx-auto flex h-11 max-w-[920px] items-center justify-start overflow-x-auto px-3 text-caption font-medium sm:justify-center">
         {onboardingProgressItems.map((item, index) => (
           <div className="flex shrink-0 items-center" key={item.key}>
             <span
@@ -394,7 +394,7 @@ function OnboardingProgress({
 function OnboardingStatusRow({ label, ready }: { label: string; ready: boolean }) {
   return (
     <div className="flex min-h-11 min-w-0 items-center justify-between gap-3 border-b border-border/60 px-3 py-2.5 last:border-b-0">
-      <span className="min-w-0 truncate text-[13px] font-medium text-foreground">{label}</span>
+      <span className="min-w-0 truncate text-body font-medium text-foreground">{label}</span>
       <span
         className={cn(
           "flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
@@ -410,8 +410,8 @@ function OnboardingStatusRow({ label, ready }: { label: string; ready: boolean }
 function OnboardingDetailRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex min-h-11 min-w-0 items-center justify-between gap-3 border-b border-border/60 px-3 py-2.5 last:border-b-0">
-      <span className="min-w-0 truncate text-[13px] font-medium text-foreground">{label}</span>
-      <span className="min-w-0 max-w-[68%] truncate text-right font-mono text-[12px] text-muted-foreground" title={value}>{value}</span>
+      <span className="min-w-0 truncate text-body font-medium text-foreground">{label}</span>
+      <span className="min-w-0 max-w-[68%] truncate text-right font-mono text-caption text-muted-foreground" title={value}>{value}</span>
     </div>
   );
 }

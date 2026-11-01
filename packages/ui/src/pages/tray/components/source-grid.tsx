@@ -1,7 +1,7 @@
 import {
   SourceTab, useState, useTrayText
 } from "../shared";
-import { CircleHelp, Layers3 } from "lucide-react";
+import { CircleHelp, Layers3 } from "@/components/ui/icons";
 
 function SourceTabIcon({ tab }: { tab: SourceTab }) {
   const [failedIconUrl, setFailedIconUrl] = useState("");
@@ -48,7 +48,7 @@ export function SourceGrid({
         return (
           <button
             aria-pressed={active}
-            className="tray-source-tab flex min-w-0 items-center justify-center gap-1 px-1.5 py-1.5 text-center text-[10px] font-semibold"
+            className="tray-source-tab flex min-w-0 items-center justify-center gap-1 px-1.5 py-1.5 text-center text-2xs font-semibold"
             data-active={active}
             key={tab.id}
             title={tab.provider ?? t(tab.label)}

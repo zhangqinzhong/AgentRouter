@@ -11,7 +11,7 @@ export function RangeSwitch({ range, onChange }: { range: TrayUsageRange; onChan
     <div className="tray-segmented flex">
       {ranges.map((item) => (
         <button
-          className="tray-segmented-item h-7 px-2.5 text-[11px] font-semibold"
+          className="tray-segmented-item h-7 px-2.5 text-label font-semibold"
           data-active={range === item}
           key={item}
           type="button"
@@ -28,8 +28,8 @@ export function ChartShell({ children, meta, title }: { children: ReactNode; met
   return (
     <div className="tray-panel relative min-w-0 overflow-hidden p-2.5">
       <div className="relative z-10 flex min-w-0 items-center justify-between gap-2">
-        <h3 className="truncate text-[11px] font-bold text-slate-100">{title}</h3>
-        {meta ? <span className="min-w-0 truncate text-[10px] font-medium text-slate-400">{meta}</span> : null}
+        <h3 className="truncate text-label font-bold text-slate-100">{title}</h3>
+        {meta ? <span className="min-w-0 truncate text-2xs font-medium text-slate-400">{meta}</span> : null}
       </div>
       <div className="relative z-10">{children}</div>
     </div>
@@ -47,7 +47,7 @@ export function StatsGrid({
     return (
       <div className="tray-panel mb-2 p-2.5">
         {items.map((item) => (
-          <div className="flex min-w-0 items-center justify-between gap-2 py-0.5 text-[10px]" key={item.label}>
+          <div className="flex min-w-0 items-center justify-between gap-2 py-0.5 text-2xs" key={item.label}>
             <span className="truncate font-medium text-slate-400">{item.label}</span>
             <span className="shrink-0 font-bold text-slate-50">{item.value}</span>
           </div>
@@ -60,7 +60,7 @@ export function StatsGrid({
     return (
       <div className="mb-2 flex flex-wrap gap-1.5">
         {items.map((item) => (
-          <div className="tray-stat-cell rounded-full px-2 py-1 text-[10px] font-semibold text-slate-100" key={item.label}>
+          <div className="tray-stat-cell rounded-full px-2 py-1 text-2xs font-semibold text-slate-100" key={item.label}>
             <span className="text-slate-400">{item.label}</span> {item.value}
           </div>
         ))}
@@ -80,8 +80,8 @@ export function StatsGrid({
 function StatChip({ label, value }: { label: string; value: string }) {
   return (
     <div className="tray-stat-cell min-w-0 px-2 py-1.5">
-      <div className="truncate text-[10px] font-medium text-slate-400">{label}</div>
-      <div className="truncate text-[13px] font-bold text-slate-50">{value}</div>
+      <div className="truncate text-2xs font-medium text-slate-400">{label}</div>
+      <div className="truncate text-body font-bold text-slate-50">{value}</div>
     </div>
   );
 }
@@ -158,8 +158,8 @@ export function TokenActivityPanel({
   return (
     <div className="tray-panel min-w-0 p-2.5">
       <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
-        <div className="truncate text-[11px] font-bold text-slate-100">{t("Activity")}</div>
-        <div className="shrink-0 text-[10px] font-medium text-slate-400">{t("Tokens")}</div>
+        <div className="truncate text-label font-bold text-slate-100">{t("Activity")}</div>
+        <div className="shrink-0 text-2xs font-medium text-slate-400">{t("Tokens")}</div>
       </div>
 
       <div className="tray-panel-subtle mb-2 grid grid-cols-4 gap-px overflow-hidden">
@@ -171,7 +171,7 @@ export function TokenActivityPanel({
 
       <TokenActivityGrid activity={activity} />
 
-      <div className="mt-2 flex min-w-0 items-center gap-1.5 text-[10px] font-medium text-slate-400">
+      <div className="mt-2 flex min-w-0 items-center gap-1.5 text-2xs font-medium text-slate-400">
         <span>{t("Less")}</span>
         {[0, 1, 2, 3, 4].map((intensity) => (
           <span
@@ -200,7 +200,7 @@ function TokenActivityStat({
     <div className="min-w-0 bg-black/10 px-1.5 py-1">
       <div className="truncate text-[8px] font-semibold text-slate-400">{label}</div>
       <div className="flex min-w-0 items-baseline gap-1">
-        <span className="truncate text-[11px] font-bold text-slate-50">{value}</span>
+        <span className="truncate text-label font-bold text-slate-50">{value}</span>
         {unit ? <span className="shrink-0 text-[8px] font-medium text-slate-500">{unit}</span> : null}
       </div>
     </div>
@@ -269,7 +269,7 @@ function TokenActivityGrid({
                   <span className="tray-activity-tooltip-detail mt-0.5 block font-medium">{formatActivityTokenCount(cell.totalTokens)} {t("tokens")}</span>
                 </>
               )}
-              contentClassName="tray-activity-tooltip min-w-[96px] px-2 py-1.5 text-left text-[10px] font-normal"
+              contentClassName="tray-activity-tooltip min-w-[96px] px-2 py-1.5 text-left text-2xs font-normal"
               key={cell.dateKey}
               side={cell.dayIndex <= 1 ? "bottom" : "top"}
               style={{
@@ -315,7 +315,7 @@ export function TokenMixPanel({
 
   return (
     <div className="tray-panel min-w-0 p-2.5">
-      <div className="mb-2 truncate text-[11px] font-bold text-slate-100">{t("Token Mix")}</div>
+      <div className="mb-2 truncate text-label font-bold text-slate-100">{t("Token Mix")}</div>
       {variant === "donut" || variant === "pie" ? (
         <div className="grid grid-cols-[64px_minmax(0,1fr)] items-center gap-2">
           <ShareChart rows={rows} variant={variant} />
@@ -334,7 +334,7 @@ export function TokenMixPanel({
             const percent = row.value > 0 ? Math.max(4, (row.value / max) * 100) : 2;
             return (
               <div key={row.label}>
-                <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-medium text-slate-400">
+                <div className="mb-1 flex items-center justify-between gap-2 text-2xs font-medium text-slate-400">
                   <span className="truncate">{row.label}</span>
                   <span className="shrink-0">{formatCompactNumber(row.value)}</span>
                 </div>
@@ -365,7 +365,7 @@ export function RingMetrics({
 
   return (
     <div className="tray-panel min-w-0 p-2.5">
-      <div className="mb-2 truncate text-[11px] font-bold text-slate-100">{t("Circular metrics")}</div>
+      <div className="mb-2 truncate text-label font-bold text-slate-100">{t("Circular metrics")}</div>
       <div className="grid grid-cols-2 gap-2">
         <RingMetric centerUnit={t("requests")} centerValue={formatCompactNumber(successRequests)} label={t("Success")} value={totals.successRate} variant={variant} />
         <RingMetric centerUnit={t("tokens")} centerValue={formatCompactNumber(totals.cacheTokens)} label={t("Cache")} value={totals.cacheRatio} variant={variant} />
@@ -401,7 +401,7 @@ function RingMetric({
           variant={variant === "rings" ? "ring" : variant === "arcs" ? "arc" : "gauge"}
         />
       </div>
-      <div className="mt-1 w-full truncate px-1 text-[10px] font-semibold leading-none text-slate-300">{label}</div>
+      <div className="mt-1 w-full truncate px-1 text-2xs font-semibold leading-none text-slate-300">{label}</div>
     </div>
   );
 }
@@ -417,7 +417,7 @@ export function ModelShareChart({
 
   if (rows.length === 0) {
     return (
-    <div className="tray-panel-subtle mb-2 px-3 py-8 text-center text-[12px] font-medium text-slate-400">
+    <div className="tray-panel-subtle mb-2 px-3 py-8 text-center text-caption font-medium text-slate-400">
         {t("No usage captured yet")}
       </div>
     );
@@ -432,7 +432,7 @@ export function ModelShareChart({
 
   return (
     <div className="tray-panel mb-2 min-w-0 p-2.5">
-      <div className="mb-2 truncate text-[11px] font-bold text-slate-100">{t("Model Share")}</div>
+      <div className="mb-2 truncate text-label font-bold text-slate-100">{t("Model Share")}</div>
       {variant === "donut" || variant === "pie" ? (
         <div className="grid grid-cols-[64px_minmax(0,1fr)] items-center gap-2">
           <ShareChart rows={chartRows} variant={variant} />
@@ -442,7 +442,7 @@ export function ModelShareChart({
       {variant === "list" ? (
         <div className="space-y-1">
           {rows.slice(0, 4).map((row, index) => (
-            <div className="flex min-w-0 items-center justify-between gap-2 text-[10px]" key={row.key}>
+            <div className="flex min-w-0 items-center justify-between gap-2 text-2xs" key={row.key}>
               <span className="min-w-0 truncate font-medium text-slate-300">{index + 1}. {row.label}</span>
               <span className="shrink-0 font-semibold text-slate-400">{formatPercent(row.maxShare)}</span>
             </div>
@@ -454,14 +454,14 @@ export function ModelShareChart({
           {rows.slice(0, 3).map((row) => (
             <div key={row.key}>
               <div className="flex min-w-0 items-center gap-2">
-                <div className="min-w-0 flex-1 truncate text-[10px] font-medium text-slate-300">{row.label}</div>
+                <div className="min-w-0 flex-1 truncate text-2xs font-medium text-slate-300">{row.label}</div>
                 <div className="h-1.5 w-14 shrink-0 overflow-hidden rounded-full bg-white/10">
                   <div
                     className="h-full rounded-full bg-[#0a84ff]"
                     style={{ width: `${Math.max(3, row.maxShare * 100)}%` }}
                   />
                 </div>
-                <div className="w-7 shrink-0 text-right text-[10px] font-semibold text-slate-400">{formatPercent(row.maxShare)}</div>
+                <div className="w-7 shrink-0 text-right text-2xs font-semibold text-slate-400">{formatPercent(row.maxShare)}</div>
               </div>
             </div>
           ))}
@@ -523,7 +523,7 @@ function ShareLegend({ rows }: { rows: ShareChartRow[] }) {
   return (
     <div className="min-w-0 space-y-1">
       {rows.map((row) => (
-        <div className="flex min-w-0 items-center gap-1.5 text-[9px] font-medium text-slate-400" key={row.label}>
+        <div className="flex min-w-0 items-center gap-1.5 text-micro font-medium text-slate-400" key={row.label}>
           <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: row.color }} />
           <span className="min-w-0 flex-1 truncate">{row.label}</span>
           <span className="shrink-0 text-slate-300">{formatCompactNumber(row.value)}</span>
@@ -598,7 +598,7 @@ export function RadialMetric({
         />
       </svg>
       <div className="absolute inset-0 flex min-w-0 flex-col items-center justify-center px-1 text-center leading-none">
-        <div className="max-w-full truncate text-[11px] font-bold text-slate-100">{centerValue ?? label}</div>
+        <div className="max-w-full truncate text-label font-bold text-slate-100">{centerValue ?? label}</div>
         {centerUnit ? <div className="mt-0.5 max-w-full truncate text-[8px] font-semibold uppercase text-slate-400">{centerUnit}</div> : null}
       </div>
     </div>

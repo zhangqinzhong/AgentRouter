@@ -2,7 +2,7 @@ import { createElement, type ReactNode, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { common, createLowlight } from "lowlight";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight } from "@/components/ui/icons";
 type Message = {
   id: number;
   role: string;
@@ -210,7 +210,7 @@ export function TranscriptMessage({
           {markedText}
         </pre>
       ) : (
-        <div className="session-markdown text-[14px] leading-7 [overflow-wrap:anywhere]">
+        <div className="session-markdown text-body-sm leading-7 [overflow-wrap:anywhere]">
           {/* Claude 把 /effort 这类命令包在 command-name 等标签里。react-markdown 会把标签本身印成文字；跳过原始 HTML 后只留下标签里的内容。 */}
           {cited.body ? (
             <ReactMarkdown
@@ -327,7 +327,7 @@ export function TranscriptTools({
             ].map(([label, value]) =>
               value ? (
                 <div key={label} className="mb-3">
-                  <div className="mb-1 text-[11px] text-muted-foreground">
+                  <div className="mb-1 text-label text-muted-foreground">
                     {label}
                   </div>
                   <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-muted/40 p-3 font-mono text-xs leading-6 [overflow-wrap:anywhere]">

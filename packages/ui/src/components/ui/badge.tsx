@@ -9,7 +9,7 @@ export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
 
 function badgeVariants({ className, variant = "default" }: { className?: string; variant?: BadgeVariant }) {
   return cn(
-    "inline-flex min-w-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium leading-4",
+    "inline-flex min-w-0 items-center gap-1 rounded-full border px-2 py-0.5 text-label font-medium leading-4",
     variant === "default" && "border-transparent bg-primary/10 text-primary",
     variant === "secondary" && "border-border bg-secondary text-secondary-foreground",
     variant === "success" && "border-emerald-200 bg-emerald-50 text-emerald-700",

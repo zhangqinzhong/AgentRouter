@@ -83,7 +83,7 @@ export function UpdateDialog({
 
           {status.state === "downloading" ? (
             <div className="grid gap-2 rounded-md border border-border bg-muted/20 px-3 py-3">
-              <div className="flex min-w-0 items-center justify-between gap-3 text-[11px] font-medium text-muted-foreground">
+              <div className="flex min-w-0 items-center justify-between gap-3 text-label font-medium text-muted-foreground">
                 <span>{t("Downloading update")}</span>
                 <span>{progressPercent !== undefined ? `${progressPercent.toFixed(0)}%` : ""}</span>
               </div>
@@ -97,24 +97,24 @@ export function UpdateDialog({
               >
                 <div className="h-full rounded-full bg-primary transition-[width] duration-200" style={{ width: `${progressPercent ?? 0}%` }} />
               </div>
-              <div className="text-[11px] text-muted-foreground">{formatDownloadProgress(status.progress)}</div>
+              <div className="text-label text-muted-foreground">{formatDownloadProgress(status.progress)}</div>
             </div>
           ) : null}
 
           {canInstall ? (
-            <div className="rounded-md border border-primary/20 bg-primary/10 px-3 py-2 text-[12px] text-primary">
+            <div className="rounded-md border border-primary/20 bg-primary/10 px-3 py-2 text-caption text-primary">
               {t("Update downloaded. Restart to finish updating.")}
             </div>
           ) : null}
 
           {!status.supported ? (
-            <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-[12px] text-muted-foreground">
+            <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-caption text-muted-foreground">
               {t("No update source is configured.")}
             </div>
           ) : null}
 
           {displayedError ? (
-            <div className="flex min-w-0 items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+            <div className="flex min-w-0 items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span className="min-w-0 break-words">{displayedError}</span>
             </div>
@@ -122,8 +122,8 @@ export function UpdateDialog({
 
           {releaseNotes ? (
             <div className="grid gap-1 rounded-md border border-border bg-background px-3 py-2">
-              <div className="text-[11px] font-semibold text-muted-foreground">{t("Release notes")}</div>
-              <div className="max-h-44 overflow-auto whitespace-pre-wrap text-[12px] leading-5 text-foreground">{releaseNotes}</div>
+              <div className="text-label font-semibold text-muted-foreground">{t("Release notes")}</div>
+              <div className="max-h-44 overflow-auto whitespace-pre-wrap text-caption leading-5 text-foreground">{releaseNotes}</div>
             </div>
           ) : null}
         </DialogBody>
@@ -147,9 +147,9 @@ export function UpdateDialog({
 function UpdateInfoRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0 rounded-md border border-border/70 bg-muted/20 px-3 py-2">
-      <div className="text-[10px] font-medium uppercase text-muted-foreground">{label}</div>
+      <div className="text-2xs font-medium uppercase text-muted-foreground">{label}</div>
       <div
-        className={cn("mt-1 min-w-0 truncate text-[12px] font-medium text-foreground")}
+        className={cn("mt-1 min-w-0 truncate text-caption font-medium text-foreground")}
         title={value}
       >
         {value}
@@ -213,7 +213,7 @@ function updatePrimaryAction({
 function UpdateStateBadge({ label, status }: { label: string; status: AppUpdateStatus }) {
   return (
     <span className={cn(
-      "inline-flex shrink-0 items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-medium",
+      "inline-flex shrink-0 items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-2xs font-medium",
       status.state === "error"
         ? "border-destructive/25 bg-destructive/10 text-destructive"
         : status.state === "not-available"

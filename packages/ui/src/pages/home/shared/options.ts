@@ -16,7 +16,7 @@ import {
   Route,
   UserRound,
   type LucideIcon
-} from "lucide-react";
+} from "@/components/ui/icons";
 import {
   BUILTIN_FUSION_TOOL_SERVER_NAME,
   BUILTIN_FUSION_IMAGE_GENERATION_TOOL_NAME,

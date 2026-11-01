@@ -29,7 +29,7 @@ function StatCell({ label, sub, title, value }: { label: string; sub?: string; t
     <div className="flex min-w-0 flex-col items-start gap-1.5 text-left">
       <span className="text-xs font-medium text-muted-foreground">{label}</span>
       <span className="text-3xl font-semibold tabular-nums tracking-tight" title={title}>{value}</span>
-      {sub ? <span className="text-[10px] tabular-nums text-muted-foreground">{sub}</span> : null}
+      {sub ? <span className="text-2xs tabular-nums text-muted-foreground">{sub}</span> : null}
     </div>
   );
 }
@@ -207,7 +207,7 @@ export function OverviewView({
   return (
     <div className="local-usage-page mx-auto w-full max-w-[1400px] px-5 py-6 sm:px-9 sm:py-8">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <h1 className="shrink-0 text-[24px] font-semibold tracking-[-0.025em]">{t("Overview")}</h1>
+        <h1 className="shrink-0 text-title font-semibold tracking-tight">{t("Overview")}</h1>
         {usageStats.localCollectionState === "loading" && (
           <span role="status" className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <LoaderCircle aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
@@ -229,7 +229,7 @@ export function OverviewView({
       <div className="mb-6 flex flex-wrap items-center gap-2">
         <Select
           aria-label={t("Model")}
-          className="h-8 w-[200px] rounded-md bg-[length:14px] px-2.5 pr-7 text-[12px] shadow-none"
+          className="h-8 w-[200px] rounded-md bg-[length:14px] px-2.5 pr-7 text-caption shadow-none"
           onValueChange={changeModelFilter}
           options={modelOptions}
           value={modelFilter}
@@ -302,16 +302,16 @@ export function OverviewStatisticsResetDialog({
 
         <DialogBody>
           <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-            <div className="flex items-start gap-2 text-[12px] font-medium text-destructive">
+            <div className="flex items-start gap-2 text-caption font-medium text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>{t("Reset gateway statistics?")}</span>
             </div>
-            <div className="mt-2 space-y-1 text-[11px] text-muted-foreground">
+            <div className="mt-2 space-y-1 text-label text-muted-foreground">
               <div>{t("Gateway statistics data will be deleted and cannot be recovered.")}</div>
               <div>{t("This clears gateway statistics. Local usage, session files, request logs and configuration are not deleted.")}</div>
             </div>
           </div>
-          {error ? <div className="mt-3 rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">{error}</div> : null}
+          {error ? <div className="mt-3 rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-label text-destructive">{error}</div> : null}
         </DialogBody>
 
         <DialogFooter>

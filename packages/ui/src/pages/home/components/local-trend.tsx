@@ -13,9 +13,9 @@ import {heatmapTrendRange,TrendPeriod,TrendPeriodTabs,UsageTrendLineChart} from 
 function StatCell({label,value,sub,title}:{label:string;value:string;sub?:string;title?:string}){
  return (
   <div className="flex min-w-0 flex-col gap-1.5">
-   <span className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground">{label}</span>
+   <span className="text-micro font-bold uppercase tracking-widest text-muted-foreground">{label}</span>
    <span className="text-xl font-semibold tabular-nums tracking-tight" title={title}>{value}</span>
-   {sub?<span className="text-[10px] tabular-nums text-muted-foreground">{sub}</span>:null}
+   {sub?<span className="text-2xs tabular-nums text-muted-foreground">{sub}</span>:null}
   </div>
  );
 }
@@ -31,12 +31,12 @@ export const LocalTrendView=memo(function LocalTrendView({defaultRange=DEFAULT_P
  const stats=useMemo(()=>computeZoomStats(trend.rows),[trend.rows]);
  const peakLabel=typeof stats.peak==='object'&&stats.peak&&'label'in stats.peak?String((stats.peak as {label?:string}).label||''):'';
  return (
-  <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
+  <div className="local-usage-page mx-auto w-full max-w-page px-5 py-6 sm:px-9 sm:py-8">
    <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
     <div>
-     <p className="text-[9px] font-bold uppercase tracking-widest text-emerald-600">{copy('trend.zoom.badge')}</p>
-     <h1 className="mt-1 text-[24px] font-semibold tracking-[-0.025em]">{t('Trend')}</h1>
-     <p className="mt-1 font-mono text-[11px] text-muted-foreground">{formatTimeZoneLabel({timeZone,offsetMinutes:getBrowserTimeZoneOffsetMinutes()})}</p>
+     <p className="text-micro font-bold uppercase tracking-widest text-emerald-600">{copy('trend.zoom.badge')}</p>
+     <h1 className="mt-1 text-title font-semibold tracking-tight">{t('Trend')}</h1>
+     <p className="mt-1 font-mono text-label text-muted-foreground">{formatTimeZoneLabel({timeZone,offsetMinutes:getBrowserTimeZoneOffsetMinutes()})}</p>
     </div>
     <div className="relative">
      <TrendPeriodTabs
@@ -55,7 +55,7 @@ export const LocalTrendView=memo(function LocalTrendView({defaultRange=DEFAULT_P
     <StatCell label={copy('trend.zoom.stats.conversations')} value={Number(stats.conversationCount||0).toLocaleString(numberLocale)}/>
     {stats.peak&&typeof stats.peak==='object'?<StatCell label={copy('trend.zoom.stats.peak')} value={formatTokenCount(Number((stats.peak as {value?:number}).value)||0)} title={formatTokenTooltip(Number((stats.peak as {value?:number}).value)||0)} sub={peakLabel.slice(0,16)}/>:null}
    </div>
-   <p className="mb-8 border-l-2 border-emerald-500 pl-3 text-[13px] leading-relaxed text-muted-foreground">
+   <p className="mb-8 border-l-2 border-emerald-500 pl-3 text-body leading-relaxed text-muted-foreground">
     {copy(getTrendInsightKey(stats),{active:stats.activeBuckets,peak:formatTokenCount(Number((stats.peak as {value?:number}|undefined)?.value)||0)})}
    </p>
    <UsageTrendLineChart

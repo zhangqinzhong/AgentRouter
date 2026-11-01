@@ -231,7 +231,7 @@ DialogTitle.displayName = "DialogTitle";
 
 const DialogDescription = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
   ({ className, ...props }, ref) => (
-    <div className={cn("mt-0.5 flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-muted-foreground", className)} ref={ref} {...props} />
+    <div className={cn("mt-0.5 flex min-w-0 flex-wrap items-center gap-2 text-label text-muted-foreground", className)} ref={ref} {...props} />
   )
 );
 

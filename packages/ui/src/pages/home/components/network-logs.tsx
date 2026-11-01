@@ -2,7 +2,7 @@ import { PageHeader, SectionHeading, tablePageClassName } from "./page-primitive
 import { outputRateForRequestLog } from "@/lib/token-rate";
 import { memo, useId } from "react";
 import { createPortal } from "react-dom";
-import { Maximize2, Route, X } from "lucide-react";
+import { Maximize2, Route, X } from "@/components/ui/icons";
 import type { RequestRouteTrace, RequestRouteTraceChange, RequestRouteTraceHop } from "@agentrouter/core/contracts/app";
 import {
   AnimatedIconSwap, Check, ChevronDown, ChevronLeft,
@@ -160,25 +160,25 @@ export function NetworkingView({
             <Search className="network-search-icon pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2" />
             <input
               aria-label={t("Search network captures")}
-              className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-[12px] font-semibold outline-none"
+              className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-caption font-semibold outline-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Filter")}
               value={query}
             />
           </div>
           <span className={cn(
-            "rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase",
+            "rounded-full px-2 py-0.5 text-label font-semibold uppercase",
             proxyStatus.state === "running" ? "network-service-running" : "network-service-muted"
           )}>
             {t(proxyStatus.state)}
           </span>
           <span className={cn(
-            "rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase",
+            "rounded-full px-2 py-0.5 text-label font-semibold uppercase",
             snapshot.captureEnabled ? "network-service-running" : "network-service-paused"
           )}>
             {snapshot.captureEnabled ? t("capturing") : t("paused")}
           </span>
-          <span className="network-count rounded-full px-2 py-0.5 text-[11px] font-semibold">{captures.length}</span>
+          <span className="network-count rounded-full px-2 py-0.5 text-label font-semibold">{captures.length}</span>
           <button
             aria-label={snapshot.captureEnabled ? t("Pause network capture") : t("Resume network capture")}
             className="network-control-button flex h-7 w-7 items-center justify-center rounded-md border outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
@@ -213,7 +213,7 @@ export function NetworkingView({
               ))}
             </div>
             <div className="min-w-[1180px] max-[720px]:hidden">
-              <div className="network-table-header sticky top-0 z-10 grid h-9 grid-cols-[34px_64px_minmax(460px,1fr)_220px_104px_116px_88px] items-center border-b text-[12px] font-semibold">
+              <div className="network-table-header sticky top-0 z-10 grid h-9 grid-cols-[34px_64px_minmax(460px,1fr)_220px_104px_116px_88px] items-center border-b text-caption font-semibold">
                 <NetworkHeaderCell label="" />
                 <NetworkHeaderCell label="ID" />
                 <NetworkHeaderCell label="URL" />
@@ -224,17 +224,17 @@ export function NetworkingView({
               </div>
 
               {captures.length === 0 ? (
-                <div className="network-empty flex h-[320px] flex-col items-center justify-center gap-2 text-center text-[12px]">
+                <div className="network-empty flex h-[320px] flex-col items-center justify-center gap-2 text-center text-caption">
                   <Network className="network-empty-icon h-7 w-7" />
                   <div>{snapshot.items.length === 0 ? (snapshot.captureEnabled ? t("No network captures") : t("Network capture is paused")) : t("No matching captures")}</div>
-                  <div className="network-empty-subtle font-mono text-[11px]">{proxyStatus.endpoint || t("Proxy not running")}</div>
+                  <div className="network-empty-subtle font-mono text-label">{proxyStatus.endpoint || t("Proxy not running")}</div>
                 </div>
               ) : null}
 
               {captures.map((item, index) => (
                 <button
                   className={cn(
-                    "network-row grid h-9 w-full grid-cols-[34px_64px_minmax(460px,1fr)_220px_104px_116px_88px] items-center border-0 px-0 text-left text-[12px] font-semibold outline-none transition-colors",
+                    "network-row grid h-9 w-full grid-cols-[34px_64px_minmax(460px,1fr)_220px_104px_116px_88px] items-center border-0 px-0 text-left text-caption font-semibold outline-none transition-colors",
                     index % 2 === 0 ? "network-row-even" : "network-row-odd",
                     selected?.id === item.id && "network-row-selected"
                   )}
@@ -269,14 +269,14 @@ export function NetworkingView({
               />
               <div className="network-detail flex min-h-0 flex-1 flex-col">
                 <div className="network-detail-bar flex h-12 min-w-0 shrink-0 items-center gap-2 border-b px-3 max-[720px]:h-auto max-[720px]:flex-wrap max-[720px]:py-2">
-                  <span className="network-method-pill rounded-full px-3 py-1 text-[12px] font-bold">{selected.method}</span>
+                  <span className="network-method-pill rounded-full px-3 py-1 text-caption font-bold">{selected.method}</span>
                   <span className={cn(
-                    "rounded-full px-3 py-1 text-[12px] font-bold uppercase",
+                    "rounded-full px-3 py-1 text-caption font-bold uppercase",
                     selected.state === "pending" ? "network-state-pill-active" : selected.state === "error" ? "network-state-pill-error" : "network-state-pill-completed"
                   )}>
                     {networkLifecycleLabel(selected)}
                   </span>
-                  <span className="min-w-0 flex-1 truncate font-mono text-[13px] font-semibold" title={selected.url}>
+                  <span className="min-w-0 flex-1 truncate font-mono text-body font-semibold" title={selected.url}>
                     <span className="network-url-scheme">{selected.protocol}://</span>
                     <span className="network-url-host">{selected.host}</span>
                     <span className="network-url-path">{selected.path}</span>
@@ -321,7 +321,7 @@ function NetworkCaptureCard({
   return (
     <button
       className={cn(
-        "network-row border-b border-border/60 px-3 py-3 text-left text-[12px] outline-none transition-colors",
+        "network-row border-b border-border/60 px-3 py-3 text-left text-caption outline-none transition-colors",
         selected && "network-row-selected"
       )}
       onClick={onSelect}
@@ -331,18 +331,18 @@ function NetworkCaptureCard({
         <span className="mt-1 shrink-0"><NetworkStatusDot exchange={exchange} /></span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="network-row-id shrink-0 font-mono text-[11px]">#{rowId}</span>
+            <span className="network-row-id shrink-0 font-mono text-label">#{rowId}</span>
             <span className="min-w-0 truncate font-mono font-semibold" title={exchange.url}>{exchange.host}{exchange.path}</span>
           </div>
           <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
-            <span className="network-method-pill rounded-full px-2 py-0.5 text-[11px] font-bold">{exchange.method}</span>
+            <span className="network-method-pill rounded-full px-2 py-0.5 text-label font-bold">{exchange.method}</span>
             <span className={cn(
-              "rounded-full px-2 py-0.5 text-[11px] font-bold uppercase",
+              "rounded-full px-2 py-0.5 text-label font-bold uppercase",
               exchange.state === "pending" ? "network-state-pill-active" : exchange.state === "error" ? "network-state-pill-error" : "network-state-pill-completed"
             )}>
               {networkLifecycleLabel(exchange)}
             </span>
-            <span className="network-row-secondary rounded-full px-2 py-0.5 text-[11px] font-semibold">{networkCodeLabel(exchange)}</span>
+            <span className="network-row-secondary rounded-full px-2 py-0.5 text-label font-semibold">{networkCodeLabel(exchange)}</span>
           </div>
           <div className="mt-2 min-w-0">
             <NetworkClientCell client={exchange.client} />
@@ -521,7 +521,7 @@ export function LogsView({
             <Search className="network-search-icon pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2" />
             <input
               aria-label={t("Search request logs")}
-              className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-[12px] font-semibold outline-none"
+              className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-caption font-semibold outline-none"
               onChange={(event) => updateFilter({ query: event.target.value })}
               placeholder={t("Filter logs, models, requests, or responses")}
               value={filter.query ?? ""}
@@ -529,21 +529,21 @@ export function LogsView({
           </div>
           <Select
             aria-label={t("Filter request log status")}
-            className="h-8 rounded-md shadow-none w-[118px] bg-[length:14px] px-2 pr-7 text-[11px]"
+            className="h-8 rounded-md shadow-none w-[118px] bg-[length:14px] px-2 pr-7 text-label"
             onValueChange={(value) => updateFilter({ status: value as RequestLogStatusFilter })}
             options={translateOptions(requestLogStatusOptions, t)}
             value={filter.status ?? "all"}
           />
           <Select
             aria-label={t("Filter request log provider")}
-            className="h-8 rounded-md shadow-none w-[148px] bg-[length:14px] px-2 pr-7 text-[11px]"
+            className="h-8 rounded-md shadow-none w-[148px] bg-[length:14px] px-2 pr-7 text-label"
             onValueChange={(value) => updateFilter({ provider: value || undefined })}
             options={logSelectOptions(t("All providers"), page.options.providers, filter.provider)}
             value={filter.provider ?? ""}
           />
           <Select
             aria-label={t("Filter request log model")}
-            className="h-8 rounded-md shadow-none w-[168px] bg-[length:14px] px-2 pr-7 text-[11px]"
+            className="h-8 rounded-md shadow-none w-[168px] bg-[length:14px] px-2 pr-7 text-label"
             onValueChange={(value) => updateFilter({ model: value || undefined })}
             options={logSelectOptions(t("All models"), page.options.models, filter.model)}
             value={filter.model ?? ""}
@@ -551,7 +551,7 @@ export function LogsView({
           {hasAnyCredentialInfo ? (
             <Select
               aria-label={t("Filter request log credential")}
-              className="h-8 rounded-md shadow-none w-[150px] bg-[length:14px] px-2 pr-7 text-[11px]"
+              className="h-8 rounded-md shadow-none w-[150px] bg-[length:14px] px-2 pr-7 text-label"
               onValueChange={(value) => updateFilter({ credential: value || undefined })}
               options={logSelectOptions(t("All credentials"), page.options.credentials, filter.credential)}
               value={filter.credential ?? ""}
@@ -568,7 +568,7 @@ export function LogsView({
             >
               <ChevronLeft className="h-3.5 w-3.5" />
             </button>
-            <span className="min-w-[132px] px-2 py-0.5 text-center text-[11px] tabular-nums text-muted-foreground">
+            <span className="min-w-[132px] px-2 py-0.5 text-center text-label tabular-nums text-muted-foreground">
               {firstItem}-{lastItem} / {page.total}
             </span>
             <button
@@ -583,7 +583,7 @@ export function LogsView({
             </button>
             <Select
               aria-label={t("Request log page size")}
-              className="h-8 rounded-md shadow-none w-[92px] bg-[length:14px] px-2 pr-7 text-[11px]"
+              className="h-8 rounded-md shadow-none w-[92px] bg-[length:14px] px-2 pr-7 text-label"
               onValueChange={(value) => updateFilter({ pageSize: Number(value) })}
               options={translateOptions(requestLogPageSizeOptions, t)}
               value={String(page.pageSize)}
@@ -601,14 +601,14 @@ export function LogsView({
         </div>
 
         {error ? (
-          <div className="network-error-box mx-3 mt-3 rounded-md border px-3 py-2 text-[12px]">{error}</div>
+          <div className="network-error-box mx-3 mt-3 rounded-md border px-3 py-2 text-caption">{error}</div>
         ) : null}
 
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="network-table-scroll min-h-0 min-w-0 flex-1 overflow-auto">
             <div className="w-full min-w-0">
               <div
-                className="network-table-header sticky top-0 z-10 grid h-9 items-center border-b text-[11px] font-medium max-[720px]:hidden"
+                className="network-table-header sticky top-0 z-10 grid h-9 items-center border-b text-label font-medium max-[720px]:hidden"
                 ref={logTableHeaderRef}
                 style={logTableGridStyle}
               >
@@ -624,11 +624,11 @@ export function LogsView({
               </div>
 
               {page.items.length === 0 ? (
-                <div className="network-empty flex h-[240px] flex-col items-center justify-center gap-2 text-center text-[12px]">
+                <div className="network-empty flex h-[240px] flex-col items-center justify-center gap-2 text-center text-caption">
                   <Database className="network-empty-icon h-7 w-7" />
                   <div>{loading ? t("Loading logs") : t(hasActiveFilters ? "No request logs match the current filters." : "No request logs yet.")}</div>
                   {!loading ? (
-                    <div className="max-w-[360px] px-4 text-[11px] leading-4 text-muted-foreground">
+                    <div className="max-w-[360px] px-4 text-label leading-4 text-muted-foreground">
                       {t(hasActiveFilters
                         ? "Clear filters or broaden the search to find more request logs."
                         : "Send a request through AgentRouter, then refresh this page to inspect it.")}
@@ -636,7 +636,7 @@ export function LogsView({
                   ) : null}
                   {!loading && hasActiveFilters ? (
                     <button
-                      className="network-control-button mt-1 rounded-md border px-3 py-1.5 text-[11px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                      className="network-control-button mt-1 rounded-md border px-3 py-1.5 text-label font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
                       onClick={() => updateFilter(clearRequestLogFilters())}
                       type="button"
                     >
@@ -714,10 +714,10 @@ export function MonitorDisabledView({
             {icon}
           </div>
           <div className="mt-4 text-[15px] font-semibold text-foreground">{t(title)}</div>
-          <div className="mt-2 text-[12px] leading-5 text-muted-foreground">{t(description)}</div>
+          <div className="mt-2 text-caption leading-5 text-muted-foreground">{t(description)}</div>
           {onEnable ? (
             <button
-              className="network-control-button mt-4 rounded-md border px-3 py-2 text-[12px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+              className="network-control-button mt-4 rounded-md border px-3 py-2 text-caption font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
               onClick={onEnable}
               type="button"
             >
@@ -836,7 +836,7 @@ function LogMobileCard({
   const tokenSummary = useMemo(() => formatLogTokenSummary(item, t, numberLocale), [item, numberLocale, t]);
 
   return (
-    <div className={cn("network-row text-[12px] tabular-nums transition-colors", expanded && "network-row-selected")}>
+    <div className={cn("network-row text-caption tabular-nums transition-colors", expanded && "network-row-selected")}>
       <button
         aria-expanded={expanded}
         className="w-full px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
@@ -847,25 +847,25 @@ function LogMobileCard({
           <span className="mt-1 shrink-0"><LogStatusDot entry={item} /></span>
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-2">
-              <span className="network-row-id shrink-0 font-mono text-[11px]">#{index + 1}</span>
+              <span className="network-row-id shrink-0 font-mono text-label">#{index + 1}</span>
               <span className="min-w-0 truncate font-mono font-semibold" title={`${item.method} ${item.path}`}>{item.method} {item.path}</span>
               <ChevronDown className={cn("ml-auto h-3.5 w-3.5 shrink-0 transition-transform", expanded && "rotate-180")} />
             </div>
             <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
               <span className={cn(
-                "rounded-full px-2 py-0.5 text-[11px] font-bold uppercase",
+                "rounded-full px-2 py-0.5 text-label font-bold uppercase",
                 item.ok ? "network-state-pill-completed" : "network-state-pill-error"
               )}>
                 HTTP {item.statusCode || "-"}
               </span>
-              <span className="network-row-secondary rounded-full px-2 py-0.5 text-[11px] font-semibold">{item.isStream ? t("Streaming") : t("Non-streaming")}</span>
+              <span className="network-row-secondary rounded-full px-2 py-0.5 text-label font-semibold">{item.isStream ? t("Streaming") : t("Non-streaming")}</span>
               {item.retryAttempts.length > 0 ? (
-                <span className="network-service-paused rounded px-1.5 py-0.5 text-[10px] font-bold">
+                <span className="network-service-paused rounded px-1.5 py-0.5 text-2xs font-bold">
                   R{item.retryAttempts.length}
                 </span>
               ) : null}
             </div>
-            <div className="mt-2 min-w-0 text-[11px] text-muted-foreground">
+            <div className="mt-2 min-w-0 text-label text-muted-foreground">
               <div className="truncate font-mono" title={createdAt}>{createdAt}</div>
               <div className="mt-1 flex min-w-0 items-center gap-1" title={`${logRequestModel(item)} -> ${logResolvedRouteModel(item)}`}>
                 <span className="min-w-0 truncate">{logRequestModel(item)}</span>
@@ -873,7 +873,7 @@ function LogMobileCard({
                 <span className="min-w-0 truncate">{logResolvedRouteModel(item)}</span>
               </div>
             </div>
-            <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
+            <div className="mt-2 grid grid-cols-2 gap-2 text-label">
               <LogCompactMetric label={t("Token")} value={tokenSummary} />
               <LogCompactMetric label={t("Duration")} value={formatDuration(item.durationMs)} />
               <LogCompactMetric label={t("First token")} value={formatLogFirstToken(item)} />
@@ -893,7 +893,7 @@ function LogMobileCard({
 function LogCompactMetric({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0 py-1">
-      <div className="truncate text-[10px] text-muted-foreground">{label}</div>
+      <div className="truncate text-2xs text-muted-foreground">{label}</div>
       <div className="mt-0.5 min-w-0 break-words font-mono font-semibold leading-4" title={value}>{value}</div>
     </div>
   );
@@ -928,7 +928,7 @@ const LogRow = memo(function LogRow({
       <button
         aria-expanded={expanded}
         className={cn(
-          "network-row grid h-11 w-full items-center border-b border-border/60 px-0 text-left text-[12px] font-medium tabular-nums outline-none transition-colors",
+          "network-row grid h-11 w-full items-center border-b border-border/60 px-0 text-left text-caption font-medium tabular-nums outline-none transition-colors",
           index % 2 === 0 ? "network-row-even" : "network-row-odd",
           expanded && "network-row-selected"
         )}
@@ -936,7 +936,7 @@ const LogRow = memo(function LogRow({
         style={logTableGridStyle}
         type="button"
       >
-        <div className="truncate px-3 font-mono text-[11px]" title={createdAt}>
+        <div className="truncate px-3 font-mono text-label" title={createdAt}>
           {createdAt}
         </div>
         <div className="flex min-w-0 items-center gap-2 px-2">
@@ -945,7 +945,7 @@ const LogRow = memo(function LogRow({
           <span className="network-row-secondary truncate">{item.statusCode || "-"}</span>
           {item.retryAttempts.length > 0 ? (
             <span
-              className="network-service-paused shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold"
+              className="network-service-paused shrink-0 rounded px-1.5 py-0.5 text-2xs font-bold"
               title={`${t("Retry attempts")}: ${item.retryAttempts.length}`}
             >
               R{item.retryAttempts.length}
@@ -998,16 +998,16 @@ export function LogExpandedDetails({
     <div className="network-detail border-b">
       <div className="network-detail-bar flex min-h-10 min-w-0 items-center gap-2 border-b px-3 py-1.5">
         <span className={cn(
-          "rounded-full px-3 py-1 text-[12px] font-bold uppercase",
+          "rounded-full px-3 py-1 text-caption font-bold uppercase",
           entry.ok ? "network-state-pill-completed" : "network-state-pill-error"
         )}>
           HTTP {entry.statusCode || "-"}
         </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[12px] font-semibold" title={entry.url}>
+        <span className="min-w-0 flex-1 truncate font-mono text-caption font-semibold" title={entry.url}>
           {entry.method} {entry.path}
         </span>
       </div>
-      <div className={cn("network-body-meta grid grid-cols-2 gap-y-2 border-b px-3 py-2 text-[12px] sm:grid-cols-4", hasCredentialInfo ? "lg:grid-cols-12" : "lg:grid-cols-10")}>
+      <div className={cn("network-body-meta grid grid-cols-2 gap-y-2 border-b px-3 py-2 text-caption sm:grid-cols-4", hasCredentialInfo ? "lg:grid-cols-12" : "lg:grid-cols-10")}>
         <LogMetric label={t("Duration")} value={formatDuration(entry.durationMs)} />
         <LogMetric label={t("First token")} value={formatLogFirstToken(entry)} />
         <LogMetric label={t("Output rate")} value={formatLogOutputRate(entry, numberLocale)} />
@@ -1033,7 +1033,7 @@ export function LogExpandedDetails({
       {entry.retryAttempts.length > 0 ? <LogRetryAttempts attempts={entry.retryAttempts} /> : null}
       {entry.routeTrace ? <LogRouteTrace trace={entry.routeTrace} /> : null}
       {detailLoading || detailError ? (
-        <div className={cn("border-b px-3 py-2 text-[12px] font-semibold", detailError ? "network-error-box" : "network-body-meta")}>
+        <div className={cn("border-b px-3 py-2 text-caption font-semibold", detailError ? "network-error-box" : "network-body-meta")}>
           {detailError || t("Loading full payload...")}
         </div>
       ) : null}
@@ -1069,7 +1069,7 @@ function LogStreamMetrics({ entry }: { entry: RequestLogEntry }) {
   const availableMetrics = metrics.filter(([, value]) => value !== undefined && Number.isFinite(value) && value >= 0);
   if (!entry.isStream || (!availableMetrics.length && !entry.streamSpeedSampleStatus)) return null;
   return (
-    <div aria-label={t("Stream metrics")} className="network-body-meta grid grid-cols-2 gap-y-2 border-b px-3 py-2 text-[12px] sm:grid-cols-4 lg:grid-cols-5">
+    <div aria-label={t("Stream metrics")} className="network-body-meta grid grid-cols-2 gap-y-2 border-b px-3 py-2 text-caption sm:grid-cols-4 lg:grid-cols-5">
       {availableMetrics.map(([label, value]) => (
         <LogMetric key={label} label={t(label)} value={formatDuration(value!)} />
       ))}
@@ -1109,16 +1109,16 @@ function LogRouteTrace({ trace }: { trace: RequestRouteTrace }) {
 
   return (
     <>
-      <div className="network-body-meta flex min-w-0 flex-wrap items-center justify-between gap-3 border-b px-3 py-2.5 text-[12px]">
+      <div className="network-body-meta flex min-w-0 flex-wrap items-center justify-between gap-3 border-b px-3 py-2.5 text-caption">
         <div className="min-w-0">
           <div className="font-semibold">{t("Route trace")}</div>
-          <div className="network-muted mt-0.5 text-[11px]">
+          <div className="network-muted mt-0.5 text-label">
             {visibleHopCount} {t("hops")}
             {trace.truncated ? ` · ${t("truncated")}` : ""}
           </div>
         </div>
         <button
-          className="network-control-button flex h-8 shrink-0 items-center gap-2 rounded-md border px-3 text-[11px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+          className="network-control-button flex h-8 shrink-0 items-center gap-2 rounded-md border px-3 text-label font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
           onClick={() => setDialogOpen(true)}
           type="button"
         >
@@ -1158,7 +1158,7 @@ function LogRouteTraceDialog({
         <DialogHeader>
           <div className="min-w-0">
             <DialogTitle>{t("Route graph")}</DialogTitle>
-            <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+            <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-2 text-label text-muted-foreground">
               <span>{hops.length} {t("hops")}</span>
               {trace.truncated ? <><span aria-hidden="true">·</span><span>{t("truncated")}</span></> : null}
             </div>
@@ -1175,10 +1175,10 @@ function LogRouteTraceDialog({
         </DialogHeader>
         <DialogBody className="flex min-h-0 flex-col overflow-hidden p-0">
           <div className="network-body-meta shrink-0 border-b px-4 py-3">
-            <div className="network-muted text-[11px] font-semibold">{t("Select a route node to inspect routing operations")}</div>
+            <div className="network-muted text-label font-semibold">{t("Select a route node to inspect routing operations")}</div>
             <div className="mt-3 overflow-x-auto rounded-md border border-[color:var(--network-border)] bg-card/40">
               {hops.length === 0 ? (
-                <div className="network-muted flex min-h-40 items-center justify-center px-4 text-[12px]">{t("No route activity")}</div>
+                <div className="network-muted flex min-h-40 items-center justify-center px-4 text-caption">{t("No route activity")}</div>
               ) : (
                 <div className="flex min-w-max items-center px-5 py-6" role="list" aria-label={t("Route graph")}>
                   {hops.map((hop, index) => (
@@ -1209,11 +1209,11 @@ function LogRouteTraceDialog({
                                 ? "network-service-muted"
                                 : "network-dot-completed"
                           )} />
-                          <span className="network-muted truncate text-[10px] font-bold uppercase">#{index + 1}</span>
-                          {hop.attempt ? <span className="network-muted ml-auto shrink-0 text-[10px]">A{hop.attempt}</span> : null}
+                          <span className="network-muted truncate text-2xs font-bold uppercase">#{index + 1}</span>
+                          {hop.attempt ? <span className="network-muted ml-auto shrink-0 text-2xs">A{hop.attempt}</span> : null}
                         </span>
-                        <span className="mt-3 line-clamp-2 break-words text-[12px] font-bold leading-4">{routeHopDisplayName(hop.name, t)}</span>
-                        <span className="network-muted mt-auto flex items-center justify-end text-[10px]">
+                        <span className="mt-3 line-clamp-2 break-words text-caption font-bold leading-4">{routeHopDisplayName(hop.name, t)}</span>
+                        <span className="network-muted mt-auto flex items-center justify-end text-2xs">
                           <span>{formatDuration(hop.durationMs)}</span>
                         </span>
                       </button>
@@ -1227,7 +1227,7 @@ function LogRouteTraceDialog({
             {activeHop ? (
               <LogRouteHopDetails hop={activeHop} index={activeHopIndex} />
             ) : (
-              <div className="network-muted flex min-h-52 items-center justify-center rounded-md border border-dashed border-border px-4 text-center text-[12px]">
+              <div className="network-muted flex min-h-52 items-center justify-center rounded-md border border-dashed border-border px-4 text-center text-caption">
                 {t("Select a route node to inspect its operations.")}
               </div>
             )}
@@ -1251,37 +1251,37 @@ function LogRouteHopDetails({ hop, index }: { hop: RequestRouteTraceHop; index: 
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3 border-b border-border pb-3">
         <div className="min-w-0">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <span className="network-muted text-[10px] font-bold uppercase">{t("Route node")} #{index + 1}</span>
-            <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">{t(hop.phase)}</span>
+            <span className="network-muted text-2xs font-bold uppercase">{t("Route node")} #{index + 1}</span>
+            <span className="rounded bg-muted px-1.5 py-0.5 text-2xs font-semibold uppercase text-muted-foreground">{t(hop.phase)}</span>
             <span className={cn(
-              "rounded px-1.5 py-0.5 text-[10px] font-bold uppercase",
+              "rounded px-1.5 py-0.5 text-2xs font-bold uppercase",
               hop.status === "error" ? "network-state-pill-error" : hop.status === "noop" ? "network-service-muted" : "network-state-pill-completed"
             )}>{t(hop.status)}</span>
-            {hop.attempt ? <span className="network-muted text-[10px]">{t("Attempt")} #{hop.attempt}</span> : null}
+            {hop.attempt ? <span className="network-muted text-2xs">{t("Attempt")} #{hop.attempt}</span> : null}
           </div>
-          <div className="mt-1 break-words font-mono text-[13px] font-bold">{hop.name}</div>
+          <div className="mt-1 break-words font-mono text-body font-bold">{hop.name}</div>
         </div>
-        <div className="network-muted shrink-0 text-right font-mono text-[10px]">
+        <div className="network-muted shrink-0 text-right font-mono text-2xs">
           <div>{formatDuration(hop.durationMs)}</div>
         </div>
       </div>
       {explanation || target || outcome ? (
-        <div className="grid gap-2 border-b border-border py-3 text-[11px] md:grid-cols-3">
+        <div className="grid gap-2 border-b border-border py-3 text-label md:grid-cols-3">
           {explanation ? <RouteHopDetail label={t("Decision")} value={explanation} /> : null}
           {target ? <RouteHopDetail label={t("Target")} mono value={target} /> : null}
           {outcome ? <RouteHopDetail danger={hop.status === "error"} label={t("Result")} value={outcome} /> : null}
         </div>
       ) : null}
       <div className="pt-3">
-        <div className="mb-2 text-[11px] font-semibold">{t("Routing operations")}</div>
+        <div className="mb-2 text-label font-semibold">{t("Routing operations")}</div>
         {hop.changes.length > 0 ? (
           <div className="overflow-x-auto rounded border border-[color:var(--network-border)]">
             {hop.changes.map((change, changeIndex) => (
               <LogRouteChange change={change} index={changeIndex} key={`${change.path}-${changeIndex}`} />
             ))}
           </div>
-        ) : <div className="network-muted rounded border border-dashed border-border px-3 py-4 text-[11px]">{t("No request fields changed")}</div>}
-        {hop.truncated ? <div className="network-service-paused mt-2 text-[10px]">{t("This hop was truncated")}</div> : null}
+        ) : <div className="network-muted rounded border border-dashed border-border px-3 py-4 text-label">{t("No request fields changed")}</div>}
+        {hop.truncated ? <div className="network-service-paused mt-2 text-2xs">{t("This hop was truncated")}</div> : null}
       </div>
     </div>
   );
@@ -1300,8 +1300,8 @@ function RouteHopDetail({
 }) {
   return (
     <div className="min-w-0 rounded-md bg-muted/50 px-3 py-2">
-      <div className="network-muted text-[10px] font-semibold uppercase">{label}</div>
-      <div className={cn("mt-1 break-words text-[11px]", mono && "font-mono", danger && "network-error-text")}>{value}</div>
+      <div className="network-muted text-2xs font-semibold uppercase">{label}</div>
+      <div className={cn("mt-1 break-words text-label", mono && "font-mono", danger && "network-error-text")}>{value}</div>
     </div>
   );
 }
@@ -1350,7 +1350,7 @@ function LogRouteChange({ change, index }: { change: RequestRouteTraceChange; in
   const displayPath = formatRouteTracePath(change);
   return (
     <div className={cn(
-      "grid min-w-[560px] grid-cols-[76px_minmax(160px,0.8fr)_minmax(0,1fr)_28px_minmax(0,1fr)] border-b last:border-b-0 text-[10px]",
+      "grid min-w-[560px] grid-cols-[76px_minmax(160px,0.8fr)_minmax(0,1fr)_28px_minmax(0,1fr)] border-b last:border-b-0 text-2xs",
       index % 2 === 0 ? "network-kv-row-even" : "network-kv-row-odd"
     )}>
       <div className="border-r border-[color:var(--network-border)] px-2 py-1.5 font-bold uppercase">{t(change.operation)}</div>
@@ -1421,13 +1421,13 @@ function LogRetryAttempts({ attempts }: { attempts: RequestLogEntry["retryAttemp
   const t = useAppText();
 
   return (
-    <div className="network-body-meta border-b px-3 py-2 text-[12px]">
+    <div className="network-body-meta border-b px-3 py-2 text-caption">
       <div className="mb-2 flex min-w-0 items-center justify-between gap-3">
         <div className="min-w-0 truncate font-semibold">{t("Retry attempts")}</div>
-        <div className="network-muted shrink-0 font-mono text-[11px]">{attempts.length}</div>
+        <div className="network-muted shrink-0 font-mono text-label">{attempts.length}</div>
       </div>
       <div className="overflow-x-auto rounded border border-[color:var(--network-border)]">
-        <div className="network-kv-header grid min-w-[520px] grid-cols-[96px_1fr_140px_120px] border-b text-[11px] font-bold">
+        <div className="network-kv-header grid min-w-[520px] grid-cols-[96px_1fr_140px_120px] border-b text-label font-bold">
           <div className="border-r border-[color:var(--network-border-strong)] px-3 py-2">{t("Attempt")}</div>
           <div className="border-r border-[color:var(--network-border-strong)] px-3 py-2">{t("Result")}</div>
           <div className="border-r border-[color:var(--network-border-strong)] px-3 py-2">{t("Next retry wait")}</div>
@@ -1436,7 +1436,7 @@ function LogRetryAttempts({ attempts }: { attempts: RequestLogEntry["retryAttemp
         {attempts.map((attempt, index) => (
           <div
             className={cn(
-              "network-kv-row grid min-w-[520px] grid-cols-[96px_1fr_140px_120px] text-[11px] font-semibold",
+              "network-kv-row grid min-w-[520px] grid-cols-[96px_1fr_140px_120px] text-label font-semibold",
               index % 2 === 0 ? "network-kv-row-even" : "network-kv-row-odd"
             )}
             key={`${attempt.attempt}-${attempt.final ? "final" : "retry"}`}
@@ -1457,8 +1457,8 @@ function LogRetryAttempts({ attempts }: { attempts: RequestLogEntry["retryAttemp
 function LogMetric({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
-      <div className="network-muted truncate text-[11px]">{label}</div>
-      <div className="truncate font-mono text-[12px] font-semibold">{value}</div>
+      <div className="network-muted truncate text-label">{label}</div>
+      <div className="truncate font-mono text-caption font-semibold">{value}</div>
     </div>
   );
 }
@@ -2061,14 +2061,14 @@ function LogJsonPanel({
   return (
     <div className={cn("network-pane-split flex min-h-0 min-w-0 flex-col", className)}>
       <div className="network-pane-header flex h-10 min-w-0 shrink-0 items-center gap-3 border-b px-3">
-        <span className="network-pane-title shrink-0 text-[14px] font-bold">{title}</span>
-        {subtitle ? <span className="network-muted shrink-0 text-[12px] font-semibold">{subtitle}</span> : null}
+        <span className="network-pane-title shrink-0 text-body-sm font-bold">{title}</span>
+        {subtitle ? <span className="network-muted shrink-0 text-caption font-semibold">{subtitle}</span> : null}
         <div className="network-payload-tabs flex min-w-0 items-center rounded-md border p-0.5">
           {(["body", "header"] as const).map((tab) => (
             <button
               aria-pressed={selectedTab === tab}
               className={cn(
-                "network-payload-tab h-6 rounded-[5px] border border-transparent px-2.5 text-[12px] font-semibold capitalize outline-none transition-[background-color,border-color,color,box-shadow] focus-visible:ring-2 focus-visible:ring-ring/30",
+                "network-payload-tab h-6 rounded-[5px] border border-transparent px-2.5 text-caption font-semibold capitalize outline-none transition-[background-color,border-color,color,box-shadow] focus-visible:ring-2 focus-visible:ring-ring/30",
                 selectedTab === tab && "network-payload-tab-active"
               )}
               key={tab}
@@ -2174,7 +2174,7 @@ function LogJsonBodyToolbar({
         <Search className="network-search-icon pointer-events-none absolute left-2 top-1/2 z-[1] h-3 w-3 -translate-y-1/2" />
         <input
           aria-label={`${t("Filter")} ${title} JSON`}
-          className="network-filter-input h-6 w-full rounded border pl-7 pr-2 text-[11px] font-semibold outline-none"
+          className="network-filter-input h-6 w-full rounded border pl-7 pr-2 text-label font-semibold outline-none"
           onChange={(event) => onQueryChange(event.target.value)}
           placeholder={t("Filter JSON...")}
           value={query}
@@ -2182,18 +2182,18 @@ function LogJsonBodyToolbar({
       </div>
       {canToggleJsonText ? (
         <button
-          className="network-tab shrink-0 border-0 bg-transparent p-0 text-[11px] font-semibold outline-none"
+          className="network-tab shrink-0 border-0 bg-transparent p-0 text-label font-semibold outline-none"
           onClick={onToggleTextBody}
           type="button"
         >
           {toggleLabel}
         </button>
       ) : null}
-      {bodyView.loading ? <span className="network-muted shrink-0 text-[11px] font-semibold">{t("Loading full payload...")}</span> : null}
-      {bodyView.error ? <span className="network-error-box shrink-0 rounded px-2 py-0.5 text-[11px] font-semibold">{bodyView.error}</span> : null}
-      {bodyView.sourceSizeBytes > 0 ? <span className="network-muted hidden shrink-0 text-[11px] font-semibold sm:inline">{formatBytes(bodyView.sourceSizeBytes)}</span> : null}
-      {body?.contentType ? <span className="network-muted hidden shrink-0 text-[11px] font-semibold sm:inline">{body.contentType}</span> : null}
-      {body?.truncated ? <span className="network-service-paused rounded-full px-2 py-0.5 text-[11px] font-semibold">{t("truncated")}</span> : null}
+      {bodyView.loading ? <span className="network-muted shrink-0 text-label font-semibold">{t("Loading full payload...")}</span> : null}
+      {bodyView.error ? <span className="network-error-box shrink-0 rounded px-2 py-0.5 text-label font-semibold">{bodyView.error}</span> : null}
+      {bodyView.sourceSizeBytes > 0 ? <span className="network-muted hidden shrink-0 text-label font-semibold sm:inline">{formatBytes(bodyView.sourceSizeBytes)}</span> : null}
+      {body?.contentType ? <span className="network-muted hidden shrink-0 text-label font-semibold sm:inline">{body.contentType}</span> : null}
+      {body?.truncated ? <span className="network-service-paused rounded-full px-2 py-0.5 text-label font-semibold">{t("truncated")}</span> : null}
     </div>
   );
 }
@@ -2221,7 +2221,7 @@ function LogJsonBodyContent({
   return showJsonTree ? (
     <LogJsonTree expandedPaths={expandedJsonPaths} onToggle={onToggleJsonPath} value={value} />
   ) : (
-    <pre className="network-code min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 pr-20 font-mono text-[11px] leading-5">{visible}</pre>
+    <pre className="network-code min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 pr-20 font-mono text-label leading-5">{visible}</pre>
   );
 }
 
@@ -2233,14 +2233,14 @@ function LogStreamTimeline({ events }: { events: LogStreamEvent[] }) {
           className="overflow-hidden rounded-md border border-[color:var(--network-border)] bg-[color:var(--network-surface)]"
           key={`${event.index}-${event.raw}`}
         >
-          <div className="network-body-meta flex min-h-8 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
+          <div className="network-body-meta flex min-h-8 items-center gap-2 border-b px-3 py-1.5 text-label">
             <span className="font-bold">#{event.index + 1}</span>
             <span className="network-muted">SSE</span>
             {event.event ? <span className="rounded bg-[color:var(--network-border)] px-1.5 py-0.5 font-mono">{event.event}</span> : null}
             {event.id ? <span className="network-muted font-mono">id={event.id}</span> : null}
             {event.done ? <span className="ml-auto rounded bg-[color:var(--network-border)] px-1.5 py-0.5 font-semibold">DONE</span> : null}
           </div>
-          <pre className="network-code overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5">
+          <pre className="network-code overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-label leading-5">
             {event.json !== undefined ? JSON.stringify(event.json, null, 2) : event.dataText}
           </pre>
         </section>
@@ -2297,11 +2297,11 @@ function LogBodyChunkContent({
         >
           <ChevronRight className="h-3.5 w-3.5" />
         </button>
-        {rangeLabel ? <span className="network-muted min-w-0 truncate text-[11px] font-semibold">{rangeLabel}</span> : null}
-        {chunkView.loading ? <span className="network-muted shrink-0 text-[11px] font-semibold">{t("Loading full payload...")}</span> : null}
-        {chunkView.error ? <span className="network-error-box shrink-0 rounded px-2 py-0.5 text-[11px] font-semibold">{chunkView.error}</span> : null}
+        {rangeLabel ? <span className="network-muted min-w-0 truncate text-label font-semibold">{rangeLabel}</span> : null}
+        {chunkView.loading ? <span className="network-muted shrink-0 text-label font-semibold">{t("Loading full payload...")}</span> : null}
+        {chunkView.error ? <span className="network-error-box shrink-0 rounded px-2 py-0.5 text-label font-semibold">{chunkView.error}</span> : null}
       </div>
-      <pre className="network-code min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 pr-20 font-mono text-[11px] leading-5">{content}</pre>
+      <pre className="network-code min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 pr-20 font-mono text-label leading-5">{content}</pre>
     </div>
   );
 }
@@ -2383,7 +2383,7 @@ function LogJsonFullscreenViewer({
       <div className="network-json-fullscreen-panel flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <div className="network-json-fullscreen-header flex h-12 min-w-0 shrink-0 items-center gap-3 border-b px-4">
           <span className="network-pane-title min-w-0 truncate text-[15px] font-bold">{title}</span>
-          {subtitle ? <span className="network-muted shrink-0 text-[12px] font-semibold">{subtitle}</span> : null}
+          {subtitle ? <span className="network-muted shrink-0 text-caption font-semibold">{subtitle}</span> : null}
           <button
             aria-label={t("Close fullscreen JSON viewer")}
             className="network-control-button ml-auto flex h-7 w-7 items-center justify-center rounded border outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
@@ -2605,7 +2605,7 @@ function LogJsonTree({
   value: unknown;
 }) {
   return (
-    <div className="network-code min-h-0 flex-1 overflow-auto p-3 pr-20 font-mono text-[11px] leading-5">
+    <div className="network-code min-h-0 flex-1 overflow-auto p-3 pr-20 font-mono text-label leading-5">
       <JsonTreeNode expandedPaths={expandedPaths} onToggle={onToggle} path="$" value={value} />
     </div>
   );
@@ -2773,14 +2773,14 @@ function OutputRateHelp({ average = false }: { average?: boolean }) {
       aria-label={t(average ? "平均吞吐率说明" : "输出速率说明")}
       aria-expanded={Boolean(position)}
       aria-controls={position ? id : undefined}
-      className="ml-1.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white text-[11px] font-bold leading-none text-slate-700 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="ml-1.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white text-label font-bold leading-none text-slate-700 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
       onClick={() => {
         if (position) { setPosition(undefined); return; }
         const rect = trigger.current?.getBoundingClientRect();
         if (rect) setPosition({ left: Math.max(12, Math.min(rect.left, window.innerWidth - 332)), top: rect.bottom + 8 });
       }}
     >?</button>
-    <TooltipPortal ref={content} open={Boolean(position)} id={id} role="note" className="pointer-events-auto w-[320px] max-w-[calc(100vw-24px)] p-3 text-[12px] leading-5" style={position}>
+    <TooltipPortal ref={content} open={Boolean(position)} id={id} role="note" className="pointer-events-auto w-[320px] max-w-[calc(100vw-24px)] p-3 text-caption leading-5" style={position}>
       {average ? <>
         <p className="font-semibold">{t("Average throughput")}</p>
         <p className="mt-1">{t("Formula: output tokens ÷ total request duration in seconds.")}</p>
@@ -2867,12 +2867,12 @@ function NetworkRequestInspector({
   return (
     <div className="network-pane-split flex h-full min-w-0 flex-col">
       <div className="network-pane-header flex h-10 min-w-0 shrink-0 items-center gap-3 border-b px-3">
-        <span className="network-pane-title shrink-0 text-[14px] font-bold">{t("Request")}</span>
+        <span className="network-pane-title shrink-0 text-body-sm font-bold">{t("Request")}</span>
         <div className="flex min-w-0 items-center gap-3">
           {(["header", "query", "body", "raw", "summary"] as const).map((tab) => (
             <button
               className={cn(
-                "network-tab border-0 bg-transparent p-0 text-[12px] font-semibold capitalize outline-none",
+                "network-tab border-0 bg-transparent p-0 text-caption font-semibold capitalize outline-none",
                 selectedTab === tab && "network-tab-active"
               )}
               key={tab}
@@ -2912,12 +2912,12 @@ function NetworkResponseInspector({
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="network-pane-header flex h-10 min-w-0 shrink-0 items-center justify-between gap-3 border-b px-3">
-        <span className="network-pane-title shrink-0 text-[14px] font-bold">{t("Response")}</span>
+        <span className="network-pane-title shrink-0 text-body-sm font-bold">{t("Response")}</span>
         <div className="flex items-center gap-3">
           {(["body", "header", "raw"] as const).map((tab) => (
             <button
               className={cn(
-                "network-tab border-0 bg-transparent p-0 text-[12px] font-semibold capitalize outline-none",
+                "network-tab border-0 bg-transparent p-0 text-caption font-semibold capitalize outline-none",
                 selectedTab === tab && "network-tab-active"
               )}
               key={tab}
@@ -2932,7 +2932,7 @@ function NetworkResponseInspector({
 
       <div className="network-pane-body min-h-0 flex-1 overflow-auto">
         {exchange.error ? (
-          <div className="network-error-box m-4 rounded-md border px-3 py-2 text-[12px]">{exchange.error}</div>
+          <div className="network-error-box m-4 rounded-md border px-3 py-2 text-caption">{exchange.error}</div>
         ) : null}
         {selectedTab === "body" ? <NetworkBodyViewer body={exchange.responseBody} /> : null}
         {selectedTab === "header" ? <NetworkKeyValueTable rows={networkHeaderRows(exchange.responseHeaders ?? {})} emptyLabel={t("No response headers")} /> : null}
@@ -2946,19 +2946,19 @@ function NetworkKeyValueTable({ emptyLabel = "No values", rows }: { emptyLabel?:
   const t = useAppText();
 
   if (rows.length === 0) {
-    return <div className="network-kv-empty px-4 py-10 text-center text-[12px] font-semibold">{t(emptyLabel)}</div>;
+    return <div className="network-kv-empty px-4 py-10 text-center text-caption font-semibold">{t(emptyLabel)}</div>;
   }
 
   return (
     <div className="min-w-[520px]">
-      <div className="network-kv-header grid h-9 grid-cols-[minmax(180px,0.9fr)_minmax(280px,1.6fr)] items-center border-b text-[12px] font-bold">
+      <div className="network-kv-header grid h-9 grid-cols-[minmax(180px,0.9fr)_minmax(280px,1.6fr)] items-center border-b text-caption font-bold">
         <div className="network-kv-key-head border-r px-3">{t("Key")}</div>
         <div className="px-3">{t("Value")}</div>
       </div>
       {rows.map(([key, value], index) => (
         <div
           className={cn(
-            "network-kv-row grid min-h-9 grid-cols-[minmax(180px,0.9fr)_minmax(280px,1.6fr)] items-start text-[12px] font-semibold",
+            "network-kv-row grid min-h-9 grid-cols-[minmax(180px,0.9fr)_minmax(280px,1.6fr)] items-start text-caption font-semibold",
             index % 2 === 0 ? "network-kv-row-even" : "network-kv-row-odd"
           )}
           key={`${key}-${index}`}
@@ -2975,19 +2975,19 @@ function NetworkBodyViewer({ body }: { body?: ProxyNetworkBody }) {
   const t = useAppText();
 
   if (!body || (!body.text && body.sizeBytes === 0)) {
-    return <div className="px-4 py-10 text-center text-[12px] font-semibold text-[#777d86]">{t("No body")}</div>;
+    return <div className="px-4 py-10 text-center text-caption font-semibold text-[#777d86]">{t("No body")}</div>;
   }
 
   return (
     <div className="min-w-0">
-      <div className="network-body-meta flex min-h-9 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-[11px] font-semibold">
+      <div className="network-body-meta flex min-h-9 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-label font-semibold">
         <span>{formatBytes(body.sizeBytes)}</span>
         {body.contentType ? <span>{body.contentType}</span> : null}
         {body.encoding === "base64" ? <span>base64</span> : null}
         {body.decodedFrom ? <span>{body.decodedFrom} {t("decoded")}</span> : null}
         {body.truncated ? <span>{t("truncated")}</span> : null}
       </div>
-      {body.error ? <div className="network-body-warning border-b px-3 py-2 text-[12px]">{body.error}</div> : null}
+      {body.error ? <div className="network-body-warning border-b px-3 py-2 text-caption">{body.error}</div> : null}
       <NetworkInspectorCode value={body.text || t("No body")} />
     </div>
   );
@@ -2995,6 +2995,6 @@ function NetworkBodyViewer({ body }: { body?: ProxyNetworkBody }) {
 
 function NetworkInspectorCode({ value }: { value: string }) {
   return (
-    <pre className="network-code min-h-[240px] overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5">{value}</pre>
+    <pre className="network-code min-h-[240px] overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-label leading-5">{value}</pre>
   );
 }

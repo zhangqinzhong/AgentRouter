@@ -9,7 +9,7 @@ import {
   Copy,
   Plus,
   X
-} from "lucide-react";
+} from "@/components/ui/icons";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -68,10 +68,10 @@ export function Field({
   const content = (
     <>
       <span className="flex min-w-0 items-center gap-1.5">
-        <span className="truncate text-[12px] font-medium text-muted-foreground">{label}</span>
+        <span className="truncate text-caption font-medium text-muted-foreground">{label}</span>
         {requirement ? (
           <span className={cn(
-            "shrink-0 rounded border px-1 py-0 text-[11px] font-semibold leading-4 tracking-wide",
+            "shrink-0 rounded border px-1 py-0 text-label font-semibold leading-4 tracking-wide",
             requirement === "required"
               ? "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300"
               : "border-border bg-muted/35 text-muted-foreground"
@@ -93,7 +93,7 @@ export function Field({
 export function FieldGroup({ children, className, label }: { children: React.ReactNode; className?: string; label: string }) {
   return (
     <div className={cn("block min-w-0 space-y-1", className)}>
-      <span className="block truncate text-[12px] font-medium text-muted-foreground">{label}</span>
+      <span className="block truncate text-caption font-medium text-muted-foreground">{label}</span>
       {children}
     </div>
   );
@@ -266,7 +266,7 @@ export function MetricCard({ className, label, tone, value }: { className?: stri
       <div className={cn("h-1", metricToneBar(tone))} />
       <CardContent className="flex min-h-[88px] flex-1 flex-col justify-center">
         <div className="min-w-0">
-          <div className="truncate text-[11px] font-medium text-muted-foreground">{label}</div>
+          <div className="truncate text-label font-medium text-muted-foreground">{label}</div>
           <div className="mt-1 truncate text-[20px] font-semibold">{value}</div>
         </div>
       </CardContent>
@@ -478,9 +478,9 @@ export function EndpointTitleBar({
             running ? "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.16)]" : "bg-muted-foreground/45"
           )}
         />
-        <span className="shrink-0 text-[11px] font-medium text-muted-foreground">{t("Endpoint")}</span>
+        <span className="shrink-0 text-label font-medium text-muted-foreground">{t("Endpoint")}</span>
         <span className="h-3 w-px shrink-0 bg-border" />
-        <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">{value}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-caption text-foreground">{value}</span>
         <span className="sr-only">{t("Service status")}: {statusLabel}</span>
         </>}
       </Button>}
@@ -540,11 +540,11 @@ export function EndpointInfoRow({
   const t = useAppText();
 
   return (
-    <div className="grid grid-cols-[76px_minmax(0,1fr)_24px] items-center gap-2 text-[12px]">
+    <div className="grid grid-cols-[76px_minmax(0,1fr)_24px] items-center gap-2 text-caption">
       <span className="text-right text-muted-foreground">{label ? `${label}:` : null}</span>
       <span className="min-w-0 truncate font-medium text-foreground">
         {value}
-        {meta ? <span className="ml-1 text-[11px] font-normal text-muted-foreground">({meta})</span> : null}
+        {meta ? <span className="ml-1 text-label font-normal text-muted-foreground">({meta})</span> : null}
       </span>
       <Button
         aria-label={copied ? t("Copied") : t("Copy")}

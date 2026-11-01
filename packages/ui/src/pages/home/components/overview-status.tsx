@@ -5,7 +5,7 @@ import {
 } from "../shared/index";
 import { TooltipPortal } from "@/components/ui/tooltip";
 import type { UIEvent } from "react";
-import { Server } from "lucide-react";
+import { Server } from "@/components/ui/icons";
 
 type SystemStatusTone = "error" | "idle" | "ok" | "warn";
 
@@ -291,7 +291,7 @@ export function SystemStatusStrip({ usageStats }: { usageStats: UsageStatsSnapsh
           <Button aria-label={t("Show earlier")} disabled={atStart} onClick={() => pageStrip(-1)} size="iconSm" title={t("Show earlier")} variant="ghost">
             <ChevronLeft className="h-3.5 w-3.5" />
           </Button>
-          <span className="min-w-[120px] text-center text-[11px] tabular-nums text-muted-foreground">
+          <span className="min-w-[120px] text-center text-label tabular-nums text-muted-foreground">
             {visibleMonthRangeLabel(statusRows[0].segments, tickMeta, scrollLeft, viewportWidth)}
           </span>
           <Button aria-label={t("Show later")} disabled={atEnd} onClick={() => pageStrip(1)} size="iconSm" title={t("Show later")} variant="ghost">
@@ -300,8 +300,8 @@ export function SystemStatusStrip({ usageStats }: { usageStats: UsageStatsSnapsh
         </div>
       </div>
       <div className="mb-4">
-        <div className="text-[28px] font-semibold leading-none tracking-tight">{overallTotals.requestCount > 0 ? formatPercent(overallTotals.successRate) : "—"}</div>
-        <div className="mt-1 text-[11px] text-muted-foreground">{t("Request success rate")}</div>
+        <div className="text-display font-semibold leading-none tracking-tight">{overallTotals.requestCount > 0 ? formatPercent(overallTotals.successRate) : "—"}</div>
+        <div className="mt-1 text-label text-muted-foreground">{t("Request success rate")}</div>
       </div>
       <div className="space-y-3">
         {statusRows.map((row, index) => {
@@ -313,9 +313,9 @@ export function SystemStatusStrip({ usageStats }: { usageStats: UsageStatsSnapsh
                   <span aria-hidden="true" className={cn("flex h-4 w-4 shrink-0 items-center justify-center rounded-full", systemStatusIconClass(row.tone))}>
                     <RowIcon className="h-3 w-3" />
                   </span>
-                  <span className="min-w-0 truncate text-[13px] font-medium">{row.provider}</span>
+                  <span className="min-w-0 truncate text-body font-medium">{row.provider}</span>
                 </div>
-                <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">
+                <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
                   {row.totals.requestCount > 0 ? `${formatPercent(row.totals.successRate)} ${t("uptime")}` : t("No requests yet")}
                 </span>
               </div>

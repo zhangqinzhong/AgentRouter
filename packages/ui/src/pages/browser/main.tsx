@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowLeft, ArrowRight, Check, KeyRound, LoaderCircle, Plus, RotateCw, UserRound, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, KeyRound, LoaderCircle, Plus, RotateCw, UserRound, X } from "@/components/ui/icons";
 import type { BuiltInBrowserState, ChromeLoginImportJob, ChromeLoginImportRequest } from "@agentrouter/core/contracts/app";
 
 declare global {

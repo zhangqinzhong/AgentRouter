@@ -87,7 +87,7 @@ function BreakdownIconBadge({
   return (
     <span
       aria-hidden="true"
-      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[11px] font-semibold uppercase transition-transform duration-150 group-hover:scale-105"
+      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-label font-semibold uppercase transition-transform duration-150 group-hover:scale-105"
       style={{ backgroundColor: `${color}1f`, color }}
     >
       {label.trim().slice(0, 1) || "?"}

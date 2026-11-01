@@ -122,12 +122,12 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
   return (
     <div className={documentPageClassName}>
         <PageHeader title={t("Providers")}>
-          <span className="text-[12px] tabular-nums text-muted-foreground">{providers.length.toLocaleString()}</span>
+          <span className="text-caption tabular-nums text-muted-foreground">{providers.length.toLocaleString()}</span>
           <div className="relative w-[240px] max-w-full">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search providers")}
-              className="h-8 pl-8 text-[12px] shadow-none"
+              className="h-8 pl-8 text-caption shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search providers")}
               value={query}
@@ -142,12 +142,12 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
           {providers.length === 0 ? (
             <div className="px-3 py-12 text-center">
               <Layers3 className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
-              <div className="text-[12px] text-muted-foreground">{t("No providers configured")}</div>
-              <div className="mt-1 text-[11px] text-muted-foreground/60">{t("Click Add to create one")}</div>
+              <div className="text-caption text-muted-foreground">{t("No providers configured")}</div>
+              <div className="mt-1 text-label text-muted-foreground/60">{t("Click Add to create one")}</div>
             </div>
           ) : null}
           {providers.length > 0 && visibleProviders.length === 0 ? (
-            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching providers")}</div>
+            <div className="px-3 py-12 text-center text-caption text-muted-foreground">{t("No matching providers")}</div>
           ) : null}
           {visibleProviders.length > 0 ? (
             <>
@@ -218,11 +218,11 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                                 ) : <div aria-hidden="true" className="h-6 w-6 shrink-0" />}
                                 <ProviderPresetIcon className="h-8 w-8 rounded-md" iconUrl={providerIconUrl} />
                                 <div className="min-w-0">
-                                  <div className="truncate text-[13px] font-medium text-foreground">{provider.name || t("Unnamed")}</div>
-                                  <div className="mt-0.5 truncate text-[10px] text-muted-foreground" title={providerCapabilitiesSummary(provider, t)}>
+                                  <div className="truncate text-body font-medium text-foreground">{provider.name || t("Unnamed")}</div>
+                                  <div className="mt-0.5 truncate text-2xs text-muted-foreground" title={providerCapabilitiesSummary(provider, t)}>
                                     {providerCapabilitiesSummary(provider, t)}
                                   </div>
-                                  <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground" title={providerBaseUrl(provider)}>
+                                  <div className="mt-0.5 truncate font-mono text-2xs text-muted-foreground" title={providerBaseUrl(provider)}>
                                     {providerBaseUrl(provider) || t("Not set")}
                                   </div>
                                 </div>
@@ -240,10 +240,10 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                                       title={expanded ? t("Collapse models") : t("Expand models")}
                                       type="button"
                                     >
-                                      <div className="text-[13px] font-medium tabular-nums text-foreground">{provider.models.length}</div>
-                                      <div className="text-[10px] text-muted-foreground">{t("Models")}</div>
+                                      <div className="text-body font-medium tabular-nums text-foreground">{provider.models.length}</div>
+                                      <div className="text-2xs text-muted-foreground">{t("Models")}</div>
                                     </button>
-                                  ) : <span className="text-[11px] text-muted-foreground">-</span>}
+                                  ) : <span className="text-label text-muted-foreground">-</span>}
                                 </div>
                                 <div className="min-w-0 flex-1">
                                   <ProviderAccountListCell provider={provider} snapshots={providerAccountSnapshots} />
@@ -303,7 +303,7 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                                       </div>
                                     ) : null}
                                     {provider.models.length === 0 ? (
-                                      <div className="rounded-md border border-dashed border-border bg-background/60 px-3 py-4 text-center text-[12px] text-muted-foreground">{t("No models configured")}</div>
+                                      <div className="rounded-md border border-dashed border-border bg-background/60 px-3 py-4 text-center text-caption text-muted-foreground">{t("No models configured")}</div>
                                     ) : (
                                       <div className="flex flex-wrap gap-2">
                                         {provider.models.map((model) => {
@@ -312,7 +312,7 @@ export function ProvidersView({ accountSnapshots, addProvider, editProvider, edi
                                           return (
                                             <button
                                               aria-label={`${t("Double click to copy")} ${displayName}`}
-                                              className="inline-flex max-w-full items-center rounded-full border border-border bg-background px-2.5 py-1 text-[11px] leading-4 text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                                              className="inline-flex max-w-full items-center rounded-full border border-border bg-background px-2.5 py-1 text-label leading-4 text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
                                               key={modelKey}
                                               onDoubleClick={() => void copyModel(model)}
                                               title={`${providerModelDisplayTitle(provider, model)} · ${t("Double click to copy")}`}
@@ -374,10 +374,10 @@ function ProviderMobileCard({
           <ProviderPresetIcon className="h-9 w-9 rounded-md" iconUrl={providerIconUrl} />
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-2">
-              <h3 className="min-w-0 truncate text-[13px] font-semibold text-foreground">{provider.name || t("Unnamed")}</h3>
+              <h3 className="min-w-0 truncate text-body font-semibold text-foreground">{provider.name || t("Unnamed")}</h3>
               {providerEnabled ? <Badge variant={models.length > 0 ? "outline" : "warning"}>{models.length} {t("models")}</Badge> : null}
             </div>
-            <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={providerBaseUrl(provider)}>
+            <div className="mt-1 truncate font-mono text-label text-muted-foreground" title={providerBaseUrl(provider)}>
               {providerBaseUrl(provider) || t("Not set")}
             </div>
           </div>
@@ -411,7 +411,7 @@ function ProviderMobileCard({
           </div>
         </div>
 
-        <dl className="mt-3 grid grid-cols-1 gap-2 text-[12px]">
+        <dl className="mt-3 grid grid-cols-1 gap-2 text-caption">
           <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
             <dt className="truncate text-muted-foreground">{t("Capability")}</dt>
             <dd className="min-w-0 truncate font-medium" title={providerCapabilitiesSummary(provider, t)}>{providerCapabilitiesSummary(provider, t)}</dd>
@@ -425,7 +425,7 @@ function ProviderMobileCard({
         {providerEnabled ? (
           <button
             aria-expanded={expanded}
-            className="mt-3 flex h-8 w-full items-center justify-between border-t border-border/60 text-[12px] font-medium text-muted-foreground"
+            className="mt-3 flex h-8 w-full items-center justify-between border-t border-border/60 text-caption font-medium text-muted-foreground"
             onClick={() => onToggle(provider, index)}
             type="button"
           >
@@ -439,14 +439,14 @@ function ProviderMobileCard({
             <AnimatedDisclosure key="provider-mobile-models">
               <div className="mt-2 border-t border-border/60 py-2">
                 {models.length === 0 ? (
-                  <div className="px-2 py-3 text-center text-[12px] text-muted-foreground">{t("No models configured")}</div>
+                  <div className="px-2 py-3 text-center text-caption text-muted-foreground">{t("No models configured")}</div>
                 ) : (
                   <div className="flex flex-wrap gap-2">
                     {models.map((model) => {
                       const displayName = providerModelDisplayName(provider, model);
                       return (
                         <button
-                          className="inline-flex max-w-full items-center rounded-full border border-border bg-background px-2.5 py-1 text-[11px] leading-4 text-foreground"
+                          className="inline-flex max-w-full items-center rounded-full border border-border bg-background px-2.5 py-1 text-label leading-4 text-foreground"
                           key={`${provider.name}:${model}`}
                           onDoubleClick={() => void onCopyModel(model)}
                           title={`${providerModelDisplayTitle(provider, model)} · ${t("Double click to copy")}`}
@@ -526,7 +526,7 @@ export function ModelsView({
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search all models")}
-              className="h-8 pl-8 text-[12px] shadow-none"
+              className="h-8 pl-8 text-caption shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search all models")}
               value={query}
@@ -538,16 +538,16 @@ export function ModelsView({
           {rows.length === 0 ? (
             <div className="px-3 py-12 text-center">
               <Box className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
-              <div className="text-[12px] text-muted-foreground">{t("No models available")}</div>
+              <div className="text-caption text-muted-foreground">{t("No models available")}</div>
             </div>
           ) : null}
           {rows.length > 0 && visibleRows.length === 0 ? (
-            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching models")}</div>
+            <div className="px-3 py-12 text-center text-caption text-muted-foreground">{t("No matching models")}</div>
           ) : null}
           {visibleRows.length > 0 ? (
             <div className="min-w-0">
               <div className="min-w-[680px]">
-                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(0,1fr)_minmax(260px,1.5fr)] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(0,1fr)_minmax(260px,1.5fr)] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-label font-medium uppercase tracking-wide text-muted-foreground">
                   <div className="truncate">{t("Model")}</div>
                   <div className="truncate">{t("Description")}</div>
                 </div>
@@ -559,10 +559,10 @@ export function ModelsView({
                         key={row.key}
                       >
                         <div className="min-w-0">
-                          <div className="truncate text-[13px] font-medium text-foreground" title={row.displayName ?? row.model}>
+                          <div className="truncate text-body font-medium text-foreground" title={row.displayName ?? row.model}>
                             {row.displayName ?? row.model}
                           </div>
-                          <div className="truncate font-mono text-[11px] text-muted-foreground" title={row.providerName ? `${row.providerName}/${row.model}` : row.model}>
+                          <div className="truncate font-mono text-label text-muted-foreground" title={row.providerName ? `${row.providerName}/${row.model}` : row.model}>
                             {row.providerName ? `${row.providerName}/${row.model}` : row.model}
                           </div>
                         </div>
@@ -570,7 +570,7 @@ export function ModelsView({
                           {row.providerIndex !== undefined ? (
                             <div className="flex min-w-0 items-start gap-2">
                               <div className="min-w-0 flex-1">
-                                <div className="line-clamp-2 text-[12px] leading-5 text-muted-foreground" title={row.description ?? ""}>
+                                <div className="line-clamp-2 text-caption leading-5 text-muted-foreground" title={row.description ?? ""}>
                                   {row.description || "—"}
                                 </div>
                               </div>
@@ -586,7 +586,7 @@ export function ModelsView({
                               </Button>
                             </div>
                           ) : (
-                            <div className="line-clamp-2 text-[12px] leading-5 text-muted-foreground" title={row.description ?? ""}>
+                            <div className="line-clamp-2 text-caption leading-5 text-muted-foreground" title={row.description ?? ""}>
                               {row.description || "—"}
                             </div>
                           )}
@@ -642,13 +642,13 @@ function ModelCatalogDescriptionDialog({
         </DialogHeader>
         <DialogBody className="space-y-3">
           <div className="min-w-0">
-            <div className="truncate text-[13px] font-semibold text-foreground" title={title}>{title}</div>
-            {subtitle ? <div className="truncate font-mono text-[11px] text-muted-foreground" title={subtitle}>{subtitle}</div> : null}
+            <div className="truncate text-body font-semibold text-foreground" title={title}>{title}</div>
+            {subtitle ? <div className="truncate font-mono text-label text-muted-foreground" title={subtitle}>{subtitle}</div> : null}
           </div>
           <Field label={t("Description")}>
             <Textarea
               aria-label={`${t("Description")} ${title}`}
-              className="min-h-[160px] resize-y text-[12px]"
+              className="min-h-[160px] resize-y text-caption"
               onChange={(event) => onChange(event.target.value)}
               placeholder={t("Describe model strengths, tradeoffs, and best-fit tasks.")}
               value={draft}
@@ -671,7 +671,7 @@ function ModelCatalogDescriptionDialog({
 function ProviderAccountListCell({ provider, snapshots }: { provider: GatewayProviderConfig; snapshots: ProviderAccountSnapshot[] }) {
   const t = useAppText();
   if (!isGatewayProviderEnabled(provider)) {
-    return <div className="min-w-0 truncate text-[11px] text-muted-foreground">{t("Disabled")}</div>;
+    return <div className="min-w-0 truncate text-label text-muted-foreground">{t("Disabled")}</div>;
   }
   const sortedSnapshots = [...snapshots].sort(compareProviderAccountSnapshots);
   const snapshot = sortedSnapshots[0];
@@ -679,26 +679,26 @@ function ProviderAccountListCell({ provider, snapshots }: { provider: GatewayPro
   const fallbackText = snapshot ? snapshot.message ?? snapshot.errors?.[0]?.message : undefined;
 
   if (!provider.account?.enabled && snapshots.length === 0) {
-    return <div className="min-w-0 text-[12px] text-muted-foreground">{t("Usage tracking not configured")}</div>;
+    return <div className="min-w-0 text-caption text-muted-foreground">{t("Usage tracking not configured")}</div>;
   }
 
   if (!snapshot) {
-    return <div className="min-w-0 truncate text-[11px] text-muted-foreground">{t("Pending")}</div>;
+    return <div className="min-w-0 truncate text-label text-muted-foreground">{t("Pending")}</div>;
   }
 
   return (
     <div className="min-w-0">
-      <div className="flex min-w-0 items-center gap-1.5 text-[11px]">
-        {meter ? <span className="min-w-0 truncate text-[11px] font-medium">{formatProviderAccountMeterValue(meter)}</span> : null}
+      <div className="flex min-w-0 items-center gap-1.5 text-label">
+        {meter ? <span className="min-w-0 truncate text-label font-medium">{formatProviderAccountMeterValue(meter)}</span> : null}
         {sortedSnapshots.length > 1 ? <span className="shrink-0 text-muted-foreground">{sortedSnapshots.length} {t("keys")}</span> : null}
       </div>
       {providerAccountSnapshotCredentialLabel(snapshot) ? (
-        <div className="mt-0.5 truncate text-[10px] font-semibold text-muted-foreground" title={providerAccountSnapshotLabel(snapshot)}>
+        <div className="mt-0.5 truncate text-2xs font-semibold text-muted-foreground" title={providerAccountSnapshotLabel(snapshot)}>
           {providerAccountSnapshotCredentialLabel(snapshot)}
         </div>
       ) : null}
       {!meter && fallbackText ? (
-        <div className="mt-0.5 truncate text-[10px] text-muted-foreground">
+        <div className="mt-0.5 truncate text-2xs text-muted-foreground">
           {t(fallbackText)}
         </div>
       ) : null}
@@ -733,11 +733,11 @@ export function DeleteProviderDialog({
 
         <DialogBody>
           <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-            <div className="flex items-start gap-2 text-[12px] font-medium text-destructive">
+            <div className="flex items-start gap-2 text-caption font-medium text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>{t("Delete this provider from the configuration?")}</span>
             </div>
-            <div className="mt-2 space-y-1 text-[11px] text-muted-foreground">
+            <div className="mt-2 space-y-1 text-label text-muted-foreground">
               <div className="truncate">
                 <span className="font-medium text-foreground">{t("Name")}:</span> {name}
               </div>
@@ -809,11 +809,11 @@ export function ProviderDeepLinkDialog({
             <div className="space-y-3">
               {showExternalProviderWarnings ? (
                 <div className="rounded-md border border-border bg-muted/30 px-3 py-2.5">
-                  <div className="flex items-start gap-2 text-[12px] font-medium text-foreground">
+                  <div className="flex items-start gap-2 text-caption font-medium text-foreground">
                     <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     <span>{t("External provider link")}</span>
                   </div>
-                  <div className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                  <div className="mt-1 text-caption leading-5 text-muted-foreground">
                     {t("This provider link came from an external website. Review details before importing.")}
                   </div>
                 </div>
@@ -828,12 +828,12 @@ export function ProviderDeepLinkDialog({
                   ) : null}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-[13px] font-semibold text-foreground">{displayName}</div>
-                  <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={provider.baseUrl}>{provider.baseUrl}</div>
+                  <div className="truncate text-body font-semibold text-foreground">{displayName}</div>
+                  <div className="mt-0.5 truncate font-mono text-label text-muted-foreground" title={provider.baseUrl}>{provider.baseUrl}</div>
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 gap-2 text-[12px] sm:grid-cols-2">
+              <div className="grid grid-cols-1 gap-2 text-caption sm:grid-cols-2">
                 <ProviderDeepLinkDetail label={t("Name")} value={displayName} />
                 <ProviderDeepLinkDetail label={t("Protocol")} value={provider.protocol ? translatedProviderProtocolLabel(provider.protocol, t) : t("Detected automatically")} />
                 <ProviderDeepLinkDetail className="sm:col-span-2" label={t("Base URL")} value={provider.baseUrl} mono />
@@ -876,11 +876,11 @@ export function ProviderDeepLinkDialog({
           ) : manifest ? (
             <div className="space-y-3">
               <div className="rounded-md border border-border bg-muted/30 px-3 py-2.5">
-                <div className="flex items-start gap-2 text-[12px] font-medium text-foreground">
+                <div className="flex items-start gap-2 text-caption font-medium text-foreground">
                   <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <span>{t("Remote provider manifest")}</span>
                 </div>
-                <div className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                <div className="mt-1 text-caption leading-5 text-muted-foreground">
                   {t("AgentRouter will fetch this HTTPS manifest with strict safety checks before showing provider details.")}
                 </div>
               </div>
@@ -888,7 +888,7 @@ export function ProviderDeepLinkDialog({
             </div>
           ) : (
             <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-              <div className="flex items-start gap-2 text-[12px] font-medium text-destructive">
+              <div className="flex items-start gap-2 text-caption font-medium text-destructive">
                 <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                 <span>{request.error || t("Invalid")}</span>
               </div>
@@ -896,7 +896,7 @@ export function ProviderDeepLinkDialog({
           )}
 
           {error ? (
-            <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+            <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>{t(error)}</span>
             </div>
@@ -934,8 +934,8 @@ function ProviderDeepLinkDetail({
 }) {
   return (
     <div className={cn("min-w-0 rounded-md border border-border bg-background px-3 py-2", className)}>
-      <div className="truncate text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className={cn("mt-1 min-w-0 truncate text-[12px] text-foreground", mono && "font-mono text-[11px]")} title={value}>
+      <div className="truncate text-2xs font-medium uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className={cn("mt-1 min-w-0 truncate text-caption text-foreground", mono && "font-mono text-label")} title={value}>
         {value}
       </div>
     </div>
@@ -1096,9 +1096,9 @@ function ProviderPresetCombobox({
       >
         <ProviderPresetIcon className="h-8 w-8 rounded-md" iconUrl={selected?.iconUrl} preset={selected?.preset} />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[13px] font-semibold text-foreground">{selected ? selected.label : t("Select preset provider")}</div>
+          <div className="truncate text-body font-semibold text-foreground">{selected ? selected.label : t("Select preset provider")}</div>
           {selectedEndpointUrl ? (
-            <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={selectedEndpointUrl}>{selectedEndpointUrl}</div>
+            <div className="mt-0.5 truncate font-mono text-label text-muted-foreground" title={selectedEndpointUrl}>{selectedEndpointUrl}</div>
           ) : null}
         </div>
         {selectedExternalUrl ? (
@@ -1174,7 +1174,7 @@ function ProviderPresetCombobox({
                     <button
                       aria-selected={selectedOption}
                       className={cn(
-                        "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
+                        "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
                         selectedOption ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted"
                       )}
                       key={option.value}
@@ -1189,7 +1189,7 @@ function ProviderPresetCombobox({
                   );
                 })
               ) : (
-                <div className="px-2 py-5 text-center text-[12px] text-muted-foreground">{t("No provider presets found")}</div>
+                <div className="px-2 py-5 text-center text-caption text-muted-foreground">{t("No provider presets found")}</div>
               )}
             </div>
           </PopoverContent>
@@ -1224,7 +1224,7 @@ function ProviderPresetIcon({ className, iconUrl: explicitIconUrl, preset }: { c
   }
 
   return (
-    <span className={cn("flex shrink-0 items-center justify-center border border-border bg-muted text-[10px] font-semibold text-muted-foreground", className)}>
+    <span className={cn("flex shrink-0 items-center justify-center border border-border bg-muted text-2xs font-semibold text-muted-foreground", className)}>
       {label || <Globe className="h-3.5 w-3.5" />}
     </span>
   );
@@ -1256,8 +1256,8 @@ function ProviderImportHeader({
     <div className="sm:col-span-2 flex min-w-0 items-center gap-3 rounded-md border border-border bg-background px-3 py-2.5">
       <ProviderPresetIcon className="h-10 w-10 rounded-md" iconUrl={iconUrl} preset={preset} />
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[13px] font-semibold text-foreground">{displayName}</div>
-        <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={baseUrl}>{baseUrl}</div>
+        <div className="truncate text-body font-semibold text-foreground">{displayName}</div>
+        <div className="mt-0.5 truncate font-mono text-label text-muted-foreground" title={baseUrl}>{baseUrl}</div>
       </div>
       {platformUrl ? (
         <Button
@@ -1475,8 +1475,8 @@ function LocalAgentProviderImportPanel({
     <div className="sm:col-span-2 rounded-xl border border-border bg-white p-3 dark:bg-neutral-900">
       <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
         <div className="min-w-0">
-          <div className="truncate text-[12px] font-semibold text-foreground">{t("Import local agent provider")}</div>
-          <div className="mt-0.5 text-[12px] leading-5 text-muted-foreground">{t("AgentRouter scanned this computer for local Claude Code, Codex, Grok CLI, Kimi CLI, OpenCode CLI, and ZCode providers. Click Import to add one as a gateway provider.")}</div>
+          <div className="truncate text-caption font-semibold text-foreground">{t("Import local agent provider")}</div>
+          <div className="mt-0.5 text-caption leading-5 text-muted-foreground">{t("AgentRouter scanned this computer for local Claude Code, Codex, Grok CLI, Kimi CLI, OpenCode CLI, and ZCode providers. Click Import to add one as a gateway provider.")}</div>
         </div>
         <Button aria-label={t("Scan local providers again")} disabled={loading || Boolean(importingId)} onClick={() => setScanAttempt((value) => value + 1)} size="sm" variant="outline">
           {loading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
@@ -1500,17 +1500,17 @@ function LocalAgentProviderImportPanel({
                   </span>
                   <div className="min-w-0">
                     <div className="flex min-w-0 items-center gap-2">
-                      <span className="min-w-0 truncate text-[12px] font-semibold">{candidate.name}</span>
+                      <span className="min-w-0 truncate text-caption font-semibold">{candidate.name}</span>
                       <Badge variant={candidate.importable ? "success" : candidate.status === "locked" ? "warning" : "outline"}>
                         {candidate.importable ? t("Ready") : t("Login unavailable")}
                       </Badge>
                     </div>
                     {candidate.importable ? (
-                      <div className="mt-1 truncate text-[12px] text-muted-foreground" title={candidate.sourceFile || candidate.detail}>
+                      <div className="mt-1 truncate text-caption text-muted-foreground" title={candidate.sourceFile || candidate.detail}>
                         {candidate.detail ? t(candidate.detail) : candidate.sourceFile}
                       </div>
                     ) : (
-                      <div className="mt-1 space-y-2 text-[12px] leading-5 text-muted-foreground">
+                      <div className="mt-1 space-y-2 text-caption leading-5 text-muted-foreground">
                         <p>{t(candidate.detail || "Cannot read local login information. Sign in to the agent and scan again, or configure an API key manually.")}</p>
                         <Button onClick={() => onChange({ presetId: customProviderPresetId }, true)} size="sm" variant="outline">{t("Configure API key manually")}</Button>
                       </div>
@@ -1534,13 +1534,13 @@ function LocalAgentProviderImportPanel({
           })}
         </div>
       ) : loading ? (
-        <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-center text-[12px] text-muted-foreground">
+        <div className="rounded-md border border-dashed border-border bg-background px-3 py-4 text-center text-caption text-muted-foreground">
           {t("Scanning local agent logins")}
         </div>
       ) : null}
 
       {error ? (
-        <div className="mt-2 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+        <div className="mt-2 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
           <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <div><p>{t("Local provider import failed. Scan again or configure an API key manually.")}</p><details className="mt-2"><summary className="cursor-pointer">{t("Technical details")}</summary><p className="mt-1 break-all">{error}</p></details></div>
         </div>
@@ -1688,7 +1688,7 @@ function ProviderSetupProgress({
         const content = (
           <>
             <span className={cn(
-              "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold",
+              "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-label font-semibold",
               complete
                 ? "border-primary/25 bg-primary/10 text-primary"
                 : active
@@ -1698,7 +1698,7 @@ function ProviderSetupProgress({
               {complete ? <Check className="h-3.5 w-3.5" /> : index + 1}
             </span>
             <div className="min-w-0">
-              <div className="truncate text-[12px] font-semibold">{t(step.label)}</div>
+              <div className="truncate text-caption font-semibold">{t(step.label)}</div>
               <div className="truncate text-[10.5px] leading-4 text-muted-foreground">
                 {complete ? t("Done") : active ? t("In progress") : t("Pending")}
               </div>
@@ -1736,8 +1736,8 @@ function ProviderFormStepHeader({
   return (
     <div className="sm:col-span-2 flex min-w-0 items-start justify-between gap-3 pb-1">
       <div className="min-w-0 space-y-1">
-        <div className="truncate text-[14px] font-semibold text-foreground">{title}</div>
-        <p className="max-w-[540px] text-[12px] leading-5 text-muted-foreground">{description}</p>
+        <div className="truncate text-body-sm font-semibold text-foreground">{title}</div>
+        <p className="max-w-[540px] text-caption leading-5 text-muted-foreground">{description}</p>
       </div>
 
     </div>
@@ -1860,8 +1860,8 @@ function ProviderConnectionStatusRow({
         {loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : state === "success" ? <Check className="h-3.5 w-3.5" /> : <Info className="h-3.5 w-3.5" />}
       </span>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[12px] font-semibold text-foreground">{title}</div>
-        <div className="mt-0.5 text-[12px] leading-5 text-muted-foreground">{description}</div>
+        <div className="truncate text-caption font-semibold text-foreground">{title}</div>
+        <div className="mt-0.5 text-caption leading-5 text-muted-foreground">{description}</div>
       </div>
       {action ? <div className="ml-auto shrink-0 self-center">{action}</div> : null}
     </div>
@@ -1954,8 +1954,8 @@ function ProviderCredentialModeTabs({
               key={option.value}
               value={option.value}
             >
-              <span className="block w-full text-[12px] font-semibold leading-4">{t(option.label)}</span>
-              <span className={cn("mt-0.5 block w-full text-[11px] font-normal leading-4", selected ? "text-primary/80" : "text-muted-foreground")}>
+              <span className="block w-full text-caption font-semibold leading-4">{t(option.label)}</span>
+              <span className={cn("mt-0.5 block w-full text-label font-normal leading-4", selected ? "text-primary/80" : "text-muted-foreground")}>
                 {t(option.description)}
               </span>
             </TabsTrigger>
@@ -2280,7 +2280,7 @@ export function AddProviderForm({
                   providers={providers}
                 />
                 <div className="block min-w-0 space-y-1 sm:col-span-2">
-                  <span className="block truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Select preset provider")}</span>
+                  <span className="block truncate text-label font-medium uppercase tracking-wide text-muted-foreground">{t("Select preset provider")}</span>
                   <ProviderPresetCombobox
                     value={draft.presetId}
                     onChange={updatePreset}
@@ -2296,7 +2296,7 @@ export function AddProviderForm({
               <Field className="sm:col-span-2" label={t("API endpoint")}>
                 <Input value={draft.baseUrl} onChange={(event) => onChange({ baseUrl: event.target.value, icon: "" }, true)} />
                 {customEndpoint ? (
-                  <div className="flex min-h-4 items-center gap-1.5 text-[12px] leading-5 text-muted-foreground">
+                  <div className="flex min-h-4 items-center gap-1.5 text-caption leading-5 text-muted-foreground">
                     {iconDetecting ? <LoaderCircle className="h-3 w-3 shrink-0 animate-spin" /> : null}
                     <span className="min-w-0">
                       {iconDetecting
@@ -2330,7 +2330,7 @@ export function AddProviderForm({
                     />
                   </Field>
                   {safetyIssue ? (
-                    <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12px] leading-5 text-amber-900 dark:text-amber-100">
+                    <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-caption leading-5 text-amber-900 dark:text-amber-100">
                       <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                       <span>{safetyIssue.message}</span>
                     </div>
@@ -2343,7 +2343,7 @@ export function AddProviderForm({
                     onChange={onChange}
                   />
                   {safetyIssue ? (
-                    <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12px] leading-5 text-amber-900 dark:text-amber-100">
+                    <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-caption leading-5 text-amber-900 dark:text-amber-100">
                       <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                       <span>{safetyIssue.message}</span>
                     </div>
@@ -2403,7 +2403,7 @@ export function AddProviderForm({
             <div className="sm:col-span-2">
               <button
                 aria-expanded={advancedOpen}
-                className="inline-flex min-w-0 items-center gap-2 border-0 bg-transparent p-0 text-[12px] font-semibold text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25"
+                className="inline-flex min-w-0 items-center gap-2 border-0 bg-transparent p-0 text-caption font-semibold text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25"
                 onClick={() => setAdvancedOpen((value) => !value)}
                 type="button"
               >
@@ -2416,7 +2416,7 @@ export function AddProviderForm({
               {advancedOpen ? (
                 <AnimatedDisclosure className="sm:col-span-2" key="provider-advanced">
                   <div className="grid grid-cols-1 gap-3 rounded-md border border-border bg-muted/20 p-3 sm:grid-cols-2">
-                    <div className="sm:col-span-2 flex min-w-0 items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2 text-[12px] font-semibold">
+                    <div className="sm:col-span-2 flex min-w-0 items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2 text-caption font-semibold">
                       <span className="flex min-w-0 items-center gap-1.5">
                         <span className="min-w-0 truncate">{t("Auto fetch latest models")}</span>
                         <Tooltip
@@ -2436,7 +2436,7 @@ export function AddProviderForm({
                         onCheckedChange={(autoFetchModels) => onChange({ autoFetchModels })}
                       />
                     </div>
-                    <div className="sm:col-span-2 flex min-w-0 items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2 text-[12px] font-semibold">
+                    <div className="sm:col-span-2 flex min-w-0 items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2 text-caption font-semibold">
                       <span className="flex min-w-0 items-center gap-1.5">
                         <span className="min-w-0 truncate">{t("Auto detect protocols")}</span>
                         <button
@@ -2471,23 +2471,23 @@ export function AddProviderForm({
                     />
                     <Field className="sm:col-span-2" label={t("Extra request body")} requirement="optional" requirementLabel={t("Optional")}>
                       <Textarea
-                        className="min-h-[92px] font-mono text-[11px]"
+                        className="min-h-[92px] font-mono text-label"
                         onChange={(event) => onChange({ extraBodyText: event.target.value })}
                         placeholder={`{\n  "default": { "reasoning_effort": "high" }\n}`}
                         value={draft.extraBodyText}
                       />
-                      <div className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                      <div className="mt-1 text-caption leading-5 text-muted-foreground">
                         {t("Merged into every upstream request for this provider. Use \"default\" for all models, or a model name as the key to target one.")}
                       </div>
                     </Field>
                     <Field className="sm:col-span-2" label={t("Extra request headers")} requirement="optional" requirementLabel={t("Optional")}>
                       <Textarea
-                        className="min-h-[68px] font-mono text-[11px]"
+                        className="min-h-[68px] font-mono text-label"
                         onChange={(event) => onChange({ extraHeadersText: event.target.value })}
                         placeholder={`{\n  "x-tenant": "acme"\n}`}
                         value={draft.extraHeadersText}
                       />
-                      <div className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                      <div className="mt-1 text-caption leading-5 text-muted-foreground">
                         {t("Sent with every upstream request for this provider, alongside the API key header.")}
                       </div>
                     </Field>
@@ -2499,7 +2499,7 @@ export function AddProviderForm({
                               const protocol = option.value;
                               const checked = draft.selectedProtocols.includes(protocol);
                               return (
-                                <div className="grid grid-cols-[20px_minmax(118px,1fr)_minmax(88px,max-content)] items-center gap-2 text-[11px]" key={protocol}>
+                                <div className="grid grid-cols-[20px_minmax(118px,1fr)_minmax(88px,max-content)] items-center gap-2 text-label" key={protocol}>
                                   <Checkbox
                                     aria-label={`${t("Add")} ${translatedProviderProtocolLabel(protocol, t)}`}
                                     checked={checked}
@@ -2529,7 +2529,7 @@ export function AddProviderForm({
                               const checked = Boolean(selectableProtocol && draft.selectedProtocols.includes(selectableProtocol));
                               const itemKey = `${item.protocol}-${item.endpoint}`;
                               return (
-                                <div className="grid grid-cols-[20px_minmax(118px,1fr)_minmax(88px,max-content)] items-center gap-2 text-[11px]" key={itemKey}>
+                                <div className="grid grid-cols-[20px_minmax(118px,1fr)_minmax(88px,max-content)] items-center gap-2 text-label" key={itemKey}>
                                   <Checkbox
                                     aria-label={`${t("Add")} ${translatedProviderProtocolLabel(item.protocol, t)}`}
                                     checked={checked}
@@ -2572,7 +2572,7 @@ export function AddProviderForm({
                             })}
                           </div>
                         ) : (
-                          <div className="text-[11px] text-muted-foreground">
+                          <div className="text-label text-muted-foreground">
                             <span>{t("No protocol detection yet")}</span>
                           </div>
                         )}
@@ -2602,7 +2602,7 @@ export function AddProviderForm({
         </div>
       </div>
 
-      {error ? <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive" role="alert"><CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" /><span>{error}</span></div> : null}
+      {error ? <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive" role="alert"><CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" /><span>{error}</span></div> : null}
     </>
   );
 }
@@ -2761,8 +2761,8 @@ function ProviderCredentialSettings({
     <div className="space-y-3">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
-          <Label className="text-[12px] font-semibold">{t("Pool keys")}</Label>
-          <div className="mt-0.5 text-[12px] leading-5 text-muted-foreground">{t("Use multiple API keys with optional priorities, weights, and limits.")}</div>
+          <Label className="text-caption font-semibold">{t("Pool keys")}</Label>
+          <div className="mt-0.5 text-caption leading-5 text-muted-foreground">{t("Use multiple API keys with optional priorities, weights, and limits.")}</div>
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-2">
           <input
@@ -2784,7 +2784,7 @@ function ProviderCredentialSettings({
       </div>
 
       {draft.credentials.length === 0 ? (
-        <div className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-4 text-center text-[12px] text-muted-foreground">
+        <div className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-4 text-center text-caption text-muted-foreground">
           {t("No provider credentials configured")}
         </div>
       ) : (
@@ -2802,7 +2802,7 @@ function ProviderCredentialSettings({
       )}
 
       {importError ? (
-        <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+        <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
           <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>{t(importError)}</span>
         </div>
@@ -2859,7 +2859,7 @@ function ProviderCredentialRow({
       </div>
       <Button
         aria-expanded={advancedOpen}
-        className="mt-3 flex h-8 w-full items-center justify-between gap-3 rounded-md border border-border bg-background px-3 text-left text-[12px] font-medium transition-colors hover:bg-muted/40"
+        className="mt-3 flex h-8 w-full items-center justify-between gap-3 rounded-md border border-border bg-background px-3 text-left text-caption font-medium transition-colors hover:bg-muted/40"
         onClick={() => setAdvancedOpen((value) => !value)}
         type="button"
         unstyled
@@ -2879,7 +2879,7 @@ function ProviderCredentialRow({
               </Field>
               <Field className="sm:col-span-2" label={t("Limits JSON")}>
                 <Textarea
-                  className="min-h-[76px] font-mono text-[11px]"
+                  className="min-h-[76px] font-mono text-label"
                   placeholder={`{\n  "rpm": 60,\n  "tpm": 100000\n}`}
                   value={credential.limitsText}
                   onChange={(event) => onChange({ limitsText: event.target.value })}
@@ -3061,7 +3061,7 @@ function ProviderUsageSettings({
   return (
     <div className="sm:col-span-2 space-y-3 rounded-md border border-border bg-background/60 p-3">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-        <Label className="flex min-w-0 items-center gap-2 text-[12px] font-semibold">
+        <Label className="flex min-w-0 items-center gap-2 text-caption font-semibold">
           <Checkbox
             checked={draft.accountEnabled}
             onCheckedChange={(checked) => onChange({ accountEnabled: checked })}
@@ -3090,7 +3090,7 @@ function ProviderUsageSettings({
           </Field>
 
           {draft.accountMode === "standard" ? (
-            <div className="sm:col-span-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-[12px] leading-5 text-muted-foreground">
+            <div className="sm:col-span-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-caption leading-5 text-muted-foreground">
               {t("Standard usage endpoint will try provider-hosted AgentRouter account endpoints.")}
               {customEndpoint ? <span> {t("Switch to HTTP JSON request to configure method, URL, headers, body, and response fields.")}</span> : null}
             </div>
@@ -3114,7 +3114,7 @@ function ProviderUsageSettings({
               </Field>
               {draft.accountMode === "browser" ? (
                 <>
-                  <div className="sm:col-span-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-[12px] leading-5 text-muted-foreground">
+                  <div className="sm:col-span-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-caption leading-5 text-muted-foreground">
                     {t("Browser request uses AgentRouter Desktop's built-in browser login state. Sign in in the in-app browser before testing.")}
                   </div>
                   <Field className="sm:col-span-2" label={t("Browser login URL")}>
@@ -3140,7 +3140,7 @@ function ProviderUsageSettings({
                       value={draft.usageBrowserRequestOrigin}
                       onChange={(event) => onChange({ usageBrowserRequestOrigin: event.target.value })}
                     />
-                    <div className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                    <div className="mt-1 text-caption leading-5 text-muted-foreground">
                       {t("Origin used to read browser storage before fetching the usage URL.")}
                     </div>
                   </Field>
@@ -3150,7 +3150,7 @@ function ProviderUsageSettings({
                       options={translateOptions(providerBrowserCredentialsOptions, t)}
                       value={draft.usageBrowserCredentials}
                     />
-                    <div className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                    <div className="mt-1 text-caption leading-5 text-muted-foreground">
                       {t("Use omit for token headers when the API returns Access-Control-Allow-Origin: *.")}
                     </div>
                   </Field>
@@ -3169,7 +3169,7 @@ function ProviderUsageSettings({
                       rows={draft.usageBrowserHeaderTemplates}
                       onChange={(usageBrowserHeaderTemplates) => onChange({ usageBrowserHeaderTemplates })}
                     />
-                    <div className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                    <div className="mt-1 text-caption leading-5 text-muted-foreground">
                       {t("Use ${localStorage.token} or ${sessionStorage.token} in values.")}
                     </div>
                   </Field>
@@ -3178,7 +3178,7 @@ function ProviderUsageSettings({
                       <div className="flex min-w-0 flex-wrap items-center gap-2">
                         {chromeImportJob ? <Badge variant={chromeImportJob.status === "completed" ? "success" : "outline"}>{t("Chrome import")} · {chromeImportJob.status}</Badge> : null}
                         {chromeImportJob?.result ? (
-                          <span className="text-[11px] text-muted-foreground">
+                          <span className="text-label text-muted-foreground">
                             {chromeImportJob.result.imported} {t("imported")}, {chromeImportJob.result.skipped} {t("skipped")}
                           </span>
                         ) : null}
@@ -3193,7 +3193,7 @@ function ProviderUsageSettings({
                           </>
                         ) : null}
                       </div>
-                      {chromeImportMessage ? <div className="mt-1 text-[12px] leading-5 text-muted-foreground">{chromeImportMessage}</div> : null}
+                      {chromeImportMessage ? <div className="mt-1 text-caption leading-5 text-muted-foreground">{chromeImportMessage}</div> : null}
                     </div>
                   ) : null}
                 </>
@@ -3207,7 +3207,7 @@ function ProviderUsageSettings({
               </Field>
               <Field className="sm:col-span-2" label={t("Body")}>
                 <Textarea
-                  className="min-h-[92px] font-mono text-[11px]"
+                  className="min-h-[92px] font-mono text-label"
                   placeholder={`{\n  "query": "usage"\n}`}
                   value={draft.usageRequestBodyText}
                   onChange={(event) => onChange({ usageRequestBodyText: event.target.value })}
@@ -3265,11 +3265,11 @@ function ProviderUsageSettings({
             <div className="sm:col-span-2 space-y-2">
               <Field label={t("Connectors JSON")}>
                 <Textarea
-                  className="min-h-[180px] font-mono text-[11px]"
+                  className="min-h-[180px] font-mono text-label"
                   value={draft.accountConnectorsText}
                   onChange={(event) => onChange({ accountConnectorsText: event.target.value })}
                 />
-                <div className="flex min-w-0 items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                <div className="flex min-w-0 items-center justify-between gap-2 text-label text-muted-foreground">
                   <span className="min-w-0 truncate">{t("Supports standard, http-json, webcontent-json, plugin, and local-estimate connectors.")}</span>
                   <button
                     className="shrink-0 text-primary hover:underline"
@@ -3283,7 +3283,7 @@ function ProviderUsageSettings({
               {showNewApiUserBalanceTemplate ? (
                 <div className="grid grid-cols-1 items-end gap-2 rounded-md border border-border/60 bg-muted/20 p-2 sm:grid-cols-[minmax(0,1fr)_auto]">
                   <div className="min-w-0 space-y-1">
-                    <Label className="text-[11px] font-medium text-muted-foreground">{t("New API user ID")}</Label>
+                    <Label className="text-label font-medium text-muted-foreground">{t("New API user ID")}</Label>
                     <Input
                       placeholder="<user-id>"
                       value={newApiUserId}
@@ -3313,7 +3313,7 @@ function ProviderUsageSettings({
       ) : null}
 
       {testError ? (
-        <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+        <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
           <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>{t(testError)}</span>
         </div>
@@ -3420,11 +3420,11 @@ function ProviderUsageTestResultPanel({
   return (
     <div className="sm:col-span-2 rounded-md border border-border bg-muted/20">
       <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
-        <div className="min-w-0 truncate text-[12px] font-semibold">{t("Response fields")}</div>
+        <div className="min-w-0 truncate text-caption font-semibold">{t("Response fields")}</div>
         <Badge variant="outline">{result.paths.length}</Badge>
       </div>
       {visiblePaths.length === 0 ? (
-        <div className="px-3 py-6 text-center text-[12px] text-muted-foreground">{t("No response fields")}</div>
+        <div className="px-3 py-6 text-center text-caption text-muted-foreground">{t("No response fields")}</div>
       ) : (
         <div className="max-h-[260px] overflow-auto p-2">
           <div className="space-y-1.5">
@@ -3433,7 +3433,7 @@ function ProviderUsageTestResultPanel({
             ))}
           </div>
           {result.paths.length > visiblePaths.length ? (
-            <div className="px-1 py-2 text-[11px] text-muted-foreground">
+            <div className="px-1 py-2 text-label text-muted-foreground">
               {t("Showing first response fields only.")}
             </div>
           ) : null}
@@ -3453,19 +3453,19 @@ function ProviderUsagePathRow({
   const t = useAppText();
 
   return (
-    <div className="grid min-w-0 grid-cols-[minmax(180px,1fr)_minmax(120px,0.6fr)_auto] items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5 text-[11px]">
+    <div className="grid min-w-0 grid-cols-[minmax(180px,1fr)_minmax(120px,0.6fr)_auto] items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5 text-label">
       <div className="min-w-0">
         <div className="truncate font-mono font-semibold" title={item.path}>{item.path}</div>
         <div className="truncate text-muted-foreground" title={item.preview}>{item.preview}</div>
       </div>
       <Badge className="justify-self-start" variant="outline">{item.type}</Badge>
       <div className="flex flex-wrap justify-end gap-1">
-        <Button className="h-6 px-1.5 text-[10px]" onClick={() => onSelectPath("balance", item.path)} type="button" variant="outline">{t("Balance rem")}</Button>
-        <Button className="h-6 px-1.5 text-[10px]" onClick={() => onSelectPath("balanceLimit", item.path)} type="button" variant="outline">{t("Balance total")}</Button>
-        <Button className="h-6 px-1.5 text-[10px]" onClick={() => onSelectPath("balanceUsed", item.path)} type="button" variant="outline">{t("Balance used")}</Button>
-        <Button className="h-6 px-1.5 text-[10px]" onClick={() => onSelectPath("subscriptionRemaining", item.path)} type="button" variant="outline">{t("Sub rem")}</Button>
-        <Button className="h-6 px-1.5 text-[10px]" onClick={() => onSelectPath("subscriptionLimit", item.path)} type="button" variant="outline">{t("Sub limit")}</Button>
-        <Button className="h-6 px-1.5 text-[10px]" onClick={() => onSelectPath("subscriptionReset", item.path)} type="button" variant="outline">{t("Reset")}</Button>
+        <Button className="h-6 px-1.5 text-2xs" onClick={() => onSelectPath("balance", item.path)} type="button" variant="outline">{t("Balance rem")}</Button>
+        <Button className="h-6 px-1.5 text-2xs" onClick={() => onSelectPath("balanceLimit", item.path)} type="button" variant="outline">{t("Balance total")}</Button>
+        <Button className="h-6 px-1.5 text-2xs" onClick={() => onSelectPath("balanceUsed", item.path)} type="button" variant="outline">{t("Balance used")}</Button>
+        <Button className="h-6 px-1.5 text-2xs" onClick={() => onSelectPath("subscriptionRemaining", item.path)} type="button" variant="outline">{t("Sub rem")}</Button>
+        <Button className="h-6 px-1.5 text-2xs" onClick={() => onSelectPath("subscriptionLimit", item.path)} type="button" variant="outline">{t("Sub limit")}</Button>
+        <Button className="h-6 px-1.5 text-2xs" onClick={() => onSelectPath("subscriptionReset", item.path)} type="button" variant="outline">{t("Reset")}</Button>
       </div>
     </div>
   );
@@ -3643,7 +3643,7 @@ export function AddProviderDialog({
   if (inline) {
     return (
       <>
-        <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
+        <div className="local-usage-page mx-auto w-full max-w-page px-5 py-6 sm:px-9 sm:py-8">
           <PageHeader title={providerTitle}>
             <Button disabled={submitting} onClick={close} type="button" variant="ghost">{t("Cancel")}</Button>
           </PageHeader>
@@ -3762,23 +3762,23 @@ export function ProviderConnectivityCheckDialog({
         <DialogBody>
           <div className="space-y-3">
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2.5">
-              <div className="flex items-start gap-2 text-[12px] font-medium text-amber-900 dark:text-amber-100">
+              <div className="flex items-start gap-2 text-caption font-medium text-amber-900 dark:text-amber-100">
                 <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                 <span>{t("This check sends real model requests with your provider API key and may consume account balance.")}</span>
               </div>
-              <div className="mt-2 text-[12px] leading-5 text-muted-foreground">
+              <div className="mt-2 text-caption leading-5 text-muted-foreground">
                 {t("Generated output is limited to 1 token for connectivity checks.")}
               </div>
             </div>
 
             <div className="rounded-md border border-border bg-background p-2">
               <div className="mb-2 flex min-w-0 flex-wrap items-center justify-between gap-2">
-                <div className="min-w-0 truncate text-[12px] font-semibold">{t("Models to check")}</div>
+                <div className="min-w-0 truncate text-caption font-semibold">{t("Models to check")}</div>
                 <div className="flex shrink-0 gap-1">
-                  <Button className="h-6 px-1.5 text-[10px]" disabled={running || models.length === 0} onClick={() => { setSelection(mergeProviderModelLists(models)); setResult(undefined); }} type="button" variant="outline">
+                  <Button className="h-6 px-1.5 text-2xs" disabled={running || models.length === 0} onClick={() => { setSelection(mergeProviderModelLists(models)); setResult(undefined); }} type="button" variant="outline">
                     {t("All")}
                   </Button>
-                  <Button className="h-6 px-1.5 text-[10px]" disabled={running || selection.length === 0} onClick={() => { setSelection([]); setResult(undefined); }} type="button" variant="outline">
+                  <Button className="h-6 px-1.5 text-2xs" disabled={running || selection.length === 0} onClick={() => { setSelection([]); setResult(undefined); }} type="button" variant="outline">
                     {t("Clear")}
                   </Button>
                 </div>
@@ -3790,13 +3790,13 @@ export function ProviderConnectivityCheckDialog({
                     return (
                       <Label
                         className={cn(
-                          "flex min-h-8 min-w-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5 text-left text-[12px] transition-colors hover:bg-muted",
+                          "flex min-h-8 min-w-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5 text-left text-caption transition-colors hover:bg-muted",
                           checked && "border-primary bg-accent"
                         )}
                         key={model}
                       >
                         <Checkbox checked={checked} disabled={running} onCheckedChange={() => toggleCheckModel(model)} />
-                        <span className="min-w-0 flex-1 truncate font-mono text-[11px]" title={model}>{model}</span>
+                        <span className="min-w-0 flex-1 truncate font-mono text-label" title={model}>{model}</span>
                       </Label>
                     );
                   })}
@@ -3829,7 +3829,7 @@ function ProviderConnectivityResultPanel({ result }: { result: ProviderConnectiv
   return (
     <div className="rounded-md border border-border bg-muted/20">
       <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
-        <div className="min-w-0 truncate text-[12px] font-semibold">{t("Check results")}</div>
+        <div className="min-w-0 truncate text-caption font-semibold">{t("Check results")}</div>
         <div className="flex shrink-0 gap-1">
           <Badge variant={result.passed.length > 0 ? "success" : "outline"}>{result.passed.length} {t("Available")}</Badge>
           <Badge variant={result.failed.length > 0 ? "warning" : "outline"}>{result.failed.length} {t("Unavailable")}</Badge>
@@ -3871,17 +3871,17 @@ function ProviderConnectivityResultGroup({
 
   return (
     <div className={className}>
-      <div className="mb-1 min-w-0 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+      <div className="mb-1 min-w-0 text-label font-medium uppercase tracking-wide text-muted-foreground">
         <span className="min-w-0 truncate">{label}</span>
       </div>
       {items.length === 0 ? (
-        <div className="rounded-md border border-dashed border-border bg-background/70 px-2 py-2 text-center text-[11px] text-muted-foreground">{emptyLabel}</div>
+        <div className="rounded-md border border-dashed border-border bg-background/70 px-2 py-2 text-center text-label text-muted-foreground">{emptyLabel}</div>
       ) : (
         <div className="space-y-1.5">
           {items.map((item) => {
             const supportedProtocols = item.protocols.filter((protocol) => protocol.supported);
             return (
-              <div className="min-w-0 rounded-md border border-border bg-background px-2 py-1.5 text-[11px]" key={item.model}>
+              <div className="min-w-0 rounded-md border border-border bg-background px-2 py-1.5 text-label" key={item.model}>
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <span className="min-w-0 truncate font-mono font-semibold" title={item.model}>{item.model}</span>
                   <Badge variant={variant}>{item.supported ? t("Available") : t("Unavailable")}</Badge>
@@ -3994,7 +3994,7 @@ function ProviderModelPicker({
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
             aria-label={t("Search provider models")}
-            className="h-8 pl-8 text-[12px] shadow-none"
+            className="h-8 pl-8 text-caption shadow-none"
             disabled={loading}
             onChange={(event) => onQueryChange(event.target.value)}
             placeholder={t("Search provider models")}
@@ -4005,7 +4005,7 @@ function ProviderModelPicker({
           <Input
             aria-label={t("Custom model")}
             aria-invalid={customModelExists && trimmedCustomModel ? true : undefined}
-            className="h-8 min-w-0 flex-1 font-mono text-[12px] shadow-none"
+            className="h-8 min-w-0 flex-1 font-mono text-caption shadow-none"
             onChange={(event) => setCustomModel(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && canAddCustomModel) {
@@ -4019,7 +4019,7 @@ function ProviderModelPicker({
           />
           <Button
             aria-label={t("Add custom model")}
-            className="h-8 shrink-0 px-2.5 text-[12px]"
+            className="h-8 shrink-0 px-2.5 text-caption"
             disabled={!canAddCustomModel}
             onClick={addCustomModel}
             size="sm"
@@ -4049,10 +4049,10 @@ function ProviderModelPicker({
 
       <div className="border-y border-border/70">
         <div className="flex min-h-9 items-center justify-between gap-3 border-b border-border/60 px-2.5 py-1.5">
-          <span className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
+          <span className="text-label font-semibold uppercase tracking-widest text-muted-foreground">
             {t("Provider models")}
           </span>
-          <span className="flex items-center gap-2.5 text-[11px] text-muted-foreground">
+          <span className="flex items-center gap-2.5 text-label text-muted-foreground">
             <span className="tabular-nums">{selectedModels.length.toLocaleString()} / {(catalog.length + customOnly.length).toLocaleString()}</span>
             {visibleModels.length > 0 ? (
               <button
@@ -4069,10 +4069,10 @@ function ProviderModelPicker({
           {loading ? (
             <ProviderModelListSkeleton />
           ) : visibleModels.length === 0 ? (
-            <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">
+            <div className="px-3 py-8 text-center text-caption text-muted-foreground">
               <div>{catalog.length === 0 ? t("No provider models") : t("No matching models")}</div>
               {catalog.length === 0 ? (
-                <div className="mt-1 text-[11px] leading-4">{t("This provider did not return a model list. Add model IDs with Custom model.")}</div>
+                <div className="mt-1 text-label leading-4">{t("This provider did not return a model list. Add model IDs with Custom model.")}</div>
               ) : null}
             </div>
           ) : (
@@ -4099,8 +4099,8 @@ function ProviderModelPicker({
                     tabIndex={-1}
                   />
                   <span className="min-w-0 flex-1">
-                    <span className={cn("block truncate text-[12px]", checked ? "font-medium text-foreground" : "text-foreground/90")}>{label}</span>
-                    {label !== model ? <span className="block truncate font-mono text-[10px] text-muted-foreground">{model}</span> : null}
+                    <span className={cn("block truncate text-caption", checked ? "font-medium text-foreground" : "text-foreground/90")}>{label}</span>
+                    {label !== model ? <span className="block truncate font-mono text-2xs text-muted-foreground">{model}</span> : null}
                   </span>
                   {isCustom ? <Badge variant="outline">{t("Custom")}</Badge> : null}
                 </button>
@@ -4113,7 +4113,7 @@ function ProviderModelPicker({
       <div className="mt-2">
         <button
           aria-expanded={advancedOpen}
-          className="inline-flex min-w-0 items-center gap-1.5 text-[12px] font-medium text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25"
+          className="inline-flex min-w-0 items-center gap-1.5 text-caption font-medium text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25"
           onClick={() => setAdvancedOpen((value) => !value)}
           type="button"
         >
@@ -4304,9 +4304,9 @@ function OpenRouterProviderBlacklistSelect({
   return (
     <div className="space-y-1.5">
       <div className="flex min-w-0 items-center justify-between gap-2">
-        <Label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Provider blacklist")}</Label>
+        <Label className="text-label font-medium uppercase tracking-wide text-muted-foreground">{t("Provider blacklist")}</Label>
         {selectedValues.length > 0 ? (
-          <Button className="h-6 px-2 text-[10px]" onClick={() => onChange([])} type="button" variant="ghost">
+          <Button className="h-6 px-2 text-2xs" onClick={() => onChange([])} type="button" variant="ghost">
             {t("Clear blacklist")}
           </Button>
         ) : null}
@@ -4316,7 +4316,7 @@ function OpenRouterProviderBlacklistSelect({
           aria-expanded={open}
           aria-haspopup="listbox"
           className={cn(
-            "flex h-9 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-2.5 text-left text-[12px] outline-none transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/25",
+            "flex h-9 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-2.5 text-left text-caption outline-none transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/25",
             open && "border-ring/35 bg-muted/30"
           )}
           onClick={() => {
@@ -4371,13 +4371,13 @@ function OpenRouterProviderBlacklistSelect({
                 </Button>
               </div>
               {error ? (
-                <div className="mb-1 rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[11px] leading-4 text-amber-700 dark:text-amber-300">
+                <div className="mb-1 rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-label leading-4 text-amber-700 dark:text-amber-300">
                   {error}
                 </div>
               ) : null}
               <div className="overflow-auto" role="listbox" style={{ maxHeight: `${popoverLayout?.listHeight ?? 240}px` }}>
                 {loading && options.length === 0 ? (
-                  <div className="flex items-center justify-center gap-2 px-2 py-6 text-[12px] text-muted-foreground">
+                  <div className="flex items-center justify-center gap-2 px-2 py-6 text-caption text-muted-foreground">
                     <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
                     <span>{t("Loading providers")}</span>
                   </div>
@@ -4389,7 +4389,7 @@ function OpenRouterProviderBlacklistSelect({
                       <button
                         aria-selected={checked}
                         className={cn(
-                          "flex min-h-9 w-full min-w-0 items-center gap-2.5 rounded-[5px] px-2.5 py-1.5 text-left text-[12px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
+                          "flex min-h-9 w-full min-w-0 items-center gap-2.5 rounded-[5px] px-2.5 py-1.5 text-left text-caption outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
                           checked ? "bg-emerald-500/[0.045] text-foreground" : "text-foreground hover:bg-muted/40"
                         )}
                         key={option.slug}
@@ -4400,20 +4400,20 @@ function OpenRouterProviderBlacklistSelect({
                         <Checkbox checked={checked} readOnly tabIndex={-1} />
                         <span className="min-w-0 flex-1">
                           <span className="block truncate font-medium">{option.name}</span>
-                          {metricText ? <span className="block truncate text-[10px] text-muted-foreground">{metricText}</span> : null}
+                          {metricText ? <span className="block truncate text-2xs text-muted-foreground">{metricText}</span> : null}
                         </span>
                       </button>
                     );
                   })
                 ) : (
-                  <div className="px-2 py-6 text-center text-[12px] text-muted-foreground">{t("No providers found")}</div>
+                  <div className="px-2 py-6 text-center text-caption text-muted-foreground">{t("No providers found")}</div>
                 )}
               </div>
             </PopoverContent>
           </AnimatedPopover>
         </PopoverPortal>
       </div>
-      <div className="text-[10px] leading-4 text-muted-foreground/75">{t("Excluded OpenRouter providers will be skipped by discount routing and OpenRouter fallbacks.")}</div>
+      <div className="text-2xs leading-4 text-muted-foreground/75">{t("Excluded OpenRouter providers will be skipped by discount routing and OpenRouter fallbacks.")}</div>
     </div>
   );
 }
@@ -4569,7 +4569,7 @@ function ModelMetadataEditor({
   const [expandedModels, setExpandedModels] = useState<Set<string>>(() => new Set());
   if (normalizedModels.length === 0) {
     return emptyLabel ? (
-      <div className={cn("rounded-md border border-dashed border-border bg-muted/20 px-3 py-8 text-center text-[12px] text-muted-foreground", className)}>
+      <div className={cn("rounded-md border border-dashed border-border bg-muted/20 px-3 py-8 text-center text-caption text-muted-foreground", className)}>
         {emptyLabel}
       </div>
     ) : null;
@@ -4751,8 +4751,8 @@ function ModelMetadataEditor({
     <div className={cn("space-y-2", header && "rounded-md border border-border bg-muted/20 p-2", className)}>
       {header ? (
         <div className="flex min-w-0 items-center justify-between gap-2">
-          <span className="block truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Model settings")}</span>
-          <span className="shrink-0 text-[12px] leading-5 text-muted-foreground/75">{t("Context, pricing, reasoning, Fast Mode, web search, and image")}</span>
+          <span className="block truncate text-label font-medium uppercase tracking-wide text-muted-foreground">{t("Model settings")}</span>
+          <span className="shrink-0 text-caption leading-5 text-muted-foreground/75">{t("Context, pricing, reasoning, Fast Mode, web search, and image")}</span>
         </div>
       ) : null}
       <div className="space-y-2">
@@ -4800,7 +4800,7 @@ function ModelMetadataEditor({
                   type="button"
                 >
                   <ChevronRight className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform", expanded && "rotate-90")} />
-                  <span className="min-w-0 flex-1 truncate text-[12px] font-medium" title={model}>{label}</span>
+                  <span className="min-w-0 flex-1 truncate text-caption font-medium" title={model}>{label}</span>
                   {!fromSource ? <Badge variant="secondary">{t("Custom model")}</Badge> : null}
                   {hasCustomDetails ? <Badge variant="secondary">{t("Custom")}</Badge> : null}
                   {!hasCustomDetails && fromSource ? <Badge variant="outline">{t("Preset")}</Badge> : null}
@@ -4822,19 +4822,19 @@ function ModelMetadataEditor({
               {expanded ? (
                 <div className="space-y-3 border-t border-border/60 p-3">
                   <div className="flex min-w-0 items-center justify-between gap-2">
-                    <span className="block truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Model settings")}</span>
-                    <span className="shrink-0 text-[12px] leading-5 text-muted-foreground/75">{t("Context, pricing, reasoning, Fast Mode, web search, and image")}</span>
+                    <span className="block truncate text-label font-medium uppercase tracking-wide text-muted-foreground">{t("Model settings")}</span>
+                    <span className="shrink-0 text-caption leading-5 text-muted-foreground/75">{t("Context, pricing, reasoning, Fast Mode, web search, and image")}</span>
                   </div>
                   {openRouterDiscountRouting ? (
                     <div className="space-y-2">
-                      <Label className="flex min-w-0 items-center gap-2 text-[12px] font-medium">
+                      <Label className="flex min-w-0 items-center gap-2 text-caption font-medium">
                         <Checkbox
                           checked={modelMetadata?.openRouterDiscountRouting?.enabled ?? false}
                           onCheckedChange={(checked) => updateOpenRouterDiscountRouting(model, checked)}
                         />
                         <span>{t("OpenRouter discount routing")}</span>
                       </Label>
-                      <div className="text-[10px] leading-4 text-muted-foreground/75">{t("Automatically choose the cheapest live OpenRouter provider endpoint when savings exceed estimated cache loss.")}</div>
+                      <div className="text-2xs leading-4 text-muted-foreground/75">{t("Automatically choose the cheapest live OpenRouter provider endpoint when savings exceed estimated cache loss.")}</div>
                       {modelMetadata?.openRouterDiscountRouting?.enabled ? (
                         <OpenRouterProviderBlacklistSelect
                           onChange={(providerBlacklist) => updateOpenRouterProviderBlacklist(model, providerBlacklist)}
@@ -4848,9 +4848,9 @@ function ModelMetadataEditor({
                   ) : null}
                   <div className="space-y-2">
                     <div className="flex min-w-0 items-center justify-between gap-2">
-                      <Label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Context window (tokens)")}</Label>
+                      <Label className="text-label font-medium uppercase tracking-wide text-muted-foreground">{t("Context window (tokens)")}</Label>
                       {modelMetadata?.contextWindow !== undefined || modelMetadata?.maxContextWindow !== undefined ? (
-                        <Button className="h-6 px-2 text-[10px]" onClick={() => resetContextWindow(model)} type="button" variant="ghost">
+                        <Button className="h-6 px-2 text-2xs" onClick={() => resetContextWindow(model)} type="button" variant="ghost">
                           {t("Use preset")}
                         </Button>
                       ) : null}
@@ -4866,9 +4866,9 @@ function ModelMetadataEditor({
                   </div>
                   <div className="space-y-2">
                     <div className="flex min-w-0 items-center justify-between gap-2">
-                      <Label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Pricing")}</Label>
+                      <Label className="text-label font-medium uppercase tracking-wide text-muted-foreground">{t("Pricing")}</Label>
                       {modelMetadata?.pricing ? (
-                        <Button className="h-6 px-2 text-[10px]" onClick={() => resetPricing(model)} type="button" variant="ghost">
+                        <Button className="h-6 px-2 text-2xs" onClick={() => resetPricing(model)} type="button" variant="ghost">
                           {t("Use preset")}
                         </Button>
                       ) : null}
@@ -4880,20 +4880,20 @@ function ModelMetadataEditor({
                       <ModelPriceInput label={`${t("Cache write 5m")}(1M tokens/$)`} onChange={(value) => updatePricing(model, "cacheWrite5mUsdPerMillionTokens", value)} value={effectivePricing.cacheWrite5mUsdPerMillionTokens} />
                       <ModelPriceInput label={`${t("Cache write 1h")}(1M tokens/$)`} onChange={(value) => updatePricing(model, "cacheWrite1hUsdPerMillionTokens", value)} value={effectivePricing.cacheWrite1hUsdPerMillionTokens} />
                     </div>
-                    <div className="text-[10px] leading-4 text-muted-foreground/75">{t("Input and output prices are both required to override catalog pricing.")}</div>
+                    <div className="text-2xs leading-4 text-muted-foreground/75">{t("Input and output prices are both required to override catalog pricing.")}</div>
                   </div>
                   <div className="space-y-2">
                     <div className="flex min-w-0 items-center justify-between gap-2">
-                      <Label className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t("Reasoning levels")}</Label>
+                      <Label className="text-label font-medium uppercase tracking-wide text-muted-foreground">{t("Reasoning levels")}</Label>
                       {reasoningConfigured ? (
-                        <Button className="h-6 px-2 text-[10px]" onClick={() => resetReasoning(model)} type="button" variant="ghost">
+                        <Button className="h-6 px-2 text-2xs" onClick={() => resetReasoning(model)} type="button" variant="ghost">
                           {t("Use preset")}
                         </Button>
                       ) : null}
                     </div>
                     <div className="grid grid-cols-2 gap-x-3 gap-y-2 sm:grid-cols-3">
                       {providerReasoningLevelOptions.map((option) => (
-                        <Label className="flex min-w-0 items-center gap-2 text-[11px] font-normal" key={option.effort}>
+                        <Label className="flex min-w-0 items-center gap-2 text-label font-normal" key={option.effort}>
                           <Checkbox
                             checked={configuredReasoningLevels.has(option.effort)}
                             onCheckedChange={(checked) => updateReasoningLevel(model, option.effort, checked)}
@@ -4902,11 +4902,11 @@ function ModelMetadataEditor({
                         </Label>
                       ))}
                     </div>
-                    <div className="text-[10px] leading-4 text-muted-foreground/75">{t("Select every reasoning effort supported by this model.")}</div>
+                    <div className="text-2xs leading-4 text-muted-foreground/75">{t("Select every reasoning effort supported by this model.")}</div>
                   </div>
                   <div className="space-y-2">
                     <div className="flex min-w-0 items-center justify-between gap-2">
-                      <Label className="flex min-w-0 items-center gap-2 text-[12px] font-medium">
+                      <Label className="flex min-w-0 items-center gap-2 text-caption font-medium">
                         <Checkbox
                           checked={modelMetadata?.supportsFastMode ?? modelDefaults?.supportsFastMode ?? false}
                           onCheckedChange={(checked) => updateFastMode(model, checked)}
@@ -4914,16 +4914,16 @@ function ModelMetadataEditor({
                         <span>{t("Fast Mode")}</span>
                       </Label>
                       {modelMetadata?.supportsFastMode !== undefined ? (
-                        <Button className="h-6 px-2 text-[10px]" onClick={() => resetFastMode(model)} type="button" variant="ghost">
+                        <Button className="h-6 px-2 text-2xs" onClick={() => resetFastMode(model)} type="button" variant="ghost">
                           {t("Use preset")}
                         </Button>
                       ) : null}
                     </div>
-                    <div className="text-[10px] leading-4 text-muted-foreground/75">{t("Declare whether Codex app should expose the Speed control for this model.")}</div>
+                    <div className="text-2xs leading-4 text-muted-foreground/75">{t("Declare whether Codex app should expose the Speed control for this model.")}</div>
                   </div>
                   <div className="space-y-2">
                     <div className="flex min-w-0 items-center justify-between gap-2">
-                      <Label className="flex min-w-0 items-center gap-2 text-[12px] font-medium">
+                      <Label className="flex min-w-0 items-center gap-2 text-caption font-medium">
                         <Checkbox
                           checked={modelMetadata?.capabilities?.webSearch ?? modelDefaults?.capabilities?.webSearch ?? false}
                           onCheckedChange={(checked) => updateCapability(model, "webSearch", checked)}
@@ -4931,16 +4931,16 @@ function ModelMetadataEditor({
                         <span>{t("Web search")}</span>
                       </Label>
                       {modelMetadata?.capabilities?.webSearch !== undefined ? (
-                        <Button className="h-6 px-2 text-[10px]" onClick={() => resetCapability(model, "webSearch")} type="button" variant="ghost">
+                        <Button className="h-6 px-2 text-2xs" onClick={() => resetCapability(model, "webSearch")} type="button" variant="ghost">
                           {t("Use preset")}
                         </Button>
                       ) : null}
                     </div>
-                    <div className="text-[10px] leading-4 text-muted-foreground/75">{t("Declare whether the model provides native web search.")}</div>
+                    <div className="text-2xs leading-4 text-muted-foreground/75">{t("Declare whether the model provides native web search.")}</div>
                   </div>
                   <div className="space-y-2">
                     <div className="flex min-w-0 items-center justify-between gap-2">
-                      <Label className="flex min-w-0 items-center gap-2 text-[12px] font-medium">
+                      <Label className="flex min-w-0 items-center gap-2 text-caption font-medium">
                         <Checkbox
                           checked={modelMetadata?.capabilities?.imageInput ?? modelDefaults?.capabilities?.imageInput ?? false}
                           onCheckedChange={(checked) => updateCapability(model, "imageInput", checked)}
@@ -4948,12 +4948,12 @@ function ModelMetadataEditor({
                         <span>{t("Image")}</span>
                       </Label>
                       {modelMetadata?.capabilities?.imageInput !== undefined ? (
-                        <Button className="h-6 px-2 text-[10px]" onClick={() => resetCapability(model, "imageInput")} type="button" variant="ghost">
+                        <Button className="h-6 px-2 text-2xs" onClick={() => resetCapability(model, "imageInput")} type="button" variant="ghost">
                           {t("Use preset")}
                         </Button>
                       ) : null}
                     </div>
-                    <div className="text-[10px] leading-4 text-muted-foreground/75">{t("Declare whether the model accepts image input.")}</div>
+                    <div className="text-2xs leading-4 text-muted-foreground/75">{t("Declare whether the model accepts image input.")}</div>
                   </div>
                 </div>
               ) : null}

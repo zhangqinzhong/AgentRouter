@@ -59,7 +59,7 @@ import {
   UserRound,
   X,
   type LucideIcon
-} from "lucide-react";
+} from "@/components/ui/icons";
 import {
   Area,
   Bar,

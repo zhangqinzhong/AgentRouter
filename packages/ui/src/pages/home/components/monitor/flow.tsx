@@ -212,7 +212,7 @@ export function Heatmap({ report: r }: { report: MonitorReport }) {
         >
           {[1, 2, 3, 4, 5, 6, 0].map((day) => (
             <div key={day} className="contents">
-              <span className="self-center text-[10px] text-muted-foreground">
+              <span className="self-center text-2xs text-muted-foreground">
                 {days[day]}
               </span>
               {Array.from({ length: 24 }, (_, hour) => {
@@ -253,7 +253,7 @@ export function Heatmap({ report: r }: { report: MonitorReport }) {
           {hours.map((_, hour) => (
             <span
               key={`hour-${hour}`}
-              className="pt-1 text-center text-[10px] tabular-nums text-muted-foreground"
+              className="pt-1 text-center text-2xs tabular-nums text-muted-foreground"
             >
               {[0, 6, 12, 18, 23].includes(hour)
                 ? String(hour).padStart(2, "0")
@@ -262,7 +262,7 @@ export function Heatmap({ report: r }: { report: MonitorReport }) {
           ))}
         </div>
       </div>
-      <div className="mt-4 flex items-center gap-1 text-[10px] text-muted-foreground">
+      <div className="mt-4 flex items-center gap-1 text-2xs text-muted-foreground">
         <span className="mr-auto">
           {m("每小时请求分布", "Hourly request distribution")}
         </span>

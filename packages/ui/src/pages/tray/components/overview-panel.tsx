@@ -71,7 +71,7 @@ export function UsageOverviewPanel({
 
       {modules.has("model-share") ? <ModelShareChart rows={activeStats.models} variant={componentVariants.modelShare} /> : null}
 
-      {loading ? <div className="mt-1.5 text-[11px] font-medium text-slate-200/60">{t("Syncing usage...")}</div> : null}
+      {loading ? <div className="mt-1.5 text-label font-medium text-slate-200/60">{t("Syncing usage...")}</div> : null}
     </section>
   );
 }

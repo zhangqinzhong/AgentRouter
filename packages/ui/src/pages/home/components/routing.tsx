@@ -53,7 +53,7 @@ export function RoutingView({
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search routing rules")}
-              className="h-8 pl-8 text-[12px] shadow-none"
+              className="h-8 pl-8 text-caption shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search routing rules")}
               value={query}
@@ -77,17 +77,17 @@ export function RoutingView({
           {rows.length === 0 ? (
             <div className="px-3 py-12 text-center">
               <Route className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
-              <div className="text-[12px] text-muted-foreground">{t("No routing rules configured")}</div>
-              <div className="mt-1 text-[11px] text-muted-foreground/60">{t("Click Add to create one")}</div>
+              <div className="text-caption text-muted-foreground">{t("No routing rules configured")}</div>
+              <div className="mt-1 text-label text-muted-foreground/60">{t("Click Add to create one")}</div>
             </div>
           ) : null}
           {rows.length > 0 && visibleRules.length === 0 ? (
-            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching routing rules")}</div>
+            <div className="px-3 py-12 text-center text-caption text-muted-foreground">{t("No matching routing rules")}</div>
           ) : null}
           {visibleRules.length > 0 ? (
             <div className="min-w-0">
               <div className="min-w-[940px]">
-                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(160px,0.8fr)_minmax(220px,1fr)_minmax(240px,1.15fr)_84px_148px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(160px,0.8fr)_minmax(220px,1fr)_minmax(240px,1.15fr)_84px_148px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-label font-medium uppercase tracking-wide text-muted-foreground">
                   <div className="truncate">{t("Name")}</div>
                   <div className="truncate">{t("Condition")}</div>
                   <div className="truncate">{t("Request action")}</div>
@@ -107,22 +107,22 @@ export function RoutingView({
                       >
                       <div className="min-w-0">
                         <div className="flex min-w-0 items-center gap-2">
-                          <div className="truncate text-[13px] font-medium">{row.name || t("Unnamed")}</div>
+                          <div className="truncate text-body font-medium">{row.name || t("Unnamed")}</div>
                           {row.readonly ? <Badge variant="outline">{t("Plugin")}</Badge> : null}
                         </div>
-                        <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={`${rowSourceLabel}: ${row.ruleId}`}>
+                        <div className="mt-0.5 truncate font-mono text-label text-muted-foreground" title={`${rowSourceLabel}: ${row.ruleId}`}>
                           {rowSourceLabel}: {row.ruleId}
                         </div>
                       </div>
                       <div className="min-w-0">
                         <div className="flex min-w-0 items-center gap-2">
                           <Badge variant="outline">{t(row.typeLabel)}</Badge>
-                          <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground" title={row.condition}>
+                          <span className="min-w-0 flex-1 truncate text-label text-muted-foreground" title={row.condition}>
                             {row.condition}
                           </span>
                         </div>
                       </div>
-                      <div className="min-w-0 truncate font-mono text-[11px] text-muted-foreground" title={rowTarget}>
+                      <div className="min-w-0 truncate font-mono text-label text-muted-foreground" title={rowTarget}>
                         {rowTarget}
                       </div>
                       <div className="flex min-w-0 items-center gap-2">
@@ -275,11 +275,11 @@ export function RouterFallbackControl({
       {fallback.mode === "model-chain" ? (
         <div className="mt-3 flex min-w-0 flex-wrap gap-2">
           {fallback.models.length === 0 ? (
-            <div className="text-[12px] text-muted-foreground">{t("No fallback targets configured")}</div>
+            <div className="text-caption text-muted-foreground">{t("No fallback targets configured")}</div>
           ) : (
             fallback.models.map((model, index) => (
               <div className="flex max-w-full items-center gap-1 rounded-md border border-border bg-background px-2 py-1" key={`${model}-${index}`}>
-                <span className="min-w-0 truncate font-mono text-[11px]" title={model}>{model}</span>
+                <span className="min-w-0 truncate font-mono text-label" title={model}>{model}</span>
                 <Button aria-label={`${t("Move")} ${model} ${t("up")}`} disabled={index === 0} onClick={() => moveFallbackModel(index, -1)} size="iconSm" title={t("Move up")} type="button" variant="ghost">
                   <ArrowUp className="h-3.5 w-3.5" />
                 </Button>
@@ -326,11 +326,11 @@ export function DeleteRoutingRuleDialog({
 
         <DialogBody>
           <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-            <div className="flex items-start gap-2 text-[12px] font-medium text-destructive">
+            <div className="flex items-start gap-2 text-caption font-medium text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>{t("Delete this routing rule from the configuration?")}</span>
             </div>
-            <div className="mt-2 space-y-1 text-[11px] text-muted-foreground">
+            <div className="mt-2 space-y-1 text-label text-muted-foreground">
               <div className="truncate" title={name}>
                 <span className="font-medium text-foreground">{t("Name")}:</span> {name}
               </div>
@@ -523,7 +523,7 @@ export function AddRoutingRuleDialog({
                     value={draft.conditionSource}
                   />
                   <Input
-                    className="font-mono text-[12px]"
+                    className="font-mono text-caption"
                     onChange={(event) => onChange({ conditionField: event.target.value })}
                     placeholder={draft.conditionSource === "request.auth" ? "profileId" : draft.conditionSource.endsWith(".header") ? "x-api-key" : "model"}
                     value={draft.conditionField}
@@ -534,7 +534,7 @@ export function AddRoutingRuleDialog({
                     value={draft.conditionOperator}
                   />
                   <Input
-                    className="font-mono text-[12px]"
+                    className="font-mono text-caption"
                     onChange={(event) => onChange({ conditionRight: event.target.value })}
                     placeholder={t("Value")}
                     value={draft.conditionRight}
@@ -545,14 +545,14 @@ export function AddRoutingRuleDialog({
               <>
                 <div className="sm:col-span-2 min-w-0 space-y-1">
                   <div className="flex min-w-0 items-center gap-2">
-                    <span className="min-w-0 truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                    <span className="min-w-0 truncate text-label font-medium uppercase tracking-wide text-muted-foreground">
                       {t("Node.js route script file")}
                     </span>
                   </div>
                   <div className="flex min-w-0 gap-2">
                     <Input
                       aria-label={t("Node.js route script file")}
-                      className="min-w-0 flex-1 font-mono text-[12px]"
+                      className="min-w-0 flex-1 font-mono text-caption"
                       onChange={(event) => onChange({ scriptFile: event.target.value })}
                       placeholder="/path/to/route-script.js"
                       value={draft.scriptFile}
@@ -585,7 +585,7 @@ export function AddRoutingRuleDialog({
                 </Field>
                 <Field className="sm:col-span-2" label={t("Test request JSON")}>
                   <Textarea
-                    className="min-h-36 resize-y font-mono text-[12px]"
+                    className="min-h-36 resize-y font-mono text-caption"
                     onChange={(event) => setScriptSample(event.target.value)}
                     spellCheck={false}
                     value={scriptSample}
@@ -622,7 +622,7 @@ export function AddRoutingRuleDialog({
                       value={rewrite.operation}
                     />
                     <Input
-                      className="font-mono text-[12px]"
+                      className="font-mono text-caption"
                       onChange={(event) => updateRewrite(index, { key: event.target.value })}
                       placeholder="request.body.model"
                       value={rewrite.key}
@@ -632,13 +632,13 @@ export function AddRoutingRuleDialog({
                     ) : rewrite.operation === "array-replace" ? (
                       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                         <Input
-                          className="font-mono text-[12px]"
+                          className="font-mono text-caption"
                           onChange={(event) => updateRewrite(index, { match: event.target.value })}
                           placeholder={t("Match value")}
                           value={rewrite.match}
                         />
                         <Input
-                          className="font-mono text-[12px]"
+                          className="font-mono text-caption"
                           onChange={(event) => updateRewrite(index, { value: event.target.value })}
                           placeholder={t("Value")}
                           value={rewrite.value}
@@ -646,7 +646,7 @@ export function AddRoutingRuleDialog({
                       </div>
                     ) : (
                       <Input
-                        className="font-mono text-[12px]"
+                        className="font-mono text-caption"
                         onChange={(event) => updateRewrite(index, { value: event.target.value })}
                         placeholder={rewrite.operation === "set" ? "glm-5.2" : t("Value")}
                         value={rewrite.value}

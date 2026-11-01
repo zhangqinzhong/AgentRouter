@@ -53,8 +53,8 @@ export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_P
  const fleet=useMemo(()=>buildFleetData({sources:data?.sources??[]},{copyFn:copy}),[data,language]);
  const tokens=Number(data?.totals.billable_total_tokens??data?.totals.total_tokens??0);
  const display=formatTokenCount(tokens,{forceFull:full,locale:numberLocale});
- return <div className="local-usage-page mx-auto w-full max-w-[1120px] px-5 py-6 sm:px-9 sm:py-8">
-   <h1 className="mb-8 text-[24px] font-semibold tracking-[-0.025em]">{t('Usage')}</h1>
+ return <div className="local-usage-page mx-auto w-full max-w-page px-5 py-6 sm:px-9 sm:py-8">
+   <h1 className="mb-8 text-title font-semibold tracking-tight">{t('Usage')}</h1>
    {error ? <div role="alert" className="mb-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}<button type="button" className="ml-3 underline" onClick={()=>setRevision(v=>v+1)}>{t('Retry')}</button></div>:null}
    <UsageOverview period={period} periods={['day','week','month','total','custom']} onPeriodChange={value=>setPeriod(value as Period)}
     summaryValue={display} summaryFullValue={formatTokenCount(tokens,{forceFull:true,locale:numberLocale})} onToggleSummaryFormat={()=>setFull(v=>!v)} summaryLabel={language==='zh'?'TOKEN 总数':'TOTAL TOKENS'}

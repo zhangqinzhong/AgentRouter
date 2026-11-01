@@ -44,7 +44,7 @@ export function ApiKeysView({
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search API keys")}
-              className="h-8 pl-8 text-[12px] shadow-none"
+              className="h-8 pl-8 text-caption shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search API keys")}
               value={query}
@@ -57,21 +57,21 @@ export function ApiKeysView({
         </PageHeader>
         <SectionHeading icon={KeyRound} title={t("Access keys")} summary={apiKeys.length.toLocaleString()} />
         <div className="@container min-w-0 overflow-x-auto border-y border-border/70">
-          {error ? <div className="m-4 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive flex items-start gap-2"><CircleAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" /><span>{error}</span></div> : null}
+          {error ? <div className="m-4 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive flex items-start gap-2"><CircleAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" /><span>{error}</span></div> : null}
           {apiKeys.length === 0 ? (
             <div className="px-3 py-12 text-center">
               <KeyRound className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
-              <div className="text-[12px] text-muted-foreground">{t("No API keys configured")}</div>
-              <div className="mt-1 text-[11px] text-muted-foreground/60">{t("Click Add to create one")}</div>
+              <div className="text-caption text-muted-foreground">{t("No API keys configured")}</div>
+              <div className="mt-1 text-label text-muted-foreground/60">{t("Click Add to create one")}</div>
             </div>
           ) : null}
           {apiKeys.length > 0 && visibleApiKeys.length === 0 ? (
-            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching API keys")}</div>
+            <div className="px-3 py-12 text-center text-caption text-muted-foreground">{t("No matching API keys")}</div>
           ) : null}
           {visibleApiKeys.length > 0 ? (
             <div className="min-w-0">
               <div className="min-w-[980px]">
-                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(140px,0.7fr)_minmax(390px,1.7fr)_132px_minmax(160px,0.7fr)_76px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(140px,0.7fr)_minmax(390px,1.7fr)_132px_minmax(160px,0.7fr)_76px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-label font-medium uppercase tracking-wide text-muted-foreground">
                   <div className="truncate">{t("Name")}</div>
                   <div className="truncate">{t("Key")}</div>
                   <div className="truncate">{t("Expires")}</div>
@@ -86,10 +86,10 @@ export function ApiKeysView({
                       key={`${apiKey.keyValue}-${apiKey.index}`}
                     >
                       <div className="min-w-0">
-                        <div className="truncate text-[13px] font-medium" title={apiKey.name}>{apiKey.name}</div>
+                        <div className="truncate text-body font-medium" title={apiKey.name}>{apiKey.name}</div>
                       </div>
                       <div className="min-w-0">
-                        <div className="flex min-w-0 items-center gap-1.5 text-[13px] font-medium leading-5" title={apiKey.masked}>
+                        <div className="flex min-w-0 items-center gap-1.5 text-body font-medium leading-5" title={apiKey.masked}>
                           <span className="min-w-0 truncate font-mono">{apiKey.masked}</span>
                           <Button
                             className="shrink-0"
@@ -104,10 +104,10 @@ export function ApiKeysView({
                           </Button>
                         </div>
                       </div>
-                      <div className="min-w-0 truncate text-[11px] text-muted-foreground" title={t(formatApiKeyExpiration(apiKey))}>
+                      <div className="min-w-0 truncate text-label text-muted-foreground" title={t(formatApiKeyExpiration(apiKey))}>
                         {t(formatApiKeyExpiration(apiKey))}
                       </div>
-                      <div className="min-w-0 truncate text-[11px] text-muted-foreground" title={t(formatApiKeyLimits(apiKey.limits))}>
+                      <div className="min-w-0 truncate text-label text-muted-foreground" title={t(formatApiKeyLimits(apiKey.limits))}>
                         {t(formatApiKeyLimits(apiKey.limits))}
                       </div>
                       <div className="flex items-center justify-end gap-1">
@@ -180,7 +180,7 @@ export function AddApiKeyDialog({
           </motion.div>
           <ApiKeyAdvancedSettings draft={draft} onChange={onChange} />
 
-          {error ? <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive flex items-start gap-2"><CircleAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" /><span>{error}</span></div> : null}
+          {error ? <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive flex items-start gap-2"><CircleAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" /><span>{error}</span></div> : null}
         </DialogBody>
 
         <DialogFooter>
@@ -227,7 +227,7 @@ export function ApiKeyCreatedDialog({
         </DialogHeader>
 
         <DialogBody>
-          <div className="flex items-start gap-3 rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 py-3 text-[12px] text-emerald-700">
+          <div className="flex items-start gap-3 rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 py-3 text-caption text-emerald-700">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-white">
               <Check className="h-3.5 w-3.5" />
             </span>
@@ -238,9 +238,9 @@ export function ApiKeyCreatedDialog({
           </div>
 
           <div className="mt-4 space-y-2">
-            <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{apiKeyName || t("API key")}</div>
+            <div className="text-label font-medium uppercase tracking-wide text-muted-foreground">{apiKeyName || t("API key")}</div>
             <div className="flex min-w-0 items-center gap-2 rounded-md border border-border bg-muted/30 p-2">
-              <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 font-mono text-[12px] text-foreground">
+              <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 font-mono text-caption text-foreground">
                 {apiKeyValue}
               </code>
               <Button
@@ -318,7 +318,7 @@ export function EditApiKeyDialog({
 
           <ApiKeyAdvancedSettings defaultOpen draft={draft} onChange={onChange} />
 
-          {error ? <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive flex items-start gap-2"><CircleAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" /><span>{error}</span></div> : null}
+          {error ? <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive flex items-start gap-2"><CircleAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" /><span>{error}</span></div> : null}
         </DialogBody>
 
         <DialogFooter>
@@ -367,7 +367,7 @@ function ApiKeyAdvancedSettings({
     <div className="mt-4 overflow-hidden rounded-md border border-border bg-background">
       <Button
         aria-expanded={advancedOpen}
-        className="flex h-10 w-full items-center justify-between gap-3 px-3 text-left text-[12px] font-medium transition-colors hover:bg-muted/40"
+        className="flex h-10 w-full items-center justify-between gap-3 px-3 text-left text-caption font-medium transition-colors hover:bg-muted/40"
         onClick={() => setAdvancedOpen((value) => !value)}
         type="button"
         unstyled
@@ -380,7 +380,7 @@ function ApiKeyAdvancedSettings({
           <AnimatedDisclosure key="api-key-advanced">
             <div className="space-y-2 border-t border-border p-3">
               {draft.limitRows.length === 0 ? (
-                <div className="rounded-md border border-dashed border-border bg-muted/20 px-3 py-5 text-center text-[12px] text-muted-foreground">
+                <div className="rounded-md border border-dashed border-border bg-muted/20 px-3 py-5 text-center text-caption text-muted-foreground">
                   {t("No limits configured")}
                 </div>
               ) : null}

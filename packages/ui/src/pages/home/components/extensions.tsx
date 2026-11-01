@@ -40,7 +40,7 @@ export function ExtensionsView({
             <Search className="pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               aria-label={t("Search extensions")}
-              className="h-8 pl-8 text-[12px] shadow-none"
+              className="h-8 pl-8 text-caption shadow-none"
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t("Search extensions")}
               value={query}
@@ -56,17 +56,17 @@ export function ExtensionsView({
           {extensions.length === 0 ? (
             <div className="px-3 py-12 text-center">
               <Braces className="mx-auto mb-2 h-7 w-7 text-muted-foreground/40" />
-              <div className="text-[12px] text-muted-foreground">{t("No extensions installed")}</div>
-              <div className="mt-1 text-[11px] text-muted-foreground/60">{t("Click Install to add one")}</div>
+              <div className="text-caption text-muted-foreground">{t("No extensions installed")}</div>
+              <div className="mt-1 text-label text-muted-foreground/60">{t("Click Install to add one")}</div>
             </div>
           ) : null}
           {extensions.length > 0 && visibleExtensions.length === 0 ? (
-            <div className="px-3 py-12 text-center text-[12px] text-muted-foreground">{t("No matching extensions")}</div>
+            <div className="px-3 py-12 text-center text-caption text-muted-foreground">{t("No matching extensions")}</div>
           ) : null}
           {visibleExtensions.length > 0 ? (
             <div className="min-w-0">
               <div className="min-w-[720px]">
-                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(180px,0.95fr)_minmax(220px,1.15fr)_minmax(240px,1.2fr)_116px_116px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="sticky top-0 z-10 grid h-10 grid-cols-[minmax(180px,0.95fr)_minmax(220px,1.15fr)_minmax(240px,1.2fr)_116px_116px] items-center gap-3 border-b border-border/60 bg-muted/45 px-4 text-label font-medium uppercase tracking-wide text-muted-foreground">
                   <div className="truncate">{t("Name")}</div>
                   <div className="truncate">{t("Path")}</div>
                   <div className="truncate">{t("Capability")}</div>
@@ -83,12 +83,12 @@ export function ExtensionsView({
                       key={`${extension.source}-${extension.index}`}
                     >
                       <div className="min-w-0">
-                        <div className="truncate text-[13px] font-medium">{extension.name}</div>
+                        <div className="truncate text-body font-medium">{extension.name}</div>
                       </div>
-                      <div className="min-w-0 truncate text-[11px] text-muted-foreground" title={extension.target}>
+                      <div className="min-w-0 truncate text-label text-muted-foreground" title={extension.target}>
                         {extension.target}
                       </div>
-                      <div className="min-w-0 truncate text-[11px] text-muted-foreground" title={extension.capability}>
+                      <div className="min-w-0 truncate text-label text-muted-foreground" title={extension.capability}>
                         {extension.capability}
                       </div>
                       <div className="flex min-w-0 items-center gap-2">
@@ -180,11 +180,11 @@ export function DeleteExtensionDialog({
 
         <DialogBody>
           <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-            <div className="flex items-start gap-2 text-[12px] font-medium text-destructive">
+            <div className="flex items-start gap-2 text-caption font-medium text-destructive">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>{t("Delete this extension from the configuration?")}</span>
             </div>
-            <div className="mt-2 space-y-1 text-[11px] text-muted-foreground">
+            <div className="mt-2 space-y-1 text-label text-muted-foreground">
               <div className="truncate" title={extension.name}>
                 <span className="font-medium text-foreground">{t("Name")}:</span> {extension.name}
               </div>
@@ -260,7 +260,7 @@ export function PluginSettingsDialog({
             <div className="overflow-hidden rounded-md border border-border bg-background">
               <Button
                 aria-expanded={advancedOpen}
-                className="flex h-10 w-full items-center justify-between gap-3 px-3 text-left text-[12px] font-medium transition-colors hover:bg-muted/40"
+                className="flex h-10 w-full items-center justify-between gap-3 px-3 text-left text-caption font-medium transition-colors hover:bg-muted/40"
                 onClick={() => setAdvancedOpen((value) => !value)}
                 type="button"
                 unstyled
@@ -310,7 +310,7 @@ export function PluginSettingsDialog({
             </div>
 
             {error ? (
-              <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">{t(error)}</div>
+              <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">{t(error)}</div>
             ) : null}
           </div>
         </DialogBody>
@@ -382,7 +382,7 @@ export function ConfigureClaudeDesignDialog({
 
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{t(routesLabel)}</div>
+                <div className="min-w-0 text-label font-medium uppercase tracking-wide text-muted-foreground">{t(routesLabel)}</div>
                 <Button onClick={onAddRule} size="sm" type="button" variant="outline">
                   <Plus className="h-3.5 w-3.5" />
                   {t("Add")}
@@ -390,7 +390,7 @@ export function ConfigureClaudeDesignDialog({
               </div>
 
               {draft.rules.length === 0 ? (
-                <div className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-[12px] text-muted-foreground">{t("No plugin routes configured")}</div>
+                <div className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-caption text-muted-foreground">{t("No plugin routes configured")}</div>
               ) : null}
 
               <div className="space-y-2">
@@ -419,7 +419,7 @@ export function ConfigureClaudeDesignDialog({
                         </Field>
                       ) : null}
                       {isClaudeDesignStaticRuleType(rule.type) ? (
-                        <div className="flex min-h-[58px] items-end rounded-md border border-border/70 bg-muted/25 px-3 py-2 text-[12px] text-muted-foreground">{t(claudeDesignRouteRuleTypeLabel(rule.type))}</div>
+                        <div className="flex min-h-[58px] items-end rounded-md border border-border/70 bg-muted/25 px-3 py-2 text-caption text-muted-foreground">{t(claudeDesignRouteRuleTypeLabel(rule.type))}</div>
                       ) : null}
                       <Field label={t("Target model")}>
                         <RouteTargetControl
@@ -430,7 +430,7 @@ export function ConfigureClaudeDesignDialog({
                       </Field>
                     </div>
                     <div className="mt-3 flex items-center justify-between gap-2 border-t border-border/60 pt-3">
-                      <Label className="flex min-w-0 items-center gap-2 text-[12px] text-muted-foreground">
+                      <Label className="flex min-w-0 items-center gap-2 text-caption text-muted-foreground">
                         <Toggle checked={rule.enabled} onChange={(enabled) => onChangeRule(index, { enabled })} />
                         <span>{t("Enabled")}</span>
                       </Label>

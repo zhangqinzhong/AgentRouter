@@ -11,7 +11,7 @@ test("memory is a native workspace page, without iframe, webview, or an engine i
   const html = renderToStaticMarkup(<AppI18nContext.Provider value={appCopy.zh}><MemoryView /></AppI18nContext.Provider>);
   assert.match(html, /记忆/); assert.match(html, /项目记忆/); assert.match(html, /客户端/); assert.match(html, /设置/);
   assert.equal((html.match(/role="tab"/g) || []).length, 3);
-  assert.match(html, /max-w-\[1120px\]/);
+  assert.match(html, /max-w-page/);
   assert.doesNotMatch(html, /<iframe|<webview|Install engine/);
   assert.ok(groupSidebarNavigation(navigation).find((group) => group.id === "workspace")?.items.some((item) => item.id === "memory"));
 });

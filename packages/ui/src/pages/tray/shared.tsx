@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { LoaderCircle, Power, RefreshCw } from "lucide-react";
+import { LoaderCircle, Power, RefreshCw } from "@/components/ui/icons";
 import appLogoUrl from "@/lib/app-icon";
 import codexLogoUrl from "@/assets/agent-logos/codex.png";
 import { formatCompactNumber as formatLocalizedCompactNumber } from "@/lib/number-format.js";

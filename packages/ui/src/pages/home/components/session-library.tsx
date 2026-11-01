@@ -25,7 +25,7 @@ import {
   Terminal,
   Copy,
   LoaderCircle,
-} from "lucide-react";
+} from "@/components/ui/icons";
 import { Select } from "@/components/ui/select";
 import { TranscriptMessage, TranscriptTools } from "./session-workbench";
 import { SessionDetailModal } from "@/vendor/tokentracker/ui/dashboard/components/SessionDetailModal";

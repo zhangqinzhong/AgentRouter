@@ -97,8 +97,8 @@ export function TrayDetailApp({ provider }: { provider?: string }) {
     >
       <TrayStatusStrip totalTokens={snapshots[range].totals.totalTokens} />
       <UsageDetailPanel activeStats={snapshots[range]} accountRefreshing={accountRefreshing} accountSnapshots={accountSnapshots} provider={provider} range={range} widgets={trayWidgets} onRefreshAccount={refreshAccountSnapshots} onRangeChange={setRange} />
-      {loading ? <div className="mt-2 text-[11px] font-medium text-slate-300/55">{t("Syncing usage...")}</div> : null}
-      {error ? <div className="mt-3 rounded-[12px] border border-rose-400/20 bg-rose-500/15 px-3 py-2 text-[12px] font-medium text-rose-100">{error}</div> : null}
+      {loading ? <div className="mt-2 text-label font-medium text-slate-300/55">{t("Syncing usage...")}</div> : null}
+      {error ? <div className="mt-3 rounded-[12px] border border-rose-400/20 bg-rose-500/15 px-3 py-2 text-caption font-medium text-rose-100">{error}</div> : null}
     </main>
   );
 }

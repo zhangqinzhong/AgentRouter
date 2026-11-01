@@ -1,5 +1,5 @@
 import { PageHeader, SectionHeading, SummaryStrip, tablePageClassName } from "./page-primitives";
-import { Activity } from "lucide-react";
+import { Activity } from "@/components/ui/icons";
 import {
   AgentAnalysisSessionSelection, AgentAnalysisSnapshot, AgentAnalysisTracePayloadFullResult, AgentAnalysisTracePayloadRequest, AgentAnalysisTraceRun, AgentFilterValue, agentAnalysisRangeOptions,
   agentFilterOptions, agentKindLabel, Badge, Button,
@@ -45,7 +45,7 @@ export function AgentAnalysisView({
       <PageHeader title={t("Observability")}>
         <Select
           aria-label={t("Filter agent")}
-          className="h-8 w-[160px] rounded-md bg-[length:14px] px-2.5 pr-7 text-[12px] shadow-none"
+          className="h-8 w-[160px] rounded-md bg-[length:14px] px-2.5 pr-7 text-caption shadow-none"
           onValueChange={(value) => setAgentFilter(normalizeAgentFilterValue(value))}
           options={translateOptions(agentFilterOptions, t)}
           value={agentFilter}
@@ -55,7 +55,7 @@ export function AgentAnalysisView({
             <Button
               aria-pressed={range === option.value}
               className={cn(
-                "px-1 py-1 text-[11px] transition-colors",
+                "px-1 py-1 text-label transition-colors",
                 range === option.value ? "font-semibold text-foreground" : "font-normal text-muted-foreground/70 hover:text-muted-foreground"
               )}
               key={option.value}
@@ -79,7 +79,7 @@ export function AgentAnalysisView({
       ]} />
 
       {error ? (
-        <div className="flex shrink-0 items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+        <div className="flex shrink-0 items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-caption text-destructive">
           <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>{error}</span>
         </div>
@@ -138,7 +138,7 @@ function AgentSessionDetailCard({
         <DialogHeader>
           <div className="min-w-0">
             <DialogTitle>{t("Trace Detail")}</DialogTitle>
-            <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={session?.id ?? selectedSession?.id}>
+            <div className="mt-1 truncate font-mono text-label text-muted-foreground" title={session?.id ?? selectedSession?.id}>
               {headerLabel}
             </div>
           </div>
@@ -189,7 +189,7 @@ function AgentSessionDetailTabs({
       <TabsList aria-label={t("Trace Detail")} className="w-fit max-w-full flex-wrap items-center gap-1 rounded-md border border-border bg-background p-1">
         {tabs.map((tab) => (
           <TabsTrigger
-            className="h-8 rounded px-3 text-[12px] font-medium data-[state=active]:bg-card data-[state=active]:text-foreground"
+            className="h-8 rounded px-3 text-caption font-medium data-[state=active]:bg-card data-[state=active]:text-foreground"
             key={tab.value}
             value={tab.value}
           >
@@ -209,7 +209,7 @@ function AgentSessionRequestsPanel({ detail }: { detail: AgentSessionDetail }) {
   return (
     <div className="min-w-0">
       <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="text-[12px] font-semibold">{t("Session Records")}</div>
+        <div className="text-caption font-semibold">{t("Session Records")}</div>
       </div>
       {requests.length === 0 ? (
         <AnalysisEmptyState label={t("No session records")} />
@@ -242,7 +242,7 @@ function AgentSessionRequestsPanel({ detail }: { detail: AgentSessionDetail }) {
                   <td className="px-3 py-2 text-right">{formatDuration(request.durationMs)}</td>
                   <td className="px-3 py-2 text-right">
                     <Button
-                      className="h-7 px-2 text-[11px]"
+                      className="h-7 px-2 text-label"
                       onClick={() => setSelectedRequestLogId(request.id)}
                       type="button"
                       variant="outline"
@@ -325,7 +325,7 @@ function AgentSessionRequestLogDialog({
         <DialogHeader>
           <div className="min-w-0">
             <DialogTitle>{t("Request Log")}</DialogTitle>
-            <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={String(requestLogId)}>
+            <div className="mt-1 truncate font-mono text-label text-muted-foreground" title={String(requestLogId)}>
               #{requestLogId}{entry ? ` · ${entry.method} ${entry.path}` : ""}
             </div>
           </div>
@@ -337,7 +337,7 @@ function AgentSessionRequestLogDialog({
           {entry ? (
             <LogExpandedDetails detailError={error} detailLoading={loading} entry={entry} />
           ) : (
-            <div className="flex min-h-[360px] items-center justify-center px-4 py-8 text-center text-[12px] text-muted-foreground">
+            <div className="flex min-h-[360px] items-center justify-center px-4 py-8 text-center text-caption text-muted-foreground">
               {loading ? (
                 <div className="flex items-center gap-2">
                   <LoaderCircle className="h-4 w-4 animate-spin" />
@@ -393,8 +393,8 @@ function AgentSessionTrajectoryPanel({ detail }: { detail: AgentSessionDetail })
     <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border-y border-border/70">
       <div className="flex min-w-0 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border/60 px-3 py-2.5">
         <div className="min-w-0 flex-1">
-          <div className="text-[12px] font-semibold">{t("Session Trajectory")}</div>
-          <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={detail.trace.sessionId}>
+          <div className="text-caption font-semibold">{t("Session Trajectory")}</div>
+          <div className="mt-0.5 truncate font-mono text-label text-muted-foreground" title={detail.trace.sessionId}>
             {compactId(detail.trace.sessionId)} | {formatLogDateTime(detail.trace.startedAt)} - {formatLogDateTime(detail.trace.endedAt)}
           </div>
         </div>
@@ -404,7 +404,7 @@ function AgentSessionTrajectoryPanel({ detail }: { detail: AgentSessionDetail })
           <Badge variant="outline">{formatCompactNumber(callCount)} {t("Calls")}</Badge>
           <input
             aria-label={t("Search")}
-            className="h-7 w-[190px] rounded-md border border-border bg-background px-2 text-[11px] outline-none transition-colors placeholder:text-muted-foreground focus:border-primary/60"
+            className="h-7 w-[190px] rounded-md border border-border bg-background px-2 text-label outline-none transition-colors placeholder:text-muted-foreground focus:border-primary/60"
             onChange={(event) => setQuery(event.target.value)}
             placeholder={t("Search")}
             value={query}
@@ -453,7 +453,7 @@ function AgentSessionTrajectoryPanel({ detail }: { detail: AgentSessionDetail })
 
 export const agentListSurfaceClassName = "border-y border-border/70";
 const agentListFrameClassName = cn("overflow-auto", agentListSurfaceClassName);
-export const agentListTableClassName = "w-full border-collapse text-left text-[11px] tabular-nums";
+export const agentListTableClassName = "w-full border-collapse text-left text-label tabular-nums";
 const agentListHeadClassName = "sticky top-0 z-10 border-b border-border/70 bg-muted/80 text-muted-foreground backdrop-blur [&_th]:min-w-[64px] [&_th]:whitespace-nowrap";
 export const agentListBodyClassName = "divide-y divide-border/50";
 
@@ -896,8 +896,8 @@ function AgentTracePanel({ trace }: { trace: AgentTraceDetail }) {
     <div className="min-w-0">
       <div className="mb-2 flex min-w-0 flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
-          <div className="text-[12px] font-semibold">{t("Call chain")}</div>
-          <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={trace.sessionId}>
+          <div className="text-caption font-semibold">{t("Call chain")}</div>
+          <div className="mt-0.5 truncate font-mono text-label text-muted-foreground" title={trace.sessionId}>
             {compactId(trace.sessionId)} - {formatLogDateTime(trace.startedAt)}{" -> "}{formatLogDateTime(trace.endedAt)}
           </div>
         </div>
@@ -933,7 +933,7 @@ function AgentTracePanel({ trace }: { trace: AgentTraceDetail }) {
                       <span className={cn("h-2 w-2 shrink-0 rounded-full", traceRunDotClass(run))} />
                       <div className="min-w-0">
                         <div className="truncate font-semibold" title={run.name}>{run.name}</div>
-                        <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[10px] text-muted-foreground">
+                        <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-2xs text-muted-foreground">
                           <span className="font-mono uppercase">{t(traceRunKindLabel(run.kind))}</span>
                           {run.requestId ? <span className="truncate font-mono" title={run.requestId}>{compactId(run.requestId)}</span> : null}
                         </div>
@@ -994,7 +994,7 @@ function TraceRunTarget({
     <div className="flex min-w-0 items-center gap-2">
       <span className="min-w-0 truncate" title={traceRunTarget(run)}>{traceRunTarget(run)}</span>
       {run.tool ? (
-        <Button className="h-6 shrink-0 border-border bg-transparent px-2 text-[10px] shadow-none hover:bg-transparent active:bg-transparent" onClick={onOpenTool} type="button" variant="outline">
+        <Button className="h-6 shrink-0 border-border bg-transparent px-2 text-2xs shadow-none hover:bg-transparent active:bg-transparent" onClick={onOpenTool} type="button" variant="outline">
           {t("Parameters")} / {t("Result")}
         </Button>
       ) : null}
@@ -1054,10 +1054,10 @@ function AgentTrajectoryNodeRow({
         ) : (
           <span className="h-5 w-5 shrink-0" />
         )}
-        <span className={cn("min-w-[84px] shrink-0 rounded px-1.5 py-0.5 text-center font-mono text-[9px] font-semibold uppercase", trajectoryNodeBadgeClass(node))}>
+        <span className={cn("min-w-[84px] shrink-0 rounded px-1.5 py-0.5 text-center font-mono text-micro font-semibold uppercase", trajectoryNodeBadgeClass(node))}>
           {trajectoryNodeRoleTag(node.kind)}
         </span>
-        <span className="min-w-0 flex-1 truncate text-[12px] text-foreground/90" title={preview || trajectoryNodeTitle(node, t)}>
+        <span className="min-w-0 flex-1 truncate text-caption text-foreground/90" title={preview || trajectoryNodeTitle(node, t)}>
           {preview || trajectoryNodeTitle(node, t)}
         </span>
       </div>
@@ -1088,14 +1088,14 @@ function AgentTrajectoryDetailPanel({
       <div className="flex min-h-12 shrink-0 items-center justify-between gap-2 border-b border-border/60 px-3 py-2">
         <div className="min-w-0">
           <div className="flex min-w-0 items-center gap-2">
-            <span className={cn("rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase", trajectoryNodeBadgeClass(node))}>
+            <span className={cn("rounded px-1.5 py-0.5 font-mono text-micro font-semibold uppercase", trajectoryNodeBadgeClass(node))}>
               {trajectoryNodeRoleTag(node.kind)}
             </span>
-            <span className="truncate text-[12px] font-medium" title={trajectoryNodeTitle(node, t)}>
+            <span className="truncate text-caption font-medium" title={trajectoryNodeTitle(node, t)}>
               {trajectoryNodeTitle(node, t)}
             </span>
           </div>
-          <div className="mt-1 text-[10px] text-muted-foreground">
+          <div className="mt-1 text-2xs text-muted-foreground">
             {node.turnIndex ? `${t("Round")} ${node.turnIndex} | ` : ""}{t("Step")} {node.stepIndex}
           </div>
         </div>
@@ -1108,7 +1108,7 @@ function AgentTrajectoryDetailPanel({
         {(["preview", "raw"] as AgentTrajectoryDetailTab[]).map((item) => (
           <button
             className={cn(
-              "h-10 border-b-2 px-2 text-[12px] font-medium transition-colors",
+              "h-10 border-b-2 px-2 text-caption font-medium transition-colors",
               tab === item ? "border-primary text-primary" : "border-transparent text-muted-foreground hover:text-foreground"
             )}
             key={item}
@@ -1157,7 +1157,7 @@ function AgentTrajectoryNodePreview({ node }: { node: AgentTrajectoryNode }) {
   }
 
   return (
-    <div className="space-y-4 p-4 text-[12px]">
+    <div className="space-y-4 p-4 text-caption">
       <div className="grid grid-cols-[92px_minmax(0,1fr)] gap-x-4 gap-y-2">
         <div className="text-muted-foreground">{t("Source")}</div>
         <div>{t(trajectoryNodeKindLabel(node.kind))}</div>
@@ -1221,7 +1221,7 @@ function ToolPayloadDialog({
         <DialogHeader>
           <div className="min-w-0">
             <DialogTitle>{run.toolName || run.name}</DialogTitle>
-            <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={tool?.callId}>
+            <div className="mt-1 truncate font-mono text-label text-muted-foreground" title={tool?.callId}>
               {tool?.callId ? compactId(tool.callId) : t("Tool")}
             </div>
           </div>
@@ -1313,8 +1313,8 @@ function TracePayloadPane({
   return (
     <section className="flex min-h-[160px] flex-col overflow-hidden rounded-lg border border-border/60 bg-muted/20">
       <div className="flex min-h-11 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border/60 px-3 py-2">
-        <div className="text-[12px] font-semibold">{label}</div>
-        <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 text-[10px] text-muted-foreground">
+        <div className="text-caption font-semibold">{label}</div>
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 text-2xs text-muted-foreground">
           {loading ? <Badge variant="outline">{t("Loading")}</Badge> : null}
           {sizeBytes > 0 ? <Badge variant="outline">{formatBytes(sizeBytes)}</Badge> : null}
           {previewOnly && !loading ? <Badge variant="outline">{t("Preview")}</Badge> : null}
@@ -1324,7 +1324,7 @@ function TracePayloadPane({
       </div>
       <div className="min-h-0 flex-1 overflow-auto">
         {loading && !content ? (
-          <div className="px-3 py-4 text-[11px] text-muted-foreground">{t("Loading")}</div>
+          <div className="px-3 py-4 text-label text-muted-foreground">{t("Loading")}</div>
         ) : (
           <TracePayloadContent content={content} kind={kind} />
         )}
@@ -1353,19 +1353,19 @@ function TracePayloadContent({
   }, [content, kind]);
 
   if (!content.trim() || kind === "empty") {
-    return <div className="px-3 py-4 text-[11px] text-muted-foreground">{t("No data")}</div>;
+    return <div className="px-3 py-4 text-label text-muted-foreground">{t("No data")}</div>;
   }
 
   if (parsed) {
     return (
-      <div className="min-w-max p-3 font-mono text-[11px] leading-5">
+      <div className="min-w-max p-3 font-mono text-label leading-5">
         <JsonTreeNode root value={parsed.value} />
       </div>
     );
   }
 
   return (
-    <pre className="min-h-full whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5 text-foreground">
+    <pre className="min-h-full whitespace-pre-wrap break-words p-3 font-mono text-label leading-5 text-foreground">
       <code>{content}</code>
     </pre>
   );
@@ -1723,7 +1723,7 @@ function AgentSessionsCard({
                     <td className="max-w-[220px] px-3 py-2" title={session.providers.join(", ")}>{session.providers.join(", ") || "—"}</td>
                     <td className="max-w-[220px] px-3 py-2 font-mono" title={session.userAgent}>{compactUserAgent(session.userAgent)}</td>
                     <td className="px-3 py-2 text-right">
-                      <Button className="h-7 border-border bg-transparent px-2 text-[11px] shadow-none hover:bg-transparent active:bg-transparent" onClick={() => onSelectSession({ agent: session.agent, id: session.id })} type="button" variant="outline">
+                      <Button className="h-7 border-border bg-transparent px-2 text-label shadow-none hover:bg-transparent active:bg-transparent" onClick={() => onSelectSession({ agent: session.agent, id: session.id })} type="button" variant="outline">
                         {t("Details")}
                       </Button>
                     </td>
@@ -1740,7 +1740,7 @@ function AgentSessionsCard({
 
 function AnalysisEmptyState({ label }: { label: string }) {
   return (
-    <div className="border-y border-border/70 px-3 py-12 text-center text-[12px] text-muted-foreground">
+    <div className="border-y border-border/70 px-3 py-12 text-center text-caption text-muted-foreground">
       {label}
     </div>
   );
@@ -1748,7 +1748,7 @@ function AnalysisEmptyState({ label }: { label: string }) {
 
 function AnalysisNotice({ children }: { children: ReactNode }) {
   return (
-    <div className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+    <div className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-caption text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
       <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
       <span>{children}</span>
     </div>

@@ -462,7 +462,7 @@ test("ProfileView renders flat profile rows with inline actions", () => {
   );
 
   assert.equal(html.match(/aria-label="(?:Claude Code Main|ZCode Main) Profile actions"/g)?.length, 2);
-  assert.match(html, /local-usage-page mx-auto w-full max-w-\[1120px\]/);
+  assert.match(html, /local-usage-page mx-auto w-full max-w-page/);
   assert.match(html, /divide-y divide-border\/60/);
   assert.doesNotMatch(html, /grid-template-columns:repeat| min-h-\[220px\]/);
   assert.match(html, /openai\/gpt-5\.2/);

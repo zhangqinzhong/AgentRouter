@@ -31,7 +31,7 @@ const TooltipPortal = React.forwardRef<HTMLDivElement, TooltipPortalProps>(
     return createPortal(
       <div
         className={cn(
-          "pointer-events-none fixed z-[200] max-w-[min(260px,calc(100vw-24px))] rounded-md border border-border/70 bg-popover px-2 py-1 text-[11px] font-medium leading-4 text-popover-foreground shadow-card-elevated ring-1 ring-black/5",
+          "pointer-events-none fixed z-[200] max-w-[min(260px,calc(100vw-24px))] rounded-md border border-border/70 bg-popover px-2 py-1 text-label font-medium leading-4 text-popover-foreground shadow-card-elevated ring-1 ring-black/5",
           className
         )}
         ref={ref}
