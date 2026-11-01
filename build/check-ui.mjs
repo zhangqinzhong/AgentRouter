@@ -45,7 +45,7 @@ export const rules = {
       /(?<![\w$.\-[])-?[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\[[^\]\s'"`]+\](?!:)/g,
       // opacity/size modifiers: bg-emerald-500/[0.045]
       /(?<=[\w)\]])\/\[[^\]\s'"`]+\](?!:)/g,
-      // arbitrary properties: [mask-type:luminance]
+      // arbitrary properties: a CSS property and value in square brackets
       /(?<=^|[\s"'`{:!])\[(?:--)?[a-z][a-z-]*:[^\]\s'"`]+\](?!:)/g
     ]
   },

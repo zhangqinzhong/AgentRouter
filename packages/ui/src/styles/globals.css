@@ -19,6 +19,7 @@
 @source "../lib/**/*.{ts,tsx}";
 @source "../types/**/*.{ts,tsx}";
 @source "../../../core/src/contracts/**/*.{ts,tsx}";
+@source not "../../../../tests/ui-guard";
 
 
 @layer base {
