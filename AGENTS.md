@@ -16,3 +16,12 @@ See [docs/releasing.md](docs/releasing.md) for the commands and recovery procedu
 ## Product copy
 
 User-visible interfaces and exports contain product content, not agent plans, implementation explanations or debugging notes. Keep that information in chat, code comments and development documentation.
+
+## Renderer UI consistency
+
+For any change under `packages/ui/src`, follow [UI-STYLE-GUIDE.md](UI-STYLE-GUIDE.md) §0:
+
+- Theme values come only from `packages/ui/src/styles/tokens.css` (Tailwind's default theme is cleared). Use semantic tokens such as `bg-background`, `text-muted-foreground`, `border-border`, `text-brand-ink`, `bg-status-ok`, `text-body`, `max-w-page` and `duration-fast`; add a token there, for light and dark, when none fits.
+- Page code takes controls from `@/components/ui/*` and icons from `@/components/ui/icons`. Do not import Radix, Base UI or `lucide-react` directly, or write native `<button>`/`<select>`; extend the shared component instead.
+- `npm run check:ui` must pass. It forbids raw colours, Tailwind arbitrary values, raw palette colours, primitive imports and native controls in page code, against `build/check-ui-baseline.json`, which may only go down. Never raise the baseline; after removing violations run `npm run check:ui -- --update-baseline` and commit the lowered file. Rule changes need matching fixtures in `tests/ui-guard` (`npm run test:ui-guard`).
+- Enable the pre-commit hook once per clone with `npm run hooks:install`. Attach light, dark and narrow before/after screenshots to UI changes.
