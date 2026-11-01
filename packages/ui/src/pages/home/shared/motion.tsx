@@ -99,28 +99,7 @@ export function AnimatedFieldSlot({ children, className }: { children: ReactNode
   );
 }
 
-export function AnimatedPopover({
-  children,
-  className,
-  placement = "below",
-  ...props
-}: MotionSafeDivAttributes & { placement?: "above" | "below" }) {
-  const shouldReduceMotion = useReducedMotion();
-  const y = placement === "above" ? 4 : -4;
-
-  return (
-    <motion.div
-      animate={shouldReduceMotion ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
-      className={className}
-      exit={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.98, y }}
-      initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.98, y }}
-      transition={shouldReduceMotion ? reducedMotionTransition : { duration: 0.12, ease: "easeOut" }}
-      {...props}
-    >
-      {children}
-    </motion.div>
-  );
-}
+export { AnimatedPopover } from "@/components/ui/popover";
 
 export function AnimatedIconSwap({
   children,

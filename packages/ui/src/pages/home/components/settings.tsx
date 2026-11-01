@@ -20,6 +20,7 @@ import {
 } from "../shared/index";
 import { ModelSelector } from "./model-selector";
 import trayLayeredIconUrl from "@/assets/tray-layered.png";
+import { useDismiss } from "@/components/ui/listbox";
 import { Spinner } from "@/components/ui/spinner";
 
 const settingsPageContentWidthClassName = "w-full min-w-0";
@@ -2506,29 +2507,7 @@ function TrayAccountDataSelector({
       ? selectedLabels[0] ?? value[0] ?? t("Select account")
       : `${selected.size} ${t("accounts selected")}`;
 
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    const closeOnOutsidePointer = (event: PointerEvent) => {
-      const target = event.target;
-      if (target instanceof Node && rootRef.current?.contains(target)) {
-        return;
-      }
-      setOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [open]);
+  useDismiss(open, [rootRef], () => setOpen(false), { pointerEvent: "pointerdown" });
 
   function toggleAccount(account: string, checked: boolean) {
     const next = new Set(selected);
@@ -2542,16 +2521,17 @@ function TrayAccountDataSelector({
 
   return (
     <div className="relative min-w-0" ref={rootRef}>
-      <button
+      <Button
         aria-expanded={open}
         aria-haspopup="listbox"
         className="flex h-8 w-full min-w-0 items-center gap-2 rounded-md border border-input bg-background px-3 text-left text-caption text-foreground shadow-[inset_0_1px_1px_rgba(0,0,0,0.03)] outline-none transition-[background-color,border-color,box-shadow,color] hover:border-muted-foreground/45 focus:border-primary/60 focus:ring-2 focus:ring-ring/25"
         onClick={() => setOpen((current) => !current)}
         type="button"
+        unstyled
       >
         <span className="min-w-0 flex-1 truncate">{summary}</span>
         <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-      </button>
+      </Button>
       {open ? (
         <div
           aria-multiselectable="true"

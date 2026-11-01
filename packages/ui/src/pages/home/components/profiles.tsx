@@ -3,7 +3,7 @@ import { documentPageClassName, PageHeader, SectionHeading } from "./page-primit
 import { isValidLaunchAlias } from "@agentrouter/core/profiles/alias-validation";
 import { useDraftClose } from "./unsaved-changes";
 import {
-  AddProfileDraft, AddRoutingRuleDraft, AgentLogo, AnimatedIconSwap, AnimatedPopover, AnimatePresence, AppConfig, Badge, BotGatewaySavedConfig, botGatewaySavedConfigLabel, BotHandoffScanTarget, Button,
+  AddProfileDraft, AddRoutingRuleDraft, AgentLogo, AnimatedIconSwap, AnimatePresence, AppConfig, Badge, BotGatewaySavedConfig, botGatewaySavedConfigLabel, BotHandoffScanTarget, Button,
   Check, ChevronDown, CircleAlert, Copy,
   createKeyValueDraftRow,
   createRoutingRuleDraft, createRoutingRuleDraftFromRule,
@@ -11,18 +11,17 @@ import {
   DialogTitle, Field, GatewayProviderConfig, Info, Input, KeyValueRowsControl, motion,
   normalizeProfileScope, normalizeProfileSurface, Pencil, Plus, PopoverContent,
   profileAgentLabel, profileAgentOptions, ProfileConfig, type ProfileAgentOption, profileModelProviderOptions, profileOpenSurfaces, profileScopeLabel, profileScopeOptions, profileSummaryItems, profileSurfaceLabel, profileSurfaceOptions,
-  Play, Power, RefreshCw, Search, Select, SelectControl, Settings, Terminal, Toggle, translateOptions, Trash2, useAppErrorText, useAppText, useLayoutEffect, type KeyValueDraftRow, type ProfileOpenSurface, type ProfileRuntimeStatus, type ReactDragEvent, type ReactNode, type VirtualModelProfileConfig,
+  Play, Power, RefreshCw, Search, Select, SelectControl, Settings, Terminal, Toggle, translateOptions, Trash2, useAppErrorText, useAppText, type KeyValueDraftRow, type ProfileOpenSurface, type ProfileRuntimeStatus, type ReactDragEvent, type ReactNode, type VirtualModelProfileConfig,
   copyTextToClipboard, formatClaudeSettingsDraft, formatRouterRuleCondition, formatRouterRuleTarget, isClaudeSettingsDraftValid, isPlainRecord, isRoutingRuleDraftSubmittable, normalizeProviderModelSelector, routerRuleTypeLabel, routingRuleFromDraft, type RouterRule, uniqueStrings, useResolvedAppLanguage, validateProfileEnvRows,
   useCallback, useEffect, useMemo, useRef, useState, X
 } from "../shared/index";
 import claudeCodeConfigOptionsJson from "@/generated/claude-code-config-options.json";
-import { PopoverPortal } from "@/components/ui/popover";
+import { AnchoredPopover, ListboxOption, useAnchoredPopoverLayout, useDismiss } from "@/components/ui/listbox";
 import { Tooltip } from "@/components/ui/tooltip";
 import { ModelMultiSelector, ModelSelector } from "./model-selector";
 import { AddRoutingRuleDialog } from "./routing";
 import { Spinner } from "@/components/ui/spinner";
 
-const useClientLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
 type ClaudeCodeConfigOption = {
   default?: string;
@@ -565,81 +564,15 @@ function AgentSelectControl({
 }) {
   const t = useAppText();
   const [open, setOpen] = useState(false);
-  const [popoverLayout, setPopoverLayout] = useState<{
-    left: number;
-    maxHeight: number;
-    offset: number;
-    placement: "above" | "below";
-    width: number;
-  }>();
   const panelRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-
-  useClientLayoutEffect(() => {
-    if (!open) {
-      setPopoverLayout(undefined);
-      return;
-    }
-
-    function updatePopoverLayout() {
-      const root = rootRef.current;
-      if (!root) {
-        return;
-      }
-      const anchor = root.getBoundingClientRect();
-      const margin = 12;
-      const gap = 6;
-      const viewportHeight = window.innerHeight;
-      const listHeight = agentOptions.length * 36 + 8;
-      const below = Math.max(0, viewportHeight - anchor.bottom - margin - gap);
-      const above = Math.max(0, anchor.top - margin - gap);
-      const placement = below < listHeight && above > below ? "above" : "below";
-      setPopoverLayout({
-        left: Math.max(margin, Math.min(anchor.left, window.innerWidth - anchor.width - margin)),
-        maxHeight: Math.min(listHeight, Math.max(120, placement === "above" ? above : below)),
-        offset: placement === "above" ? viewportHeight - anchor.top + gap : anchor.bottom + gap,
-        placement,
-        width: anchor.width
-      });
-    }
-
-    updatePopoverLayout();
-    window.addEventListener("resize", updatePopoverLayout);
-    window.addEventListener("scroll", updatePopoverLayout, true);
-    return () => {
-      window.removeEventListener("resize", updatePopoverLayout);
-      window.removeEventListener("scroll", updatePopoverLayout, true);
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!rootRef.current?.contains(target) && !panelRef.current?.contains(target)) {
-        setOpen(false);
-      }
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setOpen(false);
-      }
-    };
-
-    document.addEventListener("mousedown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [open]);
+  const listHeight = agentOptions.length * 36 + 8;
+  const popoverLayout = useAnchoredPopoverLayout(open, rootRef, { flipBelow: listHeight, maxHeight: listHeight, minHeight: 120 });
+  useDismiss(open, [rootRef, panelRef], () => setOpen(false));
 
   return (
     <div className="relative min-w-0" ref={rootRef}>
-      <button
+      <Button
         aria-controls="profile-agent-select-options"
         aria-expanded={open}
         aria-haspopup="listbox"
@@ -655,64 +588,40 @@ function AgentSelectControl({
           }
         }}
         type="button"
+        unstyled
       >
         <AgentLogo agent={value} className="h-5 w-5 rounded-[5px]" />
         <span className="min-w-0 flex-1 truncate">{t(profileAgentLabel(value))}</span>
         <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} />
-      </button>
+      </Button>
 
-      <PopoverPortal open={open && Boolean(popoverLayout)}>
-        <AnimatePresence initial={false}>
-          {open && popoverLayout ? (
-            <AnimatedPopover
-              className="fixed z-[140]"
-              placement={popoverLayout.placement}
-              style={{
-                left: `${popoverLayout.left}px`,
-                maxHeight: `${popoverLayout.maxHeight}px`,
-                width: `${popoverLayout.width}px`,
-                ...(popoverLayout.placement === "above"
-                  ? { bottom: `${popoverLayout.offset}px` }
-                  : { top: `${popoverLayout.offset}px` })
-              }}
-            >
-              <PopoverContent
-                className="overflow-auto p-1"
-                id="profile-agent-select-options"
-                ref={panelRef}
-                role="listbox"
-                style={{ maxHeight: `${popoverLayout.maxHeight}px` }}
+      <AnchoredPopover layout={popoverLayout} open={open && Boolean(popoverLayout)}>
+        <PopoverContent
+          className="overflow-auto p-1"
+          id="profile-agent-select-options"
+          ref={panelRef}
+          role="listbox"
+          style={{ maxHeight: `${popoverLayout?.maxHeight}px` }}
+        >
+          {agentOptions.map((option) => {
+            const agent = option.value;
+            return (
+              <ListboxOption
+                className="h-9 items-center gap-2 px-2 text-caption font-medium"
+                key={agent}
+                onClick={() => {
+                  onChange(agent);
+                  setOpen(false);
+                }}
+                selected={value === agent}
               >
-                {agentOptions.map((option) => {
-                  const agent = option.value;
-                  const selected = value === agent;
-
-                  return (
-                    <button
-                      aria-selected={selected}
-                      className={cn(
-                        "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
-                        selected ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted"
-                      )}
-                      key={agent}
-                      onClick={() => {
-                        onChange(agent);
-                        setOpen(false);
-                      }}
-                      role="option"
-                      type="button"
-                    >
-                      <AgentLogo agent={agent} className="h-6 w-6 rounded-[5px]" />
-                      <span className="min-w-0 flex-1 truncate">{t(profileAgentLabel(agent))}</span>
-                      {selected ? <Check className="h-3.5 w-3.5 shrink-0" /> : null}
-                    </button>
-                  );
-                })}
-              </PopoverContent>
-            </AnimatedPopover>
-          ) : null}
-        </AnimatePresence>
-      </PopoverPortal>
+                <AgentLogo agent={agent} className="h-6 w-6 rounded-[5px]" />
+                <span className="min-w-0 flex-1 truncate">{t(profileAgentLabel(agent))}</span>
+              </ListboxOption>
+            );
+          })}
+        </PopoverContent>
+      </AnchoredPopover>
     </div>
   );
 }

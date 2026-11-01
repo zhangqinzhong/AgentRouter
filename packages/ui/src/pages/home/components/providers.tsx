@@ -2,7 +2,7 @@ import { breakdownBrandIconUrl } from "./overview-breakdown";
 import { documentPageClassName, PageHeader, SectionHeading } from "./page-primitives";
 import { useDraftClose } from "./unsaved-changes";
 import {
-  AddProviderDraft, AnimatedDisclosure, AnimatedIconSwap, AnimatedListItem, AnimatedPopover, AnimatePresence, AppConfig, Badge,
+  AddProviderDraft, AnimatedDisclosure, AnimatedIconSwap, AnimatedListItem, AnimatePresence, AppConfig, Badge,
   Box, Braces, Button, Check, Checkbox, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, cn,
   compareProviderAccountSnapshots, copyTextToClipboard, createDefaultProviderAccountDraft, createModelCatalogItems, createProviderAccountDraftFromConfig, createProviderCredentialDraft,
   customProviderPresetId, defaultProviderAccountConfigForPreset, Dialog, DialogBody, DialogContent, DialogFooter,
@@ -17,17 +17,16 @@ import {
   ProviderConnectivityCheckReport, providerCapabilityBaseUrlForProtocol, providerConnectivityApiKeyFromDraft, providerDeepLinkDisplayIcon, providerDraftHasReadyCredentialPool, providerListItemKey, providerMatchesQuery, ProviderPreset, providerPresetIconUrls, providerProbeHasSupportedProtocol,
   providerDisplayIcon, providerGlobalBaseUrlForProbe, providerModelDisplayName, providerModelDisplayTitle, providerProbeModelsForProtocol, providerProtocolOptions, providerSelectableProtocolsFromProbe, providerUsageFieldPatch, ProviderUsageFieldTarget, providerUsageMethodOptions, Search, SelectControl,
   RefreshCw, resolveProviderDeepLinkPreset, ShieldCheck, splitLines, Switch, Tabs, TabsList, TabsTrigger, Textarea, Toggle, translatedProviderProtocolLabel, translateOptions,
-  translateProbeProtocolMessage, Trash2, uniqueProviderName, uniqueProviderProtocols, useAppErrorText, useAppText, useEffect, useLayoutEffect, useMemo,
+  translateProbeProtocolMessage, Trash2, uniqueProviderName, uniqueProviderProtocols, useAppErrorText, useAppText, useEffect, useMemo,
   useRef, useState, X, isGatewayProviderEnabled, isPlainRecord
 } from "../shared/index";
-import { PopoverPortal } from "@/components/ui/popover";
+import { AnchoredPopover, ListboxOption, ListboxSearch, useAnchoredPopoverLayout, useDismiss } from "@/components/ui/listbox";
 import { Tooltip, TooltipPortal } from "@/components/ui/tooltip";
 import { providerUrlWithDefaultScheme } from "@agentrouter/core/providers/url";
 import type { ChromeLoginImportJob, LocalAgentProviderCandidate, OpenRouterProviderCatalogItem, OpenRouterProviderCatalogRequest, ProviderAccountHttpJsonConnectorConfig, ProviderAccountWebContentJsonConnectorConfig } from "@agentrouter/core/contracts/app";
 import type { ReactNode } from "react";
 import { Spinner } from "@/components/ui/spinner";
 
-const useClientLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 const emptyProviderPlugins: unknown[] = [];
 
 export type ProviderEditorProps = {
@@ -962,14 +961,6 @@ function ProviderPresetCombobox({
   const t = useAppText();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [popoverLayout, setPopoverLayout] = useState<{
-    left: number;
-    listHeight: number;
-    maxHeight: number;
-    offset: number;
-    placement: "above" | "below";
-    width: number;
-  }>();
   const panelRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -981,78 +972,15 @@ function ProviderPresetCombobox({
   const selectedExternalUrl = providerPresetOptionPlatformUrl(selected);
   const selectedEndpointUrl = selected?.preset ? primaryProviderPresetEndpoint(selected.preset)?.baseUrl : undefined;
 
-  useClientLayoutEffect(() => {
-    if (!open) {
-      setPopoverLayout(undefined);
-      return;
-    }
-
-    function updatePopoverLayout() {
-      const root = rootRef.current;
-      if (!root) {
-        return;
-      }
-      const anchor = root.getBoundingClientRect();
-      const margin = 12;
-      const gap = 6;
-      const viewportWidth = window.innerWidth;
-      const viewportHeight = window.innerHeight;
-      const availableWidth = Math.max(220, viewportWidth - margin * 2);
-      const width = Math.min(Math.max(260, anchor.width), availableWidth);
-      const left = Math.min(Math.max(margin, anchor.left), viewportWidth - margin - width);
-      const below = Math.max(0, viewportHeight - anchor.bottom - margin - gap);
-      const above = Math.max(0, anchor.top - margin - gap);
-      const placement = below < 260 && above > below ? "above" : "below";
-      const availableHeight = Math.max(140, placement === "above" ? above : below);
-      const maxHeight = Math.min(328, availableHeight);
-      const listHeight = Math.max(96, Math.min(248, maxHeight - 44));
-
-      setPopoverLayout({
-        left,
-        listHeight,
-        maxHeight,
-        offset: placement === "above" ? viewportHeight - anchor.top + gap : anchor.bottom + gap,
-        placement,
-        width
-      });
-    }
-
-    updatePopoverLayout();
-    window.addEventListener("resize", updatePopoverLayout);
-    window.addEventListener("scroll", updatePopoverLayout, true);
-    return () => {
-      window.removeEventListener("resize", updatePopoverLayout);
-      window.removeEventListener("scroll", updatePopoverLayout, true);
-    };
-  }, [open]);
-
+  const popoverLayout = useAnchoredPopoverLayout(open, rootRef, { flipBelow: 260, maxHeight: 328, minHeight: 140, minViewportWidth: 220, minWidth: 260 });
+  const listHeight = popoverLayout ? Math.max(96, Math.min(248, popoverLayout.maxHeight - 44)) : undefined;
+  useDismiss(open, [rootRef, panelRef], () => setOpen(false), { restoreFocus: true });
   useEffect(() => {
     if (!open) {
       return;
     }
-
     const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 0);
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!rootRef.current?.contains(target) && !panelRef.current?.contains(target)) {
-        setOpen(false);
-      }
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setOpen(false);
-        rootRef.current?.querySelector<HTMLElement>("[aria-haspopup]")?.focus({ preventScroll: true });
-      }
-    };
-
-    document.addEventListener("mousedown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.clearTimeout(focusTimer);
-      document.removeEventListener("mousedown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
+    return () => window.clearTimeout(focusTimer);
   }, [open]);
 
   function chooseOption(nextValue: string) {
@@ -1126,76 +1054,49 @@ function ProviderPresetCombobox({
         <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} />
       </div>
 
-      <PopoverPortal open={open}>
-        <AnimatedPopover
-          className="fixed z-[140]"
-          placement={popoverLayout?.placement ?? "below"}
-          style={popoverLayout
-            ? {
-              left: `${popoverLayout.left}px`,
-              maxHeight: `${popoverLayout.maxHeight}px`,
-              width: `${popoverLayout.width}px`,
-              ...(popoverLayout.placement === "above"
-                ? { bottom: `${popoverLayout.offset}px` }
-                : { top: `${popoverLayout.offset}px` })
-            }
-            : undefined}
-        >
-          <PopoverContent className="w-full overflow-hidden p-1" ref={panelRef}>
-            <div className="relative mb-1">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                aria-label={t("Filter")}
-                className="h-8 pl-8"
-                onChange={(event) => setQuery(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    const first = filteredOptions[0];
-                    if (first) {
-                      chooseOption(first.value);
-                    }
-                  }
-                }}
-                placeholder={t("Filter")}
-                ref={inputRef}
-                value={query}
-              />
-            </div>
-            <div
-              className="overflow-auto"
-              id="provider-preset-options"
-              role="listbox"
-              style={{ maxHeight: `${popoverLayout?.listHeight ?? 240}px` }}
-            >
-              {filteredOptions.length > 0 ? (
-                filteredOptions.map((option) => {
-                  const selectedOption = option.value === value;
-                  return (
-                    <button
-                      aria-selected={selectedOption}
-                      className={cn(
-                        "flex h-9 w-full min-w-0 items-center gap-2 rounded-[5px] px-2 text-left text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
-                        selectedOption ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted"
-                      )}
-                      key={option.value}
-                      onClick={() => chooseOption(option.value)}
-                      role="option"
-                      type="button"
-                    >
-                      <ProviderPresetIcon className="h-5 w-5 rounded-[5px]" iconUrl={option.iconUrl} preset={option.preset} />
-                      <span className="min-w-0 flex-1 truncate">{option.label}</span>
-                      {selectedOption ? <Check className="h-3.5 w-3.5 shrink-0" /> : null}
-                    </button>
-                  );
-                })
-              ) : (
-                <div className="px-2 py-5 text-center text-caption text-muted-foreground">{t("No provider presets found")}</div>
-              )}
-            </div>
-          </PopoverContent>
-        </AnimatedPopover>
-      </PopoverPortal>
+      <AnchoredPopover layout={popoverLayout} open={open}>
+        <PopoverContent className="w-full overflow-hidden p-1" ref={panelRef}>
+          <ListboxSearch
+            aria-label={t("Filter")}
+            containerClassName="mb-1"
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                const first = filteredOptions[0];
+                if (first) {
+                  chooseOption(first.value);
+                }
+              }
+            }}
+            placeholder={t("Filter")}
+            ref={inputRef}
+            value={query}
+          />
+          <div
+            className="overflow-auto"
+            id="provider-preset-options"
+            role="listbox"
+            style={{ maxHeight: `${listHeight ?? 240}px` }}
+          >
+            {filteredOptions.length > 0 ? (
+              filteredOptions.map((option) => (
+                <ListboxOption
+                  className="h-9 items-center gap-2 px-2 text-caption font-medium"
+                  key={option.value}
+                  onClick={() => chooseOption(option.value)}
+                  selected={option.value === value}
+                >
+                  <ProviderPresetIcon className="h-5 w-5 rounded-[5px]" iconUrl={option.iconUrl} preset={option.preset} />
+                  <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                </ListboxOption>
+              ))
+            ) : (
+              <div className="px-2 py-5 text-center text-caption text-muted-foreground">{t("No provider presets found")}</div>
+            )}
+          </div>
+        </PopoverContent>
+      </AnchoredPopover>
     </div>
   );
 }
@@ -4157,14 +4058,6 @@ function OpenRouterProviderBlacklistSelect({
   const [providers, setProviders] = useState<OpenRouterProviderCatalogItem[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [popoverLayout, setPopoverLayout] = useState<{
-    left: number;
-    listHeight: number;
-    maxHeight: number;
-    offset: number;
-    placement: "above" | "below";
-    width: number;
-  }>();
   const panelRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -4186,49 +4079,15 @@ function OpenRouterProviderBlacklistSelect({
     setLoading(false);
   }, [requestKey]);
 
-  useClientLayoutEffect(() => {
+  const popoverLayout = useAnchoredPopoverLayout(open, rootRef, { flipBelow: 280, maxHeight: 360, minHeight: 144, minViewportWidth: 240, minWidth: 280 });
+  const listHeight = popoverLayout ? Math.max(120, Math.min(260, popoverLayout.maxHeight - 82)) : undefined;
+  useDismiss(open, [rootRef, panelRef], () => setOpen(false), { restoreFocus: true });
+  useEffect(() => {
     if (!open) {
-      setPopoverLayout(undefined);
       return;
     }
-
-    function updatePopoverLayout() {
-      const root = rootRef.current;
-      if (!root) {
-        return;
-      }
-      const anchor = root.getBoundingClientRect();
-      const margin = 12;
-      const gap = 6;
-      const viewportWidth = window.innerWidth;
-      const viewportHeight = window.innerHeight;
-      const availableWidth = Math.max(240, viewportWidth - margin * 2);
-      const width = Math.min(Math.max(anchor.width, 280), availableWidth);
-      const left = Math.min(Math.max(margin, anchor.left), viewportWidth - margin - width);
-      const below = Math.max(0, viewportHeight - anchor.bottom - margin - gap);
-      const above = Math.max(0, anchor.top - margin - gap);
-      const placement = below < 280 && above > below ? "above" : "below";
-      const availableHeight = Math.max(144, placement === "above" ? above : below);
-      const maxHeight = Math.min(360, availableHeight);
-      const listHeight = Math.max(120, Math.min(260, maxHeight - 82));
-
-      setPopoverLayout({
-        left,
-        listHeight,
-        maxHeight,
-        offset: placement === "above" ? viewportHeight - anchor.top + gap : anchor.bottom + gap,
-        placement,
-        width
-      });
-    }
-
-    updatePopoverLayout();
-    window.addEventListener("resize", updatePopoverLayout);
-    window.addEventListener("scroll", updatePopoverLayout, true);
-    return () => {
-      window.removeEventListener("resize", updatePopoverLayout);
-      window.removeEventListener("scroll", updatePopoverLayout, true);
-    };
+    const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 0);
+    return () => window.clearTimeout(focusTimer);
   }, [open]);
 
   useEffect(() => {
@@ -4237,35 +4096,6 @@ function OpenRouterProviderBlacklistSelect({
     }
     void loadProviders(false);
   }, [open, requestKey]);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-
-    const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 0);
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!rootRef.current?.contains(target) && !panelRef.current?.contains(target)) {
-        setOpen(false);
-      }
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setOpen(false);
-        rootRef.current?.querySelector<HTMLElement>("[aria-haspopup]")?.focus({ preventScroll: true });
-      }
-    };
-
-    document.addEventListener("mousedown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.clearTimeout(focusTimer);
-      document.removeEventListener("mousedown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [open]);
 
   function toggleProvider(slug: string) {
     const normalized = normalizeOpenRouterProviderValue(slug);
@@ -4313,7 +4143,7 @@ function OpenRouterProviderBlacklistSelect({
         ) : null}
       </div>
       <div className="relative min-w-0" ref={rootRef}>
-        <button
+        <Button
           aria-expanded={open}
           aria-haspopup="listbox"
           className={cn(
@@ -4325,94 +4155,72 @@ function OpenRouterProviderBlacklistSelect({
             setOpen((current) => !current);
           }}
           type="button"
+          unstyled
         >
           <span className="min-w-0 flex-1 truncate">{label}</span>
           {loading ? <Spinner className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
           <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} />
-        </button>
-        <PopoverPortal open={open}>
-          <AnimatedPopover
-            className="fixed z-[150]"
-            placement={popoverLayout?.placement ?? "below"}
-            style={popoverLayout
-              ? {
-                left: `${popoverLayout.left}px`,
-                maxHeight: `${popoverLayout.maxHeight}px`,
-                width: `${popoverLayout.width}px`,
-                ...(popoverLayout.placement === "above"
-                  ? { bottom: `${popoverLayout.offset}px` }
-                  : { top: `${popoverLayout.offset}px` })
-              }
-              : undefined}
-          >
-            <PopoverContent className="w-full overflow-hidden p-1" ref={panelRef}>
-              <div className="mb-1 flex items-center gap-1">
-                <div className="relative min-w-0 flex-1">
-                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    aria-label={t("Search providers")}
-                    className="h-8 pl-8"
-                    onChange={(event) => setQuery(event.target.value)}
-                    placeholder={t("Search providers")}
-                    ref={inputRef}
-                    value={query}
-                  />
-                </div>
-                <Button
-                  aria-label={t("Refresh providers")}
-                  className="h-8 w-8 shrink-0"
-                  disabled={loading}
-                  onClick={() => void loadProviders(true)}
-                  size="iconSm"
-                  title={t("Refresh providers")}
-                  type="button"
-                  variant="ghost"
-                >
-                  <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
-                </Button>
+        </Button>
+        <AnchoredPopover className="z-[150]" layout={popoverLayout} open={open}>
+          <PopoverContent className="w-full overflow-hidden p-1" ref={panelRef}>
+            <div className="mb-1 flex items-center gap-1">
+              <ListboxSearch
+                aria-label={t("Search providers")}
+                containerClassName="min-w-0 flex-1"
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder={t("Search providers")}
+                ref={inputRef}
+                value={query}
+              />
+              <Button
+                aria-label={t("Refresh providers")}
+                className="h-8 w-8 shrink-0"
+                disabled={loading}
+                onClick={() => void loadProviders(true)}
+                size="iconSm"
+                title={t("Refresh providers")}
+                type="button"
+                variant="ghost"
+              >
+                <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
+              </Button>
+            </div>
+            {error ? (
+              <div className="mb-1 rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-label leading-4 text-amber-700 dark:text-amber-300">
+                {error}
               </div>
-              {error ? (
-                <div className="mb-1 rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-label leading-4 text-amber-700 dark:text-amber-300">
-                  {error}
+            ) : null}
+            <div className="overflow-auto" role="listbox" style={{ maxHeight: `${listHeight ?? 240}px` }}>
+              {loading && options.length === 0 ? (
+                <div className="flex items-center justify-center gap-2 px-2 py-6 text-caption text-muted-foreground">
+                  <Spinner className="h-3.5 w-3.5" />
+                  <span>{t("Loading providers")}</span>
                 </div>
-              ) : null}
-              <div className="overflow-auto" role="listbox" style={{ maxHeight: `${popoverLayout?.listHeight ?? 240}px` }}>
-                {loading && options.length === 0 ? (
-                  <div className="flex items-center justify-center gap-2 px-2 py-6 text-caption text-muted-foreground">
-                    <Spinner className="h-3.5 w-3.5" />
-                    <span>{t("Loading providers")}</span>
-                  </div>
-                ) : filteredOptions.length > 0 ? (
-                  filteredOptions.map((option) => {
-                    const checked = selectedSet.has(option.slug);
-                    const metricText = openRouterProviderMetricText(option, t);
-                    return (
-                      <button
-                        aria-selected={checked}
-                        className={cn(
-                          "flex min-h-9 w-full min-w-0 items-center gap-2.5 rounded-[5px] px-2.5 py-1.5 text-left text-caption outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/25",
-                          checked ? "bg-emerald-500/[0.045] text-foreground" : "text-foreground hover:bg-muted/40"
-                        )}
-                        key={option.slug}
-                        onClick={() => toggleProvider(option.slug)}
-                        role="option"
-                        type="button"
-                      >
-                        <Checkbox checked={checked} readOnly tabIndex={-1} />
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate font-medium">{option.name}</span>
-                          {metricText ? <span className="block truncate text-2xs text-muted-foreground">{metricText}</span> : null}
-                        </span>
-                      </button>
-                    );
-                  })
-                ) : (
-                  <div className="px-2 py-6 text-center text-caption text-muted-foreground">{t("No providers found")}</div>
-                )}
-              </div>
-            </PopoverContent>
-          </AnimatedPopover>
-        </PopoverPortal>
+              ) : filteredOptions.length > 0 ? (
+                filteredOptions.map((option) => {
+                  const checked = selectedSet.has(option.slug);
+                  const metricText = openRouterProviderMetricText(option, t);
+                  return (
+                    <ListboxOption
+                      className="min-h-9 items-center gap-2.5 px-2.5 py-1.5 text-caption"
+                      indicator="checkbox"
+                      key={option.slug}
+                      onClick={() => toggleProvider(option.slug)}
+                      selected={checked}
+                    >
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-medium">{option.name}</span>
+                        {metricText ? <span className="block truncate text-2xs text-muted-foreground">{metricText}</span> : null}
+                      </span>
+                    </ListboxOption>
+                  );
+                })
+              ) : (
+                <div className="px-2 py-6 text-center text-caption text-muted-foreground">{t("No providers found")}</div>
+              )}
+            </div>
+          </PopoverContent>
+        </AnchoredPopover>
       </div>
       <div className="text-2xs leading-4 text-muted-foreground/75">{t("Excluded OpenRouter providers will be skipped by discount routing and OpenRouter fallbacks.")}</div>
     </div>
