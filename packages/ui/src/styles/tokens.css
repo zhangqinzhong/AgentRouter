@@ -1,0 +1,514 @@
+/*
+ * AgentRouter design tokens — the only source of Tailwind theme values.
+ *
+ * `--*: initial` drops Tailwind's default theme, so a utility exists only if
+ * its value is declared here. Page code should prefer the semantic names
+ * (background, foreground, muted, border, brand, status-*, data-*, text-body,
+ * max-w-page, duration-fast, …). The "Legacy palette" section keeps the raw
+ * Tailwind colours that existing screens still use; `npm run check:ui` keeps
+ * their use in page code from growing. See UI-STYLE-GUIDE.md §0.
+ */
+
+@theme {
+  --*: initial;
+
+  /* Breakpoints */
+  --breakpoint-sm: 40rem;
+  --breakpoint-md: 48rem;
+  --breakpoint-lg: 64rem;
+  --breakpoint-xl: 80rem;
+  --breakpoint-2xl: 96rem;
+
+  /* Spacing: numeric scale (p-4 = 1rem) */
+  --spacing: 0.25rem;
+
+  /* Content widths */
+  --container-xs: 20rem;
+  --container-sm: 24rem;
+  --container-md: 28rem;
+  --container-lg: 32rem;
+  --container-xl: 36rem;
+  --container-2xl: 42rem;
+  --container-3xl: 48rem;
+  --container-6xl: 72rem;
+  --container-7xl: 80rem;
+  --container-page: 1120px;
+  --container-wide: 1600px;
+
+  /* Type scale. The px sizes below set font-size only (line-height inherits). */
+  --text-micro: 9px;
+  --text-2xs: 10px;
+  --text-label: 11px;
+  --text-caption: 12px;
+  --text-body: 13px;
+  --text-body-sm: 14px;
+  --text-title: 24px;
+  --text-display: 28px;
+  --text-xs: 0.75rem;
+  --text-xs--line-height: calc(1 / 0.75);
+  --text-sm: 0.875rem;
+  --text-sm--line-height: calc(1.25 / 0.875);
+  --text-base: 1rem;
+  --text-base--line-height: calc(1.5 / 1);
+  --text-lg: 1.125rem;
+  --text-lg--line-height: calc(1.75 / 1.125);
+  --text-xl: 1.25rem;
+  --text-xl--line-height: calc(1.75 / 1.25);
+  --text-2xl: 1.5rem;
+  --text-2xl--line-height: calc(2 / 1.5);
+  --text-3xl: 1.875rem;
+  --text-3xl--line-height: calc(2.25 / 1.875);
+  --text-4xl: 2.25rem;
+  --text-4xl--line-height: calc(2.5 / 2.25);
+  --text-5xl: 3rem;
+  --text-5xl--line-height: 1;
+  --text-6xl: 3.75rem;
+  --text-6xl--line-height: 1;
+  --text-7xl: 4.5rem;
+  --text-7xl--line-height: 1;
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --font-weight-extrabold: 800;
+  --font-weight-black: 900;
+
+  --tracking-tight: -0.025em;
+  --tracking-normal: 0em;
+  --tracking-wide: 0.025em;
+  --tracking-wider: 0.05em;
+  --tracking-widest: 0.1em;
+
+  --leading-tight: 1.25;
+  --leading-snug: 1.375;
+  --leading-relaxed: 1.625;
+
+  /* Radii: sm/md/lg follow --radius (see @theme inline) */
+  --radius-xs: 0.125rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+  --radius-3xl: 1.5rem;
+
+  /* Elevation */
+  --shadow-sm: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  --shadow-xl: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+  --shadow-2xl: 0 25px 50px -12px rgb(0 0 0 / 0.25);
+  --inset-shadow-sm: inset 0 2px 4px rgb(0 0 0 / 0.05);
+  --drop-shadow-sm: 0 1px 2px rgb(0 0 0 / 0.15);
+  --drop-shadow-md: 0 3px 3px rgb(0 0 0 / 0.12);
+
+  --blur-sm: 8px;
+  --blur-md: 12px;
+  --blur-lg: 16px;
+  --blur-xl: 24px;
+  --blur-2xl: 40px;
+
+  /* Motion */
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-emphasized: cubic-bezier(0.22, 1, 0.36, 1);
+  --default-transition-duration: 150ms;
+  --default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  --animate-spin: spin 1s linear infinite;
+  --animate-ping: ping 1s cubic-bezier(0, 0, 0.2, 1) infinite;
+  --animate-pulse: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+
+  --default-font-family: var(--app-font-sans);
+  --default-mono-font-family: var(--app-font-mono);
+
+  --color-black: #000;
+  --color-white: #fff;
+}
+
+/*
+ * Bare `rounded`, `shadow`, `blur` and `backdrop-blur` keep Tailwind's defaults.
+ * `reference` keeps --radius here from clobbering the runtime --radius below.
+ */
+@theme inline reference {
+  --radius: 0.25rem;
+  --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  --shadow-inner: inset 0 2px 4px 0 rgb(0 0 0 / 0.05);
+  --blur: 8px;
+}
+
+/* Legacy palette: only the Tailwind colours existing screens use. Prefer semantic colours. */
+@theme static {
+  --color-slate-50: oklch(98.4% 0.003 247.858);
+  --color-slate-100: oklch(96.8% 0.007 247.896);
+  --color-slate-200: oklch(92.9% 0.013 255.508);
+  --color-slate-300: oklch(86.9% 0.022 252.894);
+  --color-slate-400: oklch(70.4% 0.04 256.788);
+  --color-slate-500: oklch(55.4% 0.046 257.417);
+  --color-slate-600: oklch(44.6% 0.043 257.281);
+  --color-slate-700: oklch(37.2% 0.044 257.287);
+  --color-slate-800: oklch(27.9% 0.041 260.031);
+  --color-slate-900: oklch(20.8% 0.042 265.755);
+  --color-slate-950: oklch(12.9% 0.042 264.695);
+  --color-gray-200: oklch(92.8% 0.006 264.531);
+  --color-gray-400: oklch(70.7% 0.022 261.325);
+  --color-gray-900: oklch(21% 0.034 264.665);
+  --color-zinc-50: oklch(98.5% 0 0);
+  --color-zinc-200: oklch(92% 0.004 286.32);
+  --color-zinc-400: oklch(70.5% 0.015 286.067);
+  --color-zinc-500: oklch(55.2% 0.016 285.938);
+  --color-zinc-600: oklch(44.2% 0.017 285.786);
+  --color-zinc-800: oklch(27.4% 0.006 286.033);
+  --color-zinc-900: oklch(21% 0.006 285.885);
+  --color-zinc-950: oklch(14.1% 0.005 285.823);
+  --color-neutral-900: oklch(20.5% 0 0);
+  --color-red-50: oklch(97.1% 0.013 17.38);
+  --color-red-200: oklch(88.5% 0.062 18.334);
+  --color-red-300: oklch(80.8% 0.114 19.571);
+  --color-red-400: oklch(70.4% 0.191 22.216);
+  --color-red-500: oklch(63.7% 0.237 25.331);
+  --color-red-600: oklch(57.7% 0.245 27.325);
+  --color-red-700: oklch(50.5% 0.213 27.518);
+  --color-red-800: oklch(44.4% 0.177 26.899);
+  --color-orange-300: oklch(83.7% 0.128 66.29);
+  --color-orange-400: oklch(75% 0.183 55.934);
+  --color-orange-500: oklch(70.5% 0.213 47.604);
+  --color-amber-50: oklch(98.7% 0.022 95.277);
+  --color-amber-100: oklch(96.2% 0.059 95.617);
+  --color-amber-200: oklch(92.4% 0.12 95.746);
+  --color-amber-300: oklch(87.9% 0.169 91.605);
+  --color-amber-400: oklch(82.8% 0.189 84.429);
+  --color-amber-500: oklch(76.9% 0.188 70.08);
+  --color-amber-600: oklch(66.6% 0.179 58.318);
+  --color-amber-700: oklch(55.5% 0.163 48.998);
+  --color-amber-800: oklch(47.3% 0.137 46.201);
+  --color-amber-900: oklch(41.4% 0.112 45.904);
+  --color-amber-950: oklch(27.9% 0.077 45.635);
+  --color-yellow-200: oklch(94.5% 0.129 101.54);
+  --color-yellow-400: oklch(85.2% 0.199 91.936);
+  --color-yellow-800: oklch(47.6% 0.114 61.907);
+  --color-green-50: oklch(98.2% 0.018 155.826);
+  --color-green-400: oklch(79.2% 0.209 151.711);
+  --color-green-700: oklch(52.7% 0.154 150.069);
+  --color-green-800: oklch(44.8% 0.119 151.328);
+  --color-emerald-50: oklch(97.9% 0.021 166.113);
+  --color-emerald-100: oklch(95% 0.052 163.051);
+  --color-emerald-200: oklch(90.5% 0.093 164.15);
+  --color-emerald-300: oklch(84.5% 0.143 164.978);
+  --color-emerald-400: oklch(76.5% 0.177 163.223);
+  --color-emerald-500: oklch(69.6% 0.17 162.48);
+  --color-emerald-600: oklch(59.6% 0.145 163.225);
+  --color-emerald-700: oklch(50.8% 0.118 165.612);
+  --color-emerald-800: oklch(43.2% 0.095 166.913);
+  --color-emerald-900: oklch(37.8% 0.077 168.94);
+  --color-emerald-950: oklch(26.2% 0.051 172.552);
+  --color-teal-50: oklch(98.4% 0.014 180.72);
+  --color-teal-100: oklch(95.3% 0.051 180.801);
+  --color-teal-300: oklch(85.5% 0.138 181.071);
+  --color-teal-500: oklch(70.4% 0.14 182.503);
+  --color-teal-700: oklch(51.1% 0.096 186.391);
+  --color-cyan-100: oklch(95.6% 0.045 203.388);
+  --color-cyan-500: oklch(71.5% 0.143 215.221);
+  --color-cyan-700: oklch(52% 0.105 223.128);
+  --color-sky-50: oklch(97.7% 0.013 236.62);
+  --color-sky-300: oklch(82.8% 0.111 230.318);
+  --color-sky-500: oklch(68.5% 0.169 237.323);
+  --color-sky-700: oklch(50% 0.134 242.749);
+  --color-blue-50: oklch(97% 0.014 254.604);
+  --color-blue-100: oklch(93.2% 0.032 255.585);
+  --color-blue-200: oklch(88.2% 0.059 254.128);
+  --color-blue-300: oklch(80.9% 0.105 251.813);
+  --color-blue-400: oklch(70.7% 0.165 254.624);
+  --color-blue-500: oklch(62.3% 0.214 259.815);
+  --color-blue-600: oklch(54.6% 0.245 262.881);
+  --color-blue-700: oklch(48.8% 0.243 264.376);
+  --color-blue-800: oklch(42.4% 0.199 265.638);
+  --color-blue-950: oklch(28.2% 0.091 267.935);
+  --color-indigo-100: oklch(93% 0.034 272.788);
+  --color-indigo-400: oklch(67.3% 0.182 276.935);
+  --color-indigo-500: oklch(58.5% 0.233 277.117);
+  --color-indigo-700: oklch(45.7% 0.24 277.023);
+  --color-violet-100: oklch(94.3% 0.029 294.588);
+  --color-violet-700: oklch(49.1% 0.27 292.581);
+  --color-purple-300: oklch(82.7% 0.119 306.383);
+  --color-purple-400: oklch(71.4% 0.203 305.504);
+  --color-purple-500: oklch(62.7% 0.265 303.9);
+  --color-purple-600: oklch(55.8% 0.288 302.321);
+  --color-rose-50: oklch(96.9% 0.015 12.422);
+  --color-rose-100: oklch(94.1% 0.03 12.58);
+  --color-rose-200: oklch(89.2% 0.058 10.001);
+  --color-rose-300: oklch(81% 0.117 11.638);
+  --color-rose-400: oklch(71.2% 0.194 13.428);
+  --color-rose-500: oklch(64.5% 0.246 16.439);
+  --color-rose-600: oklch(58.6% 0.253 17.585);
+  --color-rose-700: oklch(51.4% 0.222 16.935);
+  --color-rose-900: oklch(41% 0.159 10.272);
+  --color-rose-950: oklch(27.1% 0.105 12.094);
+}
+
+/* Semantic colours, radii and fonts resolve to the per-theme variables below. */
+@theme inline {
+  --color-oai-black: #0a0a0a;
+  --color-oai-white: #fafafa;
+  --color-oai-gray-50: #fafafa;
+  --color-oai-gray-100: #f5f5f5;
+  --color-oai-gray-200: #e5e5e5;
+  --color-oai-gray-300: #d4d4d4;
+  --color-oai-gray-400: #a3a3a3;
+  --color-oai-gray-500: #737373;
+  --color-oai-gray-600: #525252;
+  --color-oai-gray-700: #404040;
+  --color-oai-gray-800: #262626;
+  --color-oai-gray-900: #171717;
+  --color-oai-gray-950: #0a0a0a;
+  --color-oai-brand: #059669;
+  --color-oai-brand-dark: #047857;
+  --color-oai-brand-light: #10b981;
+  --color-oai-brand-500: #10b981;
+  --color-oai-blue: #059669;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --font-sans: var(--app-font-sans);
+  --font-mono: var(--app-font-mono);
+  --color-brand: var(--brand);
+  --color-brand-ink: var(--brand-ink);
+  --color-brand-soft: var(--brand-soft);
+  --color-status-ok: var(--status-ok);
+  --color-status-warn: var(--status-warn);
+  --color-status-error: var(--status-error);
+  --color-status-idle: var(--status-idle);
+  --color-data-input: var(--data-input);
+  --color-data-output: var(--data-output);
+  --color-data-cache: var(--data-cache);
+  --color-data-other: var(--data-other);
+}
+
+@utility duration-fast {
+  --tw-duration: var(--duration-fast);
+  transition-duration: var(--duration-fast);
+}
+
+@utility duration-base {
+  --tw-duration: var(--duration-base);
+  transition-duration: var(--duration-base);
+}
+
+@utility duration-slow {
+  --tw-duration: var(--duration-slow);
+  transition-duration: var(--duration-slow);
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --background: #f6f7f8;
+    --foreground: #23272f;
+    --card: #ffffff;
+    --card-foreground: #23272f;
+    --card-inset-highlight: rgba(255, 255, 255, .5);
+    --popover: #ffffff;
+    --popover-foreground: #23272f;
+    --primary: #0f766e;
+    --primary-foreground: #ffffff;
+    --secondary: #f0f2f4;
+    --secondary-foreground: #29313a;
+    --muted: #edf0f4;
+    --muted-foreground: #5f6b7a;
+    --accent: #e6f3f1;
+    --accent-foreground: #0f3533;
+    --destructive: #c3342d;
+    --destructive-foreground: #ffffff;
+    --border: #dfe3e8;
+    --input: #d4d9e0;
+    --ring: #0f766e;
+    --sidebar: #f2f4f6;
+    --sidebar-foreground: #29313a;
+    --network-bg: #f7f8fa;
+    --network-panel: #ffffff;
+    --network-panel-alt: #f0f2f5;
+    --network-panel-muted: #e9edf2;
+    --network-row: #ffffff;
+    --network-row-alt: #f3f5f8;
+    --network-row-hover: #e9f0f7;
+    --network-row-selected: #dceaf7;
+    --network-border: #cfd6df;
+    --network-border-strong: #b8c2ce;
+    --network-text: #22272f;
+    --network-text-muted: #66707e;
+    --network-text-subtle: #8c96a3;
+    --network-code: #1f2937;
+    --network-accent: #0077c8;
+    --network-accent-contrast: #ffffff;
+    --network-control: #ffffff;
+    --network-control-hover: #eef2f6;
+    --network-control-border: #c8d0db;
+    --network-client-icon-bg: #f5f7fa;
+    --network-client-icon-text: #0f766e;
+    --network-active-bg: #ffd23c;
+    --network-active-text: #3a2f00;
+    --network-complete-bg: #22a852;
+    --network-complete-text: #ffffff;
+    --network-error-bg: #d14343;
+    --network-error-text: #ffffff;
+    --network-shadow: 0 16px 42px rgba(31, 41, 55, .12);
+    --brand: var(--color-emerald-600);
+    --brand-ink: var(--color-emerald-600);
+    --brand-soft: color-mix(in oklab, var(--color-emerald-500) 10%, transparent);
+    --status-ok: #22c55e;
+    --status-warn: #f59e0b;
+    --status-error: #ef4444;
+    --status-idle: #e7e7e7;
+    --data-input: #007aff;
+    --data-output: #34c759;
+    --data-cache: #af52de;
+    --data-other: #8e8e93;
+    --duration-fast: 150ms;
+    --duration-base: 300ms;
+    --duration-slow: 500ms;
+    --radius: 0.5rem;
+    --scrollbar-size: 12px;
+    --scrollbar-border: 3px;
+    --scrollbar-thumb: color-mix(in oklab, var(--foreground) 26%, transparent);
+    --scrollbar-thumb-hover: color-mix(in oklab, var(--foreground) 40%, transparent);
+    --scrollbar-thumb-active: color-mix(in oklab, var(--foreground) 50%, transparent);
+    --app-font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --app-font-mono: "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --brand: var(--color-emerald-500);
+    --brand-ink: var(--color-emerald-400);
+    --status-idle: #3f3f46;
+    --background: #111315;
+    --foreground: #e8ecef;
+    --card: #181b1f;
+    --card-foreground: #e8ecef;
+    --card-inset-highlight: transparent;
+    --popover: #181b1f;
+    --popover-foreground: #e8ecef;
+    --primary: #2dd4bf;
+    --primary-foreground: #042f2e;
+    --secondary: #242932;
+    --secondary-foreground: #dce3ea;
+    --muted: #20242b;
+    --muted-foreground: #9aa5b1;
+    --accent: #173b38;
+    --accent-foreground: #c9fbf2;
+    --destructive: #ef625c;
+    --destructive-foreground: #ffffff;
+    --border: #303741;
+    --input: #3a424e;
+    --ring: #2dd4bf;
+    --sidebar: #15181d;
+    --sidebar-foreground: #dce3ea;
+    --network-bg: #15171a;
+    --network-panel: #1b1d21;
+    --network-panel-alt: #202226;
+    --network-panel-muted: #24272c;
+    --network-row: #1d1f22;
+    --network-row-alt: #23262a;
+    --network-row-hover: #2a2d32;
+    --network-row-selected: #27323b;
+    --network-border: #32363b;
+    --network-border-strong: #3c4046;
+    --network-text: #d7d8db;
+    --network-text-muted: #aeb2b9;
+    --network-text-subtle: #8b8f96;
+    --network-code: #d4d6da;
+    --network-accent: #00a6ff;
+    --network-accent-contrast: #ffffff;
+    --network-control: #24272b;
+    --network-control-hover: #2d3035;
+    --network-control-border: #41454b;
+    --network-client-icon-bg: #111316;
+    --network-client-icon-text: #29d957;
+    --network-active-bg: #ffc928;
+    --network-active-text: #ffffff;
+    --network-complete-bg: #1f8f41;
+    --network-complete-text: #ffffff;
+    --network-error-bg: #9b2d31;
+    --network-error-text: #ffffff;
+    --network-shadow: 0 16px 42px rgba(0, 0, 0, .28);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --brand: var(--color-emerald-500);
+      --brand-ink: var(--color-emerald-400);
+      --status-idle: #3f3f46;
+      --background: #111315;
+      --foreground: #e8ecef;
+      --card: #181b1f;
+      --card-foreground: #e8ecef;
+      --card-inset-highlight: transparent;
+      --popover: #181b1f;
+      --popover-foreground: #e8ecef;
+      --primary: #2dd4bf;
+      --primary-foreground: #042f2e;
+      --secondary: #242932;
+      --secondary-foreground: #dce3ea;
+      --muted: #20242b;
+      --muted-foreground: #9aa5b1;
+      --accent: #173b38;
+      --accent-foreground: #c9fbf2;
+      --destructive: #ef625c;
+      --destructive-foreground: #ffffff;
+      --border: #303741;
+      --input: #3a424e;
+      --ring: #2dd4bf;
+      --sidebar: #15181d;
+      --sidebar-foreground: #dce3ea;
+      --network-bg: #15171a;
+      --network-panel: #1b1d21;
+      --network-panel-alt: #202226;
+      --network-panel-muted: #24272c;
+      --network-row: #1d1f22;
+      --network-row-alt: #23262a;
+      --network-row-hover: #2a2d32;
+      --network-row-selected: #27323b;
+      --network-border: #32363b;
+      --network-border-strong: #3c4046;
+      --network-text: #d7d8db;
+      --network-text-muted: #aeb2b9;
+      --network-text-subtle: #8b8f96;
+      --network-code: #d4d6da;
+      --network-accent: #00a6ff;
+      --network-accent-contrast: #ffffff;
+      --network-control: #24272b;
+      --network-control-hover: #2d3035;
+      --network-control-border: #41454b;
+      --network-client-icon-bg: #111316;
+      --network-client-icon-text: #29d957;
+      --network-active-bg: #ffc928;
+      --network-active-text: #ffffff;
+      --network-complete-bg: #1f8f41;
+      --network-complete-text: #ffffff;
+      --network-error-bg: #9b2d31;
+      --network-error-text: #ffffff;
+      --network-shadow: 0 16px 42px rgba(0, 0, 0, .28);
+    }
+  }
+}
