@@ -12,6 +12,7 @@ import {
 } from "../shared/index";
 import { CreditCard, Rocket, WalletCards, Wifi } from "@/components/ui/icons";
 import { Spinner } from "@/components/ui/spinner";
+import { PanelHeader } from "./page-primitives";
 
 const providerAccountMeterLineLimit = 3;
 
@@ -38,14 +39,14 @@ export function ProviderAccountsSection({
   if (visibleAccounts.length === 0) {
     return (
       <section>
-        <h2 className="mb-3 text-sm font-medium">{t("Account Balance")}</h2>
+        <PanelHeader title={t("Account Balance")} />
         {unconfigured ? (
-          <div className="flex flex-wrap items-center justify-between gap-3 border-y border-border/70 py-4 text-body">
+          <div className="flex flex-wrap items-center justify-between gap-3 text-body">
             <span className="text-muted-foreground">{t("No account balance connectors configured")}</span>
             {onConfigure ? <Button onClick={onConfigure} size="sm" type="button" variant="outline">{t("Configure account usage")}</Button> : null}
           </div>
         ) : (
-          <p className="border-y border-border/70 py-4 text-body text-muted-foreground">{t("No account balance connectors configured")}</p>
+          <p className="text-body text-muted-foreground">{t("No account balance connectors configured")}</p>
         )}
       </section>
     );
@@ -53,17 +54,16 @@ export function ProviderAccountsSection({
 
   return (
     <section>
-      <div className="mb-3 flex min-w-0 items-center justify-between gap-3">
-        <h2 className="text-sm font-medium">{t("Account Balance")}</h2>
+      <PanelHeader title={t("Account Balance")}>
         <div className="flex items-center gap-2">
           <Button aria-label={t("Refresh all accounts")} title={t("Refresh all accounts")} size="iconSm" variant="ghost"
             disabled={!onRefresh || refreshing || refreshingKeys.length > 0} onClick={() => void onRefresh?.()}>
             {refreshing ? <Spinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
           </Button>
-          <span className="shrink-0 text-label tabular-nums text-muted-foreground">{visibleAccounts.length}</span>
+          <span className="shrink-0 text-caption tabular-nums text-muted-foreground">{visibleAccounts.length}</span>
         </div>
-      </div>
-      <div className="divide-y divide-border/60 border-y border-border/70">
+      </PanelHeader>
+      <div className="-mb-2 divide-y divide-border/60">
         {visibleAccounts.map((account) => (
           <ProviderAccountRow account={account} key={providerAccountSnapshotKey(account)} onRefresh={onRefresh ? () => onRefresh(account) : undefined} providers={providers} refreshing={refreshing || refreshingKeys.includes(providerAccountSnapshotKey(account))} />
         ))}

@@ -1,5 +1,5 @@
 import {
-  Button, CircleAlert, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+  Button, CircleAlert, cn, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
   formatCompactNumber, formatPercent, formatUsdCost, LoaderCircle,
   GatewayProviderConfig, ProviderAccountSnapshot, Select, Trash2, UsageComparisonRow, usageRangeOptions,
   UsageDateRange, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useState, X
@@ -9,6 +9,7 @@ import { PeriodRangeTabs } from "@/vendor/tokentracker/ui/dashboard/components/P
 import { ProviderAccountsSection } from "./overview-accounts";
 import { OverviewBreakdowns } from "./overview-breakdown";
 import { UsageTrendSection } from "./overview-trend";
+import { panelClassName } from "./page-primitives";
 import { Spinner } from "@/components/ui/spinner";
 
 export type OverviewUsageFilters = {
@@ -28,7 +29,7 @@ function formatDialogError(error: unknown): string {
 function StatCell({ label, sub, title, value }: { label: string; sub?: string; title?: string; value: string }) {
   return (
     <div className="flex min-w-0 flex-col items-start gap-1.5 text-left">
-      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      <span className="text-caption font-medium text-muted-foreground">{label}</span>
       <span className="text-3xl font-semibold tabular-nums tracking-tight" title={title}>{value}</span>
       {sub ? <span className="text-2xs tabular-nums text-muted-foreground">{sub}</span> : null}
     </div>
@@ -218,37 +219,35 @@ export function OverviewView({
         {usageStats.localCollectionState === "error" && (
           <span role="status" className="text-xs text-muted-foreground">{t("Local usage update failed. Showing saved data.")}</span>
         )}
-        <div className="ml-auto min-w-0 max-w-full">
-          <OverviewRangeTabs
-            customRange={usageCustomRange ?? emptyOverviewCustomRange}
-            range={usageRange}
-            setCustomRange={setUsageCustomRange}
-            setRange={setUsageRange}
+        <div className="ml-auto flex w-full min-w-0 flex-wrap items-center justify-end gap-2 sm:w-auto sm:max-w-full">
+          <Select
+            aria-label={t("Model")}
+            className="order-2 h-8 w-full rounded-md bg-[length:14px] px-2.5 pr-7 text-caption shadow-none sm:order-1 sm:w-[180px]"
+            onValueChange={changeModelFilter}
+            options={modelOptions}
+            value={modelFilter}
           />
+          <div className="order-1 min-w-0 max-w-full sm:order-2">
+            <OverviewRangeTabs
+              customRange={usageCustomRange ?? emptyOverviewCustomRange}
+              range={usageRange}
+              setCustomRange={setUsageCustomRange}
+              setRange={setUsageRange}
+            />
+          </div>
         </div>
       </div>
-      <div className="mb-6 flex flex-wrap items-center gap-2">
-        <Select
-          aria-label={t("Model")}
-          className="h-8 w-[200px] rounded-md bg-[length:14px] px-2.5 pr-7 text-caption shadow-none"
-          onValueChange={changeModelFilter}
-          options={modelOptions}
-          value={modelFilter}
-        />
-
-      </div>
-
-      <div className="mb-6 grid w-full grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="mb-6 grid w-full grid-cols-2 gap-4 sm:grid-cols-4">
         {statCells.map((cell) => (
-          <div key={cell.label} className="min-w-0 rounded-2xl border border-border/70 bg-card p-5 shadow-sm">
+          <div key={cell.label} className={cn(panelClassName, "px-5 py-4")}>
             <StatCell label={cell.label} sub={cell.sub} title={cell.title} value={cell.value} />
           </div>
         ))}
       </div>
       <div className="space-y-6">
-        <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-sm"><UsageTrendSection usageRange={usageRange} usageStats={usageStats} /></div>
+        <div className={cn(panelClassName, "p-5")}><UsageTrendSection usageRange={usageRange} usageStats={usageStats} /></div>
         <OverviewBreakdowns providers={filterProviders} usageStats={displayUsageStats} />
-        <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-sm"><ProviderAccountsSection
+        <div className={cn(panelClassName, "p-5")}><ProviderAccountsSection
           accounts={providerAccounts}
           onConfigure={onConfigureProviderAccounts}
           onRefresh={refreshProviderAccounts}
@@ -258,7 +257,7 @@ export function OverviewView({
         /></div>
       </div>
 
-      <div className="mt-6 flex items-center justify-between rounded-xl border border-border/60 px-4 py-3 text-xs text-muted-foreground"><span>{t("Gateway requests")} · {t("Request success rate")} {usageStats.gatewayTotals?.requestCount ? formatPercent(usageStats.gatewayTotals.successRate) : "—"}</span><Button onClick={openResetDialog} variant="ghost" size="iconSm" title={t("Reset gateway statistics")} aria-label={t("Reset gateway statistics")}><Trash2 className="h-3.5 w-3.5" /></Button></div>
+      <div className="mt-6 flex items-center justify-between rounded-xl border border-border/70 px-5 py-2.5 text-caption text-muted-foreground"><span>{t("Gateway requests")} · {t("Request success rate")} {usageStats.gatewayTotals?.requestCount ? formatPercent(usageStats.gatewayTotals.successRate) : "—"}</span><Button onClick={openResetDialog} variant="ghost" size="iconSm" title={t("Reset gateway statistics")} aria-label={t("Reset gateway statistics")}><Trash2 className="h-3.5 w-3.5" /></Button></div>
       <OverviewStatisticsResetDialog
         busy={resetBusy}
         error={resetError}

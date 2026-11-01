@@ -51,6 +51,7 @@
 | 空状态 | `EmptyState` | `empty-state.tsx` |
 | 图标 | 从 `@/components/ui/icons` 导入（re-export lucide-react） | `icons.ts` |
 | 卡片 / 徽章 | `Card` / `Badge` | 同名文件 |
+| 看板面板（统计格、图表、表格） | `panelClassName`（`rounded-xl` 细边框、浅色 `shadow-xs`、暗色无阴影）+ `PanelHeader`（`text-sm font-semibold` 标题 + 右侧辅助信息），概览页为基准 | `pages/home/components/page-primitives.tsx` |
 
 缺少某个变体时**扩展共享组件**，不要在页面里用原生元素或 Radix/Base UI/lucide 直接拼。改共享组件会影响全局，改前先 grep 调用方，并附前后截图。
 

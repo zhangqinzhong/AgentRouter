@@ -1,4 +1,5 @@
 import {
+  cn,
   formatCompactNumber,
   formatUsdCost,
   GatewayProviderConfig,
@@ -7,6 +8,7 @@ import {
   useAppText,
 } from "../shared/index";
 import { useState } from "react";
+import { panelClassName, PanelHeader } from "./page-primitives";
 import { getModelColor } from "@/vendor/tokentracker/ui/dashboard/components/TrendMonitor";
 import openaiIconUrl from "@/assets/provider-icons/openai.png";
 import anthropicIconUrl from "@/assets/provider-icons/anthropic.png";
@@ -169,14 +171,13 @@ export function OverviewBreakdowns({
   );
   const total = usageStats.totals.totalTokens;
   return (
-    <div className="grid items-start gap-6 lg:grid-cols-[1.3fr_1fr]">
-      <section className="rounded-2xl border border-border/70 bg-card p-5 shadow-sm">
-        <div className="mb-5 flex items-center justify-between">
-          <h2 className="font-semibold">{t("Model usage")}</h2>
-          <span className="text-xs text-muted-foreground">
+    <div className="grid gap-6 lg:grid-cols-[1.3fr_1fr]">
+      <section className={cn(panelClassName, "p-5")}>
+        <PanelHeader title={t("Model usage")}>
+          <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
             {modelRows.length} {t("Models")}
           </span>
-        </div>
+        </PanelHeader>
         {modelRows.length ? (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -237,8 +238,8 @@ export function OverviewBreakdowns({
           </p>
         )}
       </section>
-      <section className="rounded-2xl border border-border/70 bg-card p-5 shadow-sm">
-        <h2 className="mb-5 font-semibold">{t("Client activity")}</h2>
+      <section className={cn(panelClassName, "p-5")}>
+        <PanelHeader title={t("Client activity")} />
         <div className="space-y-4">
           {clients.map((row) => (
             <div key={row.key}>
@@ -261,8 +262,9 @@ export function OverviewBreakdowns({
               </div>
               <div className="ml-10 mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
                 <div
-                  className="h-full rounded-full bg-blue-500"
+                  className="h-full rounded-full transition-all duration-slow ease-out"
                   style={{
+                    backgroundColor: breakdownColor(row.label, t),
                     width: `${total ? (row.totalTokens / total) * 100 : 0}%`,
                   }}
                 />

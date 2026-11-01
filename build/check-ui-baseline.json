@@ -3,9 +3,9 @@
   "totals": {
     "raw-color": 226,
     "arbitrary-value": 514,
-    "palette-color": 409,
+    "palette-color": 408,
     "primitive-import": 0,
-    "native-control": 131
+    "native-control": 130
   },
   "rules": {
     "raw-color": {
@@ -83,7 +83,6 @@
       "packages/ui/src/pages/home/components/network-logs.tsx": 11,
       "packages/ui/src/pages/home/components/onboarding.tsx": 2,
       "packages/ui/src/pages/home/components/overview-accounts.tsx": 29,
-      "packages/ui/src/pages/home/components/overview-breakdown.tsx": 1,
       "packages/ui/src/pages/home/components/page-primitives.tsx": 3,
       "packages/ui/src/pages/home/components/profiles.tsx": 12,
       "packages/ui/src/pages/home/components/providers.tsx": 28,
@@ -121,7 +120,6 @@
       "packages/ui/src/pages/home/components/network-logs.tsx": 30,
       "packages/ui/src/pages/home/components/overview-accounts.tsx": 3,
       "packages/ui/src/pages/home/components/overview-breakdown.tsx": 1,
-      "packages/ui/src/pages/home/components/overview-trend.tsx": 1,
       "packages/ui/src/pages/home/components/profiles.tsx": 5,
       "packages/ui/src/pages/home/components/providers.tsx": 14,
       "packages/ui/src/pages/home/components/session-library.tsx": 20,

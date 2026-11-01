@@ -1,4 +1,5 @@
 import {
+  Button,
   cn,
   parseStatusBucketDate,
   UsageSeriesPoint,
@@ -9,6 +10,7 @@ import {
   useState,
 } from "../shared/index";
 import { UsageTrendLineChart } from "./usage-trend-line";
+import { PanelHeader } from "./page-primitives";
 
 type TrendRow = Record<string, unknown>;
 
@@ -138,21 +140,24 @@ export function UsageTrendSection({
 
   return (
     <section>
-      <div className="mb-3 flex items-center justify-between">
-        <h2 className={cn("text-sm font-medium")}>{t("Usage Trend")}</h2>
+      <PanelHeader title={t("Usage Trend")}>
         <div className="flex gap-1 rounded-lg bg-muted p-1">
           {(["tokens", "cost"] as const).map((value) => (
-            <button
+            <Button
               key={value}
               aria-pressed={metric === value}
               onClick={() => setMetric(value)}
-              className={`rounded-md px-3 py-1 text-xs ${metric === value ? "bg-background shadow-sm" : ""}`}
+              className={cn(
+                "rounded-md px-3 py-1 text-xs font-medium transition-colors duration-fast",
+                metric === value ? "bg-background text-foreground shadow-xs" : "text-muted-foreground hover:text-foreground"
+              )}
+              unstyled
             >
               {value === "tokens" ? "Token" : t("Estimated cost")}
-            </button>
+            </Button>
           ))}
         </div>
-      </div>
+      </PanelHeader>
       <UsageTrendLineChart
         from={from}
         loading={false}

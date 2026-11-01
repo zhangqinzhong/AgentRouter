@@ -10,6 +10,19 @@ export const documentPageClassName = "local-usage-page mx-auto w-full max-w-page
  *  content to the window edges. */
 export const tablePageClassName = "local-usage-page mx-auto flex h-full min-h-0 w-full min-w-0 max-w-wide flex-col px-5 pb-0 sm:px-9";
 
+/** One recipe for raised dashboard panels (stat tiles, charts, tables). */
+export const panelClassName = "min-w-0 rounded-xl border border-border/70 bg-card shadow-xs dark:shadow-none";
+
+/** Panel title row: title on the left, meta or actions on the right. */
+export function PanelHeader({ children, title }: { children?: ReactNode; title: ReactNode }) {
+  return (
+    <div className="mb-4 flex min-h-7 min-w-0 items-center justify-between gap-3">
+      <h2 className="min-w-0 truncate text-sm font-semibold">{title}</h2>
+      {children}
+    </div>
+  );
+}
+
 export function PageHeader({ children, title }: { children?: ReactNode; title: string }) {
   return (
     <header className="mb-5 flex flex-wrap items-start justify-between gap-3">

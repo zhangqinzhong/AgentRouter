@@ -74,8 +74,10 @@ for (const language of ["en", "zh"]) {
         })
       );
       expect(Math.abs(cells[0].x - gridBox.x)).toBeLessThan(1);
-      expect(Math.abs(cells[0].valueLeft - gridBox.x)).toBeLessThan(1);
-      expect(Math.abs(cells[3].valueRight - gridBox.x - gridBox.width)).toBeLessThan(1);
+      // Stat tiles: every value sits at the same inset inside its tile.
+      const insets = cells.map((cell) => cell.valueLeft - cell.x);
+      for (const inset of insets) expect(Math.abs(inset - insets[0])).toBeLessThan(1);
+      expect(Math.abs(cells[3].x + cells[3].width - gridBox.x - gridBox.width)).toBeLessThan(1);
       if (width >= 640) {
         const gaps = cells.slice(1).map((cell, index) => cell.x - cells[index].x - cells[index].width);
         for (const gap of gaps) expect(Math.abs(gap - gaps[0])).toBeLessThan(1);

@@ -66,7 +66,8 @@ test("OverviewView renders the range filter as flat tabs with one active option"
   assert.equal(active.length, 1);
   assert.match(html, /bg-oai-gray-100/);
   assert.doesNotMatch(html, /overview-segmented/);
-  assert.match(html, /class="ml-auto min-w-0 max-w-full"><div[^>]*role="tablist"/);
+  // The model filter sits in the header toolbar, before the range tabs.
+  assert.match(html, /<h1[^>]*>Overview<\/h1>[\s\S]*aria-label="Model"[\s\S]*role="tablist"/);
 });
 
 test("OverviewView marks the All tab active for all-time usage", () => {
