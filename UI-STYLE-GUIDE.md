@@ -41,7 +41,9 @@
 | 输入 | `Input` / `Textarea` / `Label` / `Checkbox` / `Switch` | 同名文件 |
 | 下拉选择 | `Select`（`options` 或 children） | `select.tsx` |
 | 对话框 | `Dialog*` | `dialog.tsx` |
-| 弹层 / 菜单 | `Popover`（目前没有独立 Menu 组件，菜单先用 Popover + Button 组合；需要时在 components/ui 新增 `menu.tsx`，不要在页面里手写） | `popover.tsx` |
+| 弹层 | `PopoverContent` / `PopoverPortal` / `AnimatedPopover` | `popover.tsx` |
+| 下拉列表（单选 / 多选，带搜索） | `useAnchoredPopoverLayout`（贴触发器定位，空间不够自动翻到上方）+ `useDismiss`（点外部 / Escape 关闭，`restoreFocus` 把焦点还给触发器）+ `AnchoredPopover` + `ListboxOption`（`indicator`: check 单选 / checkbox 多选）+ `ListboxSearch`。触发器用 `Button unstyled`，加 `aria-haspopup="listbox"`。参考 `profiles.tsx` 的 `AgentSelectControl` | `listbox.tsx` |
+| 菜单 | 目前页面里没有操作菜单；需要时在 `listbox.tsx` 的定位与关闭逻辑上新增 `menu.tsx`（`role="menu"`），不要在页面里手写 | — |
 | 标签页 | `Tabs` | `tabs.tsx` |
 | 提示 | `Tooltip` | `tooltip.tsx` |
 | Toast | `ToastStack` + `Toast`（页面里沿用 `FeedbackStack` / `LightToast` 别名） | `toast.tsx` |
