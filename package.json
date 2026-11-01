@@ -62,6 +62,9 @@
     "test:renderer": "npm run test:ui",
     "benchmark:request-logs": "node build/benchmark-request-logs.mjs",
     "typecheck": "tsc --noEmit",
+    "check:ui": "node build/check-ui.mjs",
+    "test:ui-guard": "node --test tests/ui-guard/*.test.mjs",
+    "hooks:install": "git config core.hooksPath .githooks",
     "rebuild:sqlite3": "electron-rebuild -f -w better-sqlite3",
     "test:collector": "node --test tests/collector/*.test.cjs tests/collector/upstream/*.test.cjs",
     "test:gateway-stream": "node --test tests/gateway-stream/*.test.mjs"

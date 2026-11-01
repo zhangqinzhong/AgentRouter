@@ -1,0 +1,9 @@
+#!/bin/sh
+# Installed with `npm run hooks:install` (sets core.hooksPath to .githooks).
+# Runs the UI consistency guard when renderer code or the guard itself changes.
+if git diff --cached --name-only --diff-filter=ACMR | grep -qE '^(packages/ui/src/|build/check-ui|tests/ui-guard/)'; then
+  node build/check-ui.mjs || {
+    echo "pre-commit: check:ui failed. See UI-STYLE-GUIDE.md §0." >&2
+    exit 1
+  }
+fi
