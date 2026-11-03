@@ -1,4 +1,5 @@
 import {
+  Button,
   cn,
   formatCompactNumber,
   formatUsdCost,
@@ -8,7 +9,7 @@ import {
   useAppText,
 } from "../shared/index";
 import { useState } from "react";
-import { panelClassName, PanelHeader } from "./page-primitives";
+import { groupClassName, noticeClassName, SectionHeader } from "./page-primitives";
 import { getModelColor } from "@/vendor/tokentracker/ui/dashboard/components/TrendMonitor";
 import openaiIconUrl from "@/assets/provider-icons/openai.png";
 import anthropicIconUrl from "@/assets/provider-icons/anthropic.png";
@@ -171,30 +172,30 @@ export function OverviewBreakdowns({
   );
   const total = usageStats.totals.totalTokens;
   return (
-    <div className="grid gap-6 lg:grid-cols-[1.3fr_1fr]">
-      <section className={cn(panelClassName, "p-5")}>
-        <PanelHeader title={t("Model usage")}>
+    <div className="grid gap-x-6 gap-y-10 lg:grid-cols-[1.3fr_1fr]">
+      <section className="flex min-w-0 flex-col">
+        <SectionHeader title={t("Model usage")}>
           <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
             {modelRows.length} {t("Models")}
           </span>
-        </PanelHeader>
+        </SectionHeader>
         {modelRows.length ? (
-          <div className="overflow-x-auto">
+          <div className={cn(groupClassName, "flex-1 overflow-x-auto")}>
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-xs text-muted-foreground">
-                  <th className="pb-3 text-left font-normal">{t("Model")}</th>
-                  <th className="pb-3 text-right font-normal">Token</th>
-                  <th className="pb-3 text-right font-normal">
+                  <th className="py-2.5 pl-4 text-left font-normal">{t("Model")}</th>
+                  <th className="py-2.5 text-right font-normal">Token</th>
+                  <th className="py-2.5 text-right font-normal">
                     {t("Estimated cost")}
                   </th>
-                  <th className="pb-3 text-right font-normal">{t("Share")}</th>
+                  <th className="py-2.5 pr-4 text-right font-normal">{t("Share")}</th>
                 </tr>
               </thead>
               <tbody>
                 {(expanded ? modelRows : modelRows.slice(0, 5)).map((row) => (
                   <tr key={row.key} className="border-t border-border/50">
-                    <td className="max-w-[220px] py-3 pr-3">
+                    <td className="max-w-[220px] py-3 pl-4 pr-3">
                       <div className="flex items-center gap-2">
                         <BreakdownIconBadge
                           color={breakdownColor(row.label, t)}
@@ -215,7 +216,7 @@ export function OverviewBreakdowns({
                     <td className="text-right tabular-nums">
                       {formatUsdCost(row.costUsd)}
                     </td>
-                    <td className="text-right tabular-nums text-muted-foreground">
+                    <td className="pr-4 text-right tabular-nums text-muted-foreground">
                       {total ? ((row.totalTokens / total) * 100).toFixed(1) : 0}
                       %
                     </td>
@@ -224,25 +225,26 @@ export function OverviewBreakdowns({
               </tbody>
             </table>
             {modelRows.length > 5 ? (
-              <button
+              <Button
                 onClick={() => setExpanded(!expanded)}
-                className="mt-3 text-xs text-primary"
+                className="w-full border-t border-border/50 px-4 py-2.5 text-left text-xs text-primary"
+                unstyled
               >
                 {t(expanded ? "Show less" : "Show all")}
-              </button>
+              </Button>
             ) : null}
           </div>
         ) : (
-          <p className="text-sm text-muted-foreground">
+          <p className={noticeClassName}>
             {t("No model usage yet")}
           </p>
         )}
       </section>
-      <section className={cn(panelClassName, "p-5")}>
-        <PanelHeader title={t("Client activity")} />
-        <div className="space-y-4">
+      <section className="flex min-w-0 flex-col">
+        <SectionHeader title={t("Client activity")} />
+        <div className={cn(groupClassName, "flex-1 divide-y divide-border/50")}>
           {clients.map((row) => (
-            <div key={row.key}>
+            <div className="px-4 py-3" key={row.key}>
               <div className="flex items-center gap-3">
                 <BreakdownIconBadge
                   color={breakdownColor(row.label, t)}
@@ -272,7 +274,7 @@ export function OverviewBreakdowns({
             </div>
           ))}
           {!clients.length ? (
-            <p className="text-sm text-muted-foreground">
+            <p className="px-4 py-3 text-body text-muted-foreground">
               {t("No client usage yet")}
             </p>
           ) : null}

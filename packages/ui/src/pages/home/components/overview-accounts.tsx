@@ -12,7 +12,7 @@ import {
 } from "../shared/index";
 import { CreditCard, Rocket, WalletCards, Wifi } from "@/components/ui/icons";
 import { Spinner } from "@/components/ui/spinner";
-import { PanelHeader } from "./page-primitives";
+import { groupClassName, noticeClassName, SectionHeader } from "./page-primitives";
 
 const providerAccountMeterLineLimit = 3;
 
@@ -39,14 +39,14 @@ export function ProviderAccountsSection({
   if (visibleAccounts.length === 0) {
     return (
       <section>
-        <PanelHeader title={t("Account Balance")} />
+        <SectionHeader title={t("Account Balance")} />
         {unconfigured ? (
-          <div className="flex flex-wrap items-center justify-between gap-3 text-body">
+          <div className={cn(noticeClassName, "flex flex-wrap items-center justify-between gap-3")}>
             <span className="text-muted-foreground">{t("No account balance connectors configured")}</span>
             {onConfigure ? <Button onClick={onConfigure} size="sm" type="button" variant="outline">{t("Configure account usage")}</Button> : null}
           </div>
         ) : (
-          <p className="text-body text-muted-foreground">{t("No account balance connectors configured")}</p>
+          <p className={noticeClassName}>{t("No account balance connectors configured")}</p>
         )}
       </section>
     );
@@ -54,7 +54,7 @@ export function ProviderAccountsSection({
 
   return (
     <section>
-      <PanelHeader title={t("Account Balance")}>
+      <SectionHeader title={t("Account Balance")}>
         <div className="flex items-center gap-2">
           <Button aria-label={t("Refresh all accounts")} title={t("Refresh all accounts")} size="iconSm" variant="ghost"
             disabled={!onRefresh || refreshing || refreshingKeys.length > 0} onClick={() => void onRefresh?.()}>
@@ -62,8 +62,8 @@ export function ProviderAccountsSection({
           </Button>
           <span className="shrink-0 text-caption tabular-nums text-muted-foreground">{visibleAccounts.length}</span>
         </div>
-      </PanelHeader>
-      <div className="-mb-2 divide-y divide-border/60">
+      </SectionHeader>
+      <div className={cn(groupClassName, "divide-y divide-border/60")}>
         {visibleAccounts.map((account) => (
           <ProviderAccountRow account={account} key={providerAccountSnapshotKey(account)} onRefresh={onRefresh ? () => onRefresh(account) : undefined} providers={providers} refreshing={refreshing || refreshingKeys.includes(providerAccountSnapshotKey(account))} />
         ))}
@@ -89,7 +89,7 @@ function ProviderAccountRow({
   const updatedAt = formatProviderAccountUpdatedAt(account.updatedAt);
 
   return (
-    <div className="flex items-start gap-3 py-3">
+    <div className="flex items-start gap-3 px-4 py-3">
       <ProviderAccountLogo account={account} className="mt-0.5 h-8 w-8 rounded-lg" providers={providers} />
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-baseline justify-between gap-3">

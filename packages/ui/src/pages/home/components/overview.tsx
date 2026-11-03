@@ -1,5 +1,5 @@
 import {
-  Button, CircleAlert, cn, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+  Button, CircleAlert, Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
   formatCompactNumber, formatPercent, formatUsdCost, LoaderCircle,
   GatewayProviderConfig, ProviderAccountSnapshot, Select, Trash2, UsageComparisonRow, usageRangeOptions,
   UsageDateRange, UsageStatsRange, UsageStatsSnapshot, UsageTotals, useAppText, useState, X
@@ -9,7 +9,6 @@ import { PeriodRangeTabs } from "@/vendor/tokentracker/ui/dashboard/components/P
 import { ProviderAccountsSection } from "./overview-accounts";
 import { OverviewBreakdowns } from "./overview-breakdown";
 import { UsageTrendSection } from "./overview-trend";
-import { panelClassName } from "./page-primitives";
 import { Spinner } from "@/components/ui/spinner";
 
 export type OverviewUsageFilters = {
@@ -237,27 +236,27 @@ export function OverviewView({
           </div>
         </div>
       </div>
-      <div className="mb-6 grid w-full grid-cols-2 gap-4 sm:grid-cols-4">
+      <div className="mb-10 grid w-full grid-cols-2 gap-x-8 gap-y-5 border-y border-border/70 py-5 sm:grid-cols-4">
         {statCells.map((cell) => (
-          <div key={cell.label} className={cn(panelClassName, "px-5 py-4")}>
+          <div key={cell.label} className="min-w-0">
             <StatCell label={cell.label} sub={cell.sub} title={cell.title} value={cell.value} />
           </div>
         ))}
       </div>
-      <div className="space-y-6">
-        <div className={cn(panelClassName, "p-5")}><UsageTrendSection usageRange={usageRange} usageStats={usageStats} /></div>
+      <div className="space-y-10">
+        <UsageTrendSection usageRange={usageRange} usageStats={usageStats} />
         <OverviewBreakdowns providers={filterProviders} usageStats={displayUsageStats} />
-        <div className={cn(panelClassName, "p-5")}><ProviderAccountsSection
+        <ProviderAccountsSection
           accounts={providerAccounts}
           onConfigure={onConfigureProviderAccounts}
           onRefresh={refreshProviderAccounts}
           providers={filterProviders}
           refreshing={providerAccountRefreshing}
           refreshingKeys={providerAccountRefreshingKeys}
-        /></div>
+        />
       </div>
 
-      <div className="mt-6 flex items-center justify-between rounded-xl border border-border/70 px-5 py-2.5 text-caption text-muted-foreground"><span>{t("Gateway requests")} · {t("Request success rate")} {usageStats.gatewayTotals?.requestCount ? formatPercent(usageStats.gatewayTotals.successRate) : "—"}</span><Button onClick={openResetDialog} variant="ghost" size="iconSm" title={t("Reset gateway statistics")} aria-label={t("Reset gateway statistics")}><Trash2 className="h-3.5 w-3.5" /></Button></div>
+      <div className="mt-10 flex items-center justify-between border-t border-border/70 pt-3 text-caption text-muted-foreground"><span>{t("Gateway requests")} · {t("Request success rate")} {usageStats.gatewayTotals?.requestCount ? formatPercent(usageStats.gatewayTotals.successRate) : "—"}</span><Button onClick={openResetDialog} variant="ghost" size="iconSm" title={t("Reset gateway statistics")} aria-label={t("Reset gateway statistics")}><Trash2 className="h-3.5 w-3.5" /></Button></div>
       <OverviewStatisticsResetDialog
         busy={resetBusy}
         error={resetError}

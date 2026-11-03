@@ -10,13 +10,17 @@ export const documentPageClassName = "local-usage-page mx-auto w-full max-w-page
  *  content to the window edges. */
 export const tablePageClassName = "local-usage-page mx-auto flex h-full min-h-0 w-full min-w-0 max-w-wide flex-col px-5 pb-0 sm:px-9";
 
-/** One recipe for raised dashboard panels (stat tiles, charts, tables). */
-export const panelClassName = "min-w-0 rounded-xl border border-border/70 bg-card shadow-xs dark:shadow-none";
+/** Grouped list (tables, ranked rows): a hairline container with no shadow.
+ *  Everything else sits directly on the page background. */
+export const groupClassName = "min-w-0 overflow-hidden rounded-xl border border-border/70 bg-card";
 
-/** Panel title row: title on the left, meta or actions on the right. */
-export function PanelHeader({ children, title }: { children?: ReactNode; title: ReactNode }) {
+/** Inline notice or empty state: one shade of fill, no border. */
+export const noticeClassName = "rounded-lg bg-muted/50 px-4 py-3 text-body text-muted-foreground";
+
+/** Section title row: title on the left, meta or actions on the right. */
+export function SectionHeader({ children, title }: { children?: ReactNode; title: ReactNode }) {
   return (
-    <div className="mb-4 flex min-h-7 min-w-0 items-center justify-between gap-3">
+    <div className="mb-3 flex min-h-7 min-w-0 items-center justify-between gap-3">
       <h2 className="min-w-0 truncate text-sm font-semibold">{title}</h2>
       {children}
     </div>

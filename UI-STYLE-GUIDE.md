@@ -51,7 +51,7 @@
 | 空状态 | `EmptyState` | `empty-state.tsx` |
 | 图标 | 从 `@/components/ui/icons` 导入（re-export lucide-react） | `icons.ts` |
 | 卡片 / 徽章 | `Card` / `Badge` | 同名文件 |
-| 看板面板（统计格、图表、表格） | `panelClassName`（`rounded-xl` 细边框、浅色 `shadow-xs`、暗色无阴影）+ `PanelHeader`（`text-sm font-semibold` 标题 + 右侧辅助信息），概览页为基准 | `pages/home/components/page-primitives.tsx` |
+| 区块与分组 | 区块直接放在页面背景上：`SectionHeader`（`text-sm font-semibold` 标题 + 右侧辅助信息）+ 内容，区块间距 `space-y-10`；统计数字用 `border-y` 细线统计条，不加框。只有表格、排行这类列表才装进 `groupClassName`（圆角细边框、无阴影，行间 `divide-y`）；提示与空状态用 `noticeClassName`（一档底色、无边框）。阴影只留给弹层、菜单、对话框。概览页为基准 | `pages/home/components/page-primitives.tsx` |
 
 缺少某个变体时**扩展共享组件**，不要在页面里用原生元素或 Radix/Base UI/lucide 直接拼。改共享组件会影响全局，改前先 grep 调用方，并附前后截图。
 

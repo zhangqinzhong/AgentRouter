@@ -10,7 +10,7 @@ import {
   useState,
 } from "../shared/index";
 import { UsageTrendLineChart } from "./usage-trend-line";
-import { PanelHeader } from "./page-primitives";
+import { SectionHeader } from "./page-primitives";
 
 type TrendRow = Record<string, unknown>;
 
@@ -140,7 +140,7 @@ export function UsageTrendSection({
 
   return (
     <section>
-      <PanelHeader title={t("Usage Trend")}>
+      <SectionHeader title={t("Usage Trend")}>
         <div className="flex gap-1 rounded-lg bg-muted p-1">
           {(["tokens", "cost"] as const).map((value) => (
             <Button
@@ -157,7 +157,7 @@ export function UsageTrendSection({
             </Button>
           ))}
         </div>
-      </PanelHeader>
+      </SectionHeader>
       <UsageTrendLineChart
         from={from}
         loading={false}
