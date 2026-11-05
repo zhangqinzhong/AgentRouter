@@ -69,7 +69,7 @@ async function collectionRoots({ home = os.homedir(), indexPath, env = process.e
   const active = (agent, defaults, customs) => unique([
     ...defaults.filter(root => !removed.includes(agent) && !blocked(removedRoots, agent, root)), ...customs,
   ]).filter(root => !blocked(disabled, agent, root));
-  return { claudeProjects: active('claude-code', defaultClaude, customClaude), codexStores: active('codex', defaultCodex, customCodex),
+  return { configDir, claudeProjects: active('claude-code', defaultClaude, customClaude), codexStores: active('codex', defaultCodex, customCodex),
     allowsDefault: (agent, root) => !removed.includes(agent) && !blocked(removedRoots, agent, root) && !blocked(disabled, agent, root) };
 }
 

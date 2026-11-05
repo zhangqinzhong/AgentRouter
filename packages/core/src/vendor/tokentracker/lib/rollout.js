@@ -1,3 +1,4 @@
+const {clientSource} = require("../usage-instances.cjs");
 const { claudeUserIdentity, collectClaudeForkAliases } = require("./claude-user-identity");
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
@@ -452,7 +453,7 @@ async function parseRolloutIncremental({
       const entrySource = typeof entry === "string"
         ? defaultSource
         : normalizeSourceInput(entry?.source) || defaultSource;
-      return count + (entrySource === DEFAULT_SOURCE ? 1 : 0);
+      return count + (clientSource(entrySource) === DEFAULT_SOURCE ? 1 : 0);
     }, 0);
     const discoveredRollouts = Number(syncDiagnostics.discovered_rollouts);
     const cursorKeys = Number(syncDiagnostics.cursor_keys);
@@ -537,7 +538,7 @@ async function parseRolloutIncremental({
       typeof entry === "string"
         ? defaultSource
         : normalizeSourceInput(entry?.source) || defaultSource;
-    if (syncDiagnostics && fileSource === DEFAULT_SOURCE) syncDiagnostics.stat_candidates += 1;
+    if (syncDiagnostics && clientSource(fileSource) === DEFAULT_SOURCE) syncDiagnostics.stat_candidates += 1;
     const st = rolloutStats[idx];
     if (!st || !st.isFile()) continue;
 
@@ -548,7 +549,7 @@ async function parseRolloutIncremental({
     const prevOffset = sameInode ? prev.offset || 0 : 0;
     const truncated = sameInode && prevOffset > st.size;
     const rebuildingCodexBaseline = Boolean(
-      (fileSource === DEFAULT_SOURCE || fileSource === "acode") &&
+      (clientSource(fileSource) === DEFAULT_SOURCE || fileSource === "acode") &&
       sameInode &&
       !truncated &&
       prevOffset > 0 &&
@@ -584,7 +585,7 @@ async function parseRolloutIncremental({
       && prevOffset !== st.size;
 
     const codexProjectFastPath =
-      projectEnabled && (fileSource === DEFAULT_SOURCE || fileSource === "acode");
+      projectEnabled && (clientSource(fileSource) === DEFAULT_SOURCE || fileSource === "acode");
     const projectOffset = sameInode && !truncated ? Number(prev.projectOffset || 0) : 0;
     const projectUpToDate =
       codexProjectFastPath &&
@@ -632,10 +633,10 @@ async function parseRolloutIncremental({
     const projectRef = projectContext?.projectRef || null;
     const projectKey = projectContext?.projectKey || null;
 
-    if (syncDiagnostics && !projectContextOnlyScan && fileSource === DEFAULT_SOURCE) {
+    if (syncDiagnostics && !projectContextOnlyScan && clientSource(fileSource) === DEFAULT_SOURCE) {
       syncDiagnostics.content_files_read += 1;
     }
-    const rolloutEventDedup = fileSource === DEFAULT_SOURCE
+    const rolloutEventDedup = clientSource(fileSource) === DEFAULT_SOURCE
       ? codexEventDedup
       : fileSource === "acode"
         ? getAcodeEventDedup()
@@ -784,7 +785,7 @@ async function filterColdCodexRolloutFiles({
   const files = Array.isArray(rolloutFiles) ? rolloutFiles : [];
   const syncDiagnostics = diagnostics && typeof diagnostics === "object" ? diagnostics : null;
   const isCodexEntry = (entry) => (
-    typeof entry === "string" || (normalizeSourceInput(entry?.source) || DEFAULT_SOURCE) === DEFAULT_SOURCE
+    typeof entry === "string" || clientSource(normalizeSourceInput(entry?.source) || DEFAULT_SOURCE) === DEFAULT_SOURCE
   );
   if (syncDiagnostics) {
     const discoveredRollouts = files.reduce(
@@ -843,7 +844,7 @@ async function filterColdCodexRolloutFiles({
       typeof entry === "string"
         ? DEFAULT_SOURCE
         : normalizeSourceInput(entry?.source) || DEFAULT_SOURCE;
-    if (!filePath || source !== DEFAULT_SOURCE) {
+    if (!filePath || clientSource(source) !== DEFAULT_SOURCE) {
       out.push(entry);
       continue;
     }
@@ -972,7 +973,7 @@ function activeCodexRolloutDates(
       typeof entry === "string"
         ? DEFAULT_SOURCE
         : normalizeSourceInput(entry?.source) || DEFAULT_SOURCE;
-    if (source !== DEFAULT_SOURCE) continue;
+    if (clientSource(source) !== DEFAULT_SOURCE) continue;
     const rolloutDate = rolloutDateFromPath(filePath);
     if (rolloutDate && (!latest || rolloutDate > latest)) latest = rolloutDate;
   }
@@ -2493,7 +2494,7 @@ async function parseRolloutRecords({
   let scannedEndOffset = startOffset;
   let committedEndOffset = startOffset;
   // Compaction records (issue #652, rules in codex-usage-record.js). Codex only.
-  const usageRecordState = source === DEFAULT_SOURCE && compactionResponseIds
+  const usageRecordState = clientSource(source) === DEFAULT_SOURCE && compactionResponseIds
     ? createUsageRecordState(previousUsageRecordState)
     : null;
 
@@ -2663,7 +2664,7 @@ async function parseRolloutRecords({
     if (totalUsage && typeof totalUsage === "object") latestTotal = totalUsage;
 
     const rawDelta = consumeUsageDelta(usageDeltaState, lastUsage, totalUsage);
-    const totalOnlyResetSentinel = source === DEFAULT_SOURCE
+    const totalOnlyResetSentinel = clientSource(source) === DEFAULT_SOURCE
       && isCodexTotalOnlyResetSentinel(lastUsage, totalUsage);
     const delta = rawDelta && !totalOnlyResetSentinel ? normalizeUsage(rawDelta) : null;
     if (!delta || isAllZeroUsage(delta)) continue;
@@ -2689,7 +2690,7 @@ async function parseRolloutRecords({
     let forkedReplaySkip = false;
     if (
       isForkedRollout &&
-      (source === DEFAULT_SOURCE || source === "acode") &&
+      (clientSource(source) === DEFAULT_SOURCE || source === "acode") &&
       replayPrefixActive
     ) {
       const tokenMs = Date.parse(tokenTimestamp);
@@ -2738,7 +2739,7 @@ async function parseRolloutRecords({
     const codexEvents = typeof seenCodexEvents === "function"
       ? seenCodexEvents()
       : seenCodexEvents;
-    if (codexEvents && (source === "codex" || source === "acode")) {
+    if (codexEvents && (clientSource(source) === "codex" || source === "acode")) {
       const dedupKey = `${sessionId || filePath}:${tokenTimestamp}`;
       if (codexEvents.has(dedupKey)) continue;
       codexEvents.add(dedupKey);
@@ -3367,7 +3368,7 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
     if (Object.prototype.hasOwnProperty.call(groupQueued, groupKey)) {
       legacyGroups.add(groupKey);
     }
-    if (!codexTouched && groupKey.startsWith(`${DEFAULT_SOURCE}${BUCKET_SEPARATOR}`)) {
+    if (!codexTouched && clientSource(groupKey.split(BUCKET_SEPARATOR)[0]) === DEFAULT_SOURCE) {
       codexTouched = true;
     }
   }
@@ -3747,7 +3748,7 @@ function collectCodexDominantModels(hourlyState) {
     const hourStart = parsed.hourStart;
     if (!hourStart) continue;
     const source = normalizeSourceInput(parsed.source) || DEFAULT_SOURCE;
-    if (source !== DEFAULT_SOURCE) continue;
+    if (clientSource(source) !== DEFAULT_SOURCE) continue;
     const model = normalizeModelInput(parsed.model) || DEFAULT_MODEL;
     if (model === DEFAULT_MODEL) continue;
 

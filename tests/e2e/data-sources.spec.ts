@@ -1,12 +1,12 @@
 import { test, expect, type Page } from '@playwright/test';
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 let bundle: string, css: string;
 test.beforeAll(async () => {
-  const result = await build({ entryPoints: ['tests/e2e/fixtures/data-sources.jsx'], bundle: true, write: false, format: 'iife', jsx: 'automatic', platform: 'browser', tsconfig: path.resolve('tsconfig.json'), define: { 'process.env.NODE_ENV': '"test"' }, loader: { '.png': 'dataurl', '.svg': 'dataurl', '.ico': 'dataurl', '.jpg': 'dataurl', '.jpeg': 'dataurl', '.webp': 'dataurl', '.gif': 'dataurl' } });
+  const result = await build({ entryPoints: ['tests/e2e/fixtures/data-sources.jsx'], plugins:process.env.AR_CAPTURE_BEFORE?[{name:'baseline-sources',setup(build){build.onLoad({filter:/components\/data-sources\.tsx$/},args=>({contents:execFileSync('git',['show',`HEAD:${path.relative(process.cwd(),args.path)}`],{encoding:'utf8'}),loader:'tsx',resolveDir:path.dirname(args.path)}));}}]:[], bundle: true, write: false, format: 'iife', jsx: 'automatic', platform: 'browser', tsconfig: path.resolve('tsconfig.json'), define: { 'process.env.NODE_ENV': '"test"' }, loader: { '.png': 'dataurl', '.svg': 'dataurl', '.ico': 'dataurl', '.jpg': 'dataurl', '.jpeg': 'dataurl', '.webp': 'dataurl', '.gif': 'dataurl' } });
   bundle = result.outputFiles[0].text;
   const root = mkdtempSync(path.join(os.tmpdir(), 'ar-data-sources-css-'));
   try { const output = path.join(root, 'styles.css'); execFileSync(process.execPath, [path.resolve('node_modules/@tailwindcss/cli/dist/index.mjs'), '-i', 'packages/ui/src/styles/globals.css', '-o', output, '--minify']); css = readFileSync(output, 'utf8'); }
@@ -27,6 +27,7 @@ async function open(page: Page, sources: Source[] = [], locations: string[][] = 
         state.locations.push([q.agent, q.path]); state.sources.push({ agent: q.agent, name: 'Claude Code', paths: [q.path + '/projects'], enabled: true, available: true });
       }
       if (q.op === 'location-state') state.sources.find((s: any) => s.paths.includes(q.path)).enabled = q.enabled;
+      if (q.op === 'location-label') state.instances=[{root:q.path,source:q.agent==='claude-code'?'claude':'codex',name:q.name}];
       if (q.op === 'location-remove') { state.locations = state.locations.filter((x: any) => x[1] !== q.path); state.sources = state.sources.filter((s: any) => !(s.agent === q.agent && (s.paths[0] === q.path || s.paths[0].startsWith(q.path + '/')))); }
       if (q.op === 'collection-refresh' && (window as any).__slowCollect) return new Promise(resolve => { (window as any).__finishCollection = resolve; });
       return { ok: true };
@@ -145,4 +146,20 @@ test('switches align without a delete column; removal lives in directory details
   const calls = await page.evaluate(() => (window as any).__calls);
   expect(calls.filter((q: any) => q.op === 'location-state')).toHaveLength(2);
   expect(calls.filter((q: any) => q.op === 'collection-refresh')).toHaveLength(0);
+});
+for(const mode of ['light','dark','narrow'])test(`instance label settings (${mode})`,async({page})=>{
+  await page.setViewportSize({width:mode==='narrow'?390:1280,height:900});
+  await page.emulateMedia({colorScheme:mode==='dark'?'dark':'light'});
+  const root='/private/isolated/code';
+  await open(page,[source('claude-code',root+'/projects')],[['claude-code',root]]);
+  await page.getByText(root,{exact:true}).click();
+  if(!process.env.AR_CAPTURE_BEFORE){
+    await page.getByRole('textbox',{name:'实例名称 '+root}).fill('Official fixture');
+    await page.getByRole('button',{name:'保存',exact:true}).click();
+    await expect(page.locator('summary')).toContainText('Official fixture');
+    expect(await page.evaluate(()=>(window as any).__calls.filter((q:any)=>q.op==='collection-refresh').length)).toBe(0);
+  }
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(mode==='narrow'?390:1280);
+  mkdirSync('output/usage-instances',{recursive:true});
+  await page.screenshot({path:`output/usage-instances/sources-${process.env.AR_CAPTURE_BEFORE?'before':'after'}-${mode}.png`,fullPage:true});
 });

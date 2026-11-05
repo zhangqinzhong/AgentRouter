@@ -4,6 +4,7 @@ const fs=require('node:fs'); const os=require('node:os'); const path=require('no
 const {filterRowsByUsageScope,getSourceScope,listExcludedSources,normalizeUsageScope}=require('./source-metadata');
 const {computeRowCost,getPricingRevision}=require('./pricing');
 const {deriveProjectKeyFromRef,CLAUDE_MEM_OBSERVER_PROJECT_REF}=require('./rollout');
+const {decodeSource}=require('../usage-instances.cjs');
 function resolveQueuePath() {
   const home = os.homedir();
   return path.join(home, ".tokentracker", "tracker", "queue.jsonl");
@@ -139,7 +140,7 @@ function isLegacyInclusiveCodexRow(row) {
 }
 
 function normalizeQueueRow(row) {
-  let normalized = row;
+  let normalized = {...row,...decodeSource(row.source)};
   if (isLegacyInclusiveCodexRow(normalized)) {
     normalized = {
       ...normalized,
@@ -514,7 +515,7 @@ function scopedQueueRows(queuePath, url) {
   return {
     scope,
     allRows,
-    rows: rowsSince(filterRowsByUsageScope(sourceRows, scope).filter(row => !url.searchParams.get("model") || row.model === url.searchParams.get("model")), url),
+    rows: rowsSince(filterRowsByUsageScope(sourceRows, scope).filter(row => (!url.searchParams.get("model") || row.model === url.searchParams.get("model")) && (!url.searchParams.get("instance") || (row.instance || "unattributed") === url.searchParams.get("instance"))), url),
     excludedSources: listExcludedSources(allRows, scope),
   };
 }

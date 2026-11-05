@@ -13,6 +13,7 @@ import { Spinner } from "@/components/ui/spinner";
 
 export type OverviewUsageFilters = {
   modelFilter: string;
+  availableModels?: UsageComparisonRow[];
   providerFilter: string;
   providers: GatewayProviderConfig[];
   setModelFilter: (model: string) => void;
@@ -84,11 +85,12 @@ function overviewStatCells(totals: UsageTotals, translate: (value: string) => st
 function overviewModelFilterOptions(
   providers: GatewayProviderConfig[],
   providerFilter: string,
-  usageStats: UsageStatsSnapshot,
+  rows: UsageComparisonRow[],
+  selectedModel: string,
   translate: (value: string) => string
 ): Array<{ label: string; value: string }> {
   const models = new Set<string>();
-  for (const row of usageStats.models ?? []) {
+  for (const row of rows) {
     if (!row.model || (row.requestCount ?? 0) <= 0 && (row.totalTokens ?? 0) <= 0) {
       continue;
     }
@@ -97,6 +99,8 @@ function overviewModelFilterOptions(
     }
     models.add(row.model);
   }
+  // Keep the selected value visible even when this range has no matching usage.
+  if (selectedModel) models.add(selectedModel);
   return [
     { label: translate("All models"), value: "" },
     ...Array.from(models).map((model) => ({ label: model, value: model }))
@@ -152,7 +156,7 @@ export function OverviewView({
   const filterProviders = usageFilters?.providers ?? emptyOverviewProviders;
   const providerFilter = usageFilters?.providerFilter ?? "";
   const modelFilter = usageFilters?.modelFilter ?? "";
-  const modelOptions = overviewModelFilterOptions(filterProviders, providerFilter, usageStats, t);
+  const modelOptions = overviewModelFilterOptions(filterProviders, providerFilter, usageFilters?.availableModels ?? usageStats.models ?? [], modelFilter, t);
   const statCells = overviewStatCells(usageStats.totals, t);
   // The usage store labels providers by id; resolve them to the configured display names.
   const displayUsageStats = useMemo(() => {
