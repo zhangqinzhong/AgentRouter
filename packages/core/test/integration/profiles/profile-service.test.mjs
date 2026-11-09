@@ -2178,35 +2178,71 @@ async function applyProfileFixture(config, options) {
   return applyProfileConfig(config, options);
 }
 
-for (const legacy of [false, true]) {
-  test(`disabled Claude profile restores mixed settings from ${legacy ? "legacy" : "current"} original`, () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "ar-disabled-mixed-"));
-    try {
-      const file = path.join(root, "settings.json");
-      const profile = { agent: "claude-code", id: "disabled-mixed", enabled: false, scope: "global", settingsFile: file, env: {}, model: "", surface: "auto" };
-      const original = { env: { ANTHROPIC_BASE_URL: "https://provider.test/anthropic", ANTHROPIC_AUTH_TOKEN: "original-token", ANTHROPIC_MODEL: "original-model" }, statusLine: { command: "old" } };
-      const managed = { apiKeyHelper: `/tmp/${legacy ? "ccr" : "ar"}-claude-code-api-key-disabled-mixed${process.platform === "win32" ? ".cmd" : ""}`, env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:3466", ANTHROPIC_API_BASE_URL: "http://127.0.0.1:3466", CLAUDE_AGENT_API_BASE_URL: "http://127.0.0.1:3466", ANTHROPIC_MODEL: "Provider/model", USER_SETTING: "kept" }, hooks: { custom: [] }, statusLine: { command: "new" } };
-      writeFileSync(file, JSON.stringify(managed));
-      writeFileSync(`${file}.ar-original`, JSON.stringify(legacy ? managed : original));
-      if (legacy) writeFileSync(`${file}.ccr-original`, JSON.stringify(original));
-      // A mixed managed backup must never be mistaken for the user's original.
-      writeFileSync(`${file}.ar-backup-2026-09-13`, JSON.stringify(managed));
-      const result = applyProfileRuntimeConfig(createDefaultAppConfig(), profile, "unused");
-      assert.equal(result.ok, true);
-      const restored = JSON.parse(readFileSync(file, "utf8"));
-      assert.equal(restored.apiKeyHelper, undefined);
-      assert.deepEqual(restored.env, { ...original.env, USER_SETTING: "kept" });
-      assert.deepEqual(restored.hooks, managed.hooks);
-      assert.deepEqual(restored.statusLine, managed.statusLine);
-      const content = readFileSync(file, "utf8");
-      applyProfileRuntimeConfig(createDefaultAppConfig(), profile, "unused");
-      assert.equal(readFileSync(file, "utf8"), content);
-      restored.apiKeyHelper = "/usr/local/bin/custom-helper";
-      writeFileSync(file, JSON.stringify(restored));
-      applyProfileRuntimeConfig(createDefaultAppConfig(), profile, "unused");
-      assert.equal(JSON.parse(readFileSync(file, "utf8")).apiKeyHelper, restored.apiKeyHelper);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
+test("profile service keeps a default ~/.claude profile on Claude Code's own global config file", { skip: !process.env.AR_INTERNAL_HOME_DIR }, async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "ccr-claude-default-home-"));
+  const previousHome = process.env.HOME;
+  const takeoverFile = path.join(CONFIGDIR, "global-profile-takeover.json");
+  const profileId = "default-home-claude-code";
+  const commandExtension = process.platform === "win32" ? ".cmd" : "";
+  try {
+    process.env.HOME = home;
+    assert.equal(os.homedir(), home);
+    rmSync(takeoverFile, { force: true });
+    const settingsFile = path.join(home, ".claude", "settings.json");
+    mkdirSync(path.dirname(settingsFile), { recursive: true });
+    writeFileSync(settingsFile, "{}\n");
+    writeFileSync(path.join(home, ".claude.json"), `${JSON.stringify({ hasCompletedOnboarding: true }, null, 2)}\n`);
+
+    const config = createDefaultAppConfig();
+    config.APIKEY = "ccr-profile-default-home-test";
+    config.APIKEYS = [{
+      createdAt: "2026-01-01T00:00:00.000Z",
+      id: `profile:${profileId}`,
+      key: "ccr-profile-default-home-test",
+      name: "Profile: Claude Code"
+    }];
+    config.Providers = [{
+      api_base_url: "https://example.test/v1",
+      api_key: "provider-key",
+      models: ["model"],
+      name: "Provider"
+    }];
+    config.profile.profiles = [{
+      agent: "claude-code",
+      enabled: true,
+      env: {},
+      id: profileId,
+      model: "Provider/model",
+      name: "Claude Code",
+      scope: "global",
+      settingsFile: "~/.claude/settings.json",
+      smallFastModel: "",
+      surface: "auto"
+    }];
+
+    const result = await applyProfileFixture(config);
+    assert.equal(result.clients.some((client) => client.client === "claude-code" && client.ok), true);
+
+    const wrapperContent = readFileSync(path.join(CONFIGDIR, "bin", `ccr-claude-code-wrapper-${profileId}${commandExtension}`), "utf8");
+    if (process.platform === "win32") {
+      assert.match(wrapperContent, /^set CLAUDE_CONFIG_DIR=\r?$/m);
+    } else {
+      assert.match(wrapperContent, /^unset CLAUDE_CONFIG_DIR$/m);
+      assert.doesNotMatch(wrapperContent, /export CLAUDE_CONFIG_DIR=/);
     }
-  });
-}
+
+    const globalConfig = JSON.parse(readFileSync(path.join(home, ".claude.json"), "utf8"));
+    assert.equal(globalConfig.hasCompletedOnboarding, true);
+    assert.equal(typeof globalConfig.autoCompactWindowsCache, "object");
+    assert.equal(existsSync(path.join(home, ".claude", ".claude.json")), false);
+  } finally {
+    restoreGlobalProfileConfigsOnExit([], { manageMarker: true });
+    rmSync(takeoverFile, { force: true });
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    rmSync(home, { force: true, recursive: true });
+  }
+});

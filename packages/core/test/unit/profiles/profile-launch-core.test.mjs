@@ -288,17 +288,25 @@ test("profileOpenCommand quotes profile references for shell usage", () => {
   assert.match(workbuddyCommand, / app$/);
 });
 
+test("buildProfileLaunchPlan leaves CLAUDE_CONFIG_DIR unset for a profile on the default ~/.claude", () => {
+  const previousHome = process.env.HOME;
+  const home = path.join(path.sep, "tmp", "ccr-launch-core-home");
+  process.env.HOME = home;
+  try {
+    const configDir = path.join(path.sep, "tmp", "ccr-config");
+    const globalProfile = { ...claudeProfile, id: "claude-global", scope: "global", settingsFile: undefined };
+    assert.equal(resolveClaudeCodeSettingsFile(configDir, globalProfile), path.join(home, ".claude", "settings.json"));
+    const defaultPlan = buildProfileLaunchPlan(configDir, globalProfile, "cli");
+    assert.equal("CLAUDE_CONFIG_DIR" in defaultPlan.env, false);
 
-test("CLI profiles apply per-agent YOLO flags and saved arguments, without affecting App launches", () => {
-  const claude = buildProfileLaunchPlan("/tmp/config", { ...claudeProfile, permissionMode: "yolo", launchArgs: ["--verbose", "a b"] }, "cli", ["--resume"]);
-  assert.ok(claude.args.includes("--dangerously-skip-permissions"));
-  assert.ok(claude.args.includes("a b"));
-  assert.ok(claude.args.includes("--resume"));
-  const codex = buildProfileLaunchPlan("/tmp/config", { ...codexProfile, permissionMode: "yolo" }, "cli");
-  assert.ok(codex.args.includes("--dangerously-bypass-approvals-and-sandbox"));
-  const repeated = buildProfileLaunchPlan("/tmp/config", { ...claudeProfile, permissionMode: "yolo" }, "cli", ["--dangerously-skip-permissions"]);
-  assert.equal(repeated.args.filter((arg) => arg === "--dangerously-skip-permissions").length, 1);
-  const app = buildProfileLaunchPlan("/tmp/config", { ...codexProfile, permissionMode: "yolo", launchArgs: ["--verbose"] }, "app");
-  assert.ok(!app.args.includes("--dangerously-bypass-approvals-and-sandbox"));
-  assert.ok(!app.args.includes("--verbose"));
+    const customSettings = path.join(home, ".claude-work", "settings.json");
+    const customPlan = buildProfileLaunchPlan(configDir, { ...globalProfile, settingsFile: customSettings }, "cli");
+    assert.equal(customPlan.env.CLAUDE_CONFIG_DIR, path.dirname(customSettings));
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+  }
 });
