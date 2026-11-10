@@ -1,5 +1,5 @@
 {
   "baseVersion": "1.12.1",
   "change": "minor",
-  "reason": "Add local Claude desktop subscription quota snapshots for isolated profiles without additional API requests."
+  "reason": "Add client and configuration-instance usage filters, local Claude Official quota, two-character CJK search and native MiMo subagent support; update collection and memory integration while preserving existing data."
 }
