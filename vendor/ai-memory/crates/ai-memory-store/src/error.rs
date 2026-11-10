@@ -24,6 +24,15 @@ pub struct AmbiguousProjectHolder {
     pub name: Option<String>,
     /// The key that matched.
     pub matched_by: AmbiguousMatch,
+    /// The project's id, `None` for a restricted project (same reason as
+    /// `name`).
+    pub id: Option<ai_memory_core::ProjectId>,
+    /// The repository identity the project owns, if any (`None` for a
+    /// restricted project).
+    pub repository: Option<String>,
+    /// Whether the project holds nothing: no sessions, observations, pages,
+    /// handoffs or workstreams. Always `false` for a restricted project.
+    pub empty: bool,
 }
 
 /// The projects behind a [`StoreError::ProjectNameAmbiguous`], rendered as
@@ -50,6 +59,39 @@ impl std::fmt::Display for AmbiguousProjectHolders {
                 Some(name) => write!(f, "project '{name}'")?,
                 None => f.write_str("a restricted project")?,
             }
+            if let Some(repository) = &holder.repository {
+                write!(f, " (owns repository {repository})")?;
+            } else if holder.empty {
+                f.write_str(" (empty)")?;
+            }
+        }
+        // Say what to pass instead, so an agent or operator does not have to
+        // guess (#2018).
+        let owners: Vec<&AmbiguousProjectHolder> = self
+            .0
+            .iter()
+            .filter(|holder| holder.repository.is_some() && holder.name.is_some())
+            .collect();
+        if let [owner] = owners.as_slice()
+            && let (Some(name), Some(repository)) = (&owner.name, &owner.repository)
+        {
+            write!(
+                f,
+                "; for the project of repository {repository}, pass project '{name}'"
+            )?;
+        }
+        for holder in self
+            .0
+            .iter()
+            .filter(|holder| holder.empty && holder.repository.is_none())
+        {
+            if let (Some(name), Some(id)) = (&holder.name, holder.id) {
+                write!(
+                    f,
+                    "; the empty project '{name}' can be renamed out of the way with \
+                     `ai-memory rename-project --project-id {id} --to {name}-empty`"
+                )?;
+            }
         }
         Ok(())
     }
@@ -69,6 +111,14 @@ pub enum StoreError {
     /// Migration runner failed.
     #[error("migration: {0}")]
     Migration(#[from] refinery::Error),
+
+    /// A restore source would initialize a new store instead of opening a
+    /// database that ai-memory already migrated.
+    #[error(
+        "backup has no initialized ai-memory database snapshot at db/memory.sqlite; \
+         restore requires an existing snapshot with applied migration history"
+    )]
+    UninitializedSnapshot,
 
     /// The store's schema is newer than this binary: an applied migration is
     /// above the highest compiled-in version (refinery reports this as
@@ -128,6 +178,17 @@ pub enum StoreError {
     #[error("session collision")]
     SessionCollision,
 
+    /// A hook event named a session its own operator owns (or a shared one)
+    /// under a different agent than the session was first captured with
+    /// (#2023). Raised only after the owner check admitted the caller, so the
+    /// bound agent names nothing a foreign operator could not already see;
+    /// a foreign owner still gets the opaque [`Self::SessionCollision`].
+    #[error("session is bound to agent {}", bound.as_str())]
+    SessionAgentMismatch {
+        /// The agent the session row was created with.
+        bound: ai_memory_core::AgentKind,
+    },
+
     /// A `spawn_blocking` task panicked or was cancelled.
     #[error("reader pool task did not complete: {0}")]
     PoolPanic(String),
@@ -166,6 +227,21 @@ pub enum StoreError {
     #[error("session {0} was purged and cannot be recreated")]
     SessionPurged(String),
 
+    /// A hook named an ID-selected managed run whose boundary refuses it: the
+    /// run is no longer active, or the hook's agent, owner, native session or
+    /// checkout does not match the run. A lapsed renewable lease has its own
+    /// retryable error below. Typed apart from
+    /// `InvalidState` because the refusal is permanent for that event, so a
+    /// spool drain must drop it rather than stop behind it (#1892).
+    #[error("ID-selected managed run boundary mismatch")]
+    ManagedRunBoundaryRefused,
+
+    /// An otherwise-valid ID-selected run is still active but its renewable
+    /// lease has lapsed. Unlike a terminal boundary refusal, a heartbeat may
+    /// make the same spooled event valid after a server outage.
+    #[error("ID-selected managed run lease lapsed")]
+    ManagedRunLeaseLapsed,
+
     /// A workspace delete was refused because it still holds projects and the
     /// caller did not pass `force`. Carries the project count so the admin
     /// endpoint / CLI can report it before the operator retries with force.
@@ -190,6 +266,14 @@ pub enum StoreError {
         count: u64,
         /// Comma-separated workstream names holding those runs.
         workstreams: String,
+    },
+
+    /// A project merge was refused because sessions can still receive hook
+    /// observations under the source coordinate.
+    #[error("project has {count} open session(s); finish them before merging the project")]
+    ProjectSessionsOpen {
+        /// Number of source sessions whose `ended_at` is still NULL.
+        count: u64,
     },
 
     /// A workspace rename was rejected because the destination name is already

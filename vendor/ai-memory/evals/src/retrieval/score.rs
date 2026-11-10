@@ -2,15 +2,17 @@
 //! retrieval numbers are reported: for each question, did the evidence
 //! sessions surface in the top k retrieved results?
 //!
-//! Two metrics per k:
+//! Three metrics per k:
 //!
 //! - `hit@k` — 1.0 when ANY evidence session appears in the top k
 //!   (the "Recall@k" most memory systems publish);
 //! - `recall@k` — the fraction of that question's evidence sessions
-//!   found in the top k (stricter on multi-session questions).
+//!   found in the top k;
+//! - `recall-all@k` — 1.0 only when ALL evidence sessions appear in the
+//!   top k (stricter on multi-session questions).
 //!
 //! Abstention questions have no evidence sessions and are excluded
-//! from both (reported separately as a count).
+//! from all three (reported separately as a count).
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -24,9 +26,10 @@ use super::query::Retrieved;
 pub struct QuestionScore {
     pub question_id: String,
     pub question_type: String,
-    /// hit@k and recall@k keyed by k.
+    /// Retrieval metrics keyed by k.
     pub hit_at: BTreeMap<usize, f64>,
     pub recall_at: BTreeMap<usize, f64>,
+    pub recall_all_at: BTreeMap<usize, f64>,
     /// Deduped session attributions actually retrieved (for forensics).
     pub retrieved_sessions: usize,
     /// `memory_query` round-trip latency for this question, milliseconds.
@@ -74,6 +77,7 @@ pub fn score_question(
     }
     let mut hit_at = BTreeMap::new();
     let mut recall_at = BTreeMap::new();
+    let mut recall_all_at = BTreeMap::new();
     for &k in ks {
         let top: HashSet<&uuid::Uuid> = ranked_sessions.iter().take(k).collect();
         let found = evidence.iter().filter(|e| top.contains(e)).count();
@@ -86,12 +90,21 @@ pub fn score_question(
                 found as f64 / evidence.len() as f64
             },
         );
+        recall_all_at.insert(
+            k,
+            if !evidence.is_empty() && found == evidence.len() {
+                1.0
+            } else {
+                0.0
+            },
+        );
     }
     QuestionScore {
         question_id: question_id.to_string(),
         question_type: question_type.to_string(),
         hit_at,
         recall_at,
+        recall_all_at,
         retrieved_sessions: ranked_sessions.len(),
         latency_ms,
         context_tokens,
@@ -110,6 +123,7 @@ pub struct SliceMetrics {
     pub questions: usize,
     pub hit_at: BTreeMap<usize, f64>,
     pub recall_at: BTreeMap<usize, f64>,
+    pub recall_all_at: BTreeMap<usize, f64>,
     /// Latency percentiles over the slice's per-question `memory_query`
     /// round trips, milliseconds.
     pub latency_p50_ms: u128,
@@ -207,9 +221,14 @@ pub fn aggregate(scores: &[QuestionScore], ks: &[usize]) -> BTreeMap<String, Sli
             let n = group.len() as f64;
             let mut hit_at = BTreeMap::new();
             let mut recall_at = BTreeMap::new();
+            let mut recall_all_at = BTreeMap::new();
             for &k in ks {
                 hit_at.insert(k, group.iter().map(|s| s.hit_at[&k]).sum::<f64>() / n);
                 recall_at.insert(k, group.iter().map(|s| s.recall_at[&k]).sum::<f64>() / n);
+                recall_all_at.insert(
+                    k,
+                    group.iter().map(|s| s.recall_all_at[&k]).sum::<f64>() / n,
+                );
             }
             let latencies: Vec<u128> = group.iter().map(|s| s.latency_ms).collect();
             let tokens: Vec<usize> = group.iter().map(|s| s.context_tokens).collect();
@@ -220,6 +239,7 @@ pub fn aggregate(scores: &[QuestionScore], ks: &[usize]) -> BTreeMap<String, Sli
                     questions: group.len(),
                     hit_at,
                     recall_at,
+                    recall_all_at,
                     latency_p50_ms: percentile_u128(&latencies, 0.50),
                     latency_p95_ms: percentile_u128(&latencies, 0.95),
                     context_tokens_mean: tokens_sum as f64 / n,
@@ -258,6 +278,8 @@ mod tests {
         assert_eq!(s.hit_at[&1], 1.0);
         assert_eq!(s.hit_at[&5], 1.0);
         assert_eq!(s.recall_at[&1], 1.0);
+        assert_eq!(s.recall_all_at[&1], 1.0);
+        assert_eq!(s.recall_all_at[&5], 1.0);
     }
 
     #[test]
@@ -278,24 +300,31 @@ mod tests {
         assert_eq!(s.hit_at[&1], 0.0);
         assert_eq!(s.hit_at[&3], 0.0);
         assert_eq!(s.hit_at[&5], 1.0);
+        assert_eq!(s.recall_all_at[&3], 0.0);
+        assert_eq!(s.recall_all_at[&5], 1.0);
     }
 
     #[test]
     fn duplicate_session_chunks_fill_one_slot_not_three() {
-        let e = uuid::Uuid::now_v7();
+        let e1 = uuid::Uuid::now_v7();
+        let e2 = uuid::Uuid::now_v7();
         let noise = uuid::Uuid::now_v7();
-        // three chunks of the same noise session ahead of the evidence
         let s = score_question(
             "q",
             "multi-session",
-            &HashSet::from([e]),
-            &retrieved(&[Some(noise), Some(noise), Some(noise), Some(e)]),
-            &[2],
+            &HashSet::from([e1, e2]),
+            &retrieved(&[None, Some(noise), Some(noise), Some(e1), Some(e1), Some(e2)]),
+            &[0, 2, 3],
             0,
             0,
         );
-        // dedup: noise occupies rank 0, evidence rank 1 → hit@2
+        // Unattributed pages and duplicate chunks consume no session slots.
         assert_eq!(s.hit_at[&2], 1.0);
+        assert_eq!(s.recall_at[&2], 0.5);
+        assert_eq!(s.recall_all_at[&0], 0.0);
+        assert_eq!(s.recall_all_at[&2], 0.0);
+        assert_eq!(s.recall_all_at[&3], 1.0);
+        assert_eq!(s.retrieved_sessions, 3);
     }
 
     #[test]
@@ -313,6 +342,7 @@ mod tests {
         );
         assert_eq!(s.recall_at[&5], 0.5);
         assert_eq!(s.hit_at[&5], 1.0);
+        assert_eq!(s.recall_all_at[&5], 0.0);
     }
 
     #[test]
@@ -328,6 +358,7 @@ mod tests {
             0,
         );
         assert_eq!(s.hit_at[&5], 0.0);
+        assert_eq!(s.recall_all_at[&5], 0.0);
         assert_eq!(s.retrieved_sessions, 0);
     }
 
@@ -349,6 +380,25 @@ mod tests {
         for k in [1, 3, 5, 10] {
             assert_eq!(s.hit_at[&k], 0.0, "hit@{k}");
             assert_eq!(s.recall_at[&k], 0.0, "recall@{k}");
+            assert_eq!(s.recall_all_at[&k], 0.0, "recall-all@{k}");
+        }
+    }
+
+    #[test]
+    fn empty_evidence_does_not_score_as_complete() {
+        let s = score_question(
+            "q",
+            "abstention",
+            &HashSet::new(),
+            &retrieved(&[Some(uuid::Uuid::now_v7())]),
+            &[0, 5],
+            0,
+            0,
+        );
+        for k in [0, 5] {
+            assert_eq!(s.hit_at[&k], 0.0);
+            assert_eq!(s.recall_at[&k], 0.0);
+            assert_eq!(s.recall_all_at[&k], 0.0);
         }
     }
 
@@ -364,17 +414,20 @@ mod tests {
             10,
             100,
         );
-        let miss = score_question(
+        let partial = score_question(
             "q2",
             "multi-session",
-            &HashSet::from([uuid::Uuid::now_v7()]),
-            &retrieved(&[]),
+            &HashSet::from([e, uuid::Uuid::now_v7(), uuid::Uuid::now_v7()]),
+            &retrieved(&[Some(e)]),
             &[1],
             30,
             200,
         );
-        let agg = aggregate(&[hit, miss], &[1]);
-        assert_eq!(agg["multi-session"].hit_at[&1], 0.5);
+        let agg = aggregate(&[hit, partial], &[1]);
+        assert_eq!(agg["multi-session"].hit_at[&1], 1.0);
+        assert_eq!(agg["multi-session"].recall_at[&1], 2.0 / 3.0);
+        assert_eq!(agg["multi-session"].recall_all_at[&1], 0.5);
+        assert_eq!(agg["overall"].recall_all_at[&1], 0.5);
         assert_eq!(agg["overall"].questions, 2);
         // Latency + context-tokens triple is aggregated alongside accuracy.
         assert_eq!(agg["overall"].context_tokens_mean, 150.0);
@@ -387,6 +440,7 @@ mod tests {
     fn qa(correct: bool, latency_ms: u128, tokens: usize) -> QaOutcome {
         QaOutcome {
             correct,
+            answerability: crate::retrieval::qa::Answerability::Answerable,
             answer_source: "synthesized",
             answer: "a".into(),
             grade_reason: "r".into(),

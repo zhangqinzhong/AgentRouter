@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentKind, ManagedRunId, WorkstreamId};
+use crate::{AgentKind, ManagedRunId, ProjectId, WorkspaceId, WorkstreamId};
 
 /// Versioned origin marker placed at the start of every managed workstream
 /// context packet. Native transcript adapters use it to prevent a harness from
@@ -229,6 +229,10 @@ pub struct PrepareManagedRunRequest {
     pub workspace: String,
     /// Project name resolved by the host CLI.
     pub project: String,
+    /// Select an existing project within `workspace` by ID. When present,
+    /// `project` must be empty: older servers then refuse before any write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     /// Canonical host working directory.
     pub cwd: String,
     /// Stable repository identity hash.
@@ -271,6 +275,9 @@ pub struct PrepareManagedRunRequest {
 /// Result of preparing a managed invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrepareManagedRunResponse {
+    /// Authorized scope selected by the server. Older servers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_project: Option<ManagedProjectScope>,
     /// Selected logical workstream.
     pub workstream_id: WorkstreamId,
     /// Human-readable workstream name.
@@ -401,6 +408,9 @@ pub struct ListManagedWorkstreamsRequest {
     pub workspace: String,
     /// Project name resolved by the host CLI.
     pub project: String,
+    /// Existing project ID, mutually exclusive with a non-empty `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     /// Stable repository identity hash.
     pub repo_fingerprint: String,
     /// Stable worktree identity hash (distinct across linked worktrees).
@@ -411,6 +421,37 @@ pub struct ListManagedWorkstreamsRequest {
     /// Omitted by older clients for the first page.
     #[serde(default)]
     pub offset: usize,
+}
+
+/// Authorized project coordinates, without server filesystem paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectScope {
+    /// Stable workspace identity.
+    pub workspace_id: WorkspaceId,
+    /// Stable project identity.
+    pub project_id: ProjectId,
+    /// Current workspace name.
+    pub workspace: String,
+    /// Current project name.
+    pub project: String,
+}
+
+/// Read-only recovery query for an ambiguous managed project name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedProjectCandidatesRequest {
+    /// Workspace containing the projects.
+    pub workspace: String,
+    /// Exact, canonical or legacy name to match.
+    pub project: String,
+}
+
+/// Bounded candidates the caller may select for a managed launch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedProjectCandidatesResponse {
+    /// Matching projects on which the caller currently has Write access.
+    pub candidates: Vec<ManagedProjectScope>,
+    /// More matches exist; use an explicit ID if the intended row is absent.
+    pub truncated: bool,
 }
 
 /// One checkout-local managed workstream returned by discovery reads.

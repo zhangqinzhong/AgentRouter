@@ -3,21 +3,25 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::html_auth::HtmlAuthRedirectConfig;
 use crate::state::WebState;
 
+mod agents;
 mod api;
+mod documentation;
 mod graph;
 mod health;
 mod history;
+mod inbox;
 mod index;
 mod login;
+mod notifications;
 mod page;
 mod pending;
 mod project;
-mod search;
+pub(crate) mod search;
 mod session;
 pub(crate) mod statics;
 mod workstreams;
@@ -77,6 +81,7 @@ pub(crate) async fn resolve_read_scope(
 /// `Capability::Admin` decision `require_root_for_multiuser_admin` makes:
 /// anonymous on a multi-user server is 401, a non-root user 403.
 pub(crate) async fn require_admin(
+    i18n: &ai_memory_core::i18n::Localizer,
     state: &WebState,
     level: Option<axum::Extension<ai_memory_core::AuthLevel>>,
 ) -> Result<(), axum::response::Response> {
@@ -96,41 +101,53 @@ pub(crate) async fn require_admin(
         Err(e) if e.is_authentication_required() => Err(StatusCode::UNAUTHORIZED.into_response()),
         Err(_) => {
             use askama::Template;
-            let mut response = match (crate::templates::AdminRequiredView {}).render() {
-                Ok(body) => (StatusCode::FORBIDDEN, Html(body)).into_response(),
-                Err(_) => StatusCode::FORBIDDEN.into_response(),
-            };
-            // A 403 here means "not root", not "change your password": keep
-            // the HTML auth redirect from sending the user to that form.
-            response
-                .extensions_mut()
-                .insert(crate::html_auth::AdminRequired);
-            Err(response)
+            // Unmarked, so the HTML auth redirect shows this refusal instead
+            // of sending the user to the change-password form.
+            Err(
+                match (crate::templates::AdminRequiredView { i18n: i18n.clone() }).render() {
+                    Ok(body) => (StatusCode::FORBIDDEN, Html(body)).into_response(),
+                    Err(_) => StatusCode::FORBIDDEN.into_response(),
+                },
+            )
         }
     }
 }
 
 /// Build the read-only wiki page router (no static assets — those are public).
 pub(crate) fn build(state: Arc<WebState>) -> Router {
-    Router::new()
-        .route("/", get(index::handler))
-        .route("/graph", get(graph::global_handler))
-        .route("/w/{workspace}/{project}", get(project::handler))
-        .route(
-            "/w/{workspace}/{project}/graph",
-            get(graph::project_handler),
-        )
-        .route("/w/{workspace}/{project}/p/{*path}", get(page::handler))
-        .route("/w/{workspace}/{project}/h/{*path}", get(history::handler))
-        .route(
-            "/w/{workspace}/{project}/s/{session_id}",
-            get(session::handler),
-        )
-        .route("/search", get(search::handler))
-        .route("/pending", get(pending::handler))
-        .route("/workstreams", get(workstreams::handler))
-        .route("/health", get(health::handler))
-        .with_state(state)
+    crate::localization::apply(
+        Router::new()
+            .route("/", get(index::handler))
+            .route("/docs", get(documentation::index))
+            .route("/docs/{slug}", get(documentation::page))
+            .route("/inbox", get(inbox::handler))
+            .route("/inbox/notifications", get(notifications::handler))
+            .route("/messages", post(inbox::send))
+            .route("/messages/{id}/edit", post(inbox::begin_edit))
+            .route("/messages/{id}/save", post(inbox::save_edit))
+            .route("/messages/{id}/release", post(inbox::release_edit))
+            .route(
+                "/w/{workspace}/{project}/agents/{agent}",
+                get(agents::handler),
+            )
+            .route("/graph", get(graph::global_handler))
+            .route("/w/{workspace}/{project}", get(project::handler))
+            .route(
+                "/w/{workspace}/{project}/graph",
+                get(graph::project_handler),
+            )
+            .route("/w/{workspace}/{project}/p/{*path}", get(page::handler))
+            .route("/w/{workspace}/{project}/h/{*path}", get(history::handler))
+            .route(
+                "/w/{workspace}/{project}/s/{session_id}",
+                get(session::handler),
+            )
+            .route("/search", get(search::handler))
+            .route("/pending", get(pending::handler))
+            .route("/workstreams", get(workstreams::handler))
+            .route("/health", get(health::handler))
+            .with_state(state),
+    )
 }
 
 /// Public builtin surface: login, change-password, and static assets.
@@ -138,12 +155,15 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
 /// Statics stay public so the login form can load CSS/logo without a
 /// session; wiki pages remain behind dual-auth on the protected router.
 pub(crate) fn build_public_auth(cfg: Arc<HtmlAuthRedirectConfig>) -> Router {
-    Router::new()
-        .route("/login", get(login::login))
-        .route("/change-password", get(login::change_password))
-        .route("/static/tailwind.css", get(statics::tailwind_css))
-        .route("/static/logo.png", get(statics::logo))
-        .with_state(cfg)
+    crate::localization::apply(
+        Router::new()
+            .route("/login", get(login::login))
+            .route("/change-password", get(login::change_password))
+            .route("/static/tailwind.css", get(statics::tailwind_css))
+            .route("/static/logo.png", get(statics::logo))
+            .route("/static/{font}", get(statics::font))
+            .with_state(cfg),
+    )
 }
 
 /// Build the read-only JSON API router from a shared [`WebState`].

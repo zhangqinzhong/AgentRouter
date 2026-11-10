@@ -34,8 +34,8 @@ public struct LaunchdController: Sendable {
         dataDir: URL?
     ) -> String {
         var rendered = template
-            .replacingOccurrences(of: "__AI_MEMORY_BIN__", with: binary.path)
-            .replacingOccurrences(of: "__HOME__", with: home.path)
+            .replacingOccurrences(of: "__AI_MEMORY_BIN__", with: xmlEscape(binary.path))
+            .replacingOccurrences(of: "__HOME__", with: xmlEscape(home.path))
         if let dataDir {
             let env = """
               <key>EnvironmentVariables</key>
@@ -53,19 +53,14 @@ public struct LaunchdController: Sendable {
     }
 
     public static func programArgumentsBinary(inPlist plist: String) -> String? {
-        // First <string> after ProgramArguments is the executable.
-        guard let argsRange = plist.range(of: "<key>ProgramArguments</key>") else {
+        guard let values = try? PropertyListSerialization.propertyList(
+            from: Data(plist.utf8), format: nil
+        ) as? [String: Any],
+            let arguments = values["ProgramArguments"] as? [String]
+        else {
             return nil
         }
-        let rest = plist[argsRange.upperBound...]
-        guard let start = rest.range(of: "<string>") else {
-            return nil
-        }
-        let after = rest[start.upperBound...]
-        guard let end = after.range(of: "</string>") else {
-            return nil
-        }
-        return String(after[..<end.lowerBound])
+        return arguments.first
     }
 
     public func writePlist(template: String, binary: URL, dataDir: URL?) throws {

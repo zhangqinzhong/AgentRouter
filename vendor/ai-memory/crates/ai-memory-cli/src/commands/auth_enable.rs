@@ -26,6 +26,7 @@ use crate::cli::{AuthEnableArgs, InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::install_mcp::{self, mcp_server_url_from_base};
 use crate::commands::path_util::display_path;
 use crate::config::Config;
+use crate::http_client::display_url;
 use crate::local_auth::{self, HookCredential};
 use crate::server_profiles::{self, ProfileName};
 
@@ -77,10 +78,11 @@ pub(crate) struct EnableOutcome {
 /// Fails when a server profile named `default` would share the token file,
 /// when `servers.toml` or `config.toml` cannot be parsed, or on a failed write.
 pub fn run(config: &Config, args: &AuthEnableArgs, config_path: Option<&Path>) -> Result<()> {
+    let i18n = &config.i18n;
     let locate = |client: McpClient| install_mcp::mcp_config_path(client).ok();
     let locator: Option<ConfigLocator<'_>> = (!args.no_mcp).then_some(&locate as _);
     let outcome = enable(config, config_path, locator)?;
-    print_outcome(&outcome);
+    print_outcome(i18n, &outcome);
     Ok(())
 }
 
@@ -250,13 +252,21 @@ fn rewire_clients(config: &Config, locate: ConfigLocator<'_>) -> Vec<ClientWirin
         let Some(path) = locate(client) else {
             continue;
         };
+        // A client config that fails to parse echoes its offending line, which
+        // can hold the inline bearer; this reason is printed to stdout (exit 0),
+        // so redact the credential out of it (GHSA-6pmr-q79m-87vp item 3).
+        let manual = |e: anyhow::Error| {
+            Wiring::Manual(crate::commands::render_shared::redact_config_echo(
+                &format!("{e:#}"),
+            ))
+        };
         let wiring = match install_mcp::existing_entry_endpoint(client, &path, ENTRY_NAME) {
             Ok(None) => continue,
-            Err(e) => Wiring::Manual(format!("{e:#}")),
+            Err(e) => manual(e),
             Ok(Some(url)) if bare_endpoint(&url) != ours => Wiring::OtherServer(url),
             Ok(Some(url)) => match rewire(config, client, &path, &ours, pinned_flavor(&url)) {
                 Ok(()) => Wiring::Rewired,
-                Err(e) => Wiring::Manual(format!("{e:#}")),
+                Err(e) => manual(e),
             },
         };
         outcome.push(ClientWiring {
@@ -298,58 +308,74 @@ fn rewire(
     install_mcp::run_with_opencode_dialect(config, args, dialect)
 }
 
-fn print_outcome(outcome: &EnableOutcome) {
+fn print_outcome(i18n: &ai_memory_core::i18n::Localizer, outcome: &EnableOutcome) {
     if outcome.already_inline {
         println!(
-            "auth: already required by AI_MEMORY_AUTH_TOKEN or [auth].bearer_token; nothing changed."
-        );
+            "{}", i18n.text("cli-auth-enable-auth-already-required-by-ai-memory-auth-token-or-auth-bearer-token-nothing-c"));
         return;
     }
     println!(
-        "auth: bearer token {} at {} (owner-only)",
-        if outcome.token_created {
-            "generated"
-        } else {
-            "kept"
-        },
-        display_path(&outcome.token_path)
+        "{}",
+        i18n.format(
+            "cli-auth-enable-auth-bearer-token-at-owner-only",
+            &[
+                (
+                    "value0",
+                    (if outcome.token_created {
+                        "generated"
+                    } else {
+                        "kept"
+                    })
+                    .to_string()
+                ),
+                ("value1", display_path(&outcome.token_path).to_string())
+            ]
+        )
     );
     println!(
-        "config: {} {}",
-        if outcome.config_changed {
-            "recorded [auth].bearer_token_file in"
-        } else {
-            "already names the token file:"
-        },
-        display_path(&outcome.config_path)
+        "{}",
+        i18n.format(
+            "cli-setup-config",
+            &[
+                (
+                    "value0",
+                    (if outcome.config_changed {
+                        "recorded [auth].bearer_token_file in"
+                    } else {
+                        "already names the token file:"
+                    })
+                    .to_string()
+                ),
+                ("value1", display_path(&outcome.config_path).to_string())
+            ]
+        )
     );
     match outcome.hooks {
         Some(HookCredential::Seeded) => {
-            println!("hooks: given the token through the hook credential files");
+            println!("{}", i18n.text("cli-auth-enable-hooks-given-the-token-through-the-hook-credential-files"));
         }
-        Some(HookCredential::Current) => println!("hooks: already use the token"),
+        Some(HookCredential::Current) => println!("{}", i18n.text("cli-auth-enable-hooks-already-use-the-token")),
         Some(HookCredential::KeptOther) => println!(
-            "hooks: another credential is stored for them and was kept; re-run \
-             `ai-memory install-hooks --agent <agent> --apply` to switch them to this token"
-        ),
+            "{}", i18n.text("cli-auth-enable-hooks-another-credential-is-stored-for-them-and-was-kept-re-run-ai-memory-in")),
         None => {}
     }
     for line in &outcome.mcp {
         let client = format!("{:?}", line.client);
         match &line.wiring {
             Wiring::Rewired => println!(
-                "mcp {client}: re-registered in {} so it reads the token without holding it",
-                display_path(&line.path)
-            ),
+                "{}", i18n.format("cli-auth-enable-mcp-client-re-registered-in-so-it-reads-the-token-without-holding-it", &[("value0", client.to_string()), ("value1", display_path(&line.path).to_string())])),
             Wiring::OtherServer(url) => {
-                println!("mcp {client}: targets {url}, another server; left unchanged");
+                println!("{}", i18n.format("cli-auth-enable-mcp-client-targets-url-another-server-left-unchanged", &[("value0", client.to_string()), ("value1", display_url(url))]));
             }
             Wiring::Manual(reason) => {
-                println!("mcp {client}: needs a manual change: {reason}");
+                println!("{}", crate::localization::format(i18n, "cli-auth-enable-mcp-client-needs-a-manual-change-reason", &[("value0", client.to_string()), ("value1", reason.to_string())]));
             }
         }
     }
-    println!("Restart the ai-memory server for it to require the token.");
+    println!(
+        "{}",
+        i18n.text("cli-auth-enable-restart-the-ai-memory-server-for-it-to-require-the-token")
+    );
 }
 
 #[cfg(test)]

@@ -260,6 +260,10 @@ pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
     }
     let mut phrases = Vec::new();
     for token in bounded.split_whitespace() {
+        // Grouping must not turn `(title:term)` into an unqualified match.
+        // Like prepare_fts5_token, peel opening parentheses before the column:
+        // https://www.sqlite.org/fts5.html#fts5_column_filters
+        let token = token.trim_start_matches('(');
         let (column, text) = match token.split_once(':') {
             Some((column @ ("title" | "body"), text)) => (Some(column), text),
             _ => (None, token),
@@ -304,7 +308,7 @@ fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>, column: Opti
     run.clear();
 }
 
-fn is_cjk(ch: char) -> bool {
+pub(crate) fn is_cjk(ch: char) -> bool {
     ch.is_alphanumeric()
         && matches!(
         ch as u32,
@@ -373,7 +377,10 @@ fn fts5_query_parses(query: &str) -> bool {
         static PROBE: Option<rusqlite::Connection> = {
             let conn = rusqlite::Connection::open_in_memory().ok();
             if let Some(c) = &conn
-                && c.execute_batch("CREATE VIRTUAL TABLE fts_probe USING fts5(title, body)")
+                && c.execute_batch(
+                    "CREATE VIRTUAL TABLE fts_probe \
+                     USING fts5(title, body, title_parts, body_parts)",
+                )
                     .is_err()
             {
                 None
@@ -419,25 +426,44 @@ fn prepare_fts5_token(token: &str) -> Vec<String> {
     }
 
     // A known column filter keeps its column when its term needs quoting:
-    // `title:ai-memory` becomes `title:("ai-memory" OR "ai memory")`, not a
-    // quoted phrase that also searches for the literal word `title`.
-    // A second colon in the term (`title:10:30`) needs that same quoting:
-    // left bare, FTS5 reads the inner `10` as a column name and rejects the
-    // whole expression, so the query degrades to the bag of words — which
-    // drops the filter and searches every column for the word `title`.
-    if !token.contains('"')
-        && let Some((column, term)) = token.split_once(':')
-        && matches!(column, "title" | "body")
+    // `title:ai-memory` becomes `{title title_parts}:("ai-memory" OR "ai
+    // memory")`, not a quoted phrase that also searches for the literal word
+    // `title`. A second colon in the term (`title:10:30`) needs that same
+    // quoting: left bare, FTS5 reads the inner `10` as a column name and
+    // rejects the whole expression, so the query degrades to the bag of words
+    // — which drops the filter and searches every column for the word `title`.
+    if let Some((column, term)) = token.split_once(':')
+        && let Some(columns) = content_column_set(column)
         && !term.is_empty()
-        && (should_quote_fts5_token(term) || term.contains(':'))
     {
-        return vec![format!("{column}:{}", quote_fts5_token(term))];
+        let term = if !token.contains('"') && (should_quote_fts5_token(term) || term.contains(':'))
+        {
+            quote_fts5_token(term)
+        } else {
+            term.to_owned()
+        };
+        return vec![format!("{columns}:{term}")];
     }
 
     if should_quote_fts5_token(token) {
         vec![quote_fts5_token(token)]
     } else {
         vec![token.to_string()]
+    }
+}
+
+/// The FTS5 column set a user-facing `title:` / `body:` filter searches.
+///
+/// Since V100 (#2013) each content column has a `_parts` twin that indexes
+/// the same text with `-` and `_` turned into spaces. A filter naming only the
+/// original column would miss the parts of a hyphenated word there, so
+/// `title:gateway` would not find a `my-payment-gateway` title that a bare
+/// `gateway` finds. Both `pages_fts` and `observations_fts` carry the twins.
+fn content_column_set(column: &str) -> Option<&'static str> {
+    match column {
+        "title" => Some("{title title_parts}"),
+        "body" => Some("{body body_parts}"),
+        _ => None,
     }
 }
 
@@ -472,11 +498,11 @@ fn quote_fts5_token(token: &str) -> String {
     // Otherwise emit BOTH the whole token and a punctuation-stripped sub-token
     // phrase, OR'd, because the content tokenizer and the path index disagree
     // on punctuation:
-    //   tokenize = "unicode61 remove_diacritics 2 tokenchars '/_-'"
-    // keeps `/ _ -` INSIDE tokens (so a body mention of `ai-memory` indexes as
+    //   tokenize = "unicode61 remove_diacritics 2 tokenchars '_-'"
+    // keeps `_ -` INSIDE tokens (so a body mention of `ai-memory` indexes as
     // the single token `ai-memory`), while `ops::path_search_text` pre-expands
     // `/ . - _` to spaces in the path index (so a path `ui-refresh-…` indexes
-    // the sub-tokens `ui`, `refresh`, …). `.` is a separator either way.
+    // the sub-tokens `ui`, `refresh`, …). `/` and `.` are separators either way.
     // Neither form alone matches both: `"ai-memory"` matches the content token
     // but not the split path index; `"ai memory"` matches the path but not the
     // content token. OR-ing the two makes a search for `ai-memory` / `ui-refresh`
@@ -484,6 +510,12 @@ fn quote_fts5_token(token: &str) -> String {
     // punctuation that would otherwise be FTS5 query grammar — the original
     // `current.md` → `syntax error` bug.) With no punctuation the two coincide
     // and we emit a single phrase.
+    //
+    // Since V100 (#2013) the content index carries both surfaces too: the
+    // `*_parts` generated columns hold `-`/`_` turned into spaces, so `"ai
+    // memory"` also reaches a body that writes `ai-memory`, and a search for
+    // one part (`alpha`) reaches `zebrafinch-marker-alpha`. The OR below stays
+    // as is — it now hits on either column instead of only on the path index.
     //
     // A trailing `*` is the FTS5 prefix operator. Inside a quoted string it is
     // only a separator, so it moves outside each closing quote instead:
@@ -571,9 +603,22 @@ mod tests {
         let title = prepare_cjk_fts5_query("title:支付服务").unwrap();
         assert_eq!(title, "title:\"支付 付服 服务\"");
         assert_parses(&title);
+        for query in ["(title:支付服务)", "((title:支付服务))"] {
+            let grouped = prepare_cjk_fts5_query(query).unwrap();
+            assert_eq!(grouped, title, "query={query}");
+            assert_parses(&grouped);
+        }
         let body = prepare_cjk_fts5_query("body:支付服务").unwrap();
         assert_eq!(body, "body:\"支付 付服 服务\"");
         assert_parses(&body);
+        for query in ["(body:支付服务)", "((body:支付服务))"] {
+            let grouped = prepare_cjk_fts5_query(query).unwrap();
+            assert_eq!(grouped, body, "query={query}");
+            assert_parses(&grouped);
+        }
+        let alternatives = prepare_cjk_fts5_query("((title:支付服务) OR (body:支付服务))").unwrap();
+        assert_eq!(alternatives, format!("{title} OR {body}"));
+        assert_parses(&alternatives);
         let single = prepare_cjk_fts5_query("title:支").unwrap();
         assert_eq!(single, "title:\"支\"");
         assert_parses(&single);
@@ -617,8 +662,10 @@ mod tests {
     /// prepared query must MATCH without error on a real FTS5 table.
     fn assert_parses(prepared: &str) {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE VIRTUAL TABLE t USING fts5(title, body)")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING fts5(title, body, title_parts, body_parts)",
+        )
+        .unwrap();
         let res = conn.query_row(
             "SELECT count(*) FROM t WHERE t MATCH ?1",
             [prepared],
@@ -732,7 +779,10 @@ mod tests {
     fn deliberate_well_formed_syntax_is_preserved() {
         let prepared = prepare_fts5_query("title:handoff OR body:deploy");
         assert_parses(&prepared);
-        assert_eq!(prepared, "title:handoff OR body:deploy");
+        assert_eq!(
+            prepared,
+            "{title title_parts}:handoff OR {body body_parts}:deploy"
+        );
         // Quoted phrases were re-tokenized into escaped-quote form long
         // before the validation fallback existed; the contract here is
         // "still valid FTS5 with AND preserved", not byte identity.
@@ -917,7 +967,10 @@ mod tests {
 
     #[test]
     fn known_columns_are_preserved() {
-        assert_eq!(prepare_fts5_query("title:handoff"), "title:handoff");
+        assert_eq!(
+            prepare_fts5_query("title:handoff"),
+            "{title title_parts}:handoff"
+        );
     }
 
     /// A known column filter whose term carries punctuation keeps the filter
@@ -927,11 +980,11 @@ mod tests {
     fn known_column_filter_survives_quoting_of_its_term() {
         assert_eq!(
             prepare_fts5_query("title:ai-memory"),
-            r#"title:("ai-memory" OR "ai memory")"#
+            r#"{title title_parts}:("ai-memory" OR "ai memory")"#
         );
         assert_eq!(
             prepare_fts5_query("body:current.md OR title:handoff"),
-            r#"body:("current.md" OR "current md") OR title:handoff"#
+            r#"{body body_parts}:("current.md" OR "current md") OR {title title_parts}:handoff"#
         );
         for raw in ["title:ai-memory", "body:a.b c", "title:-", "title:a:b"] {
             let prepared = prepare_fts5_query(raw);
@@ -951,7 +1004,7 @@ mod tests {
     fn known_column_filter_survives_a_second_colon_in_its_term() {
         assert_eq!(
             prepare_fts5_query("title:10:30"),
-            r#"title:("10:30" OR "10 30")"#
+            r#"{title title_parts}:("10:30" OR "10 30")"#
         );
         assert_parses(&prepare_fts5_query("title:10:30"));
     }
@@ -961,14 +1014,17 @@ mod tests {
     /// then searched as the literal word "title".
     #[test]
     fn grouped_known_column_filter_keeps_its_column() {
-        assert_eq!(prepare_fts5_query("(title:handoff)"), "(title:handoff)");
+        assert_eq!(
+            prepare_fts5_query("(title:handoff)"),
+            "({title title_parts}:handoff)"
+        );
         assert_eq!(
             prepare_fts5_query("(title:handoff OR body:deploy)"),
-            "(title:handoff OR body:deploy)"
+            "({title title_parts}:handoff OR {body body_parts}:deploy)"
         );
         assert_eq!(
             prepare_fts5_query("(title:ai-memory) AND deploy"),
-            r#"(title:("ai-memory" OR "ai memory")) AND deploy"#
+            r#"({title title_parts}:("ai-memory" OR "ai memory")) AND deploy"#
         );
         for raw in [
             "(title:handoff)",

@@ -1,0 +1,60 @@
+<section id="token-usage" class="usage-panel section-block" aria-labelledby="token-heading">
+  <div class="usage-heading"><div><p class="eyebrow">{{ i18n.text("web-follow-the-consumption") }}</p><h2 id="token-heading">{{ i18n.text("web-token-usage") }}</h2><p>{{ i18n.text("web-measured-model-responses-usage-updates-every-10-seconds") }}</p></div><span class="usage-status">{{ i18n.text("web-during-sessions") }}</span></div>
+  <div class="usage-metrics">
+    <div><span>{{ i18n.text("web-captured-calls") }}</span><strong>{{ token_usage.count }}</strong></div><div><span>{{ i18n.text("web-fresh-input") }}</span><strong>{{ token_usage.input }}</strong></div><div><span>{{ i18n.text("web-output--usage-panel") }}</span><strong>{{ token_usage.output }}</strong></div><div><span>{{ i18n.text("web-cache-read") }}</span><strong>{{ token_usage.cache_read }}</strong></div><div><span>{{ i18n.text("web-cache-write") }}</span><strong>{{ token_usage.cache_write }}</strong></div><div><span>{{ i18n.text("web-input-from-cache") }}</span><strong>{{ token_usage.hit_rate }}</strong></div>
+  </div>
+  <form class="usage-controls" id="call-query" method="get">
+    <input type="hidden" name="tab" value="tokens"><input type="hidden" name="offset" value="{{ token_usage.observation_offset }}"><input type="hidden" name="limit" value="{{ token_usage.observation_limit }}">
+    <label for="call-filter" class="sr-only">{{ i18n.text("web-filter-calls-by-model-agent-or-response") }}</label><input id="call-filter" name="calls_q" maxlength="256" type="search" placeholder="{{ i18n.text("web-find-a-model-agent-or-response") }}" value="{{ token_usage.search }}" data-filter-calls>
+    <label for="call-signal" class="sr-only">{{ i18n.text("web-filter-investigation-signals") }}</label><select id="call-signal" name="calls_signal" data-filter-calls><option value="all">{{ i18n.text("web-all-responses") }}</option><option value="signals" {% if token_usage.signals_only %}selected{% endif %}>{{ i18n.text("web-investigation-signals") }}</option></select>
+    <label for="call-sort" class="sr-only">{{ i18n.text("web-sort-calls") }}</label><select id="call-sort" name="calls_sort" data-filter-calls><option value="tokens">{{ i18n.text("web-largest-usage-first") }}</option><option value="recent" {% if token_usage.recent %}selected{% endif %}>{{ i18n.text("web-recent-response-time-first") }}</option></select>
+    <label>{{ i18n.text("web-from-utc") }}<input type="datetime-local" step="1" name="calls_from" value="{{ token_usage.from }}" data-filter-calls></label>
+    <label>{{ i18n.text("web-until-utc-exclusive") }}<input type="datetime-local" step="1" name="calls_until" value="{{ token_usage.until }}" data-filter-calls></label>
+    <label>{{ i18n.text("web-model-exact") }}<input type="text" name="calls_model" maxlength="128" value="{{ token_usage.model }}" placeholder="{{ i18n.text("web-all-models") }}" data-filter-calls></label>
+    <label>{{ i18n.text("web-harness") }}<select name="calls_agent" data-filter-calls><option value="">{{ i18n.text("web-all-harnesses") }}</option>{% for agent in token_usage.agents %}<option value="{{ agent.value }}" {% if agent.selected %}selected{% endif %}>{{ agent.label }}</option>{% endfor %}</select></label>
+    <label>{{ i18n.text("web-session-id") }}<input type="text" name="calls_session" value="{{ token_usage.session }}" placeholder="{{ i18n.text("web-all-sessions-in-this-scope") }}" data-filter-calls></label>
+    <label>{{ i18n.text("web-turn-id") }}<input type="text" name="calls_turn" maxlength="128" value="{{ token_usage.turn }}" placeholder="{{ i18n.text("web-all-reported-turns") }}" data-filter-calls></label>
+    <label>{{ i18n.text("web-tool-exact") }}<input type="text" name="calls_tool" maxlength="128" value="{{ token_usage.tool }}" placeholder="{{ i18n.text("web-all-reported-tools") }}" data-filter-calls></label>
+    <button type="submit" class="button-secondary">{{ i18n.text("web-search") }}</button>
+  </form>
+  <div class="usage-results">
+  {% if token_usage.rows.is_empty() %}{% if token_usage.count > 0 %}<p class="usage-filter-empty">{{ i18n.text("web-no-captured-responses-match-this-page-and-these-filters-change-the-search-or-return-t") }}</p>{% else %}<div class="empty-state" style="border:0"><span aria-hidden="true">⌁</span><h3>{{ i18n.text("web-no-response-usage-reported-yet") }}</h3><p>{{ i18n.text("web-updated-claude-code-and-codex-clients-report-usage-during-tool-calls-and-completed-tu") }}</p><p>{{ i18n.text("web-existing-session-totals-remain-visible-in-the-session-table") }}</p></div>{% endif %}{% else %}
+  <div class="usage-scroll" tabindex="0" role="region" aria-label="{{ i18n.text("web-captured-response-usage") }}"><table class="usage-table"><thead><tr><th>{{ i18n.text("web-response-session") }}</th><th>{{ i18n.text("web-model") }}</th><th>{{ i18n.text("web-fresh-input") }}</th><th>{{ i18n.text("web-output--usage-panel") }}</th><th>{{ i18n.text("web-cache--usage-panel") }}</th><th>{{ i18n.text("web-total") }}</th><th>{{ i18n.text("web-signal") }}</th></tr></thead><tbody>
+  {% for row in token_usage.rows %}<tr data-call-row data-total="{{ row.total_value }}" data-observed="{{ row.observed_at }}" data-signal="{% if row.signal != "—" %}yes{% else %}no{% endif %}"><td><a href="{{ row.href }}" title="{{ row.id }}">{{ row.agent }} ↗</a><small class="usage-response-id" title="{{ row.id }}">{{ row.id }}</small><small title="{{ row.time_basis }} · {{ row.recorded_at }}">{{ row.when }}</small><details class="response-context"><summary>{{ i18n.text("web-turn-tools") }}</summary><p>{{ i18n.text("web-session--usage-panel") }} <code>{{ row.session }}</code></p>{% if row.turn != "" %}<p>{{ i18n.text("web-turn") }} <a href="{{ row.turn_href }}">{{ row.turn }}</a></p>{% else %}<p>{{ i18n.text("web-turn-unknown-not-reported-by-this-client") }}</p>{% endif %}{% if row.response_native != "" %}<p>{{ i18n.text("web-native-response") }} <code>{{ row.response_native }}</code></p>{% endif %}<p>{{ row.time_basis }}: <time>{{ row.recorded_at }}</time></p>{% if row.tools.is_empty() %}<p>{{ i18n.text("web-no-tool-association-was-reported") }}</p>{% else %}<ul>{% for tool in row.tools %}<li><a href="{{ tool.href }}">{{ tool.name }}</a> <code>{{ tool.id }}</code><small>{{ tool.relation }}{% if let Some(failed) = tool.is_error %} · {% if failed %}{{ i18n.text("web-error-reported") }}{% else %}{{ i18n.text("web-no-error-reported") }}{% endif %}{% endif %}</small></li>{% endfor %}</ul>{% endif %}</details></td><td>{{ row.model }}</td><td>{{ row.input }}</td><td>{{ row.output }}</td><td>{{ row.cache }}</td><td title="{{ i18n.one("web-value0-tokens", row.total_value) }}"><strong>{{ row.total }}</strong></td><td><span class="{% if row.signal != "—" %}usage-alert{% endif %}">{{ row.signal }}</span></td></tr>{% endfor %}
+  </tbody></table></div><p class="usage-filter-empty" hidden>{{ i18n.text("web-no-captured-responses-match-these-filters") }}</p>{% endif %}
+    <nav class="usage-pagination" aria-label="{{ i18n.text("web-response-pages") }}"><span>{{ i18n.three("web-usage-matching-responses", token_usage.shown_start, token_usage.shown_end, token_usage.matching) }} · {{ i18n.one("web-usage-captured", token_usage.count) }} · {{ i18n.one("web-usage-tokens-in-matches", token_usage.matching_tokens) }}</span>{% if token_usage.previous_href != "" %} <a href="{{ token_usage.previous_href }}" data-call-page>{{ i18n.text("web-previous-responses") }}</a>{% endif %}{% if token_usage.next_href != "" %} <a href="{{ token_usage.next_href }}" data-call-page>{{ i18n.text("web-next-responses") }}</a>{% endif %}</nav>
+  </div>
+  <p class="usage-note">{{ i18n.text("web-dates-use-the-reported-response-time-when-available-otherwise-capture-time-a-shared-t") }}</p>
+  <p class="usage-note" id="token-refresh-status" role="status" aria-live="polite"></p>
+</section>
+<script>
+(function(){
+  var form=document.getElementById("call-query"),timer,controller,stopped=false;
+  if(!form)return;
+  async function load(url){
+    clearTimeout(timer);if(controller)controller.abort();controller=new AbortController();
+    form.setAttribute("aria-busy","true");
+    var request=controller,timeout=setTimeout(function(){request.abort();},5000);
+    history.replaceState(history.state,"",url);
+    document.dispatchEvent(new Event("usage:query"));
+    try{
+      var response=await fetch(url,{credentials:"same-origin",cache:"no-store",signal:request.signal,headers:{"Accept":"text/html"}});
+      if(!response.ok||response.redirected)throw new Error({{ i18n.js("web-query-unavailable")|safe }});
+      var page=new DOMParser().parseFromString(await response.text(),"text/html");
+      if(stopped||controller!==request||location.href!==url.href)return;
+      if(!page.querySelector("#token-usage .usage-results"))throw new Error({{ i18n.js("web-missing-usage")|safe }});
+      var resultFocused=document.querySelector(".usage-results").contains(document.activeElement);
+      document.dispatchEvent(new CustomEvent("usage:response",{detail:page}));
+      if(resultFocused){var target=document.querySelector(".usage-scroll");if(target)target.focus({preventScroll:true});}
+    }catch(_){if(!stopped&&controller===request)document.getElementById("token-refresh-status").textContent={{ i18n.js("web-search-unavailable-showing-the-last-received-values-try-search-again")|safe }};}
+    finally{clearTimeout(timeout);if(controller===request)form.removeAttribute("aria-busy");}
+  }
+  function search(){var url=new URL(location.href);new FormData(form).forEach(function(value,key){url.searchParams.set(key,value);});url.searchParams.delete("calls_offset");load(url);}
+  form.addEventListener("submit",function(event){event.preventDefault();search();});
+  form.addEventListener("input",function(event){if(event.target.matches("[data-filter-calls]")){clearTimeout(timer);timer=setTimeout(search,300);}});
+  form.addEventListener("change",function(event){if(event.target.matches("[data-filter-calls]"))search();});
+  document.addEventListener("click",function(event){var link=event.target.closest("[data-call-page]");if(!link||event.button!==0||event.altKey||event.ctrlKey||event.metaKey||event.shiftKey)return;event.preventDefault();load(new URL(link.href));});
+  window.addEventListener("pagehide",function(){stopped=true;clearTimeout(timer);if(controller)controller.abort();});
+  window.addEventListener("pageshow",function(event){if(event.persisted)stopped=false;});
+})();
+</script>

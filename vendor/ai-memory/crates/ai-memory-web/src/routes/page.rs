@@ -1,5 +1,6 @@
 //! `GET /w/:workspace/:project/p/*path` — rendered markdown page.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use ai_memory_core::PagePath;
@@ -14,7 +15,7 @@ use crate::markdown;
 use crate::state::WebState;
 use crate::templates::{
     NamespaceView, NotFoundView, OutlineItem, PageRow, PageView, RELATED_LIMIT, RelatedRow,
-    encode_segment, history_href, humanize, page_href, project_href,
+    encode_segment, history_href, page_href, project_href,
 };
 
 /// Pages per namespace listing page.
@@ -24,14 +25,18 @@ const NAMESPACE_PAGE_SIZE: usize = 25;
 /// default instead of becoming axum's 400.
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct NamespaceQuery {
+    #[serde(flatten)]
+    knowledge: crate::knowledge::KnowledgeQuery,
     sort: Option<String>,
     page: Option<String>,
 }
 
 /// Handler for `GET /w/:workspace/:project/p/*path`.
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
     query: Result<Query<NamespaceQuery>, QueryRejection>,
 ) -> Response {
@@ -40,7 +45,7 @@ pub(crate) async fn handler(
     let query = query.map(|Query(q)| q).unwrap_or_default();
     let viewer_id = viewer.as_ref().map(|axum::Extension(v)| v.user());
     if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
-        return refusal_response(&refusal);
+        return localized_refusal_response(&i18n, &refusal);
     }
     let meta = match state.reader.page_meta(&workspace, &project, &path).await {
         Ok(Some(m)) => m,
@@ -48,7 +53,8 @@ pub(crate) async fn handler(
         // bundle index's `[_lint/](_lint/)`. Render a listing rather than a
         // bare 404 (#603).
         Ok(None) => {
-            return namespace_or_not_found(&state, &workspace, &project, &path, &query).await;
+            return namespace_or_not_found(&i18n, &state, &workspace, &project, &path, &query)
+                .await;
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -63,7 +69,7 @@ pub(crate) async fn handler(
         .read_page(meta.workspace_id, meta.project_id, &page_path)
     {
         Ok(doc) => doc,
-        Err(_) => return not_found_response(),
+        Err(_) => return not_found_response(&i18n),
     };
 
     // Drop a leading H1 that repeats the title — the template already
@@ -113,6 +119,20 @@ pub(crate) async fn handler(
         outline
     };
 
+    let knowledge = match crate::knowledge::view(
+        &state,
+        &meta,
+        &workspace,
+        &project,
+        viewer_id,
+        super::api::owner_filter_for(actor),
+        &query.knowledge,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
     let project_href = project_href(&workspace, &project);
     let supersedes_path = meta.supersedes.unwrap_or_default();
     let supersedes_href = if supersedes_path.is_empty() {
@@ -134,6 +154,8 @@ pub(crate) async fn handler(
 
     let history_href = history_href(&workspace, &project, &path);
     match (PageView {
+        i18n: i18n.clone(),
+        knowledge,
         workspace,
         project,
         project_href,
@@ -143,8 +165,8 @@ pub(crate) async fn handler(
         tier: meta.tier,
         pinned: meta.pinned,
         expired: meta.expired,
-        updated_relative: humanize(&meta.updated_at),
-        created_relative: humanize(&meta.created_at),
+        updated_relative: i18n.relative(&meta.updated_at),
+        created_relative: i18n.relative(&meta.created_at),
         updated_at: meta.updated_at,
         created_at: meta.created_at,
         supersedes_path,
@@ -195,6 +217,7 @@ fn related_rows(
 /// (directory) if any exist; otherwise 404. Powers the OKF bundle index's
 /// directory links and any relative `dir/` link (#603).
 async fn namespace_or_not_found(
+    i18n: &ai_memory_core::i18n::Localizer,
     state: &Arc<WebState>,
     workspace: &str,
     project: &str,
@@ -203,7 +226,7 @@ async fn namespace_or_not_found(
 ) -> Response {
     let namespace = path.trim_end_matches('/');
     if namespace.is_empty() {
-        return not_found_response();
+        return not_found_response(i18n);
     }
     let prefix = format!("{namespace}/");
     let all = match state.reader.list_unexpired_pages(workspace, project).await {
@@ -215,24 +238,20 @@ async fn namespace_or_not_found(
         .filter(|p| p.path.starts_with(&prefix))
         .collect();
     if under.is_empty() {
-        return not_found_response();
+        return not_found_response(i18n);
     }
     let sort_title = query.sort.as_deref() == Some("title");
     // Titles repeat (session pages), so ties fall back to recency, then path.
-    let newest_first = |a: &PageSummary, b: &PageSummary| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| a.path.cmp(&b.path))
+    let newest_first = |page: &PageSummary| {
+        (
+            Reverse(page.updated_at.parse::<jiff::Timestamp>().ok()),
+            page.path.clone(),
+        )
     };
     if sort_title {
-        under.sort_by(|a, b| {
-            a.title
-                .to_lowercase()
-                .cmp(&b.title.to_lowercase())
-                .then_with(|| newest_first(a, b))
-        });
+        under.sort_by_cached_key(|page| (page.title.to_lowercase(), newest_first(page)));
     } else {
-        under.sort_by(newest_first);
+        under.sort_by_cached_key(newest_first);
     }
     let total = under.len();
     let last_page = total.div_ceil(NAMESPACE_PAGE_SIZE);
@@ -252,7 +271,8 @@ async fn namespace_or_not_found(
             path: p.path,
             title: p.title,
             kind: p.kind,
-            updated_relative: humanize(&p.updated_at),
+            updated_relative: i18n.relative(&p.updated_at),
+            agent_label: None,
         })
         .collect();
     // Resolved against the injected `<base href>`, so a bare `?sort=`
@@ -261,6 +281,7 @@ async fn namespace_or_not_found(
     let sort = if sort_title { "title" } else { "updated" };
     let page_link = |n: usize| format!("{href}?sort={sort}&page={n}");
     match (NamespaceView {
+        i18n: i18n.clone(),
         workspace: workspace.to_owned(),
         project: project.to_owned(),
         project_href: project_href(workspace, project),
@@ -289,20 +310,93 @@ async fn namespace_or_not_found(
 /// whose grant was never issued must not be sent looking for a typo. A
 /// repository that does not exist is still the ordinary not-found page.
 pub(crate) fn refusal_response(refusal: &ai_memory_store::ScopeResolutionError) -> Response {
+    localized_refusal_response(&ai_memory_core::i18n::Localizer::default(), refusal)
+}
+
+pub(crate) fn localized_refusal_response(
+    i18n: &ai_memory_core::i18n::Localizer,
+    refusal: &ai_memory_store::ScopeResolutionError,
+) -> Response {
     if refusal.is_forbidden() {
-        (StatusCode::FORBIDDEN, refusal.to_string()).into_response()
+        // Unmarked (no PasswordChangeRequired): the HTML auth redirect shows
+        // this project refusal as-is instead of sending the user to the
+        // change-password form.
+        (
+            StatusCode::FORBIDDEN,
+            if i18n.tag() == "en" {
+                refusal.to_string()
+            } else {
+                i18n.text("web-project-access-denied")
+            },
+        )
+            .into_response()
     } else if refusal.is_not_found() {
-        not_found_response()
+        not_found_response(i18n)
     } else if refusal.is_bad_request() {
-        (StatusCode::BAD_REQUEST, refusal.to_string()).into_response()
+        (
+            StatusCode::BAD_REQUEST,
+            if i18n.tag() == "en" {
+                refusal.to_string()
+            } else {
+                i18n.text("web-invalid-scope")
+            },
+        )
+            .into_response()
     } else {
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     }
 }
 
-pub(crate) fn not_found_response() -> Response {
-    let html = NotFoundView {}
+pub(crate) fn not_found_response(i18n: &ai_memory_core::i18n::Localizer) -> Response {
+    let html = NotFoundView { i18n: i18n.clone() }
         .render()
         .unwrap_or_else(|_| "<h1>Not found</h1>".to_owned());
     (StatusCode::NOT_FOUND, Html(html)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    use crate::html_auth::{HtmlAuthRedirectConfig, html_auth_redirect_mw};
+
+    /// A project the viewer may not read is a refusal to show, not a
+    /// password gate: behind the browser redirect layer it must stay a 403
+    /// rather than send the viewer to the change-password form.
+    #[tokio::test]
+    async fn project_refusal_is_not_redirected_to_change_password() {
+        let cfg = Arc::new(HtmlAuthRedirectConfig::from_mount("", "/web"));
+        let router = Router::new()
+            .route(
+                "/w/default/private",
+                get(|| async {
+                    super::refusal_response(&ai_memory_store::ScopeResolutionError::Forbidden(
+                        "not authorized for project private".into(),
+                    ))
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                cfg,
+                html_auth_redirect_mw,
+            ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/w/default/private")
+                    .header(header::ACCEPT, "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+    }
 }

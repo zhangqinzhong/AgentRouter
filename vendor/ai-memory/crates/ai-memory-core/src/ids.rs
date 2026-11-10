@@ -314,6 +314,9 @@ pub enum AgentKind {
     /// `~/.qwen/settings.json`.
     #[serde(rename = "qwen-code", alias = "qwen")]
     QwenCode,
+    /// Qoder CLI and IDE. Lifecycle hooks use Claude Code-shaped payloads
+    /// and inject `SessionStart` additional context.
+    Qoder,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -324,7 +327,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -354,6 +357,7 @@ impl AgentKind {
         Self::Dsh,
         Self::Cline,
         Self::QwenCode,
+        Self::Qoder,
         Self::Other,
     ];
 
@@ -390,6 +394,7 @@ impl AgentKind {
             Self::Dsh => "dsh",
             Self::Cline => "cline",
             Self::QwenCode => "qwen-code",
+            Self::Qoder => "qoder",
             Self::Other => "other",
         }
     }
@@ -429,6 +434,7 @@ impl AgentKind {
             "dsh" | "deepseek-harness" | "deepseek_harness" => Self::Dsh,
             "cline" | "cline-cli" => Self::Cline,
             "qwen-code" | "qwen" | "qwencode" => Self::QwenCode,
+            "qoder" => Self::Qoder,
             _ => Self::Other,
         }
     }
@@ -557,7 +563,23 @@ impl AgentKind {
     /// than this envelope, so neither is listed.
     #[must_use]
     pub fn user_prompt_injects_context(self) -> bool {
-        matches!(self, Self::ClaudeCode | Self::Codex | Self::QwenCode)
+        matches!(
+            self,
+            Self::ClaudeCode | Self::Codex | Self::QwenCode | Self::Qoder
+        )
+    }
+
+    /// Whether this agent adds a `SubagentStart` hook's
+    /// `hookSpecificOutput.additionalContext` to the subagent's context.
+    ///
+    /// [`Self::ClaudeCode`] adds it before the subagent's first prompt, within
+    /// the same 10,000-character limit as every hook context string (its hooks
+    /// reference, `SubagentStart` section). No other supported harness
+    /// documents a context channel on its subagent-start event, so the
+    /// `[briefing] inject_on_subagent_start` brief goes to that agent only.
+    #[must_use]
+    pub fn subagent_start_injects_context(self) -> bool {
+        matches!(self, Self::ClaudeCode)
     }
 
     /// Whether `PostToolUse` stdout is model-visible context.
@@ -736,6 +758,16 @@ mod tests {
                     !other.json_context_user_prompt_injects_handoff(),
                     "{other:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn only_one_agent_kind_takes_subagent_start_context() {
+        assert!(AgentKind::ClaudeCode.subagent_start_injects_context());
+        for other in AgentKind::ALL {
+            if other != AgentKind::ClaudeCode {
+                assert!(!other.subagent_start_injects_context(), "{other:?}");
             }
         }
     }
@@ -925,6 +957,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_kind_qoder_round_trips_and_injects_supported_context() {
+        assert_eq!(AgentKind::Qoder.as_str(), "qoder");
+        assert_eq!(AgentKind::from_wire("qoder"), AgentKind::Qoder);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Qoder).unwrap(),
+            "\"qoder\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"qoder\"").unwrap(),
+            AgentKind::Qoder
+        );
+        assert_eq!(AgentKind::from_wire("qoder-cli-2"), AgentKind::Other);
+        assert!(AgentKind::Qoder.session_start_injects_handoff());
+        assert!(!AgentKind::Qoder.user_prompt_injects_handoff());
+        assert!(AgentKind::Qoder.user_prompt_injects_context());
+        assert!(!AgentKind::Qoder.post_tool_injects_handoff());
+        assert!(!AgentKind::Qoder.reuses_session_id_after_end());
+    }
+
+    #[test]
     fn agent_kind_grizzybot_round_trips() {
         assert_eq!(AgentKind::Grizzybot.as_str(), "grizzybot");
         assert_eq!(AgentKind::from_wire("grizzybot"), AgentKind::Grizzybot);
@@ -1027,13 +1079,16 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_context_injection_is_claude_code_codex_and_qwen_code() {
+    fn user_prompt_context_injection_matches_supported_hook_protocols() {
         for agent in AgentKind::ALL {
             assert_eq!(
                 agent.user_prompt_injects_context(),
                 matches!(
                     agent,
-                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::QwenCode
+                    AgentKind::ClaudeCode
+                        | AgentKind::Codex
+                        | AgentKind::QwenCode
+                        | AgentKind::Qoder
                 ),
                 "{}",
                 agent.as_str()

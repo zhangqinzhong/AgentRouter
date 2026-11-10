@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,46 @@ import { MemoryService } from "../../../src/memory/service.ts";
 
 const runtimeDir = path.resolve(process.env.AR_MEMORY_TEST_RUNTIME_DIR || "packages/core/dist/ai-memory");
 const available = existsSync(path.join(runtimeDir, "manifest.json"));
+const previousRuntime = path.resolve(`.cache/ai-memory/3.2.5/${process.platform}-${process.arch}/ai-memory${process.platform === "win32" ? ".exe" : ""}`);
+
+test("memory 3.2.5 data migrates to the bundled runtime with pages and authentication intact", {
+  skip: !available || !existsSync(previousRuntime), timeout: 60_000,
+}, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "ar-memory-upgrade-"));
+  const dataDir = path.join(root, "data");
+  const port = await unusedPort();
+  const endpoint = `http://127.0.0.1:${port}`;
+  const env = { PATH: process.env.PATH, HOME: root, USERPROFILE: root,
+    AI_MEMORY_DATA_DIR: dataDir, AI_MEMORY_BIND: `127.0.0.1:${port}`,
+    AI_MEMORY_SERVER_URL: endpoint, AI_MEMORY_AUTH_TOKEN: "fixture-upgrade-auth",
+    AI_MEMORY_BACKFILL_ON_START: "false", AI_MEMORY_EMBEDDING_PROVIDER: "none" };
+  let child;
+  const service = new MemoryService({ dataDir, home: root, runtimeDir, port });
+  try {
+    execFileSync(previousRuntime, ["--data-dir", dataDir, "init"], { env, stdio: "pipe" });
+    child = spawn(previousRuntime, ["--data-dir", dataDir, "serve", "--transport", "http", "--bind", `127.0.0.1:${port}`, "--enable-web"], { env, stdio: "ignore" });
+    let ready = false;
+    for (let i = 0; i < 100 && !ready; i++) {
+      ready = await fetch(`${endpoint}/api/v1/projects`, { headers: { Authorization: "Bearer fixture-upgrade-auth" } }).then(r => r.ok).catch(() => false);
+      if (!ready) await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(ready, "old runtime must initialize the old database schema");
+    execFileSync(previousRuntime, ["--data-dir", dataDir, "write-page", "--workspace", "upgrade", "--project", "fixture", "--path", "notes/preserved.md", "--body", "# Preserved\nOld-version migration evidence."], { env, stdio: "pipe" });
+    const stopped = new Promise(resolve => child.once("exit", resolve)); child.kill("SIGTERM"); await stopped; child = undefined;
+    const status = await service.request({ action: "start" });
+    assert.equal(status.version, "3.4.5");
+    assert.equal((await fetch(`${endpoint}/api/v1/projects`)).status, 401);
+    const page = await service.request({ action: "read", request: { resource: "page", scope: { workspace: "upgrade", project: "fixture" }, path: "notes/preserved.md" } });
+    assert.match(page.body_markdown, /Old-version migration evidence/);
+    await service.request({ action: "stop" });
+    await service.request({ action: "start" });
+    const again = await service.request({ action: "read", request: { resource: "page", scope: { workspace: "upgrade", project: "fixture" }, path: "notes/preserved.md" } });
+    assert.equal(again.body_markdown, page.body_markdown);
+  } finally {
+    if (child) { const done = new Promise(resolve => child.once("exit", resolve)); child.kill("SIGTERM"); await done; }
+    await service.shutdown(); rmSync(root, { recursive: true, force: true });
+  }
+});
 async function unusedPort() {
   const server = net.createServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));

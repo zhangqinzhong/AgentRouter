@@ -35,9 +35,54 @@ use ai_memory_llm::{
     ProviderConfig, Role, complete_structured,
 };
 
-use super::RetrievalArgs;
 use super::query::{HitContext, QueryOutcome};
 use super::report::QaReportMeta;
+
+/// Shared opt-in QA provider arguments. Both retrieval QA and the abstention
+/// benchmark use this exact construction path so auth/provider behavior cannot
+/// drift between evaluators.
+#[derive(clap::Args, Debug, Default)]
+pub struct QaArgs {
+    /// Enable live-LLM QA. OFF by default; missing credentials produce a skip.
+    #[arg(long = "qa")]
+    pub enabled: bool,
+    /// QA answerer/judge provider.
+    #[arg(long)]
+    qa_provider: Option<String>,
+    /// QA answerer model id.
+    #[arg(long)]
+    qa_model: Option<String>,
+    /// QA answerer base URL (omit for native vendors).
+    #[arg(long)]
+    qa_base_url: Option<String>,
+    /// QA answerer API key. Prefer `--qa-api-key-env`.
+    #[arg(long)]
+    qa_api_key: Option<String>,
+    /// Env var containing the QA answerer API key.
+    #[arg(long)]
+    qa_api_key_env: Option<String>,
+    /// Auth file for OAuth/Codex/Copilot answerers.
+    #[arg(long)]
+    qa_token_file: Option<std::path::PathBuf>,
+    /// QA grader provider; defaults to the answerer.
+    #[arg(long)]
+    qa_grader_provider: Option<String>,
+    /// QA grader model; defaults to the answerer.
+    #[arg(long)]
+    qa_grader_model: Option<String>,
+    /// QA grader base URL; defaults to the answerer.
+    #[arg(long)]
+    qa_grader_base_url: Option<String>,
+    /// QA grader API key; defaults to the answerer.
+    #[arg(long)]
+    qa_grader_api_key: Option<String>,
+    /// Env var for the QA grader API key; defaults to the answerer.
+    #[arg(long)]
+    qa_grader_api_key_env: Option<String>,
+    /// QA grader auth file; defaults to the answerer.
+    #[arg(long)]
+    qa_grader_token_file: Option<std::path::PathBuf>,
+}
 
 /// chars/4 heuristic divisor, matching `query.rs`'s context-token estimate.
 const CHARS_PER_TOKEN: usize = 4;
@@ -52,6 +97,9 @@ const GRADE_MAX_TOKENS: u32 = 256;
 pub struct QaOutcome {
     /// LLM-judge verdict: did the candidate correctly answer the question?
     pub correct: bool,
+    /// Structured evidence-sufficiency verdict from synthesis (or from the
+    /// server answer's validated citation presence).
+    pub answerability: Answerability,
     /// Where the candidate came from: `synthesized` (harness LLM over the
     /// retrieved snippets) or `memory_query` (a server-provided `answer`).
     pub answer_source: &'static str,
@@ -70,10 +118,25 @@ pub struct QaOutcome {
 
 /// Answer synthesized from retrieved snippets (structured output).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct SynthesizedAnswer {
-    /// The answer to the question, grounded strictly in the snippets, or
-    /// "I don't know." when the snippets do not contain it.
+pub(crate) struct SynthesizedAnswer {
+    /// Typed verdict; evaluators never infer abstention from answer prose.
+    answerability: Answerability,
+    /// The answer to the question, grounded strictly in the snippets.
     answer: String,
+}
+
+/// Structured answerability classification used by both QA evaluators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Answerability {
+    /// The snippets contain enough evidence for the requested answer.
+    Answerable,
+    /// The snippets do not contain enough evidence.
+    Insufficient,
+    /// The snippets contain incompatible live claims.
+    Conflicting,
+    /// The snippets support only part of the requested answer.
+    Partial,
 }
 
 /// LLM-as-judge verdict (structured output), LongMemEval-style.
@@ -106,7 +169,7 @@ impl QaEngine {
     /// provider's key is used when the operator does not name one, so
     /// `--qa --qa-provider gemini --qa-model <m>` works with `GEMINI_API_KEY`
     /// already in the environment.
-    pub fn resolve(args: &RetrievalArgs) -> Result<Self> {
+    pub fn resolve(args: &QaArgs) -> Result<Self> {
         let Some(answer_provider_str) = args.qa_provider.as_deref() else {
             bail!("QA mode needs --qa-provider (e.g. anthropic|gemini|openai|openai-compat)");
         };
@@ -178,18 +241,36 @@ impl QaEngine {
         gold_answer: &str,
         outcome: &QueryOutcome,
     ) -> Result<QaOutcome> {
-        let (answer, answer_source, answer_latency_ms, answer_tokens) = match &outcome.answer {
-            // Future `answer=true` feature: the server already produced the
-            // answer, so grade it directly (no synthesis call).
-            Some(server_answer) => (server_answer.clone(), "memory_query", 0u128, 0usize),
-            None => {
-                let synth = self.synthesize(question, &outcome.contexts).await?;
-                (synth.answer, "synthesized", synth.latency_ms, synth.tokens)
-            }
-        };
+        let (answer, answerability, answer_source, answer_latency_ms, answer_tokens) =
+            match &outcome.answer {
+                // Future `answer=true` feature: the server already produced the
+                // answer, so grade it directly (no synthesis call).
+                Some(server_answer) => (
+                    server_answer.text.clone(),
+                    if server_answer.citations.is_empty() {
+                        Answerability::Insufficient
+                    } else {
+                        Answerability::Answerable
+                    },
+                    "memory_query",
+                    0u128,
+                    0usize,
+                ),
+                None => {
+                    let synth = self.synthesize(question, &outcome.contexts).await?;
+                    (
+                        synth.answer,
+                        synth.answerability,
+                        "synthesized",
+                        synth.latency_ms,
+                        synth.tokens,
+                    )
+                }
+            };
         let grade = self.grade(question, gold_answer, &answer).await?;
         Ok(QaOutcome {
             correct: grade.correct,
+            answerability,
             answer_source,
             answer,
             grade_reason: grade.reason,
@@ -200,7 +281,11 @@ impl QaEngine {
 
     /// Synthesize an answer from the retrieved snippets (the context an agent
     /// would actually get), measuring latency and a chars/4 token estimate.
-    async fn synthesize(&self, question: &str, contexts: &[HitContext]) -> Result<SynthResult> {
+    pub(crate) async fn synthesize(
+        &self,
+        question: &str,
+        contexts: &[HitContext],
+    ) -> Result<SynthResult> {
         let user = synthesis_user_prompt(question, contexts);
         let prompt_chars = SYNTHESIS_SYSTEM.chars().count() + user.chars().count();
         let request = ChatRequest {
@@ -218,6 +303,7 @@ impl QaEngine {
         let tokens = (prompt_chars + out.answer.chars().count()).div_ceil(CHARS_PER_TOKEN);
         Ok(SynthResult {
             answer: out.answer,
+            answerability: out.answerability,
             latency_ms,
             tokens,
         })
@@ -240,10 +326,11 @@ impl QaEngine {
 }
 
 /// Internal synthesis result carrier.
-struct SynthResult {
-    answer: String,
-    latency_ms: u128,
-    tokens: usize,
+pub(crate) struct SynthResult {
+    pub answer: String,
+    pub answerability: Answerability,
+    pub latency_ms: u128,
+    pub tokens: usize,
 }
 
 /// Convenience: borrow an inner `Option<String>` as `Option<&str>`, falling
@@ -259,8 +346,9 @@ impl OrRef for Option<String> {
 
 const SYNTHESIS_SYSTEM: &str = "You answer a user's question using ONLY the memory snippets \
     retrieved for them. Base your answer strictly on those snippets — do not use outside \
-    knowledge or guess. Be concise and factual. If the snippets do not contain the answer, \
-    reply exactly: I don't know.";
+    knowledge or guess. Classify `answerability` as `answerable`, `insufficient`, `conflicting`, \
+    or `partial`, then give a concise factual `answer`. For anything except `answerable`, explain \
+    the evidence limitation without filling the gap from outside knowledge.";
 
 const GRADE_SYSTEM: &str = "You are a strict grader for a long-term-memory QA benchmark. Given a \
     question, the gold (reference) answer, and a candidate answer, decide whether the candidate \
@@ -383,6 +471,7 @@ fn build_llm_provider(
         // Comparisons must not differ by engine-side thinking behaviour;
         // keep the product default (off) for every candidate.
         compat_disable_thinking: false,
+        compat_stream: None,
         request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
         reasoning_effort: None,
         extra_headers: ai_memory_llm::ExtraHeaders::default(),
@@ -427,6 +516,22 @@ mod tests {
         assert!(p.contains("Question:\nQ?"));
         assert!(p.contains("Gold answer:\ngold-x"));
         assert!(p.contains("Candidate answer:\ncand-y"));
+    }
+
+    #[test]
+    fn synthesis_requires_structured_answerability() {
+        let parsed: SynthesizedAnswer = serde_json::from_value(serde_json::json!({
+            "answerability": "insufficient",
+            "answer": "The snippets do not contain the port."
+        }))
+        .unwrap();
+        assert_eq!(parsed.answerability, Answerability::Insufficient);
+        assert!(
+            serde_json::from_value::<SynthesizedAnswer>(serde_json::json!({
+                "answer": "I don't know."
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -495,6 +600,7 @@ mod tests {
             .await
             .expect("QA evaluate succeeds with a live provider");
         assert_eq!(qa.answer_source, "synthesized");
+        assert_eq!(qa.answerability, Answerability::Answerable);
         assert!(qa.correct, "expected the judge to accept: {qa:?}");
     }
 }

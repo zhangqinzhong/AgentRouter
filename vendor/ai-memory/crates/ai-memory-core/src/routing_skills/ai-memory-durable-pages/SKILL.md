@@ -10,7 +10,15 @@ Use this skill only for deliberate durable wiki mutations. Routine session captu
 
 ## Tools in this cluster
 
-- `memory_write_page` writes a durable wiki page for permanent project knowledge.
+- `memory_resolve_write_target` validates and canonicalizes an exact existing
+  writable destination without creating or changing it. Bulk importers use it
+  before their first write.
+- `memory_write_page` writes or replaces a durable wiki page for permanent project knowledge.
+- `memory_write_pages_batch` writes a bounded set of complete page versions
+  atomically for a bulk importer. Every entry must be conditional; do not use
+  it for routine notes.
+- `memory_patch_page` atomically changes named Markdown sections in an existing
+  page without re-emitting its frontmatter or unrelated body.
 - `memory_delete_page` removes a durable wiki page by exact path.
 - `memory_restore_page` lists a page's checkpoints (no `rev`) or writes an
   earlier version back (with `rev`), including a deleted page. It is admin
@@ -27,12 +35,32 @@ Optional top-level metadata: `kind` (64 characters), `entities` (10 names,
 and `relations` (an object mapping `causes`, `fixes`, or `contradicts` to page
 target arrays, 32 targets total, 1,024 characters each). Relation targets use
 `path`, `project:path`, or `workspace/project:path`; extensionless page paths
-resolve with `.md`, and scope components must already be trimmed. Limits apply
+resolve with `.md`, and scope components must already be trimmed. A page that
+describes repository files can name them in `source_files`: up to 16
+`{path, commit}` entries, each a repository-relative `/`-separated path and the
+7-64 hex commit (`git rev-parse HEAD`) the page was checked against. The server
+never reads those files; when one changed since its commit, a client records
+`memory_feedback` with `signal: "stale"`, and rewriting the page with the new
+commit clears the flag. Limits apply
 to raw values before trimming, normalization or deduplication. Arbitrary
 frontmatter and author fields are not editable.
-Every write replaces the whole page and its metadata; omitted fields are
-cleared. Read the current page first when preserving existing content matters.
-There is no patch or compare-and-write precondition.
+Every `memory_write_page` call replaces the whole page and its metadata;
+omitted fields are cleared. Read the current page first when preserving
+existing content matters, and pass its returned `page_id` as
+`expected_page_id` so a concurrent change fails without writing. Use
+`create_only: true` when the page must not already exist; do not combine the
+two preconditions.
+
+For a targeted edit, prefer `memory_patch_page`: read the page, pass its
+required `page_id` as `expected_page_id`, and submit one bounded batch.
+`append` with `target: "section"` takes a heading `anchor` from the read
+response, and with `target: "end_of_page"` takes none; `add_section` takes a
+new level 2-6 heading such as `## Decisions`; `replace_section` takes an
+`anchor` and must also carry that section's returned `sha256` as
+`section_sha256`.
+All edits resolve against the same captured body and either commit together or
+write nothing. Missing, duplicate, stale, or conflicting anchors fail closed.
+Use `memory_write_page` when replacing the whole document.
 
 When the user explicitly wants a note to be temporary, pass `expires_at` as an
 RFC3339 instant or a bare `YYYY-MM-DD` (the end of that day in UTC). After the

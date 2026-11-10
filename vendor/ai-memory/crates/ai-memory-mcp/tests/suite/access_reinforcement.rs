@@ -41,7 +41,7 @@ fn mount(server: AiMemoryServer) -> Router {
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     Router::new().nest_service("/mcp", service)
@@ -268,7 +268,7 @@ async fn read_page_throttle_no_double_bump() {
 }
 
 /// The bump is additive: a plain read's response payload is exactly the
-/// documented fields, unchanged by reinforcement.
+/// documented fields, including bounded patch tokens, and no access metadata.
 #[tokio::test]
 async fn read_page_response_payload_unchanged() {
     let h = harness().await;
@@ -285,7 +285,17 @@ async fn read_page_response_payload_unchanged() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["body", "frontmatter", "page_id", "path", "title"],
+        vec![
+            "body",
+            "frontmatter",
+            "page_id",
+            "path",
+            "sections",
+            "sections_truncated",
+            "title",
+            "total_chars",
+            "truncated",
+        ],
         "reinforcement must not add fields to the read_page payload: {resp}"
     );
 }

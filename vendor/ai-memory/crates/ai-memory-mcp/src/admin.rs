@@ -24,7 +24,7 @@
 //! - `POST /admin/embed`          — backfill embeddings for latest pages.
 //! - `POST /admin/commit`         — stage + commit the wiki tree via git.
 //! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
-//! - `POST /admin/restore-page`   — restore one page from a checkpoint.
+//! - `POST /admin/restore-page`   — restore one page from retained history.
 //! - `POST /admin/purge-project`  — delete a project's rows and wiki files
 //!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
 //! - `POST /admin/purge-session`  — delete one session and what it derived.
@@ -33,6 +33,8 @@
 //!   computes them from local transcripts; see `ai-memory
 //!   repair-backfill-timestamps`).
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
+//! - `POST /admin/adopt-project-identity` — move an empty project's repository
+//!   identity onto the project holding the checkout's sessions (#1993).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
 //! - `POST /admin/reclaim-ledger-versions` — drop the superseded ledger
@@ -42,6 +44,7 @@
 //! - `POST /admin/merge-workspace` — fold every project of one workspace into
 //!   another, then delete the emptied source workspace.
 //! - `POST /admin/move-project`   — move a project into another workspace
+//! - `POST /admin/merge-project`  — losslessly join two projects in one workspace
 //!   (copy latest pages via the write path, then purge the source).
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
 //! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
@@ -69,9 +72,12 @@ use ai_memory_consolidate::{
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
-    DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    DEFAULT_WORKSPACE_NAME, PageId, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
-use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
+use ai_memory_llm::{
+    ChatRequest, Embedder, LlmProviders, LlmWorkload, ProviderHealth, ProviderHealthSnapshot,
+    error_status_and_message,
+};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AuditLogFilter, AutoImproveProposalOperation,
     AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool,
@@ -79,7 +85,8 @@ use ai_memory_store::{
     StoreError, WriterHandle, f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
 use ai_memory_wiki::{
-    AdmissionContext, AdmissionOp, Markdown, SessionPageFile, Wiki, WikiError, WritePageRequest,
+    AdmissionContext, AdmissionOp, Markdown, MergeProjectFile, SessionPageFile, Wiki, WikiError,
+    WritePageRequest,
 };
 use axum::Json;
 use axum::Router;
@@ -109,6 +116,111 @@ struct SweepTuning {
     compact_cold_episodic: bool,
 }
 
+/// Admission control for live `/admin/bootstrap` runs.
+///
+/// A run spends minutes in LLM calls and milliseconds writing pages, so
+/// one server-wide mutex leaves a local provider idle while callers for
+/// other projects queue behind it. The wiki's own commit lock already
+/// serialises `commit_all`, which is what the original mutex protected
+/// before that lock existed. Two guards remain:
+///
+/// - `slots` bounds how many runs call the LLM at once
+///   (`bootstrap_max_concurrent`, default 1: the previous behaviour).
+/// - one run per project at a time, so a second run for the same project
+///   waits and then reads the first run's manifest (`AlreadyBootstrapped`)
+///   instead of racing it and spending the LLM calls twice.
+#[derive(Clone)]
+pub struct BootstrapGate {
+    slots: Arc<tokio::sync::Semaphore>,
+    projects: Arc<std::sync::Mutex<BootstrapProjectLocks>>,
+}
+
+type BootstrapProjectLocks =
+    std::collections::HashMap<(WorkspaceId, ProjectId), Arc<tokio::sync::Mutex<()>>>;
+
+impl BootstrapGate {
+    /// Gate allowing up to `max_concurrent` live runs; zero is treated as one.
+    #[must_use]
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
+            projects: Arc::new(std::sync::Mutex::new(BootstrapProjectLocks::new())),
+        }
+    }
+
+    /// Wait for this project's turn, then for a free slot. The project lock
+    /// is taken first so a caller queued behind its own project never holds
+    /// a slot another project could use.
+    async fn acquire(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> Result<BootstrapPermit, tokio::sync::AcquireError> {
+        let project_lock = {
+            let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(projects.entry((ws, proj)).or_default())
+        };
+        let project = match Arc::clone(&project_lock).try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                info!(
+                    "another bootstrap of this project is in progress; queueing — \
+                     this request waits for it to finish"
+                );
+                project_lock.lock_owned().await
+            }
+        };
+        let slot = match Arc::clone(&self.slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                info!(
+                    "bootstrap_max_concurrent runs are in progress; queueing — \
+                     this request waits for a free slot"
+                );
+                Arc::clone(&self.slots).acquire_owned().await?
+            }
+        };
+        Ok(BootstrapPermit {
+            _slot: slot,
+            project: Some(project),
+            key: (ws, proj),
+            projects: Arc::clone(&self.projects),
+        })
+    }
+}
+
+impl Default for BootstrapGate {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+/// Held for the whole live run. Dropping it frees the slot and the project
+/// lock, and forgets the project's entry once nobody else waits on it, so
+/// the map stays as small as the set of projects currently bootstrapping.
+struct BootstrapPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    project: Option<tokio::sync::OwnedMutexGuard<()>>,
+    key: (WorkspaceId, ProjectId),
+    projects: Arc<std::sync::Mutex<BootstrapProjectLocks>>,
+}
+
+impl Drop for BootstrapPermit {
+    fn drop(&mut self) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        // Release under the map lock: a new caller clones the entry under
+        // that same lock, so a count of one (the map's own) means no caller
+        // holds or awaits it and the entry can go.
+        self.project = None;
+        if projects
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            projects.remove(&self.key);
+        }
+    }
+}
+
 /// Shared state for the admin router.
 #[derive(Clone)]
 pub struct AdminState {
@@ -118,8 +230,8 @@ pub struct AdminState {
     pub reader: ReaderPool,
     /// Wiki handle — pages are written here.
     pub wiki: Wiki,
-    /// Optional LLM provider. When `None`, bootstrap returns 503.
-    pub llm: Option<Arc<dyn LlmProvider>>,
+    /// LLM providers selected by workload, with a default provider.
+    pub llm_providers: LlmProviders,
     /// If true, auto-improve leaves staged proposals pending for manual
     /// approval; otherwise it approves them immediately through the normal wiki
     /// write path.
@@ -158,13 +270,10 @@ pub struct AdminState {
     /// Server home directory resolved once at config load. Used to keep admin
     /// audits consistent with the hook router's cwd-prefix guard.
     pub home_dir: Option<String>,
-    /// Serialises concurrent bootstrap requests. Bootstrap fans out
-    /// into an LLM call + a multi-page wiki write + a git commit;
-    /// running two in parallel would race the `commit_all` git ops and
-    /// stack LLM cost unnecessarily. The mutex is held for the entire
-    /// handler so a second caller waits its turn (request stays open
-    /// until the lock is acquired, then proceeds normally).
-    pub bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Admission control for live bootstrap runs: a bounded number at
+    /// once, one per project. A queued caller's request stays open until
+    /// its turn, then proceeds normally. See [`BootstrapGate`].
+    pub bootstrap_gate: BootstrapGate,
     /// Per-server token pepper, used by `/admin/api-credentials` to hash
     /// freshly-issued `aim_` secrets before they land in
     /// `api_credentials.token_hash`. `None` when the operator hasn't set
@@ -465,6 +574,8 @@ const MESSAGE_BODY_MAX_CHARS: usize = 8000;
 
 /// Subject cap for `POST /admin/messages/send` (V64).
 const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
+/// Supporting evidence cap for cross-project messages (#1428).
+const MESSAGE_EVIDENCE_MAX_CHARS: usize = 1_000;
 
 #[derive(Debug, Deserialize)]
 struct PendingWritesQuery {
@@ -678,6 +789,7 @@ pub fn admin_router_with_sweep_tuning(
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/llm-test", post(handle_llm_test))
         .route("/admin/metrics", get(handle_metrics))
         .route("/admin/projects", get(handle_list_projects))
         .route("/admin/project-coordinate", get(handle_project_coordinate))
@@ -702,7 +814,12 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
+        .route(
+            "/admin/adopt-project-identity",
+            post(handle_adopt_project_identity),
+        )
         .route("/admin/move-project", post(handle_move_project))
+        .route("/admin/merge-project", post(handle_merge_project))
         .route("/admin/move-session", post(handle_move_session))
         .route(
             "/admin/repair-session-times",
@@ -1276,7 +1393,48 @@ pub struct StatusReport {
     /// Wiki-format state: whether the OKF migration has run, and the
     /// pre-migration backup archive if its receipt still exists.
     pub wiki_format: WikiFormatStatus,
+    /// SessionEnd consolidation queue: counts plus the sessions that gave up,
+    /// so a watchdog can re-run them once the cause is fixed (#1692).
+    pub consolidation: ConsolidationStatus,
 }
+
+/// Consolidation section of [`StatusReport`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConsolidationStatus {
+    /// Jobs waiting for a worker, including ones backing off to retry.
+    pub pending: u64,
+    /// Jobs a worker holds right now.
+    pub running: u64,
+    /// Jobs that finished.
+    pub completed: u64,
+    /// Jobs that gave up after their attempts.
+    pub failed: u64,
+    /// Most recent failures, newest first, bounded to
+    /// [`CONSOLIDATION_FAILED_SESSIONS_CAP`]. The session id is what a
+    /// re-consolidation needs; the error is the worker's own bounded text,
+    /// scrubbed before it leaves the server.
+    pub failed_sessions: Vec<FailedConsolidationSession>,
+}
+
+/// One failed session in [`ConsolidationStatus::failed_sessions`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct FailedConsolidationSession {
+    /// Session whose consolidation gave up.
+    pub session_id: String,
+    /// Provider attempts spent on it.
+    pub attempts: u32,
+    /// Unix microseconds of the final failure.
+    pub failed_at_us: i64,
+    /// Bounded, scrubbed error the worker recorded.
+    pub last_error: String,
+}
+
+/// How many failed sessions one status response carries. The counts above
+/// stay exact; the list is a sample, newest first, so the payload cannot grow
+/// with the backlog.
+pub const CONSOLIDATION_FAILED_SESSIONS_CAP: u32 = 20;
+/// Longest error text one failed session carries, in characters.
+const CONSOLIDATION_ERROR_CHARS: usize = 200;
 
 /// Wiki-format section of [`StatusReport`].
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1308,6 +1466,61 @@ async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl Into
     }
 }
 
+/// `POST /admin/llm-test` — probe the server's own configured chat provider.
+///
+/// `ai-memory llm-test` builds a provider from the *caller's* environment,
+/// which is the wrong one when the server runs in a container or on another
+/// host: its keys exist only there, so following the health report's retry
+/// hint failed while the server was healthy (#1639). This runs the provider
+/// the server configured, with a fixed short prompt, and answers with the
+/// same status class and bounded message the health snapshot records — never
+/// the request, the reply text or the provider's full body.
+async fn handle_llm_test(State(state): State<Arc<AdminState>>) -> Response {
+    let Some(llm) = state.llm_providers.default.as_ref().cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this server has no default LLM provider configured; set one in its config and restart it",
+            })),
+        )
+            .into_response();
+    };
+    let mut request = ChatRequest::user_prompt("ping".to_owned());
+    request.temperature = Some(0.2);
+    let started = std::time::Instant::now();
+    let elapsed = |started: std::time::Instant| started.elapsed().as_millis() as u64;
+    match llm.complete(request).await {
+        Ok(response) => Json(serde_json::json!({
+            "ok": true,
+            "provider": llm.name(),
+            "model": response.model,
+            "latency_ms": elapsed(started),
+            "reply_chars": response.text.chars().count(),
+        }))
+        .into_response(),
+        Err(error) => {
+            let (status, message) = error_status_and_message(&error);
+            // A provider body can quote the key it rejected. The health
+            // snapshot's own copy is bounded but not scrubbed; this one is
+            // printed into an operator's terminal, so it goes through the
+            // privacy strip first.
+            let message = state.wiki.sanitizer().scrub(&message);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "provider": llm.name(),
+                    "model": llm.model(),
+                    "latency_ms": elapsed(started),
+                    "error": message,
+                    "status": status,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     // Count "missing" against the configured embedder's stored triple, so
     // a model swap cannot read as a fully covered index; with no embedder
@@ -1335,6 +1548,9 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     .unwrap_or(false);
                 let backup = ai_memory_wiki::backup::BackupReceipt::load(&state.data_dir)
                     .filter(ai_memory_wiki::backup::BackupReceipt::archive_present);
+                let consolidation =
+                    consolidation_status(&state, &state.reader.session_consolidation_queue().await)
+                        .await;
                 let report = StatusReport {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     data_dir: state.data_dir.display().to_string(),
@@ -1353,6 +1569,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                             .map(|r| r.archive_path.display().to_string()),
                         backup_archive_bytes: backup.as_ref().map(|r| r.size_bytes),
                     },
+                    consolidation,
                 };
                 (
                     StatusCode::OK,
@@ -1368,6 +1585,50 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+/// The consolidation section of a status report.
+///
+/// A failure to read the queue degrades to zeros, like the storage figures
+/// above: `status` is also the health probe, and a queue query must not take
+/// the whole answer down.
+async fn consolidation_status(
+    state: &AdminState,
+    queue: &Result<ai_memory_store::SessionConsolidationQueue, ai_memory_store::StoreError>,
+) -> ConsolidationStatus {
+    let queue = queue.as_ref().copied().unwrap_or_default();
+    let failed_sessions = match state
+        .reader
+        .failed_consolidation_jobs(CONSOLIDATION_FAILED_SESSIONS_CAP)
+        .await
+    {
+        Ok(jobs) => jobs
+            .into_iter()
+            .map(|job| FailedConsolidationSession {
+                session_id: job.session_id,
+                attempts: job.attempts,
+                failed_at_us: job.failed_at_us,
+                // The worker truncates what it records, but that text comes
+                // from a provider body: scrub it before an operator's terminal
+                // sees it, exactly like `/admin/llm-test`.
+                last_error: state
+                    .wiki
+                    .sanitizer()
+                    .scrub(&job.last_error)
+                    .chars()
+                    .take(CONSOLIDATION_ERROR_CHARS)
+                    .collect(),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    ConsolidationStatus {
+        pending: queue.pending,
+        running: queue.running,
+        completed: queue.completed,
+        failed: queue.failed,
+        failed_sessions,
     }
 }
 
@@ -2365,36 +2626,26 @@ async fn handle_bootstrap(
     }
 
     // Live runs from here on need LLM + workspace/project resolution.
-    if state.llm.is_none() {
+    let Some(llm) = state.llm_providers.get(LlmWorkload::Bootstrap).cloned() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "LLM provider not configured on server"
             })),
         ));
-    }
+    };
     let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
     let (ws, proj) = target.scope.as_tuple();
 
-    // Serialise live bootstrap runs. Two parallel `process_sources`
-    // calls would race the wiki's `commit_all` (libgit2 ops on the
-    // same repo) and stack LLM cost unnecessarily. The wait is
-    // operator-visible only in log lines; the request stays open
-    // until the lock is acquired, then proceeds normally.
-    if state.bootstrap_lock.try_lock().is_err() {
-        info!(
-            "another bootstrap is in progress; queueing — \
-             this request waits for the active one to finish"
-        );
-    }
-    let _bootstrap_guard = state.bootstrap_lock.lock().await;
-
-    let llm = Arc::clone(
-        state
-            .llm
-            .as_ref()
-            .expect("llm is Some: checked above (non-dry-run without LLM returns 503)"),
-    );
+    // Bounded, one run per project; see `BootstrapGate`. The wait is
+    // operator-visible only in log lines.
+    let _bootstrap_permit = state.bootstrap_gate.acquire(ws, proj).await.map_err(|e| {
+        log_server_error(StatusCode::INTERNAL_SERVER_ERROR, "bootstrap", &e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
 
     let cfg = BootstrapConfig {
         // repo_path is unused by process_sources — the path field is
@@ -2556,7 +2807,7 @@ async fn handle_auto_improve(
         ));
     }
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
-    let Some(llm) = state.llm.as_ref().cloned() else {
+    let Some(llm) = state.llm_providers.get(LlmWorkload::AutoImprove).cloned() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -3266,8 +3517,12 @@ async fn handle_expire_handoffs(
     let owner_filter = ai_memory_core::OwnerFilter::for_actor_context(&actor);
     let author_id = author_ext.map(|axum::Extension(u)| u);
 
+    // Saturating like the other `*_days` windows here: a span past the
+    // timestamp range is "older than anything", not a wrapped future cutoff.
     let older_than_us = req.older_than_days.map(|days| {
-        jiff::Timestamp::now().as_microsecond() - i64::from(days) * 24 * 60 * 60 * 1_000_000
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(days).saturating_mul(US_PER_DAY))
     });
 
     match state
@@ -3331,6 +3586,10 @@ struct SendMessageRequest {
     to_project: String,
     #[serde(default)]
     subject: Option<String>,
+    #[serde(default)]
+    nature: ai_memory_core::MessageNature,
+    #[serde(default)]
+    evidence: Option<String>,
     body: String,
 }
 
@@ -3383,6 +3642,21 @@ async fn handle_send_message(
             ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS)
         })
         .filter(|s| !s.is_empty());
+    let evidence = req
+        .evidence
+        .as_deref()
+        .map(|value| {
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(value), MESSAGE_EVIDENCE_MAX_CHARS)
+        })
+        .filter(|value| !value.trim().is_empty());
+    if req.nature == ai_memory_core::MessageNature::Measured && evidence.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "evidence_required: measured messages require non-empty evidence"
+            })),
+        );
+    }
 
     let distinguishes = match state
         .reader
@@ -3411,8 +3685,11 @@ async fn handle_send_message(
         from_owner_user,
         to_workspace_id: to_ws,
         to_project_id: to_proj,
+        to_agent: None,
         subject,
         body,
+        nature: req.nature,
+        evidence,
     };
 
     // Match MCP's crossing-point admission and post-commit observer ordering.
@@ -3459,6 +3736,8 @@ async fn handle_send_message(
 /// `POST /admin/messages/pop` request body (V64).
 #[derive(Debug, Deserialize)]
 struct PopMessageRequest {
+    #[serde(default)]
+    agent: Option<AgentKind>,
     workspace: String,
     project: String,
     #[serde(default)]
@@ -3516,7 +3795,15 @@ async fn handle_pop_message(
     let claim = ai_memory_core::MessageClaim {
         workspace_id: ws,
         project_id: proj,
-        claiming_agent: AgentKind::Other,
+        claiming_agent: req
+            .agent
+            .or_else(|| {
+                actor_ext
+                    .as_ref()
+                    .and_then(|a| a.0.agent.as_deref())
+                    .map(AgentKind::from_wire)
+            })
+            .unwrap_or(AgentKind::Other),
         claiming_session: None,
         claiming_user,
     };
@@ -3738,6 +4025,10 @@ async fn handle_pending_write_approve(
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "status": "conflict" })),
         ),
+        Err(WikiError::Store(StoreError::InvalidState(msg))) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        ),
         Err(e) => internal_err(e.to_string()),
     }
 }
@@ -3789,6 +4080,12 @@ async fn handle_pending_write_reject(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "rejected" })),
+        ),
+        // The proposal exists in scope (checked above) but is no longer
+        // pending: it was decided already, a conflict rather than a fault.
+        Err(StoreError::InvalidState(msg)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
         ),
         Err(e) => internal_err(e.to_string()),
     }
@@ -4083,7 +4380,7 @@ async fn handle_lint(
     run_lint(
         &state.reader,
         &state.wiki,
-        state.llm.as_ref(),
+        state.llm_providers.get(LlmWorkload::Lint),
         ws,
         proj,
         ai_memory_consolidate::LintOptions {
@@ -4458,7 +4755,12 @@ struct RestorePageRequest {
     /// Relative wiki path to restore.
     path: String,
     /// Git revision/commit to restore from.
-    rev: String,
+    #[serde(default)]
+    rev: Option<String>,
+    /// Retained SQLite page-version id to restore. Mutually exclusive with
+    /// `rev`; used for histories moved by `merge-project`.
+    #[serde(default)]
+    page_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -4488,6 +4790,42 @@ async fn handle_restore_page(
         )
     })?;
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let (restore_source, version_id) = match (&req.rev, &req.page_id) {
+        (Some(rev), None) if !rev.trim().is_empty() => (rev.trim().to_owned(), None),
+        (None, Some(page_id)) if !page_id.trim().is_empty() => {
+            let version = page_id.parse::<PageId>().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid page_id"})),
+                )
+            })?;
+            (format!("page version {page_id}"), Some(version))
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "exactly one of rev or page_id is required"
+                })),
+            ));
+        }
+    };
+
+    if version_id.is_none() {
+        state
+            .wiki
+            .page_at_checkpoint(ws, proj, &path, &restore_source)
+            .await
+            .map_err(|error| match error {
+                WikiError::GitOwner(_) => internal_err(error.to_string()),
+                _ => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("cannot read {} at {restore_source}: {error}", path.as_str())
+                    })),
+                ),
+            })?;
+    }
 
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
@@ -4499,11 +4837,37 @@ async fn handle_restore_page(
         ),
     )?;
 
-    let page_id = state
-        .wiki
-        .restore_page_from_checkpoint(ws, proj, path.clone(), &req.rev)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
+    let page_id = if version_id.is_none() {
+        state
+            .wiki
+            .restore_page_from_checkpoint(ws, proj, path.clone(), &restore_source)
+            .await
+            .map_err(|error| match error {
+                WikiError::Store(StoreError::SessionPurged(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
+                _ => internal_err(error.to_string()),
+            })?
+    } else {
+        let version = version_id
+            .ok_or_else(|| internal_err("validated page-version restore lost its version id"))?;
+        state
+            .wiki
+            .restore_page_from_version(ws, proj, path.clone(), version)
+            .await
+            .map_err(|error| match error {
+                WikiError::Store(StoreError::SessionPurged(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
+                WikiError::Store(StoreError::NotFound(_)) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
+                _ => internal_err(error.to_string()),
+            })?
+    };
     let checkpoint = checkpoint_or_warn(
         &state.wiki,
         format!(
@@ -4511,7 +4875,7 @@ async fn handle_restore_page(
             req.workspace,
             req.project,
             path.as_str(),
-            req.rev
+            restore_source
         ),
     );
 
@@ -4521,7 +4885,7 @@ async fn handle_restore_page(
             serde_json::to_value(RestorePageResponse {
                 page_id: page_id.to_string(),
                 path: path.to_string(),
-                restored_from: req.rev,
+                restored_from: restore_source,
                 pre_checkpoint,
                 checkpoint,
             })
@@ -6202,9 +6566,357 @@ async fn handle_rename_project(
     )
 }
 
+#[derive(Deserialize)]
+struct AdoptProjectIdentityRequest {
+    workspace: String,
+    /// The project that holds the checkout's sessions.
+    project_id: String,
+    /// The empty project that holds the repository identity.
+    from_project_id: String,
+    /// The emptied project's name when it held the remote-derived name;
+    /// defaults to `<name>-split-<YYYYMMDD>`.
+    #[serde(default)]
+    archive_name: Option<String>,
+}
+
+/// Wire-format summary returned by `POST /admin/adopt-project-identity`.
+#[derive(Debug, Serialize)]
+pub struct AdoptProjectIdentitySummary {
+    /// Workspace name.
+    pub workspace: String,
+    /// The project that now carries the identity, under its final name.
+    pub project: String,
+    /// That project's name before the move.
+    pub previous: String,
+    /// The emptied project's name afterwards.
+    pub archived: String,
+    /// The repository identity that moved.
+    pub identity: String,
+    /// Non-fatal manifest/checkpoint failure after the database change committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
+}
+
+async fn handle_adopt_project_identity(
+    State(state): State<Arc<AdminState>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<AdoptProjectIdentityRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    let (ws_id, into) =
+        match resolve_target_ids_for_admin(&state, &req.workspace, None, Some(&req.project_id))
+            .await
+        {
+            Ok(target) => target,
+            Err(e) => return e,
+        };
+    let (_, from) = match resolve_target_ids_for_admin(
+        &state,
+        &req.workspace,
+        None,
+        Some(&req.from_project_id),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
+    let adopted = match state
+        .writer
+        .adopt_project_identity(ws_id, into, from, req.archive_name.clone(), author_id)
+        .await
+    {
+        Ok(adopted) => adopted,
+        Err(e) => {
+            let status = match &e {
+                StoreError::InvalidState(_) => StatusCode::CONFLICT,
+                StoreError::ProjectNameTaken(_) | StoreError::InvalidProjectName(_) => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return (status, Json(serde_json::json!({ "error": e.to_string() })));
+        }
+    };
+    let mut manifest_warning = None;
+    for project_id in [into, from] {
+        if let Err(error) = state.wiki.refresh_renamed_scope(ws_id, project_id).await {
+            warn!(
+                error = %error,
+                workspace_id = %ws_id,
+                project_id = %project_id,
+                "adopt-project-identity committed; manifest refresh/checkpoint failed; startup backfill can repair"
+            );
+            manifest_warning = Some(error.to_string());
+        }
+    }
+    let summary = AdoptProjectIdentitySummary {
+        workspace: req.workspace,
+        project: adopted.project,
+        previous: adopted.previous,
+        archived: adopted.archived,
+        identity: adopted.identity,
+        manifest_warning,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
 // ---------------------------------------------------------------------
-// move-project
+// merge-project / move-project
 // ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MergeProjectRequest {
+    workspace: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    from_project_id: Option<String>,
+    #[serde(default)]
+    into: Option<String>,
+    #[serde(default)]
+    into_project_id: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Serialize)]
+struct MergeProjectReport {
+    from: String,
+    into: String,
+    dry_run: bool,
+    page_versions: u64,
+    sessions: u64,
+    observations: u64,
+    handoffs: u64,
+    workstreams: u64,
+    page_conflicts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_warning: Option<String>,
+}
+
+async fn prepare_project_merge(
+    state: &AdminState,
+    workspace: &str,
+    source_name: &str,
+    source: ProjectId,
+    target_name: &str,
+    target: ProjectId,
+    workspace_id: WorkspaceId,
+) -> Result<Vec<MergeProjectFile>, MoveErr> {
+    let summaries = state
+        .reader
+        .list_pages(workspace, source_name)
+        .await
+        .map_err(|error| internal_err(error.to_string()))?;
+    let mut pages = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let path = PagePath::new(summary.path.clone()).map_err(|error| {
+            internal_err(format!(
+                "invalid indexed page path '{}': {error}",
+                summary.path
+            ))
+        })?;
+        let source_meta = state
+            .reader
+            .page_meta(workspace, source_name, path.as_str())
+            .await
+            .map_err(|error| internal_err(error.to_string()))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "project pages changed while the merge was being prepared"
+                    })),
+                )
+            })?;
+        let target_page_id = state
+            .reader
+            .page_meta(workspace, target_name, path.as_str())
+            .await
+            .map_err(|error| internal_err(error.to_string()))?
+            .map(|meta| meta.id);
+        let source_label = format!("{workspace}/{source_name}");
+        pages.push(
+            state
+                .wiki
+                .prepare_project_merge_file(
+                    workspace_id,
+                    source,
+                    target,
+                    ai_memory_store::MergeProjectPage {
+                        path,
+                        source_page_id: source_meta.id,
+                        target_page_id,
+                        merged_page: None,
+                    },
+                    &source_label,
+                )
+                .map_err(|error| match error {
+                    WikiError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "project pages changed while the merge was being prepared"
+                        })),
+                    ),
+                    _ => internal_err(error.to_string()),
+                })?,
+        );
+    }
+    Ok(pages)
+}
+
+async fn handle_merge_project(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<MergeProjectRequest>,
+) -> impl IntoResponse {
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let result: Result<MergeProjectReport, MoveErr> = async {
+        let (source_ws, source, source_name) = resolve_target_for_admin(
+            &state,
+            &req.workspace,
+            req.from.as_deref(),
+            req.from_project_id.as_deref(),
+        )
+        .await?;
+        let (target_ws, target, target_name) = resolve_target_for_admin(
+            &state,
+            &req.workspace,
+            req.into.as_deref(),
+            req.into_project_id.as_deref(),
+        )
+        .await?;
+        if source_ws != target_ws {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "projects must be in the same workspace"})),
+            ));
+        }
+        if source == target {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "source and target project must be different"})),
+            ));
+        }
+        let pages = prepare_project_merge(
+            &state,
+            &req.workspace,
+            &source_name,
+            source,
+            &target_name,
+            target,
+            source_ws,
+        )
+        .await?;
+        let store_pages = pages.iter().map(|page| page.store.clone()).collect();
+        let summary = if req.confirm {
+            let admission = AdmissionContext {
+                workspace: req.workspace.clone(),
+                project: source_name.clone(),
+                destination_workspace: Some(req.workspace.clone()),
+                destination_project: Some(target_name.clone()),
+                op: AdmissionOp::MoveProject,
+                actor,
+                ..Default::default()
+            };
+            state
+                .wiki
+                .merge_project(source_ws, source, target, pages, Some(admission))
+                .await
+                .map_err(|error| match error {
+                    WikiError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "project pages changed while the merge was committing"
+                        })),
+                    ),
+                    WikiError::Store(StoreError::ManagedRunActive { .. })
+                    | WikiError::Store(StoreError::ProjectSessionsOpen { .. })
+                    | WikiError::Store(StoreError::Duplicate(_))
+                    | WikiError::Store(StoreError::PagePathCollides { .. })
+                    | WikiError::Store(StoreError::NotFound(_)) => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": error.to_string()})),
+                    ),
+                    _ => internal_err(error.to_string()),
+                })?
+        } else {
+            state
+                .writer
+                .merge_project(source_ws, source, target, store_pages, false)
+                .await
+                .map_err(|error| match error {
+                    StoreError::ManagedRunActive { .. }
+                    | StoreError::ProjectSessionsOpen { .. }
+                    | StoreError::Duplicate(_)
+                    | StoreError::PagePathCollides { .. } => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": error.to_string()})),
+                    ),
+                    StoreError::NotFound(_) => (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": error.to_string()})),
+                    ),
+                    _ => internal_err(error.to_string()),
+                })?
+        };
+        let (checkpoint, manifest_warning) = if req.confirm {
+            state.active_project.clear_project(source);
+            invalidate_scope_cache(&state, ScopeInvalidation::Project(source)).await;
+            let manifest_warning = state
+                .wiki
+                .backfill_scope_manifests()
+                .await
+                .err()
+                .map(|error| {
+                    warn!(%error, "merge-project: scope manifest refresh failed");
+                    error.to_string()
+                });
+            (
+                checkpoint_or_warn(
+                    &state.wiki,
+                    format!(
+                        "merge-project {}/{} -> {}/{}",
+                        req.workspace, source_name, req.workspace, target_name
+                    ),
+                ),
+                manifest_warning,
+            )
+        } else {
+            (None, None)
+        };
+        Ok(MergeProjectReport {
+            from: format!("{}/{}", req.workspace, source_name),
+            into: format!("{}/{}", req.workspace, target_name),
+            dry_run: !req.confirm,
+            page_versions: summary.page_versions,
+            sessions: summary.sessions,
+            observations: summary.observations,
+            handoffs: summary.handoffs,
+            workstreams: summary.workstreams,
+            page_conflicts: summary.page_conflicts,
+            checkpoint,
+            manifest_warning,
+        })
+    }
+    .await;
+    match result {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(error) => error,
+    }
+}
 
 /// JSON request body for `POST /admin/move-project`.
 #[derive(Deserialize)]
@@ -6235,6 +6947,13 @@ struct MoveProjectRequest {
     /// live managed-workstream lease in the destructive copy-purge path.
     #[serde(default)]
     force: bool,
+    /// Acknowledge that this move is a **copy+purge merge** rather than a
+    /// true-move, and that the source project's history goes with it (#1713).
+    /// The server picks the strategy from the destination; when it resolves to
+    /// the merge path and this is absent, the move is refused with the record
+    /// counts it would discard.
+    #[serde(default)]
+    allow_lossy_merge: bool,
     /// Policy for the copy-purge MERGE path when a source page's path already
     /// exists in the destination with DIFFERENT content. Ignored by true-move
     /// (no copy). Default `block` — the safe choice for a destructive op.
@@ -6761,6 +7480,39 @@ async fn move_project_core(
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
+    //
+    // That second half is not a move: the source's sessions, observations,
+    // handoffs and older page versions are deleted, while a true-move keeps
+    // them. A `--confirm` written for "move this project" does not say that,
+    // so the merge path needs its own acknowledgement and shows the counts it
+    // would discard (#1713).
+    if !req.allow_lossy_merge {
+        let counts = state
+            .reader
+            .project_record_counts(src_ws, src_proj)
+            .await
+            .map_err(|error| internal_err(error.to_string()))?;
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the destination workspace already holds a project named '{project_name}', so \
+                     this move would be a copy+purge merge: it copies its {} latest page(s) into \
+                     that project and deletes the source project with its {} session(s), {} \
+                     observation(s) and {} handoff(s). A true-move keeps all of that; to merge, \
+                     re-run with --allow-lossy-merge (allow_lossy_merge=true)",
+                    counts.pages, counts.sessions, counts.observations, counts.handoffs,
+                ),
+                "strategy": "copy-purge",
+                "discarded": {
+                    "pages_copied": counts.pages,
+                    "sessions": counts.sessions,
+                    "observations": counts.observations,
+                    "handoffs": counts.handoffs,
+                },
+            })),
+        ));
+    }
     let destination = create_ws_proj(state, &req.to_workspace, &project_name).await?;
     let (dst_ws, dst_proj) = destination.scope.as_tuple();
 
@@ -7332,25 +8084,20 @@ async fn move_planned_session(
         }
     };
 
-    // A page file already at the destination blocks a page move; checked here
-    // too so the dry run predicts what the wiki re-checks under its lock. When
-    // the source scope IS the destination (single-form re-home) there is no
-    // file to move and the wiki skips the file step too.
+    // A page file already at the destination blocks a page move; planned here
+    // too so the dry run predicts what the wiki re-checks under its lock. The
+    // plan follows the page rows the store sweeps: for a re-home that
+    // includes stray scopes other than `plan.from`.
     state
         .wiki
         .validate_project_tree(to.0, to.1)
         .map_err(move_session_wiki_err)?;
-    let dst_file = state
+    let file_moves = !state
         .wiki
-        .project_root(to.0, to.1)
-        .join("sessions")
-        .join(&file_name);
-    let file_moves = plan.from != to && src_file.is_file();
-    if req.pages == PagesMode::Move && file_moves && dst_file.exists() {
-        return Err(move_session_wiki_err(WikiError::DestinationPageExists(
-            dst_file.display().to_string(),
-        )));
-    }
+        .plan_session_page_files(sid, plan.from, to, req.pages)
+        .await
+        .map_err(move_session_wiki_err)?
+        .is_empty();
 
     if !req.confirm {
         let summary = state
@@ -8268,6 +9015,10 @@ async fn handle_merge_workspace(
             confirm: true,
             force: req.force,
             on_conflict: req.on_conflict,
+            // `merge-workspace` is the explicit merge command: the operator
+            // already asked for the two workspaces to be combined, so a
+            // same-named project is merged rather than refused (#1713).
+            allow_lossy_merge: true,
         };
         match move_project_core(&state, &move_req, actor.clone()).await {
             Ok(report) => merged.push(report),
@@ -9376,12 +10127,60 @@ mod tests {
         ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
     };
     use ai_memory_core::{Sanitized, Sanitizer};
-    use ai_memory_llm::{ChatRequest, ChatResponse, LlmOperationId, LlmResult, LlmWorkload};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmOperationId, LlmProvider, LlmResult};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
     use axum::http::Request;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    fn bootstrap_gate_entries(gate: &BootstrapGate) -> usize {
+        gate.projects.lock().unwrap().len()
+    }
+
+    /// The per-project map only holds projects with a run in progress or
+    /// queued: a released permit forgets its entry, and a waiter keeps it
+    /// alive until it too is done.
+    #[tokio::test]
+    async fn bootstrap_gate_forgets_a_project_once_nobody_waits_on_it() {
+        let gate = BootstrapGate::new(4);
+        let (ws, proj) = (WorkspaceId::new(), ProjectId::new());
+
+        let first = gate.acquire(ws, proj).await.unwrap();
+        let waiter = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.acquire(ws, proj).await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a second run for the same project must wait"
+        );
+
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter gets its turn once the first run ends")
+            .unwrap();
+        assert_eq!(
+            bootstrap_gate_entries(&gate),
+            1,
+            "the waiter still holds it"
+        );
+
+        drop(second);
+        assert_eq!(bootstrap_gate_entries(&gate), 0);
+    }
+
+    /// A zero limit would admit nothing and hang every caller; it is
+    /// clamped to one run at a time instead.
+    #[tokio::test]
+    async fn bootstrap_gate_treats_a_zero_limit_as_one() {
+        let gate = BootstrapGate::new(0);
+        let permit = gate.acquire(WorkspaceId::new(), ProjectId::new()).await;
+        assert!(permit.is_ok());
+        assert_eq!(gate.slots.available_permits(), 0);
+    }
 
     async fn message_send_fixture(
         reject: bool,
@@ -9552,8 +10351,11 @@ mod tests {
                     from_owner_user: None,
                     to_workspace_id: ws,
                     to_project_id: recipient,
+                    to_agent: None,
                     subject: None,
                     body: "fixture".into(),
+                    nature: ai_memory_core::MessageNature::Unknown,
+                    evidence: None,
                 })
                 .await
                 .unwrap();
@@ -9635,7 +10437,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -9647,7 +10449,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -9669,6 +10471,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["llm_workloads"], serde_json::json!([]));
+        assert!(json["providers"]["llm_workloads_started_ms"].is_null());
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
         // 2.0 item 7: the report carries the wedged-writer gauge and the
         // wiki-format state — a fresh store is natively conformant (no
@@ -9704,7 +10507,10 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: Some(llm),
+            llm_providers: LlmProviders {
+                default: Some(llm),
+                ..Default::default()
+            },
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -9716,7 +10522,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -9738,6 +10544,13 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let workloads = json["providers"]["llm_workloads"].as_array().unwrap();
         assert_eq!(workloads.len(), LlmWorkload::ALL.len());
+        // #1981: the counters say since when they count.
+        assert!(
+            json["providers"]["llm_workloads_started_ms"]
+                .as_u64()
+                .is_some_and(|started| started > 0),
+            "{json}"
+        );
         let query_answer = workloads
             .iter()
             .find(|entry| entry["workload"] == "query-answer")
@@ -9779,7 +10592,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -9791,7 +10604,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49376".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -9907,7 +10720,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -9919,7 +10732,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49375".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10146,7 +10959,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10158,7 +10971,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10344,7 +11157,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10356,7 +11169,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10569,7 +11382,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10581,7 +11394,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -11467,7 +12280,10 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm,
+            llm_providers: LlmProviders {
+                default: llm,
+                ..Default::default()
+            },
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -11479,7 +12295,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -11815,18 +12631,19 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
             .await
             .unwrap();
 
-        let router = admin_router(admin_state_for_store_with_llm(
-            &tmp,
-            &store,
-            wiki,
-            Some(Arc::new(FakeAutoImproveLlm)),
-        ));
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state
+            .llm_providers
+            .overrides
+            .insert(LlmWorkload::AutoImprove, Arc::new(FakeAutoImproveLlm));
+        let router = admin_router(state);
         let resp = router
             .oneshot(
                 Request::builder()
@@ -11973,6 +12790,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12115,6 +12933,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12235,6 +13054,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12338,6 +13158,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12348,6 +13169,7 @@ mod tests {
         state.auto_improve_review_config.eval = ai_memory_consolidate::AutoImproveEvalConfig {
             enabled: true,
             command: String::new(),
+            builtin: String::new(),
             timeout_secs: 1,
             targets: vec!["notes".into()],
             min_delta: 0.0,
@@ -12493,6 +13315,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12966,6 +13789,52 @@ mod tests {
         assert_eq!(page.body, "# Stored\n\nfrom stored proposal");
     }
 
+    /// Approving a proposal that was already decided (a double click on
+    /// `/web/pending`, two reviewers) conflicts with its state; the store
+    /// refuses it as `InvalidState` and the page keeps the first approval.
+    #[tokio::test]
+    async fn pending_write_approve_of_a_decided_proposal_returns_409() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/twice.md", "# Twice\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let approve = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/approve?workspace=default&project=scratch"
+                ))
+                .extension(ai_memory_core::ActorContext {
+                    user: Some("reviewer".into()),
+                    ..ai_memory_core::ActorContext::default()
+                })
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(approve()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router.oneshot(approve()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let page = store
+            .reader
+            .page_body_by_ids(ws, proj, "notes/twice.md")
+            .await
+            .unwrap()
+            .expect("the first approval stays");
+        assert_eq!(page.body, "# Twice\n");
+        let on_disk =
+            std::fs::read_to_string(scratch_project_dir(tmp.path()).join("notes/twice.md"));
+        assert!(
+            on_disk.is_ok_and(|text| text.contains("# Twice")),
+            "the refused approval must not remove the approved file"
+        );
+    }
+
     /// #1205: a `POST /admin/pending-writes/{id}/approve` whose `id` does
     /// not exist in the requested workspace (or belongs to a different
     /// one) must answer `404 Not Found`, not `500 Internal Server Error`.
@@ -13058,6 +13927,42 @@ mod tests {
             "reject of an unknown id must be 404, not 500 (regression for #1205): {}",
             resp.status(),
         );
+    }
+
+    /// Rejecting a proposal that was already decided (a double click on
+    /// `/web/pending`, two reviewers) is a conflict with its state, the
+    /// 409 the store's `InvalidState` maps to elsewhere, not a server error.
+    #[tokio::test]
+    async fn pending_write_reject_of_a_decided_proposal_returns_409() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (_ws, _proj, proposal_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/twice.md", "# Twice\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let reject = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"
+                ))
+                .header("content-type", "application/json")
+                .extension(ai_memory_core::ActorContext {
+                    user: Some("reviewer".into()),
+                    ..ai_memory_core::ActorContext::default()
+                })
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                ))
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(reject()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router.oneshot(reject()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
     }
 
     /// #1205: an id that exists in another workspace must still be 404
@@ -13366,7 +14271,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -13378,7 +14283,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -13479,7 +14384,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -13491,7 +14396,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -13585,7 +14490,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -13597,7 +14502,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -13697,7 +14602,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -13709,7 +14614,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -13753,7 +14658,7 @@ mod tests {
                             "from_workspace": "src",
                             "project": "merged",
                             "to_workspace": "dst",
-                            "confirm": true,
+                            "confirm": true, "allow_lossy_merge": true,
                         }))
                         .unwrap(),
                     ))
@@ -13807,7 +14712,7 @@ mod tests {
             "from_workspace": "src",
             "project": "live",
             "to_workspace": "dst",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         });
         let guarded = router
             .clone()
@@ -13827,7 +14732,7 @@ mod tests {
             "from_workspace": "src",
             "project": "live",
             "to_workspace": "dst",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
             "force": true,
         });
         let moved = router
@@ -14211,7 +15116,7 @@ mod tests {
                             "from_workspace": "src",
                             "project": "merged",
                             "to_workspace": "dst",
-                            "confirm": true,
+                            "confirm": true, "allow_lossy_merge": true,
                             "force": true,
                         }))
                         .unwrap(),
@@ -14248,7 +15153,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14260,7 +15165,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(pepper),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14317,7 +15222,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14329,7 +15234,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(pepper.clone()),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14458,6 +15363,7 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            ("POST", "/admin/llm-test", serde_json::Value::Null),
             ("GET", "/admin/metrics", serde_json::Value::Null),
             (
                 "GET",
@@ -14557,12 +15463,21 @@ mod tests {
             ),
             (
                 "POST",
+                "/admin/adopt-project-identity",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project_id": "01a19c51-63d5-7dc2-8dc1-90201095ba96",
+                    "from_project_id": "01a19da2-094f-7830-9807-1d32f2fdb464"
+                }),
+            ),
+            (
+                "POST",
                 "/admin/move-project",
                 serde_json::json!({
                     "from_workspace": "default",
                     "to_workspace": "archive",
                     "project": "scratch",
-                    "confirm": true
+                    "confirm": true, "allow_lossy_merge": true
                 }),
             ),
             (
@@ -15010,7 +15925,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -15022,7 +15937,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -15145,7 +16060,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: missing_db_reader,
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -15157,7 +16072,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -15934,7 +16849,7 @@ mod tests {
                 "from_workspace": "team-a",
                 "project": "shared",
                 "to_workspace": "team-b",
-                "confirm": true,
+                "confirm": true, "allow_lossy_merge": true,
             })),
         )
         .await;
@@ -16118,7 +17033,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -16130,7 +17045,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,

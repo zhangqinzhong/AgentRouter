@@ -282,3 +282,147 @@ async fn audit_scope_restricts_to_landed_bucket() {
         "a scoped audit returns only findings landed in the scoped project"
     );
 }
+
+/// CHECK B: one working copy that reached the server under two spellings
+/// (#1645). `renato` and `Renato` are one directory on a case-insensitive
+/// filesystem; `Rénato` is the same name typed with an accent. Neither has a
+/// cwd anomaly, so only the name check can see them — and a project that
+/// merely shares a prefix (`renato-2`) is the control.
+#[tokio::test]
+async fn audit_flags_projects_split_by_case_or_accents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let conn = Connection::open(store.db_path()).unwrap();
+    let now = 1_700_000_000_000_i64;
+    let ws = id(1);
+    conn.execute(
+        "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'w', ?2)",
+        params![&ws[..], now],
+    )
+    .unwrap();
+    for (n, name) in [
+        (2u8, "renato"),
+        (3, "Renato"),
+        (4, "R\u{e9}nato"), // Rénato, composed
+        (5, "renato-2"),
+        (6, "widget"),
+        (7, "renato!"),
+    ] {
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&id(n)[..], &ws[..], name, now],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let report = store.reader.audit_contamination(None, None).await.unwrap();
+    let collisions: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.check == "project_name_collision")
+        .map(|f| f.landed_project.as_str())
+        .collect();
+
+    assert!(
+        collisions.contains(&"renato") && collisions.contains(&"Renato"),
+        "case-only split is reported: {collisions:?}"
+    );
+    assert!(
+        collisions.contains(&"R\u{e9}nato"),
+        "accent-only split is reported: {collisions:?}"
+    );
+    assert!(
+        !collisions.contains(&"renato-2")
+            && !collisions.contains(&"widget")
+            && !collisions.contains(&"renato!"),
+        "a different name is not a collision: {collisions:?}"
+    );
+    assert_eq!(
+        report.summary.project_name_collisions, 3,
+        "three spellings of one name"
+    );
+
+    let one = report
+        .findings
+        .iter()
+        .find(|f| f.landed_project == "renato")
+        .unwrap();
+    assert_eq!(one.entity_kind, "project");
+    assert_eq!(one.confidence, "medium");
+    let peers = one.peer_projects.as_deref().unwrap_or_default();
+    assert!(
+        peers.contains("Renato") && peers.contains("R\u{e9}nato"),
+        "each finding names its peers: {peers}"
+    );
+    assert_eq!(one.pages, Some(0));
+    assert_eq!(one.sessions, Some(0));
+    assert_eq!(one.collision_kind, Some("case_and_accent"));
+    assert_eq!(one.last_activity_us, Some(now));
+    let accented = report
+        .findings
+        .iter()
+        .find(|f| f.landed_project == "R\u{e9}nato")
+        .unwrap();
+    assert_eq!(accented.collision_kind, Some("accent"));
+}
+
+/// The fold itself: what counts as the same name, and what does not.
+#[test]
+fn project_name_fold_key_matches_spelling_not_meaning() {
+    let key = ai_memory_store::project_name_fold_key;
+    assert_eq!(key("renato"), key("Renato"));
+    assert_eq!(key("R\u{e9}nato"), key("Renato"));
+    assert_eq!(key("felipe-nr-judoka"), key("Felipe-NR-Judoka"));
+    assert_ne!(key("renato"), key("renato2"));
+    assert_ne!(key("renato"), key("renato!"));
+    assert_ne!(key("widget"), key("gadget"));
+    assert_eq!(key("  api  "), "api");
+}
+
+/// A scoped audit compares the requested project with its workspace peers,
+/// then reports only the requested side of a collision.
+#[tokio::test]
+async fn scoped_audit_limits_collisions_to_the_requested_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let conn = Connection::open(store.db_path()).unwrap();
+    let now = 1_700_000_000_000_i64;
+    let (ws, a, b) = (id(1), id(2), id(3));
+    conn.execute(
+        "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'w', ?2)",
+        params![&ws[..], now],
+    )
+    .unwrap();
+    for (pid, name) in [(&a, "api"), (&b, "API")] {
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![&pid[..], &ws[..], name, now],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let all = store.reader.audit_contamination(None, None).await.unwrap();
+    assert_eq!(all.summary.project_name_collisions, 2);
+
+    let scoped = store
+        .reader
+        .audit_contamination(
+            Some((
+                WorkspaceId::from_slice(&ws).unwrap(),
+                ProjectId::from_slice(&a).unwrap(),
+            )),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scoped.summary.project_name_collisions, 1,
+        "the selected project must still be compared with its workspace peers"
+    );
+    assert_eq!(scoped.findings.len(), 1);
+    assert_eq!(scoped.findings[0].landed_project, "api");
+    assert_eq!(scoped.findings[0].peer_projects.as_deref(), Some("API"));
+}

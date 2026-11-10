@@ -70,6 +70,7 @@ async fn prepare_with_selection(
         .store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id,
             project_id,
             repo_fingerprint: format!("repo-secret-{project}"),

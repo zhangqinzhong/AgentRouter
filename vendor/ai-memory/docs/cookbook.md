@@ -61,6 +61,27 @@ always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
 
+## Recipe: notice when a page's code has changed
+
+> "Remember this deploy gotcha; it is about `bin/deploy.sh`."
+
+Your agent can pass `source_files` to `memory_write_page`: the repository
+files the page describes, each with the commit it was checked against
+(`[{"path": "bin/deploy.sh", "commit": "3f2a9c1"}]`, up to 16). The server
+stores the list in the page's frontmatter and never opens the files, so it
+works the same against a remote or containerized server. To check a page, read
+it, then run this from the checkout for each entry:
+
+```bash
+git --literal-pathspecs diff --quiet 3f2a9c1 -- bin/deploy.sh
+```
+
+A non-zero exit, or a path that no longer exists, means the file changed:
+record `memory_feedback` with `signal: "stale"` and a reason such as
+`source-changed: bin/deploy.sh since 3f2a9c1`. The page drops in rank and shows
+up as a `feedback_flagged` finding in `memory_lint`. Rewriting the page with
+the new commit clears the flag.
+
 ## Recipe: stop re-explaining your habits in every new project
 
 > "In all my projects: use pnpm, keep integration tests in tests/suite."
@@ -122,6 +143,39 @@ bring an existing body of documents in as project memory:
 Once the material is saved as pages in the right scope, any project can search
 it (`memory_query`) and read a specific document in full (`memory_read_page`)
 before implementing against it.
+
+## Recipe: bootstrap many repositories at once
+
+`ai-memory bootstrap` seeds a project from its git log, README and docs. Run it
+from several shells (or a loop with `&`) to seed many repositories; the server
+decides how many call the LLM at a time with `bootstrap_max_concurrent`
+(default 1). Runs for the same project always wait for each other, and chunks
+within one run stay sequential, so the largest repository sets the floor.
+
+- **Local GPU (vLLM, llama.cpp server):** the server batches concurrent
+  requests, so a single run leaves it mostly idle. Raise the limit until the
+  engine starts queueing (vLLM's `num_requests_waiting` metric) or its KV
+  cache fills; 4–8 per GPU is a reasonable start.
+- **Hosted API (DeepSeek, OpenAI, …):** each call is latency-bound, so the
+  speedup is close to linear until your account's rate or concurrency limit.
+  Set the limit below that quota.
+- **Hosted API with a fallback:** add a `[[llm_fallbacks]]` entry. When the
+  primary answers `429`, its circuit opens for the provider's `Retry-After` and
+  the remaining runs go to the next candidate instead of failing.
+
+```toml
+llm_provider = "openai-compat"
+llm_model = "deepseek-chat"
+llm_base_url = "https://api.deepseek.com/v1"   # key from the LLM_API_KEY env var
+bootstrap_max_concurrent = 8
+
+# Takes the overflow while the primary is rate-limited.
+[[llm_fallbacks]]
+provider = "openai-compat"
+model = "<another-model>"
+base_url = "<another OpenAI-compatible endpoint>/v1"
+api_key_env = "FALLBACK_API_KEY"
+```
 
 ## Coming from agentmemory
 
@@ -276,11 +330,12 @@ compacted or merged stays in git and the supersession chain, recoverable with
 - **Keep used memory longer:** nothing to configure. A page you open, search,
   or reach through a related-pages walk is reinforced automatically and resists
   decay.
-- **Surface likely contradictions:** run `memory_lint` (through your agent or the
-  CLI); with embeddings configured it flags pairs of same-topic pages that look
-  like they conflict, advisory only. Similarity reads shared vocabulary as much
-  as disagreement, so a single-domain or single-language store yields mostly
-  candidate pairs: read each finding as a pair to check, not as a defect. If
+- **Review similar knowledge:** run `memory_lint` (through your agent or the
+  CLI); with embeddings configured it emits `similarity_candidate` findings
+  for same-topic page pairs, advisory only. Similarity reads shared vocabulary
+  as much as disagreement, so read each candidate as a pair to check, not as a
+  contradiction or a supersession instruction. Explicit `contradicts` edges
+  remain `contradiction` findings. If
   that noise is too high, raise `contradiction_band_min` (`config.toml` or
   `AI_MEMORY_CONTRADICTION_BAND_MIN`, default `0.4`). On such a store the
   band measures domain proximity more than conflict, so a higher floor trims
@@ -290,6 +345,34 @@ compacted or merged stays in git and the supersession chain, recoverable with
   of cold notes into single coherent pages while you're idle and cancels the
   moment you return. It is off by default, never deletes a source, and is gated on
   an internal recall eval before it could ever become default behavior.
+
+## Recipe: long sessions on a small context window
+
+A local model with a context window around 200k tokens, or any long-horizon
+session, compacts again and again. Each compaction keeps a lossy summary, and
+the first thing it loses is the start of the session: the task you gave, its
+constraints, the early decisions. ai-memory has the prompts you actually
+typed, so the agent can re-ground on them.
+
+- On Claude Code, Codex, Factory Droid and OpenCode V1/V2, after each
+  compaction the hooks inject a small post-compaction anchor (about 2,000
+  characters by default) with the session's first and latest prompts, and the
+  installed instructions tell the agent to trust it over the summary.
+- On Gemini CLI, Cursor, Copilot CLI, Kimi Code, Grok, Kiro, Cline, Muse and
+  the rest, nothing is injected: the routing block and the handoff skill tell
+  the agent to read its own session's prompts with
+  `memory_read_session_observations` after a compaction. Install the managed
+  routing (`ai-memory install-instructions`, or ask "install ai-memory
+  routing") so every session gets that rule.
+- Anywhere the hooks answer a prompt, you can start one with
+  `reload context` to get the stretch the last compaction dropped, for example
+  `reload context, then finish the migration`.
+
+Codex's `compact_prompt` setting replaces Codex's whole compaction prompt and
+applies only to local providers, so it cannot add one line the way the OpenCode
+hook does. Change it only if you mean to rewrite how Codex summarizes. See
+[`usage.md`](usage.md#reload-context-after-a-compaction) for the per-harness
+details.
 
 ## Recipe: two agents / two repos working together
 
@@ -373,8 +456,8 @@ See [`managed-workstreams.md`](managed-workstreams.md).
 ## Recipe: run an unsupervised agent safely (`--yolo` + ai-jail)
 
 `--yolo` maps to each harness's dangerous-mode flag (Claude Code →
-`--dangerously-skip-permissions`), which runs every tool call with no
-confirmation. `ai-memory run --yolo` adds guardrails around that, gated
+`--dangerously-skip-permissions`, plus `--settings` forcing
+`bypassPermissions`), which runs every tool call with no confirmation. `ai-memory run --yolo` adds guardrails around that, gated
 entirely on a real interactive terminal (stdin and stderr both TTYs), so
 scripts, hooks, and CI are never prompted:
 
@@ -390,7 +473,8 @@ ai-memory run --yolo claude
   with its sandbox backend present: `bwrap` on Linux, `sandbox-exec` on
   macOS) and you are not already inside it, a second question offers to
   re-run the session inside it. When it is not usable (or on Windows) there is
-  no second question; the run just proceeds. Accepting re-execs the original
+  no second question; the run just proceeds. With an ai-jail older than
+  3.0.1, accepting re-execs the original
   command under `ai-jail --network --agent-state --env <NAME>... --`,
   forwarding only the credential/config
   environment variables that are already set (server/hook URL,
@@ -407,6 +491,28 @@ ai-memory run --yolo claude
   A mounted credential is usable by the unsupervised agent, so uncheck what it
   should not touch. What you see is what you get: unchecked rows are passed
   as `--no-X`, so they stay off even if your global `~/.ai-jail` enables them.
+- **Your answers come back next time.** The checklist remembers what you
+  chose for each checkout, so the next launch shows the same marks and Enter
+  is enough. Each pre-checked row says why it is recommended (`found on this
+  machine`, `origin pushes over SSH`), and the header says when your answers
+  were saved and what changed since (`new: …`, `no longer offered: …`). Type
+  `reset` to go back to the recommended marks. The answers are stored in
+  ai-memory's data directory, never in your repository.
+- **Letting the agent read a sibling project.** Press `f` in the checklist to
+  pick extra folders. The picker starts in the folder above your checkout:
+  type to filter, Space to select (read-only), Ctrl+W to make the selected one
+  read-write, Tab or → to open a folder, ← to go up, Enter when done. From the
+  command line, `ai-memory run --jail --jail-map ../ai-jail claude` mounts a
+  folder read-only and `--jail-rw-map DIR` read-write; both repeat. Your home,
+  `/`, credential folders (`~/.ssh`, `~/.aws`, `~/.config/gh`, …) and
+  ai-memory's own data directory are refused, and the error says why. Edits
+  the agent makes in a read-write sibling are captured under the current
+  project, because capture follows the session. This needs ai-jail 2.15.
+- **The same choices next time.** When the jailed session ends, ai-memory
+  prints the `ai-memory run …` line that repeats your choices, `--jail=…`
+  list, folders and harness included. Paste it, or keep it as an alias, to
+  skip the questions. Switching harness from the post-run menu keeps the same
+  jail and options.
 - **Skipping the questions.** `ai-memory run --jail claude` re-runs inside
   ai-jail straight away, turning on those pre-marked defaults and leaving
   everything else to your own ai-jail config. This works with or without
@@ -433,18 +539,26 @@ ai-memory run --yolo claude
   automatically there, enable them in your global `~/.ai-jail` or pass
   `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
   run never writes its own flags into your repository's `.ai-jail`.
+- **With ai-jail 3.0.1 or newer.** ai-jail reviews the access itself, once
+  per project, so ai-memory's screen keeps only the extra folders (`f`).
+  ai-memory names the harness for ai-jail and passes what the session needs
+  as plain grants, with no extra prompts: the harness's login state, the
+  `AI_MEMORY_*` variables, and only that harness's own API key (a Claude jail
+  never gets your OpenAI key). A memory server on this machine is reached
+  through one forwarded port, so the network stays filtered unless you open
+  it in ai-jail's review; a server on another machine keeps full network,
+  which ai-jail labels OPEN. Copilot and Command Code, which ai-jail has no
+  preset for, keep the checklist above.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
   directly, so `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with
   `(jail) `); it fails open (shows the warning) when undetectable, never
   open to skipping it silently.
-- **Claude "true yolo".** `--true-yolo` includes everything `--yolo` does
-  (`ai-memory run claude --true-yolo` is enough; adding `--yolo` too is
-  harmless) and, for Claude, also forces `bypassPermissions` over any
-  `defaultMode` in your settings. For other harnesses it is the same as
-  `--yolo`. `claude_true_yolo = true` in `config.toml` /
-  `AI_MEMORY_CLAUDE_TRUE_YOLO=true` applies the Claude extra to every `--yolo`
-  launch, never to a run without it.
+- **Claude's own permission settings.** For Claude, `--yolo` also forces
+  `bypassPermissions` over any `defaultMode` in your settings, so an `auto` or
+  `acceptEdits` default cannot narrow the run. Through 3.4.2 that took a separate
+  `--true-yolo`; it is now a hidden alias of `--yolo` (it prints a one-line
+  note), and `claude_true_yolo` in `config.toml` is ignored (remove it).
   **It cannot remove your own `ask` rules**: Claude Code honors explicit
   `permissions.ask` rules (and its built-in command-safety checks) in every
   mode, so a rule like `Bash(docker run *)` in `~/.claude/settings.json` still
@@ -498,7 +612,9 @@ server = "team-b"
 
 Repositories without a `server` key keep using the server `install-hooks`
 configured. The marker only ever names a profile; a profile that does not
-resolve drops the event rather than sending it anywhere else. Details, the
+resolve drops the event rather than sending it anywhere else. Commands you run
+inside the repository (`run`, `workstreams`, `doctor`, `search`, ...) use the
+same profile. Details, the
 fail-closed rules, and which integrations support it:
 [`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 

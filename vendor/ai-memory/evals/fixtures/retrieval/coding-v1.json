@@ -1,0 +1,668 @@
+[
+  {
+    "question_id": "coding-architecture",
+    "question_type": "coding-multi-session",
+    "question": "Why did the atlas worker choose a single-writer actor instead of a SQLite write pool, and how were reads handled?",
+    "answer": "The write pool caused SQLITE_BUSY under contention. A single-writer actor serializes writes and audit events; readers use a separate read-only pool.",
+    "question_date": "2026/10/24 (Sat) 12:00",
+    "haystack_dates": [
+      "2026/10/01 09:00",
+      "2026/10/02 09:00",
+      "2026/10/03 09:00",
+      "2026/10/04 09:00",
+      "2026/10/05 09:00",
+      "2026/10/06 09:00",
+      "2026/10/07 09:00",
+      "2026/10/08 09:00",
+      "2026/10/09 09:00",
+      "2026/10/10 09:00",
+      "2026/10/11 09:00",
+      "2026/10/12 09:00"
+    ],
+    "haystack_session_ids": [
+      "coding-architecture-logging",
+      "coding-architecture-testing",
+      "coding-architecture-docs",
+      "coding-architecture-problem",
+      "coding-architecture-assets",
+      "coding-architecture-release",
+      "coding-architecture-metrics",
+      "coding-architecture-config",
+      "coding-architecture-oauth",
+      "coding-architecture-decision",
+      "coding-architecture-backup",
+      "coding-architecture-format"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "Logging keeps request identifiers and removes authorization headers. The log rotation retention is seven days."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The test suite uses temporary databases. Integration tests clean up their directories after each run."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The documentation navigation needs a link to the migration guide. Correct the heading anchor before publishing."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Atlas worker experiment: a SQLite write pool caused SQLITE_BUSY during concurrent writes. Retries hid the ordering of audit events.",
+          "has_answer": true
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The web asset cache uses content hashes. The stylesheet is generated during development and committed for releases."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The release checklist requires platform builds and verified archive checksums. Version tags follow the changelog."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The metrics endpoint exports bounded counters. Avoid paths and user identifiers in label values."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Configuration loads once at startup. Environment overrides apply before validation, then typed settings are passed down."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The OAuth login uses a browser callback and stores refresh credentials locally. It does not change retrieval ranking."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Atlas worker decision: use a single-writer actor to serialize writes and audit events. Reads keep a separate read-only pool.",
+          "has_answer": true
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "An online SQLite backup produces a consistent database snapshot. A separate archive includes the wiki files."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Run the formatter before committing. Keep code comments focused on the reason for each guard."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "coding-architecture-problem",
+      "coding-architecture-decision"
+    ],
+    "incorrect_session_ids": [
+      "coding-architecture-logging",
+      "coding-architecture-testing",
+      "coding-architecture-docs",
+      "coding-architecture-assets",
+      "coding-architecture-release",
+      "coding-architecture-metrics",
+      "coding-architecture-config",
+      "coding-architecture-oauth",
+      "coding-architecture-backup",
+      "coding-architecture-format"
+    ]
+  },
+  {
+    "question_id": "coding-resolved-error",
+    "question_type": "coding-error-cause",
+    "question": "What caused the beacon deployment duplicate fence_epochs_pkey error, and which change resolved it?",
+    "answer": "The retry path reused the prior deployment epoch. Allocate a fresh epoch before retrying the deployment.",
+    "question_date": "2026/10/24 (Sat) 12:00",
+    "haystack_dates": [
+      "2026/10/01 09:00",
+      "2026/10/02 09:00",
+      "2026/10/03 09:00",
+      "2026/10/04 09:00",
+      "2026/10/05 09:00",
+      "2026/10/06 09:00",
+      "2026/10/07 09:00",
+      "2026/10/08 09:00",
+      "2026/10/09 09:00",
+      "2026/10/10 09:00",
+      "2026/10/11 09:00",
+      "2026/10/12 09:00"
+    ],
+    "haystack_session_ids": [
+      "coding-resolved-error-logging",
+      "coding-resolved-error-testing",
+      "coding-resolved-error-symptom",
+      "coding-resolved-error-docs",
+      "coding-resolved-error-assets",
+      "coding-resolved-error-release",
+      "coding-resolved-error-metrics",
+      "coding-resolved-error-config",
+      "coding-resolved-error-oauth",
+      "coding-resolved-error-backup",
+      "coding-resolved-error-resolution",
+      "coding-resolved-error-format"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "Logging keeps request identifiers and removes authorization headers. The log rotation retention is seven days."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The test suite uses temporary databases. Integration tests clean up their directories after each run."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Beacon deployment failed with duplicate key value violates unique constraint fence_epochs_pkey. The normal first deployment succeeds.",
+          "has_answer": true
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The documentation navigation needs a link to the migration guide. Correct the heading anchor before publishing."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The web asset cache uses content hashes. The stylesheet is generated during development and committed for releases."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The release checklist requires platform builds and verified archive checksums. Version tags follow the changelog."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The metrics endpoint exports bounded counters. Avoid paths and user identifiers in label values."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Configuration loads once at startup. Environment overrides apply before validation, then typed settings are passed down."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The OAuth login uses a browser callback and stores refresh credentials locally. It does not change retrieval ranking."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "An online SQLite backup produces a consistent database snapshot. A separate archive includes the wiki files."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The beacon deployment retry path reused the prior deployment epoch. Allocate a fresh epoch before retrying; the fence_epochs_pkey regression now passes.",
+          "has_answer": true
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Run the formatter before committing. Keep code comments focused on the reason for each guard."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "coding-resolved-error-symptom",
+      "coding-resolved-error-resolution"
+    ],
+    "incorrect_session_ids": [
+      "coding-resolved-error-logging",
+      "coding-resolved-error-testing",
+      "coding-resolved-error-docs",
+      "coding-resolved-error-assets",
+      "coding-resolved-error-release",
+      "coding-resolved-error-metrics",
+      "coding-resolved-error-config",
+      "coding-resolved-error-oauth",
+      "coding-resolved-error-backup",
+      "coding-resolved-error-format"
+    ]
+  },
+  {
+    "question_id": "coding-correction",
+    "question_type": "coding-later-correction",
+    "question": "What is the current comet request timeout after the correction?",
+    "answer": "The current comet request timeout is 45 seconds; the earlier 15-second value was corrected.",
+    "question_date": "2026/10/24 (Sat) 12:00",
+    "haystack_dates": [
+      "2026/10/01 09:00",
+      "2026/10/02 09:00",
+      "2026/10/03 09:00",
+      "2026/10/04 09:00",
+      "2026/10/05 09:00",
+      "2026/10/06 09:00",
+      "2026/10/07 09:00",
+      "2026/10/08 09:00",
+      "2026/10/09 09:00",
+      "2026/10/10 09:00",
+      "2026/10/11 09:00",
+      "2026/10/12 09:00"
+    ],
+    "haystack_session_ids": [
+      "coding-correction-logging",
+      "coding-correction-stale",
+      "coding-correction-testing",
+      "coding-correction-docs",
+      "coding-correction-assets",
+      "coding-correction-release",
+      "coding-correction-metrics",
+      "coding-correction-config",
+      "coding-correction-oauth",
+      "coding-correction-backup",
+      "coding-correction-format",
+      "coding-correction-current"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "Logging keeps request identifiers and removes authorization headers. The log rotation retention is seven days."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Comet request timeout decision: configure 15 seconds for every request. This is the initial proposal."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The test suite uses temporary databases. Integration tests clean up their directories after each run."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The documentation navigation needs a link to the migration guide. Correct the heading anchor before publishing."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The web asset cache uses content hashes. The stylesheet is generated during development and committed for releases."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The release checklist requires platform builds and verified archive checksums. Version tags follow the changelog."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The metrics endpoint exports bounded counters. Avoid paths and user identifiers in label values."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Configuration loads once at startup. Environment overrides apply before validation, then typed settings are passed down."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The OAuth login uses a browser callback and stores refresh credentials locally. It does not change retrieval ranking."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "An online SQLite backup produces a consistent database snapshot. A separate archive includes the wiki files."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Run the formatter before committing. Keep code comments focused on the reason for each guard."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Correction to the earlier comet request timeout decision: 15 seconds is too short for exports. The approved current timeout is 45 seconds. Use 45 seconds, not the initial 15-second proposal.",
+          "has_answer": true
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "coding-correction-current"
+    ],
+    "incorrect_session_ids": [
+      "coding-correction-logging",
+      "coding-correction-stale",
+      "coding-correction-testing",
+      "coding-correction-docs",
+      "coding-correction-assets",
+      "coding-correction-release",
+      "coding-correction-metrics",
+      "coding-correction-config",
+      "coding-correction-oauth",
+      "coding-correction-backup",
+      "coding-correction-format"
+    ]
+  },
+  {
+    "question_id": "coding-long-session",
+    "question_type": "coding-late-detail",
+    "question": "Which exact header fixed the delta upload checksum mismatch?",
+    "answer": "Use the X-Checksum-SHA256 header for the delta upload.",
+    "question_date": "2026/10/24 (Sat) 12:00",
+    "haystack_dates": [
+      "2026/10/01 09:00",
+      "2026/10/02 09:00",
+      "2026/10/03 09:00",
+      "2026/10/04 09:00",
+      "2026/10/05 09:00",
+      "2026/10/06 09:00",
+      "2026/10/07 09:00",
+      "2026/10/08 09:00",
+      "2026/10/09 09:00",
+      "2026/10/10 09:00",
+      "2026/10/11 09:00",
+      "2026/10/12 09:00"
+    ],
+    "haystack_session_ids": [
+      "coding-long-session-logging",
+      "coding-long-session-testing",
+      "coding-long-session-docs",
+      "coding-long-session-assets",
+      "coding-long-session-wrong-header",
+      "coding-long-session-release",
+      "coding-long-session-metrics",
+      "coding-long-session-config",
+      "coding-long-session-oauth",
+      "coding-long-session-backup",
+      "coding-long-session-investigation",
+      "coding-long-session-format"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "Logging keeps request identifiers and removes authorization headers. The log rotation retention is seven days."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The test suite uses temporary databases. Integration tests clean up their directories after each run."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The documentation navigation needs a link to the migration guide. Correct the heading anchor before publishing."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The web asset cache uses content hashes. The stylesheet is generated during development and committed for releases."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The initial delta upload experiment sent X-Checksum. The endpoint still reported a checksum mismatch; this was not the fix."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The release checklist requires platform builds and verified archive checksums. Version tags follow the changelog."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The metrics endpoint exports bounded counters. Avoid paths and user identifiers in label values."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Configuration loads once at startup. Environment overrides apply before validation, then typed settings are passed down."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "The OAuth login uses a browser callback and stores refresh credentials locally. It does not change retrieval ranking."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "An online SQLite backup produces a consistent database snapshot. A separate archive includes the wiki files."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 1: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 2: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 3: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 4: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 5: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 6: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 7: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 8: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 9: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 10: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 11: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 12: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 13: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 14: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 15: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 16: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 17: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 18: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 19: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 20: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 21: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 22: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 23: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 24: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 25: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 26: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 27: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 28: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 29: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 30: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 31: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 32: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 33: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 34: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 35: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 36: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 37: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 38: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 39: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Delta upload investigation step 40: checked retry timing and trace output; no checksum fix yet."
+        },
+        {
+          "role": "user",
+          "content": "Resolved the delta upload checksum mismatch: send the digest in the exact header X-Checksum-SHA256. The old X-Checksum header is ignored by the upload endpoint.",
+          "has_answer": true
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "Run the formatter before committing. Keep code comments focused on the reason for each guard."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "coding-long-session-investigation"
+    ],
+    "incorrect_session_ids": [
+      "coding-long-session-logging",
+      "coding-long-session-testing",
+      "coding-long-session-docs",
+      "coding-long-session-assets",
+      "coding-long-session-release",
+      "coding-long-session-metrics",
+      "coding-long-session-config",
+      "coding-long-session-oauth",
+      "coding-long-session-backup",
+      "coding-long-session-wrong-header",
+      "coding-long-session-format"
+    ]
+  }
+]

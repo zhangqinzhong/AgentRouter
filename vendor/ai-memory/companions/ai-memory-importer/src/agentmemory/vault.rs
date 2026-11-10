@@ -100,6 +100,7 @@ pub(crate) async fn run(args: VaultArgs) -> Result<()> {
             128,
         )?
         .to_owned(),
+        project_id: None,
         project: validate_label(
             args.project.as_deref().unwrap_or("DRY-RUN-PROJECT"),
             "project",
@@ -321,6 +322,7 @@ pub(crate) fn plan(dir: &Path, destination: &Destination, prefix: &str) -> Resul
                 tier,
                 tags: tags_from(tags.iter().map(String::as_str)),
                 expires_at: None,
+                previous_bodies: Vec::new(),
             }],
         });
     }
@@ -421,6 +423,7 @@ pub(crate) mod tests {
         Destination {
             workspace: "w".into(),
             project: "p".into(),
+            project_id: None,
         }
     }
 
@@ -596,6 +599,49 @@ pub(crate) mod tests {
         assert_eq!(second["present_versions"], 5);
     }
 
+    /// A rerun reads each page up to the server's 64,000 character ceiling
+    /// (12,000 when not asked, #1827), so a long page it wrote is still
+    /// present; a page past the ceiling stops the run with that reason
+    /// instead of being reported as somebody else's.
+    #[tokio::test]
+    async fn a_rerun_compares_long_pages_whole_or_says_why_it_cannot() {
+        let td = tempdir().unwrap();
+        let line = "Every mutation goes through one writer thread.\n";
+        put(
+            td.path(),
+            "memories/long.md",
+            &format!("---\nid: \"long\"\n---\n# Long\n\n{}", line.repeat(500)),
+        );
+        let server = MockServer::start(&[("w", "p")]);
+        let manifest = td.path().join("manifest.json");
+        run(args(td.path(), &server.url, &manifest)).await.unwrap();
+        run(args(td.path(), &server.url, &manifest)).await.unwrap();
+        let second = read_manifest(&manifest);
+        assert_eq!(second["written_versions"], 0, "{second}");
+        assert_eq!(second["present_versions"], 1, "{second}");
+
+        put(
+            td.path(),
+            "memories/longer.md",
+            &format!(
+                "---\nid: \"longer\"\n---\n# Longer\n\n{}",
+                line.repeat(1500)
+            ),
+        );
+        run(args(td.path(), &server.url, &manifest)).await.unwrap();
+        assert_eq!(server.state().stored_versions(), 2);
+        let error = run(args(td.path(), &server.url, &manifest))
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("longer than memory_read_page returns"),
+            "{message}"
+        );
+        assert!(!message.contains("did not write"), "{message}");
+        assert_eq!(server.state().stored_versions(), 2);
+    }
+
     #[tokio::test]
     async fn a_foreign_page_at_the_destination_is_never_replaced() {
         let td = tempdir().unwrap();
@@ -638,6 +684,18 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(error.to_string().contains(">= 3.0"), "{error:#}");
         assert_eq!(server.state().write_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn established_routes_do_not_require_the_new_batch_tool() {
+        let td = tempdir().unwrap();
+        fixture_vault(td.path());
+        let server = MockServer::start(&[("w", "p")]);
+        server.state().batch = false;
+        let manifest = td.path().join("manifest.json");
+        run(args(td.path(), &server.url, &manifest)).await.unwrap();
+        assert_eq!(server.state().stored_versions(), 5);
+        assert_eq!(server.state().batch_calls, 0);
     }
 
     #[tokio::test]

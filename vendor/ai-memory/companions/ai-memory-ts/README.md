@@ -88,6 +88,26 @@ if (next.status === "claimed") console.log(next.handoff.summary);
 This program is [`examples/quickstart.ts`](examples/quickstart.ts); CI runs it
 against a real server on every change.
 
+For a bulk import into an existing project, preflight the destination before
+the first write and keep its stable id for every batch (requires ai-memory
+3.4 or newer):
+
+```ts
+const target = await memory.pages.resolveWriteTarget({
+  target: { workspace: "demo", project: "app" },
+});
+await memory.pages.writeBatch({
+  target: { workspace: target.workspace, projectId: target.projectId },
+  pages: [
+    { path: "import/a.md", body: "# A", createOnly: true },
+    { path: "import/b.md", body: "# B", expectedPageId: previousPageId },
+  ],
+});
+```
+
+Every batch entry is conditional. A stale id, existing `createOnly` path,
+admission rejection, or persistence error leaves the whole batch unchanged.
+
 ## Read next
 
 - [Concepts](docs/concepts.md): workspaces and projects, pages and versions,
@@ -115,8 +135,11 @@ scope. Arguments are the server's wire names in camelCase
 <!-- generated:methods:start -->
 | SDK method | Server call |
 |---|---|
+| `pages.resolveWriteTarget` | `memory_resolve_write_target` |
+| `pages.writeBatch` | `memory_write_pages_batch` |
 | `pages.write` | `memory_write_page` |
 | `pages.update` | `memory_write_page`, `memory_read_page` |
+| `pages.patch` | `memory_patch_page` |
 | `pages.read` | `memory_read_page` |
 | `pages.delete` | `memory_delete_page` |
 | `query` | `memory_query` |
@@ -162,7 +185,9 @@ Not wrapped (call them with `callTool`):
 <!-- generated:methods:end -->
 
 `callTool(name, args)` calls any tool with wire-format arguments and returns
-its decoded JSON as `unknown`.
+its decoded JSON as `unknown`. It initializes the MCP session when needed,
+without listing tools or checking their schemas. Pass `workspace` and
+`project` yourself.
 
 Root-only lifecycle operations live in a separate entry point, so an
 application that only reads and writes pages never imports code that can
@@ -184,8 +209,9 @@ await admin.purgeProject({ workspace: "demo", project: "old", dryRun: false, con
 |---|---|---|
 | 0.1.x | 3.0.0 or newer | 22 or newer |
 
-The first wrapped call probes the server once (`initialize` and
-`tools/list`). A call the server cannot honour, such as a conditional write
+The first MCP tool call initializes the client, including `callTool`. The
+first wrapped call also probes `tools/list`; both results are cached. A call
+the server cannot honour, such as a conditional write
 on a server older than 3.0.0, fails with `UnsupportedServerError` before
 anything is written. Details in [docs/compatibility.md](docs/compatibility.md).
 

@@ -42,7 +42,10 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -54,7 +57,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         db_path,
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -343,6 +346,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 title: "alpha prompt".into(),
                 body: "".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -377,6 +381,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 title: "beta prompt".into(),
                 body: "".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -990,7 +995,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
         .unwrap();
     let old_oid = state.wiki.commit_all("old checkpoint").unwrap().unwrap();
 
-    state
+    let new_page_id = state
         .wiki
         .write_page(WritePageRequest {
             workspace_id: ws,
@@ -1045,4 +1050,312 @@ async fn checkpoints_list_and_restore_page_round_trip() {
         .unwrap()
         .expect("restored page should be indexed");
     assert_eq!(stored.body, "old body");
+
+    let resp = post(
+        state.clone(),
+        "/admin/restore-page",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "path": "notes/recover.md",
+            "page_id": new_page_id.to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        state.wiki.read_page(ws, proj, &path).unwrap().body,
+        "new body"
+    );
+    assert_eq!(
+        store
+            .reader
+            .page_body_by_ids(ws, proj, path.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        "new body"
+    );
+}
+
+#[tokio::test]
+async fn restore_page_from_an_unknown_rev_is_404_and_writes_no_checkpoint() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let write = |path: &str, body: &str| WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new(path).unwrap(),
+        frontmatter: serde_json::json!({"title": "Recover", "tier": "semantic"}),
+        body: body.into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: Some("Recover".into()),
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
+    };
+    state
+        .wiki
+        .write_page(write("notes/recover.md", "old body"))
+        .await
+        .unwrap();
+    let old_oid = state.wiki.commit_all("old checkpoint").unwrap().unwrap();
+    state
+        .wiki
+        .write_page(write("notes/other.md", "uncommitted"))
+        .await
+        .unwrap();
+    let commits = state.wiki.git().commit_count();
+
+    for (path, rev) in [
+        ("notes/recover.md", "0000000".to_owned()),
+        ("notes/missing.md", old_oid.to_string()),
+    ] {
+        let resp = post(
+            state.clone(),
+            "/admin/restore-page",
+            json!({"workspace": "default", "project": "scratch", "path": path, "rev": rev}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path} at {rev}");
+    }
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused restore must not write its pre-restore checkpoint"
+    );
+
+    let resp = post(
+        state.clone(),
+        "/admin/restore-page",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "path": "notes/recover.md",
+            "rev": format!(" {old_oid} "),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["restored_from"], old_oid.to_string());
+}
+
+#[derive(Clone, Copy)]
+enum SessionRestoreCase {
+    PurgedSummary,
+    PurgedLegacySummary,
+    SurvivingManual,
+    UnpurgedSummary,
+}
+
+async fn check_session_restore(source: &str, case: SessionRestoreCase) {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+    let mut historical = WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: path.clone(),
+        frontmatter: json!({"title": "Historical page"}),
+        body: "historical body".into(),
+        tier: Tier::Episodic,
+        pinned: false,
+        title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ActorContext::anonymous(),
+        evidence: Vec::new(),
+    };
+    if matches!(
+        case,
+        SessionRestoreCase::PurgedSummary | SessionRestoreCase::UnpurgedSummary
+    ) {
+        historical.frontmatter["session_id"] = json!(sid.to_string());
+    }
+    let mut version = state.wiki.write_page(historical.clone()).await.unwrap();
+    let rev = state.wiki.commit_all("historical page").unwrap().unwrap();
+    let mut summary = historical.clone();
+    summary.frontmatter["session_id"] = json!(sid.to_string());
+    summary.body = "current summary".into();
+    let summary_id = state.wiki.write_page(summary).await.unwrap();
+    store
+        .writer
+        .end_session(sid, Some(summary_id))
+        .await
+        .unwrap();
+    if matches!(case, SessionRestoreCase::SurvivingManual) {
+        let live_manual = state
+            .wiki
+            .write_page(WritePageRequest {
+                body: "current manual replacement".into(),
+                ..historical.clone()
+            })
+            .await
+            .unwrap();
+        if source == "page_id" {
+            version = live_manual;
+        }
+    }
+    let purged = !matches!(case, SessionRestoreCase::UnpurgedSummary);
+    if purged {
+        state
+            .wiki
+            .purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .wiki
+                .purged_sessions(ws, proj)
+                .await
+                .unwrap()
+                .contains(&sid)
+        );
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let refused = matches!(
+        case,
+        SessionRestoreCase::PurgedSummary | SessionRestoreCase::PurgedLegacySummary
+    );
+    let abs = state.wiki.project_root(ws, proj).join(path.as_str());
+    assert_eq!(abs.exists(), !refused);
+    let before = store
+        .reader
+        .page_versions(ws, proj, path.to_string(), 10, 0)
+        .await
+        .unwrap()
+        .total;
+    if refused {
+        // Legacy versions lack session_id and can survive as history (#701),
+        // but there is no live manual replacement authorizing this restore.
+        assert_eq!(
+            before,
+            u64::from(matches!(case, SessionRestoreCase::PurgedLegacySummary))
+        );
+    }
+    let mut payload = json!({"workspace": "default", "project": "scratch", "path": path.as_str()});
+    payload[source] = if source == "rev" {
+        json!(rev.to_string())
+    } else {
+        json!(version.to_string())
+    };
+    let resp = post(state.clone(), "/admin/restore-page", payload).await;
+    let status = resp.status();
+    let body = body_json(resp).await;
+    let after = store
+        .reader
+        .page_versions(ws, proj, path.to_string(), 10, 0)
+        .await
+        .unwrap()
+        .total;
+    let latest = store
+        .reader
+        .page_body_by_ids(ws, proj, path.as_str())
+        .await
+        .unwrap();
+    if refused {
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{source}: {body}; rows before={before}, after={after}, file exists={}",
+            abs.exists()
+        );
+        assert_eq!(after, before, "a refused restore must not insert a version");
+        assert!(
+            latest.is_none(),
+            "a refused restore must not revive the index"
+        );
+        assert!(
+            !abs.exists(),
+            "a refused restore must roll back the installed file"
+        );
+    } else {
+        assert_eq!(status, StatusCode::OK, "{source}: {body}");
+        let expected_body =
+            if source == "page_id" && matches!(case, SessionRestoreCase::SurvivingManual) {
+                "current manual replacement"
+            } else {
+                "historical body"
+            };
+        assert_eq!(latest.unwrap().body, expected_body);
+        assert_eq!(
+            state.wiki.read_page(ws, proj, &path).unwrap().body,
+            expected_body
+        );
+    }
+}
+
+#[tokio::test]
+async fn restore_purged_session_checkpoint_returns_conflict() {
+    check_session_restore("rev", SessionRestoreCase::PurgedSummary).await;
+}
+
+#[tokio::test]
+async fn restore_purged_legacy_session_checkpoint_returns_conflict() {
+    check_session_restore("rev", SessionRestoreCase::PurgedLegacySummary).await;
+}
+
+#[tokio::test]
+async fn restore_purged_legacy_or_older_manual_session_version_returns_conflict() {
+    // A retained older manual version has the same unlinked frontmatter as
+    // a legacy summary. Neither authorizes a restore without a live manual.
+    check_session_restore("page_id", SessionRestoreCase::PurgedLegacySummary).await;
+}
+
+#[tokio::test]
+async fn restore_surviving_manual_session_page_remains_allowed() {
+    for source in ["rev", "page_id"] {
+        check_session_restore(source, SessionRestoreCase::SurvivingManual).await;
+    }
+}
+
+#[tokio::test]
+async fn restore_unpurged_session_page_remains_allowed() {
+    for source in ["rev", "page_id"] {
+        check_session_restore(source, SessionRestoreCase::UnpurgedSummary).await;
+    }
 }

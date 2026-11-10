@@ -39,6 +39,10 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(false).await
+}
+
+async fn harness_with(index_file_paths: bool) -> Harness {
     let tmp = TempDir::new().expect("tempdir");
     let store = Store::open(tmp.path()).expect("store");
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
@@ -61,7 +65,7 @@ async fn harness() -> Harness {
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
 
@@ -81,6 +85,7 @@ async fn harness() -> Harness {
         active_project: active_project.clone(),
         ingest_semaphore: ingest_semaphore.clone(),
         ingest_gates: ai_memory_hooks::IngestGates::default(),
+        session_agents: ai_memory_hooks::SessionAgents::default(),
         cwd_probes: ai_memory_hooks::CwdProbes::default(),
         consolidate_on_session_end: false,
         session_consolidation_notify: None,
@@ -92,6 +97,7 @@ async fn harness() -> Harness {
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),
         profile: ai_memory_core::profile::ProfileSettings::default(),
         ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
+        record_tool_names: false,
         skip_wiki_checkpoints: false,
         subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
         ingest_rate: Arc::new(tokio::sync::Mutex::new(
@@ -99,6 +105,7 @@ async fn harness() -> Harness {
         )),
         home_dir: None,
         trusted_proxy_identity: false,
+        index_file_paths,
     });
 
     let admin = admin_router(AdminState {
@@ -107,7 +114,10 @@ async fn harness() -> Harness {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -119,7 +129,7 @@ async fn harness() -> Harness {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:49374".to_string(),
         home_dir: None,
-        bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: Some(pepper.clone()),
         active_project,
         scope_invalidator: None,
@@ -331,6 +341,86 @@ async fn metrics_count_queries_and_hooks_without_leaking_any_content() {
                 "unexpected label in {line}"
             );
         }
+    }
+}
+
+/// #1843: the file path counters reach `/admin/metrics` and `/admin/status`
+/// as counts only. A planted path and a planted unknown skip reason never
+/// appear, and the family keeps the closed `outcome` label. Control: the
+/// counters move by exactly what was sent.
+#[tokio::test]
+async fn file_path_counters_carry_no_path_or_skip_reason() {
+    let h = harness_with(true).await;
+    let session = "11111111-2222-7333-8444-666666666666";
+    let cwd = format!("/work/{SECRET_PROJECT}");
+    hook(
+        &h,
+        "session-start",
+        json!({ "session_id": session, "cwd": cwd }),
+    )
+    .await;
+    let read = |path: &str, field: Value| {
+        json!({
+            "session_id": session, "cwd": cwd, "tool_name": "Read",
+            "tool_input": { "file_path": path }, "tool_response": { "content": "x" },
+            "_ai_memory_file": field,
+        })
+    };
+    hook(
+        &h,
+        "post-tool-use",
+        read(
+            "src/PATHPLANTED.rs",
+            json!({ "version": 1, "path": "src/PATHPLANTED.rs" }),
+        ),
+    )
+    .await;
+    hook(
+        &h,
+        "post-tool-use",
+        read(
+            "src/x.rs",
+            json!({ "version": 1, "skipped": "reasonplanted" }),
+        ),
+    )
+    .await;
+
+    let (status, metrics) = scrape(&h.router, Some(ROOT)).await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    assert_eq!(
+        sample(
+            &metrics,
+            "ai_memory_hook_file_paths_total{outcome=\"indexed\"}"
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &metrics,
+            "ai_memory_hook_file_paths_total{outcome=\"skipped_other\"}"
+        ),
+        1.0
+    );
+    let req = Request::builder()
+        .uri("/admin/status")
+        .header("authorization", format!("Bearer {ROOT}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, status_body) = send(&h.router, req).await;
+    assert_eq!(status, StatusCode::OK, "{status_body}");
+    let report: Value = serde_json::from_str(&status_body).expect("status json");
+    assert_eq!(report["ingest"]["file_path_indexed"], 1);
+    assert_eq!(report["ingest"]["file_path_skipped_other"], 1);
+
+    for planted in ["PATHPLANTED", "reasonplanted"] {
+        assert!(
+            !metrics.contains(planted),
+            "/admin/metrics leaked {planted}"
+        );
+        assert!(
+            !status_body.contains(planted),
+            "/admin/status leaked {planted}"
+        );
     }
 }
 

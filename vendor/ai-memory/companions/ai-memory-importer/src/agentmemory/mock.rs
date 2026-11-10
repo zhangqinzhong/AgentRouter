@@ -42,6 +42,8 @@ pub(crate) struct MockState {
     pub(crate) failure: Option<Failure>,
     /// Advertise `create_only` in `tools/list` (a 3.0+ server).
     pub(crate) conditional: bool,
+    pub(crate) batch: bool,
+    pub(crate) batch_calls: usize,
     pub(crate) hook_batches: Vec<Value>,
     next_id: usize,
 }
@@ -69,6 +71,7 @@ impl MockServer {
     pub(crate) fn start(scopes: &[(&str, &str)]) -> Self {
         let state = Arc::new(Mutex::new(MockState {
             conditional: true,
+            batch: true,
             scopes: scopes
                 .iter()
                 .map(|(w, p)| ((*w).to_owned(), (*p).to_owned()))
@@ -109,18 +112,29 @@ fn handle(state: &Mutex<MockState>, path: &str, body: &[u8]) -> (&'static str, V
         return ("200 OK", json!({"accepted": accepted}));
     }
     match request["method"].as_str() {
+        Some("initialize") => (
+            "200 OK",
+            rpc(json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "mock", "version": "3.2.10"}
+            })),
+        ),
         Some("tools/list") => {
             let mut properties = json!({"path": {}, "body": {}});
             if state.conditional {
                 properties["create_only"] = json!({"type": "boolean"});
                 properties["expected_page_id"] = json!({"type": "string"});
             }
-            (
-                "200 OK",
-                rpc(
-                    json!({"tools": [{"name": "memory_write_page", "inputSchema": {"properties": properties}}]}),
-                ),
-            )
+            let mut tools = vec![json!({
+                "name": "memory_write_page", "inputSchema": {"properties": properties}
+            })];
+            if state.batch {
+                tools.push(json!({
+                    "name": "memory_write_pages_batch", "inputSchema": {"properties": {"pages": {}}}
+                }));
+            }
+            ("200 OK", rpc(json!({"tools": tools})))
         }
         Some("tools/call") => {
             let name = request["params"]["name"].as_str().unwrap_or_default();
@@ -130,12 +144,35 @@ fn handle(state: &Mutex<MockState>, path: &str, body: &[u8]) -> (&'static str, V
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
-                arguments["project"].as_str().unwrap_or_default().to_owned(),
+                arguments["project"]
+                    .as_str()
+                    .or_else(|| arguments["project_id"].as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
             );
             match name {
                 "memory_recent" => {
                     if state.scopes.contains(&scope) {
                         ("200 OK", tool_text(&json!([])))
+                    } else {
+                        (
+                            "200 OK",
+                            rpc(
+                                json!({"isError": true, "content": [{"type": "text", "text": "scope not found"}]}),
+                            ),
+                        )
+                    }
+                }
+                "memory_resolve_write_target" => {
+                    if state.scopes.contains(&scope) {
+                        (
+                            "200 OK",
+                            tool_text(&json!({
+                                "workspace": scope.0,
+                                "project": scope.1,
+                                "project_id": arguments["project_id"].as_str().unwrap_or("019a0000-0000-7000-8000-000000000000")
+                            })),
+                        )
                     } else {
                         (
                             "200 OK",
@@ -152,12 +189,20 @@ fn handle(state: &Mutex<MockState>, path: &str, body: &[u8]) -> (&'static str, V
                         arguments["path"].as_str().unwrap_or_default().to_owned(),
                     );
                     match state.pages.get(&key).and_then(|chain| chain.last()) {
-                        Some(latest) => (
-                            "200 OK",
-                            tool_text(
-                                &json!({"path": key.2, "page_id": latest.page_id, "body": latest.body}),
-                            ),
-                        ),
+                        Some(latest) => {
+                            let (body, truncated, total_chars) =
+                                read_page_body(&latest.body, &arguments);
+                            (
+                                "200 OK",
+                                tool_text(&json!({
+                                    "path": key.2,
+                                    "page_id": latest.page_id,
+                                    "body": body,
+                                    "truncated": truncated,
+                                    "total_chars": total_chars,
+                                })),
+                            )
+                        }
                         None => (
                             "200 OK",
                             rpc(
@@ -167,6 +212,7 @@ fn handle(state: &Mutex<MockState>, path: &str, body: &[u8]) -> (&'static str, V
                     }
                 }
                 "memory_write_page" => write(&mut state, scope, arguments),
+                "memory_write_pages_batch" => batch_write(&mut state, scope, arguments),
                 other => (
                     "200 OK",
                     rpc(
@@ -177,6 +223,83 @@ fn handle(state: &Mutex<MockState>, path: &str, body: &[u8]) -> (&'static str, V
         }
         _ => ("400 Bad Request", json!({"error": "bad request"})),
     }
+}
+
+fn batch_write(
+    state: &mut MockState,
+    scope: (String, String),
+    arguments: Value,
+) -> (&'static str, Value) {
+    state.batch_calls += 1;
+    let Some(items) = arguments["pages"].as_array() else {
+        return ("400 Bad Request", json!({"error": "pages missing"}));
+    };
+    let first_call = state.write_calls + 1;
+    let last_call = state.write_calls + items.len();
+    if matches!(state.failure, Some(Failure::Before(n)) if (first_call..=last_call).contains(&n)) {
+        state.write_calls = last_call;
+        return ("500 Internal Server Error", json!({"error": "injected"}));
+    }
+    for (index, item) in items.iter().enumerate() {
+        let key = (
+            scope.0.clone(),
+            scope.1.clone(),
+            item["path"].as_str().unwrap_or_default().to_owned(),
+        );
+        let current = state
+            .pages
+            .get(&key)
+            .and_then(|chain| chain.last())
+            .map(|version| version.page_id.clone());
+        let holds = if item["create_only"].as_bool() == Some(true) {
+            current.is_none()
+        } else {
+            item["expected_page_id"]
+                .as_str()
+                .is_some_and(|expected| current.as_deref() == Some(expected))
+        };
+        if !holds {
+            return (
+                "200 OK",
+                json!({"jsonrpc":"2.0","id":1,"error":{
+                    "code":-32600,"message":"precondition failed",
+                    "data":{"reason":"precondition_failed","index":index,"path":key.2,"current_page_id":current}
+                }}),
+            );
+        }
+    }
+    state.write_calls = last_call;
+    let mut response = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        state.next_id += 1;
+        let page_id = format!("page-{}", state.next_id);
+        let key = (
+            scope.0.clone(),
+            scope.1.clone(),
+            item["path"].as_str().unwrap_or_default().to_owned(),
+        );
+        state
+            .pages
+            .entry(key.clone())
+            .or_default()
+            .push(StoredVersion {
+                page_id: page_id.clone(),
+                body: item["body"].as_str().unwrap_or_default().to_owned(),
+                arguments: item.clone(),
+            });
+        response.push(json!({"index":index,"path":key.2,"page_id":page_id}));
+    }
+    state.scopes.insert(scope);
+    if matches!(state.failure, Some(Failure::After(n)) if (first_call..=last_call).contains(&n)) {
+        return (
+            "500 Internal Server Error",
+            json!({"error": "injected after commit"}),
+        );
+    }
+    (
+        "200 OK",
+        tool_text(&json!({"pages":response,"checkpoint":"mock"})),
+    )
 }
 
 fn write(
@@ -248,4 +371,24 @@ fn rpc(result: Value) -> Value {
 
 fn tool_text(value: &Value) -> Value {
     rpc(json!({"content": [{"type": "text", "text": value.to_string()}]}))
+}
+
+/// The body `memory_read_page` returns, as the server cuts it since 3.3.0
+/// (#1827): at `max_chars` characters (12,000 when the caller sends none,
+/// clamped to 500..=64,000) with a visible marker, plus `truncated` and
+/// `total_chars` (`READ_PAGE_*` in ai-memory-mcp `server.rs`).
+fn read_page_body(body: &str, arguments: &Value) -> (String, bool, usize) {
+    let max_chars = arguments["max_chars"]
+        .as_u64()
+        .map_or(12_000, |requested| requested.clamp(500, 64_000)) as usize;
+    let total_chars = body.chars().count();
+    if total_chars <= max_chars {
+        return (body.to_owned(), false, total_chars);
+    }
+    let mut cut: String = body.chars().take(max_chars).collect();
+    cut.push_str(&format!(
+        "\n[body truncated; {} chars omitted]",
+        total_chars - max_chars
+    ));
+    (cut, true, total_chars)
 }

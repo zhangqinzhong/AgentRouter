@@ -83,9 +83,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Run `initialize` (plus `notifications/initialized` when stateful) and `tools/list`. @internal */
-export async function probeTools(transport: Transport, options?: CallOptions): Promise<ToolIndex> {
-  transport.resetSession();
+/** The handshake result, shared by raw and wrapped tool calls. @internal */
+export type SessionInfo = Omit<ToolIndex, "tools">;
+
+/** Run `initialize` plus `notifications/initialized` when stateful. @internal */
+export async function initialize(transport: Transport, options?: CallOptions): Promise<SessionInfo> {
+  const epoch = transport.resetSession();
   const newest = SUPPORTED_PROTOCOL_VERSIONS[0] ?? "2024-11-05";
   const { result, headers } = await transport.rpcWithHeaders(
     "initialize",
@@ -110,9 +113,27 @@ export async function probeTools(transport: Transport, options?: CallOptions): P
       server.version,
     );
   }
-  const statefulSession = transport.adoptSession(headers);
+  // A superseded handshake (a concurrent refresh opened a newer session while
+  // this one was in flight) must neither overwrite the live session id nor
+  // send `notifications/initialized` against its stale one (#2047); it simply
+  // reports no stateful session of its own, and the caller's later calls run
+  // on the session the refresh established.
+  const adoption = transport.adoptSession(headers, epoch);
+  const statefulSession = adoption === "adopted";
   if (statefulSession) await transport.notify("notifications/initialized", options);
+  return {
+    server: { name: transport.safeText(server.name), version: transport.safeText(server.version) },
+    protocolVersion,
+    statefulSession,
+  };
+}
 
+/** List schemas after the shared handshake. @internal */
+export async function probeTools(
+  transport: Transport,
+  session: SessionInfo,
+  options?: CallOptions,
+): Promise<ToolIndex> {
   const listed = await transport.rpc("tools/list", {}, false, options);
   const rawTools = listed["tools"];
   if (!Array.isArray(rawTools)) throw new ProtocolError("tools/list answered without tools");
@@ -124,12 +145,7 @@ export async function probeTools(transport: Transport, options?: CallOptions): P
       isRecord(schema) && isRecord(schema["properties"]) ? Object.keys(schema["properties"]) : [];
     tools[tool["name"]] = { properties };
   }
-  return {
-    server: { name: transport.safeText(server.name), version: transport.safeText(server.version) },
-    protocolVersion,
-    statefulSession,
-    tools,
-  };
+  return { ...session, tools };
 }
 
 /**

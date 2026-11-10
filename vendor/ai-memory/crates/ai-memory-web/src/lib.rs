@@ -2,13 +2,17 @@
 //!
 //! Mounted under `/web` on the same axum server that hosts the MCP
 //! endpoint, so a single port + single auth posture covers both. The
-//! crate is deliberately read-only in v1: no editing, no POST routes,
-//! no agent-write APIs. The wiki is already markdown-on-disk; this
-//! surface just makes it browsable from a phone, a tablet, or a
-//! teammate's machine without `docker exec cat …`.
+//! wiki browsing remains read-only. The inbox also queues authorized messages
+//! through sanitization, admission and the single writer; it never claims mail
+//! or starts an agent. Hosts must mount the router behind normal dual-auth.
 //!
 //! Routes (all under whatever prefix the host nests this router at):
 //! - `GET /`                              → project list (cards)
+//! - `GET /docs` / `GET /docs/:id` / `GET /docs/:id.md` → bundled product guides
+//! - `GET /inbox`                         → scoped received/sent history
+//! - `GET /inbox/notifications`           → access-filtered pending counts
+//! - `POST /messages`                     → authorized harness-addressed request
+//! - `GET /w/:workspace/:project/agents/:agent` → agent sessions and usage
 //! - `GET /graph`                         → cross-project link graph (SVG + table)
 //! - `GET /w/:workspace/:project`         → page tree + recent activity
 //! - `GET /w/:workspace/:project/graph`   → in-project link graph (SVG + table)
@@ -29,10 +33,9 @@
 //! The companion `api_router` exposes the same read-only data as JSON
 //! for custom frontends. It intentionally does not expose write/admin
 //! operations. `clippy.toml` in this crate forbids the `Wiki` write and
-//! destructive methods, so read-only holds at lint time, not only by review.
+//! destructive methods, keeping wiki mutations outside this surface.
 //!
-//! Theme follows `prefers-color-scheme` via the included Tailwind
-//! stylesheet; no JS toggle, no cookie.
+//! Themes support light, dark and system choices stored locally in the browser.
 
 use std::sync::Arc;
 
@@ -41,26 +44,32 @@ use ai_memory_wiki::Wiki;
 use axum::Router;
 
 mod diff;
+mod documentation;
+pub mod features;
 pub mod health;
 mod html_auth;
+mod knowledge;
+mod localization;
 #[cfg(feature = "management-ui")]
 pub mod management;
 mod markdown;
 pub mod mount;
+mod operations;
 pub mod recall;
 mod routes;
 mod state;
 mod templates;
+mod views;
 
 pub use html_auth::{HtmlAuthRedirectConfig, html_auth_redirect_mw, sanitize_next};
 pub use mount::{
-    SplitWebRouters, WebMountSpec, inject_base_href, inject_base_path_meta, normalize_prefix,
-    split_web_routers, web_base_href,
+    ApiCors, SplitWebRouters, WebMountSpec, api_cors_mw, inject_base_href, inject_base_path_meta,
+    normalize_prefix, split_web_routers, split_web_routers_with_metrics, web_base_href,
 };
 pub use recall::Recall;
 pub use state::WebState;
 
-/// Build the read-only web router. Call once at server startup and
+/// Build the web dashboard and authorized inbox composer. Call once at server startup and
 /// `nest("/web", router)` it onto the existing axum app, OR mount at
 /// `/` if the web UI is the only HTTP surface.
 pub fn router(reader: ReaderPool, wiki: Wiki) -> Router {

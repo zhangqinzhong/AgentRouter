@@ -366,14 +366,19 @@ fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
     }
     let stdout = child.stdout.take().unwrap();
     let mut child = Kill(child);
+    let mut lines = std::io::BufReader::new(stdout).lines();
     let mut url = String::new();
-    for line in std::io::BufReader::new(stdout).lines() {
+    for line in lines.by_ref() {
         let line = line.unwrap();
         if let Some(found) = line.trim().strip_prefix("http://127.0.0.1:") {
             url = format!("http://127.0.0.1:{found}");
             break;
         }
     }
+    // Keep the pipe open and drained after the readiness line. Dropping it
+    // here races the child's following informational println!, whose
+    // broken-pipe panic resets the listening socket before axum::serve starts.
+    std::thread::spawn(move || for _ in lines {});
     assert!(url.ends_with('/'), "no address printed: {url:?}");
     let authority = url
         .trim_start_matches("http://")
@@ -474,11 +479,16 @@ fn setup_web_stops_when_its_stdin_closes_only_when_asked() {
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
-        for line in std::io::BufReader::new(stdout).lines() {
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        for line in lines.by_ref() {
             if line.unwrap().trim().starts_with("http://127.0.0.1:") {
                 break;
             }
         }
+        // Keep the pipe open and drained after the readiness line. Dropping
+        // it here races the child's following informational println!, whose
+        // broken-pipe panic can look like an stdin-triggered shutdown.
+        std::thread::spawn(move || for _ in lines {});
         child
     };
     let wait = |child: &mut std::process::Child, within: std::time::Duration| {

@@ -512,6 +512,75 @@ fn a_429_applies_its_acknowledged_items_and_then_stops() {
 }
 
 #[test]
+fn an_oversized_http_response_is_not_retried_and_keeps_the_batch() {
+    for status in [200u16, 401, 403, 413, 429, 500] {
+        let root = fixture(&format!("oversized-response-{status}"));
+        // Even a valid acknowledgement must not release the item once its
+        // response exceeds the body limit. The next response belongs to a
+        // later explicit flush, not an automatic transport retry.
+        let mut body = r#"{"accepted":1,"extra":"ACK_BODY_CANARY"}"#.to_owned();
+        body.push_str(&" ".repeat(ai_memory_relay::http::MAX_ACK_BYTES + 1 - body.len()));
+        let server = stub(vec![Reply::Json(status, body), Reply::AcceptAll]);
+        let dir = bind(&root, &server.url());
+        enqueue(
+            &dir,
+            &root,
+            "in.json",
+            serde_json::json!([event("e-1", "codex", "session-start", "s-1")]),
+        )
+        .unwrap();
+
+        let report = flush(&dir);
+        assert_eq!(
+            server.bodies().len(),
+            1,
+            "HTTP {status} must stop this flush even when its body is oversized"
+        );
+        assert_eq!(pending_count(&dir), 1);
+        assert_eq!(report.exit_code(), 2);
+        let failure = report.failure.as_deref().expect("oversized response fails");
+        assert!(failure.contains(&format!("HTTP {status}")), "{report:?}");
+        assert!(!format!("{report:?}").contains("ACK_BODY_CANARY"));
+        assert_eq!(
+            Queue::open(&dir)
+                .unwrap()
+                .stats(ai_memory_relay::now_ms())
+                .unwrap()
+                .receipts,
+            0
+        );
+
+        let next = flush(&dir);
+        assert_eq!(next.exit_code(), 0, "a later flush may retry: {next:?}");
+        assert_eq!(pending_count(&dir), 0);
+        let sent = server.sent_event_ids();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], sent[1], "the later retry keeps its identity");
+    }
+}
+
+#[test]
+fn an_ack_at_the_body_limit_is_accepted() {
+    let root = fixture("ack-at-limit");
+    let mut body = r#"{"accepted":1}"#.to_owned();
+    body.push_str(&" ".repeat(ai_memory_relay::http::MAX_ACK_BYTES - body.len()));
+    let server = stub(vec![Reply::Json(200, body)]);
+    let dir = bind(&root, &server.url());
+    enqueue(
+        &dir,
+        &root,
+        "in.json",
+        serde_json::json!([event("e-1", "codex", "session-start", "s-1")]),
+    )
+    .unwrap();
+
+    let report = flush(&dir);
+    assert_eq!(report.exit_code(), 0, "{report:?}");
+    assert_eq!(pending_count(&dir), 0);
+    assert_eq!(server.bodies().len(), 1);
+}
+
+#[test]
 fn a_redirect_is_refused_and_the_batch_never_reaches_the_second_host() {
     let root = fixture("redirect");
     let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();

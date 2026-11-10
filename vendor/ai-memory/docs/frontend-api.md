@@ -16,6 +16,27 @@
 
 ## 2. Auth model
 
+The built-in web navigation also reads `GET /web/inbox/notifications` (replace
+`/web` with the configured mount). It returns `pending`, `project_count` and up
+to five `projects`, each with `workspace`, `project` and `pending`, filtered by
+the viewer's repository access. The response is protected and non-consuming,
+uses `Cache-Control: no-store`, and contains no message body or subject.
+Notification links open `/web/inbox?workspace=...&project=...&state=pending`.
+The optional `state` filter (`pending`, `claimed`, `cancelled`, or empty for
+all) is applied before history pagination, and unknown states are refused.
+Received mail defaults to `pending` when `state` is omitted, and an empty
+`state=` shows all history. Sent mail defaults to all states.
+
+Project and session HTML views accept `calls_q` (a literal model, harness or
+response substring, at most 256 characters), `calls_sort=tokens|recent`,
+`calls_signal=all|signals` and `calls_offset`. The database applies scope and
+ownership, search, signal filtering and ordering before it selects the
+fifty-response page. Totals and signal averages still cover all authorized
+responses in that scope. These HTML query parameters are separate from
+observation pagination, and they add no write capability or new `/api/v1`
+endpoint. Project and session usage refresh every ten seconds while visible,
+and the search controls and focus stay in place.
+
 `/api/v1/*` and `/admin/*` are dual-auth surfaces:
 
 - Human operators authenticate with `POST /auth/login`. The engine returns an
@@ -314,7 +335,9 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=20
 ```
 
 `is_latest = 1` pages whose `expires_at` TTL has not passed, ordered by
-`updated_at` DESC. `limit` clamped `1..=100`, default `10`.
+`updated_at` DESC by instant, with path ascending for equal timestamps.
+Fractional-second precision in the serialized timestamps does not change this
+order. `limit` clamped `1..=100`, default `10`.
 
 Every reader surface uses the same `kind` contract. An explicit frontmatter
 `kind` wins; otherwise the path families `_rules/`, `_slots/`, `sessions/`,
@@ -581,7 +604,12 @@ row is anchored in the project OR at least one of its observations landed
 there, so a session that changed repositories mid-flight shows up in both.
 `observation_count` counts only this project's rows. `limit` clamped
 `1..=100`, default `20`; `offset` default `0`; `include_open` default
-`false` (only sessions with `ended_at` set). Owner-filtered like handoffs: a
+`false` (only effectively ended sessions). Substantive observations in the
+requested project after the persisted end make the read view open the session
+again: `ended_at` is `null`, and `include_open=false` excludes it.
+Lifecycle-only observations do not reopen it. The stored end stays the writer's
+finalization watermark, and this read changes neither history nor handoff
+admission. Owner-filtered like handoffs: a
 caller the server can name sees their own sessions plus unattributed ones;
 an unnamed caller sees unattributed ones only. Never cached (`no-store`).
 
@@ -759,15 +787,20 @@ or `too_large`; `from` is `null` when `to` replaced nothing at this path.
 - `POST /api/v1/search`: at most **25 scopes** per request.
 - HTTP body cap: **10 MB** (shared with the MCP body limit; you won't
   hit this for normal API traffic).
-- **Cache-Control + ETag.** Identity-independent read endpoints use
-  `Cache-Control: private, max-age=N` with an endpoint-specific TTL; page reads
-  also carry a SHA-256 `ETag`, and a matching `If-None-Match` receives `304 Not
-  Modified`. Briefing, overview, handoff-list, session-list and session
-  observation and page-history responses depend on the authenticated actor and therefore use
-  `Cache-Control: private, no-store`, so
-  a browser cannot reuse Alice's prompt-derived response after credentials at
-  the same URL switch to Bob. Search responses are not cacheable because the
-  request body affects the result.
+- **Cache-Control + ETag.** Every `/api/v1` read is grant-filtered (#708):
+  what it returns depends on who is signed in, so none of them may be served
+  from the browser's own cache to a later viewer at the same URL. The list,
+  graph and recent reads (workspaces, projects, pages, graph, recent) and the
+  actor-scoped briefing, overview, handoff-list, session-list, session
+  observation and page-history reads all use `Cache-Control: private,
+  no-store`. The single-page read carries a SHA-256 `ETag` and uses
+  `Cache-Control: private, no-cache`: the browser keeps the body but must
+  revalidate with `If-None-Match` every time, and because the server runs the
+  grant check before comparing the tag, a viewer without a grant receives `403`
+  rather than a `304` from the browser's copy. Search responses are not
+  cacheable because the request body affects the result. The effect is that a
+  browser cannot reuse Alice's response after credentials at the same URL
+  switch to Bob.
 
 ## 6. Custom UI hosting and base paths
 
@@ -961,6 +994,12 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
 `Authorization` + `Content-Type` headers, and credentials, with a
 10-minute preflight cache.
 
+The CORS layer sits outside authentication. A browser sends its preflight
+(`OPTIONS` with `Access-Control-Request-*`) without credentials, so the
+preflight is answered by the allow-list alone. Every real request still needs a
+bearer or session, and its `401`/`403` carries the CORS headers so the calling
+page can read the refusal.
+
 ## 10. Known gaps and deliberate non-goals
 
 - **No write surface, by design.** This is not a pending iteration: browsers
@@ -985,3 +1024,41 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
 
 For status updates on any of these, the issue tracker is the source of
 truth.
+
+### Browser inbox exception
+
+The `/api/v1` surface and wiki editing stay read-only. The built-in web UI adds
+`/web/inbox` and `POST /web/messages` (under the configured base path and web
+slug). The POST queues a sanitized, admitted message for an existing project and
+harness. It requires write access to the source and destination, a JSON body,
+the UI header and the normal browser-session CSRF checks. It does not mutate
+wiki pages, pop messages or run an agent. See
+[agent messaging](agent-messaging.md#in-the-web-ui).
+
+Three additional POST routes support editing queued messages: `/web/messages/{id}/edit` holds it
+out of the queue and returns its text, `/web/messages/{id}/save` replaces the
+subject and text and requeues it, and `/web/messages/{id}/release` requeues it
+unchanged. The body names the mailbox (`workspace`, `project`), and `save` adds
+`subject` and `body`. They need the same checks as sending, plus write access to
+the project the message came from. A message outside the expected state
+returns 409.
+
+## Bundled documentation for agents
+
+The documentation catalog is at `GET /api/v1/docs?q=token`. Each entry has an
+`id`, title, description, category and repository `source` path.
+`GET /api/v1/docs/{id}` returns that metadata plus `markdown`, the binary's
+package `version`, a selected `release` and the available `releases`. These are
+read-only product guides, independent of project scopes and database content.
+They use the same authentication as the other API routes. Search is limited to
+200 characters, and unknown document ids and releases return 404.
+
+The browser uses `/web/docs` and `/web/docs/{id}`. A `.md` suffix returns
+`text/markdown` instead of HTML. The changelog defaults to Unreleased, and
+archived series default to their first release. Use `?release=3.2.2` for one
+release or `?release=all` for a whole series. The guides and changelog files are
+compiled into the binary, including source-built Docker images, so no internet
+connection or running LLM is needed. Repository links outside the curated
+catalog open on GitHub. These pages describe shipped capabilities and do not
+expose the running server's configuration or credentials. Apply your configured
+base path and web slug to these examples.

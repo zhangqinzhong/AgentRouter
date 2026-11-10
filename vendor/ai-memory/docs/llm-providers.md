@@ -58,7 +58,7 @@ Recommended defaults:
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
 | `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
-| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Standard Compute, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 | `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
@@ -183,6 +183,8 @@ AI_MEMORY_LLM_PROVIDER=openai-compat
 AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
 AI_MEMORY_LLM_MODEL=deepseek/deepseek-v4-flash
 AI_MEMORY_LLM_COMPAT_STRICT=true
+# Set only when the endpoint defaults an omitted field to SSE:
+AI_MEMORY_LLM_COMPAT_STREAM=false
 ```
 
 Then verify:
@@ -200,6 +202,13 @@ strip, which occasionally drops a field. Setting it to `true` at the
 env-file level is safer for consolidation reliability. Turn it off
 (`AI_MEMORY_LLM_COMPAT_STRICT=false`) only for a specific model backend that
 explicitly rejects the schema-constrained shape.
+
+`AI_MEMORY_LLM_COMPAT_STREAM` controls the `stream` field on
+`openai-compat` Chat Completions requests. Leave it unset to omit the field,
+preserving the existing request shape. Set it to `false` when an endpoint
+defaults an omitted field to Server-Sent Events. Setting it to `true` is
+rejected before any request because this transport expects one JSON response
+and does not decode SSE. Use `false` or leave the setting unset.
 
 The `docker/.env.production.example` file in the repo ships with an OpenRouter
 setup pre-filled, with `moonshotai/kimi-k2.6` as the sample model (see the
@@ -274,6 +283,31 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > static `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at
 > startup for that provider; the dynamic value must not be shadowed or
 > duplicated.
+
+### Probing the server's own provider
+
+`ai-memory llm-test` builds a provider from the shell it runs in. That is the
+right check before a key goes into the config, and it works with the server
+down — but it is the wrong check when the server runs in a container or on
+another host, because the keys exist there and not in your shell. A failure
+like `building LLM provider` (no key) or a provider `400 Please pass a valid
+API key` says nothing about the server in that case.
+
+`ai-memory llm-test --server` asks the server to run the probe itself, with its
+own configured provider, fallback chain and keys, and prints the provider,
+model, latency and the error class:
+
+```bash
+ai-memory llm-test --server
+```
+
+It is the same probe `status` and the health panel name when a provider call
+fails, it runs one fixed short prompt, and it takes no `--provider`, `--model`,
+`--prompt`, `--base-url` or `--api-key`: a client cannot hand the server a key
+nor point it at another URL. On a multi-user server the route is root-only, and
+a provider's error body is scrubbed before it is printed, so a key the provider
+quoted back never reaches your terminal. Without a configured provider the
+server answers `503` and says so.
 
 ### Security and gotchas
 
@@ -381,6 +415,12 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
+The tolerant parser removes `<think>`, `<thinking>`, `<analysis>` and
+`<reasoning>` wrappers outside the JSON answer and unwraps Markdown fences.
+Literal tags inside JSON strings remain intact, so summaries can quote prompt
+templates or other tagged text. Anthropic's structured text replies use the
+same parsing rules when the provider uses automatic tool choice.
+
 > [!TIP]
 > **Thinking-capable local engines (vLLM / SGLang serving Qwen3-class
 > models).** Such engines spend the output budget on a reasoning pass before
@@ -434,7 +474,9 @@ RRF ranked below the requested cut, at the cost of LLM latency and usage. The
 request sends the query plus at most 30 bounded page titles and search snippets
 to the configured provider; all values are JSON-encoded and treated as
 untrusted data. A timeout, provider error, or incomplete/invalid score set
-preserves the normal order. `global=true` and supplemental global-preference
+preserves the normal order. The timeout is 20 seconds per query; raise it with
+`AI_MEMORY_RERANK_TIMEOUT_SECS` (or `rerank_timeout_secs` in `config.toml`)
+when a slow provider or a fallback chain needs longer to answer. `global=true` and supplemental global-preference
 hits keep their existing non-RRF ranking. Concurrent provider calls are capped
 at four; saturated queries keep their local ranking without waiting.
 
@@ -448,6 +490,11 @@ Each row reports process-lifetime calls, successes and errors, total/max
 latency, fixed-bucket p50/p95 upper bounds, last outcome, and token counts. The
 counters are process-local and reset on restart; the server constructs the
 configured provider wrapper once at startup and has no runtime provider reload.
+`providers.llm_workloads_started_ms` gives the Unix time in milliseconds when
+the counters started (null when no LLM provider is configured). A window is the
+difference between two snapshots with the same `llm_workloads_started_ms`. A
+restart, including one for a configuration change, starts a new value, so it
+closes a segment, and a window spanning restarts adds its segments.
 
 `estimated_input_tokens` and `estimated_output_tokens` use a deliberately
 coarse four-characters-per-token estimate so structured and plain calls remain
@@ -460,10 +507,10 @@ estimate is nonzero.
 The telemetry stores no prompt, completion, scope, project, or caller-supplied
 label. A fallback chain is measured as one provider-interface invocation, not
 as one call per internal candidate attempt; an outer caller retry is another
-invocation. Workload labels do not select a
-provider or model: all operations still use the configured global provider and
-fallback chain. Per-workload routing remains measure-first and has no public
-configuration surface.
+invocation. The workload label itself never selects a provider or model. A
+task uses its own provider and fallback chain only when the config declares an
+`[llm.<task>]` profile for it (see `config.default.toml`); every other task
+uses the global provider and its fallback chain.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`,
@@ -549,7 +596,7 @@ sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
 pinned checksums; see [`docs/local-embeddings.md`](local-embeddings.md).
 
 See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
-for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra
+for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra/Standard Compute
 examples, and
 [`docs/llm-provider-comparison.md`](llm-provider-comparison.md)
 for the empirical model comparison.

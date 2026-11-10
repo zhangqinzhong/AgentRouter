@@ -26,7 +26,10 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -38,7 +41,7 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
         db_path,
         bind: "127.0.0.1:49374".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -155,6 +158,89 @@ async fn status_returns_counts_and_paths() {
             .as_u64()
             .unwrap(),
         1
+    );
+}
+
+/// `GET /admin/status` carries the consolidation queue: exact counts plus the
+/// sessions that gave up, newest first, with the worker's error scrubbed — so a
+/// watchdog reads one JSON field instead of grepping the journal for a log
+/// line (#1692). The queue's own `/health` view stays counts-only.
+#[tokio::test]
+async fn status_carries_the_consolidation_queue_and_its_failed_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_admin_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let session = ai_memory_core::SessionId::new();
+    store
+        .writer
+        .begin_session(ai_memory_core::NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: ai_memory_core::AgentKind::Codex,
+            cwd: Some("/repo".into()),
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    // A provider body can quote the key it rejected; the status copy is
+    // scrubbed like `/admin/llm-test`'s.
+    let planted = format!("{} from provider", "sk-live-0123456789abcdef");
+    rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO session_consolidation_jobs \
+             (session_id, workspace_id, project_id, generation, state, requested_at, \
+              next_attempt_at, attempts, completed_at, last_error) \
+             VALUES (?1, ?2, ?3, 1, 'failed', 0, 0, 5, 1700000000000000, ?4)",
+            rusqlite::params![
+                session.as_bytes().to_vec(),
+                ws.as_bytes().to_vec(),
+                proj.as_bytes().to_vec(),
+                planted
+            ],
+        )
+        .unwrap();
+    let app = admin_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+
+    assert_eq!(body["consolidation"]["failed"], 1);
+    assert_eq!(body["consolidation"]["pending"], 0);
+    assert_eq!(
+        body["consolidation"]["failed_sessions"][0]["session_id"],
+        serde_json::json!(session.to_string())
+    );
+    assert_eq!(body["consolidation"]["failed_sessions"][0]["attempts"], 5);
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("sk-live-0123456789abcdef"),
+        "the provider body must not reach an operator: {rendered}"
+    );
+    assert!(
+        rendered.contains("from provider"),
+        "the error class stays useful: {rendered}"
     );
 }
 

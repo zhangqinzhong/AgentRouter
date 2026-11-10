@@ -54,6 +54,8 @@ rstest.workspace = true
 # In-process HTTP mock for the openai-compat strict-fallback tests.
 # Scoped to dev-dependencies so production binaries don't pull it in.
 wiremock = "0.6"
+# Captures the fallback chain's log lines in its unit tests.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

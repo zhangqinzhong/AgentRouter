@@ -27,6 +27,24 @@ fn run_hook_full_agent(
     payload: &[u8],
     capture_assistant: bool,
 ) -> Output {
+    run_hook_at(
+        data_dir,
+        agent,
+        event,
+        payload,
+        capture_assistant,
+        &ai_memory_test_support::dead_http_endpoint(),
+    )
+}
+
+fn run_hook_at(
+    data_dir: &Path,
+    agent: &str,
+    event: &str,
+    payload: &[u8],
+    capture_assistant: bool,
+    server: &str,
+) -> Output {
     let mut args = vec![
         "hook".to_string(),
         "--event".to_string(),
@@ -34,7 +52,7 @@ fn run_hook_full_agent(
         "--agent".to_string(),
         agent.to_string(),
         "--server-url".to_string(),
-        ai_memory_test_support::dead_http_endpoint(),
+        server.to_owned(),
     ];
     if capture_assistant {
         args.push("--capture-assistant".to_string());
@@ -89,6 +107,175 @@ fn spooled_entry(data_dir: &Path) -> serde_json::Value {
     assert_eq!(entries.len(), 1);
     serde_json::from_slice(&std::fs::read(entries[0].path()).expect("read spool entry"))
         .expect("parse spool entry")
+}
+
+#[test]
+fn native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure() {
+    for agent in ["claude-code", "codex"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        let text=(1..=300).map(|n| {
+            let row=if agent=="claude-code" {
+                serde_json::json!({"type":"assistant","message":{"id":format!("r-{n}"),"usage":{"input_tokens":100,"output_tokens":20}}})
+            } else {
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100*n,"output_tokens":20*n}}}})
+            };
+            format!("{row}\n")
+        }).collect::<String>();
+        std::fs::write(&transcript, text).unwrap();
+        let payload=serde_json::json!({"session_id":"native-backlog","cwd":tmp.path(),"transcript_path":transcript,"tool_name":"Bash","tool_input":{"command":"echo test"},"tool_response":"test"}).to_string();
+        let endpoint = ai_memory_test_support::dead_http_endpoint();
+        std::fs::write(tmp.path().join("hook-spool"), "unwritable spool fixture").unwrap();
+        let failed = run_hook_at(
+            tmp.path(),
+            agent,
+            "post-tool-use",
+            payload.as_bytes(),
+            false,
+            &endpoint,
+        );
+        assert!(failed.status.success());
+        std::fs::remove_file(tmp.path().join("hook-spool")).unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for expected in [256, 300, 300] {
+            let output = run_hook_at(
+                tmp.path(),
+                agent,
+                "post-tool-use",
+                payload.as_bytes(),
+                false,
+                &endpoint,
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for entry in spool_entries(tmp.path()) {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_str(v["body"].as_str().unwrap()).unwrap();
+                if let Some(calls) = body["_ai_memory_usage_calls"].as_array() {
+                    assert!(calls.len() <= 256);
+                    ids.extend(
+                        calls
+                            .iter()
+                            .map(|c| c["call_id"].as_str().unwrap().to_owned()),
+                    );
+                }
+            }
+            assert_eq!(
+                ids.len(),
+                expected,
+                "{agent} must recover the backlog across separate hook processes"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_hook_reports_live_usage_for_every_supported_event_and_harness() {
+    for agent in ["claude-code", "codex"] {
+        for event in [
+            "post-tool-use",
+            "stop",
+            "pre-compact",
+            "session-end",
+            "pre-tool-use",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let transcript = tmp.path().join("transcript.jsonl");
+            let row = if agent == "claude-code" {
+                serde_json::json!({"type":"assistant","message":{"id":"response-1","model":"fixture-model","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":80,"cache_creation_input_tokens":10}}})
+            } else {
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":20,"cached_input_tokens":800},"last_token_usage":{"input_tokens":1000,"output_tokens":20,"cached_input_tokens":800}}}})
+            };
+            std::fs::write(&transcript, format!("{row}\n{row}\n")).unwrap();
+            let payload = serde_json::json!({"session_id":"live-native-hook","cwd":tmp.path(),"transcript_path":transcript,"tool_name":"Bash","tool_input":{"command":"echo fixture"},"tool_response":"fixture"});
+            let output = run_hook_full_agent(
+                tmp.path(),
+                agent,
+                event,
+                payload.to_string().as_bytes(),
+                false,
+            );
+            assert!(
+                output.status.success(),
+                "{agent}/{event}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let delivered: serde_json::Value =
+                serde_json::from_str(&spooled_body(tmp.path())).unwrap();
+            if event == "pre-tool-use" {
+                assert!(delivered.get("_ai_memory_usage_calls").is_none());
+                continue;
+            }
+            let calls = delivered["_ai_memory_usage_calls"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{agent}/{event} did not report live usage"));
+            assert_eq!(calls.len(), 1, "A replay is not a second response");
+            assert_eq!(
+                calls[0]["input_tokens"],
+                if agent == "codex" { 200 } else { 100 }
+            );
+            assert_eq!(
+                calls[0]["cache_read_tokens"],
+                if agent == "codex" { 800 } else { 80 }
+            );
+            assert_eq!(calls[0]["output_tokens"], 20);
+        }
+    }
+}
+
+#[test]
+fn claude_code_subagent_event_leaves_the_main_transcript_lines_for_the_next_event() {
+    // The router drops a subagent event (`drop_subagent_captures`), so a
+    // subagent event that read the main transcript would advance the cursor
+    // past a response no later event reports.
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("transcript.jsonl");
+    let row = serde_json::json!({"type":"assistant","message":{"id":"response-1","model":"fixture-model","usage":{"input_tokens":100,"output_tokens":20}}});
+    // The last response stays pending until a later row closes it.
+    let next = serde_json::json!({"type":"user","message":{"role":"user","content":"next"}});
+    std::fs::write(&transcript, format!("{row}\n{next}\n")).unwrap();
+    let endpoint = ai_memory_test_support::dead_http_endpoint();
+    let send = |agent_id: Option<&str>| {
+        let mut payload = serde_json::json!({"session_id":"subagent-usage","cwd":tmp.path(),"transcript_path":transcript,"tool_name":"Bash","tool_input":{"command":"echo fixture"},"tool_response":"fixture"});
+        if let Some(id) = agent_id {
+            payload["agent_id"] = id.into();
+        }
+        let output = run_hook_at(
+            tmp.path(),
+            "claude-code",
+            "post-tool-use",
+            payload.to_string().as_bytes(),
+            false,
+            &endpoint,
+        );
+        assert!(output.status.success());
+    };
+    send(Some("agent-abc123"));
+    send(None);
+
+    let bodies: Vec<serde_json::Value> = spool_entries(tmp.path())
+        .iter()
+        .map(|entry| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+            serde_json::from_str(v["body"].as_str().unwrap()).unwrap()
+        })
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    let reporting: Vec<_> = bodies
+        .iter()
+        .filter(|body| body.get("_ai_memory_usage_calls").is_some())
+        .collect();
+    assert_eq!(reporting.len(), 1, "the response is reported exactly once");
+    assert!(
+        reporting[0].get("agent_id").is_none(),
+        "the subagent event must not carry the main conversation's response"
+    );
 }
 
 #[test]

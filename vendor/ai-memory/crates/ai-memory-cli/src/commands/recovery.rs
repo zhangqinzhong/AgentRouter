@@ -537,11 +537,12 @@ impl RecoverReport {
 /// # Errors
 /// Returns an error only for local infrastructure failures.
 pub async fn run(config: &Config, args: RecoverArgs) -> Result<i32> {
+    let i18n = &config.i18n;
     let report = recover(config, &RecoverBudgets::default()).await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_report(&report);
+        print_report(i18n, &report);
     }
     Ok(i32::from(
         report.reachable
@@ -550,6 +551,7 @@ pub async fn run(config: &Config, args: RecoverArgs) -> Result<i32> {
 }
 
 async fn recover(config: &Config, budgets: &RecoverBudgets) -> Result<RecoverReport> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let spool_dir = hook_spool::spool_dir(&config.data_dir);
     let (mut journal, journal_error) = match load_journal(&config.data_dir) {
@@ -602,7 +604,7 @@ async fn recover(config: &Config, budgets: &RecoverBudgets) -> Result<RecoverRep
             ));
         }
         Err(error) => {
-            return Err(error).context("acquiring the recovery spool lock");
+            return Err(error).context(i18n.text("cli-recovery-acquiring-the-recovery-spool-lock"));
         }
     };
     let restore_quarantine = |quarantined: HashMap<String, hook_spool::QuarantinedSpool>| {
@@ -642,9 +644,11 @@ async fn recover(config: &Config, budgets: &RecoverBudgets) -> Result<RecoverRep
                 quarantined.insert(entry.id.clone(), quarantine);
             }
             Err(error) => {
-                restore_quarantine(quarantined)
-                    .context("restoring previously quarantined hook events")?;
-                return Err(error).context("quarantining correlated hook events");
+                restore_quarantine(quarantined).context(
+                    i18n.text("cli-recovery-restoring-previously-quarantined-hook-events"),
+                )?;
+                return Err(error)
+                    .context(i18n.text("cli-recovery-quarantining-correlated-hook-events"));
             }
         }
     }
@@ -710,8 +714,12 @@ async fn recover(config: &Config, budgets: &RecoverBudgets) -> Result<RecoverRep
     let spool_incomplete = spool_is_incomplete(&spool);
     if spool.dropped > 0 {
         eprintln!(
-            "ai-memory: recovery: {count} hook event(s) were dropped; recovery remains incomplete unless an exact correlated transcript replaces them",
-            count = spool.dropped
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-recovery-ai-memory-recovery-count-hook-event-s-were-dropped-recovery-remains-incomple",
+                &[("value0", format!("{}", spool.dropped))]
+            )
         );
     }
 
@@ -759,7 +767,7 @@ async fn recover(config: &Config, budgets: &RecoverBudgets) -> Result<RecoverRep
                 EntryRecovery::RecoveredViaSpool => Ok(RestoreOutcome::Restored),
                 EntryRecovery::Failed(_) => quarantine.restore(&spool_dir),
             }
-            .context("restoring quarantined hook events")?;
+            .context(i18n.text("cli-recovery-restoring-quarantined-hook-events"))?;
             if matches!(restored, RestoreOutcome::AlreadyDelivered) {
                 // The completed marker is durable proof this interval's
                 // correlated evidence reached the server on a prior pass;
@@ -1087,9 +1095,13 @@ async fn recover_degraded_run(
     }
 }
 
-/// Apply clears and failure annotations in one locked rewrite; returns the
-/// remaining entry count.
+/// Persist spool-delivery evidence for entries from this pass.
 fn update_journal_evidence(data_dir: &Path, current: &[JournalEntry]) -> Result<()> {
+    // An unreadable journal supplied no entries to update. Leave it intact
+    // so its error can be reported after the independent spool drain.
+    if current.is_empty() {
+        return Ok(());
+    }
     mutate_journal(data_dir, |entries| {
         for entry in entries {
             if let Some(updated) = current.iter().find(|candidate| candidate.id == entry.id) {
@@ -1102,6 +1114,8 @@ fn update_journal_evidence(data_dir: &Path, current: &[JournalEntry]) -> Result<
     })
 }
 
+/// Apply clears and failure annotations in one locked rewrite and return the
+/// remaining entry count.
 fn finish_journal(
     data_dir: &Path,
     sanitizer: &Sanitizer,
@@ -1135,94 +1149,129 @@ fn finish_journal(
     Ok(remaining)
 }
 
-fn print_report(report: &RecoverReport) {
+fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) {
     if !report.reachable {
         println!(
-            "ai-memory: server at {} is unreachable — nothing to recover yet.",
-            report.server
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-recovery-ai-memory-server-at-is-unreachable-nothing-to-recover-yet",
+                &[("value0", report.server.to_string())]
+            )
         );
         if let Some(error) = &report.journal_error {
-            println!("  journal: unreadable ({error})");
+            println!(
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-recovery-journal-unreadable-error",
+                    &[("value0", error.to_string())]
+                )
+            );
         } else {
             println!(
-                "  journal: {} entr{} await{} recovery ({} degraded launch(es), {} failed \
-                 transcript import(s))",
-                report.journal_pending,
-                if report.journal_pending == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                if report.journal_pending == 1 { "s" } else { "" },
-                report.journal_degraded,
-                report.journal_finish_failed,
-            );
+                "{}", i18n.message("cli-recovery-journal-entr-await-recovery-degraded-launch-es-failed-transcript-import-s", &[("value0", (format!("{}", report.journal_pending)).into()), ("value1", (report.journal_pending).into()), ("value2", (report.journal_pending).into()), ("value3", (format!("{}", report.journal_degraded)).into()), ("value4", (format!("{}", report.journal_finish_failed)).into())]));
         }
         println!(
-            "  spool:   {} hook event(s) queued locally",
-            report.spool.remaining
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-recovery-spool-hook-event-s-queued-locally",
+                &[("value0", format!("{}", report.spool.remaining))]
+            )
         );
         println!(
-            "Start the server (or fix AI_MEMORY_SERVER_URL), then run `ai-memory recover` again."
-        );
+            "{}", i18n.text("cli-recovery-start-the-server-or-fix-ai-memory-server-url-then-run-ai-memory-recover-agai"));
         return;
     }
-    println!("ai-memory: recovering against {}…", report.server);
+    println!(
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-recovery-ai-memory-recovering-against",
+            &[("value0", report.server.to_string())]
+        )
+    );
     if report.spool_lock_busy {
-        println!("  spool: another drainer held the lock; transcript recovery was deferred");
+        println!(
+            "{}",
+            i18n.text(
+                "cli-recovery-spool-another-drainer-held-the-lock-transcript-recovery-was-deferred"
+            )
+        );
     } else {
         println!(
-            "  spool: {} hook event(s) delivered, {} remain queued, {} dropped",
-            report.spool.sent, report.spool.remaining, report.spool.dropped
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-recovery-spool-hook-event-s-delivered-remain-queued-dropped",
+                &[
+                    ("value0", format!("{}", report.spool.sent)),
+                    ("value1", format!("{}", report.spool.remaining)),
+                    ("value2", format!("{}", report.spool.dropped))
+                ]
+            )
         );
     }
     if report.spool_incomplete {
         println!(
-            "  recovery is incomplete because hook events remain queued or were dropped; exact correlated transcripts may still replace quarantined events"
-        );
+            "{}", i18n.text("cli-recovery-recovery-is-incomplete-because-hook-events-remain-queued-or-were-dropped-exa"));
     }
     for session in &report.sessions {
         let target = session.native_session_id.as_deref().map_or_else(
-            || "(no session id)".to_owned(),
+            || i18n.text("cli-recovery-no-session-id"),
             super::run::display_session_id,
         );
-        let mut line = format!(
-            "  [{}] {} {} in {}/{} — {}",
-            session.kind,
-            session.harness,
-            target,
-            session.workspace,
-            session.project,
-            session.outcome,
+        let mut line = crate::localization::format(
+            i18n,
+            "cli-recovery-in",
+            &[
+                ("value0", session.kind.to_string()),
+                ("value1", session.harness.to_string()),
+                ("value2", target.to_string()),
+                ("value3", session.workspace.to_string()),
+                ("value4", session.project.to_string()),
+                ("value5", session.outcome.to_string()),
+            ],
         );
         if session.imported_events > 0 {
-            line.push_str(&format!(" ({} events)", session.imported_events));
+            line.push_str(&crate::localization::format(
+                i18n,
+                "cli-recovery-events",
+                &[("value0", format!("{}", session.imported_events))],
+            ));
         }
         println!("{line}");
         if let Some(detail) = &session.detail {
-            println!("      {detail}");
+            println!("      {}", super::show::terminal_text(detail));
         }
     }
     println!(
-        "recovered {} event(s) across {} journal entr{}; {} failed; {} remain",
-        report.imported_total(),
-        report.sessions.len(),
-        if report.sessions.len() == 1 {
-            "y"
-        } else {
-            "ies"
-        },
-        report.failures(),
-        report.journal_remaining,
+        "{}",
+        i18n.message(
+            "cli-recovery-recovered-event-s-across-journal-entr-failed-remain",
+            &[
+                ("value0", (format!("{}", report.imported_total())).into()),
+                ("value1", (format!("{}", report.sessions.len())).into()),
+                ("value2", (report.sessions.len()).into()),
+                ("value3", (format!("{}", report.failures())).into()),
+                ("value4", (format!("{}", report.journal_remaining)).into())
+            ]
+        )
     );
     if let Some(error) = &report.journal_error {
-        println!("recovery journal error: {error}");
+        println!(
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-recovery-recovery-journal-error-error",
+                &[("value0", error.to_string())]
+            )
+        );
     }
     if report.failures() > 0 {
         println!(
-            "failed entries stay journaled with their reason; fix the cause and re-run \
-             `ai-memory recover` (re-running is safe — imports dedup)"
-        );
+            "{}", i18n.text("cli-recovery-failed-entries-stay-journaled-with-their-reason-fix-the-cause-and-re-run-ai"));
     }
 }
 
@@ -1598,6 +1647,60 @@ mod tests {
             remaining: 0,
             dropped: 0,
         }));
+    }
+
+    #[tokio::test]
+    async fn corrupt_journal_does_not_block_the_spool_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal_path(temp.path());
+        let malformed = b"{\"version\":1,\"entries\":[";
+        fs::write(&journal, malformed).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/healthz",
+                axum::routing::get(|| async { axum::http::StatusCode::OK }),
+            )
+            .route(
+                "/hook/batch",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "accepted": 1,
+                        "results": [{"index": 0, "outcome": "stored"}]
+                    }))
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let spool = hook_spool::spool_dir(temp.path());
+        hook_spool::enqueue(
+            &spool,
+            &hook_spool::SpoolEntry {
+                url: format!("http://{address}/hook?event=user-prompt-submit&agent=claude-code"),
+                body: r#"{"session_id":"sess-1","cwd":"/tmp/repo","prompt":"queued"}"#.into(),
+                created_ms: u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap(),
+                auth_mode: hook_spool::AuthMode::Anonymous,
+                token: None,
+                attempts: 0,
+                profile: None,
+            },
+        )
+        .unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            server_url: format!("http://{address}"),
+            ..Config::default()
+        };
+        let result = recover(&config, &RecoverBudgets::default()).await;
+        server.abort();
+        let report = result.unwrap();
+
+        assert_eq!(report.spool.sent, 1);
+        assert!(!report.spool_incomplete);
+        assert_eq!(hook_spool::spool_len(&spool), 0);
+        assert!(report.journal_error.is_some());
+        assert!(report.sessions.is_empty());
+        assert_eq!(fs::read(&journal).unwrap(), malformed);
     }
 
     #[tokio::test]

@@ -17,7 +17,8 @@ use ai_memory_hooks::{
     WorkstreamState, hook_router, workstream_router,
 };
 use ai_memory_llm::{
-    Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder, local_capacity,
+    Embedder, EmbeddingCapacity, LlmProvider, LlmProviders, LlmWorkload, ProviderHealth,
+    build_embedder, local_capacity,
 };
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
@@ -30,7 +31,7 @@ use ai_memory_store::{
 };
 use ai_memory_web::{
     HtmlAuthRedirectConfig, WebMountSpec, html_auth_redirect_mw, normalize_prefix,
-    split_web_routers, web_base_href,
+    split_web_routers_with_metrics, web_base_href,
 };
 use ai_memory_wiki::{WatcherHandle, Wiki, WikiError, WikiResult, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
@@ -48,6 +49,7 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use super::eval_embedding_cache::{EvalEmbeddingCache, eval_embedding_cache_dir};
 use crate::cli::{ServeArgs, TransportKind};
 use crate::config::{AuthSettings, AutoImproveSettings, Config, MaintenanceSettings};
 use ai_memory_mcp::auth::{AuthState, require_bearer};
@@ -775,7 +777,7 @@ fn trusted_proxy_identity_enabled(auth: &AuthSettings) -> bool {
 struct ConsolidatorSetup {
     server: AiMemoryServer,
     consolidator: Option<Arc<Consolidator>>,
-    admin_llm: Option<Arc<dyn LlmProvider>>,
+    llm_providers: LlmProviders,
 }
 
 fn maintenance_start_delay(
@@ -1462,6 +1464,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
         .with_per_user_slots(config.slots.per_user)
         .with_profile(config.profile.clone())
+        .with_answer_context_budget(config.query_answer.max_context_tokens)
         .with_strip_root_combinators(config.strip_root_combinators)
         .with_gemini_safe_schemas(config.gemini_safe_schemas);
     if let Some(e) = embedder.clone() {
@@ -1471,8 +1474,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         configure_consolidator(config, server, &store, &wiki, ws, proj, &provider_health)?;
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
-    let admin_llm = consolidator_setup.admin_llm;
-    let profile_llm = admin_llm.clone();
+    let llm_providers = consolidator_setup.llm_providers;
+    let llm_configured = llm_providers.is_configured();
+    let profile_llm = llm_providers.get(LlmWorkload::Profile).cloned();
     // Share the tool router's last-activity clock with the B3 dream scheduler so
     // it can tell an idle box from a busy one and cancel a run on the operator's
     // return.
@@ -1484,7 +1488,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         store.writer.clone(),
         wiki.clone(),
         embedder.clone(),
-        admin_llm.clone(),
+        llm_providers.clone(),
         config.decay,
         config.sessions,
         config.dream,
@@ -1604,8 +1608,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             // are pure request-response and project resolution rides the
             // in-process `ActiveProject` pointer, not the transport
             // session — so session mode buys us nothing. `--http-stateful`
-            // restores rmcp's session+SSE behaviour for clients that want
-            // it.
+            // restores rmcp's session+SSE behaviour for legacy clients
+            // that want it. rmcp 3 renamed the switch to
+            // `legacy_session_mode` and scoped it: under the 2026-07-28
+            // revision (SEP-2567) sessions no longer exist, so requests
+            // negotiating that version are always served statelessly and
+            // the flag only governs `initialize`-era versions.
             info!(
                 stateful = args.http_stateful,
                 "MCP Streamable HTTP transport mode"
@@ -1616,7 +1624,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 StreamableHttpServerConfig::default()
                     .with_cancellation_token(cancel.child_token())
                     .with_allowed_hosts(config.allowed_hosts.clone())
-                    .with_stateful_mode(args.http_stateful)
+                    .with_legacy_session_mode(args.http_stateful)
                     .with_json_response(!args.http_stateful),
             );
             // Shared per-cwd project cache: the hook router owns it; the admin
@@ -1659,6 +1667,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
                 )),
                 ingest_gates: ai_memory_hooks::IngestGates::default(),
+                session_agents: ai_memory_hooks::SessionAgents::default(),
                 cwd_probes: ai_memory_hooks::CwdProbes::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
@@ -1685,6 +1694,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 mid_session_routing: config.routing.mid_session,
                 profile: config.profile.clone(),
                 ingest_drop_list: (*config.ingest.drop_list).clone(),
+                record_tool_names: config.ingest.record_tool_names,
+                index_file_paths: config.ingest.index_file_paths,
                 // Benchmark-only escape (docs/benchmarks/README.md), read once
                 // here so the hooks crate keeps making no environment reads.
                 skip_wiki_checkpoints: benchmark_skip_wiki_checkpoints(),
@@ -1707,7 +1718,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     writer: store.writer.clone(),
                     reader: store.reader.clone(),
                     wiki: wiki.clone(),
-                    llm: admin_llm,
+                    llm_providers,
                     auto_improve_require_approval: config.auto_improve.require_approval,
                     auto_improve_review_config: auto_improve_review_config_from_settings(
                         &config.auto_improve,
@@ -1721,7 +1732,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     db_path: store.db_path().to_path_buf(),
                     bind: bind.clone(),
                     home_dir: config.home_dir.clone(),
-                    bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    bootstrap_gate: ai_memory_mcp::BootstrapGate::new(
+                        config.bootstrap_max_concurrent,
+                    ),
                     token_pepper: config
                         .auth
                         .token_pepper
@@ -1854,11 +1867,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auth_state.clone(),
                     require_dual_auth,
                 ));
-            let base_path = normalize_prefix(&args.base_path);
-            if base_path.is_empty() && !args.base_path.trim_matches('/').trim().is_empty() {
+            let configured_base_path = args.base_path.as_deref().unwrap_or(&config.base_path);
+            let base_path = normalize_prefix(configured_base_path);
+            if base_path.is_empty() && !configured_base_path.trim_matches('/').trim().is_empty() {
                 tracing::warn!(
-                    raw = %args.base_path,
-                    "AI_MEMORY_BASE_PATH is not a safe path prefix; serving at root instead",
+                    raw = %configured_base_path,
+                    "configured base path is not a safe path prefix; serving at root instead",
                 );
             }
             // Symmetric warning for `--web-slug` / `AI_MEMORY_WEB_SLUG`. The
@@ -1873,11 +1887,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     "AI_MEMORY_WEB_SLUG is not a safe path prefix; serving the web UI at the base-path root instead",
                 );
             }
-            let base_href = web_base_href(&args.base_path, &args.web_slug);
-            let web = split_web_routers(
+            let base_href = web_base_href(configured_base_path, &args.web_slug);
+            let web = split_web_routers_with_metrics(
                 args.enable_web,
                 store.reader.clone(),
                 wiki.clone(),
+                Some(ingest_metrics.clone()),
                 WebMountSpec {
                     enable_api: args.enable_api,
                     web_ui_dir: args.web_ui_dir.as_deref(),
@@ -1893,6 +1908,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                         embedder: embedder.clone(),
                         rerank: server.rerank_stage(),
                     },
+                    runtime: Some(ai_memory_web::features::RuntimeFeatures {
+                        llm_configured,
+                        consolidate_on_session_end: config.consolidate_on_session_end,
+                        capture_assistant_default: config.capture_assistant,
+                        backfill_on_start: config.backfill_on_start,
+                        learning_scheduled: config.auto_improve.scheduler.enabled
+                            && config.auto_improve.scheduler.interval_secs > 0
+                            && config.auto_improve.scheduler.max_sessions_per_tick > 0,
+                        learning_on_session_end: config.auto_improve.on_session_end,
+                        review_requires_approval: config.auto_improve.require_approval,
+                        maintenance_enabled: config.maintenance.enabled,
+                        retention_scheduled: config.maintenance.forget_sweep_interval_secs > 0,
+                        human_login: human_mode,
+                        observation_stream: config.retrieval.observation_stream,
+                    }),
                     health: Some(Arc::new(ai_memory_web::health::HealthSources {
                         ingest: ingest_metrics.clone(),
                         providers: provider_health.clone(),
@@ -1919,17 +1949,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
                 .merge(internal_auth_router(auth_state.clone()))
-                .merge(
-                    web.protected
-                        .layer(axum::middleware::from_fn_with_state(
-                            auth_state.clone(),
-                            require_dual_auth,
-                        ))
-                        .layer(axum::middleware::from_fn_with_state(
-                            html_auth,
-                            html_auth_redirect_mw,
-                        )),
-                )
+                .merge(layer_protected_web(
+                    web.protected,
+                    auth_state.clone(),
+                    html_auth,
+                    web.api_cors,
+                ))
                 .merge(web.public.layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
@@ -2167,7 +2192,7 @@ async fn start_maintenance_scheduler(
     writer: WriterHandle,
     wiki: Wiki,
     embedder: Option<Arc<dyn Embedder>>,
-    llm: Option<Arc<dyn LlmProvider>>,
+    llm_providers: LlmProviders,
     decay: crate::config::DecaySettings,
     sessions: crate::config::SessionsSettings,
     dream: crate::config::DreamSettings,
@@ -2257,6 +2282,7 @@ async fn start_maintenance_scheduler(
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
+                            abandoned_sessions_closed = outcome.abandoned_sessions_closed,
                             ledgers_pruned = outcome.ledgers_pruned,
                             ledger_bytes_pruned = outcome.ledger_bytes_pruned,
                             ledgers_undeleted = outcome.ledgers_undeleted,
@@ -2273,7 +2299,8 @@ async fn start_maintenance_scheduler(
     }
 
     // Hollow-project sweep: deletes project rows with no pages, sessions,
-    // observations, handoffs, managed workstreams, or auto-improvement data
+    // observations, handoffs, managed workstreams, agent messages (sent or
+    // received, in any state), or auto-improvement data
     // once they are older than HOLLOW_PROJECT_MIN_AGE_DAYS. Safe by
     // construction — nothing exists to lose — which is why it runs
     // unconditionally under the maintenance flag with no extra config. Runs
@@ -2314,7 +2341,7 @@ async fn start_maintenance_scheduler(
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
-        let llm = llm.clone();
+        let llm = llm_providers.get(LlmWorkload::Lint).cloned();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(lint_interval_secs);
             run_persisted_maintenance_job(
@@ -2436,9 +2463,15 @@ async fn start_maintenance_scheduler(
     }
 
     let scheduler = auto_improve.scheduler.clone();
+    // `max_sessions_per_tick = 0` is the documented off switch for the whole
+    // scheduler, experience pass included; a task provider must not revive it.
     if !scheduler.enabled || scheduler.interval_secs == 0 || scheduler.max_sessions_per_tick == 0 {
         info!("auto-improve scheduler disabled; manual auto-improve remains available");
-    } else if let Some(llm) = llm.clone() {
+    } else if llm_providers.get(LlmWorkload::AutoImprove).is_some()
+        || (scheduler.experience_every_sessions > 0
+            && llm_providers.get(LlmWorkload::Experience).is_some())
+    {
+        let providers = llm_providers.clone();
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
@@ -2481,7 +2514,7 @@ async fn start_maintenance_scheduler(
                     &reader,
                     &writer,
                     &wiki,
-                    &llm,
+                    &providers,
                     &scheduler_settings,
                 )
                 .await
@@ -2511,7 +2544,10 @@ async fn start_maintenance_scheduler(
     // contends with live work: it runs only after `idle_window_secs` of quiet and
     // cancels the moment activity resumes (invariant #5, cancellable + bounded).
     if dream.enabled {
-        match (llm.clone(), dedup_embedding.clone()) {
+        match (
+            llm_providers.get(LlmWorkload::Dream).cloned(),
+            dedup_embedding.clone(),
+        ) {
             (Some(llm), Some(embedding)) => {
                 let reader = reader.clone();
                 let wiki = wiki.clone();
@@ -2736,6 +2772,15 @@ async fn run_dream_scheduler_loop(
     }
 }
 
+/// How long a session may sit open with no activity before the scheduled
+/// sweep closes it (safety net) — deliberately much more
+/// conservative than the `SessionStart`-triggered backfill-close's 15
+/// minutes (`ai_memory_hooks::router::BACKFILL_CLOSE_MIN_IDLE`), since this
+/// path has no positive "someone is continuing the work" signal at all; it
+/// is a blind time-based guess and must essentially never fire on a
+/// genuinely slow-but-alive session.
+const ABANDONED_SESSION_CUTOFF: std::time::Duration = std::time::Duration::from_secs(48 * 60 * 60);
+
 #[derive(Debug, Default)]
 struct ScheduledSweepTickOutcome {
     scopes: usize,
@@ -2749,6 +2794,9 @@ struct ScheduledSweepTickOutcome {
     ledger_bytes_pruned: u64,
     ledgers_undeleted: usize,
     errors: usize,
+    /// Sessions closed by the abandoned-session safety net (no usage, no
+    /// consolidation — see `ai_memory_store::ops::close_abandoned_sessions`).
+    abandoned_sessions_closed: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2810,6 +2858,16 @@ async fn run_scheduled_sweep_tick(
                     "scheduled forget sweep failed for scope"
                 );
             }
+        }
+    }
+
+    let cutoff_us = jiff::Timestamp::now().as_microsecond()
+        - i64::try_from(ABANDONED_SESSION_CUTOFF.as_micros()).unwrap_or(i64::MAX);
+    match writer.close_abandoned_sessions(cutoff_us).await {
+        Ok(closed) => outcome.abandoned_sessions_closed = closed,
+        Err(e) => {
+            outcome.errors += 1;
+            tracing::warn!(error = %e, "scheduled abandoned-session close failed");
         }
     }
 
@@ -2957,6 +3015,7 @@ fn auto_improve_review_config_from_settings(
         eval: ai_memory_consolidate::AutoImproveEvalConfig {
             enabled: settings.eval.enabled,
             command: settings.eval.command.clone(),
+            builtin: settings.eval.builtin.trim().to_owned(),
             timeout_secs: settings.eval.timeout_secs,
             targets: settings.eval.targets.clone(),
             min_delta: settings.eval.min_delta,
@@ -3098,6 +3157,17 @@ async fn configure_embedder(
     } else {
         embedder
     };
+    // Outermost, so a cached document vector skips the capacity queue too.
+    let embedder: Arc<dyn Embedder> = match eval_embedding_cache_dir() {
+        Some(root) => {
+            info!(
+                root = %root.display(),
+                "benchmark document-embedding cache enabled (eval harness only)"
+            );
+            Arc::new(EvalEmbeddingCache::new(embedder, &root))
+        }
+        None => embedder,
+    };
     Ok((wiki.with_embedder(embedder.clone()), Some(embedder)))
 }
 
@@ -3124,86 +3194,66 @@ fn configure_consolidator(
     project_id: ProjectId,
     provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
-    // Validate the reranker setting before the provider early-return, so
-    // a typo'd or provider-less `AI_MEMORY_RERANKER` surfaces instead of
-    // looking enabled while eligible queries keep their normal ranking.
     let want_reranker = config.reranker_choice()?;
-    // Build the consolidator (if LLM configured) once, then share the
-    // Arc between the MCP server (for `memory_consolidate` + lint),
-    // the hook router (for PreCompact checkpointing), and the admin
-    // router (for `POST /admin/bootstrap`).
-    let Some(cfg) = config.llm_provider_config()? else {
-        info!(
-            "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
-             falls back to rule-based checkpoint, lint runs rule-based only"
-        );
-        if want_reranker {
-            anyhow::bail!(
-                "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER: the reranker \
-                 judges candidates with the configured LLM provider. Set a provider or \
-                 unset AI_MEMORY_RERANKER."
-            );
-        }
-        return Ok(ConsolidatorSetup {
-            server,
-            consolidator: None,
-            admin_llm: None,
-        });
-    };
-    let provider_name = cfg.provider.name().to_string();
-    let model = cfg.model.clone();
-    let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
-    // Routes through the same construction `llm_provider_config` just
-    // confirmed is `Some`: wraps `[primary, fallbacks...]` in a
-    // `FallbackLlmProvider` when `llm_fallbacks` is non-empty, else returns
-    // the plain provider unchanged (existing single-provider behavior).
-    let llm = config
-        .llm_provider_chain()
-        .context("building LLM provider chain from config")?
-        .context("LLM provider configured but chain construction returned none")?;
-    let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
-    info!(
-        provider = llm.name(),
-        model = llm.model(),
-        max_input_tokens = config.consolidation.max_input_tokens,
-        max_output_tokens = config.consolidation.max_output_tokens,
-        verbatim_residue = config.consolidation.verbatim_residue,
-        "memory_consolidate + PreCompact LLM checkpointing enabled",
-    );
-    let consolidator = Arc::new(
-        Consolidator::new(
-            store.reader.clone(),
-            store.writer.clone(),
-            wiki.clone(),
-            llm.clone(),
-            workspace_id,
-            project_id,
-        )
-        .with_per_user_slots(config.slots.per_user)
-        .with_verbatim_residue(config.consolidation.verbatim_residue)
-        .with_prompt_limits(
-            config.consolidation.max_input_tokens,
-            config.consolidation.max_output_tokens,
-            config.consolidation.input_token_safety_margin,
-        ),
-    );
-    server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
-    // Optional post-RRF reranking rides on the same provider, so it is
-    // only reachable once an LLM is configured at all. Off unless the
-    // operator asked for it: it puts an LLM call on the memory_query
-    // hot path.
-    if want_reranker {
+    let providers = config
+        .llm_providers()
+        .context("building LLM provider chains from config")?;
+    let retry_hint = providers
+        .default
+        .as_ref()
+        .map(|llm| llm_retry_hint(llm.name(), llm.model()));
+    let providers = provider_health.wrap_llm_providers(providers, retry_hint);
+    server = server.with_llm_providers(providers.clone());
+
+    let consolidator = providers.get(LlmWorkload::Consolidation).map(|llm| {
         info!(
             provider = llm.name(),
             model = llm.model(),
+            max_input_tokens = config.consolidation.max_input_tokens,
+            max_output_tokens = config.consolidation.max_output_tokens,
+            verbatim_residue = config.consolidation.verbatim_residue,
+            "memory_consolidate + PreCompact LLM checkpointing enabled",
+        );
+        Arc::new(
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                llm.clone(),
+                workspace_id,
+                project_id,
+            )
+            .with_per_user_slots(config.slots.per_user)
+            .with_verbatim_residue(config.consolidation.verbatim_residue)
+            .with_prompt_limits(
+                config.consolidation.max_input_tokens,
+                config.consolidation.max_output_tokens,
+                config.consolidation.input_token_safety_margin,
+            ),
+        )
+    });
+    if let Some(consolidator) = &consolidator {
+        server = server.with_consolidator(wiki.clone(), consolidator.clone());
+    }
+    if want_reranker {
+        let llm = providers.get(LlmWorkload::Rerank).context(
+            "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider",
+        )?;
+        info!(
+            provider = llm.name(),
+            model = llm.model(),
+            timeout_secs = config.rerank_timeout_secs,
             "project/scopes memory_query reranking enabled (adds LLM latency)",
         );
-        server = server.with_reranker(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())));
+        let stage =
+            ai_memory_llm::RerankStage::new(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())))
+                .with_timeout(std::time::Duration::from_secs(config.rerank_timeout_secs));
+        server = server.with_rerank_stage(stage);
     }
     Ok(ConsolidatorSetup {
         server,
-        consolidator: Some(consolidator),
-        admin_llm: Some(llm),
+        consolidator,
+        llm_providers: providers,
     })
 }
 
@@ -3300,13 +3350,16 @@ fn validate_web_ui_args(enable_web: bool, web_ui_dir: Option<&Path>) -> Result<(
     Ok(())
 }
 
-fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String {
-    let mut command = format!("ai-memory llm-test --provider {provider} --model {model}");
-    if let Some(base_url) = base_url {
-        command.push_str(&format!(" --base-url {base_url}"));
-    }
-    command.push_str(" --prompt ping");
-    command
+/// What to run when the server's provider call failed.
+///
+/// The probe runs *on the server* (`--server`): a client-side `llm-test`
+/// builds its provider from the caller's environment, and when the server runs
+/// in a container or on another host the keys exist only there, so the hint
+/// answered "no API key" or a provider 400 while the server was healthy
+/// (#1639). `provider`/`model` are still named, so the report is readable
+/// without opening the config.
+fn llm_retry_hint(provider: &str, model: &str) -> String {
+    format!("ai-memory llm-test --server   # server provider: {provider} / {model}")
 }
 
 /// Liveness probe for process supervisors.
@@ -3349,6 +3402,35 @@ async fn require_allowed_host(
     }
     tracing::warn!(host, allowed = ?allowed_hosts, "rejected request with disallowed Host header");
     (StatusCode::FORBIDDEN, "forbidden host\n").into_response()
+}
+
+/// Layer the dual-auth web surfaces (`/api/v1` and the builtin wiki) the way
+/// `serve` mounts them. Dual auth is innermost; the HTML login redirect wraps
+/// it so it sees the auth answers; the operator's `/api/v1` CORS policy is
+/// outermost, because a browser sends its CORS preflight without credentials
+/// and auth in front of the policy refused every one with 401.
+fn layer_protected_web(
+    protected: axum::Router,
+    auth_state: Arc<AuthState>,
+    html_auth: Arc<HtmlAuthRedirectConfig>,
+    api_cors: Option<ai_memory_web::ApiCors>,
+) -> axum::Router {
+    let router = protected
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            require_dual_auth,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            html_auth,
+            html_auth_redirect_mw,
+        ));
+    match api_cors {
+        Some(cors) => router.layer(axum::middleware::from_fn_with_state(
+            cors,
+            ai_memory_web::api_cors_mw,
+        )),
+        None => router,
+    }
 }
 
 /// Refuse browser requests from a foreign page on a server with no credential
@@ -3623,6 +3705,26 @@ fn host_without_port(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    /// The retry hint must name the probe that runs where the keys are (#1639):
+    /// a client-side `llm-test` builds its provider from the caller's
+    /// environment, which is the wrong one for a container or a remote server.
+    #[test]
+    fn the_retry_hint_probes_the_server_not_the_clients_environment() {
+        let hint = super::llm_retry_hint("anthropic", "claude-haiku-4-5");
+        assert!(
+            hint.starts_with("ai-memory llm-test --server"),
+            "the hint must run the probe on the server: {hint}"
+        );
+        assert!(
+            !hint.contains("--provider") && !hint.contains("--api-key"),
+            "the server-side probe takes no client-side provider flags: {hint}"
+        );
+        assert!(
+            hint.contains("anthropic") && hint.contains("claude-haiku-4-5"),
+            "the hint must still name what failed: {hint}"
+        );
+    }
+
     #[cfg(feature = "management-ui")]
     #[tokio::test]
     async fn management_ui_rejects_invalid_mounts_before_opening_the_store() {
@@ -3664,6 +3766,7 @@ mod tests {
         Sanitized, Sanitizer, SessionId, Tier,
     };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmError, LlmResult, SyntheticEmbedder};
+    use ai_memory_web::split_web_routers;
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
     use secrecy::SecretString;
@@ -4533,7 +4636,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings::default(),
             crate::config::DreamSettings::default(),
@@ -4557,6 +4660,57 @@ mod tests {
                     .unwrap(),
                 None
             );
+        }
+    }
+
+    /// An experience-only task provider starts the scheduler, but never past
+    /// the documented `max_sessions_per_tick = 0` off switch or with the
+    /// experience cadence off.
+    #[tokio::test]
+    async fn experience_only_provider_starts_scheduler_within_its_switches() {
+        for (max_sessions_per_tick, experience_every_sessions, expected) in
+            [(1, 1, 1), (0, 1, 0), (1, 0, 0)]
+        {
+            let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+            let mut auto_improve = AutoImproveSettings::default();
+            auto_improve.scheduler.enabled = true;
+            auto_improve.scheduler.interval_secs = 60;
+            auto_improve.scheduler.max_sessions_per_tick = max_sessions_per_tick;
+            auto_improve.scheduler.experience_every_sessions = experience_every_sessions;
+            let mut providers = LlmProviders::default();
+            providers
+                .overrides
+                .insert(LlmWorkload::Experience, Arc::new(PanicLlm));
+            let tasks = start_maintenance_scheduler(
+                MaintenanceSettings {
+                    enabled: false,
+                    ..MaintenanceSettings::default()
+                },
+                auto_improve,
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki,
+                None,
+                providers,
+                crate::config::DecaySettings::default(),
+                crate::config::SessionsSettings::default(),
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(
+                tasks.len(),
+                expected,
+                "max_sessions_per_tick={max_sessions_per_tick} \
+                 experience_every_sessions={experience_every_sessions}"
+            );
+            for task in tasks {
+                task.abort();
+            }
         }
     }
 
@@ -4586,7 +4740,7 @@ mod tests {
                 store.writer.clone(),
                 wiki,
                 None,
-                None,
+                LlmProviders::default(),
                 crate::config::DecaySettings::default(),
                 crate::config::SessionsSettings::default(),
                 crate::config::DreamSettings::default(),
@@ -4626,7 +4780,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings::default(),
             crate::config::DreamSettings::default(),
@@ -4651,7 +4805,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings {
                 idle_end_after_hours: 1,
@@ -4681,7 +4835,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings {
                 idle_end_after_hours: 1,
@@ -4735,6 +4889,7 @@ mod tests {
                     body: "prompt two hours ago".into(),
                     importance: 5,
                     occurred_at: Some(last_activity),
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4754,7 +4909,7 @@ mod tests {
             store.writer.clone(),
             wiki,
             None,
-            None,
+            LlmProviders::default(),
             crate::config::DecaySettings::default(),
             crate::config::SessionsSettings {
                 idle_end_after_hours: 1,
@@ -5114,12 +5269,9 @@ mod tests {
             );
         }
 
-        // A refused connection, built the same way the LLM suite builds one:
-        // a closed loopback port refuses immediately.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let connect = reqwest::get(format!("http://{addr}/v1"))
+        // A refused connection: a reserved loopback port that never listens.
+        let refusing = ai_memory_test_support::refusing_port();
+        let connect = reqwest::get(format!("{}/v1", refusing.url()))
             .await
             .expect_err("a closed loopback port must refuse the connection");
         assert!(
@@ -5208,6 +5360,7 @@ mod tests {
                     title: "work".into(),
                     body: "the session that outlived the daemon".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5311,6 +5464,7 @@ mod tests {
                     title: "work".into(),
                     body: "activity the seed would otherwise reach for".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5375,6 +5529,7 @@ mod tests {
                     title: "finish".into(),
                     body: "complete the durable job".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5482,6 +5637,7 @@ mod tests {
                     title: "checkpoint".into(),
                     body: "open session still running".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5587,6 +5743,7 @@ mod tests {
                     title: "checkpoint".into(),
                     body: "owned session still running".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5687,6 +5844,7 @@ mod tests {
                     title: "finish".into(),
                     body: "end the session".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5827,6 +5985,7 @@ mod tests {
                     title: "finish".into(),
                     body: "complete the durable job".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6031,6 +6190,7 @@ mod tests {
                     title: "finish".into(),
                     body: "end the session".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6949,6 +7109,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -7053,6 +7214,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -7109,6 +7271,110 @@ mod tests {
         assert_eq!(absent_web.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A browser sends a CORS preflight without credentials. With dual auth
+    /// wrapping the `/api/v1` CORS policy, every preflight from an operator's
+    /// configured origin got 401 and no cross-origin client could call the
+    /// API at all. The policy must sit outside auth, scoped to `/api/v1`,
+    /// while every real request is still authenticated.
+    #[tokio::test]
+    async fn api_cors_preflight_is_answered_outside_auth_and_only_on_api_v1() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let origins = ["https://app.example.com".to_string()];
+        let web = split_web_routers(
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: true,
+                web_ui_dir: None,
+                cors_origins: &origins,
+                web_slug: "/web",
+                base_href: "/web/",
+                base_path: "",
+                trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                runtime: None,
+                health: None,
+            },
+        )
+        .unwrap();
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let html_auth = web
+            .html_auth
+            .expect("builtin wiki mount must return html_auth");
+        let router = apply_host_layer(
+            layer_protected_web(web.protected, auth, html_auth, web.api_cors),
+            vec!["localhost".to_string()],
+        );
+        let send = |method: &str, uri: &str, origin: &str, bearer: bool| {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Host", "localhost")
+                .header(header::ORIGIN, origin);
+            if method == "OPTIONS" {
+                req = req
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization");
+            }
+            if bearer {
+                req = req.header(header::AUTHORIZATION, "Bearer secret");
+            }
+            router.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let allowed = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let app = "https://app.example.com";
+
+        let preflight = send("OPTIONS", "/api/v1/projects", app, false)
+            .await
+            .unwrap();
+        assert!(
+            preflight.status().is_success(),
+            "preflight refused: {}",
+            preflight.status()
+        );
+        assert_eq!(allowed(&preflight).as_deref(), Some(app));
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+            "true"
+        );
+
+        // The real request is still authenticated, and its refusal is
+        // readable by the calling page.
+        let anonymous = send("GET", "/api/v1/projects", app, false).await.unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(allowed(&anonymous).as_deref(), Some(app));
+        let signed = send("GET", "/api/v1/projects", app, true).await.unwrap();
+        assert_eq!(signed.status(), StatusCode::OK);
+        assert_eq!(allowed(&signed).as_deref(), Some(app));
+
+        // An unlisted origin gets no grant, before or after auth.
+        let foreign = "https://evil.example";
+        let preflight = send("OPTIONS", "/api/v1/projects", foreign, false)
+            .await
+            .unwrap();
+        assert_eq!(allowed(&preflight), None);
+        let signed = send("GET", "/api/v1/projects", foreign, true)
+            .await
+            .unwrap();
+        assert_eq!(allowed(&signed), None);
+
+        // `/web` stays CORS-free and behind auth.
+        let preflight = send("OPTIONS", "/web", app, false).await.unwrap();
+        assert_eq!(preflight.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(allowed(&preflight), None);
+        let signed = send("GET", "/web", app, true).await.unwrap();
+        assert_eq!(signed.status(), StatusCode::OK);
+        assert_eq!(allowed(&signed), None);
+    }
+
     #[tokio::test]
     async fn web_routes_are_inside_auth_layer() {
         let tmp = TempDir::new().unwrap();
@@ -7127,6 +7393,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -7294,6 +7561,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -7358,6 +7626,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )

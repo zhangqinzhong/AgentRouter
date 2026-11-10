@@ -104,6 +104,9 @@ pub const MAX_ACK_BYTES: usize = 64 * 1024;
 pub struct Delivery {
     pub status: u16,
     pub body: Vec<u8>,
+    /// An HTTP response whose body exceeded the acknowledgement cap.
+    /// Its bytes are discarded, but its status must not become a transport retry.
+    pub body_over_limit: bool,
 }
 
 impl std::fmt::Debug for Delivery {
@@ -113,6 +116,7 @@ impl std::fmt::Debug for Delivery {
         f.debug_struct("Delivery")
             .field("status", &self.status)
             .field("body_bytes", &self.body.len())
+            .field("body_over_limit", &self.body_over_limit)
             .finish()
     }
 }
@@ -174,13 +178,17 @@ impl Sender {
         if limited.read_to_end(&mut body).is_err() {
             body.clear();
         }
-        if body.len() > MAX_ACK_BYTES {
-            bail!(
-                "hook batch ack exceeded {MAX_ACK_BYTES} bytes; refusing to parse it \
-                 (the batch stays pending)"
-            );
+        let body_over_limit = body.len() > MAX_ACK_BYTES;
+        if body_over_limit {
+            // The server answered: preserve its status (especially 429) so an
+            // oversized body cannot turn backpressure into transport retries.
+            body.clear();
         }
-        Ok(Delivery { status, body })
+        Ok(Delivery {
+            status,
+            body,
+            body_over_limit,
+        })
     }
 }
 

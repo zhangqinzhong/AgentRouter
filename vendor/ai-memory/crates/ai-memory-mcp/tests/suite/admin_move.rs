@@ -48,7 +48,10 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -60,7 +63,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         db_path,
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -82,7 +85,10 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -94,7 +100,7 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
         db_path,
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -217,6 +223,7 @@ async fn move_project_true_move_into_fresh_dest() {
     let managed = store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: src_ws,
             project_id: src_proj,
             repo_fingerprint: "repo".into(),
@@ -236,7 +243,7 @@ async fn move_project_true_move_into_fresh_dest() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK, "move must succeed");
@@ -364,7 +371,7 @@ async fn move_project_merge_surfaces_destination_promotion_manifest_warning() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "acme-api", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "acme-api", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -420,7 +427,7 @@ async fn move_project_404_on_unknown_source() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "nope", "project": "ghost", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "nope", "project": "ghost", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -428,6 +435,141 @@ async fn move_project_404_on_unknown_source() {
 
 /// Moving into a workspace that already has a same-named project MERGES:
 /// the destination ends up with both the pre-existing and the moved pages.
+/// #1713: the copy+purge merge is not a move. A `--confirm` written for "move
+/// this project" must not delete a source's sessions and observations just
+/// because the destination happens to hold a project of the same name. The
+/// refusal names the counts it would discard and leaves the source intact;
+/// the same request with `allow_lossy_merge` proceeds.
+#[tokio::test]
+async fn a_copy_purge_merge_requires_its_own_acknowledgement() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
+    seed_page(&store, &state.wiki, "dst", "proj", "notes/b.md", "body b").await;
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .unwrap(),
+            project_id: store
+                .reader
+                .find_project(
+                    store
+                        .reader
+                        .find_workspace("src".to_string())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    "proj".to_string(),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            agent_kind: AgentKind::Codex,
+            cwd: Some("/src/proj".into()),
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+
+    let resp = post(
+        state.clone(),
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["strategy"], "copy-purge", "{body}");
+    assert_eq!(body["discarded"]["sessions"], 1, "{body}");
+    assert_eq!(body["discarded"]["pages_copied"], 1, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("--allow-lossy-merge"), "{error}");
+    assert!(error.contains("1 session(s)"), "{error}");
+
+    // The source is untouched: its page and its session are both still there.
+    assert_eq!(
+        store.reader.list_pages("src", "proj").await.unwrap().len(),
+        1
+    );
+    let src_ws = store
+        .reader
+        .find_workspace("src".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let src_proj = store
+        .reader
+        .find_project(src_ws, "proj".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .reader
+            .project_record_counts(src_ws, src_proj)
+            .await
+            .unwrap()
+            .sessions,
+        1,
+        "the refusal must not delete the source's history"
+    );
+
+    // The same request with the acknowledgement proceeds; the merge tests
+    // below cover that path end to end.
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "src", "project": "proj", "to_workspace": "dst",
+            "confirm": true, "allow_lossy_merge": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// The acknowledgement refusal reports the source rows the merge would lose.
+/// If those counts cannot be read, it must fail closed rather than displaying
+/// zeros that could mislead the operator into approving the destructive path.
+#[tokio::test]
+async fn a_copy_purge_preflight_propagates_count_failures() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
+    seed_page(&store, &state.wiki, "dst", "proj", "notes/b.md", "body b").await;
+    rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .execute_batch("ALTER TABLE handoffs RENAME TO unavailable_handoffs")
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(resp).await;
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("handoffs"), "{body}");
+    assert!(body.get("discarded").is_none(), "{body}");
+    assert!(body.get("strategy").is_none(), "{body}");
+    assert_eq!(
+        store.reader.list_pages("src", "proj").await.unwrap().len(),
+        1,
+        "a failed preflight must leave the source untouched"
+    );
+}
+
 #[tokio::test]
 async fn move_project_merges_into_existing_dest() {
     let tmp = TempDir::new().unwrap();
@@ -438,7 +580,7 @@ async fn move_project_merges_into_existing_dest() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -489,7 +631,7 @@ async fn move_project_same_workspace_rejected() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "w", "project": "proj", "to_workspace": "w", "confirm": true }),
+        json!({ "from_workspace": "w", "project": "proj", "to_workspace": "w", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -510,7 +652,7 @@ async fn move_project_refuses_a_private_profile() {
             "from_workspace": "default",
             "project": "_profile.00000000000000000000000000000001",
             "to_workspace": "elsewhere",
-            "confirm": true
+            "confirm": true, "allow_lossy_merge": true
         }),
     )
     .await;
@@ -537,7 +679,10 @@ async fn move_project_carries_source_embedding() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: Some(embedder),
@@ -549,7 +694,7 @@ async fn move_project_carries_source_embedding() {
         db_path,
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -609,7 +754,7 @@ async fn move_project_carries_source_embedding() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -701,6 +846,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
                 title: "prompt".into(),
                 body: "do the thing".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -710,7 +856,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -753,7 +899,7 @@ async fn true_move_stale_source_write_fails_before_creating_file() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -833,7 +979,10 @@ async fn true_move_notifies_admission_with_destination_names() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -845,7 +994,7 @@ async fn true_move_notifies_admission_with_destination_names() {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -856,7 +1005,7 @@ async fn true_move_notifies_admission_with_destination_names() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -892,7 +1041,10 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: Some(embedder),
@@ -904,7 +1056,7 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
         db_path,
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -956,7 +1108,7 @@ async fn true_move_refuses_an_invalid_destination_namespace_without_db_changes()
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1004,7 +1156,7 @@ async fn move_refuses_active_project_without_force() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -1025,7 +1177,7 @@ async fn move_active_project_with_force_succeeds_and_republishes() {
         state,
         "/admin/move-project",
         json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst",
-                "confirm": true, "force": true }),
+                "confirm": true, "allow_lossy_merge": true, "force": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1058,6 +1210,7 @@ async fn copy_purge_force_never_deletes_a_live_managed_workstream() {
     let prepared = store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: src_ws,
             project_id: src_proj,
             repo_fingerprint: "repo".into(),
@@ -1079,7 +1232,7 @@ async fn copy_purge_force_never_deletes_a_live_managed_workstream() {
             "from_workspace": "src",
             "project": "proj",
             "to_workspace": "dst",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
             "force": true
         }),
     )
@@ -1122,7 +1275,10 @@ fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1134,7 +1290,7 @@ fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -1155,7 +1311,7 @@ async fn copy_purge_conflict_duplicates_keeping_both() {
         state,
         "/admin/move-project",
         json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst",
-                "confirm": true, "on_conflict": "duplicate" }),
+                "confirm": true, "allow_lossy_merge": true, "on_conflict": "duplicate" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1221,7 +1377,7 @@ async fn copy_purge_conflict_blocks_by_default() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -1298,7 +1454,7 @@ async fn copy_purge_conflict_blocks_metadata_difference_by_default() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -1330,7 +1486,7 @@ async fn copy_purge_conflict_overwrites() {
         state,
         "/admin/move-project",
         json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst",
-                "confirm": true, "on_conflict": "overwrite" }),
+                "confirm": true, "allow_lossy_merge": true, "on_conflict": "overwrite" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1404,7 +1560,7 @@ async fn copy_purge_duplicate_avoids_clobbering_dedup_slot() {
         state,
         "/admin/move-project",
         json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst",
-                "confirm": true, "on_conflict": "duplicate" }),
+                "confirm": true, "allow_lossy_merge": true, "on_conflict": "duplicate" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1495,7 +1651,7 @@ async fn copy_purge_carries_source_embedding() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1549,7 +1705,7 @@ async fn copy_purge_partial_skips_and_preserves_source() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1623,7 +1779,10 @@ async fn true_move_aborts_when_admission_rejects() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1635,7 +1794,7 @@ async fn true_move_aborts_when_admission_rejects() {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -1646,7 +1805,7 @@ async fn true_move_aborts_when_admission_rejects() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(
@@ -1723,7 +1882,10 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1735,7 +1897,7 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -1749,7 +1911,7 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(
@@ -1840,7 +2002,10 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1852,7 +2017,7 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -1868,7 +2033,7 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
     let resp = post(
         state,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK, "merge move should succeed");
@@ -1898,7 +2063,7 @@ async fn copy_purge_rerun_is_idempotent() {
     let r1 = post(
         s1,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     assert_eq!(r1.status(), StatusCode::OK);
@@ -1915,7 +2080,7 @@ async fn copy_purge_rerun_is_idempotent() {
     let r2 = post(
         s2,
         "/admin/move-project",
-        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true, "allow_lossy_merge": true }),
     )
     .await;
     // Flaky under heavy parallel load / on Windows (observed in the 2.0
@@ -1993,6 +2158,7 @@ async fn delete_workspace_force_removes_everything() {
     let prepared = store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id,
             project_id,
             repo_fingerprint: "repo".into(),
@@ -2150,6 +2316,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2187,6 +2354,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
     let prepared = store
         .writer
         .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: ws,
             project_id: proj,
             repo_fingerprint: "repo".into(),
@@ -2511,6 +2679,7 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2638,6 +2807,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2726,6 +2896,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2766,6 +2937,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -3120,7 +3292,7 @@ async fn move_project_accepts_project_id_instead_of_name() {
             "from_workspace": "default",
             "project_id": proj.to_string(),
             "to_workspace": "elsewhere",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         }),
     )
     .await;
@@ -3159,7 +3331,7 @@ async fn move_project_rejects_a_malformed_project_id_with_400() {
             "from_workspace": "default",
             "project_id": "not-a-uuid",
             "to_workspace": "elsewhere",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         }),
     )
     .await;
@@ -3180,7 +3352,7 @@ async fn move_project_unknown_project_id_is_404() {
             "from_workspace": "default",
             "project_id": "00000000-0000-0000-0000-0000000000ff",
             "to_workspace": "elsewhere",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         }),
     )
     .await;
@@ -3217,7 +3389,7 @@ async fn move_project_refuses_a_real_id_from_another_workspace() {
             "from_workspace": "default",
             "project_id": foreign.to_string(),
             "to_workspace": "target",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         }),
     )
     .await;
@@ -3243,7 +3415,7 @@ async fn move_project_refuses_a_real_id_from_another_workspace() {
             "from_workspace": "elsewhere",
             "project_id": foreign.to_string(),
             "to_workspace": "target",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         }),
     )
     .await;
@@ -3275,7 +3447,7 @@ async fn move_project_refuses_both_project_and_project_id() {
             "project": "movable",
             "project_id": proj.to_string(),
             "to_workspace": "elsewhere",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         }),
     )
     .await;
@@ -3317,9 +3489,326 @@ async fn move_project_still_accepts_a_bare_project_name() {
             "from_workspace": "default",
             "project": "movable",
             "to_workspace": "elsewhere",
-            "confirm": true,
+            "confirm": true, "allow_lossy_merge": true,
         }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn merge_project_dry_run_then_preserves_history_and_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "default",
+        "source",
+        "notes/shared.md",
+        "source body",
+    )
+    .await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "default",
+        "source",
+        "notes/source-only.md",
+        "source only",
+    )
+    .await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "default",
+        "target",
+        "notes/shared.md",
+        "target body",
+    )
+    .await;
+    let ws = store
+        .reader
+        .find_workspace("default".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let source = store
+        .reader
+        .find_project(ws, "source".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let target = store
+        .reader
+        .find_project(ws, "target".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let source_shared_id = store
+        .reader
+        .latest_page_id_by_ids(ws, source, "notes/shared.md".into())
+        .await
+        .unwrap()
+        .expect("source page exists");
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: ws,
+            project_id: source,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store.writer.end_session(session, None).await.unwrap();
+
+    let preview = post(
+        state.clone(),
+        "/admin/merge-project",
+        json!({"workspace": "default", "from": "source", "into": "target"}),
+    )
+    .await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = body_json(preview).await;
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["page_versions"], 2);
+    assert_eq!(preview["sessions"], 1);
+    assert!(
+        store
+            .reader
+            .find_project(ws, "source".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "dry run must preserve the source"
+    );
+
+    let merged = post(
+        state.clone(),
+        "/admin/merge-project",
+        json!({
+            "workspace": "default",
+            "from": "source",
+            "into": "target",
+            "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        merged.status(),
+        StatusCode::OK,
+        "{}",
+        body_json(merged).await
+    );
+    assert!(
+        store
+            .reader
+            .find_project(ws, "source".into())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.reader.session_project_ids(session).await.unwrap(),
+        Some((ws, target))
+    );
+    let shared = state
+        .wiki
+        .read_page(ws, target, &PagePath::new("notes/shared.md").unwrap())
+        .unwrap();
+    assert!(shared.body.contains("target body"));
+    assert!(shared.body.contains("source body"));
+    assert!(shared.body.contains("ai-memory:merged-from default/source"));
+    let source_only = state
+        .wiki
+        .read_page(ws, target, &PagePath::new("notes/source-only.md").unwrap())
+        .unwrap();
+    assert_eq!(source_only.body, "source only");
+    assert_eq!(
+        store
+            .reader
+            .page_versions(ws, target, "notes/shared.md".into(), 10, 0)
+            .await
+            .unwrap()
+            .total,
+        3,
+        "both old heads and the merged head remain reachable"
+    );
+
+    let restored = post(
+        state.clone(),
+        "/admin/restore-page",
+        json!({
+            "workspace": "default",
+            "project": "target",
+            "path": "notes/shared.md",
+            "page_id": source_shared_id.to_string()
+        }),
+    )
+    .await;
+    assert_eq!(
+        restored.status(),
+        StatusCode::OK,
+        "{}",
+        body_json(restored).await
+    );
+    let shared = state
+        .wiki
+        .read_page(ws, target, &PagePath::new("notes/shared.md").unwrap())
+        .unwrap();
+    assert_eq!(shared.body, "source body");
+    assert_eq!(
+        store
+            .reader
+            .page_versions(ws, target, "notes/shared.md".into(), 10, 0)
+            .await
+            .unwrap()
+            .total,
+        4,
+        "restoring a retained source version creates a new latest version"
+    );
+}
+
+#[tokio::test]
+async fn merge_project_refuses_open_sessions_and_foreign_ids() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let source = store
+        .writer
+        .get_or_create_project(ws, "source", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "target", None)
+        .await
+        .unwrap();
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: ws,
+            project_id: source,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    let open = post(
+        state.clone(),
+        "/admin/merge-project",
+        json!({
+            "workspace": "default",
+            "from": "source",
+            "into": "target",
+            "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(open.status(), StatusCode::CONFLICT);
+
+    let foreign_ws = store
+        .writer
+        .get_or_create_workspace("foreign")
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(foreign_ws, "other", None)
+        .await
+        .unwrap();
+    let foreign_response = post(
+        state,
+        "/admin/merge-project",
+        json!({
+            "workspace": "default",
+            "from_project_id": source.to_string(),
+            "into_project_id": foreign.to_string(),
+            "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(foreign_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn concurrent_project_merges_have_one_winner_without_losing_the_page() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "default",
+        "source",
+        "notes/only.md",
+        "keep me",
+    )
+    .await;
+    let ws = store
+        .reader
+        .find_workspace("default".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let target = store
+        .writer
+        .get_or_create_project(ws, "target", None)
+        .await
+        .unwrap();
+    let request = json!({
+        "workspace": "default",
+        "from": "source",
+        "into": "target",
+        "confirm": true
+    });
+    let (first, second) = tokio::join!(
+        post(state.clone(), "/admin/merge-project", request.clone()),
+        post(state.clone(), "/admin/merge-project", request),
+    );
+    let statuses = [first.status(), second.status()];
+    let bodies = [body_json(first).await, body_json(second).await];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
+        1,
+        "exactly one concurrent merge may commit: {statuses:?} {bodies:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|status| matches!(*status, StatusCode::NOT_FOUND | StatusCode::CONFLICT)),
+        "the losing merge must fail as missing or stale: {statuses:?} {bodies:?}"
+    );
+    assert_eq!(
+        state
+            .wiki
+            .read_page(ws, target, &PagePath::new("notes/only.md").unwrap())
+            .unwrap()
+            .body,
+        "keep me"
+    );
+    assert_eq!(
+        store
+            .reader
+            .page_versions(ws, target, "notes/only.md".into(), 10, 0)
+            .await
+            .unwrap()
+            .total,
+        1
+    );
 }

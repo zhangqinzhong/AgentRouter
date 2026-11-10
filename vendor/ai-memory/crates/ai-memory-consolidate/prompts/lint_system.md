@@ -46,6 +46,14 @@ outcome — they prove the wiki is internally consistent.
   - `warning` — a real conflict that should be resolved
   - `info` — minor issue or near-duplicate worth noting
 
+## OUTPUT LANGUAGE
+
+Write each finding's `message` in the dominant natural language of
+the page previews (if the wiki is in Portuguese, write Portuguese).
+English instructions do not make English the output language.
+Page paths, `kind`, `severity`, and JSON keys stay exactly as
+specified below.
+
 ## Required JSON shape
 
 Reply with ONE JSON object matching the `LintReport` schema:

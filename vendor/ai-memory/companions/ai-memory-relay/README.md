@@ -123,6 +123,12 @@ authentication failures and transport errors retain unacknowledged events.
 A failed head blocks its own session. HTTP 429 ends the flush; the caller should
 back off before scheduling another one.
 
+An HTTP response whose body exceeds the 64 KiB acknowledgement limit also ends
+the flush without a transport retry. Its status is preserved, its body is never
+parsed or printed, and the batch stays pending. This includes oversized 200/429
+acknowledgements and error responses such as 413 or 500; only transport failures
+trigger the bounded automatic retries within a flush.
+
 An acknowledgement can also mean the server deliberately dropped an event, for
 example because of capture policy or a session identity collision. A drained
 queue does not prove that every event became an observation. The relay catches

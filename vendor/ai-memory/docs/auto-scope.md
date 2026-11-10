@@ -180,7 +180,8 @@ stay on the static HTTP transport unless this flag is used.
 Claude Code's stdio MCP subprocess keeps the id it received at startup across
 `/clear`, even though subsequent hooks receive the new id. On
 `--continue`/`--resume` without an explicit id, Claude may also give the MCP
-subprocess the startup id rather than the resumed id. Restart Claude Code after
+subprocess the startup id rather than the resumed id. Unscoped calls then fall
+back to the bridge's launch directory (see below); restart Claude Code after
 `/clear` when exact session-key continuity matters, and prefer
 `--resume <session-id>` for explicit resumes. The bridge deliberately fails
 when no `CLAUDE_CODE_SESSION_ID` is available instead of silently degrading to
@@ -198,6 +199,44 @@ when the server's token lives in `[auth].bearer_token_file`. It forwards no
 session id, not even an inherited `CLAUDE_CODE_SESSION_ID`, so those clients
 stay static MCP clients and pass `workspace` + `project`; they never touch a
 per-session pointer.
+
+### The session-less bridge's launch scope
+
+A static client sometimes omits the scope anyway, and an unscoped call then
+lands wherever the server's fallback points, which can be another repository
+the hooks made active (#1979). The session-less bridge therefore resolves a
+default scope once, from the directory it was launched in (`AI_MEMORY_HOST_CWD`
+under the Docker wrapper), with the thin CLI's rules: the nearest
+`.ai-memory.toml` names the workspace and project, else a valid `upstream` or
+`origin` remote supplies the canonical path name in the `default` workspace,
+else the launch directory's folder name does. It fills that `workspace` + `project` into
+a call only when the tool's schema takes both and the call names no scope of
+its own: no `workspace`, `project` or `project_id`, no non-empty `scopes`, no
+`global` other than `false`, and no `scope` other than `project`. Everything
+else is forwarded unchanged, so an explicit scope always wins and a partial one
+still fails closed on the server.
+
+The bridge resolves no default, and forwards every call unchanged, when its
+directory is neither covered by a scope marker nor inside a checkout (`/`, a
+bare home directory), when a marker routes it to a `server` profile (its
+project lives on another server), or when the upstream tool list cannot be
+read. The filled scope is an explicit scope like any other: the server
+authorizes it for the caller, it never reads or moves an active-project
+pointer, and it names the same project the hooks capture that checkout into.
+
+The session-aware bridge fills in nothing itself, since the server routes its
+calls by the forwarded session id. That id can miss: Claude Code's `/resume`
+and `/clear` keep the bridge's launch-time id while the hooks publish under the
+new one, a restarted server has not seen the session's hooks yet, and a
+session's first call can come before its first hook event. So the bridge sends
+the same launch scope in the `X-Memory-Actor-Fallback-Workspace` and
+`X-Memory-Actor-Fallback-Project` headers (percent-encoded), and the server
+fills it into a call that names no scope only when the caller's own keyed
+pointer did not resolve (#2005). A pointer the hooks published for the session
+wins, and so does the shared slot of a `single`-mode or hook-less install, so a
+call that routes correctly today is never re-routed. The filled scope is
+authorized like an explicit one and never moves the pointer. A directory that
+resolves to no project sends no headers, and the call keeps today's fallback.
 
 Use `per_session` only when your client or bridge can send the same
 opaque session id from the hook payload on each MCP request as

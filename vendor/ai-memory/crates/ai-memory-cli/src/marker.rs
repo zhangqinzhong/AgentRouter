@@ -185,6 +185,8 @@ impl RoutingFields {
 
 impl HomeRoutes {
     fn parse(text: &str, home: &Path) -> Result<Self, ()> {
+        // A BOM is not whitespace to `trim`, and would hide a first-line header.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let saw_route_syntax = text
             .lines()
             .any(|line| recognizable_route_syntax(line.trim()));
@@ -1237,7 +1239,9 @@ impl MarkerMemo {
 /// `project_strategy`), or any of the other settings
 /// `hook_capture::marker_query_suffix_impl` forwards (`[recall]
 /// default_global`, `[briefing]` and `[profile]` keys, top-level
-/// `drop_subagent_captures`).
+/// `drop_subagent_captures`), or `[messaging] inbox_notice_on_prompt`,
+/// which the hook reads locally instead of forwarding but must still read
+/// from the nearest settings-declaring marker (#1942).
 /// A marker with any of these is a resolution boundary; only a marker whose
 /// only content is `[capture]` (e.g. `ignore_paths`) is transparent (#668).
 ///
@@ -1254,12 +1258,15 @@ fn declares_more_than_capture(text: &str) -> bool {
         "identity",
         "identity_style",
     ];
-    const FLAG_KEYS: [&str; 5] = [
+    const FLAG_KEYS: [&str; 8] = [
         "default_global",
         "inject_on_session_start",
+        "inject_on_subagent_start",
         "max_chars",
         "contribute",
         "consume",
+        "deliver_on_session_start",
+        "inbox_notice_on_prompt",
     ];
     QUOTED_KEYS
         .iter()
@@ -1467,23 +1474,56 @@ pub(crate) fn parse_toml_flag(file: &Path, key: &str) -> Option<String> {
 /// [`parse_key_in`], shared with [`declares_more_than_capture`] so it pays
 /// for one read per key instead of re-opening the file.
 fn parse_flag_in(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| parse_flag_line(line, key))
+}
+
+fn parse_flag_line(line: &str, key: &str) -> Option<String> {
+    // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
+    let trimmed = line.trim_start_matches('\u{feff}').trim_start();
+    let after_key = trimmed.strip_prefix(key)?;
+    let rest = after_key.trim_start().strip_prefix('=')?;
+    let val = rest
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"');
+    (!val.is_empty()).then(|| val.to_string())
+}
+
+/// Parse a flag only inside one TOML table. Used for `[recovery]`, whose key
+/// deliberately matches the independent `[handoff]` delivery setting.
+pub(crate) fn parse_toml_section_flag(file: &Path, section: &str, key: &str) -> Option<String> {
+    parse_scoped_flag_in(&std::fs::read_to_string(file).ok()?, section, key, false)
+}
+
+/// Preserve the section-blind handoff parser everywhere except the new
+/// `[recovery]` table, whose same-named key must not disable handoffs.
+pub(crate) fn parse_toml_flag_outside_section(
+    file: &Path,
+    section: &str,
+    key: &str,
+) -> Option<String> {
+    parse_scoped_flag_in(&std::fs::read_to_string(file).ok()?, section, key, true)
+}
+
+fn parse_scoped_flag_in(text: &str, section: &str, key: &str, exclude: bool) -> Option<String> {
+    let mut in_section = false;
     for line in text.lines() {
-        // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
-        let trimmed = line.trim_start_matches('\u{feff}').trim_start();
-        let Some(after_key) = trimmed.strip_prefix(key) else {
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        let header = trimmed.split('#').next().unwrap_or("").trim();
+        if let Some(name) = header
+            .strip_prefix('[')
+            .and_then(|header| header.strip_suffix(']'))
+        {
+            in_section = name.trim() == section;
             continue;
-        };
-        let Some(rest) = after_key.trim_start().strip_prefix('=') else {
+        }
+        if in_section == exclude {
             continue;
-        };
-        let val = rest
-            .split('#')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"');
-        if !val.is_empty() {
-            return Some(val.to_string());
+        }
+        if let Some(value) = parse_flag_line(line, key) {
+            return Some(value);
         }
     }
     None
@@ -2381,7 +2421,9 @@ project = "infra" # this is fine
             "drop_subagent_captures = \"true\"\n",
             "[recall]\ndefault_global = true\n",
             "[briefing]\ninject_on_session_start = true\n",
+            "[briefing]\ninject_on_subagent_start = true\n",
             "[briefing]\nmax_chars = 4000\n",
+            "[handoff]\ndeliver_on_session_start = false\n",
         ] {
             assert!(
                 declares_more_than_capture(text),
@@ -2557,6 +2599,25 @@ project = "infra" # this is fine
             parse_flag_in("\u{feff}default_global = true\n", "default_global").as_deref(),
             Some("true")
         );
+    }
+
+    /// The home marker's route tables need the same BOM handling: a BOM on a
+    /// first-line route header left its fields orphaned, and the whole home
+    /// routing file was refused as malformed.
+    #[test]
+    fn a_bom_cannot_hide_a_first_line_home_route_header() {
+        let home = Path::new("/home/operator");
+        let routes = HomeRoutes::parse(
+            "\u{feff}[routes.path.\"~/src/api\"]\nroute_workspace = \"acme\"\nroute_project = \"api\"\n",
+            home,
+        )
+        .unwrap();
+        let (route, _) = routes
+            .select("/home/operator/src/api", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.workspace, "acme");
+        assert_eq!(route.project, "api");
     }
 
     #[test]

@@ -1750,6 +1750,301 @@ mod tests {
         (id, token)
     }
 
+    #[tokio::test]
+    async fn managed_project_id_http_enforces_workspace_grants_and_candidate_privacy() {
+        async fn send(
+            http: &Router,
+            token: Option<&str>,
+            path: &str,
+            body: serde_json::Value,
+        ) -> Response {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            http.clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap()
+        }
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        store
+            .writer
+            .get_or_create_workspace("foreign")
+            .await
+            .unwrap();
+        let selected = store
+            .writer
+            .get_or_create_project(ws, "widget", None)
+            .await
+            .unwrap();
+        let (hidden, _) = store
+            .writer
+            .resolve_project_by_identity(
+                ws,
+                ai_memory_core::repository_identity::RepositoryIdentity {
+                    identity: "github.com/private/widget".into(),
+                    source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+                },
+                ai_memory_core::repository_identity::IdentityStyle::Path,
+                "remote",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(selected, hidden);
+        for id in [selected, hidden] {
+            store
+                .writer
+                .set_access_mode(id, ai_memory_store::AccessMode::Restricted)
+                .await
+                .unwrap();
+        }
+        let (user, token) = owner_finish_user(&store, "selector").await;
+        let auth = AuthState::new(Some("root-selector-test".into())).with_multiuser(
+            TokenPepper::new("finish-pepper"),
+            store.reader.clone(),
+            store.writer.clone(),
+        );
+        let http = owner_finish_http(&store, tmp.path(), auth);
+        let prepare = serde_json::json!({"workspace":"default", "project":"", "project_id":selected,
+            "cwd":"/client/widget", "repo_fingerprint":"repo", "worktree_fingerprint":"tree",
+            "agent":"codex", "lease_owner":"test", "new_workstream":"selected"});
+        let candidates = serde_json::json!({"workspace":"default", "project":"widget"});
+        for (path, body) in [
+            ("/workstream/runs", prepare.clone()),
+            ("/workstream/project-candidates", candidates.clone()),
+        ] {
+            assert_eq!(
+                send(&http, None, path, body).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            send(&http, Some(&token), "/workstream/runs", prepare.clone())
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        for (field, value, expected) in [
+            (
+                "workspace",
+                serde_json::json!("foreign"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "workspace",
+                serde_json::json!("missing"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "project_id",
+                serde_json::json!(ai_memory_core::ProjectId::new()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "project",
+                serde_json::json!("widget"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let mut body = prepare.clone();
+            body[field] = value;
+            assert_eq!(
+                send(&http, Some("root-selector-test"), "/workstream/runs", body)
+                    .await
+                    .status(),
+                expected
+            );
+        }
+        assert!(
+            store
+                .reader
+                .find_workspace("missing".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .writer
+            .grant_memory(user, selected, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            send(&http, Some(&token), "/workstream/runs", prepare.clone())
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = send(
+            &http,
+            Some(&token),
+            "/workstream/project-candidates",
+            candidates.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let rows: ai_memory_core::ManagedProjectCandidatesResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            rows.candidates.is_empty(),
+            "read access must not be offered as a writable choice"
+        );
+        store
+            .writer
+            .grant_memory(user, selected, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        let response = send(
+            &http,
+            Some(&token),
+            "/workstream/project-candidates",
+            candidates.clone(),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let rows: ai_memory_core::ManagedProjectCandidatesResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            rows.candidates
+                .iter()
+                .map(|row| row.project_id)
+                .collect::<Vec<_>>(),
+            [selected]
+        );
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!body.contains("private-widget") && !body.contains(&hidden.to_string()));
+        assert!(!body.contains("repo_path") && !body.contains("/client/"));
+        let response = send(&http, Some(&token), "/workstream/runs", prepare.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let run: ai_memory_core::PrepareManagedRunResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(run.resolved_project.unwrap().project_id, selected);
+        let recent = serde_json::json!({"workspace":"default", "project":"", "project_id":selected,
+            "repo_fingerprint":"repo", "worktree_fingerprint":"tree", "limit":20});
+        let response = send(&http, Some(&token), "/workstream/recent", recent.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let rows: Vec<ai_memory_core::ManagedWorkstreamSummary> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workstream_id, run.workstream_id);
+        let mut other = recent;
+        other["workspace"] = serde_json::json!("foreign");
+        assert_eq!(
+            send(&http, Some(&token), "/workstream/recent", other)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let mut root_prepare = prepare;
+        root_prepare["new_workstream"] = serde_json::json!("root-selection");
+        assert_eq!(
+            send(
+                &http,
+                Some("root-selector-test"),
+                "/workstream/runs",
+                root_prepare
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let response = send(
+            &http,
+            Some("root-selector-test"),
+            "/workstream/project-candidates",
+            candidates,
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let rows: ai_memory_core::ManagedProjectCandidatesResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rows.candidates.len(), 2);
+
+        // IDs must preserve the named-write restriction on reserved profiles,
+        // even when an operator has an explicit write grant on that project.
+        let own_profile = ai_memory_core::profile::user_profile_project(user);
+        let foreign_profile =
+            ai_memory_core::profile::user_profile_project(ai_memory_core::UserId::new());
+        for (profile, allowed) in [
+            ("_profile", false),
+            (foreign_profile.as_str(), false),
+            (own_profile.as_str(), true),
+        ] {
+            let project_id = store
+                .writer
+                .get_or_create_project(ws, profile, None)
+                .await
+                .unwrap();
+            store
+                .writer
+                .grant_memory(user, project_id, ai_memory_store::GrantLevel::Write, None)
+                .await
+                .unwrap();
+            let body = serde_json::json!({"workspace":"default", "project":"", "project_id":project_id,
+                "cwd":"/client/widget", "repo_fingerprint":"repo", "worktree_fingerprint":"tree",
+                "agent":"codex", "lease_owner":"test", "new_workstream":"profile-selection"});
+            assert_eq!(
+                send(&http, Some(&token), "/workstream/runs", body.clone())
+                    .await
+                    .status(),
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "reserved profile selection: {profile}"
+            );
+            let response = send(
+                &http,
+                Some(&token),
+                "/workstream/project-candidates",
+                serde_json::json!({"workspace":"default", "project":profile}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let rows: ai_memory_core::ManagedProjectCandidatesResponse =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(rows.candidates.len(), usize::from(allowed));
+            if !allowed {
+                assert_eq!(
+                    send(&http, Some("root-selector-test"), "/workstream/runs", body)
+                        .await
+                        .status(),
+                    StatusCode::OK,
+                    "root retains profile repair access"
+                );
+            }
+        }
+    }
+
     async fn owner_finish_run(
         store: &Store,
         ws: ai_memory_core::WorkspaceId,
@@ -1761,6 +2056,7 @@ mod tests {
             .writer
             .prepare_workstream_run_owned(
                 ai_memory_store::PrepareWorkstreamRun {
+                    scope_by_id: false,
                     workspace_id: ws,
                     project_id: project,
                     repo_fingerprint: "repo".into(),

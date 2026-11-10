@@ -66,7 +66,7 @@ export default async function AgentRouterMiMoMemory({ directory }) {
       const project = fields.find(m => m[1] === 'project')?.[2];
       if (!workspace || !project) return '';
       const url = new URL(endpoint + '/handoff');
-      for (const [key, value] of Object.entries({ agent: 'other', cwd: directory, session_id: sid(id), workspace, project })) url.searchParams.set(key, value);
+      for (const [key, value] of Object.entries({ agent: 'other', cwd: directory, session_id: sid(id), workspace, project, recovery: '0' })) url.searchParams.set(key, value);
       const token = readFileSync(join(dataDir, 'agentrouter.token'), 'utf8').trim();
       const options = { headers: { Authorization: 'Bearer ' + token }, redirect: 'error', signal: AbortSignal.timeout(2000) };
       const prefix = endpoint + '/api/v1/workspaces/' + encodeURIComponent(workspace) + '/projects/' + encodeURIComponent(project);

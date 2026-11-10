@@ -85,6 +85,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// `ReaderPool::search_pages_with_meta`. No viewer (no database users, or
 /// root) reads everything, as before.
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
@@ -96,7 +97,7 @@ pub(crate) async fn handler(
         .as_deref()
         .is_some_and(|v| matches!(v, "1" | "true" | "on" | "yes"));
     let viewer = viewer.map(|axum::Extension(viewer)| viewer.user());
-    let scope = match non_empty(params.scope.as_deref()) {
+    let mut scope = match non_empty(params.scope.as_deref()) {
         Some(value) => match value.split_once('/') {
             Some((workspace, project)) if !workspace.is_empty() && !project.is_empty() => {
                 Some((workspace.to_owned(), project.to_owned()))
@@ -158,12 +159,24 @@ pub(crate) async fn handler(
     let mut truncated = false;
     let mut timings = None;
     let mut streams_active: Vec<&'static str> = Vec::new();
-    match &scope {
+    match &mut scope {
         Some((workspace, project)) => {
             let resolved = match super::resolve_read_scope(&state, viewer, workspace, project).await
             {
                 Ok(resolved) => resolved,
-                Err(refusal) => return super::page::refusal_response(&refusal),
+                Err(refusal) => return super::page::localized_refusal_response(&i18n, &refusal),
+            };
+            // Scope lookup accepts canonical and legacy keys, but page URLs
+            // use the exact stored name. Resolve it only after authorization,
+            // without promoting the project as a side effect of a read.
+            *project = match state
+                .reader
+                .project_name_by_id(resolved.workspace_id, resolved.project_id)
+                .await
+            {
+                Ok(Some(name)) => name,
+                Ok(None) => return super::page::not_found_response(&i18n),
+                Err(error) => return internal(error),
             };
             if !query.is_empty() {
                 let limit = params
@@ -192,7 +205,12 @@ pub(crate) async fn handler(
                 for (position, (hit, details)) in result.hits.into_iter().take(limit).enumerate() {
                     let path = hit.path.as_str().to_owned();
                     hits.push(SearchHit {
-                        href: page_href(workspace, project, &path),
+                        href: context_href(
+                            &page_href(workspace, project, &path),
+                            &params,
+                            false,
+                            limit,
+                        ),
                         workspace: workspace.clone(),
                         project: project.clone(),
                         path,
@@ -231,7 +249,12 @@ pub(crate) async fn handler(
             for h in raw.into_iter().take(limit) {
                 let path = h.path.as_str().to_owned();
                 hits.push(SearchHit {
-                    href: page_href(&h.workspace_name, &h.project_name, &path),
+                    href: context_href(
+                        &page_href(&h.workspace_name, &h.project_name, &path),
+                        &params,
+                        true,
+                        limit,
+                    ),
                     workspace: h.workspace_name,
                     project: h.project_name,
                     path,
@@ -293,6 +316,7 @@ pub(crate) async fn handler(
         }
     }
     let view = SearchView {
+        i18n: i18n.clone(),
         global_href,
         project_href: project_href(&workspace, &project),
         scope_groups,
@@ -362,7 +386,7 @@ fn fmt_rrf(value: f64) -> String {
 }
 
 /// One hit's trace rows, in the stream order `streams_active` uses.
-fn hit_trace(position: usize, rank: f64, d: &SearchExplain) -> HitTrace {
+pub(crate) fn hit_trace(position: usize, rank: f64, d: &SearchExplain) -> HitTrace {
     let mut streams = vec![
         StreamTraceRow {
             stream: "fts",
@@ -438,4 +462,21 @@ fn timing_rows(t: &StreamTimings) -> Vec<TimingRow> {
         })
     })
     .collect()
+}
+
+fn context_href(base: &str, params: &SearchParams, global: bool, limit: usize) -> String {
+    let mut href = format!(
+        "{base}?recall_q={}&recall_limit={limit}&recall_global={}",
+        encode_segment(params.q.trim()),
+        if global { "1" } else { "0" }
+    );
+    for (key, value) in [
+        ("recall_kind", params.kind.as_deref()),
+        ("recall_tier", params.tier.as_deref()),
+    ] {
+        if let Some(value) = non_empty(value) {
+            href.push_str(&format!("&{key}={}", encode_segment(value)));
+        }
+    }
+    href
 }

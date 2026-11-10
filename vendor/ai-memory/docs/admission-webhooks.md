@@ -354,6 +354,13 @@ events = ["write_page", "consolidate", "delete", "purge_project", "move_project"
 blocking = false                                         # fire-and-forget after the write; never blocks it
 ```
 
+Only `http://` and `https://` webhook URLs are accepted; any other scheme, a
+bare hostname, or an empty `url` fails server startup when the chain is
+built. Redirects are followed only when the target stays on the same
+`scheme://host:port` origin as the configured `url` (up to 10 hops); a redirect
+to another origin fails the webhook request without forwarding the payload or
+applying any response mutation.
+
 ### `blocking` (default `true`)
 
 A webhook is either **blocking** or **non-blocking**:

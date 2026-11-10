@@ -2,9 +2,10 @@
 //!
 //! Invariants guarded (docs/design-memory-aging.md §A5):
 //!
-//! 1. **Band pair ⇒ finding.** Two cold pages whose embeddings sit in the
-//!    0.4–0.75 cosine-similarity band produce one advisory `contradiction`
-//!    finding naming both paths, with newer-wins advice.
+//! 1. **Band pair ⇒ candidate.** Two cold pages whose embeddings sit in the
+//!    0.4–0.75 cosine-similarity band produce one advisory
+//!    `similarity_candidate` naming both paths without claiming conflict or
+//!    supersession.
 //! 2. **Near-duplicate ⇒ NOT a contradiction.** A pair at ≥0.75 is A3
 //!    dedup territory, never flagged here.
 //! 3. **No embeddings ⇒ clean no-op** (never an error, never a provider call).
@@ -150,31 +151,16 @@ fn options_with_band(
     }
 }
 
-/// Two cold pages in the band ⇒ one advisory contradiction finding naming
-/// both, with newer-wins advice; nothing is deleted or rewritten.
+/// Two cold pages in the band ⇒ one advisory similarity candidate naming
+/// both without conflict or supersession claims; nothing is rewritten.
 #[tokio::test]
-async fn band_pair_yields_advisory_contradiction() {
+async fn band_pair_yields_advisory_similarity_candidate() {
     let fx = seed_fixture().await;
     let old = write_semantic(&fx, "concepts/old-claim.md", "The retry budget is 3.").await;
     let new = write_semantic(&fx, "concepts/new-claim.md", "The retry budget is 5.").await;
     // dot([1,0],[0.6,0.8]) = 0.6 — squarely in the 0.4–0.75 band.
     seed_embedding(&fx, old, &[1.0, 0.0]);
     seed_embedding(&fx, new, &[0.6, 0.8]);
-    // Make `new` the more recently updated page so it wins the timestamp advice.
-    {
-        let conn = rusqlite::Connection::open(fx.tmp.path().join("db/memory.sqlite")).unwrap();
-        conn.execute(
-            "UPDATE pages SET updated_at = updated_at + 1000000 \
-             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
-            params![
-                fx.ws.as_bytes(),
-                fx.proj.as_bytes(),
-                "concepts/new-claim.md"
-            ],
-        )
-        .unwrap();
-    }
-
     let before = latest_page_count(&fx);
     let report = run_lint(
         &fx.store.reader,
@@ -187,26 +173,28 @@ async fn band_pair_yields_advisory_contradiction() {
     .await
     .unwrap();
 
-    let contradictions: Vec<_> = report
+    let candidates: Vec<_> = report
         .findings
         .iter()
-        .filter(|f| f.kind == "contradiction")
+        .filter(|f| f.kind == "similarity_candidate")
         .collect();
     assert_eq!(
-        contradictions.len(),
+        candidates.len(),
         1,
-        "one band pair ⇒ one contradiction finding: {:?}",
+        "one band pair ⇒ one similarity candidate: {:?}",
         report.findings
     );
-    let f = contradictions[0];
-    assert_eq!(f.severity, "info", "detected contradictions are advisory");
+    let f = candidates[0];
+    assert_eq!(f.severity, "info", "similarity candidates are advisory");
     assert!(f.pages.contains(&"concepts/old-claim.md".to_string()));
     assert!(f.pages.contains(&"concepts/new-claim.md".to_string()));
     assert!(
-        f.message.contains("concepts/new-claim.md") && f.message.contains("supersedes"),
-        "newer page wins on a timestamp basis: {}",
+        f.message.contains("does not establish a contradiction")
+            && f.message.contains("or supersession"),
+        "candidate must state the evidence limit: {}",
         f.message
     );
+    assert!(!report.findings.iter().any(|f| f.kind == "contradiction"));
 
     // Advisory (#16): nothing deleted or superseded.
     assert_eq!(
@@ -243,7 +231,10 @@ async fn raised_floor_suppresses_the_band_pair_end_to_end() {
     .unwrap();
 
     assert!(
-        !report.findings.iter().any(|f| f.kind == "contradiction"),
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == "similarity_candidate"),
         "a 0.7 floor must drop the 0.6-similarity pair the default 0.4 floor admits: {:?}",
         report.findings
     );
@@ -272,7 +263,10 @@ async fn near_duplicate_is_not_a_contradiction() {
     .unwrap();
 
     assert!(
-        !report.findings.iter().any(|f| f.kind == "contradiction"),
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == "similarity_candidate"),
         "a near-duplicate must not be flagged as a contradiction: {:?}",
         report.findings
     );
@@ -302,7 +296,7 @@ async fn no_embeddings_is_a_clean_no_op() {
         !with_coord
             .findings
             .iter()
-            .any(|f| f.kind == "contradiction"),
+            .any(|f| f.kind == "similarity_candidate"),
         "no embeddings ⇒ no contradiction findings: {:?}",
         with_coord.findings
     );
@@ -322,7 +316,7 @@ async fn no_embeddings_is_a_clean_no_op() {
         !without_coord
             .findings
             .iter()
-            .any(|f| f.kind == "contradiction"),
+            .any(|f| f.kind == "similarity_candidate"),
         "embedding: None ⇒ no contradiction findings: {:?}",
         without_coord.findings
     );
@@ -365,7 +359,10 @@ async fn contradiction_pass_skips_expired_pages() {
     .unwrap();
 
     assert!(
-        !report.findings.iter().any(|f| f.kind == "contradiction"),
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == "similarity_candidate"),
         "expired pages must not produce contradiction findings: {:?}",
         report.findings
     );
@@ -459,10 +456,11 @@ async fn llm_lint_pass_does_not_audit_the_previous_lint_report() {
 /// A positive pair contains incompatible simultaneous values for the same
 /// setting and scope. Compatible active pairs are negatives. Expired,
 /// superseded and foreign-project pairs exercise eligibility and are excluded
-/// from the classification metrics. A prediction means any `kind = contradiction`
-/// finding, including an advisory similarity candidate; it does not mean the
-/// server independently verified the conflict. The typed-edge control also
-/// contains conflicting prose, so its label does not rely on the edge alone.
+/// from the classification metrics. A contradiction prediction is only a
+/// `kind = contradiction` finding. A `similarity_candidate` is tracked
+/// separately because it is not independent evidence of conflict. The
+/// typed-edge control also contains conflicting prose, so its label does not
+/// rely on the edge alone.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvidenceCase {
@@ -553,7 +551,7 @@ async fn seed_evidence_case(case: &EvidenceCase) -> Fixture {
     fx
 }
 
-async fn evidence_findings(fx: &Fixture) -> Vec<(String, Vec<String>)> {
+async fn evidence_findings(fx: &Fixture) -> Vec<(String, String, Vec<String>)> {
     let report = run_lint(
         &fx.store.reader,
         &fx.wiki,
@@ -567,8 +565,8 @@ async fn evidence_findings(fx: &Fixture) -> Vec<(String, Vec<String>)> {
     report
         .findings
         .into_iter()
-        .filter(|finding| finding.kind == "contradiction")
-        .map(|finding| (finding.severity, finding.pages))
+        .filter(|finding| finding.kind == "contradiction" || finding.kind == "similarity_candidate")
+        .map(|finding| (finding.kind, finding.severity, finding.pages))
         .collect()
 }
 
@@ -580,12 +578,21 @@ struct EvidenceCounts {
     fn_: usize,
     excluded: usize,
     findings: usize,
+    similarity_candidates: usize,
 }
 
 impl EvidenceCounts {
-    fn record(&mut self, case: &EvidenceCase, findings: usize) {
-        self.findings += findings;
-        match (case.label, findings > 0) {
+    fn record(&mut self, case: &EvidenceCase, findings: &[(String, String, Vec<String>)]) {
+        self.findings += findings.len();
+        let contradictions = findings
+            .iter()
+            .filter(|(kind, _, _)| kind == "contradiction")
+            .count();
+        self.similarity_candidates += findings
+            .iter()
+            .filter(|(kind, _, _)| kind == "similarity_candidate")
+            .count();
+        match (case.label, contradictions > 0) {
             (EvidenceLabel::Conflict, true) => self.tp += 1,
             (EvidenceLabel::Conflict, false) => self.fn_ += 1,
             (EvidenceLabel::Compatible, true) => self.fp += 1,
@@ -629,7 +636,16 @@ async fn labeled_evidence_pairs_record_current_classification() {
             assert!(first.is_empty(), "excluded pair: {}", case.id);
         }
         if matches!(case.setup, EvidenceSetup::Declared) {
-            assert_eq!(first[0].0, "warning", "typed edge control");
+            assert_eq!(first[0].0, "contradiction", "typed edge control kind");
+            assert_eq!(first[0].1, "warning", "typed edge control severity");
+        } else if matches!(case.setup, EvidenceSetup::Active) && !first.is_empty() {
+            assert!(
+                first
+                    .iter()
+                    .all(|(kind, _, _)| kind == "similarity_candidate"),
+                "similarity-only findings must remain candidates: {}",
+                case.id
+            );
         }
         assert_eq!(
             first,
@@ -643,7 +659,7 @@ async fn labeled_evidence_pairs_record_current_classification() {
             "lint mutated pages: {}",
             case.id
         );
-        counts.record(case, first.len());
+        counts.record(case, &first);
     }
     assert_eq!(cases.len(), 11);
     counts.report();

@@ -6,7 +6,7 @@
 //! `docs/macos.md`, Windows zip in `docs/windows.md` Scenario C): download the
 //! matching archive + `.sha256`, verify, replace the on-disk binary (and sibling
 //! `hooks/` when present), then re-run `install-hooks --apply` for every staged
-//! agent.
+//! agent and every existing ai-memory-owned generated TypeScript integration.
 //!
 //! Client-only: never claims to upgrade a remote/homelab server.
 //!
@@ -30,6 +30,7 @@
 use std::fs;
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -64,28 +65,71 @@ const UNIX_EXECUTABLE_MODE: u32 = 0o755;
 type StagedAgentList = Vec<(String, AgentChoice)>;
 
 /// Run the `upgrade` subcommand.
-pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
+pub async fn run(config: &Config, config_path: Option<&Path>, args: UpgradeArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let exe = resolve_current_exe()?;
     ensure_supported_install(&exe)?;
 
     let fetcher = ReqwestFetcher::new()?;
     let base = release_base_url(config);
     let tag = resolve_tag(&fetcher, &base, args.version.as_deref()).await?;
-    if skip_when_current(&tag, args.force) {
+    if skip_when_current(i18n, &tag, args.force) {
         refresh_plugins(config, &super::user_service::SystemRunner);
         return Ok(());
     }
 
-    let extract_root = download_and_extract_release(&fetcher, &base, &tag).await?;
-    apply_extracted_release(extract_root.path(), &exe)?;
+    let extract_root = download_and_extract_release(i18n, &fetcher, &base, &tag).await?;
+    apply_extracted_release(i18n, extract_root.path(), &exe)?;
 
-    // Sync FS after await is intentional for this CLI one-shot path.
-    refresh_staged_hooks(config)?;
+    // The running process still contains the old release's embedded templates.
+    // Re-enter through the replacement executable so every generated hook is
+    // rendered by the version that was just installed.
+    run_replacement_refresh(&exe, &config.data_dir, config_path)?;
     refresh_plugins(config, &super::user_service::SystemRunner);
     warn_remote_server(config);
-    println!("✓ upgraded to {tag}");
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-upgraded-to-tag",
+            &[("value0", tag.to_string())]
+        )
+    );
     info!(%tag, path = %exe.display(), "native upgrade complete");
     Ok(())
+}
+
+/// Refresh staged and generated integrations from the replacement process.
+/// This is reached only through the hidden `upgrade-refresh-hooks` command.
+pub(crate) fn refresh_after_replace(config: &Config) -> Result<()> {
+    refresh_staged_hooks(config)?;
+    refresh_generated_integrations(config);
+    Ok(())
+}
+
+fn run_replacement_refresh(exe: &Path, data_dir: &Path, config_path: Option<&Path>) -> Result<()> {
+    let mut command = replacement_refresh_command(exe, data_dir, config_path);
+    let status = command
+        .status()
+        .with_context(|| format!("starting replacement executable {}", exe.display()))?;
+    if !status.success() {
+        bail!(
+            "the new binary was installed, but its hook refresh exited with {status}; \
+             run `{} --data-dir {} upgrade-refresh-hooks`",
+            exe.display(),
+            data_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn replacement_refresh_command(exe: &Path, data_dir: &Path, config_path: Option<&Path>) -> Command {
+    let mut command = Command::new(exe);
+    command.arg("--data-dir").arg(data_dir);
+    if let Some(path) = config_path {
+        command.arg("--config").arg(path);
+    }
+    command.arg("upgrade-refresh-hooks").stdin(Stdio::null());
+    command
 }
 
 fn resolve_current_exe() -> Result<PathBuf> {
@@ -100,30 +144,40 @@ fn ensure_supported_install(exe: &Path) -> Result<()> {
     }
 }
 
-fn skip_when_current(tag: &str, force: bool) -> bool {
+fn skip_when_current(i18n: &ai_memory_core::i18n::Localizer, tag: &str, force: bool) -> bool {
     let current = env!("CARGO_PKG_VERSION");
     if !force && versions_match(tag, current) {
-        println!("already up to date ({current})");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-already-up-to-date-current",
+                &[("value0", current.to_string())]
+            )
+        );
         return true;
     }
     false
 }
 
 async fn download_and_extract_release(
+    i18n: &ai_memory_core::i18n::Localizer,
     fetcher: &ReqwestFetcher,
     base: &str,
     tag: &str,
 ) -> Result<tempfile::TempDir> {
-    let asset = release_asset_name().context("no GitHub release asset for this OS/arch")?;
-    let archive_bytes = fetch_verified_archive(fetcher, base, tag, asset).await?;
-    let extract_root = tempfile::tempdir().context("creating extract temp dir")?;
+    let asset = release_asset_name()
+        .context(i18n.text("cli-upgrade-no-github-release-asset-for-this-os-arch"))?;
+    let archive_bytes = fetch_verified_archive(i18n, fetcher, base, tag, asset).await?;
+    let extract_root =
+        tempfile::tempdir().context(i18n.text("cli-upgrade-creating-extract-temp-dir"))?;
     extract_release_archive(&archive_bytes, extract_root.path(), asset)
-        .context("extracting release archive")?;
+        .context(i18n.text("cli-upgrade-extracting-release-archive"))?;
     ensure_extracted_binary(extract_root.path())?;
     Ok(extract_root)
 }
 
 async fn fetch_verified_archive(
+    i18n: &ai_memory_core::i18n::Localizer,
     fetcher: &ReqwestFetcher,
     base: &str,
     tag: &str,
@@ -131,7 +185,13 @@ async fn fetch_verified_archive(
 ) -> Result<Vec<u8>> {
     let archive_url = format!("{base}/download/{tag}/{asset}");
     let checksum_url = format!("{archive_url}.sha256");
-    println!("→ downloading {asset} ({tag})");
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-downloading-asset-tag",
+            &[("value0", asset.to_string()), ("value1", tag.to_string())]
+        )
+    );
     let archive_bytes = fetcher
         .get_bytes(&archive_url)
         .await
@@ -140,7 +200,7 @@ async fn fetch_verified_archive(
         .get_text(&checksum_url)
         .await
         .with_context(|| format!("downloading {checksum_url}"))?;
-    verify_archive_checksum(&archive_bytes, &checksum_text, asset)?;
+    verify_archive_checksum(i18n, &archive_bytes, &checksum_text, asset)?;
     Ok(archive_bytes)
 }
 
@@ -152,30 +212,58 @@ fn ensure_extracted_binary(extract_root: &Path) -> Result<()> {
     bail!("release archive is missing the {name} binary");
 }
 
-fn verify_archive_checksum(archive_bytes: &[u8], checksum_text: &str, asset: &str) -> Result<()> {
+fn verify_archive_checksum(
+    i18n: &ai_memory_core::i18n::Localizer,
+    archive_bytes: &[u8],
+    checksum_text: &str,
+    asset: &str,
+) -> Result<()> {
     let expected = parse_sha256_sidecar(checksum_text, asset)
         .with_context(|| format!("parsing checksum sidecar for {asset}"))?;
     let actual = sha256_hex(archive_bytes);
     if !actual.eq_ignore_ascii_case(&expected) {
-        bail!("release archive checksum mismatch (expected {expected}, got {actual})");
+        bail!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-release-archive-checksum-mismatch-expected-expected-got-actual",
+                &[
+                    ("value0", expected.to_string()),
+                    ("value1", actual.to_string())
+                ]
+            )
+        );
     }
-    println!("  ✓ checksum ok");
+    println!("{}", i18n.text("cli-upgrade-checksum-ok"));
     Ok(())
 }
 
-fn apply_extracted_release(extract_root: &Path, exe: &Path) -> Result<()> {
+fn apply_extracted_release(
+    i18n: &ai_memory_core::i18n::Localizer,
+    extract_root: &Path,
+    exe: &Path,
+) -> Result<()> {
     let install_dir = exe
         .parent()
         .map(Path::to_path_buf)
-        .context("executable has no parent directory")?;
-    replace_binary(extract_root, exe)?;
-    maybe_refresh_sibling_hooks(extract_root, &install_dir)?;
+        .context(i18n.text("cli-upgrade-executable-has-no-parent-directory"))?;
+    replace_binary(i18n, extract_root, exe)?;
+    maybe_refresh_sibling_hooks(i18n, extract_root, &install_dir)?;
     Ok(())
 }
 
-fn replace_binary(extract_root: &Path, exe: &Path) -> Result<()> {
+fn replace_binary(
+    i18n: &ai_memory_core::i18n::Localizer,
+    extract_root: &Path,
+    exe: &Path,
+) -> Result<()> {
     let new_binary = extract_root.join(shipped_binary_name());
-    println!("→ replacing {}", exe.display());
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-replacing",
+            &[("value0", format!("{}", exe.display()))]
+        )
+    );
     replace_file_atomic(&new_binary, exe).with_context(|| {
         format!(
             "replacing {}; if this fails mid-way look for {}.new / {}.old",
@@ -186,13 +274,23 @@ fn replace_binary(extract_root: &Path, exe: &Path) -> Result<()> {
     })
 }
 
-fn maybe_refresh_sibling_hooks(extract_root: &Path, install_dir: &Path) -> Result<()> {
+fn maybe_refresh_sibling_hooks(
+    i18n: &ai_memory_core::i18n::Localizer,
+    extract_root: &Path,
+    install_dir: &Path,
+) -> Result<()> {
     let extracted_hooks = extract_root.join(HOOKS_DIR_NAME);
     let sibling_hooks = install_dir.join(HOOKS_DIR_NAME);
     if !(extracted_hooks.is_dir() && sibling_hooks.exists()) {
         return Ok(());
     }
-    println!("→ refreshing {}", sibling_hooks.display());
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-refreshing",
+            &[("value0", format!("{}", sibling_hooks.display()))]
+        )
+    );
     replace_dir_atomic(&extracted_hooks, &sibling_hooks)
         .with_context(|| format!("replacing {}", sibling_hooks.display()))
 }
@@ -229,6 +327,15 @@ fn container_refusal() -> Option<String> {
 }
 
 fn package_managed_refusal(exe: &Path) -> Option<String> {
+    // Scoop's bucket manifest owns the version under `apps\ai-memory\`; a
+    // self-replace there would be undone or orphaned by the next
+    // `scoop update`, and `scoop cleanup` deletes old version directories.
+    if crate::install_layout::is_scoop_app_path(exe, crate::install_layout::SCOOP_APP_NAME) {
+        return Some(format!(
+            "refusing to self-upgrade a Scoop install at {}; run `scoop update ai-memory` instead",
+            exe.display()
+        ));
+    }
     let path_str = exe.to_string_lossy();
     for prefix in package_managed_prefixes() {
         if path_str.starts_with(prefix) {
@@ -435,6 +542,9 @@ fn extract_release_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
 fn extract_release_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).context("opening release zip")?;
+    archive
+        .validate_header_consistency()
+        .context("validating release zip headers")?;
     let mut budget = ReleaseArchiveBudget::default();
     for i in 0..archive.len() {
         let mut file = archive
@@ -649,18 +759,31 @@ fn replace_file_atomic(src: &Path, dest: &Path) -> Result<()> {
     }
 }
 
+/// Linear backoff, 100 ms + 200 ms + … + 1.2 s: a scanner holds a fresh
+/// 100 MB binary for a few seconds.
+#[cfg(windows)]
+const SWAP_RETRY_ATTEMPTS: u32 = 12;
+#[cfg(windows)]
+const SWAP_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
 /// Windows allows renaming a running image aside, but not overwriting it.
 /// Stage to `.new`, move live `dest` → `.old`, promote `.new` → `dest`, then
 /// best-effort delete `.old` (often fails while this process still maps it).
+///
+/// Both renames retry a sharing violation: a scanner holding the running
+/// binary or the fresh `.new` used to fail the upgrade.
 #[cfg(windows)]
 fn replace_file_windows_rename_aside(tmp: &Path, dest: &Path) -> Result<()> {
+    let rename = |from: &Path, to: &Path| {
+        ai_memory_wiki::rename_with_retry(from, to, SWAP_RETRY_ATTEMPTS, SWAP_RETRY_BASE_DELAY)
+    };
     let old = dest.with_extension("old");
     if old.exists() {
         let _ = fs::remove_file(&old);
     }
     let had_dest = dest.exists();
     if had_dest {
-        fs::rename(dest, &old).with_context(|| {
+        rename(dest, &old).with_context(|| {
             format!(
                 "moving running binary aside {} -> {}",
                 dest.display(),
@@ -668,9 +791,9 @@ fn replace_file_windows_rename_aside(tmp: &Path, dest: &Path) -> Result<()> {
             )
         })?;
     }
-    if let Err(err) = fs::rename(tmp, dest) {
+    if let Err(err) = rename(tmp, dest) {
         if had_dest {
-            let _ = fs::rename(&old, dest);
+            let _ = rename(&old, dest);
         }
         return Err(err).with_context(|| {
             format!(
@@ -786,22 +909,138 @@ fn list_staged_agents(hooks_root: &Path) -> Result<(StagedAgentList, Vec<String>
 }
 
 fn refresh_staged_hooks(config: &Config) -> Result<()> {
+    let i18n = &config.i18n;
     let hooks_root = staged_hooks_root(config);
     if !hooks_root.is_dir() {
-        println!("→ no staged hook scripts found at {}", hooks_root.display());
-        println!("  (nothing to refresh — install-hooks hasn't been run with --apply yet)");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-no-staged-hook-scripts-found-at",
+                &[("value0", format!("{}", hooks_root.display()))]
+            )
+        );
+        println!(
+            "{}",
+            i18n.text(
+                "cli-upgrade-nothing-to-refresh-install-hooks-hasn-t-been-run-with-apply-yet"
+            )
+        );
         return Ok(());
     }
-    let agents = collect_refreshable_agents(&hooks_root)?;
+    let agents = collect_refreshable_agents(i18n, &hooks_root)?;
     if agents.is_empty() {
         println!(
-            "→ no staged agent dirs found under {}",
-            hooks_root.display()
+            "{}",
+            i18n.format(
+                "cli-upgrade-no-staged-agent-dirs-found-under",
+                &[("value0", format!("{}", hooks_root.display()))]
+            )
         );
         return Ok(());
     }
     refresh_agent_list(config, &agents);
     Ok(())
+}
+
+const GENERATED_INTEGRATIONS: &[(&str, AgentChoice)] = &[
+    ("opencode", AgentChoice::OpenCode),
+    ("opencode2", AgentChoice::OpenCode2),
+    ("omp", AgentChoice::Omp),
+    ("pi", AgentChoice::Pi),
+    ("openclaw", AgentChoice::Openclaw),
+];
+
+fn refresh_generated_integrations(config: &Config) {
+    let i18n = &config.i18n;
+    for &(name, agent) in GENERATED_INTEGRATIONS {
+        let path = match default_generated_integration_path(agent) {
+            Ok(path) => path,
+            Err(err) => {
+                println!(
+                    "{}",
+                    crate::localization::format(
+                        i18n,
+                        "cli-upgrade-skipping-generated-name-integration-err",
+                        &[
+                            ("value0", name.to_string()),
+                            ("value1", format!("{:#}", err))
+                        ]
+                    )
+                );
+                continue;
+            }
+        };
+        let owned = fs::read_to_string(&path).is_ok_and(|content| {
+            install_hooks::generated_integration_content_is_owned(agent, &content)
+        });
+        if !owned {
+            continue;
+        }
+
+        println!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-refreshing-generated-name-integration",
+                &[("value0", name.to_string())]
+            )
+        );
+        if let Err(err) = refresh_generated_integration(config, agent, &path) {
+            println!(
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-apply",
+                    &[
+                        ("value0", format!("{:#}", err)),
+                        ("value1", name.to_string())
+                    ]
+                )
+            );
+        }
+    }
+}
+
+/// Re-render one owned generated integration at `path`.
+///
+/// An OpenCode 1 plugin (`ai-memory.ts`) is refreshed in the dialect of the
+/// OpenCode now installed (#1887). OpenCode 2 loads the same plugin directory
+/// and rejects a v1 function plugin ("must export a default definition with
+/// an id and an effect or setup function"), so after OpenCode itself moved to
+/// 2.x a forced v1 refresh rewrote the very file that broke it. A v2 install
+/// writes `ai-memory-opencode2.ts` beside it and removes the owned v1 file.
+/// When no OpenCode answers the version probe, the v1 file is refreshed as
+/// before rather than guessed into another dialect.
+fn refresh_generated_integration(config: &Config, agent: AgentChoice, path: &Path) -> Result<()> {
+    let mut args = apply_hooks_args(agent);
+    if agent == AgentChoice::Openclaw {
+        args.config_file = path.parent().map(Path::to_path_buf);
+        return install_hooks::run(config, args);
+    }
+    args.config_file = Some(path.to_path_buf());
+    if agent != AgentChoice::OpenCode {
+        return install_hooks::run(config, args);
+    }
+    let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+    let dialect = super::opencode_dialect::resolve_generic(None, &child_env)
+        .map_or(ai_memory_workstream::OpenCodeDialect::V1, |resolved| {
+            resolved.dialect
+        });
+    if dialect == ai_memory_workstream::OpenCodeDialect::V2 {
+        args.config_file = Some(path.with_file_name("ai-memory-opencode2.ts"));
+    }
+    install_hooks::run_with_opencode_dialect(config, args, Some(dialect))
+}
+
+fn default_generated_integration_path(agent: AgentChoice) -> Result<PathBuf> {
+    match agent {
+        AgentChoice::OpenCode => install_hooks::opencode_plugin_path(),
+        AgentChoice::OpenCode2 => install_hooks::opencode2_plugin_path(),
+        AgentChoice::Omp => install_hooks::omp_extension_path(None),
+        AgentChoice::Pi => install_hooks::pi_extension_path(),
+        AgentChoice::Openclaw => Ok(crate::commands::openclaw_plugin::default_plugin_dir()?
+            .join(crate::commands::openclaw_plugin::ENTRYPOINT_TS)),
+        _ => bail!("not a generated TypeScript integration: {agent:?}"),
+    }
 }
 
 /// Keep the marketplace plugins in step with the binary (#1166). Claude Code
@@ -810,6 +1049,7 @@ fn refresh_staged_hooks(config: &Config) -> Result<()> {
 /// run: its hooks must be re-trusted only when a command changes, and the
 /// operator should see that happen in Codex itself.
 fn refresh_plugins(config: &Config, runner: &dyn super::user_service::CommandRunner) {
+    let i18n = &config.i18n;
     use super::agent_plugins::{self, PluginHarness};
     let Some(home) = super::run::native_home(config) else {
         return;
@@ -825,16 +1065,13 @@ fn refresh_plugins(config: &Config, runner: &dyn super::user_service::CommandRun
     for plugin in agent_plugins::installed(&home, &env) {
         match plugin.harness {
             PluginHarness::ClaudeCode => {
-                println!("→ updating the ai-memory Claude Code plugin");
+                println!("{}", i18n.text("cli-upgrade-updating-the-ai-memory-claude-code-plugin"));
                 for line in agent_plugins::update_claude_code(runner) {
                     println!("    {line}");
                 }
             }
             PluginHarness::Codex => println!(
-                "→ the ai-memory Codex plugin is installed: run `codex plugin marketplace upgrade \
-                 ai-memory` and `codex plugin add {}` to update it",
-                agent_plugins::PLUGIN_ID
-            ),
+                "{}", i18n.format("cli-upgrade-the-ai-memory-codex-plugin-is-installed-run-codex-plugin-marketplace-upgrade", &[("value0", agent_plugins::PLUGIN_ID.to_string())])),
         }
     }
 }
@@ -847,46 +1084,82 @@ fn staged_hooks_root(config: &Config) -> PathBuf {
     .join(HOOKS_DIR_NAME)
 }
 
-fn collect_refreshable_agents(hooks_root: &Path) -> Result<StagedAgentList> {
+fn collect_refreshable_agents(
+    i18n: &ai_memory_core::i18n::Localizer,
+    hooks_root: &Path,
+) -> Result<StagedAgentList> {
     let (agents, unknown) = list_staged_agents(hooks_root)?;
     for name in &unknown {
-        println!("  (skipping unknown staged agent dir `{name}`)");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-skipping-unknown-staged-agent-dir-name",
+                &[("value0", name.to_string())]
+            )
+        );
     }
     Ok(agents)
 }
 
 fn refresh_agent_list(config: &Config, agents: &StagedAgentList) {
+    let i18n = &config.i18n;
     let names: Vec<_> = agents.iter().map(|(n, _)| n.as_str()).collect();
-    println!("→ refreshing staged hook scripts for: {}", names.join(" "));
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-refreshing-staged-hook-scripts-for",
+            &[("value0", names.join(" ").to_string())]
+        )
+    );
     for (name, agent) in agents {
         apply_staged_agent_hooks(config, name, *agent);
     }
 }
 
 fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
+    let i18n = &config.i18n;
     if agent == AgentChoice::ClaudeCode
         && let Some(settings) = claude_user_level_install_absent()
     {
         println!(
-            "    (no ai-memory hooks in {} — skipping the user-level re-apply; the staged \
-             scripts are refreshed, but `--scope project` files are not rewritten: re-run \
-             `ai-memory install-hooks --agent {name} --scope project --apply` in each such \
-             checkout to pick up hook-command changes)",
-            settings.display()
-        );
-        match install_hooks::restage_claude_code_scripts(&config.data_dir, None) {
-            Ok(staged) => println!("    restaged {}", staged.display()),
+            "{}", i18n.format("cli-upgrade-no-ai-memory-hooks-in-skipping-the-user-level-re-apply-the-staged-scripts-ar", &[("value0", format!("{}", settings.display())), ("value1", name.to_string())]));
+        match install_hooks::restage_claude_code_scripts(&config.i18n, &config.data_dir, None) {
+            Ok(staged) => println!(
+                "{}",
+                i18n.format(
+                    "cli-upgrade-restaged",
+                    &[("value0", format!("{}", staged.display()))]
+                )
+            ),
             Err(err) => println!(
-                "      (skipped — {err:#}; re-run `ai-memory install-hooks \
-                 --agent {name} --scope project --apply` in each checkout)"
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-scope-project-apply-in",
+                    &[
+                        ("value0", format!("{:#}", err)),
+                        ("value1", name.to_string())
+                    ]
+                )
             ),
         }
         return;
     }
-    println!("    ai-memory install-hooks --agent {name} --apply");
+    println!(
+        "{}",
+        crate::localization::diagnostic(
+            i18n,
+            format!("    ai-memory install-hooks --agent {name} --apply")
+        )
+    );
     if let Err(err) = install_hooks::run(config, apply_hooks_args(agent)) {
         println!(
-            "      (skipped — {err:#}; re-run with the same --server-url / --auth-token used originally)"
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-upgrade-skipped-err-re-run-with-the-same-server-url-auth-token-used-originally",
+                &[("value0", format!("{:#}", err))]
+            )
         );
     }
 }
@@ -933,6 +1206,7 @@ fn apply_hooks_args(agent: AgentChoice) -> InstallHooksArgs {
 }
 
 fn warn_remote_server(config: &Config) {
+    let i18n = &config.i18n;
     if !config.server_url_configured() {
         return;
     }
@@ -940,10 +1214,7 @@ fn warn_remote_server(config: &Config) {
         return;
     }
     eprintln!(
-        "note: AI_MEMORY_SERVER_URL={} looks remote — this upgrade refreshed only the local \
-         binary and hooks; redeploy the remote server separately",
-        config.server_url
-    );
+        "{}", i18n.format("cli-upgrade-note-ai-memory-server-url-looks-remote-this-upgrade-refreshed-only-the-local", &[("value0", config.server_url.to_string())]));
 }
 
 /// Loopback, or the `0.0.0.0` bind address a local server is often reached
@@ -1076,6 +1347,95 @@ mod tests {
     use tar::Header;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+
+    /// #1887: an owned OpenCode 1 plugin is refreshed in the dialect of the
+    /// OpenCode installed now. After OpenCode moved to 2.x the refresh writes
+    /// the `{ id, setup }` plugin and removes the v1 file OpenCode 2 rejects;
+    /// with OpenCode 1 (the control) the v1 file is refreshed in place.
+    #[cfg(unix)]
+    #[test]
+    fn an_opencode_plugin_refresh_follows_the_installed_opencode_major() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (version, v2) in [("opencode v2.0.23", true), ("1.18.34", false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            let plugins = temp.path().join("plugins");
+            fs::create_dir_all(&bin).unwrap();
+            fs::create_dir_all(&plugins).unwrap();
+            let opencode = bin.join("opencode");
+            fs::write(
+                &opencode,
+                format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n"),
+            )
+            .unwrap();
+            fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut config = Config {
+                data_dir: temp.path().join("data"),
+                server_url: "http://127.0.0.1:49999".into(),
+                server_url_explicit: true,
+                runtime_env: crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+                    "PATH",
+                    bin.to_str().unwrap(),
+                )]),
+                ..Config::default()
+            };
+            config.auth.bearer_token = Some("t".into());
+            let v1 = plugins.join("ai-memory.ts");
+            let mut args = apply_hooks_args(AgentChoice::OpenCode);
+            args.config_file = Some(v1.clone());
+            install_hooks::run_with_opencode_dialect(
+                &config,
+                args,
+                Some(ai_memory_workstream::OpenCodeDialect::V1),
+            )
+            .unwrap();
+            assert!(v1.is_file());
+
+            refresh_generated_integration(&config, AgentChoice::OpenCode, &v1).unwrap();
+
+            let v2_path = plugins.join("ai-memory-opencode2.ts");
+            if v2 {
+                assert!(!v1.exists(), "the v1 plugin OpenCode 2 rejects is removed");
+                let plugin = fs::read_to_string(&v2_path).unwrap();
+                assert!(plugin.contains("id: \"ai-memory-opencode2\""), "{plugin}");
+                assert!(plugin.contains("export default AiMemoryOpencode2;"));
+            } else {
+                assert!(!v2_path.exists());
+                let plugin = fs::read_to_string(&v1).unwrap();
+                assert!(plugin.contains("export default AiMemoryHooks;"));
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_binary_refresh_receives_the_loaded_config_coordinates() {
+        let exe = Path::new("/opt/ai memory/bin/ai-memory");
+        let data = Path::new("/srv/memory data");
+        let config = Path::new("/etc/ai memory/config.toml");
+        let command = replacement_refresh_command(exe, data, Some(config));
+
+        assert_eq!(command.get_program(), exe.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--data-dir".as_ref(),
+                data.as_os_str(),
+                "--config".as_ref(),
+                config.as_os_str(),
+                "upgrade-refresh-hooks".as_ref(),
+            ]
+        );
+
+        let command = replacement_refresh_command(exe, data, None);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--data-dir".as_ref(),
+                data.as_os_str(),
+                "upgrade-refresh-hooks".as_ref(),
+            ]
+        );
+    }
 
     /// `upgrade` keeps an installed Claude Code plugin in step with the
     /// binary: marketplace update, then plugin update. Without the plugin,
@@ -1217,6 +1577,26 @@ mod tests {
     fn homebrew_is_package_managed() {
         let exe = Path::new("/opt/homebrew/bin/ai-memory");
         assert!(package_managed_refusal(exe).is_some());
+    }
+
+    #[test]
+    fn scoop_install_is_package_managed_with_the_scoop_command() {
+        for exe in [
+            "/Users/me/scoop/apps/ai-memory/3.4.0/ai-memory.exe",
+            "/Users/me/scoop/apps/ai-memory/current/ai-memory.exe",
+            "/ProgramData/scoop/apps/ai-memory/3.4.0/ai-memory.exe",
+        ] {
+            let reason = package_managed_refusal(Path::new(exe)).expect(exe);
+            assert!(reason.contains("scoop update ai-memory"), "{reason}");
+        }
+        // Control: a user-owned install and another Scoop app's directory are
+        // not refused as Scoop installs.
+        for exe in [
+            "/Users/me/.local/bin/ai-memory",
+            "/Users/me/scoop/apps/other-tool/1.0/ai-memory.exe",
+        ] {
+            assert!(package_managed_refusal(Path::new(exe)).is_none(), "{exe}");
+        }
     }
 
     #[test]
@@ -1546,6 +1926,23 @@ mod tests {
     }
 
     #[test]
+    fn zip_extract_rejects_inconsistent_local_and_central_names() -> Result<()> {
+        let mut bytes = build_test_zip(&[("ai-memory.exe", b"binary")])?;
+        let local_name = bytes
+            .windows(b"ai-memory.exe".len())
+            .position(|window| window == b"ai-memory.exe")
+            .expect("local header filename");
+        bytes[local_name..local_name + b"ai-memory.exe".len()].copy_from_slice(b"bad-memory.ex");
+
+        let dest = tempfile::tempdir()?;
+        let error = extract_release_archive(&bytes, dest.path(), "ai-memory-windows-x86_64.zip")
+            .expect_err("dual-header archive must be rejected");
+        assert!(error.to_string().contains("validating release zip headers"));
+        assert!(!dest.path().join("ai-memory.exe").exists());
+        Ok(())
+    }
+
+    #[test]
     fn zip_extract_rejects_unexpected_paths() -> Result<()> {
         let bytes = build_test_zip(&[("etc/passwd", b"nope")])?;
         let dest = tempfile::tempdir()?;
@@ -1572,6 +1969,43 @@ mod tests {
         if old.exists() {
             assert_eq!(fs::read(&old)?, b"old");
         }
+        Ok(())
+    }
+
+    /// A scanner holds the running binary when the swap moves it aside; the
+    /// swap waits it out. Fails without the retry.
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_atomic_waits_out_a_transient_hold_on_the_running_binary() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ: u32 = 1;
+
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join(shipped_binary_name());
+        let src = dir.path().join("fresh");
+        fs::write(&dest, b"old")?;
+        fs::write(&src, b"new")?;
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&dest)?;
+        assert_eq!(
+            fs::rename(&dest, dest.with_extension("probe"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32),
+            "the hold must be a real sharing violation"
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(holder);
+        });
+
+        replace_file_atomic(&src, &dest)?;
+
+        release.join().expect("release thread");
+        assert_eq!(fs::read(&dest)?, b"new");
+        assert!(!dest.with_extension("new").exists());
         Ok(())
     }
 
@@ -1769,8 +2203,12 @@ mod tests {
     fn restage_refreshes_the_claude_scripts_without_a_settings_file() {
         let data = tempfile::TempDir::new().unwrap();
         let hooks_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
-        let staged =
-            install_hooks::restage_claude_code_scripts(data.path(), Some(&hooks_dir)).unwrap();
+        let staged = install_hooks::restage_claude_code_scripts(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            Some(&hooks_dir),
+        )
+        .unwrap();
         assert!(staged.starts_with(data.path()), "{staged:?}");
         let scripts = fs::read_dir(&staged)
             .unwrap()

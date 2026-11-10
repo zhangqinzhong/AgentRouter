@@ -532,6 +532,46 @@ mod slow {
             .expect("session-start hook")
             .status();
         assert!(status.is_success(), "session-start rejected: {status}");
+
+        // `/hook` acknowledges the queued task, not its persisted session.
+        // `finalize-session` lists open sessions once, so wait for this exact
+        // fixture session before exercising prompt replay (#1160).
+        let mut last_response = String::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = client
+                    .get(format!("{base}/admin/open-sessions"))
+                    .query(&[
+                        ("workspace", WORKSPACE),
+                        ("project", PROJECT),
+                        ("agent", "antigravity-cli"),
+                        ("session_id", AG_MINE),
+                    ])
+                    .send()
+                    .await
+                    .expect("open sessions request");
+                let status = response.status();
+                let body = response.text().await.expect("open sessions body");
+                last_response = format!("{status}: {body}");
+                assert!(
+                    status.is_success() || status == reqwest::StatusCode::NOT_FOUND,
+                    "open sessions failed: {last_response}"
+                );
+                if status.is_success() {
+                    let value: Value = serde_json::from_str(&body).expect("open sessions JSON");
+                    let sessions = value["sessions"].as_array().expect("open sessions array");
+                    if sessions
+                        .iter()
+                        .any(|session| session["session_id"] == AG_MINE)
+                    {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("session {AG_MINE} was never stored: {last_response}"));
     }
 
     fn finalize_antigravity(data_dir: &Path, home: &Path, cwd: &Path, base: &str, reopen: bool) {

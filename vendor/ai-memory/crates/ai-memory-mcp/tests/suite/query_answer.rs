@@ -16,8 +16,8 @@
 //! 4. (`#[ignore]`) a live smoke test that wires a real provider when a key is
 //!    in the environment, and skips cleanly when it is not.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ai_memory_core::{NewPage, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{ChatRequest, ChatResponse, LlmProvider, LlmResult};
@@ -42,6 +42,7 @@ const PROJ: &str = "scratch";
 struct FakeAnswerLlm {
     calls: Arc<AtomicUsize>,
     response: Value,
+    requests: Arc<Mutex<Vec<(ChatRequest, Value)>>>,
 }
 
 #[async_trait::async_trait]
@@ -65,10 +66,11 @@ impl LlmProvider for FakeAnswerLlm {
 
     async fn complete_structured_raw(
         &self,
-        _request: ChatRequest,
-        _schema: serde_json::Value,
+        request: ChatRequest,
+        schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().unwrap().push((request, schema));
         // Shape must deserialize into the server's answer-synthesis struct.
         Ok(self.response.clone())
     }
@@ -82,6 +84,7 @@ struct Harness {
     /// Call counter shared with the wired fake provider; `None` when no provider
     /// was attached.
     calls: Option<Arc<AtomicUsize>>,
+    requests: Arc<Mutex<Vec<(ChatRequest, Value)>>>,
     _tmp: TempDir,
 }
 
@@ -90,7 +93,7 @@ fn mount(server: AiMemoryServer) -> Router {
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     Router::new().nest_service("/mcp", service)
@@ -109,6 +112,14 @@ async fn harness(with_provider: bool) -> Harness {
 }
 
 async fn harness_with_response(with_provider: bool, response: Value) -> Harness {
+    harness_with_budget(with_provider, response, None).await
+}
+
+async fn harness_with_budget(
+    with_provider: bool,
+    response: Value,
+    budget: Option<usize>,
+) -> Harness {
     let tmp = TempDir::new().expect("tempdir");
     let store = Store::open(tmp.path()).expect("store");
     let ws = store.writer.get_or_create_workspace(WS).await.expect("ws");
@@ -118,13 +129,16 @@ async fn harness_with_response(with_provider: bool, response: Value) -> Harness 
         .await
         .expect("proj");
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
-    let mut server =
-        AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj).with_wiki(wiki);
+    let mut server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+        .with_wiki(wiki)
+        .with_answer_context_budget(budget);
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let calls = if with_provider {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider: Arc<dyn LlmProvider> = Arc::new(FakeAnswerLlm {
             calls: calls.clone(),
             response,
+            requests: requests.clone(),
         });
         server = server.with_llm(provider);
         Some(calls)
@@ -138,6 +152,7 @@ async fn harness_with_response(with_provider: bool, response: Value) -> Harness 
         ws,
         proj,
         calls,
+        requests,
         _tmp: tmp,
     }
 }
@@ -628,4 +643,212 @@ async fn answer_live_provider_smoke() {
         !text.trim().is_empty(),
         "live provider answer must be non-empty: {resp}"
     );
+}
+
+#[tokio::test]
+async fn answer_budget_never_calls_provider_without_evidence_and_keeps_hits() {
+    let h = harness_with_budget(
+        true,
+        json!({"answer":"unreachable", "citations":[]}),
+        Some(1),
+    )
+    .await;
+    seed_needle(&h).await;
+    let resp = call(
+        &h.router,
+        "memory_query",
+        query_args("needle", json!({"answer":true})),
+    )
+    .await;
+    assert_eq!(hit_paths(&resp), ["notes/topic.md"]);
+    assert!(resp.get("answer").is_none());
+    assert!(
+        resp["answer_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("no meaningful evidence")
+    );
+    assert_eq!(resp["answer_context"]["omitted"], 1);
+    assert_eq!(h.calls.unwrap().load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn answer_budget_is_inert_on_default_and_no_provider_queries() {
+    for with_provider in [true, false] {
+        let h = harness_with_budget(
+            with_provider,
+            json!({"answer":"unused", "citations":[]}),
+            Some(1),
+        )
+        .await;
+        seed_needle(&h).await;
+        let default = call(&h.router, "memory_query", query_args("needle", json!({}))).await;
+        assert!(default.get("answer_context").is_none());
+        assert!(default.get("answer_unavailable").is_none());
+        if !with_provider {
+            let answer = call(
+                &h.router,
+                "memory_query",
+                query_args("needle", json!({"answer":true})),
+            )
+            .await;
+            assert!(answer.get("answer_context").is_none());
+            assert!(
+                answer["answer_unavailable"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no LLM")
+            );
+        }
+    }
+}
+
+async fn seed_budget_pages(h: &Harness, second: bool) {
+    let mut first = page(
+        h.ws,
+        h.proj,
+        "notes/topic.md",
+        "needle: current deployment uses PostgreSQL.",
+    );
+    first.pinned = true;
+    h.store.writer.upsert_page(first).await.unwrap();
+    if second {
+        h.store
+            .writer
+            .upsert_page(page(
+                h.ws,
+                h.proj,
+                "notes/omitted.md",
+                "needle: unrelated procedure for the build system.",
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn answer_budget_transport_accepts_admitted_and_rejects_omitted_sources() {
+    let response = |path: &str| json!({"answer":"PostgreSQL", "citations":[path]});
+    let full = harness_with_budget(true, response("notes/topic.md"), Some(100_000)).await;
+    seed_budget_pages(&full, false).await;
+    let arguments = || query_args("needle", json!({"answer":true, "pin_first":true}));
+    let resp = call(&full.router, "memory_query", arguments()).await;
+    assert_eq!(resp["answer"]["citations"], json!(["notes/topic.md"]));
+    let limit = resp["answer_context"]["estimated_input_tokens"]
+        .as_u64()
+        .unwrap()
+        + resp["answer_context"]["reserved_output_tokens"]
+            .as_u64()
+            .unwrap();
+    for path in ["notes/topic.md", "notes/omitted.md"] {
+        let h = harness_with_budget(true, response(path), Some(limit as usize)).await;
+        seed_budget_pages(&h, true).await;
+        let resp = call(&h.router, "memory_query", arguments()).await;
+        assert_eq!(hit_paths(&resp), ["notes/topic.md", "notes/omitted.md"]);
+        assert_eq!(resp["answer_context"]["admitted"], 1);
+        assert_eq!(resp["answer_context"]["omitted"], 1);
+        assert_eq!(h.calls.as_ref().unwrap().load(Ordering::SeqCst), 1);
+        if path == "notes/topic.md" {
+            assert_eq!(resp["answer"]["citations"], json!([path]));
+            assert!(resp.get("answer_unavailable").is_none());
+        } else {
+            assert!(resp.get("answer").is_none());
+            assert!(
+                resp["answer_unavailable"]
+                    .as_str()
+                    .unwrap()
+                    .contains("citations")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn answer_budget_receipt_matches_request_at_provider_boundary() {
+    // Inspect the actual structured call, including its schema. A canned answer
+    // alone cannot detect a handler that accounts one prompt and sends another.
+    for (tier, output) in [
+        ("minimal", 2_000_u64),
+        ("low", 3_000),
+        ("medium", 4_000),
+        ("high", 6_000),
+        ("max", 8_000),
+    ] {
+        let h = harness_with_budget(
+            true,
+            json!({"answer":"PostgreSQL", "citations":["notes/topic.md"]}),
+            Some(16_000),
+        )
+        .await;
+        seed_budget_pages(&h, true).await;
+        let resp = call(
+            &h.router,
+            "memory_query",
+            query_args("needle", json!({"answer":true, "reasoning":tier})),
+        )
+        .await;
+        let requests = h.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{tier}");
+        let (request, schema) = &requests[0];
+        let actual_input = request.system.as_ref().unwrap().len()
+            + request
+                .messages
+                .iter()
+                .map(|m| m.content.len())
+                .sum::<usize>()
+            + serde_json::to_vec(schema).unwrap().len()
+            + 1_024;
+        assert_eq!(request.max_tokens as u64, output, "{tier}");
+        assert_eq!(resp["answer_context"]["reserved_output_tokens"], output);
+        assert_eq!(
+            resp["answer_context"]["estimated_input_tokens"],
+            actual_input
+        );
+        assert!(actual_input + request.max_tokens as usize <= 16_000);
+        assert_eq!(resp["answer_context"]["admitted"], 2);
+        assert_eq!(resp["answer_context"]["omitted"], 0);
+        assert_eq!(resp["answer_context"]["clipped"], 0);
+        assert_eq!(hit_paths(&resp).len(), 2);
+        assert_eq!(h.calls.as_ref().unwrap().load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn answer_budget_uses_store_recency_without_reordering_retrieval_hits() {
+    let h = harness_with_budget(
+        true,
+        json!({"answer":"PostgreSQL", "citations":["notes/current.md"]}),
+        Some(100_000),
+    )
+    .await;
+    let mut old = page(
+        h.ws,
+        h.proj,
+        "notes/old.md",
+        "needle: historical deployment uses SQLite.",
+    );
+    old.title = "Deployment decision".into();
+    old.pinned = true;
+    h.store.writer.upsert_page(old).await.unwrap();
+    // The two writes need distinct stored modification times for this fixture.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let mut current = page(
+        h.ws,
+        h.proj,
+        "notes/current.md",
+        "needle: current deployment uses PostgreSQL.",
+    );
+    current.title = "Deployment decision".into();
+    h.store.writer.upsert_page(current).await.unwrap();
+    let response = call(
+        &h.router,
+        "memory_query",
+        query_args("needle", json!({"answer":true,"pin_first":true})),
+    )
+    .await;
+    assert_eq!(hit_paths(&response), ["notes/old.md", "notes/current.md"]);
+    let requests = h.requests.lock().unwrap();
+    let body = &requests[0].0.messages[0].content;
+    assert!(body.find("notes/current.md").unwrap() < body.find("notes/old.md").unwrap());
+    assert_eq!(response["answer"]["citations"], json!(["notes/current.md"]));
 }

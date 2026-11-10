@@ -19,6 +19,38 @@ The command is split on whitespace and executed directly, not through a shell.
 Use a wrapper script if you need quoting, environment setup, or multiple
 commands.
 
+### The built-in scorer
+
+Writing, mounting and maintaining a scorer is optional: `builtin = "structure"`
+runs the checks in process, so the gate needs no interpreter, no script inside
+the container, and no timeout.
+
+```toml
+[auto_improve.eval]
+enabled = true
+builtin = "structure"
+targets = ["_rules", "procedures"]
+min_delta = 0.0
+```
+
+It checks, never matching a section name or a wording (so a wiki in any
+language scores the same):
+
+- an H1 heading;
+- no upper-case `TODO`/`TBD` placeholder — a hard failure, not a deduction; the
+  Portuguese word "todo" in prose is not a placeholder;
+- for `procedures/`, a `##` section and a list of steps;
+- for `_rules/`, text beyond the heading, within 2,400 characters.
+
+A proposal passes at `score_after >= 0.70` and no lower than `score_before`.
+`eval_results` records `checker_name = "builtin:structure"` and an invocation
+digest over the scorer name and the binary version, instead of a command
+string.
+
+`builtin` and `command` are mutually exclusive: setting both is a startup
+error rather than one being silently ignored. `command` keeps working
+unchanged for project-specific scorers.
+
 The eval policy is owned by the server process. `ai-memory auto-improve` and
 direct HTTP requests cannot replace the configured command, targets, timeout,
 or score threshold. When a CLI talks to a remote server, configure

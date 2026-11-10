@@ -376,10 +376,23 @@ async fn the_next_harness_is_pointed_at_where_a_cut_off_harness_stopped() {
         "the resumed session must be pointed at the cut-off one:\n{context}"
     );
     assert!(context.contains("`open-code`"), "{context}");
+    let notice = context
+        .lines()
+        .find(|line| line.starts_with("🧭 ai-memory:"))
+        .expect("the upstream continuity notice remains present");
+    let history = context
+        .split_once("<!-- ai-memory:untrusted-history:start -->")
+        .and_then(|(_, tail)| tail.split_once("<!-- ai-memory:untrusted-history:end -->"))
+        .map(|(history, _)| history)
+        .expect("the fork recovery snapshot must delimit captured text");
     for captured in [LAST_PROMPT, LAST_TOOL_OUTPUT] {
         assert!(
-            !context.contains(captured),
+            !notice.contains(captured),
             "the notice carries no captured text:\n{context}"
+        );
+        assert!(
+            history.contains(captured),
+            "recovery evidence missing: {context}"
         );
     }
 

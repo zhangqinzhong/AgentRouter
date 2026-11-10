@@ -14,21 +14,23 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::STATE_DIR;
+use crate::atomic;
 
 const STATE_FILE: &str = "state.json";
 const IGNORE_FILE: &str = ".gitignore";
+const LOCK_FILE: &str = "write.lock";
 /// Ignores the state directory, this file included. Two clones that both
 /// commit their state would conflict on every merge and replay each other's
 /// baselines.
 const IGNORE_ALL: &[u8] = b"# Written by ai-memory-wikisync: export state is per clone.\n*\n";
 const STATE_VERSION: u32 = 1;
-const TMP_SUFFIX: &str = ".tmp";
 
 /// SHA-256 of `bytes` as lowercase hex.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -56,11 +58,74 @@ pub struct PageState {
     pub page_id: Option<String>,
 }
 
+/// Which server scope a baseline was recorded from (#1708).
+///
+/// The page map alone cannot say that a destination belongs to one project:
+/// pointing the same `--dest` at another project made every page of the first
+/// one look "deleted on the server", and `--propagate-deletes --apply` then
+/// removed those files.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncScope {
+    /// Server origin the baseline was exported from.
+    pub server: String,
+    /// Workspace the baseline was exported from.
+    pub workspace: String,
+    /// Project the baseline was exported from.
+    pub project: String,
+}
+
+impl SyncScope {
+    /// Derive the scope of a run. The server origin is normalised the way the
+    /// client normalises it, so `http://host:49374/` and `http://host:49374`
+    /// are one scope.
+    #[must_use]
+    pub fn of(server: &str, workspace: &str, project: &str) -> Self {
+        Self {
+            server: server.trim_end_matches('/').to_owned(),
+            workspace: workspace.to_owned(),
+            project: project.to_owned(),
+        }
+    }
+}
+
+/// What a baseline says about the run asking to use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeCheck {
+    /// The baseline belongs to this run's scope.
+    Match,
+    /// The baseline predates scope recording (or is empty) and is taken over
+    /// by this run, which stamps its scope on the next save.
+    Adopted,
+    /// The baseline belongs to another scope. Reusing it would read that
+    /// scope's pages as deletions here.
+    Mismatch { recorded: SyncScope },
+}
+
+/// Compare a baseline with the run's scope.
+#[must_use]
+pub fn check_scope(state: &SyncState, scope: &SyncScope) -> ScopeCheck {
+    match &state.scope {
+        Some(recorded) if recorded != scope => ScopeCheck::Mismatch {
+            recorded: recorded.clone(),
+        },
+        Some(_) => ScopeCheck::Match,
+        // A file written before scopes existed carries no origin. With no
+        // pages it is empty and cannot mislead; with pages, the origin is
+        // unknown and taking it over is the behaviour every existing export
+        // already had, so it is adopted with a warning rather than refused.
+        None => ScopeCheck::Adopted,
+    }
+}
+
 /// The whole state file. `version` guards against silently misreading a
 /// future format: an unknown version fails closed instead of resetting.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncState {
     pub version: u32,
+    /// Server scope this baseline was recorded from. Absent in state written
+    /// before #1708, which still loads and is adopted by the next save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<SyncScope>,
     pub pages: BTreeMap<String, PageState>,
 }
 
@@ -68,6 +133,7 @@ impl Default for SyncState {
     fn default() -> Self {
         Self {
             version: STATE_VERSION,
+            scope: None,
             pages: BTreeMap::new(),
         }
     }
@@ -76,6 +142,87 @@ impl Default for SyncState {
 /// Path of the single state file inside a destination root.
 pub fn state_path(dest_root: &Path) -> PathBuf {
     dest_root.join(STATE_DIR).join(STATE_FILE)
+}
+
+/// Exclusive ownership of one destination's read/plan/write lifecycle.
+/// Keeping the file handle alive keeps the OS lock alive; process exit also
+/// releases it, so a crashed sync never leaves a stale lease to clean up.
+#[derive(Debug)]
+pub struct WriteLock {
+    _file: fs::File,
+}
+
+/// Linear backoff, 10 ms + 20 ms + … + 100 ms: about half a second.
+const LOCK_RETRY_ATTEMPTS: u32 = 10;
+const LOCK_RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
+
+/// Fail when another mutating run owns this destination.
+///
+/// The lock covers the whole operation, not only [`save`]: two plans derived
+/// from one baseline must not both apply.
+///
+/// A held lock is retried for about half a second first. On Unix a child
+/// forked by another thread inherits the `flock` until it calls `exec`, so a
+/// lock released a moment ago can still read as held. A real concurrent run
+/// outlasts the budget and is refused.
+pub fn acquire_write_lock(dest_root: &Path) -> Result<WriteLock> {
+    acquire_write_lock_impl(
+        dest_root,
+        LOCK_RETRY_ATTEMPTS,
+        LOCK_RETRY_BASE_DELAY,
+        fs2::FileExt::try_lock_exclusive,
+    )
+}
+
+/// [`acquire_write_lock`] with the budget and the lock call injected for tests.
+fn acquire_write_lock_impl(
+    dest_root: &Path,
+    attempts: u32,
+    base_delay: Duration,
+    try_lock: impl Fn(&fs::File) -> std::io::Result<()>,
+) -> Result<WriteLock> {
+    let dir = dest_root.join(STATE_DIR);
+    ensure_real_state_dir(&dir)?;
+    fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    ensure_real_state_dir(&dir)?;
+    ignore_state_dir(&dir)?;
+
+    let path = dir.join(LOCK_FILE);
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!("write lock is a symlink: {}", path.display());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("cannot open write lock {}", path.display()))?;
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!("write lock became a symlink: {}", path.display());
+    }
+    let contended = fs2::lock_contended_error().raw_os_error();
+    let mut attempt = 0u32;
+    loop {
+        match try_lock(&file) {
+            Ok(()) => return Ok(WriteLock { _file: file }),
+            Err(err) if attempt < attempts && err.raw_os_error() == contended => {
+                attempt += 1;
+                std::thread::sleep(base_delay * attempt);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "destination {} is already being modified by another ai-memory-wikisync run",
+                        dest_root.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 /// The state directory must be a real directory, never a symlink: a symlink
@@ -122,10 +269,13 @@ pub fn load(dest_root: &Path) -> Result<SyncState> {
     Ok(state)
 }
 
-/// Atomically persist the state: tmp file in the same directory, fsync,
-/// rename over the old file. Called once after each successful write batch,
-/// so a crash mid-batch leaves the previous state intact and the next run
-/// re-classifies through the three-way comparison instead of trusting it.
+/// Atomically persist the state: an unpredictably named, exclusively
+/// created tmp file in the same directory, fsync, rename over the old file.
+/// Called once after each successful write batch, so a crash mid-batch
+/// leaves the previous state intact and the next run re-classifies through
+/// the three-way comparison instead of trusting it. The staging name is
+/// unpredictable (GHSA-jr85-7366-xrm2), so nothing writable ever sits at a
+/// name a teammate could plant or race.
 pub fn save(dest_root: &Path, state: &SyncState) -> Result<()> {
     let path = state_path(dest_root);
     let dir = path.parent().unwrap_or(dest_root);
@@ -139,33 +289,7 @@ pub fn save(dest_root: &Path, state: &SyncState) -> Result<()> {
     }
     ignore_state_dir(dir)?;
     let json = serde_json::to_vec_pretty(state).context("cannot serialize state")?;
-    let tmp = PathBuf::from(format!("{}{TMP_SUFFIX}", path.display()));
-    // Leftover tmp from a crashed run is ours by name; clear it.
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::new(e))
-                .context(format!("cannot clear stale {}", tmp.display()));
-        }
-    }
-    {
-        let mut file =
-            fs::File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("cannot restrict permissions on {}", tmp.display()))?;
-        }
-        file.write_all(&json)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("cannot sync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("cannot move {} over {}", tmp.display(), path.display()))?;
-    Ok(())
+    atomic::write_atomic(&path, &json, atomic::KeepMode::Exact(0o600))
 }
 
 /// Keep the state directory out of git. An existing `.gitignore` is left as
@@ -261,6 +385,78 @@ mod tests {
     }
 
     #[test]
+    fn write_lock_is_exclusive_and_released_with_its_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let first = acquire_write_lock(&root).unwrap();
+        let err = acquire_write_lock(&root).unwrap_err().to_string();
+        assert!(err.contains("already being modified"), "{err}");
+
+        drop(first);
+        acquire_write_lock(&root).expect("closing the first handle releases the OS lock");
+    }
+
+    /// A hold that clears is taken, one that never clears is refused after
+    /// the budget, any other error is reported at once.
+    #[test]
+    fn a_briefly_contended_lock_is_retried_within_its_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let contended = || fs2::lock_contended_error();
+
+        let calls = std::cell::Cell::new(0u32);
+        let lock = acquire_write_lock_impl(&root, 5, Duration::ZERO, |file| {
+            calls.set(calls.get() + 1);
+            if calls.get() <= 3 {
+                Err(contended())
+            } else {
+                fs2::FileExt::try_lock_exclusive(file)
+            }
+        })
+        .expect("a hold that clears is absorbed");
+        assert_eq!(calls.get(), 4);
+        drop(lock);
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = acquire_write_lock_impl(&root, 5, Duration::ZERO, |_| {
+            calls.set(calls.get() + 1);
+            Err(contended())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already being modified"), "{err}");
+        assert_eq!(
+            calls.get(),
+            6,
+            "initial attempt plus five retries, then stop"
+        );
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = acquire_write_lock_impl(&root, 5, Duration::ZERO, |_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other("disk on fire"))
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1, "a non-contention error is not retried");
+        assert!(format!("{err:#}").contains("disk on fire"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_lock_refuses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let dir = root.join(STATE_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(root.join("elsewhere"), b"").unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), dir.join(LOCK_FILE)).unwrap();
+
+        let err = acquire_write_lock(&root).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    #[test]
     fn missing_state_is_empty_and_corrupt_state_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -273,11 +469,67 @@ mod tests {
 
         let future = SyncState {
             version: 99,
-            pages: BTreeMap::new(),
+            ..SyncState::default()
         };
         fs::write(state_path(&root), serde_json::to_string(&future).unwrap()).unwrap();
         let err = load(&root).unwrap_err().to_string();
         assert!(err.contains("version"), "{err}");
+    }
+
+    #[test]
+    fn a_baseline_records_its_scope_and_refuses_another_one() {
+        let scope = SyncScope::of("http://host:49374", "demo", "a");
+        let mut state = SyncState::default();
+        assert_eq!(check_scope(&state, &scope), ScopeCheck::Adopted);
+
+        state.scope = Some(scope.clone());
+        state.pages.insert("notes/a.md".into(), page("hash", None));
+        assert_eq!(check_scope(&state, &scope), ScopeCheck::Match);
+        // A trailing slash is the same server.
+        assert_eq!(
+            check_scope(&state, &SyncScope::of("http://host:49374/", "demo", "a")),
+            ScopeCheck::Match
+        );
+
+        // Another project on the same server is a different scope (#1708).
+        let other = SyncScope::of("http://host:49374", "demo", "b");
+        assert_eq!(
+            check_scope(&state, &other),
+            ScopeCheck::Mismatch {
+                recorded: scope.clone()
+            }
+        );
+        // So is another server with the same names.
+        let elsewhere = SyncScope::of("http://other:49374", "demo", "a");
+        assert!(matches!(
+            check_scope(&state, &elsewhere),
+            ScopeCheck::Mismatch { .. }
+        ));
+    }
+
+    /// A state file written before scopes existed still loads, and the next
+    /// save stamps the scope so the window closes after one run.
+    #[test]
+    fn legacy_state_loads_and_is_stamped_on_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(STATE_DIR)).unwrap();
+        fs::write(
+            state_path(&root),
+            r#"{"version":1,"pages":{"notes/a.md":{"hash":"h"}}}"#,
+        )
+        .unwrap();
+
+        let mut state = load(&root).unwrap();
+        assert!(state.scope.is_none());
+        let scope = SyncScope::of("http://host:49374", "demo", "a");
+        assert_eq!(check_scope(&state, &scope), ScopeCheck::Adopted);
+
+        state.scope = Some(scope.clone());
+        save(&root, &state).unwrap();
+        let reloaded = load(&root).unwrap();
+        assert_eq!(reloaded.scope.as_ref(), Some(&scope));
+        assert_eq!(check_scope(&reloaded, &scope), ScopeCheck::Match);
     }
 
     #[test]
@@ -296,14 +548,54 @@ mod tests {
         }
     }
 
+    /// A `state.json.tmp` left by a pre-fix crashed run is inert: never
+    /// read, never cleared. Since GHSA-jr85-7366-xrm2 the staging name is
+    /// unpredictable, so nothing touches the predictable one at all.
     #[test]
-    fn save_survives_a_stale_tmp_file() {
+    fn a_legacy_tmp_file_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         fs::create_dir_all(root.join(STATE_DIR)).unwrap();
         fs::write(root.join(STATE_DIR).join("state.json.tmp"), b"junk").unwrap();
         save(&root, &SyncState::default()).unwrap();
         assert!(load(&root).unwrap() == SyncState::default());
+        assert_eq!(
+            fs::read(root.join(STATE_DIR).join("state.json.tmp")).unwrap(),
+            b"junk"
+        );
+    }
+
+    /// GHSA-jr85-7366-xrm2: `save` staged at `state.json.tmp` — predictable,
+    /// cleared with remove-then-create, so a re-planted symlink won the race
+    /// and `File::create` followed it. The staging name is unpredictable and
+    /// exclusively created now: the canary keeps its bytes, the state still
+    /// saves, and the plant is never even removed.
+    #[cfg(unix)]
+    #[test]
+    fn save_ignores_a_symlink_planted_at_the_old_staging_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(STATE_DIR)).unwrap();
+        let victim = tmp.path().join("victim.json");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(STATE_DIR).join("state.json.tmp")).unwrap();
+
+        let mut state = SyncState::default();
+        state
+            .pages
+            .insert("notes/a.md".to_string(), page(&"a".repeat(64), None));
+        save(&root, &state).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(load(&root).unwrap(), state);
+        // The plant survives: no remove-then-create dance ran at a
+        // predictable name, so the race window is gone with it.
+        assert!(
+            fs::symlink_metadata(root.join(STATE_DIR).join("state.json.tmp"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

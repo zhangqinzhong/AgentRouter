@@ -9,6 +9,7 @@ use ai_memory_core::agent_backup::{
     AgentAssetKind, AgentAssetScope, AgentBackupEntry, AgentBackupManifest, HostInfo,
 };
 use ai_memory_core::ids::AgentKind;
+use ai_memory_core::routing_skills::{COPILOT_SKILL_DIR, GITHUB_SKILL_DIR, SKILLS_DIR};
 use ai_memory_core::sanitize::{SanitizeConfig, Sanitizer};
 use anyhow::{Context, Result};
 use flate2::Compression;
@@ -47,8 +48,10 @@ pub struct DiscoveredAsset {
 /// Returns an error if directory traversal fails, source files cannot be read,
 /// or writing the output archive fails.
 pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
-    let home = home_dir().context("locating user home directory")?;
-    let cwd = std::env::current_dir().context("locating current working directory")?;
+    let i18n = &_config.i18n;
+    let home = home_dir().context(i18n.text("cli-backup-agents-locating-user-home-directory"))?;
+    let cwd = std::env::current_dir()
+        .context(i18n.text("cli-backup-agents-locating-current-working-directory"))?;
 
     let mut discovered = discover_assets(&home, &cwd, &args)?;
 
@@ -63,12 +66,15 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
     discovered.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
 
     if discovered.is_empty() {
-        println!("No AI agent assets detected for backup.");
+        println!(
+            "{}",
+            i18n.text("cli-backup-agents-no-ai-agent-assets-detected-for-backup")
+        );
         return Ok(());
     }
 
     if args.dry_run {
-        print_dry_run(&discovered);
+        print_dry_run(i18n, &discovered);
         return Ok(());
     }
 
@@ -99,14 +105,14 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
     let count = build_archive(
         temporary
             .reopen()
-            .context("reopening temporary agent archive")?,
+            .context(i18n.text("cli-backup-agents-reopening-temporary-agent-archive"))?,
         &discovered,
         args.include_secrets,
     )?;
     temporary
         .as_file()
         .sync_all()
-        .context("syncing temporary agent archive")?;
+        .context(i18n.text("cli-backup-agents-syncing-temporary-agent-archive"))?;
     let persisted = temporary
         .persist(dest)
         .map_err(|error| error.error)
@@ -122,25 +128,32 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
     info!(path = %dest.display(), bytes = size, count, "agent assets backup written");
 
     println!(
-        "✓ Backed up {} agent assets to {} ({})",
-        count,
-        dest.display(),
-        human_bytes(size)
+        "{}",
+        i18n.format(
+            "cli-backup-agents-backed-up-agent-assets-to",
+            &[
+                ("value0", format!("{}", count)),
+                ("value1", format!("{}", dest.display())),
+                ("value2", human_bytes(size).to_string())
+            ]
+        )
     );
 
     if args.include_secrets {
         eprintln!(
-            "⚠️  Warning: Secrets were included without sanitization. Archive mode is 0600 on Unix; protect the file on other platforms."
-        );
+            "{}", i18n.text("cli-backup-agents-warning-secrets-were-included-without-sanitization-archive-mode-is-0600-on-u"));
     }
 
     Ok(())
 }
 
-fn print_dry_run(discovered: &[DiscoveredAsset]) {
+fn print_dry_run(i18n: &ai_memory_core::i18n::Localizer, discovered: &[DiscoveredAsset]) {
     println!(
-        "Found {} assets across AI agents (dry-run):",
-        discovered.len()
+        "{}",
+        i18n.format(
+            "cli-backup-agents-found-assets-across-ai-agents-dry-run",
+            &[("value0", format!("{}", discovered.len()))]
+        )
     );
     for asset in discovered {
         println!(
@@ -506,6 +519,43 @@ pub fn discover_assets(
         }
     }
 
+    // 4c. Qoder CLI and IDE
+    if filter_agent(AgentKind::Qoder) {
+        if want_global {
+            push_if_file(
+                &mut assets,
+                AgentKind::Qoder,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                home.join(".qoder").join("settings.json"),
+                ".qoder/settings.json",
+                "qoder/settings.json",
+            );
+            if !filter_agent(AgentKind::Codex) && !filter_agent(AgentKind::QwenCode) {
+                collect_dir_assets(
+                    &mut assets,
+                    AgentKind::Qoder,
+                    AgentAssetKind::Skill,
+                    AgentAssetScope::Global,
+                    &home.join(".agents").join("skills"),
+                    ".agents/skills",
+                    "qoder/skills/agents",
+                )?;
+            }
+        }
+        if want_project && !filter_agent(AgentKind::Codex) && !filter_agent(AgentKind::QwenCode) {
+            push_if_file(
+                &mut assets,
+                AgentKind::Qoder,
+                AgentAssetKind::Instruction,
+                AgentAssetScope::Project,
+                cwd.join("AGENTS.md"),
+                "AGENTS.md",
+                "project/qoder/AGENTS.md",
+            );
+        }
+    }
+
     // 4. Cursor
     if filter_agent(AgentKind::Cursor) {
         if want_global {
@@ -773,7 +823,42 @@ pub fn discover_assets(
         )?;
     }
 
-    // 12. VS Code / Copilot
+    // 12. GitHub Copilot CLI: the same skill roots `install-skills --agent
+    // copilot-cli` writes, `$COPILOT_HOME/skills` (default `~/.copilot/skills`)
+    // and the repository's `.github/skills`. The shared roots the same page
+    // lists (`~/.agents/skills`, `.agents/skills`, `.claude/skills`) are
+    // collected above for Codex and Claude Code. See
+    // https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills
+    if filter_agent(AgentKind::CopilotCli) {
+        if want_global {
+            let copilot_dir =
+                crate::commands::path_util::agent_config_home(std::env::var_os("COPILOT_HOME"))
+                    .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::CopilotCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &copilot_dir.join(SKILLS_DIR),
+                ".copilot/skills",
+                "copilot-cli/skills",
+            )?;
+        }
+
+        if want_project {
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::CopilotCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Project,
+                &cwd.join(GITHUB_SKILL_DIR).join(SKILLS_DIR),
+                ".github/skills",
+                "project/copilot-cli/skills",
+            )?;
+        }
+    }
+
+    // 13. VS Code / Copilot
     if want_project {
         push_if_file(
             &mut assets,
@@ -829,7 +914,11 @@ fn collect_dir_assets(
         if file_type.is_dir() {
             let dir_name = entry.file_name();
             let dir_name_str = dir_name.to_string_lossy();
-            if dir_name_str.starts_with('.')
+            // A plugin's manifest directory is the one dot-directory a
+            // restored plugin or marketplace cannot load without.
+            if (dir_name_str.starts_with('.')
+                && dir_name_str != ".claude-plugin"
+                && dir_name_str != ".codex-plugin")
                 || dir_name_str == "cache"
                 || dir_name_str == "node_modules"
                 || dir_name_str == "target"

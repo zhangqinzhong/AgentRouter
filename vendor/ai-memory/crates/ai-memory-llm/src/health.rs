@@ -3,6 +3,7 @@
 //! These wrappers never probe providers on their own. They only record
 //! the result of calls the server was already going to make.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::embedding::Embedder;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
+use crate::routes::LlmProviders;
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId, LlmWorkload, Usage};
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
@@ -29,6 +31,12 @@ pub struct ProviderHealth {
     /// ordered candidate list. Never dereferenced for anything but that
     /// read, so this adds no behavior beyond passive reporting.
     llm_provider: Arc<Mutex<Option<Arc<dyn LlmProvider>>>>,
+    llm_overrides: Arc<Mutex<HashMap<LlmWorkload, LlmOverrideHealth>>>,
+}
+
+struct LlmOverrideHealth {
+    provider: Arc<dyn LlmProvider>,
+    health: ProviderRoleHealth,
 }
 
 impl ProviderHealth {
@@ -42,16 +50,34 @@ impl ProviderHealth {
             .as_ref()
             .map(|provider| provider.candidate_health())
             .unwrap_or_default();
+        let overrides = self.llm_overrides.lock().unwrap_or_else(|e| e.into_inner());
+        let llm_task_chains = LlmWorkload::ALL
+            .iter()
+            .filter_map(|task| {
+                let LlmOverrideHealth { provider, health } = overrides.get(task)?;
+                Some(LlmTaskChainHealthSnapshot {
+                    task: *task,
+                    provider: provider.name().to_owned(),
+                    model: provider.model().to_owned(),
+                    status: health.snapshot().status,
+                    candidates: provider.candidate_health(),
+                })
+            })
+            .collect();
         let llm = self.llm.snapshot();
-        let llm_workloads = if llm.status == ProviderHealthStatus::Disabled {
-            Vec::new()
-        } else {
-            self.llm_workloads.snapshot()
-        };
+        let (llm_workloads, llm_workloads_started_ms) =
+            if llm.status == ProviderHealthStatus::Disabled && overrides.is_empty() {
+                (Vec::new(), None)
+            } else {
+                let (rows, started_ms) = self.llm_workloads.snapshot();
+                (rows, Some(started_ms))
+            };
         ProviderHealthSnapshot {
             llm,
             llm_candidates,
+            llm_task_chains,
             llm_workloads,
+            llm_workloads_started_ms,
             embedding: self.embedding.snapshot(),
         }
     }
@@ -74,6 +100,55 @@ impl ProviderHealth {
             health,
             workloads: self.llm_workloads.clone(),
         })
+    }
+
+    /// Wrap every configured route, keeping task chains and global health separate.
+    #[must_use]
+    pub fn wrap_llm_providers(
+        &self,
+        providers: LlmProviders,
+        retry_hint: Option<String>,
+    ) -> LlmProviders {
+        let default = providers.default.map(|provider| {
+            let name = provider.name().to_owned();
+            let model = provider.model().to_owned();
+            self.wrap_llm_provider(provider, name, model, retry_hint)
+        });
+        if default.is_none() {
+            self.llm_workloads.reset();
+            *self.llm_provider.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *self.llm.state.lock().unwrap_or_else(|e| e.into_inner()) =
+                ProviderRoleState::disabled();
+        }
+        let mut registered = self.llm_overrides.lock().unwrap_or_else(|e| e.into_inner());
+        registered.clear();
+        let overrides = providers
+            .overrides
+            .into_iter()
+            .map(|(task, inner)| {
+                let health = ProviderRoleHealth::default();
+                health.configure(
+                    inner.name().to_owned(),
+                    inner.model().to_owned(),
+                    None,
+                    None,
+                );
+                registered.insert(
+                    task,
+                    LlmOverrideHealth {
+                        provider: inner.clone(),
+                        health: health.clone(),
+                    },
+                );
+                let wrapped: Arc<dyn LlmProvider> = Arc::new(HealthRecordingLlmProvider {
+                    inner,
+                    health,
+                    workloads: self.llm_workloads.clone(),
+                });
+                (task, wrapped)
+            })
+            .collect();
+        LlmProviders { default, overrides }
     }
 
     /// Mark the embedding role as configured and wrap it with passive recording.
@@ -135,8 +210,32 @@ pub struct ProviderHealthSnapshot {
     /// usage and last outcome. Empty when no LLM provider is configured.
     #[serde(default)]
     pub llm_workloads: Vec<LlmWorkloadHealthSnapshot>,
+    /// Unix milliseconds when the `llm_workloads` counters started. They
+    /// reset on restart, so two snapshots measure one window only when this
+    /// value matches. `None` when `llm_workloads` is empty, and from a server
+    /// built before the field existed.
+    #[serde(default)]
+    pub llm_workloads_started_ms: Option<u64>,
+    /// Health of independently configured task chains, in stable task order.
+    #[serde(default)]
+    pub llm_task_chains: Vec<LlmTaskChainHealthSnapshot>,
     /// Embedding provider role.
     pub embedding: ProviderRoleHealthSnapshot,
+}
+
+/// Passive health for an explicitly configured task provider chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmTaskChainHealthSnapshot {
+    /// Task selecting this chain.
+    pub task: LlmWorkload,
+    /// Primary provider.
+    pub provider: String,
+    /// Primary model.
+    pub model: String,
+    /// Most recent chain call status.
+    pub status: ProviderHealthStatus,
+    /// Per-candidate circuit and outcome state.
+    pub candidates: Vec<CandidateHealth>,
 }
 
 /// Passive process-lifetime telemetry for one closed LLM workload label.
@@ -393,25 +492,30 @@ impl ProviderRoleState {
 
 const LLM_WORKLOAD_BUCKETS: usize = ai_memory_core::LATENCY_BUCKET_BOUNDS_US.len() + 1;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct LlmWorkloadHealth {
-    state: Arc<Mutex<[LlmWorkloadState; LlmWorkload::ALL.len()]>>,
+    state: Arc<Mutex<LlmWorkloadCounters>>,
 }
 
-impl Default for LlmWorkloadHealth {
+/// Every workload's counters and when they started, under one lock so a
+/// snapshot never pairs counters with the start time of another reset.
+struct LlmWorkloadCounters {
+    started_ms: u64,
+    rows: [LlmWorkloadState; LlmWorkload::ALL.len()],
+}
+
+impl Default for LlmWorkloadCounters {
     fn default() -> Self {
         Self {
-            state: Arc::new(Mutex::new(std::array::from_fn(|_| {
-                LlmWorkloadState::default()
-            }))),
+            started_ms: u64::try_from(Timestamp::now().as_millisecond()).unwrap_or(0),
+            rows: std::array::from_fn(|_| LlmWorkloadState::default()),
         }
     }
 }
 
 impl LlmWorkloadHealth {
     fn reset(&self) {
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) =
-            std::array::from_fn(|_| LlmWorkloadState::default());
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = LlmWorkloadCounters::default();
     }
 
     fn record<T>(
@@ -425,8 +529,8 @@ impl LlmWorkloadHealth {
     ) {
         let now = Timestamp::now();
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        let mut states = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let state = &mut states[workload.index()];
+        let mut counters = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut counters.rows[workload.index()];
         state.calls = state.calls.saturating_add(1);
         state.latency_total_us = state.latency_total_us.saturating_add(elapsed_us);
         state.latency_max_us = state.latency_max_us.max(elapsed_us);
@@ -467,13 +571,15 @@ impl LlmWorkloadHealth {
         }
     }
 
-    fn snapshot(&self) -> Vec<LlmWorkloadHealthSnapshot> {
-        let states = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        LlmWorkload::ALL
+    /// The rows in [`LlmWorkload::ALL`] order and when their counters started.
+    fn snapshot(&self) -> (Vec<LlmWorkloadHealthSnapshot>, u64) {
+        let counters = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = LlmWorkload::ALL
             .iter()
             .copied()
-            .map(|workload| states[workload.index()].snapshot(workload))
-            .collect()
+            .map(|workload| counters.rows[workload.index()].snapshot(workload))
+            .collect();
+        (rows, counters.started_ms)
     }
 }
 
@@ -598,6 +704,28 @@ struct HealthRecordingLlmProvider {
     workloads: LlmWorkloadHealth,
 }
 
+impl HealthRecordingLlmProvider {
+    fn record<T>(
+        &self,
+        workload: LlmWorkload,
+        started: Instant,
+        estimated_input: u64,
+        result: &LlmResult<T>,
+        output_tokens: impl FnOnce(&T) -> u64,
+        usage: impl FnOnce(&T) -> Option<Usage>,
+    ) {
+        self.health.record_result(result);
+        self.workloads.record(
+            workload,
+            started.elapsed(),
+            estimated_input,
+            result,
+            output_tokens,
+            usage,
+        );
+    }
+}
+
 #[async_trait]
 impl LlmProvider for HealthRecordingLlmProvider {
     fn name(&self) -> &'static str {
@@ -612,10 +740,9 @@ impl LlmProvider for HealthRecordingLlmProvider {
         let estimated_input = estimate_request_tokens(&request);
         let started = Instant::now();
         let result = self.inner.complete(request).await;
-        self.health.record_result(&result);
-        self.workloads.record(
+        self.record(
             LlmWorkload::Unspecified,
-            started.elapsed(),
+            started,
             estimated_input,
             &result,
             |response| estimate_text_tokens(&response.text),
@@ -639,10 +766,9 @@ impl LlmProvider for HealthRecordingLlmProvider {
             .inner
             .complete_with_operation_id(request, operation_id)
             .await;
-        self.health.record_result(&result);
-        self.workloads.record(
+        self.record(
             operation_id.workload(),
-            started.elapsed(),
+            started,
             estimated_input,
             &result,
             |response| estimate_text_tokens(&response.text),
@@ -659,10 +785,9 @@ impl LlmProvider for HealthRecordingLlmProvider {
         let estimated_input = estimate_structured_input_tokens(&request, &schema);
         let started = Instant::now();
         let result = self.inner.complete_structured_raw(request, schema).await;
-        self.health.record_result(&result);
-        self.workloads.record(
+        self.record(
             LlmWorkload::Unspecified,
-            started.elapsed(),
+            started,
             estimated_input,
             &result,
             estimate_json_tokens,
@@ -683,10 +808,9 @@ impl LlmProvider for HealthRecordingLlmProvider {
             .inner
             .complete_structured_raw_with_operation_id(request, schema, operation_id)
             .await;
-        self.health.record_result(&result);
-        self.workloads.record(
+        self.record(
             operation_id.workload(),
-            started.elapsed(),
+            started,
             estimated_input,
             &result,
             estimate_json_tokens,
@@ -749,7 +873,13 @@ impl Embedder for HealthRecordingEmbedder {
     }
 }
 
-fn error_status_and_message(err: &LlmError) -> (Option<u16>, String) {
+/// The HTTP status and a bounded, redacted message for `err`.
+///
+/// The admin `llm-test` route answers with this so a server-side probe reports
+/// the same error class the health snapshot records, never the provider's full
+/// body (#1639).
+#[must_use]
+pub fn error_status_and_message(err: &LlmError) -> (Option<u16>, String) {
     match err {
         LlmError::Http(e) => (
             e.status().map(|status| status.as_u16()),
@@ -815,6 +945,174 @@ mod tests {
                 .await
                 .map(|_| serde_json::json!({ "ok": true }))
         }
+    }
+
+    struct TransientLlm;
+
+    #[async_trait]
+    impl LlmProvider for TransientLlm {
+        fn name(&self) -> &'static str {
+            "transient"
+        }
+        fn model(&self) -> &str {
+            "transient-model"
+        }
+        async fn complete(&self, _: ChatRequest) -> LlmResult<ChatResponse> {
+            Err(LlmError::Provider {
+                status: 503,
+                body: "secret provider response".to_owned(),
+                retry_after: None,
+            })
+        }
+        async fn complete_structured_raw(
+            &self,
+            _: ChatRequest,
+            _: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Err(LlmError::Provider {
+                status: 503,
+                body: "secret provider response".to_owned(),
+                retry_after: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn task_routes_keep_independent_chains_and_shared_workload_metrics() {
+        use crate::fallback::{Candidate, FallbackLlmProvider};
+
+        let health = ProviderHealth::default();
+        let default: Arc<dyn LlmProvider> = Arc::new(FakeLlm { fail: false });
+        let chain: Arc<dyn LlmProvider> = Arc::new(FallbackLlmProvider::new(vec![
+            Candidate::new("transient", "transient-model", Arc::new(TransientLlm)),
+            Candidate::new("backup", "backup-model", Arc::new(FakeLlm { fail: false })),
+        ]));
+        let other: Arc<dyn LlmProvider> = Arc::new(FallbackLlmProvider::new(vec![Candidate::new(
+            "other",
+            "other-model",
+            Arc::new(FakeLlm { fail: false }),
+        )]));
+        let routes = health.wrap_llm_providers(
+            LlmProviders {
+                default: Some(default),
+                overrides: [(LlmWorkload::Dream, chain), (LlmWorkload::Lint, other)].into(),
+            },
+            None,
+        );
+        assert!(routes.is_configured());
+        assert!(Arc::ptr_eq(
+            routes.get(LlmWorkload::Profile).unwrap(),
+            routes.default.as_ref().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            routes.get(LlmWorkload::Dream).unwrap(),
+            routes.default.as_ref().unwrap()
+        ));
+        for task in [LlmWorkload::Dream, LlmWorkload::Lint] {
+            routes
+                .get(task)
+                .unwrap()
+                .complete_with_operation_id(
+                    ChatRequest::user_prompt("ping"),
+                    LlmOperationId::for_workload(task),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(health.snapshot().llm.status, ProviderHealthStatus::Unknown);
+        routes
+            .get(LlmWorkload::Profile)
+            .unwrap()
+            .complete_with_operation_id(
+                ChatRequest::user_prompt("ping"),
+                LlmOperationId::for_workload(LlmWorkload::Profile),
+            )
+            .await
+            .unwrap();
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.llm.provider.as_deref(), Some("fake"));
+        assert_eq!(snapshot.llm.status, ProviderHealthStatus::Ok);
+        let dream = snapshot
+            .llm_task_chains
+            .iter()
+            .find(|row| row.task == LlmWorkload::Dream)
+            .unwrap();
+        assert_eq!(dream.provider, "transient");
+        assert_eq!(dream.model, "transient-model");
+        assert_eq!(dream.status, ProviderHealthStatus::Ok);
+        assert!(dream.candidates[0].circuit_open_until.is_some());
+        assert!(dream.candidates[1].last_selected);
+        let lint = snapshot
+            .llm_task_chains
+            .iter()
+            .find(|row| row.task == LlmWorkload::Lint)
+            .unwrap();
+        assert_eq!(lint.candidates.len(), 1);
+        assert_eq!(lint.candidates[0].provider, "other");
+        for task in [LlmWorkload::Dream, LlmWorkload::Lint, LlmWorkload::Profile] {
+            assert_eq!(
+                snapshot
+                    .llm_workloads
+                    .iter()
+                    .find(|row| row.workload == task)
+                    .unwrap()
+                    .calls,
+                1
+            );
+        }
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("secret provider response")
+        );
+    }
+
+    #[tokio::test]
+    async fn override_only_routes_report_workloads_and_preserve_disabled_default() {
+        let health = ProviderHealth::default();
+        let routes = health.wrap_llm_providers(
+            LlmProviders {
+                default: None,
+                overrides: [(
+                    LlmWorkload::Dream,
+                    Arc::new(FakeLlm { fail: false }) as Arc<dyn LlmProvider>,
+                )]
+                .into(),
+            },
+            None,
+        );
+        assert!(routes.is_configured());
+        assert!(routes.get(LlmWorkload::Profile).is_none());
+        routes
+            .get(LlmWorkload::Dream)
+            .unwrap()
+            .complete_with_operation_id(
+                ChatRequest::user_prompt("ping"),
+                LlmOperationId::for_workload(LlmWorkload::Dream),
+            )
+            .await
+            .unwrap();
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.llm.status, ProviderHealthStatus::Disabled);
+        assert_eq!(snapshot.llm_task_chains[0].status, ProviderHealthStatus::Ok);
+        assert_eq!(
+            snapshot
+                .llm_workloads
+                .iter()
+                .find(|row| row.workload == LlmWorkload::Dream)
+                .unwrap()
+                .calls,
+            1
+        );
+        let mut old = serde_json::to_value(snapshot).unwrap();
+        old.as_object_mut().unwrap().remove("llm_task_chains");
+        assert!(
+            serde_json::from_value::<ProviderHealthSnapshot>(old)
+                .unwrap()
+                .llm_task_chains
+                .is_empty()
+        );
+        assert!(!LlmProviders::default().is_configured());
     }
 
     struct TaskAwareEmbedder;
@@ -1000,6 +1298,58 @@ mod tests {
         assert_eq!(after_error.retry_hint.as_deref(), Some(retry_hint.as_str()));
     }
 
+    /// #1981: the counters say when they started, the value holds while they
+    /// count, and a reset restarts both, so two snapshots with the same
+    /// `llm_workloads_started_ms` measure one window.
+    #[tokio::test]
+    async fn workload_counters_report_when_they_started() {
+        let health = ProviderHealth::default();
+        let disabled = health.snapshot();
+        assert!(disabled.llm_workloads.is_empty());
+        assert_eq!(disabled.llm_workloads_started_ms, None);
+
+        let before = u64::try_from(Timestamp::now().as_millisecond()).unwrap();
+        let llm = health.wrap_llm_provider(Arc::new(FakeLlm { fail: false }), "openai", "m", None);
+        let started = health.snapshot().llm_workloads_started_ms.unwrap();
+        assert!(started >= before, "{started} < {before}");
+        llm.complete(ChatRequest::user_prompt("ping"))
+            .await
+            .unwrap();
+        let counted = health.snapshot();
+        assert_eq!(counted.llm_workloads_started_ms, Some(started));
+        assert_eq!(
+            counted
+                .llm_workloads
+                .iter()
+                .map(|row| row.calls)
+                .sum::<u64>(),
+            1
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        let _llm = health.wrap_llm_provider(Arc::new(FakeLlm { fail: false }), "openai", "m", None);
+        let reset = health.snapshot();
+        assert!(reset.llm_workloads_started_ms.unwrap() > started);
+        assert!(reset.llm_workloads.iter().all(|row| row.calls == 0));
+
+        let json = serde_json::to_value(&reset).unwrap();
+        assert_eq!(
+            json["llm_workloads_started_ms"],
+            reset.llm_workloads_started_ms.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_from_an_older_server_has_no_workload_start() {
+        let mut json = serde_json::to_value(ProviderHealthSnapshot::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("llm_workloads_started_ms")
+            .unwrap();
+        let parsed: ProviderHealthSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.llm_workloads_started_ms, None);
+    }
+
     #[test]
     fn workload_snapshot_is_bounded_redacted_and_percentiled() {
         let workloads = LlmWorkloadHealth::default();
@@ -1044,6 +1394,7 @@ mod tests {
 
         let row = workloads
             .snapshot()
+            .0
             .into_iter()
             .find(|row| row.workload == LlmWorkload::Rerank)
             .unwrap();

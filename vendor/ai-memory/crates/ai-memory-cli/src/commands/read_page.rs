@@ -13,6 +13,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::ReadPageArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -37,58 +38,94 @@ struct PageContent {
 /// Run the `read-page` subcommand.
 ///
 /// # Errors
-/// Returns an error if the server is unreachable, returns non-2xx,
-/// or neither `--path` nor a query is supplied.
+/// Returns an error if an explicit scope flag, `--path`, or the query is empty;
+/// the server is unreachable; returns non-2xx; or neither `--path` nor a query
+/// is supplied.
 pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let i18n = &config.i18n;
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    let path = match args.path.as_deref() {
+        Some(p) if p.trim().is_empty() => {
+            bail!(
+                "{}",
+                i18n.text("cli-read-page-path-was-passed-empty-specify-the-wiki-page-path-to-read")
+            );
+        }
+        Some(p) => Some(p),
+        None => None,
+    };
+    let query = match args.query.as_deref() {
+        Some(q) if q.trim().is_empty() => {
+            bail!(
+                "{}",
+                i18n.text(
+                    "cli-read-page-search-query-was-passed-empty-specify-a-query-or-path-wiki-path"
+                )
+            );
+        }
+        Some(q) => Some(q),
+        None => None,
+    };
+    if path.is_none() && query.is_none() {
+        bail!(
+            "{}",
+            i18n.text("cli-read-page-provide-a-query-positional-or-path-wiki-path")
+        );
+    }
+
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+    let ep = ServerEndpoint::for_checkout(config).await?;
 
-    let page: PageContent = if let Some(ref raw_path) = args.path {
+    let page: PageContent = if let Some(raw_path) = path {
         get_json(
             &ep,
             "/admin/read-page",
             &[
                 ("workspace", workspace.as_str()),
                 ("project", project.as_str()),
-                ("path", raw_path.as_str()),
+                ("path", raw_path),
             ],
         )
         .await?
-    } else if let Some(ref query) = args.query {
+    } else if let Some(q) = query {
         get_json(
             &ep,
             "/admin/read-page",
             &[
                 ("workspace", workspace.as_str()),
                 ("project", project.as_str()),
-                ("q", query.as_str()),
+                ("q", q),
             ],
         )
         .await?
     } else {
-        bail!("provide a query (positional) or --path <wiki-path>");
+        unreachable!();
     };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&page)?);
     } else {
-        print!("{}", render_text(&page));
+        print!("{}", render_text(&config.i18n, &page));
     }
     Ok(())
 }
 
-fn render_text(page: &PageContent) -> String {
+fn render_text(i18n: &ai_memory_core::i18n::Localizer, page: &PageContent) -> String {
     let mut out = String::new();
     if let Some(title) = &page.title {
-        out.push_str(&format!("# {title}\n"));
+        out.push_str(&format!("# {}\n", terminal_text(title)));
     }
-    out.push_str(&format!("path: {}\n", page.path));
+    out.push_str(&i18n.format(
+        "cli-read-page-path",
+        &[("value0", terminal_text(&page.path))],
+    ));
     if page.expired {
-        out.push_str("expired: true\n");
+        out.push_str(&i18n.text("cli-read-page-expired-true"));
     }
     out.push('\n');
-    out.push_str(&page.body);
+    out.push_str(&terminal_body(&page.body));
     if !page.body.ends_with('\n') {
         out.push('\n');
     }
@@ -114,11 +151,11 @@ mod tests {
     #[test]
     fn text_output_marks_only_expired_pages() {
         assert_eq!(
-            render_text(&page(false)),
+            render_text(&ai_memory_core::i18n::Localizer::default(), &page(false)),
             "# Example\npath: notes/example.md\n\nbody\n"
         );
         assert_eq!(
-            render_text(&page(true)),
+            render_text(&ai_memory_core::i18n::Localizer::default(), &page(true)),
             "# Example\npath: notes/example.md\nexpired: true\n\nbody\n"
         );
     }
@@ -133,5 +170,91 @@ mod tests {
         }))
         .unwrap();
         assert!(!parsed.expired);
+    }
+
+    fn args(
+        path: Option<&str>,
+        query: Option<&str>,
+        workspace: Option<&str>,
+        project: Option<&str>,
+    ) -> ReadPageArgs {
+        ReadPageArgs {
+            query: query.map(Into::into),
+            path: path.map(Into::into),
+            workspace: workspace.map(Into::into),
+            project: project.map(Into::into),
+            json: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_is_refused_before_scope_or_network_work() {
+        for empty in ["", " \t "] {
+            let error = run(
+                &Config::default(),
+                args(Some("notes/example.md"), None, Some(empty), None),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("--workspace was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_is_refused_before_scope_or_network_work() {
+        for empty in ["", " \t "] {
+            let error = run(
+                &Config::default(),
+                args(Some("notes/example.md"), None, None, Some(empty)),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("--project was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_path_is_refused_before_scope_or_network_work() {
+        for empty in ["", " \t "] {
+            let error = run(&Config::default(), args(Some(empty), None, None, None))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("--path was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_query_is_refused_before_scope_or_network_work() {
+        for empty in ["", " \t "] {
+            let error = run(&Config::default(), args(None, Some(empty), None, None))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("search query was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_both_path_and_query_is_refused_before_scope_or_network_work() {
+        let error = run(&Config::default(), args(None, None, None, None))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provide a query (positional) or --path <wiki-path>"),
+            "unexpected error: {error}"
+        );
     }
 }

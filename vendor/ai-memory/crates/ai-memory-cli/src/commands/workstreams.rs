@@ -2,12 +2,14 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::io::IsTerminal as _;
 use std::path::Path;
 
 use ai_memory_core::{ListManagedWorkstreamsRequest, ManagedWorkstreamSummary};
 use ai_memory_workstream::inspect_repository_fingerprints;
 use anyhow::{Context as _, Result};
 
+use super::show::terminal_text;
 use crate::cli::WorkstreamsArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -17,20 +19,63 @@ pub async fn run(config: &Config, args: WorkstreamsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting managed workstream checkout")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let summaries = list_for_checkout(
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
+    let fingerprints = inspect_repository_fingerprints(&cwd)?;
+    let project_id = if args.project_id.is_some() || args.project.is_some() {
+        args.project_id
+    } else {
+        super::project_registry::project_binding(config, &endpoint, &workspace, &project, &cwd)?
+            .map(|scope| scope.project_id)
+    };
+    let summaries = match list_for_checkout(
         &endpoint,
         &workspace,
         &project,
         &cwd,
         usize::from(args.limit),
+        project_id,
     )
-    .await?;
+    .await
+    {
+        Err(error) if super::managed_project::is_ambiguous(&error) && project_id.is_none() => {
+            let scope = super::managed_project::choose(
+                &config.i18n,
+                &endpoint,
+                &workspace,
+                &project,
+                !args.json && std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+            let summaries = list_for_checkout(
+                &endpoint,
+                &workspace,
+                &project,
+                &cwd,
+                usize::from(args.limit),
+                Some(scope.project_id),
+            )
+            .await?;
+            super::project_registry::record_project_binding(
+                config,
+                &endpoint,
+                &project,
+                &cwd,
+                &scope,
+                &fingerprints,
+            )?;
+            summaries
+        }
+        result => result?,
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summaries)?);
         return Ok(());
     }
-    print!("{}", render_human(&summaries, &workspace, &project));
+    print!(
+        "{}",
+        render_human(&config.i18n, &summaries, &workspace, &project)
+    );
     Ok(())
 }
 
@@ -45,6 +90,7 @@ pub(super) async fn list_for_checkout(
     project: &str,
     checkout: &Path,
     limit: usize,
+    project_id: Option<ai_memory_core::ProjectId>,
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
     let repository = inspect_repository_fingerprints(checkout)
         .context("inspecting managed workstream checkout")?;
@@ -52,8 +98,13 @@ pub(super) async fn list_for_checkout(
         endpoint,
         "/workstream/recent",
         &ListManagedWorkstreamsRequest {
+            project_id,
             workspace: workspace.to_owned(),
-            project: project.to_owned(),
+            project: if project_id.is_some() {
+                String::new()
+            } else {
+                project.to_owned()
+            },
             repo_fingerprint: repository.repo_fingerprint,
             worktree_fingerprint: repository.worktree_fingerprint,
             limit,
@@ -65,18 +116,28 @@ pub(super) async fn list_for_checkout(
 
 /// Fetch every checkout-local page without changing the server's per-page cap.
 pub(super) async fn list_all_for_checkout(
+    config: &Config,
     endpoint: &ServerEndpoint,
     workspace: &str,
     project: &str,
     checkout: &Path,
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
+    let i18n = &config.i18n;
     let repository = inspect_repository_fingerprints(checkout)
-        .context("inspecting managed workstream checkout")?;
+        .context(i18n.text("cli-workstreams-inspecting-managed-workstream-checkout"))?;
+    let project_id =
+        super::project_registry::project_binding(config, endpoint, workspace, project, checkout)?
+            .map(|scope| scope.project_id);
     let mut request = ListManagedWorkstreamsRequest {
+        project_id,
         workspace: workspace.to_owned(),
-        project: project.to_owned(),
-        repo_fingerprint: repository.repo_fingerprint,
-        worktree_fingerprint: repository.worktree_fingerprint,
+        project: if project_id.is_some() {
+            String::new()
+        } else {
+            project.to_owned()
+        },
+        repo_fingerprint: repository.repo_fingerprint.clone(),
+        worktree_fingerprint: repository.worktree_fingerprint.clone(),
         limit: 100,
         offset: 0,
     };
@@ -84,7 +145,35 @@ pub(super) async fn list_all_for_checkout(
     let mut seen = HashSet::new();
     loop {
         let page: Vec<ManagedWorkstreamSummary> =
-            post_json(endpoint, "/workstream/recent", &request).await?;
+            match post_json(endpoint, "/workstream/recent", &request).await {
+                Err(error)
+                    if request.project_id.is_none()
+                        && super::managed_project::is_ambiguous(&error) =>
+                {
+                    let scope = super::managed_project::choose(
+                        &config.i18n,
+                        endpoint,
+                        workspace,
+                        project,
+                        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await?;
+                    request.project_id = Some(scope.project_id);
+                    request.project.clear();
+                    let page = post_json(endpoint, "/workstream/recent", &request).await?;
+                    super::project_registry::record_project_binding(
+                        config,
+                        endpoint,
+                        project,
+                        checkout,
+                        &scope,
+                        &repository,
+                    )?;
+                    page
+                }
+                result => result?,
+            };
         let count = page.len();
         let before = summaries.len();
         summaries.extend(
@@ -99,8 +188,12 @@ pub(super) async fn list_all_for_checkout(
         // the CLI and server may be upgraded on different machines.
         if summaries.len() == before {
             eprintln!(
-                "warning: the ai-memory server ignored workstream pagination; showing its first {} workstreams. Upgrade the server to list them all.",
-                summaries.len()
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-workstreams-warning-the-ai-memory-server-ignored-workstream-pagination-showing-its-first",
+                    &[("value0", format!("{}", summaries.len()))]
+                )
             );
             break;
         }
@@ -111,21 +204,33 @@ pub(super) async fn list_all_for_checkout(
         request.offset = request
             .offset
             .checked_add(count)
-            .context("workstream pagination offset overflow")?;
+            .context(i18n.text("cli-workstreams-workstream-pagination-offset-overflow"))?;
     }
     Ok(summaries)
 }
 
-fn render_human(summaries: &[ManagedWorkstreamSummary], workspace: &str, project: &str) -> String {
-    let mut output = format!("Managed workstreams for {workspace}/{project}:\n");
+fn render_human(
+    i18n: &ai_memory_core::i18n::Localizer,
+    summaries: &[ManagedWorkstreamSummary],
+    workspace: &str,
+    project: &str,
+) -> String {
+    let mut output = crate::localization::format(
+        i18n,
+        "cli-workstreams-managed-workstreams-for-workspace-project",
+        &[
+            ("value0", workspace.to_string()),
+            ("value1", project.to_string()),
+        ],
+    );
     if summaries.is_empty() {
-        output.push_str("No managed workstreams for this checkout.\n");
+        output.push_str(&i18n.text("cli-workstreams-no-managed-workstreams-for-this-checkout"));
         return output;
     }
     for summary in summaries {
         let marker = if summary.current { '*' } else { ' ' };
         let harnesses = if summary.linked_harnesses.is_empty() {
-            "no linked harnesses".to_owned()
+            i18n.text("cli-workstreams-no-linked-harnesses")
         } else {
             summary
                 .linked_harnesses
@@ -137,20 +242,28 @@ fn render_human(summaries: &[ManagedWorkstreamSummary], workspace: &str, project
         let _ = writeln!(
             output,
             "{marker} {}  {}  [{}]",
-            summary.name,
-            humanize_age(&summary.last_active_at),
+            terminal_text(&summary.name),
+            humanize_age(i18n, &summary.last_active_at),
             harnesses,
         );
-        let _ = writeln!(output, "    id: {}", summary.workstream_id);
+        let _ = writeln!(
+            output,
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-message-id",
+                &[("value0", format!("{}", summary.workstream_id))]
+            )
+        );
     }
     output
 }
 
-fn humanize_age(raw: &str) -> String {
+fn humanize_age(i18n: &ai_memory_core::i18n::Localizer, raw: &str) -> String {
     let Ok(then) = raw.parse::<jiff::Timestamp>() else {
         return "unknown activity".to_owned();
     };
-    super::humanize_age_secs((jiff::Timestamp::now() - then).get_seconds())
+    i18n.age((jiff::Timestamp::now() - then).get_seconds())
 }
 
 #[cfg(test)]
@@ -170,7 +283,12 @@ mod tests {
             linked_harnesses: vec![AgentKind::OpenCode, AgentKind::Codex],
         }];
 
-        let rendered = render_human(&rows, "default", "game");
+        let rendered = render_human(
+            &ai_memory_core::i18n::Localizer::default(),
+            &rows,
+            "default",
+            "game",
+        );
         assert!(rendered.contains("Managed workstreams for default/game:"));
         assert!(rendered.contains("* decide-after-death"));
         // The id line is indented past the marker column so it cannot be
@@ -183,8 +301,13 @@ mod tests {
     #[test]
     fn human_output_explains_an_empty_checkout() {
         assert!(
-            render_human(&[], "default", "game")
-                .contains("No managed workstreams for this checkout.")
+            render_human(
+                &ai_memory_core::i18n::Localizer::default(),
+                &[],
+                "default",
+                "game"
+            )
+            .contains("No managed workstreams for this checkout.")
         );
     }
 }

@@ -22,6 +22,7 @@ const OPENCLAW_BIN: &str = "openclaw";
 
 /// Write and install the generated OpenClaw plugin package.
 pub(crate) fn apply(
+    i18n: &ai_memory_core::i18n::Localizer,
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
@@ -44,16 +45,33 @@ pub(crate) fn apply(
     match install_plugin(&plugin_dir)? {
         InstallStatus::Installed => {
             println!();
-            println!("OpenClaw plugin installed from {}.", plugin_dir.display());
             println!(
-                "If your OpenClaw gateway did not auto-restart, run `openclaw gateway restart`."
+                "{}",
+                crate::localization::diagnostic(
+                    i18n,
+                    format!("OpenClaw plugin installed from {}.", plugin_dir.display())
+                )
             );
-            println!("Verify with `openclaw plugins inspect ai-memory --runtime --json`.");
+            println!(
+                "{}",
+                i18n.diagnostic(
+                    "If your OpenClaw gateway did not auto-restart, run `openclaw gateway restart`."
+                )
+            );
+            println!(
+                "{}",
+                i18n.diagnostic(
+                    "Verify with `openclaw plugins inspect ai-memory --runtime --json`."
+                )
+            );
         }
         InstallStatus::CliMissing => {
             println!();
-            println!("OpenClaw CLI not found on PATH; plugin package was written only.");
-            println!("Install it with:");
+            println!(
+                "{}",
+                i18n.diagnostic("OpenClaw CLI not found on PATH; plugin package was written only.")
+            );
+            println!("{}", i18n.diagnostic("Install it with:"));
             println!(
                 "  openclaw plugins install --link {} --force",
                 plugin_dir.display()
@@ -374,7 +392,7 @@ function postPreCompact(event: any, ctx: any): void {{
   url.searchParams.set("event", eventName);
   url.searchParams.set("agent", AGENT);
   if (!applyMarkerParams(url, typeof body.cwd === "string" ? body.cwd : undefined)) return;
-  const policy = capturePolicy(body, typeof body.cwd === "string" ? body.cwd : undefined);
+  const policy = capturePolicy(body, typeof body.cwd === "string" ? body.cwd : undefined, eventName);
   if (policy.disposition === "drop") return;
   try {{
     // Fire-and-forget, but never silent loss: an unreachable server, a
@@ -383,8 +401,11 @@ function postPreCompact(event: any, ctx: any): void {{
     // backlog.
     // Tracked in pendingHookRequests so session_end can await a bounded
     // flush instead of letting teardown kill the in-flight fetch (#676).
+    // A redirect rejects and spools the event: followed, a gateway's login
+    // page would count as a delivery.
     const request = fetch(url, {{
       proxy: false,
+      redirect: "error",
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
@@ -413,10 +434,18 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
   if (CAPTURE_MODE === "allowlist" && !findMarker(currentCwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
+  // An external-capture run shares its project with the owner's own sessions,
+  // so it offers the baton rather than consuming it (#2148): claim=0 makes the
+  // server announce the handoff for an explicit memory_handoff_accept. Parity
+  // with the native hook and the shell/PowerShell bundles.
+  if (captureOwnedExternally()) url.searchParams.set("claim", "0");
   if (!applyMarkerParams(url, currentCwd)) return undefined;
   try {{
+    // The body is prepended to the prompt, so a redirect is refused: a
+    // gateway's login page must never arrive as the handoff.
     const response = await fetch(url, {{
       proxy: false,
+      redirect: "error",
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
@@ -572,8 +601,20 @@ mod tests {
         assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         assert!(plugin.contains("function tomlFlag"));
+        assert!(plugin.contains("function tomlScopedFlag"));
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
+        assert!(
+            plugin
+                .contains("tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)")
+        );
+        assert!(
+            plugin.contains(
+                "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", false)"
+            )
+        );
+        assert!(plugin.contains("url.searchParams.set(\"handoff\", \"0\")"));
+        assert!(plugin.contains("url.searchParams.set(\"recovery\", \"0\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
         // #668: same settings-walk as the shared ts_apply_marker_params
         // (install_hooks.rs) — the two applyMarkerParams copies stay
@@ -606,6 +647,8 @@ mod tests {
         assert!(plugin.contains("fetchHandoff"));
         assert!(plugin.contains("// capture-policy-v1 (generated; do not fork between adapters)"));
         assert!(plugin.contains("const policy = capturePolicy(body"));
+        // #1843: the event name gates the `_ai_memory_file` field.
+        assert!(plugin.contains("body.cwd : undefined, eventName);"));
         assert!(plugin.contains("body: JSON.stringify(policy.payload)"));
         assert!(plugin.contains("prependContext: handoff"));
         assert!(plugin.contains("Bearer ${token}"));

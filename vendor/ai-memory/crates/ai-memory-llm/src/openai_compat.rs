@@ -22,23 +22,13 @@ use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
-// Compiled once. Matches <think>, <thinking>, <analysis>, <reasoning> blocks
-// (case-insensitive, non-greedy, DOTALL) that reasoning models emit before
-// the JSON payload. These blocks often contain `{` braces that confuse the
-// balanced-brace extractor when unstripped.
-//
-// Each tag is listed explicitly because the `regex` crate does not support
-// backreferences — we cannot write `<(tag)>.*?</\1>`.
-static REASONING_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?is)(?:<think>.*?</think>|<thinking>.*?</thinking>|<analysis>.*?</analysis>|<reasoning>.*?</reasoning>)",
-    )
-    .unwrap()
+// Scan reasoning tags and JSON starts in order.
+// A reasoning block consumes its draft JSON, but a JSON value encountered
+// first must survive intact even when its strings contain reasoning tags.
+static REASONING_OR_JSON_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:</?(?:think|thinking|analysis|reasoning)>|[\{\[])").unwrap()
 });
 
-// The first closing reasoning tag. Chat templates that open the reasoning
-// block themselves (DeepSeek-R1, QwQ, Qwen3 thinking models) return the
-// reasoning followed by a bare `</think>`, with no opening tag to pair it.
 static REASONING_CLOSE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)</(?:think|thinking|analysis|reasoning)>").unwrap());
 
@@ -47,25 +37,61 @@ static CODE_FENCE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)\A\s*```(?:json)?\s*\n(.*?)\n\s*```\s*\z").unwrap());
 
 /// Remove `<think>`, `<thinking>`, `<analysis>`, and `<reasoning>` blocks
-/// (case-insensitive) from `s`, then unwrap any surrounding markdown code
-/// fence. Returns a freshly allocated `String` so the caller can choose
-/// between the cleaned and the raw form.
+/// (case-insensitive) outside JSON values in `s`, then unwrap any surrounding
+/// markdown code fence. JSON string contents are copied verbatim.
 pub(crate) fn strip_reasoning_blocks(s: &str) -> String {
-    let stripped = REASONING_BLOCK_RE.replace_all(s, "");
-    // A closing tag left after the paired blocks are gone ends a reasoning
-    // section whose opening tag the chat template supplied. Drop that
-    // section too, unless the text before it already looks like the JSON
-    // answer (a literal closing tag inside a JSON string must survive).
-    let stripped = match REASONING_CLOSE_RE.find(stripped.as_ref()) {
-        Some(close)
-            if !stripped[..close.start()]
-                .trim_start()
-                .starts_with(['{', '[', '`']) =>
-        {
-            std::borrow::Cow::Owned(stripped[close.end()..].to_string())
+    let mut stripped = String::with_capacity(s.len());
+    let mut cursor = 0;
+    let mut saw_unopened_close = false;
+    let mut no_closing_tag: Vec<&str> = Vec::new();
+    while let Some(token) = REASONING_OR_JSON_RE.find_at(s, cursor) {
+        stripped.push_str(&s[cursor..token.start()]);
+        cursor = token.end();
+        if matches!(token.as_str(), "{" | "[") {
+            // JSON strings may contain these literal tags (RFC 8259 §7):
+            // https://www.rfc-editor.org/rfc/rfc8259#section-7
+            // Let serde locate the end, honoring escapes and nested values,
+            // rather than matching a tag inside the answer as a wrapper.
+            let mut json = serde_json::Deserializer::from_str(&s[token.start()..])
+                .into_iter::<serde_json::Value>();
+            if matches!(json.next(), Some(Ok(_))) {
+                cursor = token.start() + json.byte_offset();
+                stripped.push_str(&s[token.start()..cursor]);
+            } else {
+                stripped.push_str(token.as_str());
+            }
+        } else if token.as_str().starts_with("</") {
+            // Some chat templates supply the opening tag themselves. Keep
+            // the existing first-close rule, unless the prefix already looks
+            // like the answer. Closing tags inside JSON never reach this arm.
+            if !saw_unopened_close && !stripped.trim_start().starts_with(['{', '[', '`']) {
+                stripped.clear();
+            } else {
+                stripped.push_str(token.as_str());
+            }
+            saw_unopened_close = true;
+        } else {
+            let tag = &token.as_str()[1..token.len() - 1];
+            if !no_closing_tag
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(tag))
+            {
+                let close = REASONING_CLOSE_RE
+                    .find_iter(&s[cursor..])
+                    .find(|close| close.as_str()[2..close.len() - 1].eq_ignore_ascii_case(tag));
+                if let Some(close) = close {
+                    cursor += close.end();
+                    continue;
+                }
+                // The cursor only moves forward. Cache each of the four
+                // missing closes so repeated unfinished tags cannot rescan
+                // the remaining response once per opening tag.
+                no_closing_tag.push(tag);
+            }
+            stripped.push_str(token.as_str());
         }
-        _ => stripped,
-    };
+    }
+    stripped.push_str(&s[cursor..]);
     // If the entire remaining payload is wrapped in a code fence, unwrap it
     // so `serde_json::from_str` can see the bare JSON directly.
     if let Some(caps) = CODE_FENCE_RE.captures(stripped.as_ref()) {
@@ -155,6 +181,23 @@ impl OpenAiCompatProvider {
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.inner = self.inner.with_timeout_secs(secs);
         self
+    }
+
+    /// Omit `stream` or explicitly request a non-streaming JSON response.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] for `Some(true)` because this
+    /// Chat Completions transport cannot decode SSE responses.
+    pub fn with_stream(mut self, stream: Option<bool>) -> LlmResult<Self> {
+        if stream == Some(true) {
+            return Err(LlmError::NotConfigured(
+                "AI_MEMORY_LLM_COMPAT_STREAM (llm_compat_stream) must be false or unset: \
+                 openai-compat Chat Completions does not support SSE responses"
+                    .into(),
+            ));
+        }
+        self.inner = self.inner.with_stream(stream);
+        Ok(self)
     }
 
     /// Forward reasoning effort to the inner Chat Completions client.
@@ -317,8 +360,9 @@ impl OpenAiCompatProvider {
             }
         }
         // Default (and strict fallback): most older local engines don't
-        // honour `response_format`. Ask for JSON and extract the first
-        // balanced `{…}` object from the text.
+        // honour `response_format`. Put the schema in the prompt before
+        // extracting the first balanced `{…}` object from the response.
+        let request = with_tolerant_schema_prompt(request, &schema)?;
         let (res, finish_reason) = self
             .inner
             .complete_with_operation_id_and_finish_reason(request, operation_id)
@@ -371,6 +415,20 @@ impl OpenAiCompatProvider {
     }
 }
 
+fn with_tolerant_schema_prompt(
+    mut request: ChatRequest,
+    schema: &serde_json::Value,
+) -> LlmResult<ChatRequest> {
+    let schema = serde_json::to_string(schema)?;
+    let instruction =
+        format!("Return ONE JSON object matching this JSON Schema exactly:\n\n{schema}");
+    request.system = Some(match request.system.take() {
+        Some(system) if !system.trim().is_empty() => format!("{system}\n\n{instruction}"),
+        _ => instruction,
+    });
+    Ok(request)
+}
+
 /// True for errors where a *retry without structured-output coercion*
 /// has a real chance of succeeding — i.e. the upstream returned a
 /// response, but it wasn't in the shape we wanted. Transport / HTTP /
@@ -380,13 +438,15 @@ fn is_parse_shape_error(err: &LlmError) -> bool {
 }
 
 /// True only when a compatibility endpoint rejected structured-output syntax
-/// before generation. Generic 4xx errors are deliberately excluded so auth,
-/// quota, model, and malformed-request failures retain their original cause.
+/// before generation. 400/422 are the usual rejection; 501 Not Implemented is
+/// an engine declaring the capability missing (`structured output is
+/// unavailable`). Generic errors are deliberately excluded so auth, quota,
+/// model, and malformed-request failures retain their original cause.
 fn is_response_format_rejection(err: &LlmError) -> bool {
     let LlmError::Provider { status, body, .. } = err else {
         return false;
     };
-    if !matches!(status, 400 | 422) {
+    if !matches!(status, 400 | 422 | 501) {
         return false;
     }
     let body = body.to_ascii_lowercase();
@@ -406,8 +466,33 @@ fn is_response_format_rejection(err: &LlmError) -> bool {
 /// either truncates the object early or never closes it. This
 /// version tracks whether we're inside a `"..."` literal and
 /// honours backslash escapes the JSON spec defines.
+///
+/// A balanced span that does not parse as a JSON object is braced prose (a
+/// `{title}` placeholder before the answer), so the search moves past it to
+/// the next one. When none parses, the first balanced span is returned as
+/// before, so a malformed answer still surfaces its own parse error.
 pub(crate) fn first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
+    let first = &s[start..=balanced_end(s, start)?];
+    let mut span = first;
+    let mut end = start + first.len();
+    loop {
+        if serde_json::from_str::<serde_json::Value>(span).is_ok_and(|v| v.is_object()) {
+            return Some(span);
+        }
+        let Some(next) = s[end..].find('{').map(|i| end + i) else {
+            return Some(first);
+        };
+        let Some(close) = balanced_end(s, next) else {
+            return Some(first);
+        };
+        span = &s[next..=close];
+        end = close + 1;
+    }
+}
+
+/// Byte index of the `}` closing the `{` at `start`, string-aware.
+fn balanced_end(s: &str, start: usize) -> Option<usize> {
     let mut depth = 0_i32;
     let mut in_string = false;
     let mut escape = false;
@@ -429,7 +514,7 @@ pub(crate) fn first_json_object(s: &str) -> Option<&str> {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(&s[start..=start + i]);
+                    return Some(start + i);
                 }
             }
             _ => {}
@@ -462,6 +547,16 @@ mod tests {
             .get(crate::openai::REQUEST_ID_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned)
+    }
+
+    fn request_body(request: &wiremock::Request) -> serde_json::Value {
+        serde_json::from_slice(&request.body).expect("request body is JSON")
+    }
+
+    fn system_prompt(body: &serde_json::Value) -> &str {
+        body["messages"][0]["content"]
+            .as_str()
+            .expect("system message content")
     }
 
     /// Acceptance (a): the header is present on the wire in the accepted
@@ -540,14 +635,15 @@ mod tests {
             .with_strict(true)
             .with_request_id_header();
         let operation_id = LlmOperationId::new();
+        let schema = json!({
+            "type": "object",
+            "properties": { "ok": { "type": "boolean" } },
+            "required": ["ok"],
+        });
         let value = provider
             .complete_structured_raw_with_operation_id(
                 ChatRequest::user_prompt("emit JSON"),
-                json!({
-                    "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
-                }),
+                schema.clone(),
                 operation_id,
             )
             .await
@@ -556,6 +652,14 @@ mod tests {
         assert_eq!(value, json!({ "ok": true }));
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 2, "strict attempt + tolerant fallback");
+        let strict_body = request_body(&requests[0]);
+        let tolerant_body = request_body(&requests[1]);
+        assert!(strict_body.get("response_format").is_some());
+        assert!(tolerant_body.get("response_format").is_none());
+        assert!(
+            system_prompt(&tolerant_body)
+                .contains(&serde_json::to_string(&schema).expect("schema serializes"))
+        );
         let expected = operation_id.to_string();
         for request in &requests {
             assert_eq!(
@@ -572,6 +676,52 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tolerant_structured_request_includes_schema_in_system_prompt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(chat_response_with_content(r#"{"proposals":[]}"#)),
+            )
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAiCompatProvider::new(server.uri(), None, "model-x").expect("provider builds");
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "proposals": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "operation": { "type": "string" },
+                            "kind": { "type": "string" },
+                            "evidence": { "type": "array" },
+                            "confidence": { "type": "number" },
+                        },
+                    },
+                },
+            },
+        });
+        let mut request = ChatRequest::user_prompt("review these observations");
+        request.system = Some("Keep the existing review rules.".into());
+        provider
+            .complete_structured_raw(request, schema.clone())
+            .await
+            .expect("tolerant structured completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        let body = request_body(&requests[0]);
+        assert!(body.get("response_format").is_none());
+        let system = system_prompt(&body);
+        assert!(system.starts_with("Keep the existing review rules."));
+        assert!(system.contains(&serde_json::to_string(&schema).expect("schema serializes")));
     }
 
     /// Acceptance (e): `opencode` routes through this wrapper internally but
@@ -640,6 +790,17 @@ mod tests {
     }
 
     #[test]
+    fn compat_stream_builder_rejects_sse() {
+        let provider = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "model-x")
+            .expect("provider builds");
+        let error = provider
+            .with_stream(Some(true))
+            .err()
+            .expect("SSE must be refused before any request");
+        assert!(matches!(error, LlmError::NotConfigured(_)));
+    }
+
+    #[test]
     fn timeout_override_reaches_the_inner_provider() {
         let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "mistral-nemo")
             .expect("provider builds")
@@ -660,6 +821,17 @@ mod tests {
         assert!(is_response_format_rejection(&LlmError::Provider {
             status: 422,
             body: "json_schema is not supported".into(),
+            retry_after: None,
+        }));
+        // Production shape: an engine without structured output answers 501.
+        assert!(is_response_format_rejection(&LlmError::Provider {
+            status: 501,
+            body: r#"{"error":{"message":"structured output is unavailable","type":"api_error","param":null,"code":null}}"#.into(),
+            retry_after: None,
+        }));
+        assert!(!is_response_format_rejection(&LlmError::Provider {
+            status: 501,
+            body: "not implemented".into(),
             retry_after: None,
         }));
         assert!(!is_response_format_rejection(&LlmError::Provider {
@@ -713,6 +885,19 @@ mod tests {
         assert_eq!(first_json_object("no json here"), None);
     }
 
+    /// Prose before the answer can carry its own braces (a `{title}`
+    /// placeholder, a `{…}` aside). Those are balanced but not JSON, so the
+    /// answer object after them must still be found.
+    #[test]
+    fn first_json_object_skips_braced_prose_before_the_answer() {
+        assert_eq!(
+            first_json_object("Fill the {title} field.\n{\"findings\":[]}"),
+            Some("{\"findings\":[]}"),
+        );
+        // A truncated answer still finds nothing rather than an inner object.
+        assert_eq!(first_json_object("{\"findings\":[{\"k\":1}"), None);
+    }
+
     // ── strip_reasoning_blocks ───────────────────────────────────────────
 
     /// A `<think>` block whose body contains braces must be stripped so the
@@ -754,6 +939,40 @@ mod tests {
             strip_reasoning_blocks(fenced),
             "{\"body\":\"a </think> tag\"}"
         );
+    }
+
+    #[test]
+    fn reasoning_tags_in_json_members_and_nested_values_are_kept() {
+        let input = r#"{"<think>key</think>":[{"body":"<analysis>nested</analysis>"}]}"#;
+        assert_eq!(strip_reasoning_blocks(input), input);
+    }
+
+    /// An unmatched draft brace in reasoning must not hide the template's
+    /// closing tag or prevent the following answer from being protected.
+    #[test]
+    fn malformed_reasoning_draft_still_reaches_the_answer() {
+        let answer = r#"{"body":"<think>literal</think>"}"#;
+        for prefix in [
+            "Rough draft {not JSON</think>\n",
+            "<analysis>Rough draft {not JSON</analysis>\n",
+        ] {
+            assert_eq!(strip_reasoning_blocks(&format!("{prefix}{answer}")), answer);
+        }
+    }
+
+    #[test]
+    fn a_literal_opening_tag_does_not_consume_a_later_reasoning_block() {
+        let answer = r#"{"body":"an opening <think> tag"}"#;
+        assert_eq!(
+            strip_reasoning_blocks(&format!("{answer}<think>actual reasoning</think>")),
+            answer
+        );
+    }
+
+    #[test]
+    fn many_unclosed_reasoning_tags_preserve_prose() {
+        let input = "<think>{<thinking>[<analysis>{<REASONING>[".repeat(2048);
+        assert_eq!(strip_reasoning_blocks(&input), input);
     }
 
     /// `<analysis>` prefix is also stripped.

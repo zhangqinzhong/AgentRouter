@@ -119,7 +119,7 @@ async fn graph_pages_render_svg_and_edge_table() {
     let (status, home) = get(web.clone(), "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(home.contains(r#"href="graph""#), "{home}");
-    assert!(home.contains("Link graph"), "{home}");
+    assert!(home.contains("Knowledge graph"), "{home}");
 
     let (status, project) = get(web.clone(), "/w/default/app").await;
     assert_eq!(status, StatusCode::OK);

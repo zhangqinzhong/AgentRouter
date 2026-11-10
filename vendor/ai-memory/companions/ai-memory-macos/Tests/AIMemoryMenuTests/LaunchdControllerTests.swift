@@ -62,6 +62,42 @@ struct LaunchdControllerTests {
         )
         #expect(rendered.contains("/tmp/a&amp;b&lt;c&gt;"))
     }
+
+    @Test func pathsRoundTripThroughTheInstalledPlist() throws {
+        let templateURL = repoRoot()
+            .appending(path: "packaging/launchd/com.github.akitaonrails.ai-memory.plist")
+        let template = try String(contentsOf: templateURL, encoding: .utf8)
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "ai-memory-plist-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appending(path: "Ada & Bob <home>")
+        let binary = root.appending(path: "R&D/AI Memory.app/Contents/Resources/runtime/ai-memory")
+        let dataDir = home.appending(path: "Memory & Notes")
+        let controller = LaunchdController(home: home)
+
+        try controller.writePlist(template: template, binary: binary, dataDir: dataDir)
+
+        let data = try Data(contentsOf: controller.plistDestination)
+        let plist = try #require(
+            PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        )
+        #expect(plist["ProgramArguments"] as? [String] == [binary.path, "serve", "--transport", "http", "--enable-web"])
+        #expect(plist["StandardOutPath"] as? String == home.appending(path: "Library/Logs/ai-memory/stdout.log").path)
+        #expect(plist["StandardErrorPath"] as? String == home.appending(path: "Library/Logs/ai-memory/stderr.log").path)
+        #expect(plist["EnvironmentVariables"] as? [String: String] == ["AI_MEMORY_DATA_DIR": dataDir.path])
+        #expect(LaunchdController.programArgumentsBinary(inPlist: String(decoding: data, as: UTF8.self)) == binary.path)
+    }
+
+    @Test func readsDecodedProgramArgumentsFromPlist() {
+        let plist = """
+        <plist version="1.0"><dict><key>ProgramArguments</key><array>
+        <string>/Applications/R&amp;D/AI Memory.app/ai-memory</string><string>serve</string>
+        </array></dict></plist>
+        """
+        #expect(LaunchdController.programArgumentsBinary(inPlist: plist) == "/Applications/R&D/AI Memory.app/ai-memory")
+        #expect(LaunchdController.programArgumentsBinary(inPlist: "not a plist") == nil)
+        #expect(LaunchdController.programArgumentsBinary(inPlist: "<plist version=\"1.0\"><dict/></plist>") == nil)
+    }
 }
 
 private func repoRoot(file: String = #filePath) -> URL {

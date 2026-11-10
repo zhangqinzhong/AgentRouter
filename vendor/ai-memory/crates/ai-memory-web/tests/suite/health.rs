@@ -207,6 +207,7 @@ fn app(
             base_path: "",
             trusted_proxy_identity: false,
             recall,
+            runtime: None,
             health: health.map(Arc::new),
         },
     )
@@ -359,6 +360,60 @@ async fn health_page_renders_each_failing_check_with_its_fix_line() {
         "{body}"
     );
     assert!(!body.contains("data-check=\"none\""), "{body}");
+}
+
+#[tokio::test]
+async fn task_only_provider_is_visible_and_failure_raises_a_check() {
+    let f = fixture().await;
+    let health = ProviderHealth::default();
+    let routes = health.wrap_llm_providers(
+        ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: [(
+                ai_memory_llm::LlmWorkload::Rerank,
+                Arc::new(FailingLlm) as Arc<dyn LlmProvider>,
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    );
+    let sources = HealthSources {
+        ingest: Arc::new(IngestMetrics::default()),
+        providers: health,
+        probe: Arc::new(FixedProbe(ProcessState::default())),
+    };
+    let (_, _, body) = get(
+        app(
+            &f,
+            AuthLevel::Root,
+            Some(sources.clone()),
+            Recall::default(),
+        ),
+        true,
+    )
+    .await;
+    assert!(body.contains("default llm provider"), "{body}");
+    assert!(body.contains("llm provider (rerank)"), "{body}");
+    assert!(body.contains("openai/gpt-test"), "{body}");
+    assert!(!body.contains("data-check=\"llm_task_provider\""), "{body}");
+
+    assert!(
+        routes
+            .get(ai_memory_llm::LlmWorkload::Rerank)
+            .unwrap()
+            .complete(ChatRequest::user_prompt("ping"))
+            .await
+            .is_err()
+    );
+    let (_, _, body) = get(
+        app(&f, AuthLevel::Root, Some(sources), Recall::default()),
+        true,
+    )
+    .await;
+    assert_check(&body, "llm_task_provider", None);
+    assert!(body.contains("openai/gpt-test"), "{body}");
+    assert!(!body.contains(PLANTED_PROVIDER), "{body}");
 }
 
 /// A page whose only vector was made under another triple must fire
@@ -583,8 +638,9 @@ async fn health_page_refuses_a_db_user_and_admits_root() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(location, None, "a non-root 403 is not a password redirect");
     assert!(body.contains("Root access required"), "{body}");
+    let content = body.split("<main").nth(1).expect("refusal content");
     for leaked in ["Server health", "ai-memory recover", "90/100", "saturated"] {
-        assert!(!body.contains(leaked), "DB user saw {leaked}: {body}");
+        assert!(!content.contains(leaked), "DB user saw {leaked}: {body}");
     }
 
     // Control: root on the same multi-user server.

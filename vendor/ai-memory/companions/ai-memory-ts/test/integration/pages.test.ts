@@ -22,6 +22,42 @@ before(async () => {
 after(async () => server.stop());
 
 describe("pages against a real server", () => {
+  it("preflights a stable destination and commits a conditional batch atomically", async () => {
+    await memory.pages.write({ path: "notes/batch-existing.md", body: "# Existing\nv1" });
+    const target = await memory.pages.resolveWriteTarget({
+      target: { workspace: scope.workspace, project: scope.project },
+    });
+    assert.equal(target.workspace, scope.workspace);
+    assert.equal(target.project, scope.project);
+    assert.match(target.projectId, /^[0-9a-f-]{36}$/);
+
+    const written = await memory.pages.writeBatch({
+      target: { workspace: scope.workspace, projectId: target.projectId },
+      pages: [
+        { path: "notes/batch-a.md", body: "# Batch A", createOnly: true },
+        { path: "notes/batch-b.md", body: "# Batch B", createOnly: true },
+      ],
+    });
+    assert.deepEqual(
+      written.pages.map((page) => page.path),
+      ["notes/batch-a.md", "notes/batch-b.md"],
+    );
+    assert.equal(typeof written.checkpoint, "string");
+
+    await assert.rejects(
+      memory.pages.writeBatch({
+        target: { workspace: scope.workspace, projectId: target.projectId },
+        pages: [
+          { path: "notes/batch-a.md", body: "# Clobber", createOnly: true },
+          { path: "notes/batch-never.md", body: "# Must not land", createOnly: true },
+        ],
+      }),
+      PreconditionFailedError,
+    );
+    assert.equal((await memory.pages.read({ path: "notes/batch-a.md" })).body, "# Batch A");
+    await assert.rejects(memory.pages.read({ path: "notes/batch-never.md" }), RpcError);
+  });
+
   it("writes, reads, queries and deletes a page with every promised field", async () => {
     const written = await memory.pages.write({
       path: "notes/retries.md",
@@ -104,6 +140,7 @@ describe("pages against a real server", () => {
       kind: "howto",
       abstract: "short",
       expiresAt: "2099-01-01",
+      sourceFiles: [{ path: "bin/deploy.sh", commit: "3F2A9C1" }],
     });
     const updated = await memory.pages.update("notes/meta.md", (current) => ({
       body: `${current.body}\nsecond`,
@@ -117,6 +154,9 @@ describe("pages against a real server", () => {
     assert.equal(page.frontmatter["kind"], "howto");
     assert.equal(page.frontmatter["abstract"], "short");
     assert.equal(page.frontmatter["expires_at"], "2099-01-01");
+    assert.deepEqual(page.frontmatter["source_files"], [
+      { path: "bin/deploy.sh", commit: "3f2a9c1" },
+    ]);
 
     await assert.rejects(
       memory.pages.update("notes/meta.md", async () => {
@@ -127,6 +167,52 @@ describe("pages against a real server", () => {
       PreconditionFailedError,
     );
     assert.equal((await memory.pages.read({ path: "notes/meta.md" })).body, "# Meta\nother writer");
+  });
+
+  it("patch replaces one section and preserves frontmatter", async () => {
+    await memory.pages.write({
+      path: "notes/patch.md",
+      body: "# Status\n## Log\nold\n## Open\none\n",
+      tags: ["living"],
+      abstract: "preserved",
+    });
+    const base = await memory.pages.read({ path: "notes/patch.md" });
+    const log = base.sections.find((section) => section.anchor === "Log");
+    assert.ok(log !== undefined);
+    const patched = await memory.pages.patch({
+      path: "notes/patch.md",
+      expectedPageId: base.pageId,
+      edits: [
+        {
+          op: "replace_section",
+          anchor: "Log",
+          sectionSha256: log.sha256,
+          content: "new",
+        },
+        { op: "append", target: "end_of_page", content: "tail" },
+      ],
+    });
+    const page = await memory.pages.read({ path: "notes/patch.md" });
+    assert.equal(page.pageId, patched.pageId);
+    assert.equal(page.body, "# Status\n## Log\nnew\n## Open\none\ntail\n");
+    assert.deepEqual(page.frontmatter["tags"], ["living"]);
+    assert.equal(page.frontmatter["abstract"], "preserved");
+    await assert.rejects(
+      memory.pages.patch({
+        path: "notes/patch.md",
+        expectedPageId: patched.pageId,
+        edits: [
+          {
+            op: "replace_section",
+            anchor: "Log",
+            sectionSha256: log.sha256,
+            content: "stale",
+          },
+        ],
+      }),
+      InvalidParamsError,
+    );
+    assert.doesNotMatch((await memory.pages.read({ path: "notes/patch.md" })).body, /stale/);
   });
 
   it("superseded versions come back only when asked", async () => {

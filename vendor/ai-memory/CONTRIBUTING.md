@@ -162,6 +162,16 @@ Highlights for contributors:
   access disk directly and must retain their live-process guards. `backup`
   uses the running server's online SQLite backup API.
 
+## Translations
+
+Human CLI and web messages use embedded Fluent catalogs. See
+[interface languages](docs/localization.md) for message ownership, plural and
+escaping rules, adding languages, and the catalog checks. Update every shipped
+language when changing an existing message or CLI help description. A new CLI
+`bail!`, `anyhow!`, `.context` or `diagnostic` message also needs an entry in
+each `diagnostics.ftl`; `every_cli_diagnostic_has_a_catalog_entry` lists any
+that are missing.
+
 ## Versioning and deprecation policy
 
 This project follows [Semantic Versioning](https://semver.org/):
@@ -196,9 +206,9 @@ than the following major release.
 - **Pick the base branch from that impact.** A fix targets `main`. A new
   capability (flag, subcommand, MCP tool, config key, agent harness,
   provider, companion) targets the standing feature branch, currently
-  `release/3.3`. A fix to code that exists only on the feature branch
+  `release/3.5`. A fix to code that exists only on the feature branch
   targets that branch too.
 - **Check what already landed first.** Before opening a PR, look for the
-  issue's closing commit and search `git log origin/main origin/release/3.3`
+  issue's closing commit and search `git log origin/main origin/release/3.5`
   for the feature or fix. A closed issue usually means the work shipped;
   a PR that redoes it gets closed, however good it is.

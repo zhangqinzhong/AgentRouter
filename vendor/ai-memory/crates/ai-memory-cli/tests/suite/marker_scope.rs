@@ -5,9 +5,8 @@
 //! is read from the process environment, and `$HOME` bounds the marker walk,
 //! so both have to be set before the binary starts.
 //!
-//! Each test runs a command that resolves its scope and then fails to reach a
-//! server. That is deliberate: resolution happens first, so the stderr notice
-//! is emitted regardless, and the test never needs a live engine.
+//! Search tests use an unreachable server to inspect the resolution notice.
+//! Mutation tests use a local HTTP stub to inspect the scope sent on the wire.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -176,4 +175,100 @@ fn mounted_scope_cwd_reads_marker_while_host_cwd_keeps_project_identity() {
         stderr.contains("scope acme/cli"),
         "lookup must use the mounted path and naming must use host cwd: {stderr}"
     );
+}
+
+/// An explicitly empty scope in a restore script must not silently target
+/// the same page path in the checkout's project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_page_refuses_empty_scope_flags_without_sending_a_mutation() {
+    let (cwd, data) = marker_tree("workspace = \"checkout-ws\"\nproject = \"checkout-project\"\n");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let seen = requests.clone();
+    let app = axum::Router::new().route(
+        "/admin/restore-page",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            seen.lock().unwrap().push(body);
+            async {
+                axum::Json(serde_json::json!({
+                    "page_id": "0193e7a1-0000-7000-8000-000000000001",
+                    "path": "notes/shared.md",
+                    "restored_from": "HEAD~1"
+                }))
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let restore = |args: &[&str]| {
+        crate::e2e_support::hermetic(bin())
+            .args([
+                "restore-page",
+                "--path",
+                "notes/shared.md",
+                "--from",
+                "HEAD~1",
+            ])
+            .args(args)
+            .current_dir(real_path(&cwd))
+            .env("HOME", real_path(&cwd))
+            .env("AI_MEMORY_DATA_DIR", real_path(&data))
+            .env("AI_MEMORY_SERVER_URL", &base)
+            .output()
+            .expect("running ai-memory restore-page")
+    };
+
+    for flag in ["--workspace", "--project"] {
+        for empty in ["", " \t "] {
+            let output = restore(&[flag, empty]);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{flag} {empty:?} restored a page instead of refusing; requests: {:?}",
+                requests.lock().unwrap()
+            );
+            assert!(
+                stderr.contains(&format!("{flag} was passed empty")),
+                "{stderr}"
+            );
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "an invalid scope reached the server"
+            );
+        }
+    }
+
+    // Omitting scope still intentionally restores in the checkout's project;
+    // naming it explicitly still overrides the marker.
+    for (args, workspace, project) in [
+        (vec![], "checkout-ws", "checkout-project"),
+        (
+            vec!["--workspace", "named-ws"],
+            "named-ws",
+            "checkout-project",
+        ),
+        (
+            vec!["--project", "named-project"],
+            "checkout-ws",
+            "named-project",
+        ),
+        (
+            vec!["--workspace", "named-ws", "--project", "named-project"],
+            "named-ws",
+            "named-project",
+        ),
+    ] {
+        let output = restore(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let request = requests.lock().unwrap().pop().unwrap();
+        assert_eq!(request["workspace"], workspace);
+        assert_eq!(request["project"], project);
+        assert_eq!(request["path"], "notes/shared.md");
+        assert_eq!(request["rev"], "HEAD~1");
+    }
+    server.abort();
 }

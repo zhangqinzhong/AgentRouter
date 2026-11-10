@@ -1,10 +1,14 @@
 # ai-memory configuration.
 #
-# All values can also be overridden via environment variables prefixed
+# Scalar values can also be overridden via environment variables prefixed
 # `AI_MEMORY_` (e.g. `AI_MEMORY_BIND=0.0.0.0:49374`).
 #
 # `data_dir` is intentionally absent here: it's set by `--data-dir`
 # or `AI_MEMORY_DATA_DIR`, and the config file lives inside it.
+
+# Human-facing terminal language: "en" or "pt-BR". --language overrides this.
+# JSON, MCP, stored content and technical diagnostics keep their original format.
+language = "en"
 
 # HTTP bind address used by `ai-memory serve`.
 bind = "127.0.0.1:49374"
@@ -28,8 +32,34 @@ bind = "127.0.0.1:49374"
 # `AI_MEMORY_ALLOWED_HOSTS=homelab,192.168.0.90,localhost,127.0.0.1`.
 allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 
+# Origins allowed to make cross-origin requests to `/api/v1`. Empty (the
+# default) means same-origin only; serving a SPA through `--web-ui-dir` avoids
+# needing CORS at all. When non-empty, the CORS layer is attached to `/api/v1`
+# only, never to `/mcp`, `/hook`, `/admin` or `/web`. Each entry needs a scheme
+# and `*` is rejected. Env equivalent: `AI_MEMORY_CORS_ALLOW_ORIGINS=a,b,c`.
+# cors_allow_origins = []
+
 # Default tracing filter (overridable by RUST_LOG).
 log_level = "info"
+
+# Seconds an accepted `serve` connection sits idle before the OS starts TCP
+# keepalive probes. A hook client's peer can die without sending FIN (laptop
+# sleep, a VPN flap, a killed process); without keepalive that socket stays open
+# and leaks one file descriptor until `accept()` fails. 0 disables keepalive.
+# Env equivalent: `AI_MEMORY_TCP_KEEPALIVE_SECS`.
+# tcp_keepalive_secs = 60
+
+# URL subpath the server is mounted under when a reverse proxy serves it below
+# the root (for example `/wiki`). Thin-client commands prepend it to every
+# `/admin/*` request. Empty for a root-mounted server. `serve` reads the same
+# value from `AI_MEMORY_BASE_PATH` to nest its router.
+# base_path = ""
+
+# Releases URL that `ai-memory upgrade` downloads the archive and its `.sha256`
+# from. Unset uses https://github.com/akitaonrails/ai-memory/releases. Set it
+# for a mirror or a hermetic test. Env equivalent:
+# `AI_MEMORY_RELEASE_BASE_URL`.
+#   release_base_url = "https://mirror.example/ai-memory/releases"
 
 # Optional server-side hook ingest limiter for shared/remote installs. The rate
 # is tokens per second per actor/session source; 0 or unset disables it. Burst
@@ -76,6 +106,122 @@ log_level = "info"
 # queries keep local order. Env equivalent: `AI_MEMORY_RERANKER=llm`.
 # reranker = "llm"
 
+# Seconds one reranker call may take before memory_query keeps its pre-rerank
+# order. Raise it when an LLM fallback chain answers slowly. Must be at least 1.
+# Env equivalent: `AI_MEMORY_RERANK_TIMEOUT_SECS`.
+# rerank_timeout_secs = 20
+
+# --- LLM provider (consolidation, auto-improve, reranker) -----------------
+# With no global or per-task provider, session pages are written heuristically
+# and search needs no provider. A task profile can enable its own LLM features
+# independently. Top-level keys have `AI_MEMORY_` environment equivalents.
+#   llm_provider = "anthropic"   # or openai | gemini | openai-compat |
+#                                # openai-oauth | anthropic-oauth | codex |
+#                                # copilot | opencode | cursor
+#   llm_model    = "..."         # provider-specific model override
+#   llm_base_url = "..."         # endpoint override; required for openai-compat
+
+# Send `response_format=json_schema` (strict) to the `openai-compat` provider.
+# On by default because every structured call supplies its own schema. Turn it
+# off for an endpoint that rejects the field. Env equivalent:
+# `AI_MEMORY_LLM_COMPAT_STRICT=false`.
+# llm_compat_strict = true
+
+# openai-compat only: send `chat_template_kwargs: {"enable_thinking": false}`
+# with every chat request. Thinking-capable local engines (vLLM or SGLang
+# serving a Qwen3-class model) otherwise spend the output budget on a reasoning
+# pass and can truncate the structured payload mid-JSON. Other providers ignore
+# it. Off by default. Env equivalent: `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING`.
+# llm_compat_disable_thinking = false
+
+# openai-compat only: explicitly set the `stream` field on Chat Completions
+# requests. Set to false to prevent gateways defaulting to SSE. Setting true
+# is rejected because this transport cannot decode SSE responses.
+# Unset by default (omits the field). Env equivalent:
+# `AI_MEMORY_LLM_COMPAT_STREAM`.
+#   llm_compat_stream = false
+
+# Per-request timeout in seconds for every chat completion and for the Copilot
+# token exchange. The openai-oauth token refresh keeps its own built-in ceiling.
+# The default tolerates a local engine cold-loading a large model. Raise it for
+# a hosted gateway whose long completions run past it (seen on free aggregator
+# tiers). Env equivalent: `AI_MEMORY_LLM_TIMEOUT_SECS`.
+# llm_timeout_secs = 300
+
+# How many live `bootstrap` runs may call the LLM at once, across projects. A
+# second run for the same project always waits for the first. The default runs
+# one at a time; raise it when the provider batches concurrent requests (a local
+# vLLM or llama.cpp server) to keep it busy while many repositories bootstrap.
+# Env equivalent: `AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT`.
+# bootstrap_max_concurrent = 1
+
+# Reasoning effort sent to the provider. Unset leaves the model default. Values:
+# none, minimal, low, medium, high, xhigh, max, ultra, persistent. Each provider
+# maps the value to its own request field. Env equivalent:
+# `AI_MEMORY_LLM_REASONING_EFFORT`.
+#   llm_reasoning_effort = "medium"
+
+# Extra HTTP headers attached to every LLM chat request, as `Name: Value` or
+# `Name=Value` entries. Empty by default. Use it for a gateway that wants a
+# caller-identifying header; OpenCode asks for `x-opencode-session` and a
+# specific `User-Agent`. Headers ai-memory sets itself (`authorization`,
+# `content-type`, `x-api-key`, ...) are refused at startup. Values are never
+# logged. Env equivalent: `AI_MEMORY_LLM_HEADERS`, set as an array such as
+# `["name=value","name2=value2"]`. A plain comma separated string is rejected.
+# llm_headers = []
+
+# Ordered fallback chain, tried after the primary provider only when a call
+# fails transiently. Empty by default. Each entry needs `provider` and `model`;
+# `base_url` is required for openai-compat. `api_key_env` names the environment
+# variable holding that entry's key. Every provider without a native credential
+# source (OpenAI OAuth, Copilot) must set it, and it is never inherited from the
+# primary provider. A missing provider or model, or an unknown provider, fails
+# config load. A named variable that is unset fails when the server builds the
+# LLM chain. There is no environment shorthand. See docs/llm-provider-fallback.md.
+#   [[llm_fallbacks]]
+#   provider    = "openai-compat"
+#   model       = "poolside/laguna-s-2.1-free"
+#   base_url    = "http://127.0.0.1:49375/v1"
+#   api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"
+
+# Run LLM consolidation on SessionEnd as well as writing the heuristic session
+# page, when an LLM provider is configured. Off by default. The provider call is
+# queued after the session page and handoff are written, then handled outside
+# the hook response by one bounded retrying worker. Without this key the LLM
+# checkpoint runs on PreCompact and through manual `memory_consolidate`. Env
+# equivalent: `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true`.
+# consolidate_on_session_end = false
+
+# When a project's store is empty, the SessionStart hook imports that project's
+# existing local harness session history once, so installing hooks mid-project
+# does not start from nothing. The import is read-only on the local side,
+# sanitized like live capture, and only ever runs against an empty project.
+# On by default; `ai-memory backfill` runs it by hand. Env equivalent:
+# `AI_MEMORY_BACKFILL_ON_START=false`.
+# backfill_on_start = true
+
+# The first `ai-memory run <harness>` launch per harness, binary version and
+# config home installs that harness's lifecycle hooks and MCP server when they
+# are missing. On by default. Turn it off here, with
+# `AI_MEMORY_RUN_AUTOWIRE=false`, or for one launch with
+# `ai-memory run --no-autowire`.
+# run_autowire = true
+
+# `claude_true_yolo` is deprecated and ignored since 3.4.3: `ai-memory run
+# --yolo` on Claude now always forces `bypassPermissions` over any settings
+# `defaultMode`. An older config that sets it still loads; remove the line.
+
+# Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
+# contradiction: same topic without being a near-duplicate. Pages at or above
+# the min and below the max are flagged; at or above the max they count as
+# duplicates (cold-cluster dedup handles those). Unrelated pages in a
+# single-language or single-domain store can already sit above the default min,
+# which makes the band measure topic proximity; raise the min for such a store.
+# Must satisfy 0 <= min < max <= 1. Env equivalents:
+# `AI_MEMORY_CONTRADICTION_BAND_MIN` and `AI_MEMORY_CONTRADICTION_BAND_MAX`.
+# contradiction_band_min = 0.4
+# contradiction_band_max = 0.75
+
 # M8 retention-sweep parameters.
 #
 # Formula:
@@ -98,8 +244,10 @@ log_level = "info"
 # gigabytes a year), while the durable value is the compiled pages. Set
 # observation_retention_days to a positive number to let the sweep delete raw
 # observations older than that — but ONLY for sessions already consolidated into
-# a page that is still live. Unconsolidated sessions, and sessions whose page was
-# evicted by decay, keep every row. 0 (the default) disables the pass entirely.
+# a page that is still live in the project holding those observations.
+# Unconsolidated sessions, sessions whose page was evicted by decay, and the rows
+# a session left in a project with no page of it keep every row. 0 (the default)
+# disables the pass entirely.
 # Pruning is IRREVERSIBLE: observations are the input to consolidation, so a
 # pruned session can never be re-consolidated (a better model, a better prompt,
 # or a fixed consolidator bug make no difference) and its summary page becomes
@@ -129,9 +277,29 @@ log_level = "info"
 # enables on the next start), and existing pages are backfilled
 # automatically at startup. See docs/local-embeddings.md.
 #   embedding_provider = "none"           # opt out (FTS + entity + graph only)
-#   embedding_provider = "openai"         # or voyage | google | openai-compat
+#   embedding_provider = "openai"         # or voyage | google | gemini |
+#                                         # openai-compat | local | copilot | none
 #   embedding_model    = "..."            # provider-specific override
 #   embedding_dim      = 384              # must match the model
+
+# Embedding endpoint and text prefixes (`openai` and `openai-compat`
+# providers). `embedding_base_url` overrides the endpoint and is required for
+# `openai-compat`, which fails without it. `embedding_query_prefix` is
+# prepended to every query before it is embedded and
+# `embedding_document_prefix` to every page. Asymmetric models need
+# the pair their publisher specifies; base E5 models and
+# nvidia/Nemotron-3-Embed-1B-BF16 use "query: " and "passage: ". Instruction-
+# tuned E5 variants and Qwen3-Embedding want a task instruction on the query
+# side only, with exact spacing that differs per model (see
+# docs/llm-providers.md); leave the document prefix unset for them. Prefixes are
+# not trimmed, so a trailing space or newline is kept. Changing the query prefix
+# never needs a re-embed. The document prefix is part of the stored embedding
+# identity, so changing it is treated like a model change and stale rows are
+# picked up without `--force`. Env equivalents: `AI_MEMORY_EMBEDDING_BASE_URL`,
+# `AI_MEMORY_EMBEDDING_QUERY_PREFIX` and `AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX`.
+#   embedding_base_url        = "..."
+#   embedding_query_prefix    = "query: "
+#   embedding_document_prefix = "passage: "
 
 # --- Session lifecycle (server-side) --------------------------------------
 # [sessions] idle_end_after_hours = N (default 0 = off): the maintenance
@@ -156,6 +324,58 @@ observation_retention_days = 0     # 0 = never prune raw observations
 observation_prune_batch = 5000     # rows per prune transaction
 ledger_retention_months = 0        # 0 = never delete hook event ledgers
 
+# Compact a cold episodic page instead of evicting it: keep its L0 abstract, an
+# L1 summary and the L2 keep-token set, and drop the prose. The full body stays
+# in git and in the supersession chain, so the change is reversible. Off by
+# default.
+# compact_cold_episodic = false
+#
+# Collapse near-duplicate cold episodic pages. The forget sweep clusters them by
+# embedding (cosine DBSCAN with an adaptive eps) and keeps one survivor per
+# cluster through supersession plus a merge note. Merged-away members stay
+# reachable and no generative LLM is called. Needs an embedder; without one it
+# does nothing. Off by default.
+# dedup_cold_clusters = false
+# dedup_min_pts = 0      # DBSCAN density floor; 0 uses 2
+# dedup_max_eps = 0.0    # ceiling on eps (cosine distance); 0.0 uses 0.15
+#                        # (similarity 0.85). Lower merges less.
+#
+# Per-tier half-lives in days. A tier that sets one decays at
+# lambda = ln(2) / days; a tier that leaves it unset keeps the scalar `lambda`,
+# so with none set every score matches the single-lambda behaviour. Each value
+# must be a finite number above zero. Tiers: working, episodic, semantic,
+# procedural.
+#   [decay.half_life_days]
+#   episodic = 180.0
+
+# Per-task LLM profiles are optional. Tasks: consolidation, bootstrap,
+# auto_improve, experience, dream, lint, profile, rerank and query_answer.
+# query_answer covers memory_query(answer=true) and memory_explore.
+# An unset task shares the default provider and its fallback chain. A task
+# profile can also work without a global llm_provider; unrelated tasks remain
+# without a provider. Each task chain uses only its own fallbacks.
+#
+# provider is required and nonblank. model defaults to the selected provider's
+# model; openai-compat requires both model and base_url. A task does not inherit
+# the global endpoint. api_key_env names an environment variable, never a key
+# value; when omitted, the provider uses its normal credential source. OpenAI
+# OAuth, Codex and Cursor reject api_key_env and keep their native login.
+# A named variable that is missing fails serve startup. Timeout, compatibility
+# options, headers and reasoning effort remain global.
+#
+# Nested scalar environment overrides use double underscores, for example
+# AI_MEMORY_LLM__BOOTSTRAP__PROVIDER. Fallback lists are config-only.
+#   [llm.bootstrap]
+#   provider = "openai-compat"
+#   model = "local-model"
+#   base_url = "http://127.0.0.1:49375/v1"
+#   api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"
+#
+#   [[llm.bootstrap.fallbacks]]
+#   provider = "gemini"
+#   model = "gemini-3.5-flash"
+#   api_key_env = "GEMINI_API_KEY"
+#
 # NOTE: commented example tables stay below the first real table, where the
 # top-level keys have ended. A `[table]` header owns every key after it, so an
 # example table uncommented above a top-level key would silently capture it.
@@ -206,6 +426,24 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 # default (nothing dropped).
 # Env equivalent: AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
 # drop_events = ["pre-tool-use"]
+#
+# Name each tool call in its observation instead of only its family: the title
+# `tool non-file` becomes `tool non-file: Bash`, and a Claude Code `Skill` or
+# `Agent` call also keeps the skill or subagent type it ran. Session pages and
+# handoffs then count calls by name. Only identifiers are kept, never a tool's
+# arguments (a shell command, a prompt, a path), and a call a capture policy
+# reduced to metadata stays unnamed. Off by default.
+# Env equivalent: AI_MEMORY_INGEST__RECORD_TOOL_NAMES=true
+# record_tool_names = true
+#
+# Store the checkout-relative path of the one file a kept file-tool call named
+# (native hook client and generated TypeScript integrations), so the store can
+# answer which sessions touched a file. A path an `ignore_paths` entry excludes
+# never leaves the machine. The `file_path_*` counters in `/admin/status` and
+# `/admin/metrics` say why the other file-tool events got no path. Off by
+# default.
+# Env equivalent: AI_MEMORY_INGEST__INDEX_FILE_PATHS=true
+# index_file_paths = true
 
 # Privacy strip.
 #
@@ -267,6 +505,18 @@ per_user = false
 [consolidation]
 max_input_tokens = 100000
 max_output_tokens = 32000
+#
+# Also send bounded literal excerpts of observations the normal projection
+# omitted or truncated. Off by default because it widens the captured text that
+# reaches the provider.
+# verbatim_residue = false
+#
+# Multiplier on the max_input_tokens budget, above 0 and at most 1.
+# max_input_tokens is a flat chars-per-token estimate, so it under-budgets denser
+# corpora: pt-BR text and source code tokenize at fewer characters per token
+# than English and can overshoot a provider's real input limit by about 40%.
+# Lower the margin for a corpus that is mostly non-English or code (#884).
+# input_token_safety_margin = 0.8
 
 # Auto-improvement reviewer.
 #
@@ -290,15 +540,48 @@ max_proposals_per_run = 5
 include_raw_fallback = false
 proposal_actor = "auto_improve"
 pending_path = "_pending/auto-improve"
+#
+# Also schedule a reviewer run on SessionEnd. Off by default so hooks stay
+# cheap and fire-and-forget.
+# on_session_end = false
+#
+# Wiki folder prefixes whose page bodies the reviewer may read. A project that
+# keeps durable knowledge elsewhere (`decisions/`, `gotchas/`) can add those
+# folders so the reviewer stops proposing what is already written there (#834).
+# max_patchable_pages caps how many existing pages are included as context for
+# patch proposals, and max_patchable_body_chars caps the body rendered per page.
+# patchable_page_prefixes = ["_rules/", "procedures/"]
+# max_patchable_pages = 8
+# max_patchable_body_chars = 8000
+#
+# Size limits on patch proposals. Raise them only when validated proposals are
+# being rejected for size. max_final_body_chars is also capped at 32000 in
+# code, so a higher value has no effect; lower it to tighten the limit.
+# max_edits_per_proposal = 5
+# max_edit_content_chars = 4000
+# max_changed_chars_per_proposal = 12000
+# max_patch_edits_per_run = 8
+# max_final_body_chars = 32000
+# max_rule_page_tokens = 2000
+# max_procedure_page_tokens = 2000
+#
+# Recent rejection-buffer entries rendered into the review prompt, and how old
+# an entry may be, in days, to still be rendered.
+# max_rejection_context = 50
+# rejection_context_days = 180
 
-# Optional executable evaluation gate for selected proposal targets. Disabled by
-# default; operators supply the command and scoring policy. The command is run
-# directly (not through a shell), split on whitespace, with JSON on stdin. Use a
-# wrapper script for paths with spaces, custom environment, or multiple commands.
-# It must print JSON such as { "score_before": 0.72, "score_after": 0.76, "passed": true }.
+# Optional evaluation gate for selected proposal targets. Disabled by default;
+# choose either the built-in structural scorer or an external command. A command
+# is run directly (not through a shell), split on whitespace, with JSON on stdin.
+# Use a wrapper script for paths with spaces, custom environment, or multiple
+# commands. It must print JSON such as
+# { "score_before": 0.72, "score_after": 0.76, "passed": true }.
+# Set builtin = "structure" to run the built-in checks in process instead;
+# builtin and command are mutually exclusive.
 [auto_improve.eval]
 enabled = false
 command = ""
+builtin = ""
 timeout_secs = 120
 targets = ["_rules", "procedures"]
 min_delta = 0.0
@@ -316,6 +599,22 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project
 min_session_age_secs = 600
+
+# Pre-filter for the experience pass (A4): skip session pages that carry little
+# information instead of sending them to consolidation. A skipped page is left
+# alone and never deleted. Off by default. A page is skipped as near-empty
+# below min_chars non-whitespace characters, as low entropy below
+# min_entropy_bits_per_char (Shannon entropy per character, finite and at least
+# 0), and as repetitive when 1 - distinct_tokens / total_tokens exceeds
+# max_repetition_ratio (0.0 to 1.0). The repetition check starts once a body
+# has repetition_min_tokens tokens, so a short terse note is never judged
+# repetitive.
+# [auto_improve.scheduler.experience_entropy_filter]
+# enabled = false
+# min_chars = 16
+# min_entropy_bits_per_char = 2.0
+# max_repetition_ratio = 0.7
+# repetition_min_tokens = 6
 
 # How a mid-session event is attributed when the agent's cwd has moved since
 # the session started. Session-CREATING events always resolve from their own
@@ -348,6 +647,214 @@ mid_session = "follow-cwd"
 #
 # [auto_scope]
 # mode = "per_actor"
+#
+# Lifetime in seconds of an entry in the per_session and per_actor maps. 0 uses
+# the default of one hour. max_entries is a hard cap on the map size, evicting
+# the oldest insertions first; lower it on a very small install and raise it on
+# a shared server with many concurrent agents. Env equivalents:
+# `AI_MEMORY_AUTO_SCOPE__SESSION_TTL_SECS` and
+# `AI_MEMORY_AUTO_SCOPE__MAX_ENTRIES`.
+# session_ttl_secs = 3600
+# max_entries = 4096
+
+# Managed `ai-memory run` launches. require_server makes a launch fail when the
+# server is unreachable instead of continuing without one
+# (docs/managed-workstreams.md). Off by default. The `--require-server` flag
+# requests it for one launch, and `AI_MEMORY_RUN_REQUIRE_SERVER=true` for an
+# environment; the variable can only turn it on.
+#
+# exit_prompt offers the switch and rerun menu after a successful interactive
+# session. On by default; `run --no-exit-prompt` skips it for one launch and
+# `AI_MEMORY_RUN_EXIT_PROMPT=false` for an environment.
+# [run]
+# require_server = false
+# exit_prompt = true
+
+# Client-side hook spool retry policy. max_attempts is the number of failed
+# drain passes before a spooled hook event is dropped. 0 disables the limit.
+# Env equivalent: `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS`.
+# [hook_spool]
+# max_attempts = 8
+
+# Session handoff delivery and creation. Both keys apply to every operator on
+# the server.
+#
+# claim_on_session_start true (the default) makes a SessionStart that finds a
+# pending handoff claim it automatically. False makes it render a notice with
+# the handoff id, `from_agent` and age, never the stored summary, and the agent
+# claims it with `memory_handoff_accept`. Set false so an unrelated next
+# session or a non-interactive launch cannot consume a handoff meant for
+# another session (#959).
+#
+# create_on_session_end true (the default) makes ending an unmanaged session
+# create an automatic open handoff. False still writes the session summary page
+# and queues consolidation but creates no handoff (#1043). Handoffs from
+# `memory_handoff_begin` and managed runs are unaffected.
+# [handoff]
+# claim_on_session_start = true
+# create_on_session_end = true
+
+# Scheduled server jobs. `enabled` is the master switch. The interval keys are
+# in seconds and 0 disables that job. The forget sweep and lint persist their
+# cadence across restarts, and overdue work starts after a bounded startup
+# delay. Embedding backfill is off by default because it may call a paid
+# provider.
+#
+# reconcile_tombstones_deleted_pages (#929, docs/okf.md) lets the watcher's 30s
+# reconcile pass tombstone an OKF-imported content page whose file was missing
+# on two consecutive passes. Session summary pages are excluded. A circuit
+# breaker skips a scope where more than max(3, 50%) of the candidate pages look
+# missing at once, or where a non-partial walk finds nothing, because that
+# points to an unmounted volume or a git checkout mid-walk. A tombstone stays
+# subject to the `hard_delete_after_days` sweep, but is never destroyed while
+# its chain has no successor, and a returning file re-links to the chain. Off by
+# default: deletions still need `ai-memory delete-page`.
+# [maintenance]
+# enabled = true
+# forget_sweep_interval_secs = 86400
+# lint_interval_secs = 86400
+# embedding_backfill_interval_secs = 0
+# reconcile_tombstones_deleted_pages = false
+
+# Opt-in LLM "dream" pass: rewrite and merge clusters of cold pages with the
+# configured provider. It runs only when `enabled` is true and both an LLM
+# provider and an embedder are configured. It starts after the operator has been
+# idle for idle_window_secs, cancels when activity returns, and never deletes a
+# source page. Off by default. In the numeric keys below, 0 selects the
+# built-in default named in the comment. Env equivalents:
+# `AI_MEMORY_DREAM__ENABLED=true` and `AI_MEMORY_DREAM__IDLE_WINDOW_SECS=600`.
+# [dream]
+# enabled = false
+# interval_secs = 3600         # how often the scheduler considers a run; 0 uses 3600
+# idle_window_secs = 0         # quiet seconds before a run starts; 0 uses 300
+# min_pts = 0                  # DBSCAN density floor; 0 uses 2
+# max_eps = 0.0                # eps ceiling (cosine distance); 0.0 uses 0.15
+# max_clusters_per_run = 0     # clusters rewritten per run; 0 uses 8
+# min_cold_pages = 0           # cold pages needed before a run works; 0 uses 2
+
+# Ranking signals layered on the RRF fusion in `memory_query`. Only
+# observation_stream is on by default. With observation_stream off, the other
+# defaults leave ranking identical to a store that never had this section. Env
+# equivalents: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
+# `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true` and
+# `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
+#
+# query_intent routes queries phrased as a search for a past session ("last
+# time", "yesterday", and the Chinese equivalents). Session pages normally pay a
+# kind and tier authority penalty in ranking, and while the routing fires they
+# do not. session_recall_bonus adds authority on top of that cancellation.
+#
+# abstract_vectors adds the L0 abstract-embedding stream to the fusion. A page
+# gets an abstract vector when its frontmatter carries `abstract:` and the
+# embedding backfill runs.
+#
+# belief_authority_weight folds a page's evidence-derived confidence into its
+# authority factor. 0.0 is inert and negative values are clamped to 0.
+#
+# observation_stream lets matching observation bodies vote, once per session,
+# for that session's latest `sessions/<id>.md` page in the same project. It
+# reads observations and writes nothing. False restores the previous ranking.
+#
+# feedback_demotion subtracts its weight from the authority factor of a page
+# whose current version carries open `stale`/`wrong` feedback, until a rewrite
+# supersedes that version and clears the flag with it. helpful and not_helpful
+# never demote. 0.0 (the default) is inert and negative values are clamped to 0.
+#
+# query_signal_weight is the query-scoped implicit-signal boost: when a
+# memory_query hit is followed in the same agent session by a memory_read_page
+# of that path (or a `helpful` feedback signal), the pair is stored as a
+# (normalized query -> page) association — sanitized, scoped to the project and
+# purged with it or with the session that wrote it. Only callers with write
+# access to the project record one, only session-aware MCP clients (those that
+# send a session id) produce them, and `not_helpful` right after the query
+# withdraws it. A later query lexically similar to a stored query gives that
+# page up to `weight * similarity` in authority, similarity-capped, so an
+# unrelated query gains nothing. 0.0 (the default) also stops the capture: no
+# queries are stored while the boost is off.
+# [retrieval]
+# query_intent = false
+# session_recall_bonus = 0.25
+# abstract_vectors = false
+# belief_authority_weight = 0.0
+# observation_stream = true
+# feedback_demotion = 0.0
+# query_signal_weight = 0.0
+
+# Words dropped from a bare natural-language FTS query before the terms are
+# OR-joined. Unset uses the built-in English list. `[]` turns the filter off. A
+# non-empty list replaces the built-in one. A wiki in another language should
+# list that language's function words: with only the English list, words such
+# as `de`, `que` and `em` reach BM25 scoring and skew it (#953). Matching folds
+# case but keeps diacritics, and it sees the characters as typed, so list every
+# spelling someone might type (Portuguese `e` and `é`). Entries are single words
+# of at most 64 characters, and the list holds at most 2000 entries. Env
+# equivalent: `AI_MEMORY_SEARCH_FTS_STOPWORDS=a,b,c`; a blank value is ignored.
+# [search.fts]
+#   stopwords = ["e", "é", "de", "que", "em", "uma"]
+
+# Estimated token budget for the evidence memory_query(answer=true) sends to
+# the model, counting each UTF-8 byte as one token. Unset (the default) admits
+# every hit. Evidence that does not fit is reported in answer_context, and zero
+# or a too-small value prevents synthesis. Env equivalent:
+# `AI_MEMORY_QUERY_ANSWER__MAX_CONTEXT_TOKENS`.
+# [query_answer]
+#   max_context_tokens = 16000
+
+# Cross-project profile: how you usually work, delivered to every project as
+# defaults below the repository's rules file (docs/cross-project-profile.md).
+# Env equivalents have the form `AI_MEMORY_PROFILE__<KEY>`, for example
+# `AI_MEMORY_PROFILE__SHARE`.
+#
+# enabled is "auto" (the default), true or false. Auto turns the profile on for
+# a single-operator server and leaves it off for a multi-user one.
+#
+# share picks where the profile lives: "global" (one profile for the server, in
+# `default/_global`), "workspace" (one per workspace, in its `_profile`
+# project), "user" (one private profile per operator) or "off". The default,
+# "auto", means global on a single-operator server and user on a multi-user one.
+#
+# min_projects is the number of distinct projects a choice must appear in to
+# become an entry. inject_on_session_start delivers the digest at SessionStart.
+# digest_max_bytes caps that digest (clamped to 1500 through 12000) and
+# baseline_max_bytes caps it for a project with no pages yet (clamped to 2000
+# through 20000). apply_max_lines is the most lines `ai-memory profile apply`
+# writes into a rules file. llm lets the profile use the configured LLM
+# provider when there is one.
+# [profile]
+# enabled = "auto"
+# share = "auto"
+# min_projects = 2
+# inject_on_session_start = true
+# digest_max_bytes = 3000
+# baseline_max_bytes = 6000
+# apply_max_lines = 40
+# max_output_tokens = 2000
+# llm = true
+
+# Admission webhooks: synchronous HTTP hooks the server calls just before it
+# persists a page (docs/admission-webhooks.md). Empty by default, so no chain is
+# attached. name is a stable identifier used in loop-prevention skip lists and
+# log fields. url is the endpoint the payload is POSTed to. timeout_ms is the
+# per-request timeout (default 2000). failure_policy is what happens when the
+# webhook answers 4xx or 5xx or does not respond: "ignore" (the default) logs a
+# warning and continues with the unmodified page, "reject" aborts the write.
+# events is required and lists the operations the webhook subscribes to; an
+# empty list means it never fires. Values: write_page, consolidate, delete,
+# delete_event_ledger, purge_project, purge_session, purge_workspace,
+# move_project, move_session, handoff_begin, handoff_accept, handoff_cancel,
+# message_send, message_pop, message_cancel. blocking (default true) runs the
+# webhook inside the write path, where it can change the page and a rejection
+# aborts the write. With blocking = false the webhook is called after the page
+# lands, its response is ignored, and a slow or down mirror adds no latency to
+# writes. `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` takes a JSON array of the same
+# fields and replaces the list from this file.
+#   [[admission_webhooks]]
+#   name           = "contributors"
+#   url            = "http://contributors-webhook.memory.svc.cluster.local/enrich"
+#   timeout_ms     = 2000
+#   failure_policy = "ignore"
+#   blocking       = true
+#   events         = ["write_page", "consolidate"]
 
 # NOTE: `[auth]` must remain the LAST section in this template.
 # `ai-memory init` appends further `[auth]` keys (token_pepper, root_username,
@@ -366,3 +873,15 @@ mid_session = "follow-cwd"
 # resets the configured root_username via POST /auth/recovery.
 [auth]
 secure_cookie = false
+
+# Create new projects as `restricted`. The default is `open`, which admits every
+# authenticated user. A restricted project admits only its creator (granted
+# `write`) and root until someone grants others access. Existing projects keep
+# their access; restrict one with `ai-memory project access`. The reserved
+# `scratch` and global-preferences projects always stay open (#708).
+# new_projects_restricted = false
+
+# CIDRs allowed to supply `X-Forwarded-For` for login rate limiting. A bare
+# address counts as /32 or /128. The environment variable above takes a comma
+# separated list.
+#   trusted_proxy_cidrs = ["10.0.0.0/8"]

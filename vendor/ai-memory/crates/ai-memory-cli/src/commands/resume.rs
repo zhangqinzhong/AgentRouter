@@ -33,14 +33,15 @@ struct Candidate {
 /// Interactively select a workstream in the current checkout, or in every
 /// locally linked checkout with `--all`.
 pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
+    let i18n = &config.i18n;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!(
-            "`ai-memory resume` needs a terminal; use `ai-memory workstreams` to list a checkout in scripts"
-        );
+            "{}", i18n.text("cli-resume-ai-memory-resume-needs-a-terminal-use-ai-memory-workstreams-to-list-a-checko"));
     }
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let cwd = std::env::current_dir().context("reading the current checkout")?;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
+    let cwd =
+        std::env::current_dir().context(i18n.text("cli-resume-reading-the-current-checkout"))?;
     let candidates = if args.all {
         candidates_across_checkouts(config, &endpoint, &args, &cwd).await?
     } else {
@@ -54,9 +55,10 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
         .map(|candidate| choice_for(candidate, None))
         .collect::<Vec<_>>();
     let Some(index) = select_with_horizontal(
-        "Resume workstream",
+        i18n,
+        &i18n.text("cli-picker-resume-title"),
         &mut choices,
-        "left/right harness",
+        &i18n.text("cli-picker-horizontal-hint"),
         args.search.as_deref(),
         &mut |index, direction, choice| {
             let harness =
@@ -69,21 +71,44 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
     };
     let selected = &candidates[index];
     let target = continue_session::resolve_target(config, &selected.link)?;
+    let endpoint = continue_session::endpoint_for_link(config, &selected.link, &target).await?;
+    let project_id = project_registry::project_binding(
+        config,
+        &endpoint,
+        &selected.link.workspace,
+        &selected.link.project,
+        &target,
+    )?
+    .map(|scope| scope.project_id);
     let harness = selected_harness(harness_indices[index], &harnesses);
     eprintln!(
-        "resuming workstream '{}' with harness '{}' in {} at {}",
-        terminal_text(&selected.summary.name),
-        harness
-            .map(harness_name)
-            .unwrap_or_else(|| "auto".to_owned()),
-        scope_label(&selected.link),
-        terminal_text(&selected.target.to_string_lossy())
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-resume-resuming-workstream-with-harness-in-at",
+            &[
+                ("value0", terminal_text(&selected.summary.name).to_string()),
+                (
+                    "value1",
+                    harness
+                        .map(harness_name)
+                        .unwrap_or_else(|| "auto".to_owned())
+                        .to_string()
+                ),
+                ("value2", scope_label(&selected.link).to_string()),
+                (
+                    "value3",
+                    terminal_text(&selected.target.to_string_lossy()).to_string()
+                )
+            ]
+        )
     );
     crate::commands::run::run_from(
         config,
         RunArgs {
             workspace: Some(selected.link.workspace.clone()),
-            project: Some(selected.link.project.clone()),
+            project: project_id.is_none().then(|| selected.link.project.clone()),
+            project_id,
             workstream: Some(selected.summary.name.clone()),
             new_workstream: None,
             executable: None,
@@ -91,9 +116,12 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             true_yolo: args.true_yolo,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: args.fresh,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env: Vec::new(),
@@ -113,6 +141,7 @@ async fn candidates_for_checkout(
     args: &ResumeArgs,
     cwd: &Path,
 ) -> Result<Vec<Candidate>> {
+    let i18n = &config.i18n;
     let link = current_checkout_link(config, endpoint, cwd)?;
     if args
         .workspace
@@ -120,18 +149,36 @@ async fn candidates_for_checkout(
         .is_some_and(|workspace| workspace != link.workspace)
     {
         bail!(
-            "current checkout belongs to {}, not workspace '{}'",
-            scope_label(&link),
-            terminal_text(args.workspace.as_deref().unwrap_or_default())
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-resume-current-checkout-belongs-to-not-workspace",
+                &[
+                    ("value0", scope_label(&link).to_string()),
+                    (
+                        "value1",
+                        terminal_text(args.workspace.as_deref().unwrap_or_default()).to_string()
+                    )
+                ]
+            )
         );
     }
-    let summaries =
-        workstreams::list_all_for_checkout(endpoint, &link.workspace, &link.project, &link.path)
-            .await?;
+    let summaries = workstreams::list_all_for_checkout(
+        config,
+        endpoint,
+        &link.workspace,
+        &link.project,
+        &link.path,
+    )
+    .await?;
     if summaries.is_empty() {
         bail!(
-            "no managed workstreams for the current checkout ({}); launch one here with `ai-memory run <harness>` first",
-            scope_label(&link)
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-resume-no-managed-workstreams-for-the-current-checkout-launch-one-here-with-ai-memo",
+                &[("value0", scope_label(&link).to_string())]
+            )
         );
     }
     let mut candidates = summaries
@@ -156,6 +203,7 @@ async fn candidates_across_checkouts(
     args: &ResumeArgs,
     cwd: &Path,
 ) -> Result<Vec<Candidate>> {
+    let i18n = &config.i18n;
     let mut links = project_registry::links_for_server(config, endpoint)?;
     match current_checkout_link(config, endpoint, cwd) {
         Ok(current) => {
@@ -168,8 +216,12 @@ async fn candidates_across_checkouts(
             }
         }
         Err(error) => eprintln!(
-            "skipping current checkout: {}",
-            terminal_text(&format!("{error:#}"))
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-resume-skipping-current-checkout",
+                &[("value0", terminal_text(&format!("{error:#}")).to_string())]
+            )
         ),
     }
     let mut candidates = Vec::new();
@@ -184,15 +236,22 @@ async fn candidates_across_checkouts(
             Ok(target) => target,
             Err(error) => {
                 eprintln!(
-                    "skipping {}: {}",
-                    scope_label(&link),
-                    terminal_text(&error.to_string())
+                    "{}",
+                    crate::localization::format(
+                        i18n,
+                        "cli-continue-session-skipping-label",
+                        &[
+                            ("value0", scope_label(&link).to_string()),
+                            ("value1", terminal_text(&error.to_string()).to_string())
+                        ]
+                    )
                 );
                 skipped += 1;
                 continue;
             }
         };
         let summaries = match workstreams::list_all_for_checkout(
+            config,
             endpoint,
             &link.workspace,
             &link.project,
@@ -203,9 +262,15 @@ async fn candidates_across_checkouts(
             Ok(summaries) => summaries,
             Err(error) => {
                 eprintln!(
-                    "skipping {}: could not list managed workstreams ({})",
-                    scope_label(&link),
-                    terminal_text(&format!("{error:#}"))
+                    "{}",
+                    crate::localization::format(
+                        i18n,
+                        "cli-resume-skipping-could-not-list-managed-workstreams",
+                        &[
+                            ("value0", scope_label(&link).to_string()),
+                            ("value1", terminal_text(&format!("{error:#}")).to_string())
+                        ]
+                    )
                 );
                 skipped += 1;
                 continue;
@@ -231,7 +296,12 @@ async fn candidates_across_checkouts(
             )
         };
         bail!(
-            "no managed workstreams are available ({detail}); launch one with `ai-memory run <harness>` first"
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-resume-no-managed-workstreams-are-available-detail-launch-one-with-ai-memory-run-ha",
+                &[("value0", detail.to_string())]
+            )
         );
     }
     order_candidates(&mut candidates);

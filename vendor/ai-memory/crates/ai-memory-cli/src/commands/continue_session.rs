@@ -24,22 +24,25 @@ use crate::http_client::ServerEndpoint;
 
 /// Resolve the newest still-valid checkout and continue it.
 pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let i18n = &config.i18n;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let links = project_registry::links_for_server(config, &endpoint)?;
     let candidates = filter_workspace(links, args.workspace.as_deref());
     if candidates.is_empty() {
         bail!(
-            "no managed checkout is linked for this server yet; \
-             launch one with `ai-memory show` or `ai-memory run <harness>` first"
-        );
+            "{}", i18n.text("cli-continue-session-no-managed-checkout-is-linked-for-this-server-yet-launch-one-with-ai-memory"));
     }
 
     let (candidates, invalid_timestamps) = newest_first(candidates);
     let mut rejected = invalid_timestamps.len();
     for link in invalid_timestamps {
         eprintln!(
-            "skipping {}: client registry has an invalid linked_at timestamp",
-            scope_label(&link)
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-continue-session-skipping-client-registry-has-an-invalid-linked-at-timestamp",
+                &[("value0", scope_label(&link).to_string())]
+            )
         );
     }
     for link in candidates {
@@ -53,21 +56,50 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 // stripped like every other stored string before it reaches
                 // the terminal.
                 let label = scope_label(&link);
-                eprintln!("skipping {label}: {}", terminal_text(&reason.to_string()));
+                eprintln!(
+                    "{}",
+                    crate::localization::format(
+                        i18n,
+                        "cli-continue-session-skipping-label",
+                        &[
+                            ("value0", label.to_string()),
+                            ("value1", terminal_text(&reason.to_string()).to_string())
+                        ]
+                    )
+                );
                 rejected += 1;
                 continue;
             }
         };
         eprintln!(
-            "continuing {} in {}",
-            scope_label(&link),
-            terminal_text(&target.to_string_lossy())
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-continue-session-continuing-in",
+                &[
+                    ("value0", scope_label(&link).to_string()),
+                    (
+                        "value1",
+                        terminal_text(&target.to_string_lossy()).to_string()
+                    )
+                ]
+            )
         );
+        let endpoint = endpoint_for_link(config, &link, &target).await?;
+        let project_id = project_registry::project_binding(
+            config,
+            &endpoint,
+            &link.workspace,
+            &link.project,
+            &target,
+        )?
+        .map(|scope| scope.project_id);
         return crate::commands::run::run_from(
             config,
             RunArgs {
                 workspace: Some(link.workspace),
-                project: Some(link.project),
+                project: project_id.is_none().then_some(link.project),
+                project_id,
                 workstream: None,
                 new_workstream: None,
                 executable: None,
@@ -75,9 +107,12 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 true_yolo: args.true_yolo,
                 jail: None,
                 no_jail: false,
+                jail_map: Vec::new(),
+                jail_rw_map: Vec::new(),
                 fresh: args.fresh,
                 force_unlock: false,
                 no_autowire: false,
+                no_exit_prompt: false,
                 require_server: false,
                 profile: None,
                 env: Vec::new(),
@@ -94,9 +129,12 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
     }
 
     bail!(
-        "no linked checkout is still usable ({} skipped); \
-         pick one explicitly with `ai-memory show`",
-        rejected
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-continue-session-no-linked-checkout-is-still-usable-skipped-pick-one-explicitly-with-ai-memor",
+            &[("value0", format!("{}", rejected))]
+        )
     )
 }
 
@@ -134,6 +172,22 @@ fn linked_at(link: &ProjectLink) -> Option<jiff::Timestamp> {
     link.linked_at.parse().ok()
 }
 
+/// A registry entry and its workstream belong to one server. Recheck the
+/// selected checkout before reusing that server's project id or run name.
+pub(super) async fn endpoint_for_link(
+    config: &Config,
+    link: &ProjectLink,
+    target: &std::path::Path,
+) -> Result<ServerEndpoint> {
+    let endpoint = ServerEndpoint::for_checkout_at(config, target).await?;
+    if endpoint.identity() != link.server {
+        bail!(
+            "this checkout now selects a different server; run `ai-memory run` there to link it before resuming"
+        );
+    }
+    Ok(endpoint)
+}
+
 /// Revalidate a stored checkout before launching anything inside it.
 ///
 /// Both checks matter. The path check rejects a directory that moved or was
@@ -141,13 +195,32 @@ fn linked_at(link: &ProjectLink) -> Option<jiff::Timestamp> {
 /// exists but now resolves to a different project, which would otherwise
 /// file this session's memory under the wrong scope.
 pub(super) fn resolve_target(config: &Config, link: &ProjectLink) -> Result<PathBuf> {
+    let i18n = &config.i18n;
     let path = validate_registered_path(&link.path)?;
     let (workspace, project) = super::resolve_scope_for_path(config, &path)?;
     if workspace != link.workspace || project != link.project {
+        let bound = project_registry::project_binding_for_server(
+            config,
+            &link.server,
+            &workspace,
+            &project,
+            &path,
+        )?;
+        if bound
+            .is_some_and(|scope| scope.workspace == link.workspace && scope.project == link.project)
+        {
+            return Ok(path);
+        }
         bail!(
-            "checkout now resolves to {}/{}",
-            terminal_text(&workspace),
-            terminal_text(&project)
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-continue-session-checkout-now-resolves-to",
+                &[
+                    ("value0", terminal_text(&workspace).to_string()),
+                    ("value1", terminal_text(&project).to_string())
+                ]
+            )
         );
     }
     Ok(path)
@@ -255,6 +328,38 @@ mod tests {
             path,
             linked_at: "2026-08-01T09:00:00Z".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_retargeted_checkout_cannot_reuse_another_servers_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = make_project(tmp.path(), "app");
+        let mut config = config_at(&tmp.path().join("data"));
+        config.auth.bearer_token = Some("INSTALL-TOKEN".into());
+        let mut link = link_to(project.clone(), "default", "app");
+        assert!(endpoint_for_link(&config, &link, &project).await.is_ok());
+
+        crate::server_profiles::add(
+            &config.data_dir,
+            &crate::server_profiles::ProfileName::parse("selected").unwrap(),
+            "http://127.0.0.1:49375/memory",
+            &[project.to_string_lossy().into_owned()],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        std::fs::write(project.join(".ai-memory.toml"), "server = \"selected\"\n").unwrap();
+        let error = endpoint_for_link(&config, &link, &project)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different server"), "{error}");
+        assert!(!error.contains("TOKEN"), "{error}");
+
+        link.server = "http://127.0.0.1:49375/memory".into();
+        let endpoint = endpoint_for_link(&config, &link, &project).await.unwrap();
+        assert_eq!(endpoint.auth_token.as_deref(), Some("PROFILE-TOKEN"));
+        link.server = "http://127.0.0.1:49375/another-mount".into();
+        assert!(endpoint_for_link(&config, &link, &project).await.is_err());
     }
 
     #[test]

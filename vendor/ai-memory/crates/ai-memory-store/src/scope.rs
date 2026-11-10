@@ -532,6 +532,41 @@ pub async fn lookup_existing_scope_guarded(
     authorize_scope_for(reader, None, scope, viewer, need).await
 }
 
+/// Resolve an existing ID inside the named workspace, then authorize it.
+/// Never creates a workspace/project or falls back to a name on refusal.
+///
+/// # Errors
+/// Missing coordinates, insufficient access, or a store failure.
+pub async fn lookup_project_id_guarded(
+    reader: &ReaderPool,
+    workspace: &str,
+    project_id: ProjectId,
+    viewer: Option<UserId>,
+    need: ProjectAccess,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let workspace_id = lookup_existing_workspace(reader, workspace).await?;
+    let Some(project) = reader.project_name_by_id(workspace_id, project_id).await? else {
+        return Err(ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: workspace.to_owned(),
+            project: project_id.to_string(),
+        });
+    };
+    if need == ProjectAccess::Write {
+        refuse_foreign_profile_name(Some(workspace), &project, viewer)?;
+    }
+    authorize_scope_for(
+        reader,
+        None,
+        ResolvedScope {
+            workspace_id,
+            project_id,
+        },
+        viewer,
+        need,
+    )
+    .await
+}
+
 /// [`create_explicit_scope`] on behalf of `viewer`, authorized for a write.
 /// Returns promotion metadata that the runtime caller must use to refresh the
 /// scope manifest after the SQL transaction commits.

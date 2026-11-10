@@ -8,7 +8,8 @@ use std::str::FromStr as _;
 
 use ai_memory_core::{
     AgentKind, AuthLevel, Capability, FinishManagedRunRequest, FinishManagedRunResponse,
-    LinkManagedRunRequest, ListManagedWorkstreamsRequest, ManagedRunContextResponse, ManagedRunId,
+    LinkManagedRunRequest, ListManagedWorkstreamsRequest, ManagedProjectCandidatesRequest,
+    ManagedProjectCandidatesResponse, ManagedProjectScope, ManagedRunContextResponse, ManagedRunId,
     ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity, NewWorkstreamEvent,
     PrepareManagedRunRequest, PrepareManagedRunResponse, RenameManagedWorkstreamRequest,
     RenamedManagedWorkstream, Sanitizer, WorkstreamEventKind, WorkstreamId,
@@ -16,7 +17,7 @@ use ai_memory_core::{
 use ai_memory_store::{
     FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, RenameWorkstream, ScopeResolutionError,
     StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle, authorize_scope_for,
-    create_explicit_scope_guarded, lookup_existing_scope_guarded,
+    create_explicit_scope_guarded, lookup_existing_scope_guarded, lookup_project_id_guarded,
 };
 use ai_memory_wiki::Wiki;
 use axum::extract::{Path as AxumPath, Query, State};
@@ -91,6 +92,7 @@ pub fn workstream_router(state: WorkstreamState) -> Router {
             post(recover_finish_run),
         )
         .route("/workstream/recent", post(list_recent_workstreams))
+        .route("/workstream/project-candidates", post(project_candidates))
         .route("/workstream/rename", post(rename_workstream))
         .route("/workstream/{workstream_id}/events", get(search_events))
         .with_state(state)
@@ -99,6 +101,8 @@ pub fn workstream_router(state: WorkstreamState) -> Router {
 #[derive(Debug, Serialize)]
 struct ApiError {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
     #[serde(flatten)]
     warning: ai_memory_core::repository_identity::ManifestWarningContext,
 }
@@ -118,6 +122,7 @@ fn api_failure_with_manifest_warning(
         status,
         Json(ApiError {
             error: message.into(),
+            code: None,
             warning: ai_memory_core::repository_identity::ManifestWarningContext {
                 manifest_warning,
             },
@@ -253,6 +258,17 @@ async fn resolve_run_scope(
     };
     let workspace = request.workspace.trim();
     let project = request.project.trim();
+    if let Some(project_id) = request.project_id {
+        return lookup_project_id_guarded(
+            &state.reader,
+            workspace,
+            project_id,
+            viewer,
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await
+        .map(|scope| (scope, false));
+    }
     let identity = request
         .repository_identity
         .as_deref()
@@ -315,8 +331,19 @@ async fn prepare_run(
     if let Err(response) = authorize(level, Capability::NormalWrite) {
         return response.into_response();
     }
+    if request.project.trim().is_empty() == request.project_id.is_none() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "select exactly one project name or project_id",
+        );
+    }
+    if request.project_id.is_some() && request.repository_identity.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "project_id and repository_identity are mutually exclusive",
+        );
+    }
     if request.workspace.trim().is_empty()
-        || request.project.trim().is_empty()
         || request.cwd.trim().is_empty()
         || request.repo_fingerprint.trim().is_empty()
         || request.worktree_fingerprint.trim().is_empty()
@@ -409,9 +436,15 @@ async fn prepare_run(
     }
     let (scope, promoted) = match resolve_run_scope(&state, &request, actor_user(viewer)).await {
         Ok(resolved) => resolved,
+        Err(failure @ ScopeResolutionError::ProjectNameAmbiguous { .. }) => {
+            let (status, mut body) = api_failure(StatusCode::BAD_REQUEST, failure.to_string());
+            body.0.code = Some("ambiguous_project");
+            return (status, body).into_response();
+        }
         Err(failure) if failure.is_forbidden() => {
             return error(StatusCode::FORBIDDEN, failure.to_string());
         }
+        Err(failure) if request.project_id.is_some() => return scope_refusal(failure),
         Err(failure) => return error(StatusCode::BAD_REQUEST, failure.to_string()),
     };
     let manifest_warning = if promoted {
@@ -457,12 +490,27 @@ async fn prepare_run(
         }
     };
     let force_unlock = request.force_unlock;
+    let resolved_project = match state
+        .reader
+        .project_name_by_id(scope.workspace_id, scope.project_id)
+        .await
+    {
+        Ok(Some(project)) => ManagedProjectScope {
+            workspace_id: scope.workspace_id,
+            project_id: scope.project_id,
+            workspace: request.workspace.trim().to_owned(),
+            project,
+        },
+        Ok(None) => return error(StatusCode::NOT_FOUND, "managed project no longer exists"),
+        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+    };
     let prepared = state
         .writer
         .prepare_workstream_run_owned_with_unlock(
             PrepareWorkstreamRun {
                 workspace_id: scope.workspace_id,
                 project_id: scope.project_id,
+                scope_by_id: request.project_id.is_some(),
                 repo_fingerprint: request.repo_fingerprint,
                 worktree_fingerprint: request.worktree_fingerprint,
                 cwd: request.cwd,
@@ -478,6 +526,7 @@ async fn prepare_run(
         .await;
     match prepared {
         Ok(prepared) => Json(PrepareManagedRunResponse {
+            resolved_project: Some(resolved_project),
             workstream_id: prepared.workstream_id,
             workstream_name: prepared.workstream_name,
             run_id: prepared.run_id,
@@ -681,6 +730,68 @@ const fn default_event_limit() -> usize {
     20
 }
 
+async fn project_candidates(
+    State(state): State<WorkstreamState>,
+    level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    Json(request): Json<ManagedProjectCandidatesRequest>,
+) -> Response {
+    if let Err(response) = authorize(level, Capability::NormalWrite) {
+        return response.into_response();
+    }
+    if [&request.workspace, &request.project]
+        .iter()
+        .any(|value| value.trim().is_empty() || value.len() > MAX_NAME_BYTES)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "workspace and project must be non-empty bounded names",
+        );
+    }
+    let workspace_id =
+        match ai_memory_store::lookup_existing_workspace(&state.reader, request.workspace.trim())
+            .await
+        {
+            Ok(id) => id,
+            Err(failure) => return scope_refusal(failure),
+        };
+    let rows = match state
+        .reader
+        .project_coordinate_candidates(workspace_id, request.project.trim().to_owned())
+        .await
+    {
+        Ok(rows) => rows,
+        Err(failure) => return store_error_response(failure),
+    };
+    let truncated = rows.len() > 100;
+    let mut candidates = Vec::new();
+    for (project_id, project) in rows.into_iter().take(100) {
+        match lookup_project_id_guarded(
+            &state.reader,
+            request.workspace.trim(),
+            project_id,
+            actor_user(actor),
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await
+        {
+            Ok(_) => candidates.push(ManagedProjectScope {
+                workspace_id,
+                project_id,
+                workspace: request.workspace.trim().to_owned(),
+                project,
+            }),
+            Err(failure) if failure.is_forbidden() => {}
+            Err(failure) => return scope_refusal(failure),
+        }
+    }
+    Json(ManagedProjectCandidatesResponse {
+        candidates,
+        truncated,
+    })
+    .into_response()
+}
+
 async fn list_recent_workstreams(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
@@ -689,6 +800,12 @@ async fn list_recent_workstreams(
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalRead) {
         return response.into_response();
+    }
+    if request.project.trim().is_empty() == request.project_id.is_none() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "select exactly one project name or project_id",
+        );
     }
     for (label, value) in [
         ("workspace", request.workspace.as_str()),
@@ -699,23 +816,39 @@ async fn list_recent_workstreams(
             request.worktree_fingerprint.as_str(),
         ),
     ] {
-        if value.trim().is_empty() {
+        if value.trim().is_empty() && !(label == "project" && request.project_id.is_some()) {
             return error(StatusCode::BAD_REQUEST, format!("{label} cannot be empty"));
         }
         if value.len() > MAX_NAME_BYTES {
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
-    let scope = match lookup_existing_scope_guarded(
-        &state.reader,
-        request.workspace.trim(),
-        request.project.trim(),
-        actor_user(actor),
-        ai_memory_store::ProjectAccess::Read,
-    )
-    .await
-    {
+    let resolved = if let Some(project_id) = request.project_id {
+        lookup_project_id_guarded(
+            &state.reader,
+            request.workspace.trim(),
+            project_id,
+            actor_user(actor),
+            ai_memory_store::ProjectAccess::Read,
+        )
+        .await
+    } else {
+        lookup_existing_scope_guarded(
+            &state.reader,
+            request.workspace.trim(),
+            request.project.trim(),
+            actor_user(actor),
+            ai_memory_store::ProjectAccess::Read,
+        )
+        .await
+    };
+    let scope = match resolved {
         Ok(scope) => scope,
+        Err(failure @ ScopeResolutionError::ProjectNameAmbiguous { .. }) => {
+            let (status, mut body) = api_failure(StatusCode::BAD_REQUEST, failure.to_string());
+            body.0.code = Some("ambiguous_project");
+            return (status, body).into_response();
+        }
         Err(failure) if failure.is_forbidden() => {
             return error(StatusCode::FORBIDDEN, failure.to_string());
         }
@@ -962,16 +1095,59 @@ async fn link_run(
     if status.state != "active" {
         return error(StatusCode::CONFLICT, "managed run is not active");
     }
+    let native_session_id = native_identity.into_string();
     match state
         .writer
-        .link_managed_run_session(run_id, status.agent, native_identity.into_string())
+        .link_managed_run_session(run_id, status.agent, native_session_id.clone())
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => error(StatusCode::CONFLICT, "managed run is not active"),
+        Ok(false) => link_refusal(&state, run_id, native_session_id).await,
         Err(failure) => store_error_response(failure),
     }
 }
+
+/// Why a link of an active run was refused. A session the same operator
+/// captured under another project, which a project rename splits off (#1993),
+/// gets its own code naming both projects so `ai-memory run` can offer the
+/// repair; everything else keeps the generic conflict.
+async fn link_refusal(
+    state: &WorkstreamState,
+    run_id: ManagedRunId,
+    native_session_id: String,
+) -> Response {
+    match state
+        .reader
+        .managed_run_native_session_holder(run_id, native_session_id)
+        .await
+    {
+        Ok(Some(holder)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "native session belongs to project {}/{}, not {}/{}",
+                    holder.workspace, holder.project, holder.run_workspace, holder.run_project
+                ),
+                "code": NATIVE_SESSION_IN_OTHER_PROJECT,
+                "workspace": holder.workspace,
+                "session_project": holder.project,
+                "session_project_id": holder.project_id.to_string(),
+                "run_project": holder.run_project,
+                "run_project_id": holder.run_project_id.to_string(),
+                "run_workspace": holder.run_workspace,
+                "run_legacy_name": holder.run_legacy_name,
+                "run_sessions": holder.run_sessions,
+                "run_pages": holder.run_pages,
+            })),
+        )
+            .into_response(),
+        Ok(None) => error(StatusCode::CONFLICT, "managed run is not active"),
+        Err(failure) => store_error_response(failure),
+    }
+}
+
+/// `code` of the link conflict for a session held by another project.
+pub const NATIVE_SESSION_IN_OTHER_PROJECT: &str = "native_session_in_other_project";
 
 async fn recover_finish_run(
     State(state): State<WorkstreamState>,
@@ -1370,6 +1546,76 @@ fn truncate_owned(value: &mut String, max: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn managed_project_id_recovers_an_ambiguous_scope_without_moving_history() {
+        use tower::ServiceExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (holder, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                unknown_system(),
+                ai_memory_core::repository_identity::IdentityStyle::Path,
+                "unknown-system",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let twin = ai_memory_core::ProjectId::new();
+        rusqlite::Connection::open(store.db_path()).unwrap().execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, 'unknown-system', 0)",
+            rusqlite::params![twin.as_bytes(), workspace_id.as_bytes()],
+        ).unwrap();
+        let before = project_names(&store).await;
+        let by_name = prepare_run(
+            State(test_state(&store, temp.path())),
+            None,
+            None,
+            None,
+            Json(identity_run_request("unknown-system", None)),
+        )
+        .await;
+        assert_eq!(by_name.status(), StatusCode::BAD_REQUEST);
+
+        let mut body = serde_json::to_value(identity_run_request("", None)).unwrap();
+        body["project_id"] = serde_json::json!(holder);
+        let response = workstream_router(test_state(&store, temp.path()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/workstream/runs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an explicitly selected authorized ID must recover the legacy collision"
+        );
+        assert_eq!(run_project(&store, response).await, (workspace_id, holder));
+        assert_eq!(project_names(&store).await, before);
+        assert_eq!(
+            store
+                .reader
+                .find_project(workspace_id, "unknown-system".into())
+                .await
+                .unwrap(),
+            Some(twin)
+        );
+    }
+
     use ai_memory_store::Store;
     use axum::body::to_bytes;
     use tempfile::TempDir;
@@ -1391,6 +1637,93 @@ mod tests {
         }
     }
 
+    /// The link route turns a split session into a coded 409 the CLI can act
+    /// on (#1993); an unrelated refusal keeps the generic conflict.
+    #[tokio::test]
+    async fn a_link_refused_by_a_split_project_names_both_projects() {
+        use tower::ServiceExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let old = store
+            .writer
+            .get_or_create_project(ws, "api".to_string(), None)
+            .await
+            .unwrap();
+        let new = store
+            .writer
+            .get_or_create_project(ws, "acme-api".to_string(), None)
+            .await
+            .unwrap();
+        let run = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                ..prepare_input(ws, new, AgentKind::ClaudeCode, "launcher")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: ai_memory_core::SessionId::from_native("split-native"),
+                workspace_id: ws,
+                project_id: old,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let link = async |native: &str| {
+            let response = workstream_router(test_state(&store, temp.path()))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/workstream/runs/{}/link", run.run_id))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({ "native_session_id": native }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1 << 16).await.unwrap())
+                    .unwrap_or_default();
+            (status, body)
+        };
+
+        let (status, body) = link("split-native").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], NATIVE_SESSION_IN_OTHER_PROJECT);
+        assert_eq!(body["session_project"], "api");
+        assert_eq!(body["session_project_id"], old.to_string());
+        assert_eq!(body["run_project"], "acme-api");
+        assert_eq!(body["run_project_id"], new.to_string());
+        assert_eq!(body["run_workspace"], "default");
+        assert_eq!(
+            (body["run_sessions"].as_u64(), body["run_pages"].as_u64()),
+            (Some(0), Some(0))
+        );
+
+        // Control: a fresh session links, and then a different one is refused
+        // without any project named.
+        let (status, _) = link("fresh-native").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = link("another-native").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.get("code").is_none(), "{body}");
+    }
+
     fn prepare_input(
         workspace_id: ai_memory_core::WorkspaceId,
         project_id: ai_memory_core::ProjectId,
@@ -1398,6 +1731,7 @@ mod tests {
         owner: &str,
     ) -> PrepareWorkstreamRun {
         PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id,
             project_id,
             repo_fingerprint: "repo".into(),
@@ -1478,6 +1812,7 @@ mod tests {
             .await
             .unwrap();
         let request = || PrepareManagedRunRequest {
+            project_id: None,
             workspace: "default".into(),
             project: "acme-api".into(),
             cwd: "/repo".into(),
@@ -1586,6 +1921,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "acme-api".into(),
                 cwd: "/repo".into(),
@@ -1656,6 +1992,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "acme-api".into(),
                 cwd: "/repo".into(),
@@ -1752,6 +2089,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "acme-api".into(),
                 cwd: "/repo".into(),
@@ -1836,6 +2174,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "acme-api".into(),
                 cwd: "/repo".into(),
@@ -2166,13 +2505,14 @@ mod tests {
             .unwrap();
         // The key starts 18 bytes before the cap: capping first would keep
         // `sk-` plus 15 characters, one short of the 16 the pattern needs.
-        // The space before the tail matters — without it the greedy key
+        // The key follows a space, since the rule skips an `sk-` glued to a
+        // letter. The space before the tail matters — without it the greedy key
         // pattern would swallow the tail into the same match and the
         // scrubbed text would never reach the cap.
         let credential = format!("sk-{}", "A".repeat(40));
         let content = format!(
-            "{}{credential} {}",
-            "x".repeat(MAX_EVENT_CONTENT_BYTES - 18),
+            "{} {credential} {}",
+            "x".repeat(MAX_EVENT_CONTENT_BYTES - 19),
             "y".repeat(2 * 1024),
         );
         let response = finish_run(
@@ -2415,6 +2755,7 @@ mod tests {
         let prepared = store
             .writer
             .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: false,
                 selection: WorkstreamSelection::New("typo-nmae".into()),
                 ..prepare_input(workspace_id, project_id, AgentKind::OpenCode, "launcher")
             })
@@ -2488,6 +2829,7 @@ mod tests {
         store
             .writer
             .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: false,
                 selection: WorkstreamSelection::New("taken".into()),
                 ..prepare_input(workspace_id, project_id, AgentKind::OpenCode, "other")
             })
@@ -2512,6 +2854,7 @@ mod tests {
         let prepared = store
             .writer
             .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: false,
                 selection: WorkstreamSelection::New("decide-after-death".into()),
                 ..prepare_input(workspace_id, project_id, AgentKind::OpenCode, "launcher")
             })
@@ -2546,6 +2889,7 @@ mod tests {
             None,
             None,
             Json(ListManagedWorkstreamsRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
@@ -2573,6 +2917,7 @@ mod tests {
             None,
             None,
             Json(ListManagedWorkstreamsRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
@@ -2595,6 +2940,7 @@ mod tests {
             None,
             None,
             Json(ListManagedWorkstreamsRequest {
+                project_id: None,
                 workspace: "missing".into(),
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
@@ -2617,6 +2963,7 @@ mod tests {
             store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
                     selection: WorkstreamSelection::New(format!("local-{index:03}")),
                     ..prepare_input(workspace_id, project_id, AgentKind::Codex, "launcher")
                 })
@@ -2667,6 +3014,7 @@ mod tests {
             store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
                     selection: WorkstreamSelection::New(name.into()),
                     repo_fingerprint: repo.into(),
                     worktree_fingerprint: worktree.into(),
@@ -2682,6 +3030,7 @@ mod tests {
                 None,
                 None,
                 Json(ListManagedWorkstreamsRequest {
+                    project_id: None,
                     workspace: "default".into(),
                     project: "managed".into(),
                     repo_fingerprint: "repo".into(),
@@ -2755,6 +3104,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -2794,6 +3144,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -2845,6 +3196,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -2893,6 +3245,7 @@ mod tests {
             })),
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed-owner".into(),
                 cwd: "/repo".into(),
@@ -2996,6 +3349,7 @@ mod tests {
             actor("alice"),
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed-owner-routes".into(),
                 cwd: "/repo".into(),
@@ -3134,6 +3488,7 @@ mod tests {
             }))
         };
         let request = |force_unlock: bool, lease_owner: &str| PrepareManagedRunRequest {
+            project_id: None,
             workspace: "default".into(),
             project: "managed-force-unlock".into(),
             cwd: "/repo".into(),
@@ -3219,6 +3574,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -3269,6 +3625,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -3300,6 +3657,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -3350,6 +3708,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -3381,6 +3740,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -3431,6 +3791,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -3482,6 +3843,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -3532,6 +3894,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "managed".into(),
                 cwd: "/repo".into(),
@@ -3817,6 +4180,7 @@ mod tests {
             None,
             None,
             Json(PrepareManagedRunRequest {
+                project_id: None,
                 workspace: "default".into(),
                 project: "alice-client-work".into(),
                 cwd: "/repo".into(),
@@ -4087,6 +4451,7 @@ mod tests {
                 .writer
                 .prepare_workstream_run_owned(
                     PrepareWorkstreamRun {
+                        scope_by_id: false,
                         selection: WorkstreamSelection::New(format!("revoke-{finished}")),
                         ..prepare_input(ws, project, AgentKind::Codex, "label")
                     },
@@ -4436,6 +4801,7 @@ mod tests {
         state.trusted_proxy_identity = true;
         let (ws, project) = seed_scope(&store).await;
         let prepare = |name: &str| PrepareWorkstreamRun {
+            scope_by_id: false,
             workspace_id: ws,
             project_id: project,
             repo_fingerprint: name.into(),
@@ -4601,6 +4967,7 @@ mod tests {
             .writer
             .prepare_workstream_run_owned(
                 PrepareWorkstreamRun {
+                    scope_by_id: false,
                     repo_fingerprint: "superseded".into(),
                     worktree_fingerprint: "superseded".into(),
                     selection: WorkstreamSelection::Named("superseded".into()),
@@ -4692,6 +5059,7 @@ mod tests {
     /// whose folder name differs from its remote's derived name.
     fn identity_run_request(project: &str, identity: Option<&str>) -> PrepareManagedRunRequest {
         PrepareManagedRunRequest {
+            project_id: None,
             workspace: "default".into(),
             project: project.into(),
             cwd: "/repo/new-space-game".into(),
@@ -4806,16 +5174,29 @@ mod tests {
         // The twin an earlier name-only run created under the derived name,
         // inserted directly: the capture path under test no longer mints it, so
         // this has to stand in for the row an older release left behind.
+        let twin = ai_memory_core::ProjectId::new();
         rusqlite::Connection::open(store.db_path())
             .unwrap()
             .execute(
                 "INSERT INTO projects (id, workspace_id, name, created_at) \
                  VALUES (?1, ?2, 'victorcesc-unknown-system', 0)",
-                rusqlite::params![
-                    ai_memory_core::ProjectId::new().as_bytes().to_vec(),
-                    workspace_id.as_bytes().to_vec()
-                ],
+                rusqlite::params![twin.as_bytes().to_vec(), workspace_id.as_bytes().to_vec()],
             )
+            .unwrap();
+        // The twin holds a session, so the name stays ambiguous: an empty twin
+        // would resolve to the identity owner by name alone (#2018).
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: ai_memory_core::SessionId::new(),
+                workspace_id,
+                project_id: twin,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
             .unwrap();
 
         // By name alone the derived name names both projects.

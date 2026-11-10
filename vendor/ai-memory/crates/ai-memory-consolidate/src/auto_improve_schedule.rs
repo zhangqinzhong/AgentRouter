@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use ai_memory_core::{ActorContext, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::LlmProvider;
+use ai_memory_llm::{LlmProvider, LlmProviders, LlmWorkload};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, NewAutoImproveProposal,
     ReaderPool, SkippedProposal, StageAutoImproveRun, WriterHandle,
@@ -154,7 +154,7 @@ pub async fn run_auto_improve_scheduler_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
     wiki: &Wiki,
-    llm: &Arc<dyn LlmProvider>,
+    llms: &LlmProviders,
     settings: &ScheduledAutoImproveSettings,
 ) -> Result<ScheduledAutoImproveTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
@@ -178,40 +178,20 @@ pub async fn run_auto_improve_scheduler_tick(
             continue;
         }
 
-        let candidates = match reader
-            .auto_improve_candidate_sessions(
-                scope.workspace_id,
-                scope.project_id,
-                settings.min_session_age_secs,
-                settings.max_sessions_per_tick,
-            )
-            .await
-        {
-            Ok(candidates) => candidates,
-            Err(e) => {
-                outcome.errors += 1;
-                tracing::warn!(
-                    workspace = %scope.workspace_name,
-                    project = %scope.project_name,
-                    error = %e,
-                    "scheduled auto-improve candidate query failed"
-                );
-                continue;
-            }
-        };
-        let ctx = ScheduledAutoImproveContext {
-            reader,
-            writer,
-            wiki,
-            llm,
-            workspace_id: scope.workspace_id,
-            project_id: scope.project_id,
-            settings,
-        };
-
         // Cross-session ("experience") pass — cadence-gated per scope,
         // independent of whether this tick has per-session candidates.
-        if let Some(experience) = &settings.experience {
+        if let (Some(experience), Some(llm)) =
+            (&settings.experience, llms.get(LlmWorkload::Experience))
+        {
+            let ctx = ScheduledAutoImproveContext {
+                reader,
+                writer,
+                wiki,
+                llm,
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+                settings,
+            };
             match reader
                 .experience_pass_due(scope.workspace_id, scope.project_id)
                 .await
@@ -283,6 +263,44 @@ pub async fn run_auto_improve_scheduler_tick(
                 }
             }
         }
+        if settings.max_sessions_per_tick == 0 {
+            continue;
+        }
+
+        let Some(llm) = llms.get(LlmWorkload::AutoImprove) else {
+            continue;
+        };
+
+        let candidates = match reader
+            .auto_improve_candidate_sessions(
+                scope.workspace_id,
+                scope.project_id,
+                settings.min_session_age_secs,
+                settings.max_sessions_per_tick,
+            )
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(e) => {
+                outcome.errors += 1;
+                tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    error = %e,
+                    "scheduled auto-improve candidate query failed"
+                );
+                continue;
+            }
+        };
+        let ctx = ScheduledAutoImproveContext {
+            reader,
+            writer,
+            wiki,
+            llm,
+            workspace_id: scope.workspace_id,
+            project_id: scope.project_id,
+            settings,
+        };
 
         if candidates.is_empty() {
             continue;
@@ -855,6 +873,10 @@ mod tests {
         let llm: Arc<dyn LlmProvider> = Arc::new(SchedulerSentinelLlm {
             calls: Arc::clone(&calls),
         });
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            overrides: [(LlmWorkload::AutoImprove, llm)].into(),
+        };
         let settings = ScheduledAutoImproveSettings {
             review: AutoImproveReviewConfig {
                 min_observations: 3,
@@ -880,7 +902,7 @@ mod tests {
         // Attempt 1: retryable provider 400 → the claim records the attempt
         // (not parked). The persisted column carries only class/status.
         let first =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(first.errors, 1, "the retryable failure must be reported");
@@ -899,7 +921,7 @@ mod tests {
         // Attempt 2: the claim re-arms and each attempt writes only the safe
         // summary.
         let second =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(second.errors, 1);
@@ -911,7 +933,7 @@ mod tests {
         // Attempt 3 exhausts the budget: the claim parks and stops being a
         // candidate — the policy is unchanged by the redaction.
         let third =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(third.errors, 1);
@@ -919,7 +941,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
         let fourth =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(fourth.errors, 0, "a parked claim must not be retried");
@@ -1034,21 +1056,30 @@ mod tests {
             review: AutoImproveReviewConfig::default(),
             require_approval: true,
             min_session_age_secs: 0,
-            max_sessions_per_tick: 10,
+            max_sessions_per_tick: 0,
             experience: Some(crate::ExperienceConfig {
                 sessions: 10,
                 min_new_sessions: 3,
                 ..crate::ExperienceConfig::default()
             }),
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceSentinelLlm);
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            overrides: [(
+                LlmWorkload::Experience,
+                Arc::new(ExperienceSentinelLlm) as Arc<dyn LlmProvider>,
+            )]
+            .into(),
+        };
 
         let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
 
         assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
+        assert_eq!(outcome.scopes_with_candidates, 0, "{outcome:?}");
+        assert_eq!(outcome.reviewed, 0, "{outcome:?}");
         assert_eq!(
             outcome.errors, 1,
             "the experience failure must be reported once: {outcome:?}"
@@ -1107,6 +1138,262 @@ mod tests {
             redacted_scheduler_error_summary(&missing),
             "auto-improve failed: class=session-not-found status=none"
         );
+    }
+
+    /// A provider that counts every structured call and answers with a valid
+    /// empty review: the scheduler's observable effect is the call count.
+    struct CountingLlm {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmProvider for CountingLlm {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        fn model(&self) -> &str {
+            "counting-model"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "counting-model".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({
+                    "summary": "nothing durable",
+                    "proposals": [],
+                    "rejected_candidates": []
+                }))
+            })
+        }
+    }
+
+    /// The sweep must not queue an LLM review: with one sweep-closed session
+    /// and one normally ended session in the same project, a real tick calls
+    /// the LLM exactly once — for the real `SessionEnd`.
+    #[tokio::test]
+    async fn abandoned_sweep_closed_session_is_not_reviewed_by_the_scheduler_tick() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "sweep-tick", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_microsecond();
+
+        // Stale session the sweep is about to close.
+        let swept = seed_swept_session(&store, ws, project, now).await;
+
+        // Normally ended session, same project.
+        let control = seed_reviewable_session(&store, ws, project).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(CountingLlm {
+            calls: Arc::clone(&calls),
+        });
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            overrides: [(LlmWorkload::AutoImprove, llm)].into(),
+        };
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        };
+
+        let outcome =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
+                .await
+                .unwrap();
+        assert_eq!(outcome.scopes_with_candidates, 1);
+        assert_eq!(outcome.reviewed, 1, "only the real end was reviewed");
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one LLM call: the real SessionEnd, never the sweep-closed session"
+        );
+
+        // The sweep-closed session stays parked, and its claim carries the
+        // sweep's marker — not a review failure.
+        let (last_error, attempts) = claim_row(store.db_path(), ws, project, swept);
+        assert_eq!(attempts, ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            last_error,
+            ai_memory_store::ABANDONED_SWEEP_CLAIM_ERROR,
+            "the claim must mark the sweep, not a review failure"
+        );
+
+        // The control session actually got a review.
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_improve_runs WHERE session_id = ?1",
+                rusqlite::params![control.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "the real end must have a persisted review run");
+    }
+
+    /// Reorg moves a sweep-closed session out of the project that the
+    /// hollow-project sweep is about to delete. The sweep's parked claim is
+    /// keyed to the session's project: left behind, it would cascade away
+    /// with the deleted project and the parked session would become
+    /// reviewable again in its new scope. The claim must move with the
+    /// session and keep the scheduler out of it.
+    #[tokio::test]
+    async fn abandoned_sweep_session_moved_by_reorg_is_not_reviewed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "sweep-tick", None)
+            .await
+            .unwrap();
+        // The destination must exist before the scheduler scopes are
+        // initialized: the state seed parks its watermark at the newest
+        // already-ended session (none yet), exactly like a scope created at
+        // startup.
+        let destination = store
+            .writer
+            .get_or_create_project(ws, "destination", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_microsecond();
+        // Stale session the sweep is about to close.
+        let swept = seed_swept_session(&store, ws, project, now).await;
+
+        // Age the source past the hollow sweep's minimum, move the session
+        // out and delete the emptied project — the sequence that used to
+        // cascade the parked claim away with the project.
+        {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            conn.execute(
+                "UPDATE projects SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![now - 10 * 24 * 3_600 * 1_000_000, project.as_bytes()],
+            )
+            .unwrap();
+        }
+        store
+            .writer
+            .reorg_sessions(ws, vec![(swept, destination)])
+            .await
+            .unwrap();
+        let deleted = store.writer.sweep_hollow_projects(7).await.unwrap();
+        assert!(
+            deleted.iter().any(|name| name == "sweep-tick"),
+            "the emptied source project must be deleted"
+        );
+
+        // A normally ended session in the destination: the one real review.
+        let control = seed_reviewable_session(&store, ws, destination).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(CountingLlm {
+            calls: Arc::clone(&calls),
+        });
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            overrides: [(LlmWorkload::AutoImprove, llm)].into(),
+        };
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        };
+
+        let outcome =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
+                .await
+                .unwrap();
+        assert_eq!(outcome.scopes_with_candidates, 1);
+        assert_eq!(outcome.reviewed, 1, "only the real end was reviewed");
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one LLM call: the real end, never the sweep-closed session the reorg moved"
+        );
+
+        // The moved session's claim followed it to the destination and still
+        // carries the sweep's marker — not a review failure.
+        let (last_error, attempts) = claim_row(store.db_path(), ws, destination, swept);
+        assert_eq!(attempts, ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            last_error,
+            ai_memory_store::ABANDONED_SWEEP_CLAIM_ERROR,
+            "the claim must mark the sweep, not a review failure"
+        );
+
+        // The control session actually got a review.
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_improve_runs WHERE session_id = ?1",
+                rusqlite::params![control.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "the real end must have a persisted review run");
     }
 
     #[tokio::test]
@@ -1187,9 +1474,12 @@ mod tests {
             max_sessions_per_tick: 10,
             experience: None,
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            ..Default::default()
+        };
         let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
 
@@ -1337,8 +1627,7 @@ mod tests {
             review: AutoImproveReviewConfig::default(),
             require_approval: true,
             min_session_age_secs: 0,
-            // Per-session path effectively off: the fake sessions have no
-            // observations, so preflight rejects them anyway.
+            // Only the experience provider is configured.
             max_sessions_per_tick: 10,
             experience: Some(crate::ExperienceConfig {
                 sessions: 10,
@@ -1346,12 +1635,32 @@ mod tests {
                 ..crate::ExperienceConfig::default()
             }),
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceLlm);
+        let disabled = run_auto_improve_scheduler_tick(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &LlmProviders::default(),
+            &settings,
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled.experience_runs, 0);
+        assert_eq!(disabled.reviewed, 0);
+
+        let llms = LlmProviders {
+            overrides: [(
+                LlmWorkload::Experience,
+                Arc::new(ExperienceLlm) as Arc<dyn LlmProvider>,
+            )]
+            .into(),
+            ..Default::default()
+        };
         let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(outcome.experience_runs, 1, "{outcome:?}");
+        assert_eq!(outcome.reviewed, 0, "{outcome:?}");
         assert_eq!(outcome.errors, 0, "{outcome:?}");
 
         // The proposal is staged pending (require_approval), through the
@@ -1374,7 +1683,7 @@ mod tests {
 
         // Cadence anchored: an immediate second tick runs nothing.
         let outcome2 =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(outcome2.experience_runs, 0, "{outcome2:?}");
@@ -1454,9 +1763,12 @@ mod tests {
                 ..crate::ExperienceConfig::default()
             }),
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            ..Default::default()
+        };
         let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
@@ -1522,6 +1834,65 @@ mod tests {
 
     const COLLIDING_PATH: &str = "procedures/release.md";
 
+    /// Open a stale session in `proj` and let the abandoned-session sweep
+    /// close it: the session ends with no page and the sweep's claim parked
+    /// (exhausted attempts, the sweep's marker error). Returns the session.
+    async fn seed_swept_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        now: i64,
+    ) -> SessionId {
+        let one_hour_us = 3_600 * 1_000_000;
+        let swept = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(now - 49 * one_hour_us),
+                id: swept,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(now - 49 * one_hour_us + i as i64),
+                        session_id: swept,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                        file_path: None,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        let closed = store
+            .writer
+            .close_abandoned_sessions(now - 48 * one_hour_us)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1, "the stale session must be closed by the sweep");
+        swept
+    }
+
     async fn seed_reviewable_session(store: &Store, ws: WorkspaceId, proj: ProjectId) -> SessionId {
         let session_id = SessionId::new();
         store
@@ -1556,6 +1927,7 @@ mod tests {
                         title: format!("event {i}"),
                         body: "run the full gate before release".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -1645,6 +2017,10 @@ mod tests {
             experience: None,
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);
+        let llms = LlmProviders {
+            default: Some(Arc::clone(&llm)),
+            ..Default::default()
+        };
         let ctx = ScheduledAutoImproveContext {
             reader: &store.reader,
             writer: &store.writer,
@@ -1666,7 +2042,7 @@ mod tests {
 
         let tick_session = seed_reviewable_session(&store, ws, proj).await;
         let tick =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(tick.errors, 0);

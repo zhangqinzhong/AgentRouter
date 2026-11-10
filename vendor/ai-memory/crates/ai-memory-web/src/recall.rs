@@ -98,7 +98,7 @@ pub(crate) async fn search_scopes(
                     query,
                     hits,
                     limit,
-                    ai_memory_llm::reranker::RERANK_TIMEOUT,
+                    stage.timeout(),
                     |(hit, _)| RerankCandidate {
                         id: hit.id.to_string(),
                         title: hit.title.clone(),

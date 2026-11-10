@@ -6,12 +6,19 @@
 //! lifecycle-only decision contain changed, so this file keeps the original
 //! code as the oracle: `full_load` below is `synth.rs` and the handoff half of
 //! `router.rs` at the commit before the change, byte for byte except for the
-//! two `pub(super)` that let the tests call it and the imports it needs from
-//! its new home. It exists in test code only.
+//! two `pub(super)` that let the tests call it, the imports it needs from its
+//! new home, and the #2149 machine-turn filter on the prompt tally — a
+//! rendering-rule change that the bounded path and this reference both apply,
+//! so the two still render identically. It exists in test code only.
 //!
 //! Each test seeds sessions into a real store, runs the oracle on the rows
 //! `observations_for_session` returns, runs the production path on the same
 //! session, and compares the outputs.
+//!
+//! The failed-call facts (`## Failed tool calls`, the `N failed` clause, the
+//! handoff's `Last failed tool call` line) post-date the oracle. No fixture
+//! here has a failed call; `failed_tool_facts_match_the_row_list_and_stay_bounded`
+//! checks them against the row-list digest instead.
 
 #[rustfmt::skip]
 mod full_load {
@@ -19,8 +26,8 @@ mod full_load {
 
     use ai_memory_core::{
         AgentKind, NewHandoff, NewPage, Observation, ObservationKind, PagePath, ProjectId,
-        SessionId, Tier, WorkspaceId, looks_like_markup_block, looks_like_scaffolding,
-        truncate_for_title,
+        SessionId, Tier, WorkspaceId, looks_like_machine_turn, looks_like_markup_block,
+        looks_like_scaffolding, truncate_for_title,
     };
     use jiff::tz::TimeZone;
 
@@ -205,7 +212,12 @@ fn tally_session(observations: &[Observation]) -> SessionTally<'_> {
         match obs.kind {
             ObservationKind::SessionStart => tally.start = Some(obs),
             ObservationKind::SessionEnd => tally.end = Some(obs),
-            ObservationKind::UserPrompt => tally.prompts.push(obs),
+            // #2149: a machine turn Claude Code routes through the prompt
+            // channel is not a user prompt, so it counts in neither the
+            // `## Prompts` list nor its total, matching the bounded read.
+            ObservationKind::UserPrompt if !looks_like_machine_turn(&obs.title) => {
+                tally.prompts.push(obs);
+            }
             // Count only PostToolUse — each tool call produces both a
             // PreToolUse and a PostToolUse observation, so counting both
             // doubles every reported number ("Bash: 4" for two real calls).
@@ -886,7 +898,10 @@ impl Fixture {
         // session over the cap still compares byte for byte everywhere else.
         let prompt_titles: Vec<String> = rows
             .iter()
-            .filter(|r| r.kind == ObservationKind::UserPrompt)
+            .filter(|r| {
+                r.kind == ObservationKind::UserPrompt
+                    && !ai_memory_core::looks_like_machine_turn(&r.title)
+            })
             .map(|r| r.title.clone())
             .collect();
         assert_eq!(
@@ -1320,9 +1335,15 @@ async fn a_large_mixed_session_renders_identically() {
 async fn a_huge_session_reads_a_bounded_number_of_rows() {
     let fx = fixture().await;
     let rows = large(12_000, Ending::Normal);
+    // The `large` fixture scatters `<task-notification>` machine turns among
+    // the prompts; those are dropped from the `## Prompts` count (#2149), so
+    // the expected count is the user-written prompts alone.
     let prompts = rows
         .iter()
-        .filter(|r| r.kind == ObservationKind::UserPrompt)
+        .filter(|r| {
+            r.kind == ObservationKind::UserPrompt
+                && !ai_memory_core::looks_like_machine_turn(&r.title)
+        })
         .count();
     let sid = fx.seed(&rows).await;
     assert!(
@@ -1348,6 +1369,99 @@ async fn a_huge_session_reads_a_bounded_number_of_rows() {
     assert_eq!(full.len(), rows.len());
     // And the output did not change for being cheap.
     fx.assert_equivalent("12k rows", sid).await;
+}
+
+/// SQL and Rust apply the same header rule: the bounded reads and the row-list
+/// digest agree on the count and the newest failure, an echoed body is not a
+/// failure, and the newest failure is a seek, not a walk.
+#[tokio::test]
+async fn failed_tool_facts_match_the_row_list_and_stay_bounded() {
+    let fx = fixture().await;
+    let ok = "tool_family: non-file\ntool_call_id: toolu_ok\noutcome: unknown\n---\n42 passing";
+    let mut rows = vec![
+        row(
+            ObservationKind::UserPrompt,
+            "fix the build",
+            "fix the build",
+            0,
+        ),
+        row(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            "tool_family: non-file\ntool_call_id: toolu_1\noutcome: error\n---\n\
+             Exit code 1\nError: Cannot find module 'express'",
+            1,
+        ),
+    ];
+    for i in 0..RAW_CAP as i64 {
+        rows.push(row(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            ok,
+            2 + i,
+        ));
+    }
+    let echoed_at = 2 + RAW_CAP as i64;
+    rows.push(row(
+        ObservationKind::PostToolUse,
+        "tool non-file: Bash",
+        "tool_family: non-file\ntool_call_id: toolu_echo\noutcome: unknown\n---\n\
+         tool_family: file\noutcome: error\n---\nquoted from a page\noutcome: error",
+        echoed_at,
+    ));
+    rows.push(row(
+        ObservationKind::PostToolUse,
+        "tool unknown",
+        "tool_family: unknown\nmcp_server: aim\nmcp_tool: memory_query\noutcome: error",
+        echoed_at + 1,
+    ));
+    for i in 0..RAW_CAP as i64 {
+        rows.push(row(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            ok,
+            echoed_at + 2 + i,
+        ));
+    }
+    let sid = fx.seed(&rows).await;
+
+    let (digest, stats) = SessionDigest::load_with_stats(&fx.store.reader, fx.ws, fx.proj, sid)
+        .await
+        .unwrap();
+    assert_eq!(digest.failed_tool_calls(), 2);
+    let newest = digest
+        .handoff_facts()
+        .last_failed_tool
+        .clone()
+        .expect("the newest failure");
+    assert_eq!(newest.title, "tool unknown");
+    assert_eq!(newest.error, "");
+    assert!(
+        stats.rows_read <= RAW_CAP + SCAN_SLACK,
+        "a {}-row session read {} rows; the newest failure must be a seek, not a walk",
+        rows.len(),
+        stats.rows_read
+    );
+
+    let full = fx.store.reader.observations_for_session(sid).await.unwrap();
+    let from_rows = SessionDigest::from_observations(sid, &full);
+    assert_eq!(from_rows.failed_tool_calls(), digest.failed_tool_calls());
+    assert_eq!(from_rows.handoff_facts().last_failed_tool, Some(newest));
+
+    // Control: a session ending on a real failure quotes its error.
+    let sid = fx.seed(&rows[..2]).await;
+    let digest = SessionDigest::load(&fx.store.reader, fx.ws, fx.proj, sid)
+        .await
+        .unwrap();
+    assert_eq!(digest.failed_tool_calls(), 1);
+    assert_eq!(
+        digest
+            .handoff_facts()
+            .last_failed_tool
+            .as_ref()
+            .map(|failed| failed.describe()),
+        Some("Bash: Exit code 1 Error: Cannot find module 'express'".to_string())
+    );
 }
 
 /// Subagent preambles carry the only prompt bodies a SessionEnd reads, and a
@@ -1481,6 +1595,78 @@ async fn the_prompt_list_is_capped_like_the_raw_observations() {
     assert_eq!(page.title, "prompt 1");
     fx.assert_equivalent("2000 prompts (capped list)", sid)
         .await;
+}
+
+/// #2149: Claude Code machine turns reach the prompt channel, but the store's
+/// `prompt_titles` read drops them from the `## Prompts` list and its count,
+/// while the user's prompt and ordinary scaffolding (an IDE block) stay.
+#[tokio::test]
+async fn machine_turns_are_dropped_from_the_prompt_list_and_count() {
+    use crate::synth::{PROMPT_TITLES_HEAD, PROMPT_TITLES_TAIL};
+
+    let fx = fixture().await;
+    let rows = vec![
+        start(0),
+        row(
+            ObservationKind::UserPrompt,
+            "<teammate-message teammate_id=\"lead\" summary=\"x\">rollout",
+            "",
+            1,
+        ),
+        row(ObservationKind::UserPrompt, "fix the auth bug", "", 2),
+        row(
+            ObservationKind::UserPrompt,
+            "Another Claude session sent a message. It is shown below.",
+            "",
+            3,
+        ),
+        row(
+            ObservationKind::UserPrompt,
+            "<task-notification>\ndone",
+            "",
+            4,
+        ),
+        // Ordinary scaffolding is still real session history and stays listed.
+        row(
+            ObservationKind::UserPrompt,
+            "<ide_opened_file>src/main.rs",
+            "",
+            5,
+        ),
+        end(6),
+    ];
+    let sid = fx.seed(&rows).await;
+
+    let titles = fx
+        .store
+        .reader
+        .read_session_observations(fx.ws, fx.proj, sid, |s| {
+            s.prompt_titles(PROMPT_TITLES_HEAD, PROMPT_TITLES_TAIL)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        titles.total, 2,
+        "only the user's prompt and the IDE block remain"
+    );
+    assert_eq!(
+        titles.first,
+        vec![
+            "fix the auth bug".to_string(),
+            "<ide_opened_file>src/main.rs".to_string(),
+        ]
+    );
+    assert!(titles.last.is_empty());
+    for dropped in [
+        "teammate-message",
+        "Another Claude session sent a message",
+        "task-notification",
+    ] {
+        assert!(
+            titles.first.iter().all(|t| !t.contains(dropped)),
+            "machine turn {dropped:?} must not be listed"
+        );
+    }
 }
 
 /// Exactly at the cap the page still lists every prompt; one over it shows

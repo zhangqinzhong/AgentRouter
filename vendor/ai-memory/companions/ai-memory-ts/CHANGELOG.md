@@ -10,8 +10,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `observations` documents the server's new `session_id: "current"`: the
+  server resolves it only for a request carrying the caller's hook session
+  id, which this client does not send, so SDK callers pass the id. (#1983)
+- `pages.write`, `pages.writeBatch` and `pages.update` accept `sourceFiles`
+  (sent as `source_files`), the repository files a page describes with the
+  commit it was checked against; `pages.update` carries it over. (#1957)
+
+### Fixed
+
+- Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
+  GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
+  Node 22 and 24.
+
+- Capability initialization is owned by the client rather than its first
+  caller. Concurrent callers now wait with independent abort signals and
+  deadlines; cancelling one does not fail or delay the others. (#1815)
+
+- Initialized the MCP session before the first `callTool`, so raw tool calls
+  work with `--http-stateful` without a preceding wrapped call. Raw calls
+  still skip `tools/list` and schema checks. (#1816)
+
+### Added
+
+- `briefing` takes `recentSessionsLimit` (default 5, max 50), matching the
+  server's new `memory_briefing` argument for seeing every active harness in a
+  busy project. (#1934)
+
+- `messages.send` takes `toAgent`, the registered harness that may claim the
+  message in the recipient project, and `fromAgent`, the sending harness for a
+  client whose session does not record it, matching the server's new
+  `to_agent` and `from_agent`. (#1935)
+- `pages.resolveWriteTarget` preflights an exact existing writable project by
+  name or stable id, and `pages.writeBatch` commits up to 100 conditional page
+  versions atomically. These wrappers cover the bulk-import tools added for
+  ai-memory 3.4.
+
+- Decoded optional query-answer context admission receipts as `answerContext` (#1684).
+
 - `query` takes the server's `memory_query` page filters: `kind`, `tier`,
   `pathPrefix` and `tag`, in every search mode.
+
+- `messages.pop` takes `agent`, the harness claiming harness-addressed mail,
+  and `Message` carries `toAgent` (`null` for shared project mail), matching
+  the server's new `to_agent` addressing.
+
+- `pages.read` takes `maxChars`, and `Page` carries `truncated` and
+  `totalChars`, matching the server's new `memory_read_page` size cap. Both are
+  `undefined` against a server that predates it. The documented `observations`
+  defaults are now 20 rows of 1000 characters.
 
 ## [0.1.0]
 

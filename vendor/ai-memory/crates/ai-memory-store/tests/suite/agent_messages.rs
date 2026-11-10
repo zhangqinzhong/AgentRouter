@@ -9,7 +9,8 @@
 //! recipient inbox is bounded so a flood cannot exhaust its context/storage.
 
 use ai_memory_core::{
-    AgentKind, MessageBox, MessageClaim, NewAgentMessage, ProjectId, WorkspaceId,
+    AgentKind, MessageBox, MessageClaim, MessageNature, MessageState, NewAgentMessage, ProjectId,
+    WorkspaceId,
 };
 use ai_memory_store::{MAX_PENDING_INBOX_MESSAGES, Store};
 
@@ -27,6 +28,90 @@ async fn project(store: &Store, workspace: &str, project: &str) -> (WorkspaceId,
     (ws, proj)
 }
 
+#[tokio::test]
+async fn measured_messages_require_evidence_at_the_store_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+
+    let mut measured = message(a, b, "the benchmark improved");
+    measured.nature = MessageNature::Measured;
+    measured.evidence = Some("   ".into());
+    let error = store
+        .writer
+        .insert_message(measured)
+        .await
+        .expect_err("blank evidence must not support a measured claim");
+    assert!(error.to_string().contains("evidence_required"), "{error}");
+
+    let mut inferred = message(a, b, "the lock probably expired");
+    inferred.nature = MessageNature::Inferred;
+    let id = store.writer.insert_message(inferred).await.unwrap();
+    let listed = store
+        .reader
+        .list_messages(b.0, b.1, MessageBox::Inbox, 50)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].nature, MessageNature::Inferred);
+    assert_eq!(listed[0].evidence, None);
+}
+
+#[tokio::test]
+async fn message_evidence_is_bounded_at_the_store_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    let mut measured = message(a, b, "the benchmark improved");
+    measured.nature = MessageNature::Measured;
+    measured.evidence = Some("x".repeat(2_000));
+    store.writer.insert_message(measured).await.unwrap();
+
+    let listed = store
+        .reader
+        .list_messages(b.0, b.1, MessageBox::Inbox, 50)
+        .await
+        .unwrap();
+    assert_eq!(listed[0].evidence.as_deref().unwrap().len(), 1_000);
+}
+
+#[tokio::test]
+async fn pre_tag_rows_read_as_unknown_without_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    let id = ai_memory_core::MessageId::new();
+    rusqlite::Connection::open(store.db_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO agent_messages (id, from_workspace_id, from_project_id, from_agent, \
+             to_workspace_id, to_project_id, body, state, created_at) \
+             VALUES (?1, ?2, ?3, 'other', ?4, ?5, 'legacy', 'pending', ?6)",
+            rusqlite::params![
+                id.as_bytes(),
+                a.0.as_bytes(),
+                a.1.as_bytes(),
+                b.0.as_bytes(),
+                b.1.as_bytes(),
+                jiff::Timestamp::now().as_microsecond(),
+            ],
+        )
+        .unwrap();
+
+    let listed = store
+        .reader
+        .list_messages(b.0, b.1, MessageBox::Inbox, 50)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].nature, MessageNature::Unknown);
+    assert_eq!(listed[0].evidence, None);
+}
+
 fn message(
     from: (WorkspaceId, ProjectId),
     to: (WorkspaceId, ProjectId),
@@ -40,8 +125,11 @@ fn message(
         from_owner_user: None,
         to_workspace_id: to.0,
         to_project_id: to.1,
+        to_agent: None,
         subject: Some("need a thing".into()),
         body: body.into(),
+        nature: ai_memory_core::MessageNature::Unknown,
+        evidence: None,
     }
 }
 
@@ -53,6 +141,66 @@ fn claim(to: (WorkspaceId, ProjectId)) -> MessageClaim {
         claiming_session: None,
         claiming_user: None,
     }
+}
+
+#[tokio::test]
+async fn addressed_messages_are_claimed_once_only_by_the_selected_harness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+    let mut directed = message(a, b, "for codex");
+    directed.to_agent = Some(AgentKind::Codex);
+    let id = store.writer.insert_message(directed).await.unwrap();
+    let mut wrong = claim(b);
+    wrong.claiming_agent = AgentKind::ClaudeCode;
+    assert!(
+        store
+            .writer
+            .pop_message(wrong.clone(), None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .writer
+            .pop_message(wrong, Some(id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let shared = store
+        .writer
+        .insert_message(message(a, b, "shared"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .pop_message(claim(b), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        shared
+    );
+    let mut correct = claim(b);
+    correct.claiming_agent = AgentKind::Codex;
+    let (left, right) = tokio::join!(
+        store.writer.pop_message(correct.clone(), Some(id)),
+        store.writer.pop_message(correct, Some(id))
+    );
+    let claimed: Vec<_> = [left.unwrap(), right.unwrap()]
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].to_agent, Some(AgentKind::Codex));
+    assert_eq!(
+        store.reader.pending_message_count(b.0, b.1).await.unwrap(),
+        0
+    );
 }
 
 /// The core queue contract: A sends to B, B pops it exactly once, a second pop
@@ -405,4 +553,229 @@ async fn a_full_inbox_rejects_further_sends() {
         .insert_message(message(a, b, "now there is room"))
         .await
         .expect("a send succeeds once the inbox drops below the cap");
+}
+
+/// A message being edited leaves the queue: it cannot be popped, counted or held
+/// twice, and only its own recipient project can hold, save or release it.
+#[tokio::test]
+async fn a_message_being_edited_leaves_the_queue_until_it_is_saved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+    let other = project(&store, "team", "other").await;
+    let other_workspace = project(&store, "other-team", "receiver").await;
+    let id = store
+        .writer
+        .insert_message(message(a, b, "first draft"))
+        .await
+        .unwrap();
+
+    for foreign in [other, other_workspace] {
+        assert!(
+            store
+                .writer
+                .begin_message_edit(foreign.0, foreign.1, id)
+                .await
+                .unwrap()
+                .is_none(),
+            "another project or workspace cannot hold the message"
+        );
+    }
+    for replacement in [None, Some((Some("unheld".into()), "unheld".into()))] {
+        assert!(
+            !store
+                .writer
+                .finish_message_edit(b.0, b.1, id, replacement)
+                .await
+                .unwrap(),
+            "save and release require a held message"
+        );
+    }
+    assert_eq!(
+        store.reader.pending_message_count(b.0, b.1).await.unwrap(),
+        1
+    );
+
+    let held = store
+        .writer
+        .begin_message_edit(b.0, b.1, id)
+        .await
+        .unwrap()
+        .expect("a pending message can be held");
+    assert_eq!(held.body, "first draft");
+    assert_eq!(held.state, MessageState::Editing);
+    assert_eq!(
+        store.reader.pending_message_count(b.0, b.1).await.unwrap(),
+        0
+    );
+    assert!(
+        store
+            .writer
+            .pop_message(claim(b), None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .writer
+            .pop_message(claim(b), Some(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a held message cannot be popped even by id"
+    );
+    assert!(
+        store
+            .writer
+            .begin_message_edit(b.0, b.1, id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a held message cannot be held again"
+    );
+    for foreign in [other, other_workspace] {
+        for replacement in [None, Some((Some("foreign".into()), "foreign".into()))] {
+            assert!(
+                !store
+                    .writer
+                    .finish_message_edit(foreign.0, foreign.1, id, replacement)
+                    .await
+                    .unwrap(),
+                "another project or workspace cannot save or release the held message"
+            );
+        }
+    }
+
+    assert!(
+        store
+            .writer
+            .finish_message_edit(
+                b.0,
+                b.1,
+                id,
+                Some((Some("new subject".into()), "second draft".into())),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.reader.pending_message_count(b.0, b.1).await.unwrap(),
+        1
+    );
+    let popped = store
+        .writer
+        .pop_message(claim(b), None)
+        .await
+        .unwrap()
+        .expect("the saved message is back in the queue");
+    assert_eq!(popped.body, "second draft");
+    assert_eq!(popped.subject.as_deref(), Some("new subject"));
+    assert!(
+        !store
+            .writer
+            .finish_message_edit(b.0, b.1, id, None)
+            .await
+            .unwrap(),
+        "a message that is no longer held cannot be saved again"
+    );
+}
+
+/// Releasing an edit without changes puts the message back unchanged and in its
+/// original place in the queue.
+#[tokio::test]
+async fn releasing_an_edit_keeps_the_text_and_the_queue_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+    let first = store
+        .writer
+        .insert_message(message(a, b, "one"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_message(message(a, b, "two"))
+        .await
+        .unwrap();
+    let before = store
+        .reader
+        .message_in_mailbox(b.0, b.1, first)
+        .await
+        .unwrap()
+        .unwrap();
+
+    store
+        .writer
+        .begin_message_edit(b.0, b.1, first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .finish_message_edit(b.0, b.1, first, None)
+            .await
+            .unwrap()
+    );
+    let after = store
+        .reader
+        .message_in_mailbox(b.0, b.1, first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, MessageState::Pending);
+    assert_eq!(after.body, before.body);
+    assert_eq!(after.created_at, before.created_at);
+
+    let popped = store
+        .writer
+        .pop_message(claim(b), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(popped.body, "one", "the released message is still first");
+}
+
+/// Only a pending message can be held: collected and cancelled mail is final.
+#[tokio::test]
+async fn collected_or_cancelled_mail_cannot_be_taken_for_editing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+    let collected = store
+        .writer
+        .insert_message(message(a, b, "collected"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .pop_message(claim(b), Some(collected))
+        .await
+        .unwrap()
+        .unwrap();
+    let cancelled = store
+        .writer
+        .insert_message(message(a, b, "cancelled"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .cancel_messages(a.0, a.1, Some(cancelled))
+        .await
+        .unwrap();
+
+    for id in [collected, cancelled] {
+        assert!(
+            store
+                .writer
+                .begin_message_edit(b.0, b.1, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

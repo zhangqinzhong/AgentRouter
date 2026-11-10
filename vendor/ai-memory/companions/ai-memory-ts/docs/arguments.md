@@ -6,6 +6,27 @@ SDK arguments are the server's wire names in camelCase. `workspace` and
 `project` travel inside `scope`; `messages.send` takes `to` and `from` scopes
 for the `to_*` and `from_*` pairs.
 
+## `memory_resolve_write_target`
+
+Methods: `pages.resolveWriteTarget`
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `project_id` | `projectId` |
+
+## `memory_write_pages_batch`
+
+Methods: `pages.writeBatch`
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `project_id` | `projectId` |
+| `pages` | `pages` |
+
 ## `memory_write_page`
 
 Methods: `pages.write`, `pages.update`
@@ -25,8 +46,21 @@ Methods: `pages.write`, `pages.update`
 | `abstract` | `abstract` |
 | `relations` | `relations` |
 | `expires_at` | `expiresAt` |
+| `source_files` | `sourceFiles` |
 | `expected_page_id` | `expectedPageId` |
 | `create_only` | `createOnly` |
+
+## `memory_patch_page`
+
+Methods: `pages.patch`
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `path` | `path` |
+| `expected_page_id` | `expectedPageId` |
+| `edits` | `edits` |
 
 ## `memory_read_page`
 
@@ -36,10 +70,12 @@ Methods: `pages.read`, `pages.update`
 |---|---|
 | `workspace` | `workspace` |
 | `project` | `project` |
+| `scope` | `scope` |
 | `path` | `path` |
 | `query` | `query` |
 | `include_related` | `includeRelated` |
 | `related_depth` | `relatedDepth` |
+| `max_chars` | `maxChars` |
 
 ## `memory_delete_page`
 
@@ -150,10 +186,14 @@ Methods: `messages.send`
 |---|---|
 | `to_workspace` | `toWorkspace` |
 | `to_project` | `toProject` |
+| `to_agent` | `toAgent` |
 | `from_workspace` | `fromWorkspace` |
 | `from_project` | `fromProject` |
+| `from_agent` | `fromAgent` |
 | `body` | `body` |
 | `subject` | `subject` |
+| `nature` | `nature` |
+| `evidence` | `evidence` |
 
 ## `memory_message_list`
 
@@ -175,6 +215,7 @@ Methods: `messages.pop`
 | `workspace` | `workspace` |
 | `project` | `project` |
 | `message_id` | `messageId` |
+| `agent` | `agent` |
 
 ## `memory_message_cancel`
 
@@ -195,6 +236,7 @@ Methods: `briefing`
 | `workspace` | `workspace` |
 | `project` | `project` |
 | `recent_pages_limit` | `recentPagesLimit` |
+| `recent_sessions_limit` | `recentSessionsLimit` |
 | `settled_first` | `settledFirst` |
 
 ## `memory_explore`
