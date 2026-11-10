@@ -96,3 +96,25 @@ October 20, 2026 targeted backports:
   migrations): AgentRouter does not use upstream's `commands/sync.js` wipe/
   rebuild migration path. Its native DB parser and persisted aggregate queue
   retain collected history; no destructive upstream migration was imported.
+
+November 10, 2026 targeted backports, reviewed against upstream v1.5.17
+(`fba54de8e8fc96301ad3607e911181040b86fdb6`):
+- `559d7c7`: lowercase ZCode `providerId`.
+- `d7228d0`, `529227d`: WorkBuddy bounded JSONL reads, committed-byte cursors and
+  incomplete UTF-8 tail retry. Only the local usage collector path is included.
+- `f1fdd15`, `cf29548`: DeepSeek Harness fork ownership and safe historical repair.
+- `ae64e97`, `c3b8643`: observed-only Codex model buckets and flattened-history
+  migration. AgentRouter applies this per encoded configuration-instance source;
+  sibling profiles never share an attribution group.
+- `669e989`, `42102e0`, `6a0a1a7`: Grok 4.7/build-fast and Gemini Flash/Argon pricing.
+- `5afb70b`, `196eaf3`: session sidecar reuse, stat signatures, scoped usage buckets
+  and optional projections. AgentRouter sidecar version 29 invalidates older
+  derived rows; `recheck` bypasses the scan TTL without discarding unchanged files.
+- `d54f1650` and subsequent shared-cache fixes through v1.5.17, including
+  `f037ed8e` and `afbf0283`: `limits-cache.js`. AgentRouter's adapter currently
+  enables it for Cursor, Grok Bot and Grok Build, retaining single-account refresh,
+  account/product isolation and the existing Claude Official local-only source.
+
+This is a selective source backport, not a replacement of the full collector or
+the upstream UI. Existing custom roots, profile attribution and AgentRouter data
+paths remain authoritative. See `docs/issue-reviews/2026-11-10-upstream-sync.md`.

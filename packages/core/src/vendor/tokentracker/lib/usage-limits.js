@@ -27,7 +27,8 @@ const {
   fetchCursorSandAccessStatus,
   fetchCursorSandUsageStatus,
 } = require("./cursor-config");
-const { fetchGrokLimits } = require("./grok-limits");
+const { fetchGrokLimits, loadGrokAuthEntry } = require("./grok-limits");
+const { withAccountLimitsCache } = require("./account-limits-cache");
 const { fetchZcodeLimits } = require("./zcode-limits");
 const { fetchOpencodeGoLimits } = require("./opencode-go-limits");
 const { fetchCommandcodeLimits } = require("./commandcode-limits");
@@ -3892,6 +3893,18 @@ async function fetchUsageLimitsUncached({
     ? readFreshClaudeLimitsCache({ home, nowMs })
     : null;
 
+  const cachedAccountPoll = (key, read) => withAccountLimitsCache({
+    home, provider: key, fetchLimits: read,
+    identity: () => {
+      try {
+        if (key !== "grok") return extractCursorAuth({ home, env })?.userId || null;
+        const token = loadGrokAuthEntry({ home, env })?.entry?.key;
+        if (typeof token !== "string" || token.split(".").length !== 3) return null;
+        const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
+        return typeof claims.sub === "string" && claims.sub ? claims.sub : null;
+      } catch { return null; }
+    },
+  });
   const providerFetch = withFetchTimeout(fetchImpl, providerTimeoutMs);
   const [claudeResult, codexResult, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGoRaw, qoder, qoderCn, codingPlan, agentPlan, commandCodeRaw, devinRaw, claudeServiceStatus] = await Promise.all([
     selectProvider('claude', () => claudeToken && !freshClaudeCache && !claudeRetryAtMs
@@ -3910,8 +3923,8 @@ async function fetchUsageLimitsUncached({
           (reason) => ({ status: "rejected", reason }),
         )
       : Promise.resolve(null)),
-    selectProvider(provider === 'grokbot' ? 'grokbot' : 'cursor', () => withProviderTimeout(fetchCursorLimits({ home, fetchImpl: providerFetch, scope: provider }), "Cursor", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider(provider === 'grokbot' ? 'grokbot' : 'cursor', () => cachedAccountPoll(provider === 'grokbot' ? 'grokbot' : provider === 'cursor' ? 'cursor' : 'cursor-all', () => withProviderTimeout(fetchCursorLimits({ home, fetchImpl: providerFetch, scope: provider }), "Cursor", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })))),
     selectProvider('kimi', () => withProviderTimeout(fetchKimiLimits({ home, env, fetchImpl: providerFetch }), "Kimi", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
     selectProvider('gemini', () => withProviderTimeout(fetchGeminiLimits({ home, env, fetchImpl: providerFetch, commandRunner }), "Gemini", providerTimeoutMs)
@@ -3937,8 +3950,8 @@ async function fetchUsageLimitsUncached({
     ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
     selectProvider('copilot', () => withProviderTimeout(fetchCopilotLimits({ home, env, fetchImpl: providerFetch, platform, securityRunner }), "GitHub Copilot", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
-    selectProvider('grok', () => withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), "Grok Build", providerTimeoutMs)
-      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
+    selectProvider('grok', () => cachedAccountPoll('grok', () => withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), "Grok Build", providerTimeoutMs)
+      .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })))),
     selectProvider('zcode', () => withProviderTimeout(fetchZcodeLimits({ home, env, fetchImpl: providerFetch }), "ZCode", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" }))),
     // OpenCode Go: authoritative subscription windows come from the dashboard
