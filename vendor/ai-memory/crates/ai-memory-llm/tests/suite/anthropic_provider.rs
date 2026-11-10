@@ -103,6 +103,24 @@ async fn an_unforced_call_reads_json_after_thinking_or_in_prose() {
     assert_eq!(outcome.unwrap(), json!({"answer": "ok"}));
 }
 
+#[rstest::rstest]
+#[case::plain("", "")]
+#[case::fenced("```json\n", "\n```")]
+#[case::prose("Here it is: ", "")]
+#[case::reasoning("<think>Draft {\"answer\":\"discard\"}</think>\n", "")]
+#[tokio::test]
+async fn unforced_text_reply_preserves_literal_reasoning_tags(
+    #[case] prefix: &str,
+    #[case] suffix: &str,
+) {
+    let expected =
+        json!({"answer": "Keep <analysis>literal text</analysis> and <think>quoted text</think>."});
+    let content = format!("{prefix}{expected}{suffix}");
+    let (outcome, body) = structured_call("claude-opus-5-5", text_reply(&content)).await;
+    assert!(body.get("tool_choice").is_none());
+    assert_eq!(outcome.unwrap(), expected);
+}
+
 #[tokio::test]
 async fn a_reply_without_a_tool_call_or_json_is_still_an_error() {
     let prose = text_reply("I cannot produce that.");

@@ -175,8 +175,8 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
     };
-    // `workspacePaths` is Antigravity's spelling; `workspace_roots` is
-    // Cursor's. Cursor never sends a usable top-level `cwd` — `sessionStart`
+    // `workspacePaths` is Antigravity's spelling, `workspace_roots` is
+    // Cursor's, and `workspaceRoots` is Cline's. Cursor never sends a usable top-level `cwd` — `sessionStart`
     // / `sessionEnd` omit it and its tool events send `cwd: ""` — so without
     // this the whole session resolves to no cwd and lands in `default/scratch`.
     let first_array_path = |keys: &[&str]| {
@@ -194,7 +194,7 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
         })
     };
     let cwd = direct(&["cwd", "current_dir", "working_dir", "directory"])
-        .or_else(|| first_array_path(&["workspacePaths", "workspace_roots"]))
+        .or_else(|| first_array_path(&["workspacePaths", "workspace_roots", "workspaceRoots"]))
         .or_else(|| {
             [
                 ["path", "cwd"].as_slice(),
@@ -214,6 +214,7 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
         "sessionID",
         "session",
         "conversationId",
+        "taskId",
     ])
     .or_else(|| {
         [
@@ -293,7 +294,34 @@ pub fn url_encode(s: &str) -> String {
 /// routing win; otherwise a valid remote's canonical path wins, and repo-root
 /// is only the host-side no-valid-remote fallback.
 pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
-    marker_query_suffix_impl(cwd, default_strategy, true)
+    marker_query_suffix_impl(cwd, default_strategy, Some(BriefingKey::SessionStart))
+}
+
+/// [`marker_query_suffix`] whose `&briefing` pair carries the
+/// `[briefing] inject_on_subagent_start` opt-in instead: the query a subagent
+/// start sends to `GET /brief`.
+pub fn marker_query_suffix_for_subagent_brief(cwd: &str, default_strategy: Option<&str>) -> String {
+    marker_query_suffix_impl(cwd, default_strategy, Some(BriefingKey::SubagentStart))
+}
+
+/// Which `[briefing]` opt-in a request forwards as its `&briefing` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BriefingKey {
+    /// `inject_on_session_start`: the brief the session-start `/handoff`
+    /// fetch appends.
+    SessionStart,
+    /// `inject_on_subagent_start`: the brief a subagent starts with, from
+    /// `/brief`.
+    SubagentStart,
+}
+
+impl BriefingKey {
+    fn marker_key(self) -> &'static str {
+        match self {
+            Self::SessionStart => "inject_on_session_start",
+            Self::SubagentStart => "inject_on_subagent_start",
+        }
+    }
 }
 
 /// [`marker_query_suffix`] without the `[briefing]` pair
@@ -306,7 +334,46 @@ pub fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String 
 /// cheap and self-limiting (empty body when nothing is pending) — without the
 /// briefing params, so the server does not recompose the brief per prompt.
 pub fn marker_query_suffix_without_briefing(cwd: &str, default_strategy: Option<&str>) -> String {
-    marker_query_suffix_impl(cwd, default_strategy, false)
+    marker_query_suffix_impl(cwd, default_strategy, None)
+}
+
+/// The fixed `/handoff` flags of a count-only inbox notice fetch (#1942).
+/// `inbox_only=1` makes the server return only the notice and skip every
+/// claim, write and active-project publish; the suppression flags keep a
+/// server that predates `inbox_only` to the same body.
+const INBOX_NOTICE_FLAGS: &str = "&inbox_only=1&handoff=0&recovery=0&profile_digest=0";
+
+/// The query suffix of a count-only inbox notice fetch: the routing pairs of
+/// [`marker_query_suffix_without_briefing`] followed by
+/// [`INBOX_NOTICE_FLAGS`]. The marker's own `&handoff=0` / `&recovery=0`
+/// delivery opt-outs are left out because the fixed flags already carry
+/// them: `GET /handoff` deserializes its query into a struct, and a repeated
+/// key is a 400, which would hide the notice for exactly the repositories
+/// that turned delivery off. Both the Claude Code prompt notice and the
+/// `mcp-bridge --channel inbox` poll build their query here.
+pub fn inbox_notice_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
+    match routing_selection(cwd) {
+        Ok(selection) => inbox_notice_query_suffix_from_selection(cwd, default_strategy, selection),
+        // Like `marker_query_suffix_impl`: an unreadable routing marker sends
+        // no routing pairs at all.
+        Err(_) => INBOX_NOTICE_FLAGS.to_owned(),
+    }
+}
+
+fn inbox_notice_query_suffix_from_selection(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    selection: Option<RoutingSelection>,
+) -> String {
+    let mut qs = build_marker_query_suffix(
+        cwd,
+        default_strategy,
+        None,
+        selection,
+        DeliveryOptOuts::Omit,
+    );
+    qs.push_str(INBOX_NOTICE_FLAGS);
+    qs
 }
 
 /// Whether the marker that routes `cwd` explicitly enables the compiled
@@ -319,16 +386,50 @@ pub fn marker_query_suffix_without_briefing(cwd: &str, default_strategy: Option<
 /// Kimi Code uses this before creating its local once-per-session marker so
 /// repositories that did not opt in do not accumulate marker files.
 pub fn marker_requests_briefing(cwd: &str) -> bool {
-    marker_requests_briefing_with_home(cwd, home_dir().as_deref())
+    marker_requests_briefing_with_home(cwd, home_dir().as_deref(), BriefingKey::SessionStart)
 }
 
-/// [`marker_requests_briefing`] resolved against `home` instead of the
-/// operator's home directory.
-fn marker_requests_briefing_with_home(cwd: &str, home: Option<&Path>) -> bool {
+/// Whether the marker that routes `cwd` explicitly enables the subagent
+/// brief (`[briefing] inject_on_subagent_start`), read from the selection
+/// [`marker_query_suffix_for_subagent_brief`] reads, so a subagent start asks
+/// `/brief` only when its query would carry the opt-in.
+pub fn marker_requests_subagent_briefing(cwd: &str) -> bool {
+    marker_requests_briefing_with_home(cwd, home_dir().as_deref(), BriefingKey::SubagentStart)
+}
+
+/// Whether the marker that routes `cwd` opts this repository into the
+/// mid-session inbox notice (#1942): `[messaging] inbox_notice_on_prompt`.
+/// Same selection rule as [`marker_requests_briefing`] — the nearest
+/// settings-declaring marker, so a nested capture-only marker cannot shadow
+/// an outer opt-in and a marker declaring only this key still counts as a
+/// settings boundary. Truthy-only: absent or falsy leaves the notice off.
+pub fn marker_requests_inbox_notice(cwd: &str) -> bool {
+    marker_requests_inbox_notice_with_home(cwd, home_dir().as_deref())
+}
+
+/// [`marker_requests_inbox_notice`] resolved against `home` instead of the
+/// operator's home directory, so tests are hermetic.
+fn marker_requests_inbox_notice_with_home(cwd: &str, home: Option<&Path>) -> bool {
     crate::marker::routing_selection_with_home(cwd, cwd, home, false)
         .ok()
         .flatten()
-        .and_then(|selection| parse_toml_flag(&selection.path, "inject_on_session_start"))
+        .and_then(|selection| {
+            crate::marker::parse_toml_section_flag(
+                &selection.path,
+                "messaging",
+                "inbox_notice_on_prompt",
+            )
+        })
+        .is_some_and(|value| is_truthy(&value))
+}
+
+/// [`marker_requests_briefing`] for the opt-in `key`, resolved against `home`
+/// instead of the operator's home directory.
+fn marker_requests_briefing_with_home(cwd: &str, home: Option<&Path>, key: BriefingKey) -> bool {
+    crate::marker::routing_selection_with_home(cwd, cwd, home, false)
+        .ok()
+        .flatten()
+        .and_then(|selection| parse_toml_flag(&selection.path, key.marker_key()))
         .is_some_and(|value| is_truthy(&value))
 }
 
@@ -628,20 +729,45 @@ fn profile_flag_value(raw: Option<String>) -> &'static str {
 fn marker_query_suffix_impl(
     cwd: &str,
     default_strategy: Option<&str>,
-    include_briefing: bool,
+    briefing_key: Option<BriefingKey>,
 ) -> String {
     let selection = match routing_selection(cwd) {
         Ok(selection) => selection,
         Err(_) => return String::new(),
     };
-    marker_query_suffix_impl_from_selection(cwd, default_strategy, include_briefing, selection)
+    marker_query_suffix_impl_from_selection(cwd, default_strategy, briefing_key, selection)
 }
 
 fn marker_query_suffix_impl_from_selection(
     cwd: &str,
     default_strategy: Option<&str>,
-    include_briefing: bool,
+    briefing_key: Option<BriefingKey>,
     selection: Option<RoutingSelection>,
+) -> String {
+    build_marker_query_suffix(
+        cwd,
+        default_strategy,
+        briefing_key,
+        selection,
+        DeliveryOptOuts::Forward,
+    )
+}
+
+/// Whether a marker suffix carries the `[handoff]` / `[recovery]`
+/// `deliver_on_session_start` opt-outs as `&handoff=0` / `&recovery=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOptOuts {
+    Forward,
+    /// The caller appends both flags itself ([`INBOX_NOTICE_FLAGS`]).
+    Omit,
+}
+
+fn build_marker_query_suffix(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    briefing_key: Option<BriefingKey>,
+    selection: Option<RoutingSelection>,
+    delivery_opt_outs: DeliveryOptOuts,
 ) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
     let marker = selection.as_ref().map(|selection| selection.path.clone());
@@ -649,6 +775,8 @@ fn marker_query_suffix_impl_from_selection(
     let (mut drop_subagent, mut default_global) = (None, None);
     let (mut briefing, mut briefing_budget) = (None, None);
     let (mut profile_contribute, mut profile_consume) = (None, None);
+    let mut handoff_off = false;
+    let mut recovery_off = false;
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
@@ -659,15 +787,31 @@ fn marker_query_suffix_impl_from_selection(
         default_global = parse_toml_flag(&marker, "default_global");
         // `[briefing] inject_on_session_start = true` + optional
         // `max_chars = N` — opt this repo into the compiled project brief
-        // appended to the session-start handoff fetch (#176).
-        briefing = parse_toml_flag(&marker, "inject_on_session_start");
-        briefing_budget = parse_toml_flag(&marker, "max_chars");
+        // appended to the session-start handoff fetch (#176); the subagent
+        // brief reads `inject_on_subagent_start` instead.
+        if let Some(key) = briefing_key {
+            briefing = parse_toml_flag(&marker, key.marker_key());
+            briefing_budget = parse_toml_flag(&marker, "max_chars");
+        }
         // `[profile] contribute` / `consume` (quoted or bare), always sent
         // explicitly once a marker resolved: a falsy value sends `0`, anything
         // else (an absent key included) `1`. Removing the key re-enables; no
         // marker sends nothing, so the server keeps what it stored.
         profile_contribute = Some(profile_flag_value(parse_toml_flag(&marker, "contribute")));
         profile_consume = Some(profile_flag_value(parse_toml_flag(&marker, "consume")));
+        // The delivery keys share a name but not a table. Keep legacy handoff
+        // parsing outside `[recovery]`; recovery itself is section-scoped.
+        handoff_off = crate::marker::parse_toml_flag_outside_section(
+            &marker,
+            "recovery",
+            "deliver_on_session_start",
+        )
+        .as_deref()
+        .is_some_and(crate::marker::is_falsy);
+        recovery_off =
+            crate::marker::parse_toml_section_flag(&marker, "recovery", "deliver_on_session_start")
+                .as_deref()
+                .is_some_and(crate::marker::is_falsy);
     }
     if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
@@ -715,19 +859,26 @@ fn marker_query_suffix_impl_from_selection(
     if let Some(val) = profile_consume {
         qs.push_str(&format!("&profile_consume={val}"));
     }
-    // Per-repo session-start brief opt-in: forwarded on every request for
-    // simplicity (the capture path ignores it); only the `/handoff` GET at
-    // session start acts on it. Truthiness and the char-budget clamp are
-    // decided server-side. Callers that deliver the brief once per session
-    // (the kimi user-prompt path) pass `include_briefing = false` after the
-    // first delivery so the server stops recomposing the brief per request.
-    if include_briefing {
-        if let Some(val) = briefing.filter(|v| !v.is_empty()) {
-            qs.push_str(&format!("&briefing={}", url_encode(&val)));
+    if delivery_opt_outs == DeliveryOptOuts::Forward {
+        if handoff_off {
+            qs.push_str("&handoff=0");
         }
-        if let Some(val) = briefing_budget.filter(|v| !v.is_empty()) {
-            qs.push_str(&format!("&briefing_budget={}", url_encode(&val)));
+        if recovery_off {
+            qs.push_str("&recovery=0");
         }
+    }
+    // Per-repo brief opt-in: forwarded on every request for simplicity (the
+    // capture path ignores it); only the `/handoff` GET at session start, or
+    // `/brief` at a subagent start, acts on it. Truthiness and the
+    // char-budget clamp are decided server-side. Callers that deliver the
+    // brief once per session (the kimi user-prompt path) pass no key after
+    // the first delivery so the server stops recomposing the brief per
+    // request.
+    if let Some(val) = briefing.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&briefing={}", url_encode(&val)));
+    }
+    if let Some(val) = briefing_budget.filter(|v| !v.is_empty()) {
+        qs.push_str(&format!("&briefing_budget={}", url_encode(&val)));
     }
     qs
 }
@@ -774,12 +925,15 @@ const NATIVE_HOOK_CLIENT_KIND: &str = "hook";
 /// ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, which have no
 /// business on a loopback/LAN POST; reqwest is built without its
 /// `system-proxy` feature, so no OS proxy setting is read either way.
+/// Redirects are disabled so a 3xx from an SSO portal or proxy never drops
+/// spooled events, replays payloads, or injects foreign HTML into context.
 /// Built once per invocation and reused for both the event POST and the
 /// handoff GET. Default root certs are kept so HTTPS targets (e.g. a TLS
 /// proxy) still work.
 pub fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -806,9 +960,10 @@ pub enum PostOutcome {
     /// so the drain can skip past them instead of stopping at the first one
     /// (#493).
     Unreachable,
-    /// `403` — the server understood the request and will never accept it.
-    /// Today that means the author may not write the project
-    /// the event belongs to.
+    /// `403` or `409` — the server understood the request and will never
+    /// accept it. A 403 means the author may not write the project the event
+    /// belongs to; a 409 means the session was first captured under another
+    /// agent (#2023).
     ///
     /// Terminal, and that is the whole point of separating it from
     /// [`Self::Failed`]. A refusal that counts as a failure gets re-sent until
@@ -853,7 +1008,14 @@ pub async fn post_hook(
             PostOutcome::Saturated
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => PostOutcome::Unauthorized,
-        Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => PostOutcome::Refused,
+        Ok(resp)
+            if matches!(
+                resp.status(),
+                reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::CONFLICT
+            ) =>
+        {
+            PostOutcome::Refused
+        }
         Ok(_) => PostOutcome::Failed,
         Err(_) => PostOutcome::Unreachable,
     }
@@ -1033,8 +1195,11 @@ pub async fn get_handoff(
         Ok(r) => r,
         Err(e) => {
             eprintln!(
-                "ai-memory hook warning: handoff fetch failed ({e}); \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook warning: handoff fetch failed ({e}); \
                  a pending handoff (if any) was NOT injected"
+                ))
             );
             return None;
         }
@@ -1046,9 +1211,12 @@ pub async fn get_handoff(
         // is the server's reason and goes to stderr, never into context.
         let reason = resp.text().await.unwrap_or_default();
         eprintln!(
-            "ai-memory hook warning: not authorized for this project's memory ({}); \
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook warning: not authorized for this project's memory ({}); \
              nothing was injected",
-            reason.trim()
+                super::show::terminal_text(reason.trim())
+            ))
         );
         return None;
     }
@@ -1077,9 +1245,12 @@ mod tests {
             Some(home.path()),
             false,
         ) {
-            Ok(selection) => {
-                marker_query_suffix_impl_from_selection(cwd, default_strategy, true, selection)
-            }
+            Ok(selection) => marker_query_suffix_impl_from_selection(
+                cwd,
+                default_strategy,
+                Some(BriefingKey::SessionStart),
+                selection,
+            ),
             Err(_) => String::new(),
         }
     }
@@ -1094,7 +1265,13 @@ mod tests {
     /// reason.
     fn marker_requests_briefing(cwd: &str) -> bool {
         let home = tempfile::TempDir::new().unwrap();
-        marker_requests_briefing_with_home(cwd, Some(home.path()))
+        marker_requests_briefing_with_home(cwd, Some(home.path()), BriefingKey::SessionStart)
+    }
+
+    /// Shadows [`super::marker_requests_inbox_notice`] with the same empty home.
+    fn marker_requests_inbox_notice(cwd: &str) -> bool {
+        let home = tempfile::TempDir::new().unwrap();
+        marker_requests_inbox_notice_with_home(cwd, Some(home.path()))
     }
 
     async fn serve_once(status: &'static str, body: &'static str) -> String {
@@ -1227,6 +1404,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_hook_agent_mismatch_409_is_terminal_not_a_failure() {
+        // #2023: a 409 names the agent the session is bound to. Re-sending the
+        // same event cannot change that, so it must not burn retry attempts.
+        let url = serve_once(
+            "409 Conflict",
+            r#"{"error":"agent_mismatch","bound_agent":"claude-code"}"#,
+        )
+        .await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Refused);
+    }
+
+    #[tokio::test]
     async fn post_hook_408_and_425_are_retryable_failed_not_refused() {
         // 408 (request timeout) and 425 (too early) say "retry me", not
         // "never": they must fall through to `Failed` so the spool keeps the
@@ -1277,6 +1467,100 @@ mod tests {
         let url = serve_once("401 Unauthorized", "unauthorized").await;
         let got = get_handoff(&build_client(), &url, None, Duration::from_secs(1)).await;
         assert!(got.is_none(), "non-2xx body must not become context");
+    }
+
+    async fn redirect_server(status: &'static str, target_url: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = target_url.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}/redirect")
+    }
+
+    #[tokio::test]
+    async fn build_client_refuses_redirects() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let response = build_client().get(&source_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_hook_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let outcome = post_hook(
+            &build_client(),
+            &source_url,
+            "{}",
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(outcome, PostOutcome::Failed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_batch_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let outcome = post_batch(
+            &build_client(),
+            &source_url,
+            "[]",
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(outcome, BatchOutcome::Failed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_handoff_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/login", target.local_addr().unwrap());
+        let source_url = redirect_server("302 Found", &target_url).await;
+
+        let got = get_handoff(&build_client(), &source_url, None, Duration::from_secs(1)).await;
+        assert!(got.is_none(), "redirect must not inject target content");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
     }
 
     /// Like `serve_once`, but answers 200 and hands back the raw request.
@@ -1458,6 +1742,34 @@ mod tests {
         assert_eq!(
             canonical_context(&tool_event).0,
             Some("/checkouts/repo-a".into())
+        );
+    }
+
+    /// Cline file hooks send no top-level `cwd` and no `session_id`: the
+    /// checkout arrives as `workspaceRoots` and the session as `taskId`
+    /// (#1888). Routing already reads both, so the capture gate must too, or
+    /// allowlist mode finds no marker and drops every Cline event. Shape
+    /// abridged from a Cline CLI 3.0.74 `TaskStart` payload.
+    #[test]
+    fn canonical_context_reads_cline_workspace_roots_and_task_id() {
+        let task_start = serde_json::json!({
+            "taskId": "conv_cline-task",
+            "hookName": "agent_start",
+            "sessionContext": {"rootSessionId": "root"},
+            "workspaceRoots": ["/checkouts/repo-a", "/checkouts/repo-b"],
+            "workspaceInfo": {"rootPath": "/checkouts/repo-a", "latestGitBranchName": "main"}
+        });
+        assert_eq!(
+            canonical_context(&task_start),
+            (
+                Some("/checkouts/repo-a".into()),
+                Some("conv_cline-task".into())
+            )
+        );
+        let routing = ai_memory_hooks::payload::hook_payload_context(&task_start);
+        assert_eq!(
+            canonical_context(&task_start),
+            (routing.cwd, routing.session_id)
         );
     }
 
@@ -1723,8 +2035,12 @@ mod tests {
             false,
         )
         .unwrap();
-        let query =
-            marker_query_suffix_impl_from_selection(repo.to_str().unwrap(), None, true, selection);
+        let query = marker_query_suffix_impl_from_selection(
+            repo.to_str().unwrap(),
+            None,
+            Some(BriefingKey::SessionStart),
+            selection,
+        );
         for expected in [
             "&workspace=right",
             "&project=api",
@@ -1760,7 +2076,7 @@ mod tests {
         )
         .unwrap();
         let query =
-            marker_query_suffix_impl_from_selection(repo.to_str().unwrap(), None, false, selection);
+            marker_query_suffix_impl_from_selection(repo.to_str().unwrap(), None, None, selection);
         assert!(query.contains("&workspace=path&project=api"), "{query}");
         assert!(!query.contains("aliases="), "{query}");
         assert!(!query.contains("identity_src="), "{query}");
@@ -1848,6 +2164,179 @@ drop_subagent_captures = "true"
         assert!(!none.contains("profile_"), "{none}");
     }
 
+    /// `[handoff] deliver_on_session_start` is forwarded as `&handoff=0` only
+    /// when explicitly falsy; every other shape leaves the request unchanged,
+    /// and a `[handoff]`-only marker is a settings boundary.
+    #[test]
+    fn marker_query_suffix_forwards_the_handoff_opt_out_only_when_falsy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"outer\"\n",
+        )
+        .unwrap();
+        for off in ["false", "\"no\"", "0", "\"OFF\""] {
+            std::fs::write(
+                inner.join(".ai-memory.toml"),
+                format!("[handoff]\ndeliver_on_session_start = {off}\n"),
+            )
+            .unwrap();
+            let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+            assert!(qs.contains("&handoff=0"), "{off}: {qs}");
+            assert!(
+                !qs.contains("workspace=outer"),
+                "a [handoff] marker is a boundary: {qs}"
+            );
+        }
+        for on in ["true", "\"yes\"", "banana"] {
+            std::fs::write(
+                inner.join(".ai-memory.toml"),
+                format!("[handoff]\ndeliver_on_session_start = {on}\n"),
+            )
+            .unwrap();
+            let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+            assert!(!qs.contains("handoff"), "{on}: {qs}");
+        }
+        // The sibling project keeps delivering: the opt-out is read from the
+        // nearest settings marker only.
+        let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!outer.contains("handoff"), "{outer}");
+    }
+
+    /// `[recovery]` has its own delivery flag and is a settings boundary. Its
+    /// same-named key never disables handoffs, and every non-falsy value keeps
+    /// the request byte-identical to a marker without the key.
+    #[test]
+    fn marker_query_suffix_forwards_recovery_independently_only_when_falsy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"outer\"\n",
+        )
+        .unwrap();
+        let marker = inner.join(".ai-memory.toml");
+        let unchanged = format!(
+            "&cwd={}&profile_contribute=1&profile_consume=1",
+            url_encode(inner.to_str().unwrap())
+        );
+
+        for off in ["false", "\"no\"", "0", "\"OFF\""] {
+            std::fs::write(
+                &marker,
+                format!("[recovery]\ndeliver_on_session_start = {off}\n"),
+            )
+            .unwrap();
+            let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+            assert_eq!(qs, format!("{unchanged}&recovery=0"), "{off}");
+            assert!(
+                !qs.contains("workspace=outer"),
+                "a [recovery] marker is a boundary: {qs}"
+            );
+        }
+        for on in ["true", "\"yes\"", "banana"] {
+            std::fs::write(
+                &marker,
+                format!("[recovery]\ndeliver_on_session_start = {on}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                marker_query_suffix(inner.to_str().unwrap(), None),
+                unchanged,
+                "{on}"
+            );
+        }
+
+        std::fs::write(
+            &marker,
+            "[handoff]\ndeliver_on_session_start = false\n[recovery]\ndeliver_on_session_start = false\n",
+        )
+        .unwrap();
+        let both = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(both.contains("&handoff=0&recovery=0"), "{both}");
+
+        // Compatibility: legacy section-blind handoff parsing is unchanged
+        // outside the new [recovery] table.
+        std::fs::write(&marker, "deliver_on_session_start = false\n").unwrap();
+        let legacy = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert_eq!(legacy, format!("{unchanged}&handoff=0"));
+
+        let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!outer.contains("recovery"), "{outer}");
+    }
+
+    /// The inbox notice query (#1942) appends its own `handoff=0` and
+    /// `recovery=0`, so it must not also forward the marker's delivery
+    /// opt-outs: `GET /handoff` deserializes its query into `HandoffQuery`,
+    /// which rejects a repeated key, and the notice would never appear for a
+    /// repository that turned handoff or recovery delivery off. Every shape is
+    /// parsed with the server's own extractor; the control proves that
+    /// extractor rejects the old composition.
+    #[test]
+    fn inbox_notice_query_parses_as_a_handoff_query_under_every_delivery_opt_out() {
+        use ai_memory_hooks::router::HandoffQuery;
+        use axum::extract::Query;
+
+        let parse = |qs: &str| {
+            let uri: axum::http::Uri = format!("/handoff?agent=claude-code&session_id=s{qs}")
+                .parse()
+                .unwrap();
+            Query::<HandoffQuery>::try_from_uri(&uri).map(|Query(query)| query)
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let selection = || {
+            super::super::super::marker::routing_selection_with_home(
+                cwd,
+                cwd,
+                Some(home.path()),
+                false,
+            )
+            .unwrap()
+        };
+        let handoff_off = "[handoff]\ndeliver_on_session_start = false\n";
+        let recovery_off = "[recovery]\ndeliver_on_session_start = false\n";
+        let cases = [
+            ("no marker", None),
+            ("no opt-out", Some("workspace = \"w\"\n".to_owned())),
+            ("handoff off", Some(handoff_off.to_owned())),
+            ("recovery off", Some(recovery_off.to_owned())),
+            ("both off", Some(format!("{handoff_off}{recovery_off}"))),
+            (
+                "legacy handoff off",
+                Some("deliver_on_session_start = false\n".to_owned()),
+            ),
+        ];
+        for (name, body) in cases {
+            match &body {
+                Some(body) => std::fs::write(&marker, body).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&marker);
+                }
+            }
+            let qs = inbox_notice_query_suffix_from_selection(cwd, None, selection());
+            let query = parse(&qs).unwrap_or_else(|e| panic!("{name}: {qs} rejected: {e}"));
+            assert_eq!(query.inbox_only.as_deref(), Some("1"), "{name}");
+            assert_eq!(query.handoff.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.recovery.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.profile_digest.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.cwd.as_deref(), Some(cwd), "{name}");
+            assert!(query.briefing.is_none(), "{name}: {qs}");
+
+            // Control: the routing suffix that forwards the opt-outs, followed
+            // by the fixed flags, is what both callers used to send.
+            let forwarded = marker_query_suffix_impl_from_selection(cwd, None, None, selection());
+            let old = format!("{forwarded}{INBOX_NOTICE_FLAGS}");
+            let opted_out = forwarded.contains("&handoff=0") || forwarded.contains("&recovery=0");
+            assert_eq!(parse(&old).is_err(), opted_out, "{name}: {old}");
+        }
+    }
+
     /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so
     /// the server keeps that project's subagent captures (opt-in only).
     #[test]
@@ -1916,6 +2405,79 @@ drop_subagent_captures = "true"
         assert!(!qs.contains("briefing"), "{qs}");
     }
 
+    /// `[briefing] inject_on_subagent_start` is its own opt-in: it rides only
+    /// the subagent-start query, and the session-start query keeps forwarding
+    /// `inject_on_session_start` alone, so neither turns the other on.
+    #[test]
+    fn subagent_brief_query_forwards_only_its_own_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let subagent_query = || {
+            let home = tempfile::TempDir::new().unwrap();
+            let selection = super::super::super::marker::routing_selection_with_home(
+                cwd,
+                cwd,
+                Some(home.path()),
+                false,
+            );
+            marker_query_suffix_impl_from_selection(
+                cwd,
+                None,
+                Some(BriefingKey::SubagentStart),
+                selection.unwrap(),
+            )
+        };
+
+        std::fs::write(
+            &marker,
+            "[briefing]\ninject_on_subagent_start = true\nmax_chars = 6000\n",
+        )
+        .unwrap();
+        let qs = subagent_query();
+        assert!(qs.contains("&cwd="), "{qs}");
+        assert!(qs.contains("&briefing=true"), "{qs}");
+        assert!(qs.contains("&briefing_budget=6000"), "{qs}");
+        // `max_chars` rides along with or without an opt-in, as it always has;
+        // only `&briefing=` turns a brief on.
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            !qs.contains("&briefing="),
+            "session start must not inherit it: {qs}"
+        );
+
+        std::fs::write(
+            &marker,
+            "[briefing]\ninject_on_session_start = true\nmax_chars = 6000\n",
+        )
+        .unwrap();
+        let qs = subagent_query();
+        assert!(
+            !qs.contains("&briefing="),
+            "subagents must not inherit it: {qs}"
+        );
+        assert!(marker_query_suffix(cwd, None).contains("&briefing=true"));
+    }
+
+    #[test]
+    fn marker_requests_subagent_briefing_only_for_its_own_truthy_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let cwd = tmp.path().to_str().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let requested = || {
+            marker_requests_briefing_with_home(cwd, Some(home.path()), BriefingKey::SubagentStart)
+        };
+
+        assert!(!requested());
+        std::fs::write(&marker, "[briefing]\ninject_on_session_start = true\n").unwrap();
+        assert!(!requested());
+        std::fs::write(&marker, "[briefing]\ninject_on_subagent_start = off\n").unwrap();
+        assert!(!requested());
+        std::fs::write(&marker, "[briefing]\ninject_on_subagent_start = \"yes\"\n").unwrap();
+        assert!(requested());
+    }
+
     #[test]
     fn marker_requests_briefing_only_for_truthy_opt_in() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1935,6 +2497,58 @@ drop_subagent_captures = "true"
         )
         .unwrap();
         assert!(marker_requests_briefing(cwd));
+    }
+
+    #[test]
+    fn marker_requests_inbox_notice_only_for_truthy_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let cwd = tmp.path().to_str().unwrap();
+
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninject_on_session_start = true\n").unwrap();
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninbox_notice_on_prompt = false\n").unwrap();
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninbox_notice_on_prompt = true\n").unwrap();
+        assert!(marker_requests_inbox_notice(cwd));
+    }
+
+    #[test]
+    fn inbox_notice_gate_reads_the_nearest_settings_marker() {
+        let home = tempfile::TempDir::new().unwrap();
+        let nested = home.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            home.path().join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = true\n",
+        )
+        .unwrap();
+        let cwd = nested.to_str().unwrap();
+        assert!(marker_requests_inbox_notice_with_home(
+            cwd,
+            Some(home.path())
+        ));
+
+        std::fs::write(
+            nested.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"/secret\"]\n",
+        )
+        .unwrap();
+        assert!(
+            marker_requests_inbox_notice_with_home(cwd, Some(home.path())),
+            "a capture-only nested marker is transparent, so the outer opt-in stays active"
+        );
+
+        std::fs::write(
+            nested.join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = false\n",
+        )
+        .unwrap();
+        assert!(!marker_requests_inbox_notice_with_home(
+            cwd,
+            Some(home.path())
+        ));
     }
 
     /// The Kimi once-per-session gate reads the marker the query it gates
@@ -1959,18 +2573,31 @@ drop_subagent_captures = "true"
                 Some(home.path()),
                 false,
             );
-            marker_query_suffix_impl_from_selection(cwd, None, true, selection.unwrap())
+            marker_query_suffix_impl_from_selection(
+                cwd,
+                None,
+                Some(BriefingKey::SessionStart),
+                selection.unwrap(),
+            )
         };
 
         let qs = query();
         assert!(qs.contains("&briefing=true"), "{qs}");
-        assert!(marker_requests_briefing_with_home(cwd, Some(home.path())));
+        assert!(marker_requests_briefing_with_home(
+            cwd,
+            Some(home.path()),
+            BriefingKey::SessionStart
+        ));
 
         // The repo's own settings marker wins over the home marker for both.
         std::fs::write(repo.path().join(".ai-memory.toml"), "project = \"repo\"\n").unwrap();
         let qs = query();
         assert!(!qs.contains("briefing"), "{qs}");
-        assert!(!marker_requests_briefing_with_home(cwd, Some(home.path())));
+        assert!(!marker_requests_briefing_with_home(
+            cwd,
+            Some(home.path()),
+            BriefingKey::SessionStart
+        ));
     }
 
     #[test]

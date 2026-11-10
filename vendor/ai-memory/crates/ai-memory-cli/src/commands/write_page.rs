@@ -6,9 +6,10 @@
 
 use std::io::Read;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::WritePageArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -43,14 +44,25 @@ struct WritePageResponseBody {
 /// Run the `write-page` subcommand.
 ///
 /// # Errors
-/// Returns an error if stdin cannot be read (when `body == "-"`), or if
-/// the POST to `/admin/write-page` fails.
+/// Returns an error if an explicit scope flag is empty, `--path` is empty,
+/// stdin cannot be read (when `body == "-"`), or if the POST to
+/// `/admin/write-page` fails.
 pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
+    let i18n = &config.i18n;
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    if args.path.trim().is_empty() {
+        bail!(
+            "{}",
+            i18n.text("cli-write-page-path-was-passed-empty-specify-the-wiki-page-path-to-write")
+        );
+    }
+
     let body_text = if args.body == "-" {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
-            .context("reading body from stdin")?;
+            .context(i18n.text("cli-write-page-reading-body-from-stdin"))?;
         buf
     } else {
         args.body
@@ -62,7 +74,7 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let resp: WritePageResponseBody = post_json(
         &endpoint,
         "/admin/write-page",
@@ -81,17 +93,29 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
         },
     )
     .await
-    .context("writing page via server")?;
+    .context(i18n.text("cli-write-page-writing-page-via-server"))?;
 
     if let Some(warning) = resp.manifest_warning.as_deref() {
-        eprintln!("ai-memory: warning: {warning}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-move-project-ai-memory-warning-warning",
+                &[("value0", terminal_text(warning))]
+            )
+        );
     }
     println!(
-        "✓ wrote {} (page_id={}) under {}/{}",
-        resp.path,
-        short_page_id(&resp.page_id),
-        workspace,
-        project
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-write-page-wrote-page-id-under",
+            &[
+                ("value0", terminal_text(&resp.path)),
+                ("value1", terminal_text(short_page_id(&resp.page_id))),
+                ("value2", workspace.to_string()),
+                ("value3", project.to_string())
+            ]
+        )
     );
     Ok(())
 }
@@ -106,7 +130,7 @@ pub(crate) fn short_page_id(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::short_page_id;
+    use super::*;
 
     #[test]
     fn short_page_id_keeps_the_random_tail() {
@@ -119,5 +143,67 @@ mod tests {
             "5783b7fb"
         );
         assert_eq!(short_page_id("abc"), "abc");
+    }
+
+    fn write_args(path: &str, project: Option<&str>) -> WritePageArgs {
+        WritePageArgs {
+            path: path.into(),
+            body: "test body".into(),
+            workspace: None,
+            project: project.map(str::to_string),
+            title: None,
+            kind: None,
+            tier: "semantic".into(),
+            tag: Vec::new(),
+            pinned: false,
+            applies_to: Vec::new(),
+            enforced_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let a = write_args("notes/example.md", Some("   "));
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = write_args("notes/example.md", Some("app"));
+        a.workspace = Some("".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_path_is_refused_before_any_request() {
+        let config = Config::default();
+        let a = write_args("   ", Some("app"));
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--path was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_flag_is_refused_before_reading_stdin() {
+        let config = Config::default();
+        let mut a = write_args("notes/example.md", Some(""));
+        a.body = "-".into();
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
     }
 }

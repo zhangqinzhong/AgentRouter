@@ -45,7 +45,10 @@ pub fn session_text(date: &str, turns: &[Turn]) -> String {
 }
 
 /// Rank `(id, lowercased document)` pairs for `query`, best first.
-pub fn rank<'a, T: Copy>(query: &str, docs: impl IntoIterator<Item = (T, &'a str)>) -> Vec<T> {
+pub fn rank_with_scores<'a, T: Copy>(
+    query: &str,
+    docs: impl IntoIterator<Item = (T, &'a str)>,
+) -> Vec<(T, usize)> {
     let terms = tokenize(query);
     let mut scored: Vec<(T, usize)> = docs
         .into_iter()
@@ -56,7 +59,15 @@ pub fn rank<'a, T: Copy>(query: &str, docs: impl IntoIterator<Item = (T, &'a str
         .collect();
     // `sort_by_key` is stable: equal scores keep haystack order.
     scored.sort_by_key(|(_, hits)| std::cmp::Reverse(*hits));
-    scored.into_iter().map(|(id, _)| id).collect()
+    scored
+}
+
+/// Rank documents and discard their raw overlap scores.
+pub fn rank<'a, T: Copy>(query: &str, docs: impl IntoIterator<Item = (T, &'a str)>) -> Vec<T> {
+    rank_with_scores(query, docs)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Rank one question's haystack sessions, returning stored session uuids.
@@ -126,6 +137,14 @@ mod tests {
         // query terms: leather, boots → doc 2 and 3 score 2, doc 4 scores 1.
         let ranked = rank("leather boots", docs);
         assert_eq!(ranked, [2, 3, 4]);
+    }
+
+    #[test]
+    fn ranked_scores_preserve_the_overlap_signal() {
+        assert_eq!(
+            rank_with_scores("leather boots", [(1, "boots"), (2, "leather boots")]),
+            [(2, 2), (1, 1)]
+        );
     }
 
     #[test]

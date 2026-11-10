@@ -9,11 +9,11 @@
 //! a consistent (old) state that the next run re-classifies safely.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::atomic;
 use crate::client::{ApiClient, ApiPage, PageSummary};
 use crate::page_file::{self, PageMeta};
 use crate::paths;
@@ -135,6 +135,63 @@ pub struct RunArgs {
     pub include: Vec<String>,
     /// Overwrite files that diverged locally since the last export.
     pub force: bool,
+    /// Take over a destination whose baseline belongs to another server,
+    /// workspace or project: the baseline is discarded, so this run treats
+    /// the destination as a fresh export (#1708). Without it a scope change
+    /// refuses before anything is written.
+    pub adopt_scope: bool,
+}
+
+/// Refuse to reuse a baseline recorded for another scope (#1708).
+///
+/// Reusing it made every page of the previous project look "deleted on the
+/// server", which `--propagate-deletes --apply` then removed. Returns the
+/// state a run should use: cleared when `--adopt-scope` takes the
+/// destination over, stamped with this run's scope so the next save records
+/// it.
+pub fn baseline_for(
+    mut state: state::SyncState,
+    scope: &state::SyncScope,
+    adopt: bool,
+) -> Result<state::SyncState> {
+    match state::check_scope(&state, scope) {
+        state::ScopeCheck::Match => {}
+        state::ScopeCheck::Adopted => {
+            if !state.pages.is_empty() {
+                eprintln!(
+                    "ai-memory-wikisync: this destination's baseline predates origin tracking; \
+                     adopting it for {}/{}. A baseline from another project cannot be detected, \
+                     so check the plan before --apply.",
+                    scope.workspace, scope.project
+                );
+            }
+            state.scope = Some(scope.clone());
+        }
+        state::ScopeCheck::Mismatch { recorded } => {
+            if !adopt {
+                bail!(
+                    "this destination's baseline belongs to {} ({}/{}), not {}/{}. \
+                     Reusing it would read that project's pages as deletions here; re-run with \
+                     --adopt-scope to discard the baseline and export fresh",
+                    recorded.server,
+                    recorded.workspace,
+                    recorded.project,
+                    scope.workspace,
+                    scope.project
+                );
+            }
+            eprintln!(
+                "ai-memory-wikisync: discarding the baseline recorded for {}/{}, adopting this \
+                 destination for {}/{}",
+                recorded.workspace, recorded.project, scope.workspace, scope.project
+            );
+            state = state::SyncState {
+                scope: Some(scope.clone()),
+                ..state::SyncState::default()
+            };
+        }
+    }
+    Ok(state)
 }
 
 /// Classify one page from its three versions. Pure: all IO happens around
@@ -252,34 +309,17 @@ fn preview(line: Option<&[u8]>) -> String {
     format!("{text:?}")
 }
 
-/// Atomic file replacement inside the destination: write a hidden tmp file
-/// next to the target, fsync, rename. The tmp name is namespaced by this
-/// tool so a crash never leaves an ambiguous artifact next to page files.
+/// Atomic file replacement inside the destination: an unpredictably named,
+/// exclusively created staging file next to the target, fsync, rename. A
+/// crash's leftover is visibly this tool's by prefix, and a symlink planted
+/// in the destination is neither followed nor raced (GHSA-jr85-7366-xrm2).
 pub fn atomic_write(dest_root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
     let target = paths::secure_join(dest_root, rel)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create directory {}", parent.display()))?;
     }
-    let file_name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "page.md".to_string());
-    let tmp = target
-        .parent()
-        .unwrap_or(dest_root)
-        .join(format!(".wikisync-tmp-{file_name}"));
-    {
-        let mut file =
-            fs::File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("cannot sync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, &target)
-        .with_context(|| format!("cannot move {} into place", tmp.display()))?;
-    Ok(())
+    atomic::write_atomic(&target, bytes, atomic::KeepMode::UmaskDefault)
 }
 
 /// Validate the allowlist: explicit, concrete families only.
@@ -630,7 +670,11 @@ pub(crate) fn resolve_dest(dest: &Path, mode: Mode) -> Result<PathBuf> {
 pub async fn run(args: &RunArgs, mode: Mode) -> Result<()> {
     let families = validate_allowlist(&args.include)?;
     let dest_root = resolve_dest(&args.dest, mode)?;
-    let old_state = state::load(&dest_root)?;
+    let _write_lock = (mode == Mode::Apply)
+        .then(|| state::acquire_write_lock(&dest_root))
+        .transpose()?;
+    let scope = state::SyncScope::of(&args.server, &args.workspace, &args.project);
+    let old_state = baseline_for(state::load(&dest_root)?, &scope, args.adopt_scope)?;
     let client = ApiClient::new(&args.server, args.token.clone())?;
 
     let (report, _new_state, applied) =
@@ -817,6 +861,39 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["a.md".to_string()]);
+    }
+
+    /// GHSA-jr85-7366-xrm2: the staging name used to be
+    /// `.wikisync-tmp-<file>`, computable in advance, and `File::create`
+    /// followed a symlink planted there. A plant at that exact name must be
+    /// inert now: the canary keeps its bytes, the page is still written, and
+    /// the plant is never even removed. With the old code this fails on the
+    /// canary: the write goes straight through the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_ignores_a_symlink_planted_at_the_old_staging_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        let victim = tmp.path().join("victim.md");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("notes/.wikisync-tmp-a.md")).unwrap();
+
+        atomic_write(&root, "notes/a.md", b"server body").unwrap();
+
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"untouched",
+            "the planted symlink was followed"
+        );
+        assert_eq!(fs::read(root.join("notes/a.md")).unwrap(), b"server body");
+        assert!(
+            fs::symlink_metadata(root.join("notes/.wikisync-tmp-a.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the predictable staging name was touched"
+        );
     }
 
     #[test]

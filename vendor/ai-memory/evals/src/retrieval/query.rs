@@ -47,7 +47,7 @@ pub struct QueryOutcome {
     /// `None` today; the QA path falls back to harness synthesis when it is
     /// absent or blank. Detecting it now future-proofs R2b for the B4
     /// `answer`/`reasoning` MCP features without a harness change.
-    pub answer: Option<String>,
+    pub answer: Option<ServerAnswer>,
     /// Wall-clock of the `memory_query` MCP round trip (request send →
     /// response parsed).
     pub latency: Duration,
@@ -74,7 +74,17 @@ struct QueryResponse {
     /// Unknown fields are ignored by serde, so this is forward-compatible:
     /// today's server simply never sets it.
     #[serde(default)]
-    answer: Option<String>,
+    answer: Option<ServerAnswer>,
+}
+
+/// Production `memory_query(answer=true)` response shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerAnswer {
+    /// Synthesized answer text.
+    pub text: String,
+    /// Server-validated evidence paths. Empty means the server abstained.
+    #[serde(default)]
+    pub citations: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,17 +143,15 @@ pub async fn memory_query(
     )
     .await?;
     let latency = started.elapsed();
-    let parsed: QueryResponse = serde_json::from_str(&text)
+    let mut parsed: QueryResponse = serde_json::from_str(&text)
         .with_context(|| format!("parsing memory_query JSON: {text}"))?;
     let raw_hits = parsed.raw_hits.len();
     // A blank/whitespace `answer` is treated as absent so the QA path falls
     // back to harness synthesis rather than grading an empty string.
     let answer = parsed
         .answer
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+        .take()
+        .filter(|answer| !answer.text.trim().is_empty());
     let (retrieved, contexts, context_tokens) = flatten(parsed);
     Ok(QueryOutcome {
         retrieved,
@@ -341,5 +349,17 @@ mod tests {
         assert_eq!(estimate_tokens(5), 2);
         assert_eq!(estimate_tokens(0), 0);
         assert_eq!(estimate_tokens(8), 2);
+    }
+
+    #[test]
+    fn production_answer_object_is_parsed_with_citations() {
+        let parsed: QueryResponse = serde_json::from_value(serde_json::json!({
+            "hits": [],
+            "answer": {"text": "Use port 49374.", "citations": ["rules/server.md"]}
+        }))
+        .unwrap();
+        let answer = parsed.answer.unwrap();
+        assert_eq!(answer.text, "Use port 49374.");
+        assert_eq!(answer.citations, ["rules/server.md"]);
     }
 }

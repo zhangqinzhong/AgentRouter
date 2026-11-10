@@ -10,7 +10,6 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -54,16 +53,14 @@ export function serverBinary(): string {
   return resolve(bin);
 }
 
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      const port = typeof address === "object" && address !== null ? address.port : 0;
-      server.close(() => resolve(port));
-    });
-  });
+/** The listener address from a complete ready line, not the configured bind. */
+export function serverAddress(log: string): string | undefined {
+  for (const line of log.split("\n").slice(0, -1)) {
+    if (!line.includes("MCP HTTP server ready")) continue;
+    const match = /\blocal_addr=(127\.0\.0\.1:(\d+))\b/.exec(line);
+    if (match !== null && Number(match[2]) > 0 && Number(match[2]) <= 65535) return match[1];
+  }
+  return undefined;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -98,10 +95,9 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
   await Promise.all([home, data, tmp, project].map((dir) => mkdir(dir, { recursive: true })));
   const gitconfig = join(root, "gitconfig");
   await writeFile(gitconfig, "");
-  const port = await freePort();
   const rootToken = `FAKEsdkroot${randomBytes(12).toString("hex")}`;
   const basePath = options.basePath ?? "";
-  const url = `http://127.0.0.1:${port}${basePath}`;
+  let url = "";
 
   const env: Record<string, string> = {
     HOME: home,
@@ -122,7 +118,8 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     AI_MEMORY_AUTO_IMPROVE__SCHEDULER__ENABLED: "false",
     AI_MEMORY_AUTH_TOKEN: rootToken,
     AI_MEMORY_AUTH__TOKEN_PEPPER: `FAKEsdkpepper${randomBytes(16).toString("hex")}`,
-    RUST_LOG: "off",
+    RUST_LOG: "off,ai_memory_cli::commands::serve=info",
+    NO_COLOR: "1",
   };
   const args = [
     "--data-dir",
@@ -131,7 +128,9 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     "--transport",
     "http",
     "--bind",
-    `127.0.0.1:${port}`,
+    // Let this listener keep its kernel-assigned port: reserving and then
+    // releasing a port before spawn races other integration-test processes.
+    "127.0.0.1:0",
     "--no-watcher",
   ];
   if (options.api !== false) args.push("--enable-api");
@@ -167,13 +166,19 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
       await rm(root, { recursive: true, force: true });
       throw new Error(`ai-memory exited before it was ready:\n${log.slice(-2000)}`);
     }
+    if (url === "") {
+      const address = serverAddress(await readFile(logPath, "utf8"));
+      if (address !== undefined) url = `http://${address}${basePath}`;
+    }
     try {
-      const response = await fetch(`${url}/identity`, {
-        headers: { Authorization: `Bearer ${rootToken}` },
-        signal: AbortSignal.timeout(1_000),
-      });
-      await response.arrayBuffer();
-      if (response.ok) break;
+      if (url !== "") {
+        const response = await fetch(`${url}/identity`, {
+          headers: { Authorization: `Bearer ${rootToken}` },
+          signal: AbortSignal.timeout(1_000),
+        });
+        await response.arrayBuffer();
+        if (response.ok) break;
+      }
     } catch {
       // Not listening yet.
     }

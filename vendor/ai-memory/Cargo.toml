@@ -35,7 +35,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "3.2.5"
+version = "3.4.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -45,18 +45,24 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "3.2.5" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "3.2.5" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.2.5" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.2.5" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.2.5" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.2.5" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.2.5" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "3.2.5" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.2.5" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.2.5" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "3.4.5" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "3.4.5" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.4.5" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.4.5" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.4.5" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.4.5" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.4.5" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "3.4.5" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.4.5" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.4.5" }
 
 # (Workspace shared deps follow below)
+
+# Localization. Catalogs are embedded; no runtime files or JavaScript tooling.
+fluent-bundle = "0.16"
+unic-langid = "0.9"
+fluent-syntax = "0.12"
+askama = { version = "0.12", default-features = false, features = ["humansize", "num-traits", "urlencode"] }
 
 # Error handling.
 anyhow = "1"
@@ -91,7 +97,7 @@ uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 # Config & CLI.
 figment = { version = "0.10", features = ["toml", "env"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "string"] }
 # Shell-completion generator for `ai-memory completions <shell>`. Reads the
 # same derived `Command` the parser uses, so completions can never drift
 # from the actual CLI surface.
@@ -118,8 +124,8 @@ getrandom = "0.3"
 base64 = "0.22"
 
 # Storage.
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-refinery = { version = "0.8", features = ["rusqlite"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup", "fallible_uint"] }
+refinery = { version = "0.10", features = ["rusqlite"] }
 sha2 = "0.10"
 # Argon2id PHC for human passwords. Tokens stay SHA-256+pepper (hot-path
 # unique lookup); the slow KDF is reserved for the password class.
@@ -142,7 +148,10 @@ winapi-util = "0.1"
 # `aws_lc_rs`, which is exactly the C/JNI toolchain the bridge avoids by using
 # rmcp's `reqwest-tls-no-provider`. `ring` is already in the lockfile via reqwest 0.12.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+# rmcp 3.x speaks the MCP 2026-07-28 revision (stateless `server/discover`,
+# per-request `_meta` negotiation) while keeping the legacy `initialize`
+# handshake, so both-era clients connect without a shim (#1924).
+rmcp = { version = "3.9", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Same `http` 1.x rmcp/axum use, so handlers can read the injected
@@ -173,6 +182,7 @@ regex = "1"
 # Unicode NFC for the portable page-path key. Already in the tree via
 # idna -> idna_adapter, so this adds no new code to the binary.
 icu_normalizer = "2"
+unicode_categories = "0.1"
 
 # Wiki git versioning.
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
@@ -200,11 +210,12 @@ tempfile = "3"
 rstest = "0.26"
 
 # Candle 0.11 requires `zip ^8.6`, but crates.io yanked every compatible 8.x
-# release after publishing zip 9. Pin the upstream v8.6.0 release commit so a
-# fresh `cargo install --path` can still resolve the graph. Remove this patch
-# when Candle publishes a release compatible with zip 9.
+# release after publishing zip 9. Pin upstream's official 8.x security
+# backport for GHSA-m665-v7pm-7grj so fresh source resolution stays possible
+# without retaining the vulnerable v8.6.0 release. Remove this patch when
+# Candle publishes a release compatible with zip 9.
 [patch.crates-io]
-zip = { git = "https://github.com/zip-rs/zip2", rev = "771dfc534d2614158af5497ea3dff4d4208d7db1" }
+zip = { git = "https://github.com/zip-rs/zip2", rev = "507c5c76ddd4cde767e64832fc6f848c51a99e44" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

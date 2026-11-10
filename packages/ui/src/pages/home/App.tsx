@@ -16,7 +16,7 @@ import {
   fallbackUpdateStatus, fallbackUsageStats, formatAppError, GatewayProviderConfig, GatewayProviderProtocol,
   fusionCustomMcpServerFromDraft, fusionCustomToolConfigFromProfile,
   GatewayProviderProbeResult, gatewayServiceMessage, GatewayStatus, getDefaultOnboardingStep, isClaudeDesignPluginConfig, isClaudeDesignRoutingDraftValid,
-  isCursorProxyPluginConfig, isGatewayProviderEnabled, isMacPlatform, isPlainRecord, isProfileDraftSubmittable, isProviderNameDuplicate, isProviderProbeCandidateReady,
+  isCursorProxyPluginConfig, isMacPlatform, isPlainRecord, isProfileDraftSubmittable, isProviderNameDuplicate, isProviderProbeCandidateReady,
   isRoutingRuleDraftSubmittable,
   isTraySupportedPlatform,
   LayoutGroup, mergeModelDisplayNames, mergeModelMetadata, mergeProviderModelLists, modelDescriptionsForModels, modelDisplayNamesForModels, modelMetadataForModels,
@@ -301,6 +301,7 @@ function App() {
   const [agentAnalysisRange, setAgentAnalysisRange] = useState<UsageStatsRange>("7d");
   const [agentAnalysisSession, setAgentAnalysisSession] = useState<AgentAnalysisSessionSelection>();
   const [usageModelFilter, setUsageModelFilter] = useState("");
+  const [usageModelOptions, setUsageModelOptions] = useState<UsageStatsSnapshot["models"]>([]);
   const [usageProviderFilter, setUsageProviderFilter] = useState("");
   const [usageRange, setUsageRange] = useState<UsageStatsRange>(DEFAULT_PAGE_RANGES.overview);
   const [usageCustomRange, setUsageCustomRange] = useState<UsageDateRange>({ from: "", to: "" });
@@ -527,6 +528,7 @@ function App() {
       return window.agentrouter?.getUsageStats(usageRange, filter, usageRange === "custom" ? usageCustomRange : undefined).then((snapshot) => {
         if (!cancelled && requestId === usageStatsRequestId.current) {
           setUsageStats(snapshot);
+          if (!filter.model) setUsageModelOptions(snapshot.models);
         }
       }).catch(() => undefined);
     };
@@ -546,19 +548,8 @@ function App() {
     }
   }, [draftConfig.Providers, usageProviderFilter]);
 
-  useEffect(() => {
-    if (!usageModelFilter) {
-      return;
-    }
-    const modelAvailable = draftConfig.Providers.some((provider) =>
-      isGatewayProviderEnabled(provider) &&
-      (!usageProviderFilter || provider.name === usageProviderFilter) &&
-      provider.models.some((model) => model.trim() === usageModelFilter)
-    );
-    if (!modelAvailable) {
-      setUsageModelFilter("");
-    }
-  }, [draftConfig.Providers, usageModelFilter, usageProviderFilter]);
+  // Overview models come from collected sessions, including direct clients and
+  // historical models. Gateway configuration cannot invalidate their selection.
 
   useEffect(() => {
     if (!window.agentrouter) {
@@ -1006,6 +997,7 @@ function App() {
     );
     if (requestId === usageStatsRequestId.current) {
       setUsageStats(snapshot);
+      if (!usageModelFilter) setUsageModelOptions(snapshot.models);
     }
     showToast(t("Overview statistics reset."));
   }
@@ -3432,6 +3424,7 @@ function App() {
                   onConfigureProviderAccounts: () => selectNavigationItem("providers"),
                   usageFilters: {
                     modelFilter: usageModelFilter,
+                    availableModels: usageModelOptions,
                     providerFilter: usageProviderFilter,
                     providers: draftConfig.Providers,
                     setModelFilter: setUsageModelFilter,

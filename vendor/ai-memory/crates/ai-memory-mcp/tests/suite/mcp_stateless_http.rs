@@ -6,9 +6,9 @@
 //! `Mcp-Session-Id`. In rmcp's default *stateful* mode the server demands
 //! that header and rejects the second request with 422 "Unexpected
 //! message, expect initialize request". `ai-memory serve --transport http`
-//! now defaults to *stateless* mode (`stateful_mode=false` +
+//! now defaults to *stateless* mode (`legacy_session_mode=false` +
 //! `json_response=true`), so those clients work with no `mcp-remote` shim.
-//! `--http-stateful` restores the session behaviour.
+//! `--http-stateful` restores the initialize-era session behaviour.
 //!
 //! These tests drive the exact `StreamableHttpService` wiring from
 //! `serve.rs` through an axum router, so they catch a regression in either
@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+const DISCOVER: &str = r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"dual-era-test","version":"1.0"}}}}"#;
 const TOOLS_CALL_STATUS: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_status","arguments":{}}}"#;
 const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#;
 /// Exact JSON the generated Pi `mcpNotify` posts (#1136).
@@ -82,7 +83,7 @@ async fn make_router_with_dialect(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(stateful)
+            .with_legacy_session_mode(stateful)
             .with_json_response(!stateful),
     );
     let router = Router::new().nest_service("/mcp", svc);
@@ -94,6 +95,21 @@ async fn make_router_with_dialect(
 /// session id.
 fn post(body: &'static str) -> Request<Body> {
     post_to("/mcp", body)
+}
+
+/// [`post`] for a 2026-07-28 request: that revision carries the negotiated
+/// version both in `_meta` and the `MCP-Protocol-Version` header.
+fn post_discover() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "server/discover")
+        .body(Body::from(DISCOVER))
+        .unwrap()
 }
 
 /// [`post`] against an explicit URI (tests carrying `?flavor=moonshot`).
@@ -170,6 +186,128 @@ async fn stateless_initialize_returns_json_result() {
     assert!(
         body.contains("serverInfo") || body.contains("protocolVersion"),
         "initialize result should carry server info: {body}"
+    );
+}
+
+/// Older clients keep negotiating their own revision after the rmcp 3 bump
+/// (#1924): an `initialize` naming 2024-11-05, 2025-03-26 or 2025-06-18 gets
+/// that version back with the ai-memory server identity and instructions, in
+/// both the default stateless mode and `--http-stateful`.
+#[tokio::test]
+async fn legacy_initialize_negotiates_each_older_protocol_version() {
+    for stateful in [false, true] {
+        for version in ["2024-11-05", "2025-03-26", "2025-06-18"] {
+            let tmp = TempDir::new().unwrap();
+            let (router, _store) = make_router(&tmp, stateful).await;
+            let request = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{version}","capabilities":{{}},"clientInfo":{{"name":"legacy","version":"1.0"}}}}}}"#
+            );
+            let resp = router.oneshot(post_to("/mcp", request)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{version} stateful={stateful}"
+            );
+            let body = body_string(resp).await;
+            // Stateful mode answers over SSE; take the JSON-RPC payload line.
+            let payload = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+                .find(|data| !data.is_empty())
+                .unwrap_or(body.as_str());
+            let json: serde_json::Value = serde_json::from_str(payload)
+                .unwrap_or_else(|_| panic!("initialize returns JSON: {body}"));
+            assert_eq!(
+                json["result"]["protocolVersion"],
+                serde_json::json!(version),
+                "stateful={stateful}: {body}"
+            );
+            assert_eq!(
+                json["result"]["serverInfo"]["name"],
+                serde_json::json!("ai-memory"),
+                "{body}"
+            );
+            assert!(
+                json["result"]["instructions"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("memory_query")),
+                "{body}"
+            );
+        }
+    }
+}
+
+/// A 2026-07-28 client skips `initialize` entirely: a `tools/call` carrying
+/// the per-request version metadata is served on its own, and reaches the
+/// same tool router (#1924).
+#[tokio::test]
+async fn modern_tools_call_is_served_without_a_handshake() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "memory_status")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"memory_status","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"modern","version":"1.0"}}}}"#,
+        ))
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("tools/call returns JSON: {body}"));
+    assert!(json.get("error").is_none(), "{body}");
+    assert!(json["result"]["content"].is_array(), "{body}");
+}
+
+/// rmcp 3 serves the MCP 2026-07-28 lifecycle probe directly: a stateless
+/// `server/discover` names the versions and tool capability without an
+/// initialize handshake, while the test above proves that handshake still
+/// works for a legacy client (#1924).
+#[tokio::test]
+async fn stateless_server_discover_names_both_eras() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router.clone().oneshot(post_discover()).await.unwrap();
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("discover returns JSON: {body}"));
+    let result = json["result"]
+        .as_object()
+        .unwrap_or_else(|| panic!("missing discover result: {body}"));
+    assert_eq!(
+        result.get("resultType").and_then(|value| value.as_str()),
+        Some("complete"),
+        "{body}"
+    );
+    let versions = result
+        .get("supportedVersions")
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("missing supportedVersions: {body}"));
+    assert!(
+        versions.contains(&serde_json::json!("2026-07-28")),
+        "{body}"
+    );
+    assert!(
+        versions.contains(&serde_json::json!("2024-11-05")),
+        "the legacy initialize era stays advertised: {body}"
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|value| value.get("tools"))
+            .is_some(),
+        "{body}"
     );
 }
 
@@ -472,11 +610,11 @@ async fn generic_machine_client_writes_queries_and_claims_a_handoff() {
     assert_eq!(repeated["handoff"], serde_json::Value::Null);
 }
 
-/// Contrast / guard: with `--http-stateful` (session mode), the same
-/// session-less `tools/call` is rejected with 422 "Unexpected message,
-/// expect initialize request" — the exact symptom from issue #3. This
-/// proves the default flip is what resolves it, and pins the opt-in
-/// behaviour so a future change to the default can't silently regress it.
+/// Contrast / guard: with `--http-stateful` (legacy session mode), the same
+/// session-less `tools/call` is rejected with 400 "Session ID is required".
+/// This proves the default stateless mode is what resolves issue #3, and
+/// pins the opt-in behaviour so a future change to the default can't
+/// silently regress it.
 #[tokio::test]
 async fn stateful_tools_call_without_session_is_rejected() {
     let tmp = TempDir::new().unwrap();
@@ -489,13 +627,13 @@ async fn stateful_tools_call_without_session_is_rejected() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::BAD_REQUEST,
         "stateful mode must reject a session-less tools/call"
     );
     let body = body_string(resp).await;
     assert!(
-        body.contains("initialize"),
-        "stateful rejection should mention the missing initialize: {body}"
+        body.contains("Session ID is required"),
+        "stateful rejection should name the missing session: {body}"
     );
 }
 
@@ -799,4 +937,129 @@ async fn stateless_tools_list_without_flavor_is_root_combinator_free() {
             "unflavored tools/list must be root-combinator-free (#577): {schema}"
         );
     }
+}
+
+/// Every result a 2026-07-28 server sends carries `resultType`; a client
+/// treats an absent field as `"complete"` only for servers on an earlier
+/// revision, which never send it
+/// (<https://modelcontextprotocol.io/specification/2026-07-28/basic#resulttype>).
+/// The cacheable `tools/list` also carries `ttlMs` and `cacheScope`. Requests
+/// at an older revision keep the earlier shape. Covers every method that
+/// answers with a result, stateless and stateful (#2022).
+#[tokio::test]
+async fn results_carry_result_type_only_at_the_2026_revision() {
+    const MODERN_META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"strict","version":"1.0"}}"#;
+    let calls: [(&str, Option<&str>, &str); 5] = [
+        ("tools/list", None, ""),
+        (
+            "tools/call",
+            Some("memory_status"),
+            r#""name":"memory_status","arguments":{}"#,
+        ),
+        ("resources/list", None, ""),
+        ("resources/templates/list", None, ""),
+        ("prompts/list", None, ""),
+    ];
+    for stateful in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let (router, _store) = make_router(&tmp, stateful).await;
+        for (method, name, params) in calls {
+            let separator = if params.is_empty() { "" } else { "," };
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":9,"method":"{method}","params":{{{params}{separator}{MODERN_META}}}}}"#
+            );
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", method);
+            if let Some(name) = name {
+                request = request.header("mcp-name", name);
+            }
+            let resp = router
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let json = response_json(resp).await;
+            let result = json["result"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{method} (stateful={stateful}): {json}"));
+            assert_eq!(
+                result.get("resultType"),
+                Some(&serde_json::json!("complete")),
+                "{method} (stateful={stateful}): {json}"
+            );
+            if method.ends_with("/list") {
+                assert_eq!(result.get("ttlMs"), Some(&serde_json::json!(0)), "{json}");
+                assert_eq!(
+                    result.get("cacheScope"),
+                    Some(&serde_json::json!("private")),
+                    "{json}"
+                );
+            }
+        }
+
+        // The legacy era: `initialize` at 2025-06-18, then plain requests.
+        let resp = router
+            .clone()
+            .oneshot(post_to(
+                "/mcp",
+                INITIALIZE.replace("2024-11-05", "2025-06-18"),
+            ))
+            .await
+            .unwrap();
+        let session = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let init = response_json(resp).await;
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18", "{init}");
+        assert!(init["result"].get("resultType").is_none(), "{init}");
+        if let Some(session) = &session {
+            let mut notify = post_to("/mcp", INITIALIZED_NOTIFICATION);
+            notify
+                .headers_mut()
+                .insert("mcp-session-id", session.parse().unwrap());
+            router.clone().oneshot(notify).await.unwrap();
+        }
+        for (method, _, params) in calls {
+            let body =
+                format!(r#"{{"jsonrpc":"2.0","id":9,"method":"{method}","params":{{{params}}}}}"#);
+            let mut request = post_to("/mcp", body);
+            request
+                .headers_mut()
+                .insert("mcp-protocol-version", "2025-06-18".parse().unwrap());
+            if let Some(session) = &session {
+                request
+                    .headers_mut()
+                    .insert("mcp-session-id", session.parse().unwrap());
+            }
+            let json = response_json(router.clone().oneshot(request).await.unwrap()).await;
+            let result = json["result"]
+                .as_object()
+                .unwrap_or_else(|| panic!("legacy {method} (stateful={stateful}): {json}"));
+            assert!(
+                result.get("resultType").is_none(),
+                "legacy {method} (stateful={stateful}): {json}"
+            );
+            assert!(result.get("ttlMs").is_none(), "{json}");
+        }
+    }
+}
+
+/// The JSON-RPC message in a Streamable HTTP reply, whether the server
+/// answered with plain JSON (stateless) or one SSE event (stateful).
+async fn response_json(resp: axum::response::Response) -> serde_json::Value {
+    let body = body_string(resp).await;
+    let payload = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .find(|data| !data.trim().is_empty())
+        .unwrap_or(&body);
+    serde_json::from_str(payload.trim()).unwrap_or_else(|_| panic!("not JSON-RPC: {body}"))
 }

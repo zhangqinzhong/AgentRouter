@@ -58,8 +58,8 @@ async fn page_fts_rows_report_index_drift() {
     {
         let conn = rusqlite::Connection::open(store.db_path()).unwrap();
         conn.execute(
-            "INSERT INTO pages_fts(pages_fts, rowid, title, body, path_search) \
-             SELECT 'delete', rowid, title, body, path_search FROM pages",
+            "INSERT INTO pages_fts(pages_fts, rowid, title, body, path_search, title_parts, body_parts) \
+             SELECT 'delete', rowid, title, body, path_search, title_parts, body_parts FROM pages",
             [],
         )
         .unwrap();
@@ -123,6 +123,7 @@ async fn observation_fts_rows_report_index_drift() {
                 title: "prompt".into(),
                 body: "bravo zebra".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -139,8 +140,8 @@ async fn observation_fts_rows_report_index_drift() {
     {
         let conn = rusqlite::Connection::open(store.db_path()).unwrap();
         conn.execute(
-            "INSERT INTO observations_fts(observations_fts, rowid, title, body) \
-             SELECT 'delete', rowid, title, body FROM observations",
+            "INSERT INTO observations_fts(observations_fts, rowid, title, body, title_parts, body_parts) \
+             SELECT 'delete', rowid, title, body, title_parts, body_parts FROM observations",
             [],
         )
         .unwrap();

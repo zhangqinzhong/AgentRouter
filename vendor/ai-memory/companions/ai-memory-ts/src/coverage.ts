@@ -36,6 +36,18 @@ const SCOPE = ["workspace", "project"] as const;
 
 /** Every MCP tool the server lists, keyed by tool name. */
 export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
+  memory_resolve_write_target: {
+    status: "wrapped",
+    methods: ["pages.resolveWriteTarget"],
+    phase: 2,
+    sends: ["workspace", "project", "project_id"],
+  },
+  memory_write_pages_batch: {
+    status: "wrapped",
+    methods: ["pages.writeBatch"],
+    phase: 2,
+    sends: ["workspace", "project", "project_id", "pages"],
+  },
   memory_write_page: {
     status: "wrapped",
     methods: ["pages.write", "pages.update"],
@@ -53,15 +65,22 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
       "abstract",
       "relations",
       "expires_at",
+      "source_files",
       "expected_page_id",
       "create_only",
     ],
+  },
+  memory_patch_page: {
+    status: "wrapped",
+    methods: ["pages.patch"],
+    phase: 2,
+    sends: [...SCOPE, "path", "expected_page_id", "edits"],
   },
   memory_read_page: {
     status: "wrapped",
     methods: ["pages.read", "pages.update"],
     phase: 1,
-    sends: [...SCOPE, "path", "query", "include_related", "related_depth"],
+    sends: [...SCOPE, "scope", "path", "query", "include_related", "related_depth", "max_chars"],
   },
   memory_delete_page: {
     status: "wrapped",
@@ -122,7 +141,18 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["messages.send"],
     phase: 2,
-    sends: ["to_workspace", "to_project", "from_workspace", "from_project", "body", "subject"],
+    sends: [
+      "to_workspace",
+      "to_project",
+      "to_agent",
+      "from_workspace",
+      "from_project",
+      "from_agent",
+      "body",
+      "subject",
+      "nature",
+      "evidence",
+    ],
   },
   memory_message_list: {
     status: "wrapped",
@@ -134,7 +164,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["messages.pop"],
     phase: 2,
-    sends: [...SCOPE, "message_id"],
+    sends: [...SCOPE, "message_id", "agent"],
   },
   memory_message_cancel: {
     status: "wrapped",
@@ -146,7 +176,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["briefing"],
     phase: 2,
-    sends: [...SCOPE, "recent_pages_limit", "settled_first"],
+    sends: [...SCOPE, "recent_pages_limit", "recent_sessions_limit", "settled_first"],
   },
   memory_explore: {
     status: "wrapped",

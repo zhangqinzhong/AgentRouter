@@ -23,7 +23,10 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > other client gets a local stdio entry, in its own format, that runs
 > `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
 > the token file at launch and forwards no session id, so the client passes
-> `workspace` and `project` like any static client. Stdio entries name the
+> `workspace` and `project` like any static client. When a call names no
+> scope, the bridge fills in the project of the directory the client launched
+> it from, resolved the way the CLI resolves one (see
+> [`auto-scope.md`](auto-scope.md#the-session-less-bridges-launch-scope)). Stdio entries name the
 > `ai-memory` binary by its absolute path, so the client does not need it on
 > its `PATH`; the Docker wrapper keeps the bare `ai-memory`. When the install
 > was given a data dir (`--data-dir`, `AI_MEMORY_DATA_DIR` or `data_dir` in
@@ -45,6 +48,23 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > config already resolves a bearer, a different key is stored, the hooks
 > sign in with OIDC, or the snippet is only printed.
 
+> **A bridge started while the server restarts waits for it.** A stdio
+> client does not relaunch an MCP server that exited, so `mcp-bridge` waits
+> up to 3 seconds for a server whose port refuses connections (a service
+> restarting after an upgrade or a reboot) before it gives up. When nothing
+> answers, it exits with `could not reach the ai-memory server at <url>` and
+> says to check that the server is running and that the entry points at it.
+> Other connection failures, such as a host name that does not resolve, are
+> reported at once.
+
+> **Inbox push is explicit.** A session-aware Claude Code bridge can add
+> `--channel inbox` to advertise Claude's experimental `claude/channel`
+> capability and push a count-only pending-mail notice when it changes.
+> Claude loads it only when started with
+> `claude --dangerously-load-development-channels server:<entry name>`, since
+> the ai-memory bridge is not on Claude's channel allowlist. See
+> [`agent-messaging.md`](agent-messaging.md#mid-session-notices-for-claude-code).
+
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
 > required), so any client that points a remote URL at `/mcp`, including
@@ -54,7 +74,10 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > supports stdio servers; session state has nothing to do with it. If you run a
 > client that *requires* MCP session continuity or server-initiated SSE
 > streams, start the server with `ai-memory serve --transport http
-> --http-stateful` to restore rmcp's session mode.
+> --http-stateful` to restore the legacy initialize-era session mode. Clients
+> that speak MCP 2026-07-28 use `server/discover` and per-request version
+> metadata, both served without a session; clients that send the older
+> `initialize` handshake keep working.
 
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start. For OpenCode, the generic
@@ -145,7 +168,8 @@ the next primary-session turn, including after a native resume),
 it after every turn) and `on_session_finalize` (the session end). Hermes gates
 user hooks behind its own acceptance prompt (`hooks_auto_accept`), so paste the
 block and let Hermes accept it. [install.md](install.md#hermes-agent-nous-research)
-has the event table, the `TERMINAL_CWD` routing and the
+has the event table, the `TERMINAL_CWD` routing, the per-profile marker for a
+multiplexing gateway's bots and the
 `finalize-session --agent hermes` step for idle gateway sessions.
 
 `install-mcp --client hermes` (alias `hermes-agent`) prints an entry for the
@@ -343,7 +367,20 @@ there. The Codex plugin likewise registers `ai-memory mcp-bridge
 - Cursor hooks live in `~/.cursor/hooks.json` or `.cursor/hooks.json`.
   ai-memory maps `sessionStart`, `sessionEnd`, `beforeSubmitPrompt`,
   `preToolUse`, `postToolUse`, `postToolUseFailure`, `preCompact`, and
-  `stop` to the shared capture path.
+  `stop` to the shared capture path. Cursor fires `postToolUseFailure`
+  instead of `postToolUse` when a tool fails, times out or is denied. A
+  failed or timed-out call is stored as `outcome: error` with Cursor's
+  `error_message`, so the session page counts it and the handoff names it;
+  a denied call keeps its message but stays `outcome: unknown`.
+- When the default data dir's path needs quoting, `install-hooks --agent
+  cursor` leaves `--data-dir` out of each hook command and the hook finds that
+  directory itself. This covers the macOS default
+  (`~/Library/Application Support/ai-memory`) and a Windows user folder with a
+  space. A space-free default, such as the usual Linux path, and any custom
+  data dir are still passed, so a Cursor launched with a different
+  `XDG_DATA_HOME` writes to the same place. `ai-memory upgrade` rewrites
+  entries an older install wrote; so does running
+  `ai-memory install-hooks --agent cursor --apply` again (#1949).
 - Cursor watches `hooks.json` on save. For MCP config changes, restart
   Cursor or toggle the server off+on in **Settings → MCP**.
 - Sources: <https://cursor.com/docs/mcp>, <https://cursor.com/docs/hooks.md>
@@ -394,8 +431,8 @@ write one, keeping in mind that `.github/mcp.json` is meant to be committed,
 so it should not carry a bearer token. `install-hooks --agent copilot-cli`
 run without `--server-url` reads the URL and token back from this entry.
 
-The hook installer wires Claude Code's nine events plus `PostToolUseFailure`
-with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
+The hook installer wires the same ten events as Claude Code, `PostToolUseFailure`
+included, with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
 payload; native installs spool events locally and enforce capture exclusions. The
 `SessionStart` hook delivers the prior session's handoff: Copilot reads a
 top-level `additionalContext` from `SessionStart` stdout (not Claude Code's
@@ -976,6 +1013,49 @@ and [Qwen Code settings](https://qwenlm.github.io/qwen-code-docs/en/users/config
 
 ---
 
+## Qoder
+
+**Status:** MCP and lifecycle hooks are supported. Managed workstreams and
+transcript backfill are not claimed.
+
+**Config file:** `~/.qoder/settings.json` (user), or a project
+`.qoder/settings.json` supplied with `--config-file`. MCP servers live under
+`mcpServers`; hooks live under `hooks` in the same document.
+
+```bash
+ai-memory install-mcp --client qoder --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent qoder --apply \
+    --server-url "https://memory.example" --auth-token "$TOKEN"
+```
+
+Qoder's MCP configuration accepts stdio `command`, `args`, and `env`. ai-memory
+always writes a sessionless `mcp-bridge` entry, so it can use the configured
+remote server without a second server process contending for the data-dir lock.
+The bridge has no lifecycle identity; pass explicit `workspace` and `project`
+on every project-scoped MCP call. Applied token installs use ai-memory's
+owner-only token file when possible; printed configuration carries the token in
+the entry's `AI_MEMORY_AUTH_TOKEN` environment.
+
+The hook installer registers the eight documented events that carry useful
+memory state: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`PostToolUseFailure`, `PreCompact`, `Stop`, and `SessionEnd`. Qoder sends
+Claude-shaped fields such as `session_id`, `cwd`, `tool_name`, `tool_input`, and
+`tool_use_id`, so capture exclusions are enforced by the same closed parser.
+SessionStart delivers a pending handoff through
+`hookSpecificOutput.additionalContext`; a missing payload `cwd` falls back to
+`QODER_PROJECT_DIR`. Qoder requires a restart after hook changes.
+
+Qoder reads `AGENTS.md` and shared `~/.agents/skills`, so the normal routing
+snippet and installed Agent Skills need no Qoder-specific copy. There is no
+`ai-memory run qoder` adapter or native transcript backfill because no stable
+native transcript-store contract is documented.
+
+Sources: [Qoder hooks](https://docs.qoder.com/cli/hooks) and
+[Qoder MCP](https://docs.qoder.com/cli/mcp-reference).
+
+---
+
 ## Antigravity CLI (`agy`)
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
@@ -1100,13 +1180,15 @@ The rendered hooks config looks like:
   nothing new is a harmless no-op). See
   [`docs/install.md`](install.md#antigravity-lifecycle-hooks) for the
   transcript read's limits.
-- `memory_handoff_begin` always creates an explicit manual handoff with no
-  `from_session_id` and `from_agent = other`; it is project-wide for cwd
-  matching but belongs to the creating operator by default. Pass `shared=true`
-  only to publish it to every operator in the project. That session-neutral
-  shape is the same for every MCP client. Handoffs carrying a
-  Codex or Claude session id came from canonical SessionEnd processing, not
-  from the manual tool. Use the explicit Antigravity finalizer when the
+- `memory_handoff_begin` always creates an explicit manual handoff; it is
+  project-wide for cwd matching but belongs to the creating operator by
+  default. Pass `shared=true` only to publish it to every operator in the
+  project. A client that forwards its hook session id (the session-aware
+  bridge, OpenCode 2) gets that session's id, harness and cwd recorded on the
+  handoff, but only when the server recorded that session in the handoff's
+  project for the same operator. Antigravity's static HTTP connection forwards
+  no session, so its manual handoff has no `from_session_id` and
+  `from_agent = other`. Use the explicit Antigravity finalizer when the
   session itself must end and produce an attributed automatic handoff.
 - The built-in `/web` route displays compiled wiki pages, not raw session or
   observation rows. To verify hook capture, compare the `sessions` and
@@ -1308,6 +1390,9 @@ mirror Claude Code's vocabulary (`SessionStart`, `UserPromptSubmit`,
 native `ai-memory hook --event … --agent grok` commands. Session-end
 handoff *creation* works. Injection is the first `PostToolUse`: JSON
 `additionalContext` with the pending handoff and an opted-in `[briefing]`.
+A subagent runs in a Grok session of its own whose events carry
+`subagentType`: its tool calls never claim the handoff, and its end closes
+and summarizes that session without leaving one.
 `memory_handoff_list` is the first-turn path when the managed Grok rule is
 installed (skills live under `.grok/skills` / `$GROK_HOME/skills`, default
 `~/.grok/skills`; the rule lives under `$GROK_HOME/rules`).
@@ -1944,11 +2029,11 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, OpenCode 2 beta, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart; `install-hooks --agent grok --apply` also installs a first-turn `memory_handoff_list` user rule so that tool exists. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart; `install-hooks --agent grok --apply` also installs a first-turn `memory_handoff_list` user rule so that tool exists. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
-delivery. The OpenCode 2 beta plugin subscribes to the same event name on the
+delivery. The OpenCode V2 plugin subscribes to the same event name on the
 V2 event stream and injects handoffs through the `context` hook instead of
 v1's removed `experimental.chat.system.transform`. Its generated plugin also sends a deduped best-effort close for any
 still-active sessions from `dispose` during normal plugin teardown; abrupt

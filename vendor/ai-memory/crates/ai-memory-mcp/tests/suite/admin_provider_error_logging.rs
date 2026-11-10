@@ -98,7 +98,10 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: llm,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -110,7 +113,7 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
         db_path,
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -138,6 +141,11 @@ async fn a_bootstrap_provider_failure_is_logged_and_not_only_returned() {
         .with_ansi(false)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // tracing-core caches callsite interest process-wide; a second live
+    // `Dispatch` and a rebuild keep a parallel test from pinning these
+    // callsites to `never` (see `ai-memory-llm`'s `capture_info_logs`).
+    let _companion = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::callsite::rebuild_interest_cache();
 
     let tmp = TempDir::new().unwrap();
     let state = make_admin_state(&tmp, Some(Arc::new(FourOhFourProvider))).await;
@@ -186,6 +194,11 @@ async fn a_rejected_request_is_answered_without_a_server_log_line() {
         .with_ansi(false)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // tracing-core caches callsite interest process-wide; a second live
+    // `Dispatch` and a rebuild keep a parallel test from pinning these
+    // callsites to `never` (see `ai-memory-llm`'s `capture_info_logs`).
+    let _companion = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::callsite::rebuild_interest_cache();
 
     let tmp = TempDir::new().unwrap();
     let state = make_admin_state(&tmp, Some(Arc::new(FourOhFourProvider))).await;

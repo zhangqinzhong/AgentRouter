@@ -3,7 +3,10 @@
 //! Spins up a `Store` + `Wiki` in a tempdir, seeds two pages, builds
 //! the router, and exercises each route via `tower::ServiceExt::oneshot`.
 
-use ai_memory_core::{AgentKind, NewHandoff, NewPage, PagePath, Tier};
+use ai_memory_core::{
+    AgentKind, NewHandoff, NewPage, NewSession, NewSessionUsage, PageEvidence, PageEvidenceKind,
+    PagePath, SessionId, Tier,
+};
 use ai_memory_store::Store;
 use ai_memory_web::{api_router, router};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -18,6 +21,56 @@ async fn setup() -> (TempDir, Store, Wiki) {
     let store = Store::open(tmp.path()).unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     (tmp, store, wiki)
+}
+
+#[tokio::test]
+async fn dashboard_hook_counters_follow_the_upstream_admin_gate() {
+    use ai_memory_core::AuthLevel;
+    use ai_memory_web::{WebMountSpec, split_web_routers_with_metrics};
+
+    let (_tmp, store, wiki) = setup().await;
+    let split = split_web_routers_with_metrics(
+        true,
+        store.reader.clone(),
+        wiki,
+        Some(std::sync::Arc::new(ai_memory_core::IngestMetrics::default())),
+        WebMountSpec {
+            enable_api: false,
+            web_ui_dir: None,
+            cors_origins: &[],
+            web_slug: "",
+            base_href: "/",
+            base_path: "",
+            trusted_proxy_identity: true,
+            recall: ai_memory_web::Recall::default(),
+            runtime: None,
+            health: None,
+        },
+    )
+    .unwrap();
+    for level in [AuthLevel::Root, AuthLevel::User, AuthLevel::Anonymous] {
+        let response = split
+            .protected
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(level)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            text.contains("Hook capture health"),
+            level == AuthLevel::Root
+        );
+    }
 }
 
 fn new_page(
@@ -145,6 +198,131 @@ async fn smoke_project_page_returns_200() {
         text.contains("Bar Note"),
         "expected page title in project response"
     );
+    assert!(text.contains("Project capture summary"));
+    assert!(text.contains("Captured events"));
+    assert!(text.contains("Compiled pages"));
+    assert!(text.contains("?tab=sessions#session-token-table"));
+    assert!(text.contains("?tab=sessions&sort=events#session-token-table"));
+    assert!(text.contains("?tab=sessions&state=open#session-token-table"));
+    assert!(text.contains("?tab=knowledge#project-panel-knowledge"));
+    assert!(text.contains("?tab=tokens#token-usage"));
+}
+
+#[tokio::test]
+async fn dashboard_metric_links_sort_filter_and_reject_unknown_views() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let active = store
+        .writer
+        .get_or_create_project(ws, "active", None)
+        .await
+        .unwrap();
+    let idle = store
+        .writer
+        .get_or_create_project(ws, "idle", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, idle, "idle.md", "Idle", "body"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: SessionId::new(),
+            workspace_id: ws,
+            project_id: active,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki);
+    let (status, html) = get_text(&app, "/?sort=open&state=open", None).await;
+    assert_eq!(status, StatusCode::OK);
+    for href in [
+        "?sort=sessions#project-list",
+        "?sort=events#project-list",
+        "?sort=pages#project-list",
+        "?sort=open&state=open#project-list",
+    ] {
+        assert!(html.contains(href), "missing metric target {href}: {html}");
+    }
+    assert!(html.contains("value=\"open\" selected"), "{html}");
+    let active_at = html.find("data-project-search=\"default active").unwrap();
+    let idle_at = html.find("data-project-search=\"default idle").unwrap();
+    assert!(active_at < idle_at, "open-session sort was not applied");
+    let idle_card = &html[idle_at..html[idle_at..].find('>').unwrap() + idle_at];
+    assert!(
+        idle_card.contains("hidden"),
+        "idle project was not filtered"
+    );
+
+    for uri in ["/?sort=unknown", "/?state=unknown"] {
+        let (status, _) = get_text(&app, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn project_session_metric_filters_apply_before_the_page_limit() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let ended = seed_session(
+        &store,
+        ws,
+        proj,
+        true,
+        &[
+            (ai_memory_core::ObservationKind::UserPrompt, "one", "1"),
+            (ai_memory_core::ObservationKind::UserPrompt, "two", "2"),
+            (ai_memory_core::ObservationKind::UserPrompt, "three", "3"),
+        ],
+    )
+    .await;
+    let open = seed_session(
+        &store,
+        ws,
+        proj,
+        false,
+        &[(ai_memory_core::ObservationKind::UserPrompt, "only", "1")],
+    )
+    .await;
+    let app = router(store.reader.clone(), wiki);
+
+    let (status, html) = get_text(&app, "/w/default/scratch?tab=sessions&state=open", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(&open.to_string()));
+    assert!(!html.contains(&ended.to_string()));
+
+    let (status, html) = get_text(&app, "/w/default/scratch?tab=sessions&sort=events", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.find(&ended.to_string()).unwrap() < html.find(&open.to_string()).unwrap());
+
+    for uri in [
+        "/w/default/scratch?tab=sessions&state=unknown",
+        "/w/default/scratch?tab=sessions&sort=unknown",
+    ] {
+        let (status, _) = get_text(&app, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -895,6 +1073,10 @@ async fn api_projects_returns_project_stats() {
     assert_eq!(json[0]["workspace_name"], "default");
     assert_eq!(json[0]["project_name"], "scratch");
     assert_eq!(json[0]["page_count"], 1);
+    assert_eq!(json[0]["session_count"], 0);
+    assert_eq!(json[0]["observation_count"], 0);
+    assert_eq!(json[0]["open_session_count"], 0);
+    assert!(json[0]["last_activity"].is_string());
 }
 
 #[tokio::test]
@@ -1500,6 +1682,219 @@ async fn api_project_routes_return_404_for_missing_project() {
 }
 
 #[tokio::test]
+async fn recent_page_lists_order_timestamps_chronologically() {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    // Both a newer peer project and an identically named project in another
+    // workspace must stay out of the limited result.
+    let other_workspace = store.writer.get_or_create_workspace("other").await.unwrap();
+    for (workspace, name) in [(ws, "peer"), (other_workspace, "scratch")] {
+        let foreign = store
+            .writer
+            .get_or_create_project(workspace, name, None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(new_page(
+                workspace,
+                foreign,
+                "notes/foreign.md",
+                "Foreign",
+                "body",
+            ))
+            .await
+            .unwrap();
+    }
+    let second = "2026-01-01T12:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_microsecond();
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    for (path, delta) in [
+        ("notes/oldest.md", -2_000_000),
+        ("notes/prior.md", -1_000_000),
+        ("notes/whole.md", 0),
+        ("notes/tenth.md", 100_000),
+        ("notes/z-newest.md", 100_001),
+        ("notes/a-newest.md", 100_001),
+    ] {
+        let id = store
+            .writer
+            .upsert_page(new_page(ws, proj, path, "Repeated title", "body"))
+            .await
+            .unwrap();
+        conn.execute(
+            "UPDATE pages SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![second + delta, id.as_bytes()],
+        )
+        .unwrap();
+    }
+    let expected = [
+        "notes/a-newest.md",
+        "notes/z-newest.md",
+        "notes/tenth.md",
+        "notes/whole.md",
+        "notes/prior.md",
+        "notes/oldest.md",
+    ];
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let (status, body) =
+        get_body(&api, "/workspaces/default/projects/scratch/recent?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        rows[0]["path"], expected[0],
+        "limit must retain the newest instant, not the lexically largest timestamp"
+    );
+    let (_, body) = get_body(
+        &api,
+        "/workspaces/default/projects/scratch/recent?limit=100",
+    )
+    .await;
+    let rows: Value = serde_json::from_str(&body).unwrap();
+    let paths: Vec<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, expected);
+    assert_eq!(rows[2]["updated_at"], "2026-01-01T12:00:00.1Z");
+    assert_eq!(rows[3]["updated_at"], "2026-01-01T12:00:00Z");
+
+    // Incremental reads keep their SQL-backed ascending order.
+    let (status, body) = get_body(
+        &api,
+        "/workspaces/default/projects/scratch/recent?updated_since=2026-01-01T00:00:00Z&limit=100",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let incremental: Value = serde_json::from_str(&body).unwrap();
+    let ascending: Vec<_> = incremental["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|page| page["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ascending,
+        [
+            expected[5],
+            expected[4],
+            expected[3],
+            expected[2],
+            expected[0],
+            expected[1]
+        ]
+    );
+
+    let web = router(store.reader.clone(), wiki);
+    let assert_order = |html: &str, paths: &[&str]| {
+        let positions: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                html.find(&format!("href=\"w/default/scratch/p/{path}\""))
+                    .unwrap_or_else(|| panic!("missing {path}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "wrong chronological order: {positions:?}"
+        );
+    };
+    let (_, project) = get_body(&web, "/w/default/scratch").await;
+    let sidebar_start = project
+        .find("<aside aria-label=\"Project pages\">")
+        .expect("project page sidebar");
+    let sidebar_end = sidebar_start
+        + project[sidebar_start..]
+            .find("</aside>")
+            .expect("project page sidebar end");
+    let sidebar = &project[sidebar_start..sidebar_end];
+    assert_order(sidebar, &expected[..5]);
+    assert!(
+        !sidebar.contains("p/notes/oldest.md\""),
+        "folder preview must omit the oldest page"
+    );
+    let recent = &project[project.find("Recent Activity").unwrap()..];
+    assert_order(recent, &expected);
+    for uri in [
+        "/w/default/scratch/p/notes/",
+        "/w/default/scratch/p/notes/?sort=title",
+    ] {
+        let (status, body) = get_body(&web, uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_order(&body, &expected);
+    }
+}
+
+#[tokio::test]
+async fn legacy_recent_keeps_unrepresentable_timestamps_last() {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    for (path, stamp) in [
+        ("notes/z-invalid.md", i64::MAX),
+        ("notes/a-invalid.md", i64::MIN),
+        ("notes/valid.md", 0),
+    ] {
+        let id = store
+            .writer
+            .upsert_page(new_page(ws, project, path, "Page", "body"))
+            .await
+            .unwrap();
+        conn.execute(
+            "UPDATE pages SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![stamp, id.as_bytes()],
+        )
+        .unwrap();
+    }
+    let app = api_router(store.reader.clone(), wiki);
+    let uri = "/workspaces/default/projects/scratch/recent";
+    let expected = [
+        ("notes/valid.md", "1970-01-01T00:00:00Z"),
+        ("notes/a-invalid.md", ""),
+        ("notes/z-invalid.md", ""),
+    ];
+    for limit in [1, 2, 3] {
+        let (status, body) = get_body(&app, &format!("{uri}?limit={limit}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows: Value = serde_json::from_str(&body).unwrap();
+        let actual: Vec<_> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["path"].as_str().unwrap(),
+                    row["updated_at"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected[..limit]);
+    }
+}
+
+#[tokio::test]
 async fn api_recent_and_briefing_return_project_data() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
@@ -1579,6 +1974,7 @@ async fn seed_session(
                     title: (*title).to_owned(),
                     body: (*body).to_owned(),
                     importance: 5,
+                    file_path: None,
                 },
                 &ai_memory_core::Sanitizer::builtin(),
             ))
@@ -3023,13 +3419,9 @@ async fn api_responses_set_cache_control_private() {
         .expect("Cache-Control header must be present on /workspaces")
         .to_str()
         .unwrap();
-    assert!(
-        cc.contains("private"),
-        "Cache-Control must be private: {cc}"
-    );
-    assert!(
-        cc.contains("max-age=30"),
-        "Cache-Control must be max-age=30 for /workspaces: {cc}"
+    assert_eq!(
+        cc, "private, no-store",
+        "/workspaces is grant-filtered, so it must not be browser-cacheable: {cc}"
     );
 }
 
@@ -3106,6 +3498,101 @@ async fn actor_scoped_api_responses_are_never_reused_across_credentials() {
     }
 }
 
+/// Every `/api/v1` read is grant-filtered (#708): what it returns depends on
+/// who is signed in. If any of them is sent with a cacheable `max-age`, a
+/// shared browser profile can serve one viewer's restricted response to the
+/// next viewer at the same URL without the server running the second viewer's
+/// grant check. The list/graph/recent reads must therefore be `no-store`, and
+/// the single-page read `no-cache` so its `authorize_read` runs on every
+/// revalidation. This test fails against the old `with_cache` (`max-age`).
+#[tokio::test]
+async fn viewer_filtered_api_reads_are_never_served_from_cache() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new("secrets.md").unwrap(),
+        frontmatter: serde_json::json!({"kind": "fact"}),
+        body: "# Secret\n\nRestricted content.".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+
+    // The list, graph and recent reads must forbid the browser cache entirely.
+    for uri in [
+        "/workspaces",
+        "/projects",
+        "/graph",
+        "/workspaces/default/projects/scratch/graph",
+        "/workspaces/default/projects/scratch/pages",
+        "/workspaces/default/projects/scratch/recent",
+    ] {
+        let req = Request::builder()
+            .uri(uri)
+            .extension(ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            })
+            .extension(ai_memory_core::AuthLevel::User)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, no-store"),
+            "grant-filtered read {uri} must not be browser-cacheable"
+        );
+    }
+
+    // The single-page read keeps its ETag but must be revalidated every time,
+    // so the server re-runs authorize_read instead of a browser serving a 304.
+    let page_uri = "/workspaces/default/projects/scratch/pages/secrets.md";
+    let req = Request::builder()
+        .uri(page_uri)
+        .extension(ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            ..ai_memory_core::ActorContext::default()
+        })
+        .extension(ai_memory_core::AuthLevel::User)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, no-cache"),
+        "single-page read must be revalidated, not served from the browser cache"
+    );
+    assert!(
+        resp.headers().get(header::ETAG).is_some(),
+        "the page read keeps its ETag for conditional revalidation"
+    );
+}
+
 #[tokio::test]
 async fn api_page_handler_emits_etag_and_supports_if_none_match() {
     let (_tmp, store, wiki) = setup().await;
@@ -3164,7 +3651,10 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         .expect("Cache-Control must be present on single-page read")
         .to_str()
         .unwrap();
-    assert!(cc.contains("max-age=300"), "page max-age must be 300: {cc}");
+    assert_eq!(
+        cc, "private, no-cache",
+        "a single-page read must be revalidated so authorize_read runs every time: {cc}"
+    );
 
     // Second request with the returned ETag: must return 304 with empty body.
     let resp304 = app
@@ -3634,7 +4124,9 @@ async fn project_view_separates_machinery_from_knowledge() {
 
     // The sidebar still reaches everything: machinery sits in the
     // collapsed System section.
-    let sidebar = &text[..text.find("Recent Activity").unwrap()];
+    let sidebar = &text[text
+        .find("<aside aria-label=\"Project pages\"")
+        .expect("sidebar")..text.find("Recent Activity").unwrap()];
     let system = &sidebar[sidebar.find("System").expect("system section")..];
     assert!(system.contains("Lint report 2026-09-02"));
     assert!(system.contains("Session abc123"));
@@ -3646,8 +4138,287 @@ async fn project_view_separates_machinery_from_knowledge() {
     assert!(!knowledge.contains("Session abc123"));
 }
 
+/// The project overview shows which agent CLIs produced its memory: a
+/// session-count breakdown in the stats card, and, on each Recent Activity
+/// row, the harness whose session most recently cited that page as
+/// evidence.
 #[tokio::test]
-async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
+async fn project_view_shows_agent_attribution() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let session_id = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            evidence: vec![PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+            }],
+            ..new_page(
+                ws,
+                proj,
+                "concepts/retrieval.md",
+                "Retrieval Concept",
+                "body text",
+            )
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    assert!(
+        text.contains("Agents:"),
+        "the stats card must show the per-agent session breakdown"
+    );
+    let recent = &text[text.find("Recent Activity").expect("recent heading")..];
+    assert!(
+        recent.contains("Claude Code"),
+        "the page cited by the Claude Code session must carry that badge"
+    );
+}
+
+/// The project overview's Sessions table shows per-session token usage and
+/// duration, and the stats card's "Tokens" metric aggregates the project
+/// total.
+#[tokio::test]
+async fn project_view_shows_session_token_usage() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let session_id = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store.writer.end_session(session_id, None).await.unwrap();
+    store
+        .writer
+        .upsert_session_usage(NewSessionUsage {
+            session_id,
+            input_tokens: 12_345,
+            output_tokens: 6_789,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            model: Some("gpt-5-codex".into()),
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    assert!(
+        text.contains("Tokens (in / out)"),
+        "the stats card must show the project-wide tokens metric"
+    );
+    assert!(
+        text.contains("12.3k / 6.8k"),
+        "the stats total must reflect the reported usage"
+    );
+    let sessions = &text[text.find("Sessions</h2>").expect("sessions heading")..];
+    assert!(
+        sessions.contains("Codex"),
+        "the session row must carry the agent badge"
+    );
+    assert!(
+        sessions.contains("12.3k in / 6.8k out"),
+        "the session row must show its own token usage"
+    );
+}
+
+#[tokio::test]
+async fn project_view_ranks_live_token_responses_and_flags_large_usage() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    let calls: Vec<_> = (0..5)
+        .map(|i| ai_memory_core::TokenCall {
+            context: None,
+            call_id: format!("response-{i}"),
+            input_tokens: if i == 4 { 150_000 } else { 100 },
+            output_tokens: 20,
+            cache_read_tokens: 800,
+            cache_write_tokens: 0,
+            model: Some("test-model".into()),
+        })
+        .collect();
+    store
+        .writer
+        .upsert_token_calls(sid, calls.clone())
+        .await
+        .unwrap();
+    store.writer.upsert_token_calls(sid, calls).await.unwrap();
+    let response = router(store.reader.clone(), wiki)
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    let panel = text
+        .split("id=\"token-usage\"")
+        .nth(1)
+        .unwrap()
+        .split("</section>")
+        .next()
+        .unwrap();
+    assert!(panel.contains("Captured calls</span><strong>5</strong>"));
+    assert!(panel.contains("Above 3× average"));
+    assert!(panel.contains("test-model"));
+    assert!(panel.find("response-4").unwrap() < panel.find("response-0").unwrap());
+    assert!(
+        panel.contains(&sid.to_string()),
+        "responses link to their source session"
+    );
+    for theme in ["light", "dark", "system"] {
+        assert!(text.contains(&format!("data-theme-choice=\"{theme}\"")));
+    }
+}
+
+/// A session with no reported usage shows "—", never a zeroed total — the
+/// dashboard must not imply a session cost nothing when it simply never
+/// reported.
+#[tokio::test]
+async fn project_view_session_without_usage_shows_dash_not_zero() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: SessionId::new(),
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::OpenCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    let sessions = &text[text.find("Sessions</h2>").expect("sessions heading")..];
+    assert!(
+        sessions.contains("—"),
+        "a session with no reported usage must show a dash"
+    );
+    assert!(
+        !sessions.contains("0 in / 0 out"),
+        "must never show a zeroed total for an unreported session"
+    );
+}
+
+#[tokio::test]
+async fn homepage_memory_explainer_is_collapsed_and_backup_banner_is_gone() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -3674,11 +4445,14 @@ async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
         .unwrap();
     let text = std::str::from_utf8(&body).unwrap();
 
-    // The explainer ships hidden with a persistent dismissal control;
-    // client script reveals it unless previously dismissed.
-    assert!(text.contains(r#"id="llm-notice""#));
-    assert!(text.contains(r#"id="llm-notice-close""#));
-    assert!(text.contains("ai-memory-llm-notice-dismissed"));
+    // The explainer stays available without competing with the operational cards.
+    let explainer = text.split("About compiled memory").next().unwrap();
+    let details = explainer.rsplit("<details").next().unwrap();
+    assert!(!details.contains(" open"));
+    assert!(text.contains("Pages are compiled from captured observations"));
+    assert!(text.contains("Memory dashboard"));
+    assert!(text.contains("Captured events"));
+    assert!(text.contains("Open sessions"));
 
     // The old always-on backup banner is gone (the migration dialog
     // carries that information; `status` keeps the durable reminder).
@@ -3888,6 +4662,39 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
             "{uri} with no viewer: {body}"
         );
     }
+
+    // In a browser the refusal must stay a refusal. The HTML auth layer used
+    // to turn every 403 it did not recognize into a redirect to the
+    // change-password form, telling bob his password was the problem.
+    let browser = web.layer(axum::middleware::from_fn_with_state(
+        std::sync::Arc::new(ai_memory_web::HtmlAuthRedirectConfig::from_mount(
+            "", "/web",
+        )),
+        ai_memory_web::html_auth_redirect_mw,
+    ));
+    let navigate = |viewer: UserId| {
+        Request::builder()
+            .uri("/w/default/alice-client-work/p/secrets/rates.md")
+            .header(header::ACCEPT, "text/html")
+            .header("sec-fetch-dest", "document")
+            .extension(AuthorizedViewer(viewer))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let resp = browser.clone().oneshot(navigate(bob)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get(header::LOCATION), None);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("not authorized for alice-client-work"),
+        "{body}"
+    );
+    assert!(!body.contains("confidential"), "leaked the body: {body}");
+    let resp = browser.oneshot(navigate(alice)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 /// A project name that two projects answer to is the caller's ambiguity, not
@@ -4537,7 +5344,7 @@ async fn api_recent_incremental_paginates_over_120_pages_and_binds_cursor() {
         .unwrap();
     assert_eq!(
         response.headers()[header::CACHE_CONTROL],
-        "private, max-age=30"
+        "private, no-store"
     );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -4606,6 +5413,26 @@ async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
             .unwrap()
     };
     let base = "/workspaces/default/projects/private-memory/recent";
+    let legacy = format!("{base}?limit=1");
+    let refused = app
+        .clone()
+        .oneshot(request(legacy.clone(), users[1]))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let granted = app
+        .clone()
+        .oneshot(request(legacy.clone(), users[0]))
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(granted.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert!(matches!(json[0]["path"].as_str(), Some("p0.md" | "p1.md")));
+
     let first = app
         .clone()
         .oneshot(request(
@@ -4644,6 +5471,14 @@ async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
             .unwrap()
     );
     assert_eq!(
+        app.clone()
+            .oneshot(request(legacy, users[0]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
+    );
+    assert_eq!(
         app.oneshot(request(url, users[0])).await.unwrap().status(),
         StatusCode::FORBIDDEN,
         "a cursor cannot retain access after its user's grant is revoked"
@@ -4668,8 +5503,11 @@ async fn send_mail(
             from_owner_user: None,
             to_workspace_id: to.0,
             to_project_id: to.1,
+            to_agent: None,
             subject: Some(subject.to_owned()),
             body: body.to_owned(),
+            nature: ai_memory_core::MessageNature::Unknown,
+            evidence: None,
         })
         .await
         .unwrap();
@@ -4731,6 +5569,7 @@ async fn web_mailbox_lists_only_this_projects_inbox_and_never_consumes_it() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Add retry to relay"), "{body}");
     assert!(body.contains("from default/sender"), "{body}");
+    assert!(body.contains(">unknown</span>"), "{body}");
     assert!(body.contains("1 pending"), "{body}");
     assert!(
         body.contains("&lt;script&gt;") || body.contains("&#60;script&#62;"),
@@ -5310,7 +6149,13 @@ async fn sidebar_folders_show_five_newest_with_a_link_to_the_rest() {
     assert!(body.contains("href=\"w/default/scratch/p/big/\""));
     assert!(body.contains("(6)"));
     assert!(body.contains("View all 6"));
-    let side = &body[..body.find("</aside>").expect("sidebar")];
+    let side = body
+        .split("<aside aria-label=\"Project pages\"")
+        .nth(1)
+        .expect("project sidebar")
+        .split("</aside>")
+        .next()
+        .unwrap();
     assert!(side.contains("Big 5") && !side.contains("Big 0"));
     // Five pages: all shown, no link; the root bucket is unlinked.
     assert!(body.contains("Five 0") && !body.contains("View all 5"));
@@ -5472,8 +6317,8 @@ async fn project_tree_and_namespace_listing_hide_expired_pages() {
     // The home page cards count only unexpired pages.
     let (status, home) = get_body(&app, "/").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(home.contains("2 pages"), "{home}");
-    assert!(!home.contains("4 pages"), "{home}");
+    assert!(home.contains("2 <small>pages</small>"), "{home}");
+    assert!(!home.contains("4 <small>pages</small>"), "{home}");
 
     let (status, namespace) = get_body(&app, "/w/default/scratch/p/notes/").await;
     assert_eq!(status, StatusCode::OK);
@@ -5766,7 +6611,7 @@ async fn header_search_carries_the_current_project() {
             !header.contains(r#"type="hidden" name="workspace""#),
             "{uri}: {header}"
         );
-        assert!(header.contains(r#"placeholder="Search…""#), "{uri}");
+        assert!(header.contains(r#"placeholder="Search memory…""#), "{uri}");
     }
 }
 
@@ -5894,4 +6739,242 @@ async fn search_page_scope_selector_round_trips_and_rejects_malformed_values() {
         let (status, _) = get_text(&app, &format!("/search?q=x&scope={bad}"), None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "scope={bad}");
     }
+}
+
+/// Old clients can register the basename while explicit reads already accept
+/// its canonical key. Only an explicit write promotes the stored name.
+async fn search_alias_fixture() -> (
+    TempDir,
+    Store,
+    Wiki,
+    ai_memory_core::WorkspaceId,
+    ai_memory_core::ProjectId,
+) {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let (project, _) = store
+        .writer
+        .resolve_project_by_identity(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            Some("/work/api".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        project,
+        "notes/alias.md",
+        "# Alias note\n\naliaslookupword",
+    ))
+    .await
+    .unwrap();
+    (tmp, store, wiki, ws, project)
+}
+
+#[tokio::test]
+async fn legacy_recent_uses_the_exact_project_name() {
+    let (_tmp, store, wiki, _, _) = search_alias_fixture().await;
+    let app = api_router(store.reader.clone(), wiki);
+    let (status, body) = get_body(&app, "/workspaces/default/projects/api/recent?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows[0]["path"], "notes/alias.md");
+
+    let (status, body) =
+        get_body(&app, "/workspaces/default/projects/acme-api/recent?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "[]");
+}
+
+#[tokio::test]
+async fn search_alias_links_open_before_and_after_project_promotion() {
+    let (_tmp, store, wiki, ws, project) = search_alias_fixture().await;
+    let app = router(store.reader.clone(), wiki);
+
+    for current_name in ["api", "acme-api"] {
+        if current_name == "acme-api" {
+            let promoted =
+                ai_memory_store::create_explicit_scope(&store.writer, "default", current_name)
+                    .await
+                    .unwrap();
+            assert_eq!(promoted.scope.project_id, project);
+            assert_eq!(promoted.promoted_from.as_deref(), Some("api"));
+        }
+        for requested_name in ["api", "acme-api"] {
+            for scope in [
+                format!("workspace=default&project={requested_name}"),
+                format!("scope=default/{requested_name}"),
+            ] {
+                for query in ["aliaslookupword", ""] {
+                    let uri = format!("/search?q={query}&{scope}&explain=1");
+                    let (status, html) = get_text(&app, &uri, None).await;
+                    assert_eq!(status, StatusCode::OK, "{uri}: {html}");
+                    if !query.is_empty() {
+                        // Follow the rendered result, including its recall context,
+                        // rather than constructing the expected URL ourselves.
+                        let href = html
+                            .split("href=\"")
+                            .filter_map(|part| part.split_once('"').map(|(href, _)| href))
+                            .find(|href| href.contains("/p/notes/alias.md"))
+                            .unwrap_or_else(|| panic!("{uri} had no result link: {html}"))
+                            .replace("&#38;", "&")
+                            .replace("&amp;", "&");
+                        let (page_status, page) = get_text(&app, &format!("/{href}"), None).await;
+                        assert_eq!(
+                            page_status,
+                            StatusCode::OK,
+                            "{uri} linked to {href}: {page}"
+                        );
+                        assert!(page.contains("aliaslookupword"), "{page}");
+                        assert!(href.starts_with(&format!("w/default/{current_name}/p/")));
+                    }
+                    assert!(
+                        html.contains(&format!("href=\"w/default/{current_name}\"")),
+                        "breadcrumb for {uri}: {html}"
+                    );
+                    assert!(
+                        html.contains(&format!("value=\"default/{current_name}\" selected")),
+                        "selector for {uri}: {html}"
+                    );
+                }
+            }
+        }
+        // Reads through either spelling neither rename nor create a project.
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(ws, project)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(current_name)
+        );
+        assert_eq!(
+            store
+                .reader
+                .list_projects_with_stats(None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_alias_links_require_a_grant_and_refuse_ambiguous_names() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+    use ai_memory_core::{NewUser, UserRole};
+    use ai_memory_store::{AccessMode, GrantLevel};
+
+    let (_tmp, store, wiki, ws, project) = search_alias_fixture().await;
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let mut users = Vec::new();
+    for username in ["reader", "outsider"] {
+        users.push(
+            store
+                .writer
+                .create_human_user(
+                    NewUser {
+                        username: username.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    store
+        .writer
+        .grant_memory(users[0], project, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki);
+
+    for current_name in ["api", "acme-api"] {
+        if current_name == "acme-api" {
+            ai_memory_store::create_explicit_scope(&store.writer, "default", current_name)
+                .await
+                .unwrap();
+        }
+        for requested_name in ["api", "acme-api"] {
+            for scope in [
+                format!("workspace=default&project={requested_name}"),
+                format!("scope=default/{requested_name}"),
+            ] {
+                for query in ["aliaslookupword", ""] {
+                    let uri = format!("/search?q={query}&{scope}&explain=1");
+                    let (status, html) = get_text(&app, &uri, Some(users[1])).await;
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html}");
+                    assert!(!html.contains("notes/alias.md"), "{html}");
+                    assert!(!html.contains("aliaslookupword"), "{html}");
+                    assert!(!html.contains("Recall trace"), "{html}");
+                    // The granted reader and root still reach the same project.
+                    for viewer in [Some(users[0]), None] {
+                        let (status, html) = get_text(&app, &uri, viewer).await;
+                        assert_eq!(status, StatusCode::OK, "{uri}: {html}");
+                        assert!(
+                            html.contains(&format!("value=\"default/{current_name}\" selected"))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // A second repository with the same basename makes the legacy key
+    // ambiguous; normalization must not silently choose either project.
+    let (other, _) = store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/other/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::Path,
+            "other-api",
+            Some("/other/api".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(other, project);
+    for scope in ["workspace=default&project=api", "scope=default/api"] {
+        let uri = format!("/search?q=aliaslookupword&{scope}");
+        let (status, html) = get_text(&app, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {html}");
+        assert!(!html.contains("notes/alias.md"), "{html}");
+    }
+    let (status, html) = get_text(
+        &app,
+        "/search?q=aliaslookupword&scope=default/acme-api",
+        Some(users[0]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("notes/alias.md"), "{html}");
 }

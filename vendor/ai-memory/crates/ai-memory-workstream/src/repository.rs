@@ -145,14 +145,22 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_bytes(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    hide_console(&mut command);
+    let output = command.arg("-C").arg(cwd).args(args).output().ok()?;
     output.status.success().then_some(output.stdout)
 }
+
+#[cfg(windows)]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_command: &mut Command) {}
 
 fn parse_status_paths(status: &[u8]) -> Vec<String> {
     let mut entries = status.split(|byte| *byte == 0).peekable();

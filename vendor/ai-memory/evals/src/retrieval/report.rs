@@ -28,6 +28,10 @@ pub struct Report {
     /// Human-readable knob summary for this config (e.g.
     /// `embeddings=local reranker=off`).
     pub config: String,
+    /// Haystack document vectors came from the eval embedding cache when
+    /// present (query embeddings are always live).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub embedding_cache: bool,
     pub questions_scored: usize,
     pub abstention_excluded: usize,
     pub ks: Vec<usize>,
@@ -208,9 +212,12 @@ fn slices_table_md(r: &Report) -> String {
     for k in &r.ks {
         md.push_str(&format!(" recall@{k} |"));
     }
+    for k in &r.ks {
+        md.push_str(&format!(" recall-all@{k} |"));
+    }
     md.push_str(" p50 ms | p95 ms | ctx tok mean | ctx tok med |\n");
     md.push_str("|---|---|");
-    for _ in r.ks.iter().chain(r.ks.iter()) {
+    for _ in r.ks.iter().chain(r.ks.iter()).chain(r.ks.iter()) {
         md.push_str("---|");
     }
     md.push_str("---|---|---|---|\n");
@@ -221,6 +228,9 @@ fn slices_table_md(r: &Report) -> String {
         }
         for k in &r.ks {
             md.push_str(&format!(" {:.3} |", m.recall_at[k]));
+        }
+        for k in &r.ks {
+            md.push_str(&format!(" {:.3} |", m.recall_all_at[k]));
         }
         md.push_str(&format!(
             " {} | {} | {:.1} | {:.1} |\n",
@@ -270,7 +280,8 @@ fn overall_qa_accuracy(r: &Report) -> Option<f64> {
 }
 
 const METRIC_NOTES: &str = "\nNotes: hit@k = any evidence session in top k (the \"Recall@k\" most \
-     systems publish); recall@k = fraction of evidence sessions found. \
+     systems publish); recall@k = fraction of evidence sessions found; \
+     recall-all@k = all evidence sessions found in top k. \
      Latency is the `memory_query` MCP round trip (send→parse); ctx tok is \
      the estimated context an agent ingests from the result = chars/4 over \
      returned hit titles + snippets. Session attribution: `sessions/<id>.md` \
@@ -280,11 +291,15 @@ const METRIC_NOTES: &str = "\nNotes: hit@k = any evidence session in top k (the 
 pub fn to_markdown(r: &Report) -> String {
     let mut md = String::new();
     md.push_str(&format!(
-        "# LongMemEval-S retrieval — {}\n\n",
-        r.generated_at
+        "# {} retrieval — {}\n\n",
+        r.dataset, r.generated_at
     ));
     md.push_str(&provenance_md(r));
-    md.push_str(&format!("- mode: {}\n- config: {}\n\n", r.mode, r.config));
+    md.push_str(&format!("- mode: {}\n- config: {}\n", r.mode, r.config));
+    if r.embedding_cache {
+        md.push_str("- document embeddings: eval cache (`evals/.cache/embeddings`)\n");
+    }
+    md.push('\n');
     md.push_str(&slices_table_md(r));
     md.push_str(&qa_table_md(r));
     md.push_str(&extras_md(r));
@@ -307,6 +322,7 @@ pub struct AbReport {
 pub struct AbDelta {
     pub hit_at: BTreeMap<usize, f64>,
     pub recall_at: BTreeMap<usize, f64>,
+    pub recall_all_at: BTreeMap<usize, f64>,
     pub latency_p50_ms: i128,
     pub latency_p95_ms: i128,
     pub context_tokens_mean: f64,
@@ -344,9 +360,11 @@ fn compute_delta(baseline: &Report, candidate: &Report) -> AbDelta {
     let c = overall(candidate);
     let mut hit_at = BTreeMap::new();
     let mut recall_at = BTreeMap::new();
+    let mut recall_all_at = BTreeMap::new();
     for k in &candidate.ks {
         hit_at.insert(*k, c.hit_at[k] - b.hit_at[k]);
         recall_at.insert(*k, c.recall_at[k] - b.recall_at[k]);
+        recall_all_at.insert(*k, c.recall_all_at[k] - b.recall_all_at[k]);
     }
     let base_by_id: BTreeMap<&str, &QuestionScore> = baseline
         .per_question
@@ -372,6 +390,7 @@ fn compute_delta(baseline: &Report, candidate: &Report) -> AbDelta {
         hit_flips,
         hit_at,
         recall_at,
+        recall_all_at,
         latency_p50_ms: c.latency_p50_ms as i128 - b.latency_p50_ms as i128,
         latency_p95_ms: c.latency_p95_ms as i128 - b.latency_p95_ms as i128,
         context_tokens_mean: c.context_tokens_mean - b.context_tokens_mean,
@@ -389,8 +408,8 @@ fn compute_delta(baseline: &Report, candidate: &Report) -> AbDelta {
 pub fn ab_to_markdown(r: &AbReport) -> String {
     let mut md = String::new();
     md.push_str(&format!(
-        "# LongMemEval-S retrieval A/B — {}\n\n",
-        r.candidate.generated_at
+        "# {} retrieval A/B — {}\n\n",
+        r.candidate.dataset, r.candidate.generated_at
     ));
     // Provenance is shared (same dataset/commit/hardware/question set).
     md.push_str(&provenance_md(&r.candidate));
@@ -426,6 +445,12 @@ pub fn ab_to_markdown(r: &AbReport) -> String {
             b.recall_at[k], c.recall_at[k], r.delta.recall_at[k]
         ));
     }
+    for k in &r.candidate.ks {
+        md.push_str(&format!(
+            "| recall-all@{k} | {:.3} | {:.3} | {:+.3} |\n",
+            b.recall_all_at[k], c.recall_all_at[k], r.delta.recall_all_at[k]
+        ));
+    }
     md.push_str(&format!(
         "| latency p50 ms | {} | {} | {:+} |\n",
         b.latency_p50_ms, c.latency_p50_ms, r.delta.latency_p50_ms
@@ -456,11 +481,12 @@ pub fn ab_to_markdown(r: &AbReport) -> String {
 mod tests {
     use super::*;
 
-    fn slice(questions: usize, hit5: f64, recall5: f64) -> SliceMetrics {
+    fn slice(questions: usize, hit5: f64, recall5: f64, recall_all5: f64) -> SliceMetrics {
         SliceMetrics {
             questions,
             hit_at: BTreeMap::from([(5, hit5)]),
             recall_at: BTreeMap::from([(5, recall5)]),
+            recall_all_at: BTreeMap::from([(5, recall_all5)]),
             latency_p50_ms: 12,
             latency_p95_ms: 34,
             context_tokens_mean: 100.0,
@@ -469,9 +495,9 @@ mod tests {
         }
     }
 
-    fn report(config: &str, hit5: f64, recall5: f64) -> Report {
+    fn report(config: &str, hit5: f64, recall5: f64, recall_all5: f64) -> Report {
         let mut slices = BTreeMap::new();
-        slices.insert("overall".to_string(), slice(2, hit5, recall5));
+        slices.insert("overall".to_string(), slice(2, hit5, recall5, recall_all5));
         Report {
             generated_at: "2026-09-01".into(),
             commit: "abc".into(),
@@ -480,6 +506,7 @@ mod tests {
             dataset_sha256: crate::retrieval::dataset::LONGMEMEVAL_S_SHA256,
             mode: "zero-llm",
             config: config.into(),
+            embedding_cache: false,
             questions_scored: 2,
             abstention_excluded: 1,
             ks: vec![5],
@@ -492,14 +519,29 @@ mod tests {
     }
 
     #[test]
+    fn coding_reports_name_the_selected_dataset() {
+        let mut baseline = report("embeddings=none", 1.0, 1.0, 1.0);
+        baseline.dataset = "coding_v1";
+        let mut candidate = report("embeddings=none", 1.0, 1.0, 1.0);
+        candidate.dataset = "coding_v1";
+        assert!(to_markdown(&baseline).starts_with("# coding_v1 retrieval"));
+        assert!(
+            ab_to_markdown(&AbReport::new(baseline, candidate))
+                .starts_with("# coding_v1 retrieval A/B")
+        );
+    }
+
+    #[test]
     fn markdown_carries_provenance_and_the_triple() {
-        let r = report("embeddings=none reranker=off", 0.5, 0.25);
+        let r = report("embeddings=none reranker=off", 0.5, 0.25, 0.0);
         let md = to_markdown(&r);
+        assert!(md.starts_with("# longmemeval_s retrieval"));
         assert!(md.contains("commit: `abc`"));
         assert!(md.contains("config: embeddings=none reranker=off"));
-        // triple row: hit@5 recall@5 p50 p95 ctx-mean ctx-median
+        assert!(md.contains(" hit@5 | recall@5 | recall-all@5 |"));
+        // Accuracy, latency and context-token columns remain aligned.
         assert!(
-            md.contains("| overall | 2 | 0.500 | 0.250 | 12 | 34 | 100.0 | 90.0 |"),
+            md.contains("| overall | 2 | 0.500 | 0.250 | 0.000 | 12 | 34 | 100.0 | 90.0 |"),
             "{md}"
         );
         assert!(md.contains("abstention questions excluded"));
@@ -508,11 +550,12 @@ mod tests {
 
     #[test]
     fn ab_delta_is_candidate_minus_baseline_and_zero_for_identical_runs() {
-        let baseline = report("embeddings=none", 0.5, 0.25);
-        let candidate = report("embeddings=none", 0.5, 0.25);
+        let baseline = report("embeddings=none", 0.5, 0.25, 0.0);
+        let candidate = report("embeddings=none", 0.5, 0.25, 0.0);
         let ab = AbReport::new(baseline, candidate);
         assert_eq!(ab.delta.hit_at[&5], 0.0);
         assert_eq!(ab.delta.recall_at[&5], 0.0);
+        assert_eq!(ab.delta.recall_all_at[&5], 0.0);
         assert_eq!(ab.delta.latency_p50_ms, 0);
         assert_eq!(ab.delta.context_tokens_mean, 0.0);
         let md = ab_to_markdown(&ab);
@@ -521,12 +564,13 @@ mod tests {
             md.contains("| hit@5 | 0.500 | 0.500 | +0.000 (+0/-0) |"),
             "{md}"
         );
+        assert!(md.contains("| recall-all@5 | 0.000 | 0.000 | +0.000 |"));
     }
 
     #[test]
     fn qa_table_renders_only_when_qa_ran_and_carries_no_key() {
         use super::super::score::QaSliceMetrics;
-        let mut r = report("embeddings=none reranker=off", 0.5, 0.25);
+        let mut r = report("embeddings=none reranker=off", 0.5, 0.25, 0.0);
         // No QA → no QA section.
         assert!(!to_markdown(&r).contains("QA accuracy"));
         // Attach QA.
@@ -558,13 +602,32 @@ mod tests {
 
     #[test]
     fn ab_delta_reports_a_real_difference() {
-        let baseline = report("embeddings=none", 0.4, 0.20);
-        let candidate = report("embeddings=local", 0.6, 0.30);
+        let baseline = report("embeddings=none", 0.4, 0.20, 0.1);
+        let candidate = report("embeddings=local", 0.6, 0.30, 0.2);
         let ab = AbReport::new(baseline, candidate);
         assert!((ab.delta.hit_at[&5] - 0.2).abs() < 1e-9);
+        assert!((ab.delta.recall_all_at[&5] - 0.1).abs() < 1e-9);
         let md = ab_to_markdown(&ab);
         assert!(md.contains("| hit@5 | 0.400 | 0.600 | +0.200"), "{md}");
         assert!(md.contains("candidate: embeddings=local"));
+        assert!(md.contains("| recall-all@5 | 0.100 | 0.200 | +0.100 |"));
+        let json = serde_json::to_value(&ab).unwrap();
+        assert_eq!(
+            json["baseline"]["slices"]["overall"]["recall_all_at"]["5"],
+            0.1
+        );
+        assert_eq!(
+            json["candidate"]["slices"]["overall"]["recall_all_at"]["5"],
+            0.2
+        );
+        assert_eq!(json["delta"]["recall_all_at"]["5"], 0.1);
+
+        let reversed = AbReport::new(ab.candidate, ab.baseline);
+        assert!(ab_to_markdown(&reversed).contains("| recall-all@5 | 0.200 | 0.100 | -0.100 |"));
+        assert_eq!(
+            serde_json::to_value(&reversed).unwrap()["delta"]["recall_all_at"]["5"],
+            -0.1
+        );
     }
 
     fn question(id: &str, hit5: f64) -> QuestionScore {
@@ -573,6 +636,7 @@ mod tests {
             question_type: "t".into(),
             hit_at: BTreeMap::from([(5, hit5)]),
             recall_at: BTreeMap::from([(5, hit5)]),
+            recall_all_at: BTreeMap::from([(5, hit5)]),
             retrieved_sessions: 1,
             latency_ms: 0,
             context_tokens: 0,
@@ -584,13 +648,13 @@ mod tests {
 
     #[test]
     fn ab_delta_counts_paired_flips_both_ways() {
-        let mut baseline = report("b", 0.5, 0.5);
+        let mut baseline = report("b", 0.5, 0.5, 0.5);
         baseline.per_question = vec![
             question("q1", 1.0),
             question("q2", 0.0),
             question("q3", 1.0),
         ];
-        let mut candidate = report("c", 0.5, 0.5);
+        let mut candidate = report("c", 0.5, 0.5, 0.5);
         candidate.per_question = vec![
             question("q1", 0.0),
             question("q2", 1.0),
@@ -599,6 +663,18 @@ mod tests {
         let ab = AbReport::new(baseline, candidate);
         assert_eq!(ab.delta.hit_flips[&5], (1, 1));
         assert!(ab_to_markdown(&ab).contains("(+1/-1)"));
+    }
+
+    #[test]
+    fn json_carries_per_question_and_slice_recall_all() {
+        let mut r = report("c", 0.5, 0.5, 0.5);
+        r.per_question = vec![question("q1", 1.0), question("q2", 0.0)];
+        r.slices = super::super::score::aggregate(&r.per_question, &r.ks);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["per_question"][0]["recall_all_at"]["5"], 1.0);
+        assert_eq!(json["per_question"][1]["recall_all_at"]["5"], 0.0);
+        assert_eq!(json["slices"]["t"]["recall_all_at"]["5"], 0.5);
+        assert_eq!(json["slices"]["overall"]["recall_all_at"]["5"], 0.5);
     }
 
     #[test]
@@ -630,7 +706,7 @@ mod tests {
         assert_eq!(s.request_p95_ms, 9);
         assert_eq!(s.docs_over_16kib, 1);
         assert_eq!(s.mode, "whole-session");
-        let mut r = report("c", 0.5, 0.5);
+        let mut r = report("c", 0.5, 0.5, 0.5);
         r.ingest = Some(s);
         let md = to_markdown(&r);
         assert!(md.contains("### Ingest"));

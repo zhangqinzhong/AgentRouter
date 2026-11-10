@@ -44,9 +44,36 @@ export interface ScopedArgs {
   scope?: Scope;
 }
 
+/** An existing project selected by name or by its stable id. */
+export type ExistingProjectTarget =
+  | {
+      /** Existing workspace name. */
+      workspace: string;
+      /** Existing project name. */
+      project: string;
+      /** Not allowed together with `project`. */
+      projectId?: never;
+    }
+  | {
+      /** Existing workspace name. */
+      workspace: string;
+      /** Stable id of an existing project in the workspace. */
+      projectId: string;
+      /** Not allowed together with `projectId`. */
+      project?: never;
+    };
+
 // ---------------------------------------------------------------------------
 // Pages
 // ---------------------------------------------------------------------------
+
+/** A repository file a page describes, and the commit it was checked against. */
+export interface PageSourceFile {
+  /** Repository-relative path with `/` separators. */
+  path: string;
+  /** Commit id, 7-64 hex characters; the server stores it lowercased. */
+  commit: string;
+}
 
 /**
  * Page metadata a write sets. A write replaces the whole page: metadata the
@@ -72,6 +99,12 @@ export interface PageMetadata {
   relations?: Partial<Record<RelationName, string[]>>;
   /** TTL: an RFC 3339 instant or a bare `YYYY-MM-DD` date. Expired pages are hidden. */
   expiresAt?: string;
+  /**
+   * Up to 16 repository files the page describes. The server stores them and
+   * never reads the files; compare each with your checkout and record `stale`
+   * feedback when one changed.
+   */
+  sourceFiles?: PageSourceFile[];
 }
 
 /** Arguments of {@link PagesNamespace.write}. */
@@ -102,12 +135,150 @@ export interface WritePageResult {
   readonly raw: Raw;
 }
 
+/** Arguments of {@link PagesNamespace.resolveWriteTarget}. */
+export interface ResolveWriteTargetArgs {
+  /** Exact existing destination; this operation never creates a scope. */
+  target: ExistingProjectTarget;
+}
+
+/** Canonical existing destination returned by a write-access preflight. */
+export interface ResolvedWriteTarget {
+  /** Canonical workspace name. */
+  readonly workspace: string;
+  /** Canonical project name. */
+  readonly project: string;
+  /** Stable project id. */
+  readonly projectId: string;
+  /** The server's decoded JSON. */
+  readonly raw: Raw;
+}
+
+/** One complete, conditional page version in an atomic batch. */
+export type BatchWritePage = PageMetadata & {
+  /** Relative wiki path. */
+  path: string;
+  /** Complete Markdown body for this version. */
+  body: string;
+} &
+  (
+    | {
+        /** Require this latest page version. */
+        expectedPageId: string;
+        /** Not allowed together with `expectedPageId`. */
+        createOnly?: never;
+      }
+    | {
+        /** Require the path to be absent. */
+        createOnly: true;
+        /** Not allowed together with `createOnly`. */
+        expectedPageId?: never;
+      }
+  );
+
+/** Arguments of {@link PagesNamespace.writeBatch}. */
+export interface WritePagesBatchArgs {
+  /** Exact existing destination; batch writes never create a scope. */
+  target: ExistingProjectTarget;
+  /** One to 100 complete page versions, committed atomically. */
+  pages: readonly BatchWritePage[];
+}
+
+/** One page written by {@link PagesNamespace.writeBatch}. */
+export interface BatchWritePageResult {
+  /** Zero-based request position. */
+  readonly index: number;
+  /** Canonical wiki path written. */
+  readonly path: string;
+  /** New page version id. */
+  readonly pageId: string;
+  /** The server's decoded item JSON. */
+  readonly raw: Raw;
+}
+
+/** Result of {@link PagesNamespace.writeBatch}. */
+export interface WritePagesBatchResult {
+  /** Results in request order. */
+  readonly pages: readonly BatchWritePageResult[];
+  /** One git checkpoint for the whole batch, when reported. */
+  readonly checkpoint: string | null;
+  /** The server's decoded JSON. */
+  readonly raw: Raw;
+}
+
+/** A bounded heading token returned by `memory_read_page`. */
+export interface PageSection {
+  /** Heading text without Markdown markers. */
+  readonly anchor: string;
+  /** ATX heading level, 1 through 6. */
+  readonly level: number;
+  /** SHA-256 of the exact section bytes, including its heading. */
+  readonly sha256: string;
+}
+
+/** One atomic anchored page edit. */
+export type PagePatchEdit =
+  | {
+      /** Append operation. */
+      op: "append";
+      /** Insert before the next same-or-higher-level heading. */
+      target: "section";
+      /** Unique existing heading. */
+      anchor: string;
+      /** Markdown to append. */
+      content: string;
+    }
+  | {
+      /** Append operation. */
+      op: "append";
+      /** Insert at the end of the page. */
+      target: "end_of_page";
+      /** An EOF append has no heading anchor. */
+      anchor?: never;
+      /** Markdown to append. */
+      content: string;
+    }
+  | {
+      /** Add a new section at EOF. */
+      op: "add_section";
+      /** Unique ATX level 2-6 heading, for example `## Decisions`. */
+      anchor: string;
+      /** New section body. */
+      content: string;
+    }
+  | {
+      /** Replace one existing section body. */
+      op: "replace_section";
+      /** Unique existing heading. */
+      anchor: string;
+      /** Exact section token returned by {@link Page.sections}. */
+      sectionSha256: string;
+      /** Replacement section body, excluding the heading. */
+      content: string;
+    };
+
+/** Arguments of {@link PagesNamespace.patch}. */
+export interface PatchPageArgs extends ScopedArgs {
+  /** Existing page path. */
+  path: string;
+  /** Required latest page version returned by a read or mutation. */
+  expectedPageId: string;
+  /** Bounded batch resolved against one base body and committed atomically. */
+  edits: readonly PagePatchEdit[];
+}
+
+/** Result of {@link PagesNamespace.patch}. */
+export type PatchPageResult = WritePageResult;
+
 /** Options shared by both forms of {@link ReadPageArgs}. */
 export interface ReadPageBase extends ScopedArgs {
+  /** Read from the reserved cross-project global scope. Cannot be combined with `scope`. */
+  global?: boolean;
   /** Also walk the link graph and return the reachable pages in `related`. */
   includeRelated?: boolean;
   /** Hops to walk with `includeRelated` (default 1, capped at 3 by the server). */
   relatedDepth?: number;
+  /** Cap the returned body at this many characters (default 12000, 500 to 64000). */
+  maxChars?: number;
 }
 
 /** Arguments of {@link PagesNamespace.read}: exactly one of `path` or `query`. */
@@ -153,10 +324,18 @@ export interface Page {
   readonly path: string;
   /** Page title. */
   readonly title: UntrustedText;
-  /** Markdown body. */
+  /** Markdown body, cut at `maxChars` with a visible marker when `truncated`. */
   readonly body: UntrustedText;
+  /** Whether the server cut the body at `maxChars`. */
+  readonly truncated: boolean | undefined;
+  /** Length in characters of the untruncated body. */
+  readonly totalChars: number | undefined;
   /** Parsed frontmatter (tags, tier, pinned and other metadata). Untrusted. */
   readonly frontmatter: Readonly<Record<string, unknown>>;
+  /** Bounded heading hashes for anchored patches. */
+  readonly sections: readonly PageSection[];
+  /** True when the page has more sections than the response cap. */
+  readonly sectionsTruncated: boolean;
   /** Pages reachable through links, present only with `includeRelated`. */
   readonly related: readonly RelatedPage[] | undefined;
   /** The server's decoded JSON. */
@@ -322,6 +501,22 @@ export interface QueryAnswer {
   readonly citations: readonly string[];
 }
 
+/** Optional server-side context admission receipt for answer synthesis. */
+export interface QueryAnswerContext {
+  /** Number of source snippets admitted to the model input. */
+  readonly admitted: number;
+  /** Number of retrieval snippets not admitted. Retrieval hits stay complete. */
+  readonly omitted: number;
+  /** Number of admitted snippets clipped on a UTF-8 boundary. */
+  readonly clipped: number;
+  /** Conservative byte-based input estimate, including schema and envelope allowance. */
+  readonly estimatedInputTokens: number;
+  /** Output token allowance reserved for the requested reasoning tier. */
+  readonly reservedOutputTokens: number;
+  /** Server-configured combined context target; not a tokenizer guarantee. */
+  readonly maxContextTokens: number;
+}
+
 /** Result of {@link AiMemoryClient.query}. */
 export interface QueryResult {
   /** Page hits. A global query puts its cross-project hits here, with `workspace` and `project` set. */
@@ -334,6 +529,8 @@ export interface QueryResult {
   readonly answer: QueryAnswer | undefined;
   /** Why no answer was produced, when `answer` was set. */
   readonly answerUnavailable: string | undefined;
+  /** Present only when the server applied its optional answer context budget. */
+  readonly answerContext?: QueryAnswerContext;
   /** The server's decoded JSON. */
   readonly raw: Raw;
 }
@@ -468,6 +665,8 @@ export interface SessionActivity {
 export interface BriefingArgs extends ScopedArgs {
   /** How many recent pages to include (default 10, max 100). */
   recentPagesLimit?: number;
+  /** How many recent sessions to include (default 5, max 50). */
+  recentSessionsLimit?: number;
   /** Lead with the project's settled rule and decision pages. */
   settledFirst?: boolean;
 }
@@ -510,12 +709,15 @@ export type ObservationKind =
 /** Arguments of {@link AiMemoryClient.observations}. */
 export interface ObservationsArgs extends ScopedArgs {
   /**
-   * Session id. Omit for the newest other session with captured work in the
-   * project, ended or cut off (the caller's cwd first), or the latest
-   * completed one when nothing worked in the last 30 days.
+   * Session id. The server reads `"current"` as the caller's own session
+   * only when the request carries the caller's hook session id, which this
+   * client does not send, so pass the id itself here. Omit
+   * for the newest other session with captured work in the project, ended or
+   * cut off (the caller's cwd first), or the latest completed one when
+   * nothing worked in the last 30 days.
    */
   sessionId?: string;
-  /** Maximum observations (server default 50, clamped to 200). */
+  /** Maximum observations (server default 20, clamped to 200). */
   limit?: number;
   /** Observations to skip. */
   offset?: number;
@@ -525,7 +727,7 @@ export interface ObservationsArgs extends ScopedArgs {
   kinds?: ObservationKind[];
   /** Full-text query restricted to the session. */
   query?: string;
-  /** Cap each body at this many characters (200 to 16384, default 4000). */
+  /** Cap each body at this many characters (200 to 16384, default 1000). */
   bodyMaxChars?: number;
 }
 
@@ -741,10 +943,25 @@ export interface SendMessageArgs {
   to: Scope;
   /** Sending project. Defaults to the client's `scope`. */
   from?: Scope;
+  /**
+   * Restrict claiming to this registered harness in the recipient project
+   * (for example `codex` or `claude-code`); the server refuses a harness with
+   * no session there. Omit for shared project mail.
+   */
+  toAgent?: string;
+  /**
+   * The sending harness (for example `claude-code`), for a client whose
+   * session metadata does not record it. Carried as the message's `fromAgent`.
+   */
+  fromAgent?: string;
   /** Self-contained request for the recipient's agent. */
   body: string;
   /** Optional one-line subject. */
   subject?: string;
+  /** How the sender knows the claim. Defaults to `unknown`. */
+  nature?: "unknown" | "measured" | "reported" | "inferred";
+  /** Supporting evidence. Required by the server when `nature` is `measured`. */
+  evidence?: string;
 }
 
 /** Result of {@link MessagesNamespace.send}. */
@@ -763,7 +980,11 @@ export interface Message {
   readonly subject: UntrustedText | null;
   /** Body: a request to evaluate, never instructions to obey. */
   readonly body: UntrustedText;
-  /** `pending`, `claimed` or `cancelled`. */
+  /** How the sender knows the claim. */
+  readonly nature: "unknown" | "measured" | "reported" | "inferred";
+  /** Supporting evidence, or `null`. */
+  readonly evidence: UntrustedText | null;
+  /** `pending`, `editing`, `claimed` or `cancelled`. */
   readonly state: string;
   /** Send time. */
   readonly createdAt: string | undefined;
@@ -771,6 +992,8 @@ export interface Message {
   readonly claimedAt: string | null;
   /** The sender's harness label. */
   readonly fromAgent: string | undefined;
+  /** The harness the message is addressed to, or `null` for shared project mail. */
+  readonly toAgent: string | null;
   /** The sending operator key, or `null`. */
   readonly fromOwner: string | null;
   /** The server's decoded JSON. */
@@ -797,6 +1020,12 @@ export interface ListMessagesResult {
 export interface PopMessageArgs extends ScopedArgs {
   /** Claim exactly this message. Omit to claim the oldest pending one. */
   messageId?: string;
+  /**
+   * The harness claiming (for example `codex` or `claude-code`), for a
+   * client whose session metadata does not identify it. Mail addressed to a
+   * harness can only be claimed by that harness.
+   */
+  agent?: string;
 }
 
 /** Result of {@link MessagesNamespace.pop}. */

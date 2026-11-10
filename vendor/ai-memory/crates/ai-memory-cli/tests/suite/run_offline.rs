@@ -28,11 +28,6 @@ type RecoveryServerState = (
     Arc<Mutex<Vec<(String, Value)>>>,
 );
 
-/// A loopback address nothing listens on: `free_port` binds and releases.
-fn closed_port_url() -> String {
-    format!("http://127.0.0.1:{}", crate::e2e_support::free_port())
-}
-
 fn write_script(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -273,7 +268,9 @@ async fn fake_recovery_server_on(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_run_launches_the_harness_without_the_server() {
     let fixture = Fixture::new();
-    let server = closed_port_url();
+    // Reserved and never listening, so no parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
     let output = run(&fixture, &server, &["run", "--no-autowire", "claude"]).await;
     assert!(output.status.success(), "{}", stderr_text(&output));
 
@@ -360,7 +357,9 @@ async fn unsupported_exporter_is_journaled_by_a_real_degraded_run_as_spool_only(
     drop(connection);
     write_script(&fixture.bin.join("agy"), "exit 0\n");
 
-    let server = closed_port_url();
+    // Reserved and never listening, so no parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
     let output = run(
         &fixture,
         &server,
@@ -536,7 +535,9 @@ async fn recover_drains_spool_then_replays_exact_degraded_transcript_idempotentl
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn require_server_fails_closed_when_offline() {
     let fixture = Fixture::new();
-    let server = closed_port_url();
+    // Reserved and never listening, so no parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
     let output = run(
         &fixture,
         &server,
@@ -565,7 +566,9 @@ async fn require_server_fails_closed_when_offline() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_autowire_wires_hooks_but_not_mcp() {
     let fixture = Fixture::new();
-    let server = closed_port_url();
+    // Reserved and never listening, so no parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
     let output = run(&fixture, &server, &["run", "claude"]).await;
     assert!(output.status.success(), "{}", stderr_text(&output));
     let output_stderr = stderr_text(&output);
@@ -724,4 +727,80 @@ async fn a_mid_run_outage_preserves_the_child_exit_code() {
     assert!(rerun.status.success(), "{}", stderr_text(&rerun));
     assert_eq!(finishes.lock().unwrap().len(), 1);
     recovery_server.abort();
+}
+
+/// A session recorded under the checkout's old folder-name project fails the
+/// link with a coded conflict (#1993). Off a terminal there is nobody to ask,
+/// so the run stops before the agent starts and prints the exact lossless
+/// renames instead of the bare "managed run is not active".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_split_project_link_prints_the_rename_commands_off_a_terminal() {
+    let cancels = Arc::new(Mutex::new(0_u32));
+    let cancel_count = cancels.clone();
+    let app = Router::new()
+        .route(
+            "/workstream/runs",
+            post(|| async {
+                Json(json!({
+                    "workstream_id": "12345678-1234-4234-9234-123456789abd",
+                    "workstream_name": "fixture",
+                    "run_id": "12345678-1234-4234-9234-123456789abe",
+                    "resolved_agent": "claude-code",
+                    "sync_after": 0, "sync_through": 0,
+                    "may_adopt_existing_session": false,
+                }))
+            }),
+        )
+        .route(
+            "/workstream/runs/{run_id}/link",
+            post(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "native session belongs to project default/api, not default/acme-api",
+                        "code": "native_session_in_other_project",
+                        "workspace": "default",
+                        "session_project": "api",
+                        "session_project_id": "01a19c51-63d5-7dc2-8dc1-90201095ba96",
+                        "run_workspace": "default",
+                        "run_project": "acme-api",
+                        "run_project_id": "01a19da2-094f-7830-9807-1d32f2fdb464",
+                        "run_legacy_name": "api",
+                        "run_sessions": 0,
+                        "run_pages": 0,
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/workstream/runs/{run_id}/cancel",
+            post(move || {
+                *cancel_count.lock().unwrap() += 1;
+                async { StatusCode::NO_CONTENT }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let fixture = Fixture::new();
+    let server_url = format!("http://{address}");
+    let output = run(&fixture, &server_url, &["run", "--no-autowire", "claude"]).await;
+    let stderr = stderr_text(&output);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("recorded in project default/api"),
+        "the split is explained:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "ai-memory repair-split --workspace default \
+             --project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96 \
+             --from-project-id 01a19da2-094f-7830-9807-1d32f2fdb464 --archive-name acme-api-split-"
+        ),
+        "the lossless repair is printed:\n{stderr}"
+    );
+    assert!(!stderr.contains("managed run is not active"), "{stderr}");
+    assert!(!fixture.claude_ran.exists(), "the agent must not start");
+    assert_eq!(*cancels.lock().unwrap(), 1, "the refused run is released");
 }

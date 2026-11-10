@@ -1,5 +1,6 @@
 import {DEFAULT_PAGE_RANGES} from "@agentrouter/core/config/page-default-ranges";
 import type {PageDefaultRanges} from "@agentrouter/core/contracts/app";
+import { Select } from '@/components/ui/select';
 import {memo,useEffect,useMemo,useState} from 'react';
 import type {LocalUsagePageData} from '@agentrouter/core/collector/usage-page';
 import {CostAnalysisModal} from '@/vendor/tokentracker/ui/dashboard/components/CostAnalysisModal';
@@ -28,6 +29,9 @@ export function localUsageRange(period:Period, custom:{from:string;to:string}, n
 }
 export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_PAGE_RANGES.usage}:{defaultRange?:PageDefaultRanges["usage"]}){
  const t=useAppText();const language=useResolvedAppLanguage();const numberLocale=useAppNumberLocale();
+ const [source,setSource]=useState('');const [instance,setInstance]=useState('');
+ const [knownSources,setKnownSources]=useState<string[]>([]);
+ const [instances,setInstances]=useState<NonNullable<LocalUsagePageData['instances']>>([]);
  const [period,setPeriod]=useState<Period>(defaultRange);
  const [custom,setCustom]=useState(()=>localUsageRange('day',{from:'',to:''}));
  const [costOpen,setCostOpen]=useState(false);
@@ -36,7 +40,7 @@ export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_P
  const [revision,setRevision]=useState(0);const [full,setFull]=useState(false);
  const range=localUsageRange(period,custom);
  const tz=Intl.DateTimeFormat().resolvedOptions().timeZone;
- const rangeKey=JSON.stringify([range.from,range.to,tz]);
+ const rangeKey=JSON.stringify([range.from,range.to,tz,period,source,instance]);
  const data=result?.key===rangeKey?result.data:undefined;
  useEffect(()=>{let active=true;setLoading(true);setError('');
    const api=window.agentrouter;
@@ -44,7 +48,7 @@ export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_P
    // Recomputed inside the effect so the rolling window slides on each poll
    // without churning the result cache key.
    const since=localUsageSince(period);
-   void api.getLocalUsagePage({...range,tz,since}).then(data=>{if(active)setResult({key:rangeKey,data})}).catch(e=>{if(active)setError(e instanceof Error?e.message:String(e))}).finally(()=>{if(active)setLoading(false)});
+   void api.getLocalUsagePage({...range,tz,since,...(source?{source}:{}),...(instance?{instance}:{})}).then(data=>{if(active){setResult({key:rangeKey,data});setInstances(data.instances??[]);if(!source)setKnownSources((data.sources??[]).map(row=>String(row.source)));}}).catch(e=>{if(active)setError(e instanceof Error?e.message:String(e))}).finally(()=>{if(active)setLoading(false)});
    return()=>{active=false};
  },[rangeKey,revision]);
  useEffect(()=>{const timer=setInterval(()=>setRevision(v=>v+1),60000);return()=>clearInterval(timer)},[]);
@@ -54,7 +58,13 @@ export const LocalUsageView=memo(function LocalUsageView({defaultRange=DEFAULT_P
  const tokens=Number(data?.totals.billable_total_tokens??data?.totals.total_tokens??0);
  const display=formatTokenCount(tokens,{forceFull:full,locale:numberLocale});
  return <div className="local-usage-page mx-auto w-full max-w-page px-5 py-6 sm:px-9 sm:py-8">
-   <h1 className="mb-8 text-title font-semibold tracking-tight">{t('Usage')}</h1>
+   <div className="mb-8 flex flex-wrap items-center justify-between gap-3">
+     <h1 className="text-title font-semibold tracking-tight">{t('Usage')}</h1>
+     <div className="flex flex-wrap items-center gap-2">
+       <Select aria-label={t('Client')} className="w-auto" value={source} onValueChange={value=>{setSource(value);setInstance('')}} options={[{value:'',label:t('All clients')},...[...new Set([...knownSources,...instances.map(i=>i.source),...(source?[source]:[])])].map(value=>({value,label:value==='claude'?'Claude':value==='codex'?'Codex':value}))]} />
+       <Select aria-label={t('Instance')} className="w-auto" value={instance} disabled={!source} onValueChange={setInstance} options={[{value:'',label:t('All instances')},...instances.filter(i=>i.source===source).map(i=>({value:i.id,label:t(i.name)})),{value:'unattributed',label:t('Unattributed')}]} />
+     </div>
+   </div>
    {error ? <div role="alert" className="mb-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}<button type="button" className="ml-3 underline" onClick={()=>setRevision(v=>v+1)}>{t('Retry')}</button></div>:null}
    <UsageOverview period={period} periods={['day','week','month','total','custom']} onPeriodChange={value=>setPeriod(value as Period)}
     summaryValue={display} summaryFullValue={formatTokenCount(tokens,{forceFull:true,locale:numberLocale})} onToggleSummaryFormat={()=>setFull(v=>!v)} summaryLabel={language==='zh'?'TOKEN 总数':'TOTAL TOKENS'}

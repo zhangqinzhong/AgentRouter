@@ -37,7 +37,9 @@ $ErrorActionPreference = 'Stop'
 function Invoke-WebRequest {
     param(
         [switch] $UseBasicParsing,
+        [switch] $NoProxy,
         [int] $TimeoutSec,
+        [int] $MaximumRedirection,
         [string] $Method = 'Get',
         [string] $Uri,
         $Headers,
@@ -46,7 +48,7 @@ function Invoke-WebRequest {
     )
     Add-Content -LiteralPath $env:AI_MEMORY_TEST_LOG -Value ('{0} {1} client={2}' -f $Method.ToUpperInvariant(), $Uri, $Headers['X-AI-Memory-Client'])
     if ($Method -eq 'Post') { return $null }
-    return [pscustomobject]@{ Content = 'HANDOFF FROM SERVER' }
+    return [pscustomobject]@{ Content = 'HANDOFF FROM SERVER'; StatusCode = 200 }
 }
 
 Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff
@@ -155,6 +157,13 @@ Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff
             "the handoff GET must still be issued: {:?}",
             run.requests
         );
+        // The baton is offered, not claimed: the fetch forwards claim=0 so the
+        // server names the handoff without consuming it.
+        assert!(
+            run.requests[0].contains("claim=0"),
+            "an external owner must offer the handoff with claim=0: {:?}",
+            run.requests
+        );
         assert!(
             run.stdout.contains("HANDOFF FROM SERVER"),
             "the fetched context must still reach the agent: {:?}",
@@ -172,6 +181,11 @@ Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff
             assert!(
                 request.ends_with(" client=hook-ps"),
                 "request without the client marker: {request}"
+            );
+            // No external owner means a normal claiming fetch: no claim=0.
+            assert!(
+                !request.contains("claim=0"),
+                "a non-owner fetch must not force claim=0: {request}"
             );
         }
     }

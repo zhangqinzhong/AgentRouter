@@ -1,0 +1,25 @@
+<script>
+(function () {
+  var key="ai-memory-management-theme", selected="system";
+  var media=window.matchMedia("(prefers-color-scheme: dark)");
+  try { selected=localStorage.getItem(key)||"system"; } catch (_) {}
+  function apply(value) {
+    selected=(value==="dark"||value==="light")?value:"system";
+    var dark=selected==="dark" || (selected==="system" && media.matches);
+    document.documentElement.dataset.theme=selected;
+    document.documentElement.classList.toggle("dark",dark);
+    document.documentElement.style.colorScheme=dark?"dark":"light";
+    document.querySelectorAll("button[data-theme-choice]").forEach(function(button){button.setAttribute("aria-pressed",String(button.dataset.themeChoice===selected));});
+  }
+  apply(selected);
+  document.addEventListener("DOMContentLoaded",function(){
+    apply(selected);
+    document.querySelectorAll("button[data-theme-choice]").forEach(function(button){button.addEventListener("click",function(){
+      apply(button.dataset.themeChoice);
+      try {if(selected==="system") localStorage.removeItem(key); else localStorage.setItem(key,selected);} catch (_) {}
+    });});
+  });
+  media.addEventListener("change",function(){if(selected==="system")apply(selected);});
+  window.addEventListener("storage",function(event){if(event.key===key)apply(event.newValue||"system");});
+})();
+</script>

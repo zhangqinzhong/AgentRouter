@@ -245,11 +245,37 @@ ai-memory setup
 missing or mismatched checksum and any archive entry that is absolute or holds
 `..`, unpacks the release to `%LOCALAPPDATA%\Programs\ai-memory` and adds that
 directory to your user `PATH` (set `AI_MEMORY_NO_MODIFY_PATH=1` to skip that).
+The destination must not exist, even as an empty directory or a link. Remove
+it if it is empty or left over from a failed install, or use
+`ai-memory upgrade` for an existing installation. Failed copy/publication
+attempts leave the destination alone and report their staging directory for
+inspection; see the [native installer details](install.md#one-step-native-install-installsh--ai-memory-setup).
 `ai-memory setup` then initialises the data dir (`%LOCALAPPDATA%\ai-memory`),
 registers the server to start at logon (see
 [Scenario E](#scenario-e-keep-the-server-running-native-windows-service)),
 wires the agents it finds, and checks the result. Inside WSL2 the Linux
 `install.sh` and `setup` path works unchanged.
+
+### With Scoop
+
+Releases from 3.4.0 on are also published to the maintainer's
+[Scoop](https://scoop.sh) bucket:
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Scoop checks the zip against the release's published SHA-256, unpacks it to
+`<scoop>\apps\ai-memory\<version>` and points the
+`<scoop>\apps\ai-memory\current` junction at it. The `ai-memory` shim on
+`PATH` runs the binary through `current`. `ai-memory setup` records that
+`current` path in the logon entry, the hook commands and the MCP entries,
+never the version directory, so they keep working after
+`scoop update ai-memory` installs the next version and `scoop cleanup` deletes
+the old one. Update with `scoop update ai-memory`: `ai-memory upgrade` refuses
+a Scoop install, because the bucket owns the version.
 
 To do the same by hand:
 
@@ -283,7 +309,8 @@ $EnvKey.Dispose()
     --server-url "https://memory.example.com" --auth-token "<token>"
 ```
 
-Later updates for this install use the same command as Linux/macOS release
+Later updates for this install (not a Scoop one, which updates with
+`scoop update ai-memory`) use the same command as Linux/macOS release
 binaries. From a writable prefix (for example `%LOCALAPPDATA%\ai-memory`),
 run:
 
@@ -297,9 +324,13 @@ ai-memory upgrade --force
 That downloads `ai-memory-windows-x86_64.zip` + `.sha256`, verifies the
 checksum, replaces `ai-memory.exe` via rename-aside (Windows cannot overwrite
 a running image), refreshes a sibling `hooks/` tree when present, then
-re-stages hooks for agents already under the data-dir hooks tree. Keep the
-manual zip download above as a fallback if the install directory is not
-writable (for example under Program Files).
+re-stages hooks for agents already under the data-dir hooks tree. It also
+re-renders existing ai-memory-owned OpenCode, OpenCode 2, OMP, Pi, and OpenClaw
+TypeScript integrations from the newly installed binary's templates at their
+default or active-profile paths; absent and user-owned files are left untouched.
+Keep the manual zip download above as a
+fallback if the install directory is not writable (for example under Program
+Files).
 
 The zip mirrors the Linux release tarball, minus the Linux-only service
 assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +

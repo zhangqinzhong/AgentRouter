@@ -1,6 +1,6 @@
 # `evals/` — evaluation harnesses
 
-One Rust binary (`ai-memory-eval`) with three subcommands:
+One Rust binary (`ai-memory-eval`) with four subcommands:
 
 - **`ab`** — runs the EXACT consolidation prompt ai-memory uses in
   production against two LLM providers side by side, saves both
@@ -9,16 +9,74 @@ One Rust binary (`ai-memory-eval`) with three subcommands:
 - **`projection`** — the zero-LLM half of that scoring: which fixture
   facts the observation projection lets into the prompt at all. No
   provider, no network.
-- **`retrieval`** — the LongMemEval retrieval benchmark, driven end to
-  end through a real `ai-memory serve` subprocess. Published baselines
+- **`retrieval`** — LongMemEval and bundled coding-session retrieval checks,
+  driven through a real `ai-memory serve` subprocess. Published baselines
   live in `docs/benchmarks/`.
+- **`abstention`** — offline evidence-sufficiency signals and threshold sweeps
+  over versioned answerable, hard-negative, conflicting, partial, and
+  missing-channel fixtures, with optional structured LLM answerability.
 
 **This is not part of the shipped binary.** It's a workspace member
 purely so it shares deps + builds with the rest. `cargo build` from
 the repo root will compile it, but it's never bundled into the
 docker image. CI builds it and runs its unit tests
-(`cargo nextest run --workspace --all-targets`); the `ab`,
-`projection` and `retrieval` commands themselves never run there.
+(`cargo nextest run --workspace --all-targets`); the `ab`, `projection`,
+`retrieval`, and `abstention` commands themselves never run there.
+
+## `abstention` — evidence sufficiency
+
+The default run is deterministic, offline, and keyless:
+
+```bash
+cargo run -p ai-memory-eval -- abstention
+```
+
+It reads `evals/fixtures/abstention/v1.json`, validates the version, unique
+ids, evidence paths, finite score/belief ranges, and required support for
+answerable cases, then writes `report.json` and `report.md` under a timestamped
+`evals/runs/*-abstention/` directory. Each case records raw normalized lexical
+coverage, top-score margin/distribution, matching-term density, snippet size,
+and belief aggregation only where the fixture actually supplies belief.
+
+The report sweeps lexical-coverage thresholds from 0.0 through 1.0 and records
+coverage, false-supported rate (FSR), and false-abstention rate (FAR), including
+undefined denominators. It does not designate a calibrated threshold: the
+clean-room corpus is a regression probe, not a representative sample.
+`answerable` maps to supported and `unanswerable` to unsupported;
+`conflicting` and `partial` remain separate slices and are excluded from both
+binary error-rate denominators.
+
+The fixture complements rather than relabels LongMemEval. To add the pinned
+LongMemEval-S `*_abs` questions as unanswerable cases, first fetch that dataset
+through the retrieval command, then opt in without any network access:
+
+```bash
+cargo run -p ai-memory-eval -- retrieval --fetch --sample 1
+cargo run -p ai-memory-eval -- abstention --longmemeval-abs
+```
+
+Those cases use the evaluator's existing whole-session grep baseline, not the
+production server: each question receives at most the top 10 term-overlap
+sessions, with normalized overlap scores and each rendered session clipped to
+4,000 characters. This keeps optional QA inputs bounded and makes the signal's
+provenance explicit; it does not claim to measure production retrieval.
+
+Optional `--qa` uses the exact `--qa-*` provider/auth construction shared with
+the retrieval evaluator. Synthesis returns a structured `answerability` enum
+(`answerable`, `insufficient`, `conflicting`, or `partial`); the evaluator never
+detects abstention from answer wording. Missing credentials produce a reported
+skip and leave the offline signal report intact. The retrieval QA path also
+parses production's `answer: { text, citations }` object; empty validated
+citations are an abstention, while nonempty citations are answerable for this
+evaluation metadata. This is still identity evidence, not a claim-level
+support proof.
+
+When adding cases, keep them clean-room and synthetic. `target_evidence` must
+name supplied paths, answerable cases require a `gold_answer`, and channel-loss
+cases declare `channels.fts` / `channels.vector` explicitly. Do not tune a
+threshold and the fixture against each other, and do not fold conflicting or
+partial evidence into binary ground truth without changing the documented
+mapping and report schema.
 
 ## When to reach for this
 
@@ -281,9 +339,10 @@ haystacks). Nothing is mocked:
 3. the question runs through MCP `tools/call memory_query` with
    explicit workspace/project scoping;
 4. results are scored session-level: `hit@k` (any evidence session in
-   the top k — the "Recall@k" most systems publish) and `recall@k`
-   (fraction of evidence sessions found). The 30 abstention questions
-   are excluded and reported separately.
+   the top k), `recall@k` (fraction of evidence sessions found), and
+   `recall-all@k` (all evidence sessions found). Duplicate session hits
+   count once. The 30 abstention questions are excluded and reported
+   separately.
 
 The dataset (278 MB) is NOT committed; it downloads to
 `evals/datasets/` (gitignored) with a pinned sha256 that fails loudly
@@ -301,12 +360,112 @@ Output: a per-slice table on stdout plus
 provenance (commit, dataset sha, hardware, per-question scores).
 When publishing a baseline, copy the markdown into `docs/benchmarks/`.
 
+`--embeddings local` runs keep haystack document vectors in
+`evals/.cache/embeddings/` (gitignored) and reuse them on the next run, so a
+repeat run skips most of its embedding work; query embeddings stay live.
+`--no-embedding-cache` runs cold. See
+[Reuse haystack embeddings across runs](../docs/benchmarks/README.md#reuse-haystack-embeddings-across-runs-local-mode).
+
+### Bundled coding-session retrieval corpus
+
+`--dataset-variant coding-v1` selects four synthetic questions in
+`evals/fixtures/retrieval/coding-v1.json`. The file is committed and pinned by
+SHA-256, so a zero-LLM run needs neither a dataset download nor a provider.
+Use the existing server or grep engine and A/B reporting:
+
+```bash
+cargo build -p ai-memory-cli -p ai-memory-eval
+cargo run -p ai-memory-eval -- retrieval --dataset-variant coding-v1 \
+    --server-bin target/debug/ai-memory --candidate --concurrency 1
+cargo run -p ai-memory-eval -- retrieval --dataset-variant coding-v1 --engine grep
+```
+
+| Case | Expected evidence | Incorrect alternative |
+|---|---|---|
+| `coding-architecture` | The write-pool failure and the later actor/read-pool decision | Unrelated implementation sessions |
+| `coding-resolved-error` | The observed database error and the retry-path fix | Unrelated operational sessions |
+| `coding-correction` | The later 45-second timeout correction | The earlier 15-second proposal |
+| `coding-long-session` | The exact checksum header at the end of a 41-turn investigation | The unsuccessful initial header |
+
+Each question has twelve sessions, including distractors, and one or two
+expected evidence sessions. `answer_session_ids` drives the existing scorer;
+`has_answer` marks the relevant turns. `incorrect_session_ids` is corpus
+metadata checked by the fixture test, not an extra scoring rule. It partitions
+the remaining sessions and makes stale alternatives explicit for review.
+The gold answer is available to the optional QA mode, which still needs a
+separately configured provider.
+
+These checks measure evidence retrieval: hit@k, recall@k, recall-all@k,
+context-token estimates, and query latency. Retrieving the correction does not
+prove that an agent follows it, and a stale hit is not a measured answer error.
+The corpus does not exercise `as_of`, typed supersession, handoff claiming,
+actual harness switching, private/shared authorization, or concurrent writes.
+The existing integration suites cover those contracts. Every replay still uses
+the evaluator's Claude Code hook shape and one project per question.
+
+Run identical baseline/candidate settings to check accuracy and context-token
+parity; wall-clock latency can vary. Treat the four cases as regression probes,
+not representative quality estimates or numbers comparable to LongMemEval.
+If a fixture changes, update its pin and record the new corpus version beside
+any reported results. `--fetch` cannot download a missing bundled fixture;
+restore it from the repository instead.
+
+### coding-v1 baseline receipt (2026-10-25 UTC)
+
+Measured with debug evaluator and server binaries from
+`e5ac18d8a819a76990d079ee70329973dd1a2e55`, based on `release/3.3` at
+`e7e17555efb6a95596480249598ad517ff587310`. The change adds evaluation inputs;
+production code is unchanged. Both A/B sides used that same source and
+configuration. The published source commit
+`7e9ea65b15215d50cb1593956fb57e45954d5347` has the same Git tree
+(`5b896e1bbe3550341f25f64529656b919ee16970`) as that locally built commit.
+This is a repeatability baseline, not a measured improvement.
+
+- Corpus SHA-256: `af3382663a3e4e969c8bcfa744b3a794de86cb5932393a88bea16f014193d467`.
+- Server binary SHA-256: `2f501060445ff2bae166117b8143622c9f3bee606a8aa4ce34911ba7c827f84a`.
+- Evaluator binary SHA-256: `498ee8917655b71438111afc30936a97bb213f8c722fb8dd5635efd16dfed29f`.
+- Rust `1.95.0 (59807616e 2026-04-14)`; Linux `6.18.55`, x86_64;
+  AMD EPYC 9V74, eight available threads.
+- Three A/B trials, four questions and 48 sessions per side, concurrency one.
+  Default hook ingestion and per-turn dates; embeddings and reranker off;
+  no LLM provider or QA calls.
+
+| Metric | Baseline | Identical candidate | Delta |
+|---|---:|---:|---:|
+| hit@1 / hit@5 / hit@10 | 1.000 | 1.000 | 0.000 |
+| recall@1 | 0.750 | 0.750 | 0.000 |
+| recall-all@1 | 0.500 | 0.500 | 0.000 |
+| recall@5 / recall@10 | 1.000 | 1.000 | 0.000 |
+| recall-all@5 / recall-all@10 | 1.000 | 1.000 | 0.000 |
+| Estimated context tokens, mean | 225.0 | 225.0 | 0.0 |
+
+Every question's retrieval scores and context estimate matched across all six
+runs. Context tokens use the existing Unicode-character-count divided by four
+estimator over returned titles and snippets; no provider token count was taken.
+
+| Trial | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+|---|---:|---:|
+| 1 | 8 / 8 | 7 / 8 |
+| 2 | 10 / 11 | 8 / 25 |
+| 3 | 7 / 9 | 8 / 12 |
+
+Latency covers the MCP round trip. Each percentile uses only four questions,
+and unrelated compilation ran on the same host, so these timings are descriptive
+and do not establish a performance difference. A separate offline grep run on
+the same fixture found the same retrieval scores. Its zero latency/context
+fields are evaluator placeholders and are not server measurements.
+
+Reproduce with the `coding-v1 --candidate --concurrency 1` command above, three
+times. The ignored `coding_corpus_replays_offline_with_identical_ab_results`
+smoke test also asserts full evidence recall@10 and identical A/B scores/context;
+it needs a server binary at `target/release/ai-memory`.
+
 ### The triple: accuracy + latency + context-tokens
 
 Every run — single-config or A/B — reports three things per slice, not
 just accuracy:
 
-- **accuracy** — `hit@k` / `recall@k` (unchanged);
+- **accuracy** — `hit@k` / `recall@k` / `recall-all@k`;
 - **latency** — `memory_query` MCP round-trip **p50 / p95** in ms;
 - **context tokens** — the context an agent would ingest from the result,
   estimated as **chars / 4** over each returned hit's `title` + `snippet`
@@ -346,6 +505,43 @@ Output: `evals/runs/<timestamp>-retrieval/report.{json,md}` — the JSON is
 `{ baseline, candidate, delta }`; the markdown carries both per-slice
 triples and an `overall` delta table. Publish full-dataset A/B numbers in
 `docs/benchmarks/retrieval-ab-r2.md`.
+
+### `retrieval-compare` — two saved runs, question by question
+
+An A/B run compares two configs of one build in one process. A release
+comparison pairs runs of two builds made on different days, and its slice
+averages say how much moved, not which questions moved or how.
+`retrieval-compare` reads the `report.json` of two single-config runs (the
+run directory or the file), pairs questions by id, and prints:
+
+- hit@k and recall@k over the questions both runs scored, with the
+  questions gained and lost at each k;
+- every question whose first hit moved: the cutoffs it crossed, its recall
+  at the largest k and its latency on each side, widest moves and losses
+  first;
+- per question type, how many moved earlier and how many later.
+
+```bash
+cargo run --release -p ai-memory-eval -- retrieval-compare \
+    --baseline evals/runs/<previous release local run> \
+    --candidate evals/runs/<release candidate local run> \
+    --fts evals/runs/<release candidate FTS run>
+```
+
+Moves of one cutoff in both directions, spread across types, are what
+questions near a cutoff trading places look like. Moves that skip cutoffs,
+all go one way, or cluster in one type point at a ranking change (#1854).
+`--fts` takes the candidate build's FTS run and marks moved questions whose
+candidate row equals the FTS row in every hit, recall, retrieved-session
+and context-token value. With a latency at or above the 250 ms query
+embedding wait, that is a local query that ran without its vector. An A/B
+`report.json` is refused; compare the single-config runs instead.
+
+Strict `recall-all@k` scores each question as 1 only when every evidence
+session appears in the top k distinct retrieved sessions, otherwise 0.
+Slice scores average those per-question values. Finding one of two required
+sessions gives `hit@k = 1`, `recall@k = 0.5`, and `recall-all@k = 0`.
+JSON reports use `recall_all_at` for per-question, slice and A/B delta values.
 
 ### `retrieval` QA-accuracy mode (R2b, opt-in, live LLM)
 

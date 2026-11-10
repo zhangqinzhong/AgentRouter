@@ -231,8 +231,13 @@ export async function sessionWorkspace(
       index: path.join(resolveRuntimeConfigDir(), "sessions", "index.sqlite"),
     };
   if (q.op === "collection-refresh") return await queryLocalCollector("/functions/tokentracker-local-sync", { sessions: "1" }) as Record<string, any>;
-  if (["location-add", "location-remove", "location-state"].includes(q.op) && typeof q.path === "string") {
+  if (["location-add", "location-remove", "location-state", "location-label"].includes(q.op) && typeof q.path === "string") {
     q.path = q.path === "~" ? resolveRuntimeAppPath("home") : /^~[/\\]/.test(q.path) ? path.join(resolveRuntimeAppPath("home"), q.path.slice(2)) : q.path;
+  }
+  if (q.op === "location-label") {
+    const settings = await invoke({op:"settings"}, 60_000);
+    if (!Array.isArray(settings.locations) || !settings.locations.some((row: string[]) => row[0] === q.agent && row[1] === q.path)) throw new Error("Unknown collection directory");
+    return await queryLocalCollector("/functions/tokentracker-instance-names", {source:q.agent === "claude-code" ? "claude" : String(q.agent),path:String(q.path),name:String(q.name || "")}) as Record<string, any>;
   }
   if (q.op === "status") return { scanning, scannedAt, error: scanError };
   if (!allowed.has(q.op)) throw new Error("Unknown session operation");
@@ -241,6 +246,8 @@ export async function sessionWorkspace(
     if (!remoteStarted) syncRemotes();
   }
   const result = await invoke(q, q.op === "remote-sync" ? 300_000 : 60_000);
+  if (q.op === "location-add" && typeof q.name === "string" && q.name.trim()) await queryLocalCollector("/functions/tokentracker-instance-names", {source:q.agent === "claude-code" ? "claude" : String(q.agent),path:String(q.path),name:q.name});
+  if (q.op === "settings") result.instances = (await queryLocalCollector("/functions/tokentracker-instance-names") as {instances:unknown[]}).instances;
   if (
     [
       "location-add",

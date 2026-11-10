@@ -286,14 +286,22 @@ export function handoff(value: unknown, where: string): Handoff {
 export function message(value: unknown, where: string): Message {
   const o = record(value, where);
   const subject = nullableStr(o, "subject", where);
+  const evidence = nullableStr(o, "evidence", where);
+  const nature = optStr(o, "nature", where) ?? "unknown";
+  if (!["unknown", "measured", "reported", "inferred"].includes(nature)) {
+    throw new ProtocolError(`${where}.nature must be a supported message nature`);
+  }
   return {
     id: str(o, "id", where),
     subject: subject === null ? null : untrusted(subject),
     body: untrusted(str(o, "body", where)),
+    nature: nature as Message["nature"],
+    evidence: evidence === null ? null : untrusted(evidence),
     state: str(o, "state", where),
     createdAt: optStr(o, "created_at", where),
     claimedAt: nullableStr(o, "claimed_at", where),
     fromAgent: optStr(o, "from_agent", where),
+    toAgent: nullableStr(o, "to_agent", where),
     fromOwner: nullableStr(o, "from_owner_user", where),
     raw: o,
   };

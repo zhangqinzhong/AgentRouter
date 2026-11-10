@@ -6,8 +6,14 @@
  * @module
  */
 
-import { probeTools, requireFeature, type ToolIndex } from "./capabilities.js";
-import { ArgumentError, ProtocolError, ToolError } from "./errors.js";
+import {
+  initialize,
+  probeTools,
+  requireFeature,
+  type SessionInfo,
+  type ToolIndex,
+} from "./capabilities.js";
+import { AbortError, ArgumentError, ConfigError, ProtocolError, TimeoutError, ToolError } from "./errors.js";
 import { resolveScope, type Scope } from "./scope.js";
 import type { CallOptions, Transport } from "./transport.js";
 
@@ -37,6 +43,55 @@ export function argsObject<T extends object>(value: T | undefined, where: string
   return value;
 }
 
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** Wait for client-owned initialization without lending it a caller's cancellation. */
+function waitForShared<T>(shared: Promise<T>, options?: CallOptions): Promise<T> {
+  const signal = options?.signal;
+  if (signal?.aborted === true) {
+    return Promise.reject(new AbortError("aborted by the caller while waiting for initialization", false));
+  }
+  const timeoutMs = options?.timeoutMs;
+  if (
+    timeoutMs !== undefined &&
+    (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS)
+  ) {
+    return Promise.reject(
+      new ConfigError(`timeoutMs must be an integer between 1 and ${MAX_TIMEOUT_MS}`),
+    );
+  }
+  if (signal === undefined && timeoutMs === undefined) return shared;
+
+  return new Promise<T>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", aborted);
+    };
+    const aborted = (): void => {
+      cleanup();
+      reject(new AbortError("aborted by the caller while waiting for initialization", false));
+    };
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new TimeoutError(`initialization got no response within ${timeoutMs} ms`, false));
+      }, timeoutMs);
+    }
+    shared.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 /** The first `{ type: "text", text }` item of a tool result's content. */
 function firstText(content: unknown): string | undefined {
   if (!Array.isArray(content)) return undefined;
@@ -52,6 +107,7 @@ function firstText(content: unknown): string | undefined {
 export class Core {
   readonly transport: Transport;
   readonly defaultScope: Scope | undefined;
+  #session: Promise<SessionInfo> | undefined;
   #index: Promise<ToolIndex> | undefined;
 
   constructor(transport: Transport, defaultScope: Scope | undefined) {
@@ -64,21 +120,46 @@ export class Core {
     return resolveScope(callScope, this.defaultScope, where);
   }
 
+  /** The handshake is needed even by calls that skip schema checks. */
+  #initialize(options?: CallOptions): Promise<SessionInfo> {
+    if (options?.signal?.aborted === true) {
+      return Promise.reject(new AbortError("aborted by the caller before initialization", false));
+    }
+    if (this.#session === undefined) {
+      const session = initialize(this.transport);
+      this.#session = session;
+      session.catch(() => {
+        if (this.#session === session) this.#session = undefined;
+      });
+    }
+    return waitForShared(this.#session, options);
+  }
+
   /** `initialize` + `tools/list`, probed once per client and cached. */
   toolIndex(options?: CallOptions): Promise<ToolIndex> {
+    if (options?.signal?.aborted === true) {
+      return Promise.reject(new AbortError("aborted by the caller before initialization", false));
+    }
     if (this.#index === undefined) {
-      const probe = probeTools(this.transport, options);
+      const session = this.#initialize();
+      const probe = session.then((info) => probeTools(this.transport, info));
       this.#index = probe;
       // A failed probe is not cached: the next call probes again.
       probe.catch(() => {
-        if (this.#index === probe) this.#index = undefined;
+        if (this.#index === probe) {
+          this.#index = undefined;
+          // A raw caller may already have started a new handshake after the
+          // old one failed; this probe must not discard that pending retry.
+          if (this.#session === session) this.#session = undefined;
+        }
       });
     }
-    return this.#index;
+    return waitForShared(this.#index, options);
   }
 
-  /** Drop the cached tool index. */
+  /** Drop the handshake and tool index so refresh opens a new session. */
   forgetToolIndex(): void {
+    this.#session = undefined;
     this.#index = undefined;
   }
 
@@ -104,6 +185,7 @@ export class Core {
     mutating: boolean,
     options?: CallOptions,
   ): Promise<unknown> {
+    await this.#initialize(options);
     const result = await this.transport.rpc(
       "tools/call",
       { name: tool, arguments: args },

@@ -50,6 +50,8 @@ fn the_harness_scores_a_tiny_sample_end_to_end() {
     assert_eq!(report["questions_scored"], 2);
     assert_eq!(report["mode"], "zero-llm");
     assert!(report["slices"]["overall"]["hit_at"]["5"].is_number());
+    assert!(report["slices"]["overall"]["recall_all_at"]["5"].is_number());
+    assert!(report["per_question"][0]["recall_all_at"]["5"].is_number());
     // The R2 triple lands next to accuracy.
     assert!(report["slices"]["overall"]["latency_p50_ms"].is_number());
     assert!(report["slices"]["overall"]["context_tokens_mean"].is_number());
@@ -117,8 +119,61 @@ fn the_ab_path_reports_a_zero_delta_for_identical_configs() {
     for k in ["1", "3", "5", "10"] {
         assert_eq!(delta["hit_at"][k], 0.0, "hit@{k} delta");
         assert_eq!(delta["recall_at"][k], 0.0, "recall@{k} delta");
+        assert_eq!(delta["recall_all_at"][k], 0.0, "recall-all@{k} delta");
     }
     assert_eq!(delta["context_tokens_mean"], 0.0);
     assert_eq!(delta["context_tokens_median"], 0.0);
     assert!(run_dir.join("report.md").exists());
+}
+
+/// The bundled corpus exercises the same server and scorer without downloading
+/// LongMemEval. Identical configurations must agree on evidence and context.
+#[test]
+#[ignore = "needs the release server binary; uses the bundled offline corpus"]
+fn coding_corpus_replays_offline_with_identical_ab_results() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let server_bin = repo_root.join("target/release/ai-memory");
+    assert!(server_bin.exists(), "build the release server first");
+    let out = tempfile::tempdir().unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_ai-memory-eval"))
+        .current_dir(&repo_root)
+        .args([
+            "retrieval",
+            "--dataset-variant",
+            "coding-v1",
+            "--candidate",
+            "--concurrency",
+            "1",
+        ])
+        .arg("--server-bin")
+        .arg(&server_bin)
+        .arg("--out")
+        .arg(out.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let run_dir = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["baseline"]["dataset"], "coding_v1");
+    for question in report["baseline"]["per_question"].as_array().unwrap() {
+        assert_eq!(
+            question["recall_at"]["10"], 1.0,
+            "missing expected evidence: {}",
+            question["question_id"]
+        );
+    }
+    assert_eq!(report["baseline"]["questions_scored"], 4);
+    assert_eq!(report["candidate"]["questions_scored"], 4);
+    for metric in ["hit_at", "recall_at", "recall_all_at"] {
+        for k in ["1", "3", "5", "10"] {
+            assert_eq!(report["delta"][metric][k], 0.0, "{metric}@{k}");
+        }
+    }
+    assert_eq!(report["delta"]["context_tokens_mean"], 0.0);
+    assert_eq!(report["delta"]["context_tokens_median"], 0.0);
 }

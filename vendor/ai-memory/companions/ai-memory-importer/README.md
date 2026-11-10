@@ -55,7 +55,9 @@ Two routes read what agentmemory exports. Both write through the MCP
 `memory_write_page` tool with explicit `workspace` and `project`, every write
 conditional: `create_only` for a page's first version and `expected_page_id`
 for each later one. They refuse a server older than ai-memory 3.0, which would
-ignore those arguments. Pages land under `--dest-prefix` (default
+ignore those arguments. The client performs the MCP initialization handshake,
+so these routes work with both the default stateless transport and
+`serve --http-stateful`. Pages land under `--dest-prefix` (default
 `imported/agentmemory`), never under ai-memory's own `sessions/` or any other
 reserved family.
 
@@ -122,6 +124,53 @@ export page whose `pagination.hasMore` is true needs `--allow-partial`.
 Claude memory graph and Qdrant imports remain roadmap items; there are no code
 stubs for them.
 
+### claude-mem SQLite
+
+`claude-mem --mapping <mapping.json>` reads claude-mem's local SQLite database
+(`~/.claude-mem/claude-mem.db`, or `--database <path>`). It imports only the
+model-produced observations and session summaries. Raw tool calls and event
+payloads are never read. Observation types `sensitive` and `security_alert`
+are skipped and counted without copying their bodies into the manifest;
+`security_note` is retained as an ai-memory `gotcha`.
+
+The mapping format follows `agentmemory-export`: `projects` maps claude-mem's
+project key, `cwds` can override it for schema generations that record
+`sdk_sessions.cwd`, and `unscoped` is the optional fallback. A target contains
+`workspace` and exactly one of `project` or stable `project_id`; the id form
+selects an existing project without creating a same-name twin. Observation
+pages land at `imported/claude-mem/<type>/<id>.md`; summaries use
+`imported/claude-mem/session-summary/<id>.md`. The closed type set is
+`decision`, `gotcha`, `security_note`, `feature`, `bugfix`, `change`,
+`refactor`, and `discovery`. Unknown types are skipped and counted without
+reading their bodies. `security_note` retains that source path and maps to the
+`gotcha` kind; the five change/discovery types map to `fact` while retaining
+their source type in the path. claude-mem stores an observation's facts and
+file lists, and a summary's file lists, as JSON arrays; each becomes a bullet
+list, file paths in code spans, and an empty list adds no section. A value
+that is not such an array is kept as written.
+
+The importer opens the source read-only and uses SQLite's backup API to take a
+WAL-consistent private snapshot before inspection. It refuses a symlink or a
+source whose identity changes during the snapshot. Live databases are
+recognized from `schema_versions` and their actual `PRAGMA table_info`
+columns: the legacy text and structured observation families are supported,
+as are both the pre-v17 `sdk_session_id` and current `memory_session_id`
+relationships. Mixed or incomplete layouts fail closed with a schema
+diagnostic. A
+source is capped at 2 GiB, each source text field at 1 MiB, and each supported
+table at 100,000 rows. SQLite cells are capped at 8 MiB before allocation,
+each final page stays within the 64,000-character exact-read ceiling, and all
+planned page bodies together are capped at 512 MiB.
+
+```bash
+# Plan only; add --show-body for review.
+ai-memory-importer claude-mem --mapping mapping.json
+
+# Apply with a durable resume/conflict manifest.
+ai-memory-importer claude-mem --mapping mapping.json \
+  --apply --manifest-out claude-mem-import.json
+```
+
 ### Local documents
 
 `document --file <path>` extracts one explicitly selected local document into
@@ -135,7 +184,10 @@ The page records the source file's basename, format, SHA-256 digest, and
 extractor version, followed by sanitized text. Its path includes the full
 source digest, and its last line carries a deterministic provenance marker.
 A rerun therefore performs no duplicate write. If another page already owns
-that path, the import refuses to replace it.
+that path, the import refuses to replace it. The rerun compares the whole
+stored page, read through `memory_read_page`, which returns at most 64,000
+characters of a body; a page longer than that cannot be compared, so its
+rerun fails with that reason instead of being reported as present.
 
 This is text extraction, not a media pipeline. Image-only PDFs need OCR before
 import. Images, raw audio/video, and proprietary media transcription are not
@@ -145,9 +197,18 @@ by formatting may still be extracted; deleted revisions and field instructions
 are excluded. Review `--show-body` before every live import of a document whose
 visibility rules matter.
 
+DOCX and PPTX extraction preserves explicit run-level line breaks, including
+DOCX carriage returns and formatted PPTX breaks, and DOCX tabs. Paired XML
+start/end tags and self-closing tags produce the same separators.
+Paragraph tab-stop definitions are formatting and do not insert text.
+
+XLSX extraction reads the base cell text and omits pronunciation annotations.
+
 VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
 between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep
-their cue text.
+their cue text. WebVTT character references such as `&amp;` and `&#233;` are
+decoded once before sanitization. Escaped tags remain literal text, and SRT
+character references retain their original spelling.
 
 ## Safety contract
 
@@ -204,8 +265,9 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
 `--manifest-out`, auth and path rules, with these differences:
 
 - Writes use MCP `memory_write_page` only, each conditional, so the server
-  refuses a page that appears or changes during the import. A destination page this import did not write is never
-  replaced; the run stops and names it.
+  refuses a page that appears or changes after the version read. A resume
+  accepts an existing page only when its complete body matches a planned
+  version; a different body stops the run and names the page.
 - `--dest-prefix` must be relative and portable. `..`, absolute paths, a
   Windows drive, and a first segment that is reserved (`sessions`,
   `session-logs`, `procedures`, `decisions`, `gotchas`, `profile`) or starts
@@ -218,12 +280,31 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
   the manifest or any request exists. Record ids that look like credentials
   are refused.
 - Each record has a stable ingest key, a UUIDv5 of its agentmemory id, written
-  on the page's last line. A rerun finds the key in the page the server
-  already holds and skips it, so an interrupted import resumes without
-  duplicates and a finished one writes nothing. The manifest records each
-  version as `written`, `present` (already there) or `failed`.
+  on the page's last line. A rerun compares the entire sanitized planned body,
+  including that line, with the page the server already holds before skipping
+  it. `memory_read_page` returns at most 64,000 characters of a body, so a
+  longer page cannot be compared and stops the run with that reason. Editing the body while keeping its attribution footer therefore cannot
+  authorize a later imported version to replace the edit. Server-side
+  sanitation that changes the body also stops automatic resumption. This
+  comparison covers the body, not frontmatter-only edits; a later imported
+  version still applies its planned metadata. An identical interrupted import
+  resumes without duplicates and a finished one writes nothing. The manifest
+  records each version as `written`, `present` (already there) or `failed`.
 - Without `--create-destination`, every destination must already exist; the
   check is a read, which never creates a scope.
+
+The claude-mem route submits bounded atomic page batches. A failed precondition
+or rejected page changes none of that batch; successful batches create one
+wiki checkpoint rather than one per page. It therefore requires a server that
+advertises `memory_write_pages_batch`; the older agentmemory routes retain
+their ai-memory 3.0 compatibility. The claude-mem manifest contains source
+ids, destinations, counts, and hashes, but never imported bodies or skipped
+sensitive/security bodies. Each imported page carries a deterministic
+source-row key, while resume authority still requires an exact full-body
+match; retaining the footer on an edited page does not permit overwrite. The
+one other body a rerun accepts is the exact body the 3.4.0 importer planned for
+the same row, with the lists copied as text: the rerun writes the current
+layout over it, and the old version stays in the page's history.
 
 The document route adds these boundaries:
 

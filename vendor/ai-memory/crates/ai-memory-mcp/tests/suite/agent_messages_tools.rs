@@ -44,7 +44,7 @@ fn mount(server: AiMemoryServer) -> Router {
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     Router::new().nest_service("/mcp", service)
@@ -115,6 +115,29 @@ async fn call(router: &Router, name: &str, arguments: Value) -> Value {
     serde_json::from_str(&joined).unwrap_or_else(|e| panic!("tool text not JSON: {joined}: {e}"))
 }
 
+/// Drive a real call without unwrapping a JSON-RPC error.
+async fn call_rpc(router: &Router, name: &str, arguments: Value) -> Value {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments },
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(body.to_string()))
+        .expect("mcp req");
+    let resp = router.clone().oneshot(req).await.expect("oneshot");
+    let bytes = axum::body::to_bytes(resp.into_body(), 4_000_000)
+        .await
+        .expect("body");
+    serde_json::from_slice(&bytes).expect("JSON-RPC response")
+}
+
 /// `memory_message_send` from `project-a` to `project-b`, returning the new id.
 async fn send(router: &Router, subject: &str, body: &str) -> String {
     let sent = call(
@@ -134,6 +157,48 @@ async fn send(router: &Router, subject: &str, body: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("send returned no message_id: {sent}"))
         .to_string()
+}
+
+#[tokio::test]
+async fn measured_send_requires_evidence_but_inferred_does_not() {
+    let h = harness().await;
+    let refused = call_rpc(
+        &h.router,
+        "memory_message_send",
+        json!({
+            "from_workspace": WS,
+            "from_project": A,
+            "to_workspace": WS,
+            "to_project": B,
+            "body": "the benchmark improved",
+            "nature": "measured",
+            "evidence": "   ",
+        }),
+    )
+    .await;
+    assert!(
+        refused.to_string().contains("evidence_required"),
+        "{refused}"
+    );
+    assert!(list(&h.router, B, "inbox").await.is_empty());
+
+    call(
+        &h.router,
+        "memory_message_send",
+        json!({
+            "from_workspace": WS,
+            "from_project": A,
+            "to_workspace": WS,
+            "to_project": B,
+            "body": "the lock probably expired",
+            "nature": "inferred",
+        }),
+    )
+    .await;
+    let inbox = list(&h.router, B, "inbox").await;
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0]["nature"], "inferred");
+    assert_eq!(inbox[0]["evidence"], Value::Null);
 }
 
 /// The messages array from a `memory_message_list` for `workspace/project`.

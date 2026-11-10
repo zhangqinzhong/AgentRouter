@@ -1,8 +1,9 @@
 # Behavioral evidence for the PowerShell bundle's offline spool: the
 # entry writer's on-disk contract (file name, SpoolEntry fields, no BOM,
 # token handling) and a refused-connection drain pass that keeps the
-# backlog. Pure functions plus a connection-refused loopback POST — no
-# live server. Invoked by tests/hooks/test_lib.sh when pwsh is available;
+# backlog, plus a stubbed mixed queue proving native OIDC entries stay queued.
+# Pure functions plus a connection-refused loopback POST — no live server.
+# Invoked by tests/hooks/test_lib.sh when pwsh is available;
 # exits non-zero on any failed assertion.
 
 param([Parameter(Mandatory = $true)] [string] $PsLib)
@@ -64,6 +65,170 @@ Assert-True ($kept.Count -eq 2) "refused connection keeps the backlog"
 Remove-Item -Recurse -Force (Join-Path $root "data")
 Invoke-AiMemoryDrainSpool -Max 8
 
+# 7. Native OIDC entries require auth.json resolution. Even a server accepting
+#    an anonymous request must not receive them from the script drain; eligible
+#    entries behind them still deliver. A body mentioning auth_mode is data.
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$oidcPath = Join-Path $dir "0000000000000-1-0000000000000000.json"
+$oidcJson = [ordered]@{
+    url = "http://127.0.0.1:49374/hook?event=oidc"
+    body = '{"e":"native-oidc"}'
+    created_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    auth_mode = "oidc"
+    attempts = 0
+} | ConvertTo-Json -Compress
+[IO.File]::WriteAllText($oidcPath, $oidcJson, [Text.UTF8Encoding]::new($false))
+$env:AI_MEMORY_AUTH_TOKEN = "probe-bearer"
+Write-AiMemorySpoolEvent -Url "http://127.0.0.1:49374/hook?event=static" -Body '{"auth_mode":"oidc"}'
+Remove-Item Env:\AI_MEMORY_AUTH_TOKEN -ErrorAction SilentlyContinue
+Write-AiMemorySpoolEvent -Url "http://127.0.0.1:49374/hook?event=none" -Body '{"auth_mode":"oidc"}'
+$legacyJson = [ordered]@{
+    url = "http://127.0.0.1:49374/hook?event=legacy"
+    body = '{"auth_mode":"oidc"}'
+    created_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    attempts = 0
+} | ConvertTo-Json -Compress
+[IO.File]::WriteAllText((Join-Path $dir "9999999999999-1-0000000000000000.json"), $legacyJson, [Text.UTF8Encoding]::new($false))
+$script:OidcRequests = [Collections.Generic.List[object]]::new()
+function Invoke-WebRequest {
+    param([switch] $UseBasicParsing, [switch] $NoProxy, [int] $TimeoutSec,
+        [int] $MaximumRedirection, [string] $Method, [string] $Uri, $Headers,
+        [string] $ContentType, $Body)
+    $script:OidcRequests.Add([pscustomobject]@{ Url = $Uri; Authorization = $Headers["Authorization"] })
+}
+Invoke-AiMemoryDrainSpool -Max 8
+Assert-True ((Test-Path $oidcPath) -and [IO.File]::ReadAllText($oidcPath) -ceq $oidcJson) "OIDC entry stays untouched"
+Assert-True (@($script:OidcRequests | Where-Object { $_.Url -match 'event=oidc$' }).Count -eq 0) "OIDC entry is never posted"
+Assert-True (@($script:OidcRequests | Where-Object { $_.Url -match 'event=static$' -and $_.Authorization -ceq 'Bearer probe-bearer' }).Count -eq 1) "static control delivers with its bearer"
+foreach ($control in @("none", "legacy")) {
+    Assert-True (@($script:OidcRequests | Where-Object { $_.Url -match "event=$control`$" -and -not $_.Authorization }).Count -eq 1) "$control control delivers without a bearer"
+}
+Assert-True ($script:OidcRequests.Count -eq 3) "only eligible entries are posted"
+$kept = @(Get-ChildItem -LiteralPath $dir -Filter "*.json" -File)
+Assert-True ($kept.Count -eq 1 -and $kept[0].FullName -eq $oidcPath) "only the OIDC entry stays queued"
+
+# 8. Every request splats MaximumRedirection 0, matching the native hook.
+$splat = Get-AiMemoryNoProxy
+Assert-True ($splat.ContainsKey('MaximumRedirection') -and $splat.MaximumRedirection -eq 0) "splat refuses redirects"
+Assert-True ((Get-AiMemoryResponseStatus $null) -eq 200) "null response defaults to 200"
+Assert-True ((Get-AiMemoryResponseStatus ([pscustomobject]@{ Content = 'x' })) -eq 200) "missing StatusCode defaults to 200"
+Assert-True ((Get-AiMemoryResponseStatus ([pscustomobject]@{ StatusCode = 302 })) -eq 302) "302 is classified"
+Assert-True ((Get-AiMemoryResponseStatus ([pscustomobject]@{ StatusCode = 202 })) -eq 202) "202 is classified"
+
+# 9. A 307 from the drain must not contact the Location origin and must keep
+# the spooled event (the native hook_capture bite: the redirect target
+# receives nothing). Remove the IWR mock so this pass hits the real cmdlet.
+Remove-Item -Force -ErrorAction SilentlyContinue function:\Invoke-WebRequest
+Remove-Item -Recurse -Force (Join-Path $root "data") -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path (Get-AiMemorySpoolDir) | Out-Null
+
+$target = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$source = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$target.Start()
+$source.Start()
+$targetPort = ([System.Net.IPEndPoint]$target.LocalEndpoint).Port
+$sourcePort = ([System.Net.IPEndPoint]$source.LocalEndpoint).Port
+$targetUrl = "http://127.0.0.1:$targetPort/login"
+$contacted = [System.Threading.ManualResetEventSlim]::new($false)
+$targetRs = [runspacefactory]::CreateRunspace()
+$sourceRs = [runspacefactory]::CreateRunspace()
+$targetRs.Open()
+$sourceRs.Open()
+$targetPs = [powershell]::Create()
+$sourcePs = [powershell]::Create()
+$targetPs.Runspace = $targetRs
+$sourcePs.Runspace = $sourceRs
+[void]$targetPs.AddScript({
+    param($Listener, $Flag)
+    try {
+        $client = $Listener.AcceptTcpClient()
+        $Flag.Set()
+        $stream = $client.GetStream()
+        $buf = New-Object byte[] 1024
+        $null = $stream.Read($buf, 0, $buf.Length)
+        $resp = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Length: 5`r`nConnection: close`r`n`r`nlogin")
+        $stream.Write($resp, 0, $resp.Length)
+        $stream.Close()
+        $client.Close()
+    } catch {
+    }
+}).AddArgument($target).AddArgument($contacted)
+[void]$sourcePs.AddScript({
+    param($Listener, $Location)
+    try {
+        $client = $Listener.AcceptTcpClient()
+        $stream = $client.GetStream()
+        $buf = New-Object byte[] 8192
+        $null = $stream.Read($buf, 0, $buf.Length)
+        $resp = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 307 Temporary Redirect`r`nLocation: $Location`r`nContent-Length: 0`r`nConnection: close`r`n`r`n")
+        $stream.Write($resp, 0, $resp.Length)
+        $stream.Close()
+        $client.Close()
+    } catch {
+    }
+}).AddArgument($source).AddArgument($targetUrl)
+$targetHandle = $targetPs.BeginInvoke()
+$sourceHandle = $sourcePs.BeginInvoke()
+try {
+    Write-AiMemorySpoolEvent -Url "http://127.0.0.1:$sourcePort/hook?event=stop&agent=codex" -Body '{"e":"redirect"}'
+    Invoke-AiMemoryDrainSpool -Max 8
+    Assert-True (-not $contacted.Wait(200)) "drain redirect target is not contacted"
+    $kept = @(Get-ChildItem -LiteralPath (Get-AiMemorySpoolDir) -Filter "*.json" -File)
+    Assert-True ($kept.Count -eq 1) "307 keeps the spool entry"
+
+    # The same splat on GET must not follow a 302 to the login origin.
+    $getSource = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $getSource.Start()
+    $getPort = ([System.Net.IPEndPoint]$getSource.LocalEndpoint).Port
+    $getRs = [runspacefactory]::CreateRunspace()
+    $getRs.Open()
+    $getPs = [powershell]::Create()
+    $getPs.Runspace = $getRs
+    [void]$getPs.AddScript({
+        param($Listener, $Location)
+        try {
+            $client = $Listener.AcceptTcpClient()
+            $stream = $client.GetStream()
+            $buf = New-Object byte[] 8192
+            $null = $stream.Read($buf, 0, $buf.Length)
+            $resp = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 302 Found`r`nLocation: $Location`r`nContent-Length: 10`r`nConnection: close`r`n`r`nLOGIN-HTML")
+            $stream.Write($resp, 0, $resp.Length)
+            $stream.Close()
+            $client.Close()
+        } catch {
+        }
+    }).AddArgument($getSource).AddArgument($targetUrl)
+    $getHandle = $getPs.BeginInvoke()
+    $injected = $null
+    try {
+        $NoProxy = Get-AiMemoryNoProxy
+        try {
+            $Response = Invoke-WebRequest @NoProxy -UseBasicParsing -TimeoutSec 2 -Uri "http://127.0.0.1:$getPort/handoff"
+            if ((Get-AiMemoryResponseStatus $Response) -ge 200 -and (Get-AiMemoryResponseStatus $Response) -lt 300) {
+                $injected = [string]$Response.Content
+            }
+        } catch {
+        }
+        Assert-True (-not $contacted.Wait(200)) "GET redirect target is not contacted"
+        Assert-True ($null -eq $injected) "302 body is not injected"
+    } finally {
+        try { $getSource.Stop() } catch { }
+        try { $getPs.EndInvoke($getHandle) } catch { }
+        $getPs.Dispose()
+        $getRs.Close()
+    }
+} finally {
+    try { $source.Stop() } catch { }
+    try { $target.Stop() } catch { }
+    try { $sourcePs.EndInvoke($sourceHandle) } catch { }
+    try { $targetPs.EndInvoke($targetHandle) } catch { }
+    $sourcePs.Dispose()
+    $targetPs.Dispose()
+    $sourceRs.Close()
+    $targetRs.Close()
+    $contacted.Dispose()
+}
+
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
-Write-Output "spool ps behavioral probe: ok checks=15"
+Write-Output "spool ps behavioral probe: ok checks=31"
 exit 0

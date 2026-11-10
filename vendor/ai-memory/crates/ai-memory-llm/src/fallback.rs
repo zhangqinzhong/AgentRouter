@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jiff::Timestamp;
+use tracing::{debug, info, warn};
 
 use crate::error::{LlmError, LlmResult};
 use crate::health::CandidateHealth;
@@ -118,24 +119,74 @@ impl FallbackLlmProvider {
             state.last_success_at = Some(Timestamp::now());
             state.circuit_open_until = None;
         }
-        *self.last_selected.lock().unwrap_or_else(|e| e.into_inner()) = Some(index);
+        let previous = self
+            .last_selected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(index);
+        // Logged on a change of answering candidate only, so a primary that
+        // stays down for an hour yields one line instead of one per call.
+        let switched = match previous {
+            Some(previous) => previous != index,
+            None => index > 0,
+        };
+        if switched {
+            let candidate = &self.entries[index].candidate;
+            info!(
+                provider = candidate.provider,
+                model = %candidate.model,
+                position = index,
+                "llm fallback chain now answering from this candidate"
+            );
+        }
     }
 
     fn record_error(&self, index: usize, err: &LlmError) {
-        let mut state = self.entries[index]
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        state.last_error_at = Some(Timestamp::now());
-        state.last_error_status = err.http_status();
-        state.last_error_class = Some(err.class());
-        if err.is_transient() {
-            let cooldown = err
-                .retry_after()
+        let cooldown = err.is_transient().then(|| {
+            err.retry_after()
                 .unwrap_or(CIRCUIT_COOLDOWN)
                 .max(CIRCUIT_COOLDOWN)
-                .min(MAX_CIRCUIT_COOLDOWN);
-            state.circuit_open_until = Some(Instant::now() + cooldown);
+                .min(MAX_CIRCUIT_COOLDOWN)
+        });
+        let should_log_transient = {
+            let mut state = self.entries[index]
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let circuit_was_open =
+                matches!(state.circuit_open_until, Some(until) if Instant::now() < until);
+            state.last_error_at = Some(Timestamp::now());
+            state.last_error_status = err.http_status();
+            state.last_error_class = Some(err.class());
+            if let Some(cooldown) = cooldown {
+                state.circuit_open_until = Some(Instant::now() + cooldown);
+            }
+            cooldown.is_some() && !circuit_was_open
+        };
+        // Redacted fields only, as the reranker does: the `Display` of a
+        // provider failure carries the upstream response body. The model is
+        // the failing candidate's, which the caller cannot see: every caller
+        // labels the chain with its first candidate.
+        let candidate = &self.entries[index].candidate;
+        match cooldown {
+            Some(cooldown) if should_log_transient => warn!(
+                provider = candidate.provider,
+                model = %candidate.model,
+                position = index,
+                error_class = err.class(),
+                error_status = ?err.http_status(),
+                cooldown_secs = cooldown.as_secs(),
+                "llm fallback candidate failed; skipping it until its cooldown ends"
+            ),
+            Some(_) => {}
+            None => debug!(
+                provider = candidate.provider,
+                model = %candidate.model,
+                position = index,
+                error_class = err.class(),
+                error_status = ?err.http_status(),
+                "llm fallback candidate failed deterministically; the chain stops here"
+            ),
         }
     }
 
@@ -800,5 +851,182 @@ mod tests {
 
         let rendered = format!("{health:?}");
         assert!(!rendered.contains("must not leak"));
+    }
+
+    /// Collects what a subscriber writes so a test can assert on log lines.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn info_subscriber(writer: CapturedLog) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish()
+    }
+
+    /// Captures this thread's log lines. tracing-core caches each callsite's
+    /// interest process-wide, so a parallel test reaching the same `warn!`
+    /// with no subscriber can pin it to `never` and drop the line here. As in
+    /// `ai-memory-mcp`'s `install_capture`, a second live `Dispatch` stops that
+    /// and `rebuild_interest_cache()` heals a callsite already pinned. The
+    /// companion must outlive the capture, so the caller holds it.
+    fn capture_info_logs() -> (
+        CapturedLog,
+        tracing::subscriber::DefaultGuard,
+        tracing::Dispatch,
+    ) {
+        let captured = CapturedLog::default();
+        let companion = tracing::Dispatch::new(info_subscriber(CapturedLog::default()));
+        let guard = tracing::subscriber::set_default(info_subscriber(captured.clone()));
+        tracing::callsite::rebuild_interest_cache();
+        (captured, guard, companion)
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_logs_the_failing_candidate_without_its_body() {
+        let (log, _guard, _companion) = capture_info_logs();
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new(
+                "openai-compat",
+                "gemini-3.8-flash",
+                Arc::new(ScriptedLlm::err(
+                    "openai-compat",
+                    "gemini-3.8-flash",
+                    LlmError::Provider {
+                        status: 429,
+                        body: "quota body sk-secret-echo".into(),
+                        retry_after: Some(Duration::from_secs(600)),
+                    },
+                )),
+            ),
+            Candidate::new(
+                "openai-compat",
+                "gemini-3.6-flash",
+                Arc::new(ScriptedLlm::ok("openai-compat", "gemini-3.6-flash", "ok")),
+            ),
+        ]);
+
+        chain
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap();
+
+        let text = log.text();
+        let failure = text
+            .lines()
+            .find(|line| line.contains("skipping it until its cooldown ends"))
+            .expect("the transient failure is logged");
+        assert!(failure.contains("gemini-3.8-flash"), "{failure}");
+        assert!(failure.contains("429"), "{failure}");
+        assert!(failure.contains("cooldown_secs=600"), "{failure}");
+        assert!(!text.contains("sk-secret-echo"), "the body leaked: {text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("now answering") && line.contains("gemini-3.6-flash")),
+            "the switch to the fallback is logged: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answering_candidate_is_logged_only_when_it_changes() {
+        let (log, _guard, _companion) = capture_info_logs();
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new(
+                "gemini",
+                "primary",
+                Arc::new(ScriptedLlm::err(
+                    "gemini",
+                    "primary",
+                    LlmError::Provider {
+                        status: 503,
+                        body: "overloaded".into(),
+                        retry_after: None,
+                    },
+                )),
+            ),
+            Candidate::new(
+                "gemini",
+                "spare",
+                Arc::new(ScriptedLlm::ok("gemini", "spare", "ok")),
+            ),
+        ]);
+
+        // The primary's circuit stays open across these calls, so each one is
+        // answered by the spare: one switch, then silence.
+        for _ in 0..3 {
+            chain
+                .complete(ChatRequest::user_prompt("hi"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(log.text().matches("now answering").count(), 1);
+
+        // Control: a chain whose primary answers never logs a switch.
+        let (quiet_log, _quiet_guard, _quiet_companion) = capture_info_logs();
+        let healthy = FallbackLlmProvider::new(vec![Candidate::new(
+            "gemini",
+            "primary",
+            Arc::new(ScriptedLlm::ok("gemini", "primary", "ok")),
+        )]);
+        healthy
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap();
+        assert!(!quiet_log.text().contains("now answering"));
+    }
+
+    #[test]
+    fn concurrent_transient_failures_log_only_the_circuit_transition() {
+        let (log, _guard, _companion) = capture_info_logs();
+        let chain = FallbackLlmProvider::new(vec![Candidate::new(
+            "gemini",
+            "primary",
+            Arc::new(ScriptedLlm::ok("gemini", "primary", "unused")),
+        )]);
+        let failure = LlmError::Provider {
+            status: 503,
+            body: "must not leak".into(),
+            retry_after: Some(Duration::from_secs(600)),
+        };
+
+        // Two requests can both reach the provider before the first failure
+        // opens its circuit. The later result still refreshes health state,
+        // but it must not repeat the outage warning.
+        chain.record_error(0, &failure);
+        chain.record_error(0, &failure);
+
+        let text = log.text();
+        assert_eq!(
+            text.matches("skipping it until its cooldown ends").count(),
+            1,
+            "an already-open circuit repeated its warning: {text}"
+        );
+        assert!(!text.contains("must not leak"), "the body leaked: {text}");
     }
 }

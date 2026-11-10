@@ -32,6 +32,15 @@ window.agentrouter = new Proxy({}, {
           if (new URLSearchParams(location.search).has("slowUsage")) {
             await new Promise(resolve => { window.__releaseUsage = resolve; });
           }
+          if (new URLSearchParams(location.search).has("modelFilters")) {
+            const snapshot = usageStats(args[0]);
+            const rows = snapshot.models.map((row, i) => ({ ...row, model: i ? "local-claude-model" : "local-codex-model", label: i ? "local-claude-model" : "local-codex-model", costUsd: i ? 2 : 1 }));
+            snapshot.models = args[1]?.model ? rows.filter(row => row.model === args[1].model) : rows;
+            if (args[0] === "24h" && args[1]?.model) snapshot.models = [];
+            snapshot.clientModels = snapshot.models.map(row => ({...row, client: row.model.includes('claude') ? 'Claude Code' : 'Codex'}));
+            snapshot.totals = { ...snapshot.totals, totalTokens: snapshot.models.reduce((sum, row) => sum + row.totalTokens, 0), costUsd: snapshot.models.reduce((sum, row) => sum + row.costUsd, 0) };
+            return snapshot;
+          }
           return usageStats(args[0]);
         case "getLocalUsagePage": return { totals: { total_tokens: 100 }, sources: [] };
         case "getLocalUsageSessions": return { sessions: [], session_count: 0, available: true };

@@ -1,0 +1,27 @@
+# Every wiki filesystem path crosses one of these typed entry points and then
+# `tree_path`, which rejects absolute, parent, root and prefix components and
+# inspects the in-root directory chain for symbolic links or Windows reparse
+# points before returning the path. Model the entry points as well as the
+# implementation boundary: CodeQL's interprocedural summary can otherwise
+# propagate request taint through a wrapper before it reaches `tree_path`.
+# CodeQL's Rust model resolver realizes these source-defined `Result<PathBuf,
+# WikiError>` boundaries only at `ReturnValue`; an `Ok(0)` field access path
+# currently produces no barrier node. The error variant contains no path value,
+# so treating the whole return as the barrier preserves the runtime contract.
+# Request-derived values that bypass these functions remain tainted.
+# `repository_root` similarly returns the configured wiki root only after the
+# repository boundary has been initialized and inspected; this prevents Axum's
+# request-source model from tainting the retained application state itself.
+#
+# The CLI test `codeql_model_targets_exist` fails if the modeled function is
+# renamed or moved.
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      - ["ai_memory_wiki::confinement::project_root", "ReturnValue", "path-injection", "manual"]
+      - ["ai_memory_wiki::confinement::project_path", "ReturnValue", "path-injection", "manual"]
+      - ["ai_memory_wiki::confinement::workspace_path", "ReturnValue", "path-injection", "manual"]
+      - ["ai_memory_wiki::confinement::tree_path", "ReturnValue", "path-injection", "manual"]
+      - ["ai_memory_wiki::git::repository_root", "ReturnValue", "path-injection", "manual"]

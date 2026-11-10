@@ -148,13 +148,13 @@ fn create_pre_migration_backup_inner(
     crate::confinement::inspect_tree(data_dir)?;
     let dest_dir = destination_dir(dest_override, data_dir, in_container)?;
     let stamp = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
-    let archive_path = dest_dir.join(format!("ai-memory-backup-{label}-{stamp}.tar.gz"));
+    let (archive_path, archive_file) = reserve_archive(&dest_dir, label, &stamp)?;
 
     // The migration runs at server startup before any traffic, so the
     // SQLite files (db + WAL/SHM) are quiescent and archived as a set.
     let mut expected = 0usize;
     {
-        let file = BufWriter::new(File::create(&archive_path)?);
+        let file = BufWriter::new(archive_file);
         let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut tar = tar::Builder::new(enc);
         tar.follow_symlinks(false);
@@ -271,6 +271,29 @@ fn create_pre_migration_backup_inner(
     Ok(receipt)
 }
 
+/// Different data dirs can migrate in the same second and share a destination
+/// (the default is the user's home). Reserve a new path atomically so neither
+/// archive can replace the other's only pre-migration snapshot.
+fn reserve_archive(dest: &Path, label: &str, stamp: &str) -> WikiResult<(PathBuf, File)> {
+    for suffix in 0_u32..=u32::MAX {
+        let suffix = if suffix == 0 {
+            String::new()
+        } else {
+            format!("-{suffix}")
+        };
+        let path = dest.join(format!("ai-memory-backup-{label}-{stamp}{suffix}.tar.gz"));
+        match File::options().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(WikiError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not reserve a unique pre-migration archive path",
+    )))
+}
+
 /// End the gzip stream and flush the buffer, returning the underlying writer.
 ///
 /// `GzEncoder::finish` hands back the `BufWriter`; dropping it would write the
@@ -367,6 +390,58 @@ mod tests {
         assert!(receipt.archive_present());
         let loaded = BackupReceipt::load(data.path()).unwrap();
         assert_eq!(loaded.archive_path, receipt.archive_path);
+    }
+
+    #[test]
+    fn separate_installs_keep_their_own_pre_migration_archives() {
+        let first_data = data_dir_with_content();
+        let second_data = data_dir_with_content();
+        std::fs::write(second_data.path().join("db.sqlite"), b"another install").unwrap();
+        let dest = TempDir::new().unwrap();
+        let first =
+            create_pre_migration_backup(first_data.path(), "test", Some(dest.path())).unwrap();
+        let original = std::fs::read(&first.archive_path).unwrap();
+        let second =
+            create_pre_migration_backup(second_data.path(), "test", Some(dest.path())).unwrap();
+
+        assert_ne!(first.archive_path, second.archive_path);
+        assert_eq!(std::fs::read(&first.archive_path).unwrap(), original);
+        assert_eq!(
+            BackupReceipt::load(first_data.path()).unwrap().archive_path,
+            first.archive_path
+        );
+        assert_eq!(
+            BackupReceipt::load(second_data.path())
+                .unwrap()
+                .archive_path,
+            second.archive_path
+        );
+    }
+
+    #[test]
+    fn archive_reservations_at_the_same_timestamp_preserve_existing_files() {
+        let dest = TempDir::new().unwrap();
+        let stamp = "20261028-120000";
+        let first = dest
+            .path()
+            .join(format!("ai-memory-backup-test-{stamp}.tar.gz"));
+        let second = dest
+            .path()
+            .join(format!("ai-memory-backup-test-{stamp}-1.tar.gz"));
+        std::fs::write(&first, b"first snapshot").unwrap();
+        std::fs::write(&second, b"second snapshot").unwrap();
+
+        let (third, mut file) = reserve_archive(dest.path(), "test", stamp).unwrap();
+        file.write_all(b"third snapshot").unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(&first).unwrap(), b"first snapshot");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second snapshot");
+        assert_eq!(std::fs::read(&third).unwrap(), b"third snapshot");
+        assert_eq!(
+            third.file_name().unwrap(),
+            format!("ai-memory-backup-test-{stamp}-2.tar.gz").as_str()
+        );
     }
 
     /// The signal this field exists for: a verified archive next to a

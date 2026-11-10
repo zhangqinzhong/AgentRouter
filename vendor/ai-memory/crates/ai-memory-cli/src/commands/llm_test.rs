@@ -4,8 +4,10 @@ use ai_memory_llm::{ChatRequest, LlmError, ProviderChoice, ProviderConfig, build
 use anyhow::{Context, Result};
 use tracing::info;
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::{LlmProviderChoice, LlmTestArgs};
 use crate::config::Config;
+use crate::http_client::{ServerEndpoint, post_json};
 
 /// Run the `llm-test` subcommand.
 ///
@@ -13,31 +15,45 @@ use crate::config::Config;
 /// Returns an error if the provider cannot be constructed, the env
 /// lacks the required keys, or the HTTP call fails.
 pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
-    let provider = ProviderChoice::from(args.provider);
+    let i18n = &config.i18n;
+    if args.server {
+        return run_against_server(config).await;
+    }
+    let provider = ProviderChoice::from(
+        args.provider
+            .context(i18n.text("cli-llm-test-provider-is-required-unless-server-is-passed"))?,
+    );
     let api_key_override = args
         .api_key
         .filter(|s| !s.is_empty())
         .map(secrecy::SecretString::from);
     let provider_config = ProviderConfig {
         provider,
-        model: args.model,
+        model: args
+            .model
+            .context(i18n.text("cli-llm-test-model-is-required-unless-server-is-passed"))?,
         auth: config.provider_auth(provider, api_key_override),
         base_url: args.base_url.or_else(|| config.llm_test_base_url(provider)),
         compat_strict: config.llm_compat_strict,
         compat_disable_thinking: config.llm_compat_disable_thinking,
+        compat_stream: config.llm_compat_stream,
         request_timeout_secs: config.llm_timeout_secs,
         reasoning_effort: config.llm_reasoning_effort,
         extra_headers: config
             .llm_extra_headers()
-            .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?,
+            .context(i18n.text("cli-llm-test-parsing-ai-memory-llm-headers-llm-headers"))?,
     };
-    let client = build_provider(provider_config).context("building LLM provider")?;
+    let client =
+        build_provider(provider_config).context(i18n.text("cli-llm-test-building-llm-provider"))?;
     info!(
         provider = client.name(),
         model = client.model(),
         "sending prompt",
     );
-    let request = representative_request(args.prompt);
+    let request = representative_request(
+        args.prompt
+            .context(i18n.text("cli-llm-test-prompt-is-required-unless-server-is-passed"))?,
+    );
     if args.structured {
         let value = client
             .complete_structured_raw(
@@ -50,8 +66,14 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
             )
             .await
             .map_err(|e| with_oauth_hint(provider, e))
-            .context("calling provider for structured output")?;
-        println!("--- model: {} ---", client.model());
+            .context(i18n.text("cli-llm-test-calling-provider-for-structured-output"))?;
+        println!(
+            "{}",
+            i18n.format(
+                "cli-llm-test-model",
+                &[("value0", client.model().to_string())]
+            )
+        );
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
@@ -59,16 +81,28 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         .complete(request)
         .await
         .map_err(|e| with_oauth_hint(provider, e))
-        .context("calling provider")?;
+        .context(i18n.text("cli-llm-test-calling-provider"))?;
 
-    println!("--- model: {} ---", resp.model);
+    println!(
+        "{}",
+        i18n.format(
+            "cli-llm-test-model",
+            &[("value0", terminal_text(&resp.model))]
+        )
+    );
     if let Some(u) = resp.usage {
         println!(
-            "--- usage: in={} out={} ---",
-            u.input_tokens, u.output_tokens
+            "{}",
+            i18n.format(
+                "cli-llm-test-usage-in-out",
+                &[
+                    ("value0", format!("{}", u.input_tokens)),
+                    ("value1", format!("{}", u.output_tokens))
+                ]
+            )
         );
     }
-    println!("{}", resp.text);
+    println!("{}", terminal_body(&resp.text));
     Ok(())
 }
 
@@ -79,9 +113,12 @@ tokens with this 429 for any client that is not Claude Code; it is not a real \
 rate limit. Use `--provider anthropic` with an API key or an OpenAI-compatible \
 gateway (see docs/llm-providers.md).";
 
-fn with_oauth_hint(provider: ProviderChoice, err: LlmError) -> anyhow::Error {
+fn with_oauth_hint(provider: ProviderChoice, mut err: LlmError) -> anyhow::Error {
     let is_oauth_429 = provider == ProviderChoice::AnthropicOAuth
         && matches!(err, LlmError::Provider { status: 429, .. });
+    if let LlmError::Provider { body, .. } = &mut err {
+        *body = terminal_body(body);
+    }
     let err = anyhow::Error::new(err);
     if is_oauth_429 {
         err.context(ANTHROPIC_OAUTH_429_HINT)
@@ -113,6 +150,33 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Cursor => Self::Cursor,
         }
     }
+}
+
+/// Probe the server's own configured provider (`--server`).
+///
+/// The server runs the probe with a fixed short prompt against what its
+/// configuration holds, so this works from a machine that has no keys at all —
+/// which is the whole point (#1639).
+async fn run_against_server(config: &Config) -> Result<()> {
+    let i18n = &config.i18n;
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let report: serde_json::Value = post_json(&endpoint, "/admin/llm-test", &()).await?;
+    let provider = report["provider"].as_str().unwrap_or("(unknown)");
+    let model = report["model"].as_str().unwrap_or("(unknown)");
+    let latency = report["latency_ms"].as_u64().unwrap_or(0);
+    println!(
+        "{}",
+        i18n.format(
+            "cli-llm-test-server-provider-provider-model-latency-ms",
+            &[
+                ("value0", terminal_text(provider)),
+                ("value1", terminal_text(model)),
+                ("value2", format!("{}", latency))
+            ]
+        )
+    );
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 #[cfg(test)]

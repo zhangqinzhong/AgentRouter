@@ -234,7 +234,29 @@ CREATE TABLE IF NOT EXISTS claimed_sessions (
 /// "16" = 会话目录里的子代理转录(Claude Code 含 Workflow、Cursor CLI、CodeBuddy / WorkBuddy、
 ///       Qoder、Kimi)作为子会话入库、标 spawned,`<git-context>` 不进标题;旧版监听当顶层会话收进来
 ///       的 Workflow 转录(sidechain 行被滤掉、零消息)文件没变、引用也没变,靠这轮重解析写对。
-pub const FTS_FORMAT: &str = "16";
+/// "ar-17" = Claude AI 标题及分支标题继承修正、MiMo 独立解析器的导入记录与子代理分离。
+pub const FTS_FORMAT: &str = "ar-17";
+
+/// 正文里中日韩字符的两字组索引(issue #79):trigram 对两个字的词 MATCH 不出东西,而中文最常搜的
+/// 恰恰是两字词。只收有两个以上相连中日韩字符的行,文本是 `cjk_bigrams` 切好、空格隔开的两字组,
+/// rowid = messages.id;只存索引不存内容,删改按 rowid(contentless_delete)。文本里只有中日韩字符与
+/// 空格,ascii 分词器按空格切出的词与 unicode61 一模一样,写入快两成。与 messages_fts 同在
+/// `replace_units` 里维护;建表与换代在 open_conn(见 `CJK_FORMAT`)
+const CJK_DDL: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_cjk USING fts5(
+  text,
+  content='', contentless_delete=1,
+  tokenize="ascii"
+);
+"#;
+
+/// 两字组表的切法版本:哪些字算中日韩(`is_cjk`)、怎么切(`cjk_pairs`)、怎么建表(`CJK_DDL`)。改了
+/// 就换个值——GUI 开库时整张表重建,扫描收尾的维护从头补(`Store::backfill_cjk`);只读的 MCP / CLI
+/// 看到库里记的版本与自己的不一样就不用这张表,两字词照旧逐条 LIKE。`FTS_FORMAT` 管会话怎么变成
+/// 单元,这里管单元怎么变成这张表的行:单元没变,换代用不着重解析
+const CJK_FORMAT: &str = "1";
+
+
 
 /// FTS 压缩的节奏(见 `Store::compact_fts`):距上次压缩满一天、或从没压过才压。没有记录
 /// 就算到期——老库升级后、新建库首轮扫描收尾各压一次;`FTS_FORMAT` 换代时 open_conn 把
@@ -295,14 +317,7 @@ fn open_conn(path: &Path) -> Result<Connection> {
     // FTS 派生规则换代:库里记的版本与 FTS_FORMAT 不一致且已有会话 → 挂 fts_reindex
     // 旗子,下一轮扫描把全部文件重解析一遍(增量按 mtime/size 跳过的也重来),否则
     // 旧行会按旧规则一直留着,直到用户手动全量刷新(Codex review 2026-09-14)
-    let stored_format: Option<String> = conn
-        .query_row(
-            "SELECT value FROM schema_meta WHERE key = 'fts_format'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if stored_format.as_deref() != Some(FTS_FORMAT) {
+    if read_meta(&conn, "fts_format")?.as_deref() != Some(FTS_FORMAT) {
         if sessions_existed {
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('fts_reindex', '1')",
@@ -316,6 +331,25 @@ fn open_conn(path: &Path) -> Result<Connection> {
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('fts_format', ?1)",
             params![FTS_FORMAT],
         )?;
+    }
+    // 两字组表:库里记的切法版本与 CJK_FORMAT 不一样(老库首开还没有这张表,或换了切法 / 分词器)
+    // 就整张表重建,已有的消息由扫描收尾的维护补进去(`Store::backfill_cjk`,cjk_backfill 记补到哪条
+    // messages.id)。补齐之前搜索不用它——表里只有之后写入的行,两字词照旧逐条 LIKE。全新的库没有
+    // 消息可补,只记版本
+    if read_meta(&conn, "cjk_format")?.as_deref() != Some(CJK_FORMAT) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS messages_cjk;{CJK_DDL}"))?;
+        if sessions_existed {
+            tx.execute(
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('cjk_backfill', '0')",
+                [],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('cjk_format', ?1)",
+            params![CJK_FORMAT],
+        )?;
+        tx.commit()?;
     }
     // host 迁移(2026-09-01 远程会话加列;空串 = 本地)。老库首扫时既有行
     // 全部落 '',与远程装饰器生产的非空 host 天然分域,无需回填
@@ -374,8 +408,19 @@ fn open_conn(path: &Path) -> Result<Connection> {
 /// 一次 GUI 侧的加表就让旁路二进制对所有老库拒开
 const NEWEST_COLUMN: (&str, &str) = ("memories", "source");
 /// 最近一次迁移加的、只读读者会查的表(wake_list_memories 读 memories),与
-/// NEWEST_COLUMN 同一用途、同一维护规矩
+/// NEWEST_COLUMN 同一用途、同一维护规矩。可有可无的加速表不算:两字组表(messages_cjk)由只读读者
+/// 在查询时按库里记的切法版本判断能不能用(`cjk_index_ready`),用不了就照旧逐条 LIKE,不该因此拒开老库
 const NEWEST_TABLE: &str = "memories";
+
+/// schema_meta 里的一个值(开库时的迁移判断与 `Store::meta_value` 共用)
+fn read_meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM schema_meta WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+}
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(conn.query_row(
@@ -900,14 +945,7 @@ impl Store {
 
     /// schema_meta 里的一个值;没有、或读不出都给 None
     fn meta_value(&self, key: &str) -> Option<String> {
-        let conn = self.read.lock().unwrap();
-        conn.query_row(
-            "SELECT value FROM schema_meta WHERE key = ?1",
-            params![key],
-            |r| r.get(0),
-        )
-        .optional()
-        .unwrap_or(None)
+        read_meta(&self.read.lock().unwrap(), key).unwrap_or(None)
     }
 
     /// schema_meta 里的一次性旗子(升级后要补做的事),做完由 scanner 清掉
@@ -949,7 +987,7 @@ impl Store {
             .is_none_or(|at| now.saturating_sub(at) >= FTS_COMPACT_EVERY_MS)
     }
 
-    /// 把三张 FTS 表各自的段合并成一棵 b-tree,顺带丢掉删除标记。会话每重写一次
+    /// 把四张 FTS 表各自的段合并成一棵 b-tree,顺带丢掉删除标记。会话每重写一次
     /// (watcher 的增量、`FTS_FORMAT` 换代的全量重解析)都只追加新段与删除标记,automerge
     /// 收不回大段里的旧版本:本机实测 661 MB 的库里 557 MB 是 messages_fts 的段,压完
     /// 87 MB,多词查询从 10–20 ms 降到 0.4–2 ms。
@@ -961,7 +999,7 @@ impl Store {
         // 防御上限:持续有写入时合并也终会收敛,这里只防万一卡在循环里(250 页一块,
         // 一万块远超任何真实索引)
         const MAX_CHUNKS: usize = 10_000;
-        for table in ["messages_fts", "titles_fts", "memories_fts"] {
+        for table in ["messages_fts", "messages_cjk", "titles_fts", "memories_fts"] {
             let sql = format!("INSERT INTO {table}({table}, rank) VALUES ('merge', ?1)");
             let mut pages = -FTS_MERGE_PAGES;
             for _ in 0..MAX_CHUNKS {
@@ -981,6 +1019,48 @@ impl Store {
             params![now.to_string()],
         )?;
         Ok(())
+    }
+
+    /// 老库升级或换了切法之后(见 `CJK_FORMAT`)把已有的消息补进两字组表(`messages_cjk`;open_conn
+    /// 重建表时挂 cjk_backfill,值是补到哪条 messages.id)。按 id 分块,每块一个写事务、块之间放开
+    /// 写锁,监听的增量写入照常插队;中途退出下次接着补。补完撤掉旗子,搜索才开始用这张表
+    pub fn backfill_cjk(&self) -> Result<()> {
+        // 一块 2000 行,本机正文平均每行两百多字,一块的写锁持有在几十毫秒以内
+        const ROWS: i64 = 2000;
+        let Some(mut after) = self
+            .meta_value("cjk_backfill")
+            .and_then(|v| v.parse::<i64>().ok())
+        else {
+            return Ok(());
+        };
+        loop {
+            let mut conn = self.write.lock().unwrap();
+            let tx = conn.transaction()?;
+            let rows: Vec<(i64, String)> = tx
+                .prepare_cached("SELECT id, text FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2")?
+                .query_map(params![after, ROWS], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let Some(&(last, _)) = rows.last() else {
+                tx.execute("DELETE FROM schema_meta WHERE key = 'cjk_backfill'", [])?;
+                tx.commit()?;
+                return Ok(());
+            };
+            {
+                let mut cjk = CjkRows::new(&tx)?;
+                for (id, text) in &rows {
+                    // 之后写入的行已经由 replace_units 带进表里了:先删再写
+                    cjk.forget(*id, text)?;
+                    cjk.put(*id, text)?;
+                }
+            }
+            // 整库重建会把旗子撤掉:这时 UPDATE 什么都不改,剩下的行照样补完(都是幂等的)
+            tx.execute(
+                "UPDATE schema_meta SET value = ?1 WHERE key = 'cjk_backfill'",
+                params![last.to_string()],
+            )?;
+            tx.commit()?;
+            after = last;
+        }
     }
 
     /// 压缩后空闲页占到三成、且至少 64 MiB 才 VACUUM,把文件真正缩回去(Settings → Data
@@ -1704,8 +1784,11 @@ impl Store {
 
     pub fn rebuild_all(&self) -> Result<()> {
         let conn = self.write.lock().unwrap();
+        // 两字组表清空后,之后写进来的行都带着两字组,没补完的回填也就不用补了
         conn.execute_batch(
             "DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM titles_fts;
+             INSERT INTO messages_cjk(messages_cjk) VALUES ('delete-all');
+             DELETE FROM schema_meta WHERE key = 'cjk_backfill';
              DELETE FROM memories; DELETE FROM memories_fts; DELETE FROM wake_lookups;
              DELETE FROM sessions;",
         )?;
@@ -2432,7 +2515,7 @@ impl Store {
         Ok(stmt.query_row(params![key], row_to_memory).optional()?)
     }
 
-    /// 记忆全文搜索(标题 + 正文),与会话搜索同一套分词与 <3 码点降级规则;命中按
+    /// 记忆全文搜索(标题 + 正文),与会话搜索同一套分词(`Terms`,记忆没有两字组表);命中按
     /// bm25 排、snippet 取自正文。筛选同 list_memories
     pub fn search_memories(&self, q: &str, f: &MemoryFilter) -> Result<Vec<MemoryHit>> {
         let segs = fts_terms(q);
@@ -2441,31 +2524,29 @@ impl Store {
         }
         let limit = if f.limit > 0 { f.limit } else { 20 };
         let (filter_sql, filter_args) = memory_filter(f);
-        // FTS 与 LIKE 降级只差 SQL 与前导参数。片段取自正文、在 make_snippet 里开窗(FTS5 的
+        // 三字以上的词走 memories_fts、按 bm25 排,其余的词在候选里 LIKE;只有短词才整条按时间扫
+        // (记忆没有两字组表,几百份,扫得起)。片段取自正文、在 make_snippet 里开窗(FTS5 的
         // snippet() 在 trigram 下只露十几个字);只在标题里命中的,正文里找不到词,给正文开头
-        let (sql, mut all_args): (String, Vec<Box<dyn rusqlite::ToSql>>) =
-            if !needs_like_fallback(&segs) {
-                (
-                    format!(
-                        "SELECT {MEMORY_COLS}
-                         FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
-                         {MEMORY_SESSION_JOIN}
-                         WHERE memories_fts MATCH ?{filter_sql}
-                         ORDER BY bm25(memories_fts) LIMIT ?"
-                    ),
-                    vec![Box::new(fts_match_expr(&segs))],
-                )
-            } else {
-                (
-                    format!(
-                        "SELECT {MEMORY_COLS} FROM memories m {MEMORY_SESSION_JOIN}
-                         WHERE {}{filter_sql}
-                         ORDER BY m.updated_at DESC LIMIT ?",
-                        like_where(&["m.title", "m.body"], segs.len())
-                    ),
-                    like_args(&segs, 2),
-                )
-            };
+        let terms = Terms::split(&segs, false);
+        let (like_sql, like_args) = like_filter(&["m.title", "m.body"], &terms.short);
+        let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let sql = if terms.unindexed() {
+            format!(
+                "SELECT {MEMORY_COLS} FROM memories m {MEMORY_SESSION_JOIN}
+                 WHERE 1 = 1{like_sql}{filter_sql}
+                 ORDER BY m.updated_at DESC LIMIT ?"
+            )
+        } else {
+            all_args.push(Box::new(fts_match_expr(&terms.trigram)));
+            format!(
+                "SELECT {MEMORY_COLS}
+                 FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
+                 {MEMORY_SESSION_JOIN}
+                 WHERE memories_fts MATCH ?{like_sql}{filter_sql}
+                 ORDER BY bm25(memories_fts) LIMIT ?"
+            )
+        };
+        all_args.extend(like_args);
         all_args.extend(filter_args);
         all_args.push(Box::new(limit));
         let conn = self.read.lock().unwrap();
@@ -2771,7 +2852,8 @@ impl Store {
         Ok(data)
     }
 
-    /// 全文搜索:trigram MATCH(每段 ≥3 码点)或 LIKE 降级。返回 (hits, degraded)
+    /// 全文搜索(词怎么分组、各走哪个索引见 `Terms`)。返回 (hits, degraded):degraded = 一个能走
+    /// 索引的词都没有,整条退回了按时间的逐条 LIKE
     pub fn search(
         &self,
         q: &str,
@@ -2800,7 +2882,6 @@ impl Store {
         if segs.is_empty() {
             return Ok((Vec::new(), false));
         }
-        let degraded = needs_like_fallback(&segs);
         let limit = if f.limit > 0 { f.limit } else { 60 };
         // 近因加权:bm25 是负数、越小越相关,乘上 (1 + W / (1 + 距今天数 / H)) 让
         // 新会话的命中"更负"。W = 1、H = 30 天:今天的会话 ×2、一个月前 ×1.5、
@@ -2845,37 +2926,52 @@ impl Store {
             }
             v
         };
-        // FTS 的 MATCH 表达式(正文与标题两张表共用)
-        let match_expr = fts_match_expr(&segs);
-
         let conn = self.read.lock().unwrap();
+        // 正文按能走哪个索引分词(`Terms`);两字组表用不了时(还没补齐、切法版本对不上)两字词照旧 LIKE
+        let terms = Terms::split(&segs, cjk_index_ready(&conn)?);
+        let degraded = terms.unindexed();
 
-        // 正文命中:FTS 与 LIKE 降级只差 SQL 与前导参数;片段都取原文在 make_snippet 里开窗
+        // 正文命中:由三字以上的词(没有就由两字词)取候选、按它的 bm25 排,其余的词在候选里过滤;
+        // 一个能走索引的词都没有才退回按时间的 LIKE 扫描。片段都取原文在 make_snippet 里开窗
         // (FTS5 的 snippet() 在 trigram 下只露十几个字)
-        let (sql, mut all_args): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !degraded {
-            (
-                format!(
-                    "SELECT m.session_key, m.seq, m.sidechain_id, m.role, m.ts, m.text
-                     FROM messages_fts
-                     JOIN messages m ON m.id = messages_fts.rowid
-                     JOIN sessions s ON s.key = m.session_key
-                     WHERE messages_fts MATCH ?{filter_sql}
-                     ORDER BY bm25(messages_fts) * {RECENCY_BOOST} LIMIT ?"
-                ),
-                vec![Box::new(match_expr.clone())],
+        let (like_sql, like_args) = like_filter(&["m.text"], &terms.short);
+        let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let sql = if degraded {
+            format!(
+                "SELECT m.session_key, m.seq, m.sidechain_id, m.role, m.ts, m.text
+                 FROM messages m JOIN sessions s ON s.key = m.session_key
+                 WHERE 1 = 1{like_sql}{filter_sql}
+                 ORDER BY m.ts DESC LIMIT ?"
             )
         } else {
-            (
+            // 取候选的表与它的词;有三字以上的词时,两字词另在两字组表里过滤
+            let (fts, driver, cjk_filter): (&str, &[&str], &[&str]) = if terms.trigram.is_empty() {
+                ("messages_cjk", &terms.bigram, &[])
+            } else {
+                ("messages_fts", &terms.trigram, &terms.bigram)
+            };
+            all_args.push(Box::new(fts_match_expr(driver)));
+            let cjk_sql = if cjk_filter.is_empty() {
+                String::new()
+            } else {
+                all_args.push(Box::new(fts_match_expr(cjk_filter)));
+                // 一元 `+` 不能去:没有它 SQLite 把这个 IN 交给 FTS5 当 rowid 约束,列表里每一项各探
+                // 一次索引(本机 37–1246 ms);有它就是每扫出一个候选当场查一下,还在读 messages 那一行
+                // 之前(`部署 the` 9.7 → 2.0 ms)
                 format!(
-                    "SELECT m.session_key, m.seq, m.sidechain_id, m.role, m.ts, m.text
-                     FROM messages m JOIN sessions s ON s.key = m.session_key
-                     WHERE {}{filter_sql}
-                     ORDER BY m.ts DESC LIMIT ?",
-                    like_where(&["m.text"], segs.len())
-                ),
-                like_args(&segs, 1),
+                    " AND +{fts}.rowid IN (SELECT rowid FROM messages_cjk WHERE messages_cjk MATCH ?)"
+                )
+            };
+            format!(
+                "SELECT m.session_key, m.seq, m.sidechain_id, m.role, m.ts, m.text
+                 FROM {fts}
+                 JOIN messages m ON m.id = {fts}.rowid
+                 JOIN sessions s ON s.key = m.session_key
+                 WHERE {fts} MATCH ?{cjk_sql}{like_sql}{filter_sql}
+                 ORDER BY bm25({fts}) * {RECENCY_BOOST} LIMIT ?"
             )
         };
+        all_args.extend(like_args);
         all_args.extend(filter_args(f));
         if !degraded {
             all_args.push(Box::new(now));
@@ -2901,51 +2997,42 @@ impl Store {
 
         // 标题命中:独立的 titles_fts。排在正文命中之前——词出现在标题里是最强的
         // 相关性信号;role 记 "title"、seq 记 0,跳转落到会话开头(标题没有对应的
-        // 转录行,不伪造 seq)
-        let mut title_raw: Vec<(String, String)> = Vec::new();
-        if !degraded {
-            let sql = format!(
-                "SELECT t.key, highlight(titles_fts, 1, ?, ?)
-                 FROM titles_fts t JOIN sessions s ON s.key = t.key
-                 WHERE titles_fts MATCH ?{filter_sql}
-                 ORDER BY bm25(titles_fts) * {RECENCY_BOOST} LIMIT ?"
-            );
-            let mut stmt = conn.prepare_cached(&sql)?;
-            let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(HL_OPEN.to_string()),
-                Box::new(HL_CLOSE.to_string()),
-                Box::new(match_expr),
-            ];
-            all_args.extend(filter_args(f));
-            all_args.push(Box::new(now));
-            all_args.push(Box::new(limit));
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )?;
-            for r in rows {
-                title_raw.push(r?);
-            }
-        } else {
-            let like_where = like_where(&["s.title"], segs.len());
-            let sql = format!(
+        // 转录行,不伪造 seq)。标题没有两字组表(几千行,LIKE 扫得起):三字以上的词走
+        // titles_fts,其余的词在候选里 LIKE;只有短词时按更新时间扫。三条路都给整个标题、
+        // 每个词都标(highlight_all)
+        let title_terms = Terms::split(&segs, false);
+        let (like_sql, like_args) = like_filter(&["s.title"], &title_terms.short);
+        let mut title_args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let title_sql = if title_terms.unindexed() {
+            format!(
                 "SELECT s.key, s.title FROM sessions s
-                 WHERE {like_where}{filter_sql}
+                 WHERE 1 = 1{like_sql}{filter_sql}
                  ORDER BY s.updated_at DESC LIMIT ?"
-            );
-            let mut stmt = conn.prepare_cached(&sql)?;
-            let mut all_args = like_args(&segs, 1);
-            all_args.extend(filter_args(f));
-            all_args.push(Box::new(limit));
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )?;
-            for r in rows {
-                let (key, title) = r?;
-                title_raw.push((key, make_snippet(&title, &segs)));
-            }
+            )
+        } else {
+            title_args.push(Box::new(fts_match_expr(&title_terms.trigram)));
+            format!(
+                "SELECT t.key, s.title FROM titles_fts t JOIN sessions s ON s.key = t.key
+                 WHERE titles_fts MATCH ?{like_sql}{filter_sql}
+                 ORDER BY bm25(titles_fts) * {RECENCY_BOOST} LIMIT ?"
+            )
+        };
+        title_args.extend(like_args);
+        title_args.extend(filter_args(f));
+        if !title_terms.unindexed() {
+            title_args.push(Box::new(now));
         }
+        title_args.push(Box::new(limit));
+        let title_raw: Vec<(String, String)> = conn
+            .prepare_cached(&title_sql)?
+            .query_map(
+                rusqlite::params_from_iter(title_args.iter().map(|b| b.as_ref())),
+                |r| {
+                    let title: String = r.get(1)?;
+                    Ok((r.get(0)?, highlight_all(&title, &segs)))
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?;
 
         // 补齐 session meta:按会话只查一次(一个会话常占几十行命中),语句走
         // prepare_cached——Connection::query_row 每次都是裸 prepare
@@ -3515,12 +3602,14 @@ fn replace_units(tx: &rusqlite::Transaction<'_>, key: &str, units: &[IndexUnit])
                 && *text == u.text
         })
         .count();
+    let mut cjk = CjkRows::new(tx)?;
     if let Some((first_stale, ..)) = existing.get(keep) {
         let mut fts_del = tx.prepare_cached(
             "INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', ?1, ?2)",
         )?;
         for (id, .., text) in &existing[keep..] {
             fts_del.execute(params![id, text])?;
+            cjk.forget(*id, text)?;
         }
         tx.prepare_cached("DELETE FROM messages WHERE session_key = ?1 AND id >= ?2")?
             .execute(params![key, first_stale])?;
@@ -3538,7 +3627,9 @@ fn replace_units(tx: &rusqlite::Transaction<'_>, key: &str, units: &[IndexUnit])
             u.timestamp,
             u.text
         ])?;
-        ins_fts.execute(params![tx.last_insert_rowid(), u.text])?;
+        let id = tx.last_insert_rowid();
+        ins_fts.execute(params![id, u.text])?;
+        cjk.put(id, &u.text)?;
     }
     Ok(())
 }
@@ -3654,12 +3745,126 @@ fn fts_terms(q: &str) -> Vec<&str> {
     q.split_whitespace().filter(|s| !s.is_empty()).collect()
 }
 
-/// 有词项短于 3 码点就走 LIKE 子串扫描——trigram 分词对更短的词无能为力
-fn needs_like_fallback(segs: &[&str]) -> bool {
-    segs.iter().any(|s| s.chars().count() < 3)
+/// 检索词按能走哪个索引分组(issue #79)。trigram 的 FTS 表对不到 3 个字符的词 MATCH 不出东西:
+/// 三字及以上的走它;恰好两个中日韩字符的走正文的两字组表(`messages_cjk`,`bigrams` 为假时——
+/// 标题、记忆没有这张表,或它眼下用不了——归进 `short`);剩下的单字、`js` 这类两个字符的词只能
+/// 逐条 LIKE。有能走索引的词时由它取候选、按它的 bm25 排,其余的词在候选里过滤;一个都没有才
+/// 整条退回按时间的 LIKE 扫描
+#[derive(Default)]
+struct Terms<'a> {
+    trigram: Vec<&'a str>,
+    bigram: Vec<&'a str>,
+    short: Vec<&'a str>,
 }
 
-/// FTS5 的 MATCH 表达式:每个词项加引号(内部引号翻倍)、AND 连接。三张 FTS 表共用,
+impl<'a> Terms<'a> {
+    fn split(segs: &[&'a str], bigrams: bool) -> Self {
+        let mut terms = Terms::default();
+        for &seg in segs {
+            if seg.chars().count() >= 3 {
+                terms.trigram.push(seg);
+            } else if bigrams && cjk_pairs(seg).next() == Some(seg) {
+                // 整个词就是一对相连的中日韩字符:两字组表里的一个词
+                terms.bigram.push(seg);
+            } else {
+                terms.short.push(seg);
+            }
+        }
+        terms
+    }
+
+    /// 一个能走索引的词都没有:整条退回 LIKE 扫描
+    fn unindexed(&self) -> bool {
+        self.trigram.is_empty() && self.bigram.is_empty()
+    }
+}
+
+/// 两字组表收的字符:汉字(含扩展区、兼容区)、假名、谚文——词与词之间不空格,两个字就是一个常用词。
+/// 只认字母类(假名区里的 `・` 是标点,unicode61 也拿它当分隔)
+fn is_cjk(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF
+            | 0x20000..=0x323AF
+    ) && c.is_alphabetic()
+}
+
+/// 文本里每一对相连的中日韩字符,相互重叠(`部署脚本` → 部署、署脚、脚本),切的是原文。两字组表
+/// 怎么切只有这一处:写入(`cjk_bigrams`)、删行前的判断(`CjkRows::forget`)与查询分组(两字词
+/// 恰好是一对)都从它取
+fn cjk_pairs(text: &str) -> impl Iterator<Item = &str> {
+    // 上一个字符是中日韩字符时,它在原文里的起点
+    let mut prev: Option<usize> = None;
+    text.char_indices().filter_map(move |(i, c)| {
+        if !is_cjk(c) {
+            prev = None;
+            return None;
+        }
+        let pair = prev.map(|p| &text[p..i + c.len_utf8()]);
+        prev = Some(i);
+        pair
+    })
+}
+
+/// 两字组表里一行的文本:`cjk_pairs` 用空格隔开(分词器按空格切出的一个词就是一个两字组),别的
+/// 字符都丢掉。没有两个相连的中日韩字符给 None:这一行不进两字组表
+fn cjk_bigrams(text: &str) -> Option<String> {
+    let mut out = String::new();
+    for pair in cjk_pairs(text) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(pair);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// 两字组表一条消息的增删,`replace_units` 与 `Store::backfill_cjk` 共用。表不存内容,删一行只认
+/// rowid;同一个 rowid 再插一次 SQLite 不报错,旧词却留在索引里——所以写之前,这个 rowid 要么从没
+/// 进过表,要么先 `forget` 过
+struct CjkRows<'c> {
+    del: rusqlite::CachedStatement<'c>,
+    ins: rusqlite::CachedStatement<'c>,
+}
+
+impl<'c> CjkRows<'c> {
+    fn new(conn: &'c Connection) -> rusqlite::Result<Self> {
+        Ok(Self {
+            del: conn.prepare_cached("DELETE FROM messages_cjk WHERE rowid = ?1")?,
+            ins: conn.prepare_cached("INSERT INTO messages_cjk(rowid, text) VALUES (?1, ?2)")?,
+        })
+    }
+
+    /// 删掉一条消息的两字组。`text` 是它入库时的正文:没有一对相连中日韩字符的从没进过表,不删——
+    /// 先看一眼比删一个不在表里的 rowid 便宜好几倍
+    fn forget(&mut self, id: i64, text: &str) -> rusqlite::Result<()> {
+        if cjk_pairs(text).next().is_some() {
+            self.del.execute(params![id])?;
+        }
+        Ok(())
+    }
+
+    /// 写入一条消息的两字组(没有两字组的不写)
+    fn put(&mut self, id: i64, text: &str) -> rusqlite::Result<()> {
+        if let Some(bigrams) = cjk_bigrams(text) {
+            self.ins.execute(params![id, bigrams])?;
+        }
+        Ok(())
+    }
+}
+
+/// 两字组表能不能用:库里记的切法版本与这个二进制的一样(老库在新版 GUI 开过之前没有这张表、也
+/// 没有版本记录;只读的 MCP / CLI 不建表),也补齐了(补齐之前表里只有之后写入的行)。不能用时
+/// 两字词照旧逐条 LIKE
+fn cjk_index_ready(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM schema_meta WHERE key = 'cjk_format' AND value = ?1)
+            AND NOT EXISTS(SELECT 1 FROM schema_meta WHERE key = 'cjk_backfill')",
+    )?
+    .query_row(params![CJK_FORMAT], |r| r.get(0))
+}
+
+/// FTS5 的 MATCH 表达式:每个词项加引号(内部引号翻倍)、AND 连接。各 FTS 表共用,
 /// 转义规则只此一处
 fn fts_match_expr(segs: &[&str]) -> String {
     segs.iter()
@@ -3668,9 +3873,11 @@ fn fts_match_expr(segs: &[&str]) -> String {
         .join(" AND ")
 }
 
-/// LIKE 降级路径的 WHERE:每个词项对每一列各一个 `LIKE ? ESCAPE '\'`(列之间 OR、
-/// 词项之间 AND),参数由 `like_args` 按同一顺序给。正文、标题、记忆三条降级路径共用
-fn like_where(cols: &[&str], terms: usize) -> String {
+/// 逐条 LIKE 的条件与参数,写成接在 WHERE 后面的 ` AND …`(与 `memory_filter` 等筛选片段同形;
+/// 没有词给空串):每个词对每一列各一个 `LIKE ? ESCAPE '\'`,列之间 OR、词之间 AND。有能走索引的
+/// 词时它在候选里过滤剩下的短词,一个都没有时它就是整条查询的条件(接在 `WHERE 1 = 1` 后面)。
+/// 正文、标题、记忆三处共用
+fn like_filter(cols: &[&str], terms: &[&str]) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let per_term = cols
         .iter()
         .map(|c| format!("{c} LIKE ? ESCAPE '\\'"))
@@ -3681,35 +3888,36 @@ fn like_where(cols: &[&str], terms: usize) -> String {
     } else {
         per_term
     };
-    std::iter::repeat_n(per_term, terms)
-        .collect::<Vec<_>>()
-        .join(" AND ")
-}
-
-/// `like_where` 的参数:每个词项转义成 `%term%`,每列一份
-fn like_args(segs: &[&str], cols: usize) -> Vec<Box<dyn rusqlite::ToSql>> {
-    segs.iter()
-        .flat_map(|s| {
-            let pat = format!("%{}%", escape_like(s));
-            std::iter::repeat_n(pat, cols)
-        })
+    let sql = terms.iter().map(|_| format!(" AND {per_term}")).collect();
+    let args = terms
+        .iter()
+        .flat_map(|t| std::iter::repeat_n(format!("%{}%", escape_like(t)), cols.len()))
         .map(|pat| Box::new(pat) as Box<dyn rusqlite::ToSql>)
-        .collect()
+        .collect();
+    (sql, args)
 }
 
 /// 命中片段:以最早出现的检索词为锚,前 40 / 后 80 字符开窗,窗口里每个检索词的每次
-/// 出现都高亮(相邻、重叠的并成一段)。会话正文与记忆的 FTS / LIKE 两条路径、标题的 LIKE
-/// 路径共用这一个(标题的 FTS 路径用 highlight() 给整个标题,标题短,不用开窗):FTS5 的
-/// snippet() 按词元数开窗,trigram 分词下一个词元是三个字符的滑窗,16 个词元只露出十几个
-/// 字,看不出命中在说什么。
+/// 出现都高亮(相邻、重叠的并成一段)。会话正文与记忆的 FTS / LIKE 两条路径共用这一个;
+/// 标题不开窗(`highlight_all`)。FTS5 的 snippet() 按词元数开窗,trigram 分词下一个词元是
+/// 三个字符的滑窗,16 个词元只露出十几个字,看不出命中在说什么
+fn make_snippet(text: &str, segs: &[&str]) -> String {
+    mark_terms(text, segs, Some((40, 80)))
+}
+
+/// 整段原样、每个检索词的每次出现都高亮,不开窗。标题命中用它:标题短,三条标题路径(只有三字
+/// 以上的词、另带短词、全是短词)同一个取法,同一个标题不因查询里有没有短词显示得不一样
+fn highlight_all(text: &str, segs: &[&str]) -> String {
+    mark_terms(text, segs, None)
+}
+
+/// `make_snippet` 与 `highlight_all` 的本体,`window` 是锚点前后各留多少字符。
 ///
 /// 全程按**字符**下标走:逐字符小写并记下每个小写字符来自原文第几个字符——小写
 /// 不保长(Ω→ω、İ→i̇、K→k 字节数与字符数都会变),拿小写串里的字节偏移去切原文正是
 /// 2026-09-21 review 复现的 panic(⌘K 逐字键入 CJK 查询必经此路,后台线程 panic
 /// 直接 abort 整个 app)
-fn make_snippet(text: &str, segs: &[&str]) -> String {
-    const BEFORE: usize = 40;
-    const AFTER: usize = 80;
+fn mark_terms(text: &str, segs: &[&str], window: Option<(usize, usize)>) -> String {
     // 大小写按字符折叠,正文与词项同一个取法、对齐 FTS 的 trigram:它把 ΟΣΟΣ / οσος / οσοσ
     // 当成同一个词。整串 to_lowercase 会把词尾的 Σ 变成 ς(希腊文词尾 sigma 规则),逐字符的
     // 正文那边是 σ,两边就对不上;ς 也并成 σ
@@ -3742,10 +3950,18 @@ fn make_snippet(text: &str, segs: &[&str]) -> String {
     }
     spans.sort_unstable();
     let Some(&(anchor_start, anchor_end)) = spans.first() else {
-        return chars.iter().take(BEFORE + AFTER).collect();
+        return match window {
+            Some((before, after)) => chars.iter().take(before + after).collect(),
+            None => text.to_string(),
+        };
     };
-    let start = anchor_start.saturating_sub(BEFORE);
-    let end = (anchor_end + AFTER).min(chars.len());
+    let (start, end) = match window {
+        Some((before, after)) => (
+            anchor_start.saturating_sub(before),
+            (anchor_end + after).min(chars.len()),
+        ),
+        None => (0, chars.len()),
+    };
     let mut marks: Vec<(usize, usize)> = Vec::new();
     for &(s, e) in &spans {
         if s >= end {
@@ -3837,6 +4053,31 @@ pub fn default_db_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cjk_bigrams_cover_every_pair_and_drop_everything_else() {
+        assert_eq!(cjk_bigrams("部署脚本").as_deref(), Some("部署 署脚 脚本"));
+        // 中日韩字符之外的都断开:单个的字不成对
+        assert_eq!(cjk_bigrams("用 docker 部署").as_deref(), Some("部署"));
+        assert_eq!(cjk_bigrams("ログ設定").as_deref(), Some("ログ グ設 設定"));
+        assert_eq!(cjk_bigrams("로그인").as_deref(), Some("로그 그인"));
+        // `・` 在假名区里但是标点
+        assert_eq!(cjk_bigrams("コー・ヒー").as_deref(), Some("コー ヒー"));
+        assert_eq!(cjk_bigrams("a 字 b"), None);
+        assert_eq!(cjk_bigrams("plain text"), None);
+    }
+
+    #[test]
+    fn terms_go_to_the_index_that_can_answer_them() {
+        let t = Terms::split(&["docker", "部署", "js", "锁", "ログ", "a部"], true);
+        assert_eq!(t.trigram, ["docker"]);
+        assert_eq!(t.bigram, ["部署", "ログ"]);
+        assert_eq!(t.short, ["js", "锁", "a部"]);
+        // 没有两字组表(标题、记忆,或还没补齐)时两字词只能 LIKE
+        let t = Terms::split(&["部署", "js"], false);
+        assert!(t.unindexed());
+        assert_eq!(t.short, ["部署", "js"]);
+    }
+
     /// 把哨兵换成方括号,断言好写好读
     fn shown(s: &str) -> String {
         s.replace(HL_OPEN, "[").replace(HL_CLOSE, "]")
@@ -3860,6 +4101,10 @@ mod tests {
         );
         // 前 40 后 80 字符的窗口,再加两个省略号
         assert!(s.chars().count() <= 40 + 80 + "二维码".chars().count() + 2 + 6);
+        // 标题那种不开窗的:整段原样,每次出现都标
+        let all = shown(&highlight_all(&text, &["二维码"]));
+        assert_eq!(all.replace(['[', ']'], ""), text);
+        assert_eq!(all.matches("[二维码]").count(), 2);
     }
 
     #[test]

@@ -237,6 +237,7 @@ pub const RERANK_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct RerankStage {
     reranker: Arc<dyn Reranker>,
     gate: Arc<Semaphore>,
+    timeout: Duration,
 }
 
 impl RerankStage {
@@ -246,7 +247,25 @@ impl RerankStage {
         Self {
             reranker,
             gate: Arc::new(Semaphore::new(RERANK_MAX_IN_FLIGHT)),
+            timeout: RERANK_TIMEOUT,
         }
+    }
+
+    /// Replace the per-call wall-clock budget ([`RERANK_TIMEOUT`] by
+    /// default). Free-tier hosted providers can spend most of the default
+    /// budget on a single slow 503 before a fallback candidate answers.
+    ///
+    /// Example: `RerankStage::new(reranker).with_timeout(Duration::from_secs(60))`.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The per-call wall-clock budget every search surface applies.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// The wrapped reranker.

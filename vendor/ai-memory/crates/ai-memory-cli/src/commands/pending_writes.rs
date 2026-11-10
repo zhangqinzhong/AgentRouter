@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::{
     PendingWriteIdArgs, PendingWriteRejectArgs, PendingWritesArgs, PendingWritesCommand,
     PendingWritesListArgs,
@@ -35,7 +36,7 @@ struct DiffResponse {
 }
 
 pub async fn run(config: &Config, args: PendingWritesArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let ep = ServerEndpoint::for_checkout(config).await?;
     match args.command {
         PendingWritesCommand::List(args) => list(config, &ep, args).await,
         PendingWritesCommand::Show(args) => show(config, &ep, args).await,
@@ -46,6 +47,7 @@ pub async fn run(config: &Config, args: PendingWritesArgs) -> Result<()> {
 }
 
 async fn list(config: &Config, ep: &ServerEndpoint, args: PendingWritesListArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let limit = args.limit.to_string();
@@ -61,16 +63,23 @@ async fn list(config: &Config, ep: &ServerEndpoint, args: PendingWritesListArgs)
     if args.json {
         println!("{}", serde_json::to_string_pretty(&proposals)?);
     } else if proposals.is_empty() {
-        println!("(no pending writes)");
+        println!("{}", i18n.text("cli-pending-writes-no-pending-writes"));
     } else {
         for p in proposals {
-            println!("{}  {}  {}  {}", p.id, p.status, p.operation, p.target_path);
+            println!(
+                "{}  {}  {}  {}",
+                terminal_text(&p.id),
+                terminal_text(&p.status),
+                terminal_text(&p.operation),
+                terminal_text(&p.target_path)
+            );
         }
     }
     Ok(())
 }
 
 async fn show(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let detail: ProposalDetail = get_json(
@@ -87,11 +96,19 @@ async fn show(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) ->
     } else {
         println!(
             "{} [{}] {}",
-            detail.summary.target_path, detail.summary.status, detail.summary.title
+            terminal_text(&detail.summary.target_path),
+            terminal_text(&detail.summary.status),
+            terminal_text(&detail.summary.title)
         );
         println!(
-            "\n{}\n\n--- body ---\n{}",
-            detail.rationale, detail.body_markdown
+            "{}",
+            i18n.format(
+                "cli-pending-writes-body",
+                &[
+                    ("value0", terminal_body(&detail.rationale)),
+                    ("value1", terminal_body(&detail.body_markdown))
+                ]
+            )
         );
     }
     Ok(())
@@ -112,12 +129,13 @@ async fn diff(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) ->
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
-        print!("{}", resp.diff);
+        print!("{}", terminal_body(&resp.diff));
     }
     Ok(())
 }
 
 async fn approve(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let resp: serde_json::Value = post_json_with_query(
@@ -133,12 +151,19 @@ async fn approve(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs)
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
-        println!("✓ approved {}", args.id);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-pending-writes-approved",
+                &[("value0", args.id.to_string())]
+            )
+        );
     }
     Ok(())
 }
 
 async fn reject(config: &Config, ep: &ServerEndpoint, args: PendingWriteRejectArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let resp: serde_json::Value = post_json_with_query(
@@ -154,7 +179,13 @@ async fn reject(config: &Config, ep: &ServerEndpoint, args: PendingWriteRejectAr
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
-        println!("✓ rejected {}", args.id);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-pending-writes-rejected",
+                &[("value0", args.id.to_string())]
+            )
+        );
     }
     Ok(())
 }

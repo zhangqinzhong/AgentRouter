@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::CheckpointsArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -21,6 +22,7 @@ struct CheckpointResponse {
 /// Returns an error if the server is unreachable or returns a non-2xx
 /// response.
 pub async fn run(config: &Config, args: CheckpointsArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let limit = args.limit.to_string();
     let checkpoints: Vec<CheckpointResponse> = get_json(
@@ -36,12 +38,17 @@ pub async fn run(config: &Config, args: CheckpointsArgs) -> Result<()> {
     }
 
     if checkpoints.is_empty() {
-        println!("no wiki checkpoints found");
+        println!("{}", i18n.text("cli-checkpoints-no-wiki-checkpoints-found"));
         return Ok(());
     }
 
     for cp in checkpoints {
-        println!("{}  {}  {}", cp.short_oid, cp.time, cp.summary);
+        println!(
+            "{}  {}  {}",
+            terminal_text(&cp.short_oid),
+            cp.time,
+            terminal_text(&cp.summary)
+        );
     }
     Ok(())
 }

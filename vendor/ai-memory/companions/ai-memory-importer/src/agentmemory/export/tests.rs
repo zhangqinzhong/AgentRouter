@@ -439,6 +439,54 @@ async fn resume_after_an_injected_failure_writes_no_duplicates() {
 }
 
 #[tokio::test]
+async fn resume_refuses_an_edited_body_even_with_the_original_ingest_key() {
+    let fixture = fixture_files(
+        &json!({"memories": [
+            {"id": "mem_q1", "project": "api", "version": 1,
+             "title": "First policy", "content": "Initial source body."},
+            {"id": "mem_q2", "project": "api", "version": 2, "parentId": "mem_q1",
+             "title": "Second policy", "content": "New source body."}
+        ]}),
+        &fixture_mapping(),
+    );
+    let server = MockServer::start(&[]);
+    server.state().failure = Some(Failure::Before(2));
+    assert!(run(args(&fixture, &server.url)).await.is_err());
+
+    // A normal destination edit preserves the import's attribution footer.
+    // Its new page_id must not become the precondition for importing v2.
+    let edited_body = {
+        let mut state = server.state();
+        state.failure = None;
+        let chain = state
+            .pages
+            .get_mut(&("acme".into(), "acme-api".into(), CHAIN.into()))
+            .unwrap();
+        let mut edited = chain.last().unwrap().clone();
+        edited.page_id = "destination-edit".into();
+        edited
+            .body
+            .insert_str(0, "Keep this destination correction.\n\n");
+        let body = edited.body.clone();
+        chain.push(edited);
+        body
+    };
+
+    let error = run(args(&fixture, &server.url)).await.unwrap_err();
+    assert!(error.to_string().contains("did not write"), "{error:#}");
+    let state = server.state();
+    let chain = state.chain("acme", "acme-api", CHAIN);
+    assert_eq!(chain.len(), 2, "no source version replaces the edit");
+    assert_eq!(chain[1].page_id, "destination-edit");
+    assert_eq!(chain[1].body, edited_body);
+    assert_eq!(state.stored_versions(), 2, "the run stops at the conflict");
+    let manifest = read_manifest(&fixture.manifest);
+    assert_eq!(manifest["status"], "failed");
+    assert_eq!(manifest["written_versions"], 0);
+    assert_eq!(manifest["present_versions"], 0);
+}
+
+#[tokio::test]
 async fn observations_replay_as_ordered_external_import_sessions_when_asked() {
     let fixture = fixture_files(&fixture_export(), &fixture_mapping());
     let server = MockServer::start(&[]);

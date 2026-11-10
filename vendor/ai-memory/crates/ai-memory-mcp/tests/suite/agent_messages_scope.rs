@@ -81,7 +81,7 @@ impl Harness {
             move || Ok(server.clone()),
             LocalSessionManager::default().into(),
             StreamableHttpServerConfig::default()
-                .with_stateful_mode(false)
+                .with_legacy_session_mode(false)
                 .with_json_response(true),
         );
         Self {
@@ -343,4 +343,112 @@ async fn unscoped_list_names_the_mailbox_it_read_even_when_not_empty() {
             assert!(listed.get("resolved_scope").is_none(), "{listed}");
         }
     }
+}
+
+/// A static client derives the sender from the git remote (`acme-api`). An
+/// empty leftover row under that literal name no longer blocks the send: the
+/// message is stamped with the project that owns the repository (#2018). A
+/// leftover that holds data keeps it refused, and the refusal says what to
+/// pass instead.
+#[tokio::test]
+async fn a_sender_named_by_its_remote_reaches_the_repository_owner_past_an_empty_twin() {
+    let h = Harness::new().await;
+    let conn = rusqlite::Connection::open(h.store.db_path()).expect("db");
+    conn.execute(
+        "UPDATE projects SET identity = 'github.com/acme/api', identity_source = 'git_remote', \
+         canonical_name = 'acme-api', legacy_name = 'api' WHERE id = ?1",
+        [h.a.as_bytes().to_vec()],
+    )
+    .expect("owner identity");
+    let twin = ProjectId::new();
+    conn.execute(
+        "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, 'acme-api', 0)",
+        rusqlite::params![twin.as_bytes().to_vec(), h.ws.as_bytes().to_vec()],
+    )
+    .expect("twin");
+
+    h.send("acme-api", C, "hello from the repository").await;
+    assert_eq!(h.outbox_len(h.a).await, 1, "stamped with the owner");
+    assert_eq!(h.outbox_len(twin).await, 0);
+
+    h.store
+        .writer
+        .begin_session(ai_memory_core::NewSession {
+            occurred_at: None,
+            id: ai_memory_core::SessionId::new(),
+            workspace_id: h.ws,
+            project_id: twin,
+            agent_kind: ai_memory_core::AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .expect("twin session");
+    let err = h
+        .call(
+            None,
+            "memory_message_send",
+            json!({
+                "from_workspace": WS, "from_project": "acme-api",
+                "to_workspace": WS, "to_project": C, "body": "ambiguous now",
+            }),
+        )
+        .await
+        .expect_err("a twin with data keeps the name ambiguous");
+    assert!(err.contains("is ambiguous"), "{err}");
+    assert!(
+        err.contains("for the project of repository github.com/acme/api, pass project 'project-a'"),
+        "{err}"
+    );
+    assert_eq!(
+        h.pending_for(h.c).await,
+        1,
+        "only the first message arrived"
+    );
+}
+
+/// Both recipient fields are required (#2082, `docs/security-boundaries.md`
+/// row 8f). A blank one used to fall through to the caller's inferred current
+/// project, delivering the message into the sender's own inbox instead of
+/// refusing it. The sender here is explicit, so only the required-recipient
+/// guard is under test.
+#[tokio::test]
+async fn blank_recipient_send_is_refused_and_lands_in_no_inbox() {
+    let h = Harness::new().await;
+    for (to_ws, to_proj) in [("", "  "), ("", C), (WS, "")] {
+        let err = h
+            .call(
+                None,
+                "memory_message_send",
+                json!({
+                    "from_workspace": WS, "from_project": A,
+                    "to_workspace": to_ws, "to_project": to_proj,
+                    "body": "hello?",
+                }),
+            )
+            .await
+            .expect_err("a blank recipient coordinate must be refused");
+        assert!(
+            err.contains("to_workspace and to_project are required"),
+            "{to_ws:?}/{to_proj:?}: {err}"
+        );
+    }
+    // Nothing was delivered anywhere — in particular not into the sender's
+    // own inbox (project-a), which is where the fall-through used to land it.
+    assert_eq!(h.pending_for(h.a).await, 0, "sender inbox stays empty");
+    assert_eq!(h.pending_for(h.b).await, 0, "the inferred slot stays empty");
+    assert_eq!(h.pending_for(h.c).await, 0, "no phantom delivery");
+
+    // Control: a fully named recipient proceeds and lands in that inbox.
+    h.send(A, C, "please do X").await;
+    assert_eq!(
+        h.pending_for(h.c).await,
+        1,
+        "the named recipient received it"
+    );
+    assert_eq!(
+        h.pending_for(h.a).await,
+        0,
+        "still not in the sender's inbox"
+    );
 }

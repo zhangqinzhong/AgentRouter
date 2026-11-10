@@ -324,8 +324,12 @@ pub async fn run(args: &SyncArgs, mode: SyncMode) -> Result<Outcome> {
         Mode::DryRun
     };
     let dest_root = sync::resolve_dest(&run_args.dest, fs_mode)?;
+    let _write_lock = (mode == SyncMode::Apply)
+        .then(|| state::acquire_write_lock(&dest_root))
+        .transpose()?;
     let stateless_check = mode == SyncMode::Check && !state::state_path(&dest_root).exists();
-    let old_state = state::load(&dest_root)?;
+    let scope = state::SyncScope::of(&run_args.server, &run_args.workspace, &run_args.project);
+    let old_state = sync::baseline_for(state::load(&dest_root)?, &scope, run_args.adopt_scope)?;
     let api = ApiClient::new(&run_args.server, run_args.token.clone())?;
 
     let plan = build_plan(
@@ -464,9 +468,15 @@ async fn build_plan(
         let mut etag = None;
         let mut rendered = None;
         if on_server.contains(&path) {
-            let hint = disk
-                .as_ref()
-                .and(base.and_then(|base| base.etag.as_deref()));
+            // An edited file needs metadata and a version id from the same
+            // read we classify. Following a 304 with a full read could pick
+            // up a concurrent edit and import over it without a conflict.
+            let hint = base
+                .filter(|base| {
+                    disk.as_ref()
+                        .is_some_and(|disk| state::sha256_hex(disk) == base.hash)
+                })
+                .and_then(|base| base.etag.as_deref());
             let read = api
                 .read_page(&run_args.workspace, &run_args.project, &path, hint)
                 .await?;
@@ -730,6 +740,11 @@ async fn apply_plan(
     plan: Plan,
 ) -> Result<Applied> {
     let mut new_state = old_state.clone();
+    new_state.scope = Some(state::SyncScope::of(
+        &args.server,
+        &args.workspace,
+        &args.project,
+    ));
     new_state.pages.extend(plan.adopted);
     for path in &plan.forget {
         new_state.pages.remove(path);
@@ -797,13 +812,13 @@ async fn apply_plan(
         );
     }
     for delete in &plan.server_deletes {
-        let result = match &delete.expected_page_id {
-            Some(expected) => mcp.delete_page(&scope, &delete.path, expected).await,
-            None => Err(anyhow::anyhow!(mcp::server_too_old())),
-        };
-        match result {
-            Ok(()) => {
+        match delete_server_page(mcp, &scope, dest_root, delete).await {
+            Ok(true) => {
                 new_state.pages.remove(&delete.path);
+            }
+            Ok(false) => {
+                report_local_change(&delete.path);
+                applied.raced.push(delete.path.clone());
             }
             Err(error) if error.is::<PreconditionFailed>() => {
                 report_race(&delete.path, &error);
@@ -853,6 +868,32 @@ fn report_race(path: &str, error: &anyhow::Error) {
         "  {:<9} {path} — {error}; left for the next sync",
         "CHANGED"
     );
+}
+
+/// A planned server deletion depends on the repository file still being
+/// absent. Recheck immediately before the request, without reading a recreated
+/// file's content; the server separately guards its own version.
+async fn delete_server_page(
+    mcp: &McpClient,
+    scope: &Scope<'_>,
+    dest_root: &Path,
+    delete: &ServerDelete,
+) -> Result<bool> {
+    let target = paths::secure_join(dest_root, &delete.path)?;
+    match fs::symlink_metadata(&target) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::Error::new(error))
+                .context(format!("cannot inspect {}", target.display()));
+        }
+    }
+    let expected = delete
+        .expected_page_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!(mcp::server_too_old()))?;
+    mcp.delete_page(scope, &delete.path, expected).await?;
+    Ok(true)
 }
 
 /// Delete one repository file through the same confinement as every write:

@@ -43,6 +43,7 @@ struct PurgeProjectRequest {
 /// confirmed run or `"Would purge"` for a preview — everything else about
 /// the line is identical, so a script matching one also matches the other.
 fn purge_summary_line(verb: &str, label: &str, report: &serde_json::Value) -> String {
+    let label = super::show::terminal_text(label);
     let pages = report["pages_deleted"].as_u64().unwrap_or(0);
     let sessions = report["sessions_deleted"].as_u64().unwrap_or(0);
     let observations = report["observations_deleted"].as_u64().unwrap_or(0);
@@ -169,6 +170,7 @@ fn derived_target_warning(
 /// preview surfaced), the server is unreachable, or the server returns a
 /// non-2xx response.
 pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
@@ -207,7 +209,10 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             ),
             id.clone(),
         ),
-        (None, None) => bail!("one of --project or --project-id is required"),
+        (None, None) => bail!(
+            "{}",
+            i18n.text("cli-move-project-one-of-project-or-project-id-is-required")
+        ),
     };
 
     if !args.confirm {
@@ -220,19 +225,25 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             compact: args.compact,
             dry_run: true,
         };
-        let outcome = run_preview(config, "/admin/purge-project", &request).await;
+        let outcome = run_preview(config, "/admin/purge-project", &request).await?;
         let fallback_label = format!("{}/{}", workspace, target_label);
         if let Some(line) = preview_message(&outcome, &fallback_label) {
             println!("{line}");
         }
         bail!(
-            "purge-project is destructive and irreversible.\n\
-             Re-run with --confirm to proceed:\n\n  {}",
-            confirm_command(&workspace, &target_flag, &args),
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-purge-project-purge-project-is-destructive-and-irreversible-re-run-with-confirm-to-proceed",
+                &[(
+                    "value0",
+                    confirm_command(&workspace, &target_flag, &args).to_string()
+                )]
+            )
         );
     }
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     // The name was derived, not typed: say so before the irreparable step, and
     // name the exact command that would have been unambiguous (#1642).
     if args.project.is_none() && args.project_id.is_none() {
@@ -264,30 +275,25 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
         && !ids.is_empty()
     {
         println!(
-            "The following workstream segment directories are now orphaned under \
-             <data_dir>/raw/workstreams/ and can be removed:"
-        );
+            "{}", i18n.text("cli-purge-project-the-following-workstream-segment-directories-are-now-orphaned-under-data-dir"));
         for id in ids.iter().filter_map(serde_json::Value::as_str) {
-            println!("  - {id}");
+            println!("  - {}", super::show::terminal_text(id));
         }
     }
     if let Some(failed) = report["files_failed"].as_array()
         && !failed.is_empty()
     {
         println!(
-            "Warning: {} wiki file(s) could not be removed from disk (DB rows are gone).",
-            failed.len()
-        );
+            "{}", i18n.format("cli-purge-project-warning-wiki-file-s-could-not-be-removed-from-disk-db-rows-are-gone", &[("value0", format!("{}", failed.len()))]));
     }
     if report["compacted"].as_bool().unwrap_or(false) {
-        println!("Database compacted: freed bytes reclaimed.");
+        println!(
+            "{}",
+            i18n.text("cli-purge-project-database-compacted-freed-bytes-reclaimed")
+        );
     } else {
         println!(
-            "Note: this was a logical delete. The project is unreachable through \
-             the API and search, but its bytes remain in the database file until \
-             it is rewritten. Re-run with --compact to reclaim them (slow), and \
-             see docs/lifecycle-ops.md for what that does and does not guarantee."
-        );
+            "{}", i18n.text("cli-purge-project-note-this-was-a-logical-delete-the-project-is-unreachable-through-the-api-an"));
     }
     Ok(())
 }
@@ -492,10 +498,18 @@ mod tests {
     // above.
     // -----------------------------------------------------------------
 
+    /// The preview follows this checkout's marker (#2016), so the config pins
+    /// the directory and home to the temp dir: a marker above the developer's
+    /// checkout must not decide where these previews go.
     fn config_for(tmp: &tempfile::TempDir, server_url: String) -> Config {
+        let dir = tmp.path().to_string_lossy().into_owned();
         Config {
             data_dir: tmp.path().to_path_buf(),
             server_url,
+            runtime_env: crate::config::RuntimeEnv::with_host_cwd_and_home_for_tests(
+                dir.clone(),
+                dir,
+            ),
             ..Config::default()
         }
     }
@@ -542,7 +556,9 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-project", &preview_request())
+            .await
+            .unwrap();
         assert!(matches!(outcome, PreviewOutcome::OlderServer));
         assert!(preview_message(&outcome, "default/scratch").is_none());
     }
@@ -558,7 +574,9 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-project", &preview_request())
+            .await
+            .unwrap();
         match &outcome {
             PreviewOutcome::Refused { status, body } => {
                 assert_eq!(*status, 404);
@@ -588,26 +606,40 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-project", &preview_request())
+            .await
+            .unwrap();
         let msg = preview_message(&outcome, "default/scratch").expect("must print a line");
         assert!(msg.starts_with("Would purge default/scratch: 3 pages, 1 sessions, 1063"));
     }
 
-    /// Nothing listening at all (connection refused) must classify as
-    /// `Unreachable`, the same as a timeout — both are silent fallbacks.
+    /// A dropped connection must classify as `Unreachable`, the same as a
+    /// timeout — both are silent fallbacks.
     #[tokio::test]
-    async fn run_preview_classifies_a_connection_failure_as_unreachable() {
+    async fn run_preview_classifies_a_dropped_connection_as_unreachable() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // Bind then drop immediately: the port is very likely free again by
-        // the time the request lands, and nothing else can be listening on
-        // it inside this test's short lifetime.
+        // Own the endpoint until the request arrives; releasing a reserved
+        // port first lets another concurrent test answer the preview instead.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            // Close after receiving the request, without an HTTP response.
+        });
         let config = config_for(&tmp, format!("http://{addr}"));
-        let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-project", &preview_request())
+            .await
+            .unwrap();
         assert!(matches!(outcome, PreviewOutcome::Unreachable));
         assert!(preview_message(&outcome, "default/scratch").is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("the preview must reach the fixture")
+            .unwrap();
     }
 
     // -----------------------------------------------------------------

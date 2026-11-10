@@ -53,6 +53,23 @@ fn render(body: &str, workspace: &str, project: &str) -> String {
     render_document(body, workspace, project).html
 }
 
+/// Render bundled product docs with repository-aware links, without wiki routing.
+pub(crate) fn render_reference_document(
+    body: &str,
+    mut rewrite: impl FnMut(&str) -> String,
+) -> Rendered {
+    let mut headings = HeadingIdAssigner::new(Parser::new_ext(body, options()));
+    let events = headings
+        .by_ref()
+        .map(|event| sanitize_event_with_links(event, |url| CowStr::Boxed(rewrite(&url).into())));
+    let mut html = String::new();
+    html::push_html(&mut html, events);
+    Rendered {
+        html,
+        outline: headings.outline,
+    }
+}
+
 /// A rendered page body and the headings it contains.
 pub struct Rendered {
     /// The sanitized HTML.
@@ -554,6 +571,13 @@ fn slugify(text: &str) -> String {
 }
 
 fn sanitize_event<'a>(event: Event<'a>, workspace: &str, project: &str) -> Event<'a> {
+    sanitize_event_with_links(event, |url| scope_relative_link(url, workspace, project))
+}
+
+fn sanitize_event_with_links<'a>(
+    event: Event<'a>,
+    mut rewrite: impl FnMut(CowStr<'a>) -> CowStr<'a>,
+) -> Event<'a> {
     match event {
         Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
         Event::Start(Tag::Link {
@@ -565,7 +589,7 @@ fn sanitize_event<'a>(event: Event<'a>, workspace: &str, project: &str) -> Event
             link_type,
             // Scope relative in-wiki targets first (#603), then run the
             // scheme allowlist over whatever remains.
-            dest_url: safe_url(scope_relative_link(dest_url, workspace, project)),
+            dest_url: safe_url(rewrite(dest_url)),
             title,
             id,
         }),
@@ -1555,5 +1579,24 @@ mod tests {
             html.contains(r#"<h2 id="my-section">My Section</h2>"#),
             "heading id: {html}"
         );
+    }
+}
+
+#[cfg(test)]
+mod reference_document_tests {
+    #[test]
+    fn bundled_guides_keep_unsafe_markup_inert_and_use_document_anchors() {
+        let doc = crate::documentation::find("features").unwrap();
+        let rendered = super::render_reference_document(
+            "# Example\n\n<script>alert(1)</script>\n\n[x](javascript:alert) [guide](install.md) [local](#example)\n\n```text\n[[private-page]]\n```",
+            |url| crate::documentation::link(doc, "docs/features", url),
+        );
+        assert!(!rendered.html.contains("<script>"));
+        assert!(rendered.html.contains("&lt;script&gt;"));
+        assert!(!rendered.html.contains("href=\"javascript:"));
+        assert!(rendered.html.contains("href=\"docs/install\""));
+        assert!(rendered.html.contains("href=\"docs/features#example\""));
+        assert!(rendered.html.contains("[[private-page]]"));
+        assert_eq!(rendered.outline[0].id, "example");
     }
 }

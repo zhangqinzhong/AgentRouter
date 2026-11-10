@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::hook_spool::{SpoolHealth, spool_dir, spool_health};
+use super::show::terminal_text;
 use crate::cli::StatusArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -76,6 +77,38 @@ struct Report {
     /// Wiki-format state (2.0 servers).
     #[serde(default)]
     wiki_format: Option<WikiFormatReport>,
+    /// SessionEnd consolidation queue (#1692). Absent from older servers, and
+    /// skipped on the way out so their shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consolidation: Option<ConsolidationReport>,
+}
+
+/// Consolidation queue as the server reports it: counts plus the sessions that
+/// gave up, so a watchdog reads one JSON field instead of parsing logs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ConsolidationReport {
+    #[serde(default)]
+    pending: u64,
+    #[serde(default)]
+    running: u64,
+    #[serde(default)]
+    completed: u64,
+    #[serde(default)]
+    failed: u64,
+    #[serde(default)]
+    failed_sessions: Vec<FailedConsolidationSession>,
+}
+
+/// One failed session from [`ConsolidationReport`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct FailedConsolidationSession {
+    session_id: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    failed_at_us: i64,
+    #[serde(default)]
+    last_error: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -142,11 +175,11 @@ struct EmbeddingTriple {
 /// Run the `status` subcommand.
 ///
 /// # Errors
-/// Print local spool state when the server could not be reached.
+/// Print local spool state when the server could not be reached or returned an error.
 ///
 /// Goes to stderr so it cannot corrupt `--json` consumers, which expect a
 /// single object on stdout and get a non-zero exit here anyway. The
-/// unreachable-server error still propagates unchanged; this only adds the
+/// underlying error still propagates unchanged; this only adds the
 /// local half of the picture that the caller can actually act on.
 /// Render the last-persisted stamp as an age, or `-` when this server
 /// process has not written an event yet.
@@ -162,38 +195,84 @@ fn last_write_line(unix_ms: Option<u64>) -> String {
     spool_age_line(Some(now_ms.saturating_sub(ms)))
 }
 
-fn report_offline_spool(spool: &SpoolHealth, json: bool) {
+fn report_offline_spool(
+    i18n: &ai_memory_core::i18n::Localizer,
+    spool: &SpoolHealth,
+    json: bool,
+    unreachable: bool,
+) {
     if json {
         if let Ok(rendered) = serde_json::to_string(spool) {
-            eprintln!("local spool (server unreachable): {rendered}");
+            let key = if unreachable {
+                "cli-status-local-spool-server-unreachable-rendered"
+            } else {
+                "cli-status-local-spool-rendered"
+            };
+            eprintln!("{}", i18n.format(key, &[("value0", rendered.to_string())]));
         }
         return;
     }
-    eprintln!("local spool (server unreachable):");
-    eprintln!("  pending:    {}", spool.pending);
-    eprintln!("  oldest:     {}", spool_age_line(spool.oldest_age_ms));
-    eprintln!("  retries:    {}", spool.retries_total);
+    let header_key = if unreachable {
+        "cli-status-local-spool-server-unreachable"
+    } else {
+        "cli-status-local-spool"
+    };
+    eprintln!("{}", i18n.text(header_key));
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-pending",
+            &[("value0", format!("{}", spool.pending))]
+        )
+    );
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-oldest",
+            &[("value0", spool_age_line(spool.oldest_age_ms).to_string())]
+        )
+    );
+    eprintln!(
+        "{}",
+        i18n.format(
+            "cli-status-retries",
+            &[("value0", format!("{}", spool.retries_total))]
+        )
+    );
     if spool.at_capacity() {
+        let msg_key = if unreachable {
+            "cli-status-the-spool-is-full-events-newly-captured-events-are-dropped-until-space-is-av"
+        } else {
+            "cli-status-the-spool-is-full-events-newly-captured-events-are-dropped-until-space-is-av-reachable"
+        };
         eprintln!(
-            "  The spool is full ({} events): newly captured events are dropped until \
-             space is available. Bring the server back to stop the loss.",
-            spool.capacity
+            "{}",
+            i18n.format(msg_key, &[("value0", format!("{}", spool.capacity))])
         );
     } else if spool.pending > 0 {
+        let msg_key = if unreachable {
+            "cli-status-event-s-are-queued-locally-and-will-be-delivered-once-the-server-is-reachabl"
+        } else {
+            "cli-status-event-s-are-queued-locally"
+        };
         eprintln!(
-            "  {} event(s) are queued locally and will be delivered once the \
-             server is reachable again.",
-            spool.pending
+            "{}",
+            i18n.format(msg_key, &[("value0", format!("{}", spool.pending))])
         );
     }
 }
 
-/// One line pointing at `ai-memory recover` while the server is down, when
-/// there is actually something waiting: queued hook events or journaled
+/// One line pointing at `ai-memory recover` while the server is down or reporting
+/// an error, when there is actually something waiting: queued hook events or journaled
 /// outage runs. Goes to stderr like the spool block above, so `--json`
 /// consumers' stdout stays a single object.
-fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool) {
-    for line in offline_recovery_hint_lines(config, spool, json) {
+fn report_offline_recovery_hint(
+    config: &Config,
+    spool: &SpoolHealth,
+    json: bool,
+    unreachable: bool,
+) {
+    for line in offline_recovery_hint_lines(config, spool, json, unreachable) {
         eprintln!("{line}");
     }
 }
@@ -210,7 +289,12 @@ fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool
 /// The online path at `status/presentation.rs` and `journal_error` in
 /// [`json_report`] already treat it as reportable; this matches their label
 /// and key.
-fn offline_recovery_hint_lines(config: &Config, spool: &SpoolHealth, json: bool) -> Vec<String> {
+fn offline_recovery_hint_lines(
+    config: &Config,
+    spool: &SpoolHealth,
+    json: bool,
+    unreachable: bool,
+) -> Vec<String> {
     let (journal_pending, _, _, journal_error) = super::recovery::journal_summary(&config.data_dir);
     if spool.pending == 0 && journal_pending == 0 && journal_error.is_none() {
         return Vec::new();
@@ -221,32 +305,52 @@ fn offline_recovery_hint_lines(config: &Config, spool: &SpoolHealth, json: bool)
             "journal_error": journal_error,
             "spool_pending": spool.pending,
         });
-        return vec![format!("recovery hint (server unreachable): {rendered}")];
+        let label = if unreachable {
+            "recovery hint (server unreachable)"
+        } else {
+            "recovery hint"
+        };
+        return vec![format!("{label}: {rendered}")];
     }
     let mut lines = Vec::new();
     if let Some(error) = &journal_error {
         lines.push(format!("  error:      {error}"));
     }
-    lines.push(format!(
-        "  run `{}` once the server is back to deliver queued events and \
-         repair unrecorded runs ({journal_pending} journaled)",
-        fix_lines::RECOVER
-    ));
+    if unreachable {
+        lines.push(format!(
+            "  run `{}` once the server is back to deliver queued events and \
+             repair unrecorded runs ({journal_pending} journaled)",
+            fix_lines::RECOVER
+        ));
+    } else {
+        lines.push(format!(
+            "  run `{}` to deliver queued events and \
+             repair unrecorded runs ({journal_pending} journaled)",
+            fix_lines::RECOVER
+        ));
+    }
     lines
 }
 
-/// The missing logon binary while the server is down, on stderr like the
-/// spool block, so `--json` consumers' stdout stays a single object.
+/// The missing logon binary while the server is down or reporting an error,
+/// on stderr like the spool block, so `--json` consumers' stdout stays a single object.
 fn report_offline_logon_binary(
+    i18n: &ai_memory_core::i18n::Localizer,
     problem: Option<&super::user_service::MissingLogonBinary>,
     json: bool,
+    unreachable: bool,
 ) {
     let Some(problem) = problem else {
         return;
     };
     if json {
         if let Ok(rendered) = serde_json::to_string(problem) {
-            eprintln!("windows logon (server unreachable): {rendered}");
+            let key = if unreachable {
+                "cli-status-windows-logon-server-unreachable-rendered"
+            } else {
+                "cli-status-windows-logon-rendered"
+            };
+            eprintln!("{}", i18n.format(key, &[("value0", rendered.to_string())]));
         }
         return;
     }
@@ -269,6 +373,7 @@ fn resolve_capture_mode(data_dir: &std::path::Path) -> &'static str {
 /// Returns an error if the server is unreachable, returns non-2xx, or
 /// the response can't be parsed.
 pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     let capture_mode = resolve_capture_mode(&config.data_dir);
 
@@ -288,10 +393,38 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     let report: Report = match get_json::<Report>(&ep, "/admin/status", &[]).await {
         Ok(report) => report,
         Err(err) => {
-            report_offline_spool(&spool, args.json);
-            report_offline_recovery_hint(config, &spool, args.json);
-            report_offline_logon_binary(windows_logon.as_ref(), args.json);
-            return Err(err);
+            let unreachable = crate::http_client::server_unreachable(&err);
+            report_offline_spool(i18n, &spool, args.json, unreachable);
+            report_offline_recovery_hint(config, &spool, args.json, unreachable);
+            report_offline_logon_binary(i18n, windows_logon.as_ref(), args.json, unreachable);
+            if unreachable {
+                return Err(err);
+            }
+            if let Some(server_err) = err.downcast_ref::<crate::http_client::ServerResponseError>()
+            {
+                let context = match server_err.status() {
+                    reqwest::StatusCode::UNAUTHORIZED => i18n.format(
+                        "cli-status-server-reachable-unauthenticated",
+                        &[("url", crate::http_client::display_url(&ep.url))],
+                    ),
+                    reqwest::StatusCode::FORBIDDEN => i18n.format(
+                        "cli-status-server-reachable-forbidden",
+                        &[("url", crate::http_client::display_url(&ep.url))],
+                    ),
+                    status => i18n.format(
+                        "cli-status-server-reachable-error",
+                        &[
+                            ("url", crate::http_client::display_url(&ep.url)),
+                            ("status", status.to_string()),
+                        ],
+                    ),
+                };
+                return Err(err.context(context));
+            }
+            return Err(err.context(i18n.format(
+                "cli-status-server-reachable-unprocessed",
+                &[("url", crate::http_client::display_url(&ep.url))],
+            )));
         }
     };
     let (journal_pending, journal_degraded, journal_finish_failed, journal_error) =
@@ -318,7 +451,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         );
     } else {
         presentation::render(
-            &crate::terminal::Terminal::stdout(&config.runtime_env),
+            &crate::terminal::Terminal::stdout(&config.runtime_env, &config.i18n),
             presentation::View {
                 report: &report,
                 ep: &ep,
@@ -340,7 +473,11 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
 /// completed call, and its most notable state (an open circuit takes
 /// priority over a stale last-error status).
 fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String {
-    let mut line = format!("{}/{}", candidate.provider, candidate.model);
+    let mut line = format!(
+        "{}/{}",
+        terminal_text(&candidate.provider),
+        terminal_text(&candidate.model)
+    );
     if candidate.last_selected {
         line.push_str(" (last selected)");
     }
@@ -349,7 +486,7 @@ fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String
     } else if let Some(status) = candidate.last_error_status {
         line.push_str(&format!(" — last error: status {status}"));
     } else if let Some(class) = &candidate.last_error_class {
-        line.push_str(&format!(" — last error: {class}"));
+        line.push_str(&format!(" — last error: {}", terminal_text(class)));
     }
     line
 }
@@ -371,6 +508,41 @@ pub(super) fn spool_age_line(age_ms: Option<u64>) -> String {
     } else {
         format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3600)
     }
+}
+
+/// This binary's version. `report.version` is the server's, and the two drift
+/// apart when a split install (native client, server in a container or on
+/// another host) upgrades only one side.
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The client line of the human report, plus a warning when the client and
+/// the server differ in major version, the only difference the semver policy
+/// treats as breaking. A version that does not start with a number never
+/// warns.
+fn client_version_lines(
+    i18n: &ai_memory_core::i18n::Localizer,
+    server_version: &str,
+    client_version: &str,
+) -> Vec<String> {
+    let mut lines = vec![i18n.one("cli-status-client-version", client_version)];
+    let major = |version: &str| -> Option<u64> {
+        version
+            .trim_start_matches('v')
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    };
+    if let (Some(server), Some(client)) = (major(server_version), major(client_version))
+        && server != client
+    {
+        lines.push(i18n.two(
+            "cli-status-major-version-mismatch",
+            client_version,
+            server_version,
+        ));
+    }
+    lines
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -409,7 +581,11 @@ fn json_report(
         },
         "capture_mode": capture_mode,
         "ingest": report.ingest,
-        "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
+        "client": {
+            "version": CLIENT_VERSION,
+            "server_url": endpoint.url,
+            "auth": endpoint.auth_token.is_some(),
+        },
         "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
     });
     // Absent when there is nothing to say, so the shape consumers read is
@@ -417,40 +593,57 @@ fn json_report(
     if let Some(problem) = windows_logon {
         value["windows_logon"] = serde_json::json!(problem);
     }
+    // Present whenever the server reports it; an older server has no queue in
+    // `/admin/status`, and its shape stays exactly as before (#1692).
+    if let Some(consolidation) = report.consolidation {
+        value["consolidation"] = serde_json::json!(consolidation);
+    }
     value
 }
 
-fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
+fn provider_health_line(
+    i18n: &ai_memory_core::i18n::Localizer,
+    role: &ProviderRoleHealthSnapshot,
+) -> String {
     match role.status {
-        ProviderHealthStatus::Disabled => "disabled".to_string(),
+        ProviderHealthStatus::Disabled => i18n.text("cli-status-provider-disabled"),
         ProviderHealthStatus::Unknown => {
-            format!("{} unknown (no calls yet)", provider_label(role))
+            i18n.one("cli-status-provider-unknown", provider_label(role))
         }
         ProviderHealthStatus::Ok => {
             let when = role
                 .last_call_at
                 .as_ref()
                 .map(ToString::to_string)
-                .unwrap_or_else(|| "unknown time".to_string());
-            format!("{} ok (last call: {when})", provider_label(role))
+                .unwrap_or_else(|| i18n.text("cli-status-time-unknown"));
+            i18n.two("cli-status-provider-ok", provider_label(role), when)
         }
         ProviderHealthStatus::Error => {
-            let detail = error_detail(role);
-            format!("{} error ({detail})", provider_label(role))
+            let detail = error_detail(i18n, role);
+            i18n.two("cli-status-provider-error", provider_label(role), detail)
         }
     }
 }
 
 fn provider_label(role: &ProviderRoleHealthSnapshot) -> String {
     match (&role.provider, &role.model, role.dim) {
-        (Some(provider), Some(model), Some(dim)) => format!("{provider}/{model} ({dim}d)"),
-        (Some(provider), Some(model), None) => format!("{provider}/{model}"),
-        (Some(provider), None, _) => provider.clone(),
+        (Some(provider), Some(model), Some(dim)) => format!(
+            "{}/{} ({dim}d)",
+            terminal_text(provider),
+            terminal_text(model)
+        ),
+        (Some(provider), Some(model), None) => {
+            format!("{}/{}", terminal_text(provider), terminal_text(model))
+        }
+        (Some(provider), None, _) => terminal_text(provider),
         _ => "provider".to_string(),
     }
 }
 
-fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
+fn error_detail(
+    i18n: &ai_memory_core::i18n::Localizer,
+    role: &ProviderRoleHealthSnapshot,
+) -> String {
     let mut parts = Vec::new();
     if let Some(status) = role.last_error_status {
         parts.push(format!("status {status}"));
@@ -458,10 +651,10 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
     if let Some(message) = &role.last_error_message
         && !message.is_empty()
     {
-        parts.push(message.clone());
+        parts.push(terminal_text(message));
     }
     if let Some(when) = &role.last_error_at {
-        parts.push(format!("last error: {when}"));
+        parts.push(i18n.one("cli-status-last-error", when));
     }
     if parts.is_empty() {
         "last call failed".to_string()
@@ -535,6 +728,87 @@ mod tests {
         }
         assert_eq!(value["recovery"]["journal_pending"], 2);
         assert_eq!(value["counts"]["observations"], 4);
+        assert!(
+            value.get("consolidation").is_none(),
+            "an older server has no queue, and its shape is unchanged: {value}"
+        );
+
+        // A server that reports its queue adds exactly that one key (#1692).
+        let mut with_queue = report_json.clone();
+        with_queue["consolidation"] = serde_json::json!({
+            "pending": 2,
+            "running": 0,
+            "completed": 9,
+            "failed": 1,
+            "failed_sessions": [{
+                "session_id": "0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                "attempts": 5,
+                "failed_at_us": 1_700_000_000_000_000_i64,
+                "last_error": "provider error 400: quota exceeded",
+            }],
+        });
+        let queued = json_report(
+            serde_json::from_value(with_queue).unwrap(),
+            SpoolHealth::default(),
+            0,
+            0,
+            0,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            None,
+        );
+        assert_eq!(queued["consolidation"]["failed"], 1);
+        assert_eq!(queued["consolidation"]["pending"], 2);
+        assert_eq!(
+            queued["consolidation"]["failed_sessions"][0]["session_id"],
+            "0192b6a1-4c2e-7d3f-8a5b-1234567890ab"
+        );
+        assert_eq!(queued["consolidation"]["failed_sessions"][0]["attempts"], 5);
+
+        // The server's version stays at the top level; the client's is new.
+        assert_eq!(value["version"], "2.6.0");
+        assert_eq!(value["client"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["client"]["server_url"], "http://127.0.0.1:49374");
+        assert!(
+            value.get("consolidation").is_none(),
+            "an older server has no queue, and its shape is unchanged: {value}"
+        );
+
+        // A server that reports its queue adds exactly that one key (#1692).
+        let mut with_queue = report_json.clone();
+        with_queue["consolidation"] = serde_json::json!({
+            "pending": 2,
+            "running": 0,
+            "completed": 9,
+            "failed": 1,
+            "failed_sessions": [{
+                "session_id": "0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                "attempts": 5,
+                "failed_at_us": 1_700_000_000_000_000_i64,
+                "last_error": "provider error 400: quota exceeded",
+            }],
+        });
+        let queued = json_report(
+            serde_json::from_value(with_queue).unwrap(),
+            SpoolHealth::default(),
+            0,
+            0,
+            0,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            None,
+        );
+        assert_eq!(queued["consolidation"]["failed"], 1);
+        assert_eq!(queued["consolidation"]["pending"], 2);
+        assert_eq!(
+            queued["consolidation"]["failed_sessions"][0]["session_id"],
+            "0192b6a1-4c2e-7d3f-8a5b-1234567890ab"
+        );
+        assert_eq!(queued["consolidation"]["failed_sessions"][0]["attempts"], 5);
 
         // A missing logon binary (#1280) adds one key and changes no other.
         let problem = super::super::user_service::MissingLogonBinary {
@@ -567,6 +841,67 @@ mod tests {
         let mut without = warned.clone();
         without.as_object_mut().unwrap().remove("windows_logon");
         assert_eq!(without, value);
+    }
+
+    #[test]
+    fn client_version_line_warns_only_across_a_major_version() {
+        let same = client_version_lines(
+            &ai_memory_core::i18n::Localizer::default(),
+            "3.1.1",
+            "3.1.1",
+        );
+        assert_eq!(same, ["ai-memory 3.1.1 (client)"]);
+        // A minor or patch difference is shown, not warned about.
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "3.2.0",
+                "3.1.1"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "v3.0.0",
+                "3.1.1"
+            )
+            .len(),
+            1
+        );
+
+        let across = client_version_lines(
+            &ai_memory_core::i18n::Localizer::default(),
+            "2.6.0",
+            "3.1.1",
+        );
+        assert_eq!(across.len(), 2, "{across:?}");
+        assert!(
+            across[1].contains("client is 3.1.1 but the server is 2.6.0"),
+            "{across:?}"
+        );
+        assert_eq!(
+            client_version_lines(
+                &ai_memory_core::i18n::Localizer::default(),
+                "4.0.0",
+                "3.1.1"
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn client_version_line_never_warns_on_an_unparseable_version() {
+        assert_eq!(
+            client_version_lines(&ai_memory_core::i18n::Localizer::default(), "dev", "3.1.1").len(),
+            1
+        );
+        assert_eq!(
+            client_version_lines(&ai_memory_core::i18n::Localizer::default(), "", "3.1.1").len(),
+            1
+        );
     }
 
     #[test]
@@ -645,11 +980,55 @@ mod tests {
             vec!["pending", "oldest_age_ms", "retries_total", "capacity"]
         );
 
-        // Both render paths must tolerate an empty spool.
-        report_offline_spool(&SpoolHealth::default(), false);
-        report_offline_spool(&SpoolHealth::default(), true);
-        report_offline_spool(&spool, false);
-        report_offline_spool(&spool, true);
+        // Both render paths must tolerate an empty spool, offline and reachable.
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            false,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            true,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            false,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            true,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            false,
+            false,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            true,
+            false,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            false,
+            false,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            true,
+            false,
+        );
     }
 
     /// A pre-#629 server's `/admin/status` response has no
@@ -681,7 +1060,10 @@ mod tests {
     #[test]
     fn provider_health_line_renders_unknown_and_disabled() {
         assert_eq!(
-            provider_health_line(&ProviderRoleHealthSnapshot::default()),
+            provider_health_line(
+                &ai_memory_core::i18n::Localizer::default(),
+                &ProviderRoleHealthSnapshot::default()
+            ),
             "disabled"
         );
 
@@ -692,7 +1074,7 @@ mod tests {
             ..ProviderRoleHealthSnapshot::default()
         };
         assert_eq!(
-            provider_health_line(&role),
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role),
             "openai/gpt-5.5 unknown (no calls yet)"
         );
     }
@@ -710,9 +1092,18 @@ mod tests {
             ..ProviderRoleHealthSnapshot::default()
         };
 
-        assert!(provider_health_line(&role).contains("anthropic-oauth/claude-sonnet-4-6 error"));
-        assert!(provider_health_line(&role).contains("status 401"));
-        assert!(provider_health_line(&role).contains("bad token"));
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("anthropic-oauth/claude-sonnet-4-6 error")
+        );
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("status 401")
+        );
+        assert!(
+            provider_health_line(&ai_memory_core::i18n::Localizer::default(), &role)
+                .contains("bad token")
+        );
     }
 
     #[test]
@@ -768,8 +1159,12 @@ mod tests {
             b"not json",
         )
         .unwrap();
-        let lines =
-            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), false);
+        let lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            false,
+            true,
+        );
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("error:"),
@@ -789,8 +1184,12 @@ mod tests {
             b"not json",
         )
         .unwrap();
-        let lines =
-            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), true);
+        let lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            true,
+            true,
+        );
         assert_eq!(lines.len(), 1, "{lines:?}");
         let payload = lines[0].split_once(": ").expect("prefix then object").1;
         let value: serde_json::Value = serde_json::from_str(payload).unwrap();
@@ -810,7 +1209,8 @@ mod tests {
                 offline_recovery_hint_lines(
                     &config_for(temp.path()),
                     &SpoolHealth::default(),
-                    json
+                    json,
+                    true,
                 )
                 .is_empty(),
                 "nothing queued and no journal error must print nothing (json={json})"
@@ -826,5 +1226,102 @@ mod tests {
         assert_eq!(spool_age_line(Some(60_000)), "1m 0s");
         assert_eq!(spool_age_line(Some(3_661_000)), "1h 1m");
         assert_eq!(spool_age_line(Some(172_800_000)), "2d 0h");
+    }
+
+    #[test]
+    fn offline_recovery_hint_reachable_server_omits_unreachable_label() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            super::super::recovery::journal_path(temp.path()),
+            b"not json",
+        )
+        .unwrap();
+        let human = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            false,
+            false,
+        );
+        let rendered_human = human.join("\n");
+        assert!(!rendered_human.contains("once the server is back"));
+        assert!(rendered_human.contains("to deliver queued events"));
+
+        let json_lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            true,
+            false,
+        );
+        assert_eq!(json_lines.len(), 1);
+        assert!(json_lines[0].starts_with("recovery hint: "));
+        assert!(!json_lines[0].contains("(server unreachable)"));
+    }
+
+    #[tokio::test]
+    async fn status_run_reports_server_reachable_on_unauthorized() {
+        let app = axum::Router::new().route(
+            "/admin/status",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "error": "admin operation requires authentication in multi-user mode"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            server_url: format!("http://{address}"),
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let result = run(&config, StatusArgs { json: false }).await;
+        server.abort();
+
+        let err = result.expect_err("status must fail on 401");
+        assert!(!crate::http_client::server_unreachable(&err));
+        let message = format!("{err:#}");
+        assert!(message.contains("server reachable at"), "{message}");
+        assert!(message.contains("not authenticated"), "{message}");
+        assert!(!message.contains("server unreachable"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn status_run_reports_server_reachable_on_forbidden() {
+        let app = axum::Router::new().route(
+            "/admin/status",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "error": "admin operation is root-only in multi-user mode"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            server_url: format!("http://{address}"),
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let result = run(&config, StatusArgs { json: false }).await;
+        server.abort();
+
+        let err = result.expect_err("status must fail on 403");
+        assert!(!crate::http_client::server_unreachable(&err));
+        let message = format!("{err:#}");
+        assert!(message.contains("server reachable at"), "{message}");
+        assert!(message.contains("root/admin permissions"), "{message}");
+        assert!(!message.contains("server unreachable"), "{message}");
     }
 }

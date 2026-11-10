@@ -28,7 +28,9 @@ use crate::config::Config;
 // Markers + the snippet body live in `ai_memory_core::routing_snippet`
 // so the `memory_install_self_routing` MCP tool can return the same
 // block this subcommand writes. Single source of truth.
-use ai_memory_core::{MARKER_END, MARKER_START, compact_block, find_marker_line, full_block};
+use ai_memory_core::{
+    MARKER_END, MARKER_START, compact_block, find_managed_block, find_marker_line, full_block,
+};
 
 const LEGACY_ORPHAN_TAIL_LF: &str =
     "` markers without\ndisturbing the rest of the file.\n<!-- ai-memory:end -->\n";
@@ -41,17 +43,20 @@ const LEGACY_ORPHAN_TAIL_CRLF: &str =
 /// Returns an error if the target path can't be written or if the
 /// existing file isn't valid UTF-8.
 pub fn run(config: &Config, args: InstallInstructionsArgs) -> Result<()> {
-    run_inner(args, &config.runtime_env, true)
+    let i18n = &config.i18n;
+    run_inner(i18n, args, &config.runtime_env, true)
 }
 
 pub(super) fn run_quiet(
+    i18n: &ai_memory_core::i18n::Localizer,
     args: InstallInstructionsArgs,
     env: &crate::config::RuntimeEnv,
 ) -> Result<()> {
-    run_inner(args, env, false)
+    run_inner(i18n, args, env, false)
 }
 
 fn run_inner(
+    i18n: &ai_memory_core::i18n::Localizer,
     args: InstallInstructionsArgs,
     env: &crate::config::RuntimeEnv,
     report: bool,
@@ -61,7 +66,7 @@ fn run_inner(
     } else {
         full_block()
     };
-    let targets = resolve_targets(args.target.as_ref())?;
+    let targets = resolve_targets(i18n, args.target.as_ref())?;
     if report {
         let home = env
             .var_os("HOME")
@@ -89,7 +94,13 @@ fn run_inner(
 
     if args.print {
         for t in &targets {
-            println!("# Would write into: {}\n", t.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-install-instructions-would-write-into",
+                    &[("value0", format!("{}", t.display()))]
+                )
+            );
             println!("{block}");
         }
     } else {
@@ -141,11 +152,16 @@ fn run_inner(
 /// Kimi Code) converged on AGENTS.md. The heuristic "extend whatever's
 /// already there" matches the user's intent better than a hard-coded
 /// default.
-fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::path::PathBuf>> {
+fn resolve_targets(
+    i18n: &ai_memory_core::i18n::Localizer,
+    explicit: Option<&std::path::PathBuf>,
+) -> Result<Vec<std::path::PathBuf>> {
     if let Some(p) = explicit {
         return Ok(vec![p.clone()]);
     }
-    let cwd = std::env::current_dir().context("getting CWD for install-instructions target")?;
+    let cwd = std::env::current_dir().context(
+        i18n.text("cli-install-instructions-getting-cwd-for-install-instructions-target"),
+    )?;
     let claude_md = cwd.join("CLAUDE.md");
     let agents_md = cwd.join("AGENTS.md");
     let has_claude = claude_md.exists();
@@ -156,12 +172,7 @@ fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::pat
         (false, true) => Ok(vec![agents_md]),
         (false, false) => {
             eprintln!(
-                "note: neither CLAUDE.md nor AGENTS.md exists in {}; \
-                 creating CLAUDE.md. If you use Codex / OpenCode / \
-                 Cursor / Gemini CLI / Antigravity CLI / Kimi Code / \
-                 Kiro CLI, re-run with `--target AGENTS.md`.",
-                cwd.display()
-            );
+                "{}", i18n.format("cli-install-instructions-note-neither-claude-md-nor-agents-md-exists-in-creating-claude-md-if-you-use", &[("value0", format!("{}", cwd.display()))]));
             Ok(vec![claude_md])
         }
     }
@@ -616,9 +627,7 @@ fn merge_instructions_block(existing: &str, block: &str) -> String {
     // the marker strings (e.g. this block's own prose describing them)
     // cannot be mistaken for the real end delimiter — which would truncate
     // the block and leave an orphan tail on every refresh.
-    if let Some(start_idx) = find_marker_line(existing, MARKER_START, 0)
-        && let Some(end_pos) = find_marker_line(existing, MARKER_END, start_idx)
-    {
+    if let Some((start_idx, end_pos)) = find_managed_block(existing) {
         let end_idx = end_pos + MARKER_END.len();
         // Consume a trailing newline after the end marker if present
         // so we don't accumulate blank lines on every re-run.
@@ -987,6 +996,17 @@ mod tests {
         let first = merge_instructions_block("# Title\n", &block);
         let second = merge_instructions_block(&first, &block);
         assert_eq!(first, second, "second merge must be a no-op");
+    }
+
+    #[test]
+    fn merge_keeps_text_after_a_start_marker_without_its_end() {
+        let block = format!("{MARKER_START}\nBLOCK\n{MARKER_END}\n");
+        let existing = format!("# A\n{MARKER_START}\nmy notes\n");
+        let first = merge_instructions_block(&existing, &block);
+        assert_eq!(first, format!("{existing}\n{block}"));
+        let second = merge_instructions_block(&first, &block);
+        assert_eq!(first, second, "second merge must be a no-op");
+        assert!(second.contains("my notes"));
     }
 
     /// Regression: a block whose body *mentions* the end marker inline

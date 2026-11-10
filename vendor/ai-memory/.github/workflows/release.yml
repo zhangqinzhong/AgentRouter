@@ -11,6 +11,8 @@ name: release
 #   DOCKERHUB_USERNAME  — Docker Hub account name
 #   DOCKERHUB_TOKEN     — Docker Hub access token (read/write)
 #   AUR_SSH_PRIVATE_KEY — private key for an AUR account with maintainer access
+#   SCOOP_BUCKET_TOKEN  — token that can push to akitaonrails/scoop-bucket
+#                         (fine-grained: Contents read/write on that repo)
 #
 # The CI workflow already validates the binary and package assets
 # (fmt / clippy / test / native-packaging). This workflow assumes CI
@@ -104,7 +106,9 @@ jobs:
         with:
           toolchain: "1.95"
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
         run: cargo build --locked --release -p ai-memory-cli
@@ -131,7 +135,7 @@ jobs:
           COPYFILE_DISABLE=1 tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
           sha256sum "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -159,7 +163,9 @@ jobs:
         with:
           toolchain: "1.95"
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
         run: cargo build --locked --release -p ai-memory-cli
@@ -213,7 +219,7 @@ jobs:
           done
           grep -Eq "^[0-9a-f]{64}  $artifact\.tar\.gz$" "$artifact.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -231,7 +237,9 @@ jobs:
         with:
           toolchain: "1.95"
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
         run: cargo build --locked --release -p ai-memory-cli
@@ -297,7 +305,7 @@ jobs:
             throw "Windows release zip checksum is not sha256sum format"
           }
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ai-memory-windows-x86_64
           path: |
@@ -315,12 +323,14 @@ jobs:
     outputs:
       docker_enabled: ${{ steps.check.outputs.docker_enabled }}
       aur_enabled: ${{ steps.check.outputs.aur_enabled }}
+      scoop_enabled: ${{ steps.check.outputs.scoop_enabled }}
     steps:
       - id: check
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
         run: |
           if [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_USERNAME" ]; then
             echo "docker_enabled=true" >> "$GITHUB_OUTPUT"
@@ -336,6 +346,13 @@ jobs:
             echo "::warning::AUR_SSH_PRIVATE_KEY not set — skipping AUR publish."
           fi
 
+          if [ -n "$SCOOP_BUCKET_TOKEN" ]; then
+            echo "scoop_enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "scoop_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SCOOP_BUCKET_TOKEN not set — skipping Scoop bucket publish."
+          fi
+
   docker-amd64:
     name: docker amd64 image
     needs: [binary, check-secrets, validate-version]
@@ -346,7 +363,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ai-memory-linux-x86_64
           path: artifacts
@@ -361,7 +378,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -389,7 +406,7 @@ jobs:
           mkdir -p /tmp/digests
           touch "/tmp/digests/${digest#sha256:}"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-digest-amd64
           path: /tmp/digests/*
@@ -406,7 +423,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ai-memory-linux-aarch64
           path: artifacts
@@ -421,7 +438,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -451,7 +468,7 @@ jobs:
           mkdir -p /tmp/digests
           touch "/tmp/digests/${digest#sha256:}"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-digest-arm64
           path: /tmp/digests/*
@@ -466,7 +483,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: docker-digest-*
           path: /tmp/digests
@@ -479,7 +496,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -519,7 +536,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: ai-memory-*
           path: artifacts
@@ -600,6 +617,11 @@ jobs:
           echo "\$env:AI_MEMORY_VERSION='${{ needs.validate-version.outputs.version }}'; irm https://github.com/akitaonrails/ai-memory/releases/download/${GITHUB_REF_NAME}/install.ps1 | iex" >> body.md
           echo "ai-memory setup" >> body.md
           echo "" >> body.md
+          echo "# Windows (Scoop)" >> body.md
+          echo "scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket" >> body.md
+          echo "scoop install ai-memory" >> body.md
+          echo "ai-memory setup" >> body.md
+          echo "" >> body.md
           echo "# From source" >> body.md
           echo "cargo install --locked --git https://github.com/akitaonrails/ai-memory --tag ${GITHUB_REF_NAME}" >> body.md
           echo '```' >> body.md
@@ -623,7 +645,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: ai-memory-linux-*
           path: artifacts
@@ -720,6 +742,73 @@ jobs:
           publish_pkg ai-memory-bin "$bin_pkgbuild"
           EOF
 
+  # Pins packaging/scoop/ai-memory.json to this tag and pushes it to the
+  # akitaonrails/scoop-bucket `bucket/` directory. The hash comes from the
+  # published release's `.sha256` sidecar, never from workflow artifacts, so
+  # the bucket verifies exactly what the release serves.
+  scoop:
+    name: scoop bucket publish
+    needs: [check-secrets, github-release, validate-version]
+    if: needs.check-secrets.outputs.scoop_enabled == 'true'
+    runs-on: ubuntu-latest
+    # The release is already published; a bucket push failure (expired or
+    # under-scoped token) must not turn the release run red.
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pin version, URL and hash for the tag
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          zip="ai-memory-windows-x86_64.zip"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          sidecar="$(curl -fsSL --retry 3 "$base/$zip.sha256")"
+          hash="$(printf '%s\n' "$sidecar" | awk -v zip="$zip" '$2 == zip { print $1 }')"
+          if ! printf '%s' "$hash" | grep -Eqx '[0-9a-f]{64}'; then
+            echo "::error::$zip.sha256 on the v${VERSION} release has no sha256 for $zip"
+            exit 1
+          fi
+          jq --arg version "$VERSION" --arg url "$base/$zip" --arg hash "$hash" '
+            del(."##")
+            | .version = $version
+            | .architecture."64bit".url = $url
+            | .architecture."64bit".hash = $hash
+          ' packaging/scoop/ai-memory.json > scoop-manifest.json
+          jq -e '.version and .architecture."64bit".hash' scoop-manifest.json >/dev/null
+
+      - name: Push manifest to scoop-bucket
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The token reaches git through GIT_ASKPASS, never argv or the
+          # remote URL, so it stays out of process listings and git config.
+          askpass="$(mktemp)"
+          trap 'rm -f "$askpass"' EXIT
+          printf '#!/bin/sh\nprintf %%s "$SCOOP_BUCKET_TOKEN"\n' > "$askpass"
+          chmod 700 "$askpass"
+          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+          git clone --depth 1 https://x-access-token@github.com/akitaonrails/scoop-bucket.git bucket
+          mkdir -p bucket/bucket
+          cp scoop-manifest.json bucket/bucket/ai-memory.json
+          cd bucket
+          git config user.name "ai-memory release bot"
+          git config user.email "actions@github.com"
+          git add bucket/ai-memory.json
+          if git diff --cached --quiet; then
+            echo "scoop-bucket already has ai-memory ${VERSION}; nothing to push"
+            exit 0
+          fi
+          git commit -m "ai-memory ${VERSION}"
+          git push origin HEAD
+
   rpm:
     name: Fedora RPM (${{ matrix.arch }})
     needs: [binary, validate-version]
@@ -734,7 +823,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ai-memory-linux-${{ matrix.arch }}
           path: artifacts
@@ -763,7 +852,7 @@ jobs:
           mv "$rpm_file" "artifacts/$rpm_name"
           (cd artifacts && sha256sum "$rpm_name" > "$rpm_name.sha256")
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ai-memory-rpm-${{ matrix.arch }}
           path: artifacts/*.rpm*

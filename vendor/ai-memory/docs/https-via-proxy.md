@@ -146,6 +146,11 @@ and tell ai-memory about it:
 AI_MEMORY_BASE_PATH=/wiki
 ```
 
+Alternatively, set `base_path = "/wiki"` in `config.toml`; the server and
+thin-client commands both read it. For `serve`, `--base-path` overrides
+`AI_MEMORY_BASE_PATH`, which overrides the file. An explicitly empty value
+or `/` selects the host root even when the file names a prefix.
+
 ```caddyfile
 memory.example.com {
     handle /wiki/* {

@@ -413,6 +413,20 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
             break;
         }
 
+        if delivery.body_over_limit {
+            for item in &batch.items {
+                queue.record_failure(&item.ingest_key, "oversized ack")?;
+            }
+            failure = Some(format!(
+                "HTTP {} from /hook/batch: hook batch ack exceeded {} bytes; \
+                 refusing to parse it; all {} item(s) kept pending",
+                delivery.status,
+                http::MAX_ACK_BYTES,
+                batch.items.len()
+            ));
+            break;
+        }
+
         let parsed: BatchAck = match serde_json::from_slice(&delivery.body) {
             Ok(parsed) => parsed,
             Err(_) => {

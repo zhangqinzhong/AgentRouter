@@ -169,6 +169,12 @@ struct CommonArgs {
     /// allowlist is explicit: '*' is refused.
     #[arg(long = "include", value_name = "FAMILY")]
     include: Vec<String>,
+    /// Take over a destination whose baseline was recorded for another
+    /// server, workspace or project. The baseline is discarded, so the run
+    /// exports fresh instead of reading that project's pages as deletions
+    /// (#1708).
+    #[arg(long)]
+    adopt_scope: bool,
 }
 
 impl From<ExportArgs> for RunArgs {
@@ -181,6 +187,7 @@ impl From<ExportArgs> for RunArgs {
             dest: args.common.dest,
             include: args.common.include,
             force: args.force,
+            adopt_scope: args.common.adopt_scope,
         }
     }
 }
@@ -195,6 +202,7 @@ impl From<CommonArgs> for RunArgs {
             dest: args.dest,
             include: args.include,
             force: false,
+            adopt_scope: args.adopt_scope,
         }
     }
 }

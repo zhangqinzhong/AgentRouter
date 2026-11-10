@@ -4,7 +4,9 @@
 //! (a quota limit, a crash) without ending. Such a session never writes a
 //! fresh start or a clean end, so the ordering must come from its captured
 //! work, a session resumed after an earlier end must read as not ended, and
-//! the owner filter must keep one operator's session ids from another.
+//! the owner filter must keep one operator's session ids from another. The
+//! same rules pick the session `latest_interrupted_session_candidate` offers
+//! as a startup recovery snapshot.
 
 use ai_memory_core::{ActorContext, IdentityKey, OwnerFilter, ProjectId, WorkspaceId};
 use ai_memory_store::Store;
@@ -201,4 +203,281 @@ async fn a_handoff_from_the_session_after_its_last_work_covers_it() {
         .collect();
     // 30's baton predates its last work at NOW + 500; 31's follows its work.
     assert_eq!(covered, vec![(30, false), (31, true)]);
+}
+
+/// The legacy end remains the writer's watermark; it must not make the
+/// scoped read disagree with the activity feed after substantive work resumes.
+#[tokio::test]
+async fn resumed_summary_is_open_and_preserves_the_persisted_end() {
+    let (_tmp, store) = open_seeded();
+    let resumed_id = ai_memory_core::SessionId::from_slice(&id(30)).unwrap();
+    let resumed = store
+        .reader
+        .session_summary_scoped(ws(), proj_a(), resumed_id, OwnerFilter::Unattributed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(resumed.ended_at.is_none(), "new work reopens the read view");
+    for n in [31, 32] {
+        let closed = store
+            .reader
+            .session_summary_scoped(
+                ws(),
+                proj_a(),
+                ai_memory_core::SessionId::from_slice(&id(n)).unwrap(),
+                OwnerFilter::Unattributed,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(closed.ended_at.is_some(), "closed sessions stay closed");
+    }
+    let conn = Connection::open(store.db_path()).unwrap();
+    let persisted: i64 = conn
+        .query_row(
+            "SELECT ended_at FROM sessions WHERE id = ?1",
+            params![&id(30)[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, NOW + 100, "the writer watermark is untouched");
+}
+
+#[tokio::test]
+async fn completed_listing_excludes_resumed_work_and_keeps_closed_controls() {
+    let (_tmp, store) = open_seeded();
+    let completed = store
+        .reader
+        .sessions_for_scope(ws(), proj_a(), OwnerFilter::Unattributed, false, 10, 0)
+        .await
+        .unwrap();
+    let listed: Vec<_> = completed
+        .iter()
+        .map(|s| s.session_id.as_bytes()[15])
+        .collect();
+    assert_eq!(listed, vec![32, 31]);
+    let all = store
+        .reader
+        .sessions_for_scope(ws(), proj_a(), OwnerFilter::Unattributed, true, 10, 0)
+        .await
+        .unwrap();
+    let listed: Vec<_> = all.iter().map(|s| s.session_id.as_bytes()[15]).collect();
+    assert_eq!(listed, vec![32, 31, 30]);
+}
+
+#[tokio::test]
+async fn resumed_summary_keeps_owner_and_scope_guards_with_legitimate_controls() {
+    let (_tmp, store) = open_seeded();
+    let bob = ai_memory_core::SessionId::from_slice(&id(33)).unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), proj_a(), bob, filter_for("alice"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), proj_a(), bob, filter_for("bob"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let other = ProjectId::from_slice(&id(3)).unwrap();
+    let resumed = ai_memory_core::SessionId::from_slice(&id(30)).unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), other, resumed, OwnerFilter::Unattributed)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let foreign = ai_memory_core::SessionId::from_slice(&id(34)).unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), proj_a(), foreign, OwnerFilter::Unattributed)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws(), other, foreign, OwnerFilter::Unattributed)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn only_scoped_substantive_work_reopens_the_summary() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    for (n, sid, project, kind) in [(70, 31, 3, "user-prompt"), (71, 32, 2, "session-start")] {
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, importance, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 't', 'synthetic', 5, ?6)",
+            params![
+                &id(n)[..],
+                &id(sid)[..],
+                &id(1)[..],
+                &id(project)[..],
+                kind,
+                NOW + 900
+            ],
+        )
+        .unwrap();
+    }
+    for n in [31, 32] {
+        let summary = store
+            .reader
+            .session_summary_scoped(
+                ws(),
+                proj_a(),
+                ai_memory_core::SessionId::from_slice(&id(n)).unwrap(),
+                OwnerFilter::Unattributed,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(summary.ended_at.is_some());
+    }
+    let other = store
+        .reader
+        .session_summary_scoped(
+            ws(),
+            ProjectId::from_slice(&id(3)).unwrap(),
+            ai_memory_core::SessionId::from_slice(&id(31)).unwrap(),
+            OwnerFilter::Unattributed,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        other.ended_at.is_none(),
+        "new work opens only its own scope"
+    );
+}
+
+#[tokio::test]
+async fn a_later_persisted_end_closes_the_resumed_read_view() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE sessions SET ended_at = ?1 WHERE id = ?2",
+        params![NOW + 600, &id(30)[..]],
+    )
+    .unwrap();
+    let completed = store
+        .reader
+        .sessions_for_scope(ws(), proj_a(), OwnerFilter::Unattributed, false, 10, 0)
+        .await
+        .unwrap();
+    let listed: Vec<_> = completed
+        .iter()
+        .map(|s| s.session_id.as_bytes()[15])
+        .collect();
+    assert_eq!(listed, vec![32, 31, 30]);
+    assert!(completed.iter().all(|s| s.ended_at.is_some()));
+}
+
+fn observe(conn: &Connection, n: u8, session: u8, project: u8, kind: &str, at: i64) {
+    conn.execute(
+        "INSERT INTO observations \
+         (id, session_id, workspace_id, project_id, kind, title, body, importance, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 't', 'b', 5, ?6)",
+        params![
+            &id(n)[..],
+            &id(session)[..],
+            &id(1)[..],
+            &id(project)[..],
+            kind,
+            at
+        ],
+    )
+    .unwrap();
+}
+
+/// The recovery candidate in `proj-a`: its session byte and last activity.
+async fn interrupted(store: &Store, filter: OwnerFilter) -> Option<(u8, String)> {
+    store
+        .reader
+        .latest_interrupted_session_candidate(ws(), proj_a(), filter, None)
+        .await
+        .unwrap()
+        .map(|candidate| {
+            (
+                candidate.session_id.as_bytes()[15],
+                candidate.last_activity_at,
+            )
+        })
+}
+
+/// Recovery offers the newest session whose substantive work nothing covers.
+/// Activity counts every event, eligibility only prompts and tool calls: the
+/// open 35 holds the newest events but no work, 31 ended after its work, 32
+/// never worked, 33 is bob's and 34 works in another project.
+#[tokio::test]
+async fn interrupted_candidate_is_the_newest_uncovered_substantive_work() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+         VALUES (?1, ?2, ?3, 'claude-code', '/w/a', ?4)",
+        params![&id(35)[..], &id(1)[..], &id(2)[..], NOW + 700],
+    )
+    .unwrap();
+    observe(&conn, 80, 35, 2, "session-start", NOW + 700);
+    observe(&conn, 81, 35, 2, "stop", NOW + 710);
+    observe(&conn, 82, 30, 2, "stop", NOW + 520);
+    assert_eq!(
+        interrupted(&store, OwnerFilter::Unattributed).await,
+        Some((30, ts(NOW + 520).to_string()))
+    );
+    for filter in [filter_for("bob"), OwnerFilter::Any] {
+        assert_eq!(interrupted(&store, filter).await.map(|c| c.0), Some(33));
+    }
+
+    // An end after 30's newest work covers it; the stop that follows is not work.
+    conn.execute(
+        "UPDATE sessions SET ended_at = ?1 WHERE id = ?2",
+        params![NOW + 510, &id(30)[..]],
+    )
+    .unwrap();
+    assert_eq!(interrupted(&store, OwnerFilter::Unattributed).await, None);
+}
+
+/// A handoff from the session written at or after its newest work covers it,
+/// even when lifecycle events follow; one written before does not.
+#[tokio::test]
+async fn a_handoff_at_the_newest_work_covers_the_interrupted_candidate() {
+    let (_tmp, store) = open_seeded();
+    let conn = Connection::open(store.db_path()).unwrap();
+    observe(&conn, 82, 30, 2, "stop", NOW + 520);
+    let baton = |n: u8, at: i64| {
+        conn.execute(
+            "INSERT INTO handoffs \
+             (id, workspace_id, project_id, from_session_id, from_agent, summary, \
+              open_questions, next_steps, files_touched, state, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'other', 's', '[]', '[]', '[]', 'accepted', ?5)",
+            params![&id(n)[..], &id(1)[..], &id(2)[..], &id(30)[..], at],
+        )
+        .unwrap();
+    };
+    baton(60, NOW + 499);
+    assert_eq!(
+        interrupted(&store, OwnerFilter::Unattributed)
+            .await
+            .map(|c| c.0),
+        Some(30),
+        "a baton before the newest work leaves it uncovered"
+    );
+    baton(61, NOW + 500);
+    assert_eq!(interrupted(&store, OwnerFilter::Unattributed).await, None);
 }

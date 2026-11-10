@@ -293,7 +293,7 @@ async fn cjk_stream_does_not_fuse_back_a_not_excluded_term() {
 }
 
 #[tokio::test]
-async fn cjk_stream_honours_a_title_column_filter() {
+async fn cjk_stream_honours_column_filters() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let (ws, project) = scope(&store, "default", "app").await;
@@ -321,9 +321,21 @@ async fn cjk_stream_honours_a_title_column_filter() {
         .await
         .unwrap();
 
-    // Control: both pages carry 支付服务 in an unspaced run and both are
-    // reachable through the CJK stream, so the narrowed search below failing
-    // to return one of them means the column filter held.
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "支付服务.md",
+            "Path notes",
+            "English body",
+        ))
+        .await
+        .unwrap();
+
+    // Control: every column carries 支付服务 and all three pages are
+    // reachable through the CJK stream. Excluding a body/path-only match
+    // below therefore proves the column filter held.
     let unqualified = store
         .reader
         .search_pages_for_project(ws, project, "支付服务".into(), 10, None)
@@ -339,20 +351,45 @@ async fn cjk_stream_honours_a_title_column_filter() {
         "control search failed: {paths:?}"
     );
 
-    let titled = store
-        .reader
-        .search_pages_for_project(ws, project, "title:支付服务".into(), 10, None)
-        .await
-        .unwrap();
-    let paths: Vec<_> = titled.iter().map(|hit| hit.path.as_str()).collect();
     assert!(
-        paths.contains(&"titled.md"),
-        "the title match lost its page: {paths:?}"
+        paths.contains(&"支付服务.md"),
+        "path control failed: {paths:?}"
     );
-    assert!(
-        !paths.contains(&"bodied.md"),
-        "the CJK stream ignored the title filter: {paths:?}"
-    );
+
+    for (query, expected) in [
+        ("title:支付服务", vec!["titled.md"]),
+        ("(title:支付服务)", vec!["titled.md"]),
+        ("((title:支付服务))", vec!["titled.md"]),
+        ("body:支付服务", vec!["bodied.md"]),
+        ("(body:支付服务)", vec!["bodied.md"]),
+        ("((body:支付服务))", vec!["bodied.md"]),
+        (
+            "(title:支付服务 OR body:支付服务)",
+            vec!["bodied.md", "titled.md"],
+        ),
+        (
+            "((title:支付服务) OR (body:支付服务))",
+            vec!["bodied.md", "titled.md"],
+        ),
+    ] {
+        let hits = store
+            .reader
+            .search_pages_for_project(ws, project, query.into(), 10, None)
+            .await
+            .unwrap();
+        let mut paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, expected, "project query={query}");
+
+        let hits = store
+            .reader
+            .search_pages_with_meta(query.into(), 10, None, None, Default::default())
+            .await
+            .unwrap();
+        let mut paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, expected, "global query={query}");
+    }
 }
 
 #[tokio::test]

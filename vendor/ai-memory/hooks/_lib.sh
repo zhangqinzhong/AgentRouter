@@ -88,6 +88,48 @@ ai_memory_parse_toml_flag() {
         | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
+# Section-scoped counterpart for the same-named [handoff] and [recovery]
+# delivery keys. The exclusion mode preserves legacy handoff parsing elsewhere.
+ai_memory_parse_toml_scoped_flag() {
+    file="$1"; section="$2"; key="$3"; exclude="$4"
+    [ -f "$file" ] || return 0
+    ai_memory_strip_utf8_bom <"$file" | LC_ALL=C awk \
+        -v section="$section" -v key="$key" -v exclude="$exclude" '
+        function trim(value) {
+            gsub(/^[ \t\r]+|[ \t\r]+$/, "", value)
+            return value
+        }
+        {
+            header = $0
+            sub(/#.*/, "", header)
+            header = trim(header)
+            if (header ~ /^\[.*\]$/) {
+                in_section = trim(substr(header, 2, length(header) - 2)) == section
+                next
+            }
+            if ((exclude == "1" && in_section) || (exclude != "1" && !in_section)) next
+            pattern = "^[ \t]*" key "[ \t]*="
+            if ($0 !~ pattern) next
+            value = $0
+            sub(pattern, "", value)
+            sub(/#.*/, "", value)
+            value = trim(value)
+            gsub(/^"|"$/, "", value)
+            if (value != "") {
+                print value
+                exit
+            }
+        }'
+}
+
+ai_memory_parse_toml_section_flag() {
+    ai_memory_parse_toml_scoped_flag "$1" "$2" "$3" 0
+}
+
+ai_memory_parse_toml_flag_outside_section() {
+    ai_memory_parse_toml_scoped_flag "$1" "$2" "$3" 1
+}
+
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
 # 0 for a falsy value (0/false/no/off, any case), 1 for anything else, an
 # absent key included. Parity with `profile_flag_value` in hook_capture.rs.
@@ -101,8 +143,8 @@ ai_memory_profile_flag() {
 # Whether "$1" (a marker file) declares anything beyond a `[capture]`
 # section: any root-level scope key (workspace/project/project_strategy), or
 # any of the other settings ai_memory_marker_qs / ai_memory_briefing_qs
-# forward (drop_subagent_captures, default_global, [briefing] and [profile]
-# keys). Mirrors
+# forward (drop_subagent_captures, default_global, [briefing], [profile],
+# [handoff] and [messaging] keys). Mirrors
 # `declares_more_than_capture` in marker.rs. A marker with any of these is a
 # resolution boundary; only a marker whose only content is `[capture]` (e.g.
 # ignore_paths) is scope/settings-transparent (#668).
@@ -115,7 +157,7 @@ ai_memory_marker_declares_settings() {
     ai_memory_strip_utf8_bom <"$file" \
         | LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' && return 0
     ai_memory_marker_declares_server "$file" && return 0
-    for key in default_global inject_on_session_start max_chars contribute consume; do
+    for key in default_global inject_on_session_start inject_on_subagent_start max_chars contribute consume deliver_on_session_start inbox_notice_on_prompt; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
     done
     return 1
@@ -339,9 +381,16 @@ ai_memory_antigravity_is_initial_invocation() {
     [ "$value" = "0" ]
 }
 
+# Invocation-scoped context: the managed run, and the per-execution
+# `AI_MEMORY_AUTO_HANDOFF=off` opt-out of the automatic handoff (#1951), which
+# is forwarded only for an explicit falsy value, as the native hook does.
 ai_memory_managed_qs() {
-    [ -n "${AI_MEMORY_RUN_ID:-}" ] || return 0
-    printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"
+    if [ -n "${AI_MEMORY_RUN_ID:-}" ]; then
+        printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"
+    fi
+    case "$(printf '%s' "${AI_MEMORY_AUTO_HANDOFF:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|off) printf '&auto_handoff=0' ;;
+    esac
 }
 
 # Resolve cwd for agents whose native hook payload omits it. Payload wins,
@@ -491,7 +540,10 @@ ai_memory_home_route() {
     _ai_hr_file="$1"; _ai_hr_cwd="$2"; _ai_hr_identity="$3"
     [ -f "$_ai_hr_file" ] || return 0
     [ "$(wc -c <"$_ai_hr_file")" -le 65536 ] || { printf 'invalid'; return 0; }
-    LC_ALL=C awk -v cwd="$_ai_hr_cwd" -v home="$_amhome" -v identity="$_ai_hr_identity" '
+    # Through the environment, not `-v`: awk reads escape sequences in a `-v`
+    # value, so a Windows cwd's backslashes never reached `cleanpath`.
+    _AI_HR_CWD="$_ai_hr_cwd" _AI_HR_HOME="$_amhome" _AI_HR_IDENTITY="$_ai_hr_identity" \
+        LC_ALL=C awk '
         function invalid() { bad = 1 }
         function cleanpath(value,    n, raw, out, i, root, home_relative, rel_depth, j) {
             gsub(/\\/, "/", value)
@@ -556,7 +608,10 @@ ai_memory_home_route() {
             }
             kind=""; selector=""; route_workspace=""; route_project=""; route_identity_style=""; route_aliases=""; delete field_seen
         }
-        BEGIN { count=0; bad=0; best_depth=0; tie=0 }
+        BEGIN {
+            count=0; bad=0; best_depth=0; tie=0
+            cwd=ENVIRON["_AI_HR_CWD"]; home=ENVIRON["_AI_HR_HOME"]; identity=ENVIRON["_AI_HR_IDENTITY"]
+        }
         {
             line=$0; sub(/\r$/, "", line)
             if (match(line, /^[[:space:]]*\[routes\.(identity|path)\."[^"\\]+"\][[:space:]]*$/)) {
@@ -719,6 +774,8 @@ ai_memory_marker_qs() {
     isty=""
     pcon=""
     pcons=""
+    hoff=""
+    roff=""
     aliases=""
     routed=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
@@ -736,8 +793,12 @@ ai_memory_marker_qs() {
             return 0
         fi
         if [ -n "$route" ]; then
+            # Split without globbing: route_aliases is a raw `["a","b"]`
+            # value, a bracket pattern that a file in the cwd would match.
             old_ifs=$IFS; IFS=$(printf '\034')
+            set -f
             set -- $route
+            set +f
             IFS=$old_ifs
             ws=$1; pr=$2; isty=${3:-}; route_aliases=${4:-}; ps=marker; routed=1
             [ -n "$route_aliases" ] && aliases=$(ai_memory_aliases_json_value "$route_aliases")
@@ -762,6 +823,9 @@ ai_memory_marker_qs() {
         # what it stored.
         pcon=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" contribute)")
         pcons=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" consume)")
+        # The delivery key is independent in [handoff] and [recovery].
+        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag_outside_section "$marker" recovery deliver_on_session_start)")" = 0 ] && hoff=0
+        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_section_flag "$marker" recovery deliver_on_session_start)")" = 0 ] && roff=0
         [ -n "$pr" ] && ps="marker"
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
@@ -807,13 +871,16 @@ ai_memory_marker_qs() {
     [ -n "$dg" ] && qs="${qs}&default_global=$(ai_memory_url_encode "$dg")"
     [ -n "$pcon" ] && qs="${qs}&profile_contribute=$(ai_memory_url_encode "$pcon")"
     [ -n "$pcons" ] && qs="${qs}&profile_consume=$(ai_memory_url_encode "$pcons")"
+    [ -n "$hoff" ] && qs="${qs}&handoff=0"
+    [ -n "$roff" ] && qs="${qs}&recovery=0"
     qs="${qs}$(ai_memory_managed_qs)"
     printf '%s' "$qs"
 }
 
 # Build `&briefing=<v>[&briefing_budget=<v>]` from the `[briefing]` section
-# of the marker walked up from "$1" (inject_on_session_start + optional
-# max_chars). Prints nothing when cwd is absent or the repo did not opt in.
+# of the marker walked up from "$1" (the opt-in key "$2", by default
+# inject_on_session_start, + optional max_chars). Prints nothing when cwd is
+# absent or the repo did not opt in.
 # NOT part of ai_memory_marker_qs on purpose: agents that deliver the brief
 # once per session (kimi-code, via the first user prompt — kimi discards
 # SessionStart hook stdout) append this only on the first fetch, so the
@@ -821,13 +888,14 @@ ai_memory_marker_qs() {
 # is decided server-side.
 ai_memory_briefing_qs() {
     cwd="$1"
+    _ambkey="${2:-inject_on_session_start}"
     [ -z "$cwd" ] && return 0
     # Settings walk (#668): a nested capture-only marker must not shadow an
     # outer marker's [briefing] opt-in.
     marker=$(ai_memory_find_settings_marker "$cwd")
     [ -n "$marker" ] || return 0
     qs=""
-    briefing=$(ai_memory_parse_toml_flag "$marker" inject_on_session_start)
+    briefing=$(ai_memory_parse_toml_flag "$marker" "$_ambkey")
     case "$(printf '%s' "$briefing" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|on) ;;
         *) return 0 ;;
@@ -836,6 +904,13 @@ ai_memory_briefing_qs() {
     qs="&briefing=$(ai_memory_url_encode "$briefing")"
     [ -n "$budget" ] && qs="${qs}&briefing_budget=$(ai_memory_url_encode "$budget")"
     printf '%s' "$qs"
+}
+
+# The `[briefing] inject_on_subagent_start` pair for cwd "$1": the query a
+# subagent start sends to `/brief`. Prints nothing without that
+# opt-in, whatever `inject_on_session_start` says.
+ai_memory_subagent_briefing_qs() {
+    ai_memory_briefing_qs "$1" inject_on_subagent_start
 }
 
 # Path of the once-per-session "brief delivered" marker for "$1" (a session
@@ -871,7 +946,10 @@ ai_memory_state_dir() {
     elif [ -n "${XDG_DATA_HOME:-}" ]; then
         printf '%s/ai-memory' "$XDG_DATA_HOME"
     elif [ -n "${HOME:-}" ]; then
-        printf '%s/.local/share/ai-memory' "$HOME"
+        case "$(uname -s 2>/dev/null || printf '')" in
+            Darwin) printf '%s/Library/Application Support/ai-memory' "$HOME" ;;
+            *) printf '%s/.local/share/ai-memory' "$HOME" ;;
+        esac
     else
         printf '.ai-memory'
     fi
@@ -925,7 +1003,7 @@ ai_memory_clear_session_id() {
 # Path of the `Authorization:` header file `install-hooks --apply` writes
 # (0600, inside the 0700 data dir). Printed only when readable.
 ai_memory_auth_header_file() {
-    _amhf="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ai-memory}/auth-header"
+    _amhf="$(ai_memory_state_dir)/auth-header"
     [ -r "$_amhf" ] && printf '%s' "$_amhf"
 }
 
@@ -1022,15 +1100,60 @@ ai_memory_get_handoff() {
         *'&cwd='*) ;;
         *) return 0 ;;
     esac
+    _amurl="$1"
+    # An external-capture run shares its project with the owner's own
+    # interactive sessions, so a handoff fetch must offer the baton, not consume
+    # it: send claim=0 and let the server announce it for an explicit
+    # memory_handoff_accept (#2148). /brief claims nothing, so it is untouched.
+    if ai_memory_capture_owned_externally; then
+        case "$_amurl" in
+            *'/handoff?'*) _amurl="$_amurl&claim=0" ;;
+        esac
+    fi
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
-            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl" \
+            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN") || return $?
     elif [ -n "$_amhdr" ]; then
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl" -H @"$_amhdr") || return $?
     else
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl") || return $?
     fi
+    # Appending the status preserves the body's final newlines in the command
+    # substitution. Redirect and error bodies must never become agent context.
+    _amhandoff_code=${_amhandoff##*'
+'}
+    case "$_amhandoff_code" in
+        2??) printf '%s' "${_amhandoff%'
+'*}" ;;
+    esac
+    return 0
+}
+
+# True when SessionStart payload "$1" is the one an agent fires right after a
+# context compaction (`"source": "compact"`). That start is mid-session, so it
+# must not claim a handoff baton, recovery snapshot or brief.
+ai_memory_is_compaction_start() {
+    _amsrc=$(printf '%s' "$1" | ai_memory_after_key source \
+        | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n 1) || return 1
+    [ "$_amsrc" = "compact" ]
+}
+
+# The session-start handoff GET: `ai_memory_get_handoff "$2"`, except for a
+# compaction start (payload "$1"), which fetches nothing and so prints the
+# same empty reply as "no pending handoff" (parity with the native hook; the
+# post-compaction anchor is native-only).
+ai_memory_get_start_handoff() {
+    ai_memory_is_compaction_start "$1" && return 0
+    ai_memory_get_handoff "$2"
+}
+
+# GET the read-only subagent brief at URL "$1", with ai_memory_get_handoff's
+# guards: a URL without `cwd`, or for a server-routed repository, is never
+# sent. It keeps a name of its own because `/brief` claims nothing, while
+# every ai_memory_get_handoff caller claims a baton.
+ai_memory_get_brief() {
+    ai_memory_get_handoff "$1"
 }
 
 # Encode stdin as a JSON string (with surrounding quotes). Used by hooks
@@ -1189,7 +1312,7 @@ ai_memory_spool_event() {
 # appends, and that holds whether the step is one character or one
 # escaped-backslash pair — a 2.2 MB entry of `grep` output over source, where
 # every literal backslash is a pair, cost 36 s a pass that way under
-# one-true-awk. A drain pass reads every entry three times and one detached
+# one-true-awk. A drain pass reads every eligible entry four times and one detached
 # pass starts behind every delivery that succeeds, so the cost is paid over
 # and over.
 #
@@ -1240,6 +1363,10 @@ ai_memory_drain_spool() {
         [ -f "$_amdf" ] || break
         [ "$_amdn" -lt "$_amdmax" ] || break
         _amdn=$((_amdn + 1))
+        # OIDC entries have no inline bearer. Leave them for the native drain,
+        # which can resolve/refresh auth.json, rather than POSTing anonymously.
+        _amdmode=$(ai_memory_json_field auth_mode "$_amdf" 2>/dev/null) || _amdmode=''
+        [ "$_amdmode" = oidc ] && continue
         _amdurl=$(ai_memory_json_field url "$_amdf" 2>/dev/null) || continue
         [ -n "$_amdurl" ] || continue
         _amdbody=$(ai_memory_json_field body "$_amdf" 2>/dev/null) || continue

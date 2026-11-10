@@ -77,9 +77,10 @@ drop to plain http); BusyBox wget is refused there. The release goes to
 `~/.local/lib/ai-memory`, and `~/.local/bin/ai-memory` becomes a link to the
 binary, so the bundled `hooks/` directory sits beside it and
 `ai-memory upgrade` can later replace both. An `ai-memory` at the link path that
-is not such a link (the Docker wrapper, a hand-built binary) is left alone and
-the script exits. The whole script runs from one function called on its last
-line, so a download cut short runs nothing. To read it before running it:
+is not such a link (the Docker wrapper, a hand-built binary, or a link to one of
+them) is left alone and the script exits. The whole script runs from one
+function called on its last line, so a download cut short runs nothing. To read
+it before running it:
 
 ```bash
 curl -fsSLO https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh
@@ -92,9 +93,23 @@ sh install.sh
 |---|---|---|
 | `AI_MEMORY_VERSION` | latest | Install this release, e.g. `3.0.0` |
 | `AI_MEMORY_BIN_DIR` | `~/.local/bin` | Where the `ai-memory` link goes |
-| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked |
+| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked; a directory of its own, since a rerun replaces it whole |
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
+
+Relative `AI_MEMORY_BIN_DIR` and `AI_MEMORY_LIB_DIR` paths are resolved from
+the directory where you start `install.sh`.
+
+Running `install.sh` again replaces its own release in place, and it deletes
+the old lib dir to do so. Before downloading, it therefore refuses a lib dir
+that is the bin dir or a directory above it, and one that holds no release (the
+`ai-memory` binary itself, not a link, beside the `hooks/` bundle). Once the new
+release is unpacked, it also refuses a lib dir holding anything that release
+does not ship, apart from the `ai-memory.new`, `.hooks.new` and `.hooks.old` an
+interrupted `ai-memory upgrade` can leave there. The link is replaced only when
+it points at this install's binary. Each refusal names what it found; move that
+aside, or pick another directory with `AI_MEMORY_LIB_DIR` or
+`AI_MEMORY_BIN_DIR`.
 
 Native Windows has its own script, `install.ps1`, published next to
 `install.sh` with its own `install.ps1.sha256`. In PowerShell (no
@@ -110,12 +125,33 @@ unpacking when the checksum file is missing, names another asset, or does not
 match, and refuses an archive entry that is absolute or holds `..`. The
 release goes to `%LOCALAPPDATA%\Programs\ai-memory` (`AI_MEMORY_INSTALL_DIR`
 overrides it), which is added to your user `PATH` unless
-`AI_MEMORY_NO_MODIFY_PATH=1`. An existing install there is left alone; update it
-with `ai-memory upgrade`. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
+`AI_MEMORY_NO_MODIFY_PATH=1`. The destination must not exist: even an empty
+directory, an unrelated file, or a directory link is refused before download.
+Remove it if it is empty or left over from a failed install, choose a new
+dedicated directory, or update an existing installation with
+`ai-memory upgrade`. A validated release is copied to a new sibling staging
+directory and published only if the destination is still absent. On a copy or
+publication failure, the destination is never deleted; the error identifies
+the leftover staging directory for inspection and later cleanup. It is not a
+completed installation. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
 work as for `install.sh`. On Windows on Arm it installs the x86_64 build, which
 Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
 failure under `iex` leaves your PowerShell window open. Details are in
 [`docs/windows.md`](windows.md).
+
+With [Scoop](https://scoop.sh), add the maintainer's bucket and install from it
+instead (ai-memory 3.4.0 or later):
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Scoop verifies the zip against the SHA-256 published with the release and puts
+an `ai-memory` shim on `PATH`. Update with `scoop update ai-memory`;
+`ai-memory upgrade` refuses a Scoop install, because the bucket owns the
+version.
 
 `ai-memory setup [--yes] [--agent <name>]... [--no-service] [--plan [--json]] [--web [--no-open]]`
 runs, in order, the commands a native install otherwise needs one by one:
@@ -132,11 +168,13 @@ runs, in order, the commands a native install otherwise needs one by one:
    `~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist` on macOS,
    rendered from the packaged LaunchAgent. The unit runs the binary `setup` ran
    from. When that binary sits in a versioned package location (Homebrew's
-   `Cellar/ai-memory/<version>` or a `/nix/store` path, both gone after an
-   upgrade and `brew cleanup` or garbage collection), the unit names a stable
-   link that resolves to the same file instead: the path as invoked, an
-   `ai-memory` on `PATH` such as `~/.nix-profile/bin/ai-memory`, or Homebrew's
-   `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`. With no such link it names
+   `Cellar/ai-memory/<version>`, a `/nix/store` path, or Scoop's
+   `apps\ai-memory\<version>`, all gone after an upgrade and `brew cleanup`,
+   garbage collection or `scoop cleanup`), the unit names a stable link that
+   resolves to the same file instead: the path as invoked, an `ai-memory` on
+   `PATH` such as `~/.nix-profile/bin/ai-memory`, Homebrew's
+   `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`, or Scoop's
+   `apps\ai-memory\current\ai-memory.exe`. With no such link it names
    the versioned path, and you re-run `setup` after upgrading.
    On Windows there is no per-user service manager, so `setup` writes an
    `ai-memory` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
@@ -308,6 +346,16 @@ configure ai-memory@ai-memory`:
   `install-mcp`, `install-skills`) to add them anyway.
 - Folderless sessions (a desktop scratch workspace with no project folder)
   are not captured through the plugin.
+- Ten events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `SessionEnd`,
+  `SubagentStart` and `SubagentStop`. Claude Code fires `PostToolUseFailure`
+  *instead of* `PostToolUse` when a tool fails (a non-zero exit, a thrown
+  error, an MCP error result). The observation records `outcome: error` and
+  the error text, bounded like any tool excerpt and never the tool's
+  arguments; the session page counts failed calls and quotes the newest one;
+  the automatic handoff adds a `Last failed tool call` line. An install made
+  before this fix has nine events; re-run `ai-memory install-hooks --agent
+  claude-code --apply` (or `ai-memory setup`) to add the tenth.
 - Factory Droid can install this plugin through its Claude marketplace
   fallback. Its events are recorded as `droid`, and when `install-hooks
   --agent droid` hooks deliver the same event (`~/.factory/hooks.json`, or
@@ -566,6 +614,28 @@ take precedence; see
 [the marker-file reference](marker-file.md#install-wide-default-no-marker).
 
 ---
+
+## Homebrew (macOS and Linux)
+
+The `akitaonrails/tap` formula installs the release binary and its hook
+sources for macOS (Apple Silicon and Intel) and Linux (x86_64 and aarch64).
+On Linux it works with Homebrew on Linux, which is how atomic distributions
+such as Bazzite and Fedora Silverblue usually add command-line tools.
+
+```bash
+brew install akitaonrails/tap/ai-memory
+ai-memory setup
+```
+
+`ai-memory setup` creates the data directory and its bearer token, installs
+and starts its own user service (a LaunchAgent on macOS, a systemd user unit
+on Linux), wires the agents it finds and checks the result. The formula also
+defines a `brew services` entry. Use one or the other, not both: with
+`brew services start ai-memory`, run `ai-memory init` first and wire the
+agents with `ai-memory setup --no-service`. `brew upgrade ai-memory` replaces
+the binary under a versioned Cellar path, so a service started by
+`ai-memory setup` should point at the stable `$(brew --prefix)/bin/ai-memory`
+(see the note on versioned package locations above).
 
 ## Fedora (RPM)
 
@@ -1057,7 +1127,10 @@ failure: they POST first and write the event to the same
 `<data_dir>/hook-spool/` contract when the server is unreachable, answers
 5xx, or answers 408, 425 or 429 (a saturated server asks for a retry), then
 flush the backlog behind the next delivery that succeeds. Any other 4xx
-is a permanent rejection and is not retried. Session start
+is a permanent rejection and is not retried. POSIX, PowerShell, and generated
+TypeScript drains leave native OIDC entries untouched for `ai-memory hook-drain`
+to resolve or refresh credentials from `auth.json`. They continue with other
+eligible entries within the same bounded scan. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
@@ -1071,6 +1144,19 @@ transaction complete finishes any interrupted wiki commit, durable provider
 enqueue, and ingest-key completion without adding a second handoff. Those
 incomplete effects remain at-least-once until the server marks the event
 complete.
+
+If the harness is terminated before it can send `SessionEnd` (including an API
+quota or 429 cutoff), the next session start does not need a synthetic close to
+recover context. The server picks the most recently active substantive open
+session in the same project and owner boundary and injects a read-only snapshot
+of its newest 64 sanitized observations, capped at 6,000 characters. It makes no
+rolling transcript copy, reads no observations from another project, and does
+not close the source session, which may still be a valid parallel agent. Recent
+prompts and bounded tool and lifecycle metadata are always available. The latest
+assistant status appears only when Claude Code assistant capture was enabled as
+described above. Use `finalize-session` later, once you know the abandoned
+source is no longer live.
+
 On Unix, the helper uses a trusted `setsid` launcher when available and falls
 back to a separate process group otherwise; Windows uses detached/breakaway
 process flags. The spool is capped, so a permanently undrained backlog is
@@ -1670,6 +1756,37 @@ does not document a stable native transcript store. Start a new Qwen session
 after installing so it reloads `settings.json`. See [the Qwen Code MCP and
 hook details](mcp-install.md#qwen-code).
 
+### Qoder
+
+Qoder CLI and IDE share `~/.qoder/settings.json`. Install MCP and lifecycle
+capture together:
+
+```bash
+ai-memory install-mcp --client qoder --apply \
+    --server-url "https://memory.example/mcp" \
+    --auth-token "$TOKEN"
+ai-memory install-hooks --agent qoder --apply \
+    --server-url "https://memory.example" \
+    --auth-token "$TOKEN"
+```
+
+The MCP entry runs `ai-memory mcp-bridge --no-session-id` using Qoder's stdio
+shape. It therefore reaches local or remote ai-memory servers without starting
+a second server, but remains a static client: project-scoped MCP calls must pass
+`workspace` and `project`. The hook installer preserves other settings,
+servers, and handlers while adding `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, and
+`SessionEnd`. A pending handoff is delivered as SessionStart
+`hookSpecificOutput.additionalContext`; capture-only context hooks stay silent.
+When a payload omits `cwd`, only Qoder's documented `QODER_PROJECT_DIR` is used.
+
+`ai-memory setup` detects `~/.qoder`; `backup-agents` preserves its settings and
+shared `~/.agents/skills` / `AGENTS.md` assets when Qoder owns those shared
+paths. Restart Qoder after changing hooks. Managed `ai-memory run qoder` and
+native transcript backfill are not claimed because Qoder does not document a
+stable transcript-store contract. See [the detailed MCP and hook
+notes](mcp-install.md#qoder).
+
 ### Kiro CLI
 
 Kiro CLI has one MCP surface and two incompatible lifecycle-hook formats.
@@ -1883,9 +2000,9 @@ The events are configured with PascalCase names (`SessionStart`,
 `PreToolUse`, …), which makes Copilot send the VS Code/Claude-compatible
 snake_case payload (`session_id`, `cwd`, `tool_name`, `tool_input`,
 `tool_result`), so ai-memory's existing extraction applies and native commands
-enforce `[capture] ignore_paths`. Ten events are wired: Claude Code's nine plus
-`PostToolUseFailure`, which Copilot fires instead of `PostToolUse` when a tool
-errors. Entries sit directly in each event array with no `matcher`: Copilot
+enforce `[capture] ignore_paths`. Ten events are wired, the same as Claude
+Code's, including `PostToolUseFailure`, which Copilot fires instead of
+`PostToolUse` when a tool errors. Entries sit directly in each event array with no `matcher`: Copilot
 rejects `matcher` on `SessionStart`, `Stop`, `SessionEnd`, and the subagent
 events, and omitting it elsewhere means "every invocation". Tool output is
 read from `tool_result.text_result_for_llm`.
@@ -2090,6 +2207,19 @@ file, `--apply` included: `~/.hermes/config.yaml` is YAML you also edit, and
 Hermes gates user hooks behind its own acceptance prompt (`hooks_auto_accept`).
 Paste the block, let Hermes accept it, and restart Hermes and its gateway.
 
+Hermes runs a hook only when its exact `(event, command)` pair is in that
+home's `shell-hooks-allowlist.json`, or when `hooks_auto_accept`,
+`--accept-hooks` or `HERMES_ACCEPT_HOOKS` approves it. Each profile
+(`~/.hermes/profiles/<name>`) is a home of its own with its own allowlist, so
+pasting the block into a profile's `config.yaml` is not enough: approve it
+there once with `hermes -p <name> --accept-hooks chat`, or run `hermes -p
+<name>` and accept the prompt. A gateway has no terminal to prompt on, so it
+skips an unapproved hook and logs `not allowlisted — skipped` on every event.
+`ai-memory doctor` checks the root home and every profile and names each
+profile whose ai-memory hooks are not approved. It reads both files and never
+changes them, and it cannot see a `HERMES_ACCEPT_HOOKS` set only in the
+gateway's environment.
+
 Six events are wired, each with a 20-second timeout:
 
 | Hermes event | ai-memory event | What it does |
@@ -2119,8 +2249,21 @@ instead, the variable Hermes exports `terminal.cwd` through, when it names an
 existing absolute directory. A multiplexing gateway serves every profile from
 the default profile's process and exports only the default profile's
 `terminal.cwd`, so inside a gateway the variable is used only for events the
-`default` profile fired; another profile's events keep the process directory.
-A tool call can still move to another checkout
+`default` profile fired. Another profile's events keep the process directory
+unless that profile's own Hermes home (`~/.hermes/profiles/<name>`, under the
+gateway's `HERMES_HOME` when it is set) carries an `.ai-memory.toml`; then the
+hook routes them by that marker. This is how the bots of one gateway reach the
+project they work for:
+
+```toml
+# ~/.hermes/profiles/sc-seo/.ai-memory.toml
+workspace = "default"
+project = "smart-compost"
+```
+
+The marker is an ordinary local marker, so its `[capture]` exclusions and
+`server` profile govern that profile's events. A profile without one is left
+where it was. A tool call can still move to another checkout
 when its absolute location proves one: `terminal`'s `workdir`, a file tool's
 `path`, or `search_files`' `path`. With neither, an event stays with the
 process directory and, under `capture_mode = allowlist`, is captured only if
@@ -2162,6 +2305,12 @@ docker run --rm akitaonrails/ai-memory:latest \
     --auth-token "$TOKEN"
 ```
 
+OpenCode 1.x runs each `task` subagent in a child session, and the task tool can
+resume an earlier one by its `task_id`. The plugin recognizes a child session from
+the parent OpenCode reports for it: a subagent never claims the pending handoff, and
+its end, including the one the plugin posts when OpenCode exits, leaves no handoff
+behind.
+
 Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup. The generic `opencode` client/agent spelling runs the installed
 `opencode --version` directly, accepts only major 1 or 2, and selects the matching
@@ -2170,10 +2319,26 @@ and launch share the same captured environment plus `--env` / `--env-file`
 overrides. Malformed output, a timeout, or an unsupported future major fails with
 an actionable error instead of guessing.
 
-### OpenCode 2 (beta)
+OpenCode 1 and 2 load plugins from the same `~/.config/opencode/plugins/`
+directory, and OpenCode 2 refuses the V1 plugin with "Plugin must export a
+default definition with an id and an effect or setup function". After upgrading
+OpenCode itself to 2.x, run `ai-memory install-hooks --agent opencode --apply`
+again (or `ai-memory upgrade`, which probes the installed major the same way):
+it writes `ai-memory-opencode2.ts` and removes the V1 `ai-memory.ts` it owns.
+
+A Claude Code compatibility layer inside OpenCode (such as oh-my-opencode's
+`claude_code.hooks`) may also run the hooks from `~/.claude/settings.json`. On
+native Windows those entries use Claude Code's exec form: `command` is the bare
+path to `ai-memory.exe` and the arguments sit in `args`, which Claude Code
+spawns without a shell, so a path with spaces is correct there. A layer that
+runs `command` through a shell and drops `args` splits that path at the first
+space and fails with `unrecognized subcommand`. Turn its Claude hooks off; the
+OpenCode plugin already captures those events.
+
+### OpenCode V2 compatibility
 
 The generated plugin targets the OpenCode 2.0.10+ event API (checked against
-2.0.14). OpenCode 2 runs one long-lived service behind every CLI, so closing a
+2.0.14). OpenCode V2 runs one long-lived service behind every CLI, so closing a
 terminal is not a session end: each completed root turn instead writes a
 deterministic checkpoint (no LLM call) of `sessions/<id>.md` and refreshes the
 session's automatic handoff, keeping one open baton per live session. The next
@@ -2198,9 +2363,10 @@ For a commented `opencode.jsonc`, preview `install-mcp --client opencode2` and
 merge the entry into the existing `mcp.servers` object by hand: the apply path
 writes strict JSON.
 
-The `opencode2`, `opencode-v2`, and `open-code2` spellings remain compatibility
-aliases that force the V2 contracts without probing. They share V1's config dir
-and session store. Prefer the generic `opencode` spelling for normal installs:
+The `opencode2`, `opencode-v2`, and `open-code2` spellings are legacy
+compatibility aliases that force the V2 contracts without probing. They share
+the generic OpenCode config directory and session store and are not a separate
+harness. Prefer the generic `opencode` spelling for normal installs:
 
 ```bash
 # Host-side generic commands auto-detect V2; compatibility aliases force it.
@@ -2225,19 +2391,13 @@ preserved. Repeating either install is
 byte-idempotent, and `uninstall` continues to recognize both historical files
 and MCP locations.
 
-> **Back up `~/.local/share/opencode` before running the beta against
-> your real data.** The two binaries share the one `opencode.db` file and
-> the beta has migrated its schema in place before, leaving stable
-> `opencode` 1.x broken
-> ([upstream #42260](https://github.com/anomalyco/opencode/issues/42260)).
-> ai-memory only ever opens that database read-only; the migration risk
-> comes from launching `opencode2` itself, not from this integration.
->
-> **The beta's background service defaults to port 49374, which is also ai-memory's
-> default.** Running both on defaults crash-loops the opencode2 service
+> **OpenCode V2's shared background service defaults to port 49374, which is
+> also ai-memory's default.** Running both on defaults prevents the OpenCode service
 > (`Managed service port 49374 ... is already in use`). Move one side:
-> `opencode2 service set port <free-port>`, or start ai-memory with
+> `opencode service set port <free-port>`, or start ai-memory with
 > `--bind 127.0.0.1:<free-port>` (and matching `--server-url` installs).
+> `ai-memory run --jail opencode` avoids the shared-service collision by using
+> OpenCode's private `--standalone` server inside the jail.
 
 **On a Gemini/Vertex model, serve Gemini-safe schemas.** OpenCode forwards MCP
 tool schemas to the configured provider verbatim, and Google's `Schema`
@@ -2279,6 +2439,15 @@ Restart OMP after installing or changing the extension; extensions are
 loaded at startup. The ai-memory CLI accepts `--client omp` (or
 `--client oh-my-pi`) for MCP and `--agent omp` (or `--agent oh-my-pi`)
 for hooks; both target OMP's native `.omp` integration surface.
+
+OMP runs subagents (the task tool, eval `agent()`, `/tan` clones) inside its
+own process and loads the extension into each one. The extension reads the
+agent a session runs from OMP's `ctx.agent` (OMP 18.3.2 and later) and posts a
+subagent session's events with `agent_id`. A subagent never claims the
+pending handoff, its end leaves no handoff behind, and a project that sets
+`drop_subagent_captures` drops it. An advisor's tool calls stay with the
+session they advise. An older OMP reports no `ctx.agent`, so every session
+there counts as top-level.
 
 ### Pi
 
@@ -3193,6 +3362,23 @@ current ids. Keys are created in the
 [FutureInfra console](https://futureinfra.ai/console/?screen=ai-router). This
 example configures the LLM only; configure embeddings separately.
 
+[Standard Compute](https://standardcompute.com) is an OpenAI-compatible LLM
+gateway and also uses the existing `openai-compat` provider. Supply a
+Standard Compute API key:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://api.stdcmpt.com/v1
+-e AI_MEMORY_LLM_MODEL=standardcompute
+-e LLM_API_KEY="$STANDARDCOMPUTE_API_KEY"
+```
+
+The `standardcompute` model id is routed: each request goes to a capable model
+from those you've enabled. To pin a specific model instead, use an id from
+`GET https://api.stdcmpt.com/v1/models`. See the
+[Standard Compute docs](https://docs.standardcompute.com) for details. This
+example configures the LLM only; configure embeddings separately.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
@@ -3835,7 +4021,7 @@ are checked against the release workflow's exact layout but are not extracted
 during self-upgrade. Archives are capped at 4,096 entries and 512 MiB expanded,
 in addition to the 128 MiB response-body cap. Windows uses rename-aside
 (`.exe` → `.old`, then promote `.new`) because
-a running image cannot be overwritten in place. It refuses Homebrew/AUR/`/usr`
+a running image cannot be overwritten in place. It refuses Homebrew/AUR/Scoop/`/usr`
 installs (use the package manager), unwritable prefixes (for example Program
 Files; download the zip manually), and in-container binaries (upgrade the
 host wrapper/image instead). Windows aarch64 has no release asset yet. For

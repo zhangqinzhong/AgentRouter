@@ -85,12 +85,13 @@ struct Branch {
     original: PathBuf,
 }
 
-/// 整份文件的 uuid 集合与最后一条自定义标题。只给分支之前的那几份读(绝大多数会话没有
-/// 分支,一份都不用读)
+/// 整份文件的 uuid 集合与最后一条自定义标题、AI 标题。只给分支之前的那几份读(绝大多数
+/// 会话没有分支,一份都不用读)
 #[derive(Clone)]
 struct Lineage {
     uuids: Arc<HashSet<String>>,
     custom_title: Option<String>,
+    ai_title: Option<String>,
 }
 
 /// 一个项目目录的分支分组,按目录 mtime 校验:文件进出、改名都会改它;文件追加不会,也
@@ -117,13 +118,12 @@ struct BranchCache {
     lineages: HashMap<PathBuf, ((i64, i64), Lineage)>,
 }
 
-/// 一份分支会话的继承段:比它早写下的同根文件里出现过的 uuid。文件开头连续落在这些集合
-/// 里的行是从原件复制来的
+/// 一份分支会话的继承段:比它早写下的同根文件(原件在其中)。文件开头连续落在它们 uuid 集合
+/// 里的行是复制来的;分支的自定义标题、AI 标题跟其中哪一份的一样(分支时照抄过来)也不当标题
+/// 用,往下退——否则父子两行标题一模一样,看不出分支在问什么。每一份都比、不只比原件:A 分出
+/// B、B 改了名再分出 C,C 抄来的是 B 的名字
 struct Inherited {
     earlier: Vec<Lineage>,
-    /// 原件最后一条自定义标题:分支的自定义标题跟它一样(分支时照抄过来)就不当标题用,
-    /// 改用分支自己的第一句话——否则父子两行标题一模一样,看不出分支在问什么
-    parent_title: Option<String>,
 }
 
 impl Inherited {
@@ -214,8 +214,14 @@ fn read_head(path: &Path, born: Option<i64>) -> Head {
     head
 }
 
-/// 读整份文件的 uuid 集合与最后一条自定义标题。逐行只反序列化这三个字段;坏行跳过,
-/// 读错误整份失败(读不全就宁可不折)
+/// `ai-title` 行里命令行自己起的名字(2.1 起,#74)。解析与 read_lineage 都经这里取,分支的
+/// 标题与原件的才比得上
+fn ai_title_of(v: Option<&Value>) -> Option<String> {
+    optional_string(v)
+}
+
+/// 读整份文件的 uuid 集合与最后一条自定义标题、AI 标题。逐行只反序列化这几个字段;坏行
+/// 跳过,读错误整份失败(读不全就宁可不折)
 fn read_lineage(path: &Path) -> Result<Lineage> {
     #[derive(Deserialize)]
     struct Row {
@@ -224,22 +230,28 @@ fn read_lineage(path: &Path) -> Result<Lineage> {
         typ: Option<String>,
         #[serde(rename = "customTitle")]
         custom_title: Option<Value>,
+        #[serde(rename = "aiTitle")]
+        ai_title: Option<Value>,
     }
     let mut uuids = HashSet::new();
     let mut title = None;
+    let mut ai_title = None;
     for row in jsonl_rows::<Row, _>(BufReader::with_capacity(1 << 20, fs::File::open(path)?)) {
         let Some(row) = row? else { continue };
         if let Some(uuid) = row.uuid.filter(|u| !u.is_empty()) {
             uuids.insert(uuid);
         }
-        // 与解析同一个取法(optional_string),分支标题与原件标题才比得上
-        if row.typ.as_deref() == Some("custom-title") {
-            title = optional_string(row.custom_title.as_ref()).or(title);
+        // 与解析同一个取法,分支标题与原件标题才比得上
+        match row.typ.as_deref() {
+            Some("custom-title") => title = optional_string(row.custom_title.as_ref()).or(title),
+            Some("ai-title") => ai_title = ai_title_of(row.ai_title.as_ref()).or(ai_title),
+            _ => {}
         }
     }
     Ok(Lineage {
         uuids: Arc::new(uuids),
         custom_title: title,
+        ai_title,
     })
 }
 
@@ -344,7 +356,7 @@ impl ClaudeAdapter {
         Ok(lineage)
     }
 
-    /// `file` 是分支的话,它的继承段与原件的标题;不是分支给 None。更早的文件读不出来就报错,
+    /// `file` 是分支的话,它的继承段;不是分支给 None。更早的文件读不出来就报错,
     /// 不能当成"不是分支"照常入库:等它读得出来,分支的引用没变、扫描不会重来,索引停在没
     /// 折叠的那份,现场解析却折叠了,两边的 seq 对不上(不变量 1)。解析失败时库里的旧行
     /// 留着,下一轮再试
@@ -365,11 +377,7 @@ impl ClaudeAdapter {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let parent_title = self.lineage(&branch.original)?.custom_title;
-        Ok(Some(Inherited {
-            earlier,
-            parent_title,
-        }))
+        Ok(Some(Inherited { earlier }))
     }
 
     /// 会话的解析(parse_session 与 parse_transcript 共用):分支先拿继承段;子代理的转录整份
@@ -548,6 +556,8 @@ fn parse_claude_jsonl(
     // tool_use id → (消息占位:回填时按 id 在已 flush 消息与 pending 中查)
     let mut tool_index: HashMap<String, (usize, usize)> = HashMap::new();
     let mut custom_title = String::new();
+    // 2.1 起命令行自己起的标题;只用命令行、没有桌面端写 custom-title 的会话全靠它(#74)
+    let mut ai_title = String::new();
     let mut fallback_title = String::new();
     let mut cwd = String::new();
     let mut git_branch: Option<String> = None;
@@ -590,6 +600,12 @@ fn parse_claude_jsonl(
         if typ == "custom-title" {
             if let Some(t) = optional_string(row.get("customTitle")) {
                 custom_title = t;
+            }
+            continue;
+        }
+        if typ == "ai-title" {
+            if let Some(t) = ai_title_of(row.get("aiTitle")) {
+                ai_title = t;
             }
             continue;
         }
@@ -823,15 +839,18 @@ fn parse_claude_jsonl(
         if own_created_at > 0 {
             created_at = own_created_at;
         }
-        if inh.parent_title.as_deref() == Some(custom_title.as_str()) {
+        if inh.earlier.iter().any(|l| l.custom_title.as_deref() == Some(&custom_title)) {
             custom_title.clear();
         }
+        if inh.earlier.iter().any(|l| l.ai_title.as_deref() == Some(&ai_title)) { ai_title.clear(); }
     }
     assign_seq(&mut messages);
 
     Ok(ParseResult {
         title: if !custom_title.is_empty() {
             custom_title
+        } else if !ai_title.is_empty() {
+            ai_title
         } else if !fallback_title.is_empty() {
             fallback_title
         } else {

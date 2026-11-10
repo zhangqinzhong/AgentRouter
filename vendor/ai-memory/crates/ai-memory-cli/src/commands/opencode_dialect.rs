@@ -13,7 +13,11 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use crate::cli::{AgentChoice, McpClient};
 use crate::commands::run::EffectiveChildEnv;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Budget for `opencode --version`. A cold first run of an executable can take
+/// seconds (macOS scans a fresh binary, and a busy machine slows every exec), so
+/// a tight limit turns a slow start into a hard failure. Every caller is a
+/// one-shot command, so only a hung `opencode` pays the full wait.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_VERSION_OUTPUT: u64 = 64 * 1024;
 
 #[derive(Debug)]
@@ -46,6 +50,14 @@ pub(crate) fn resolve_generic(
     executable: Option<&OsStr>,
     env: &EffectiveChildEnv,
 ) -> Result<ResolvedOpenCode> {
+    resolve_generic_with_timeout(executable, env, PROBE_TIMEOUT)
+}
+
+fn resolve_generic_with_timeout(
+    executable: Option<&OsStr>,
+    env: &EffectiveChildEnv,
+    timeout: Duration,
+) -> Result<ResolvedOpenCode> {
     let program = executable.unwrap_or_else(|| OsStr::new("opencode"));
     let resolved = super::run::resolve_program(program, env.executable_search()).ok_or_else(|| {
         anyhow!(
@@ -55,12 +67,12 @@ pub(crate) fn resolve_generic(
     })?;
     let mut command = Command::new(&resolved);
     env.apply_to_std(&mut command);
-    let mut child = command
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = spawn_retrying_busy(&mut command)
         .with_context(|| format!("probing OpenCode executable {}", resolved.display()))?;
     let stdout = read_bounded(child.stdout.take());
     let stderr = read_bounded(child.stderr.take());
@@ -72,21 +84,21 @@ pub(crate) fn resolve_generic(
         {
             break status;
         }
-        if started.elapsed() >= PROBE_TIMEOUT {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(timeout_error(&resolved));
+            return Err(timeout_error(&resolved, timeout));
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let remaining = PROBE_TIMEOUT.saturating_sub(started.elapsed());
+    let remaining = timeout.saturating_sub(started.elapsed());
     let stdout = stdout
         .recv_timeout(remaining)
-        .map_err(|_| timeout_error(&resolved))??;
-    let remaining = PROBE_TIMEOUT.saturating_sub(started.elapsed());
+        .map_err(|_| timeout_error(&resolved, timeout))??;
+    let remaining = timeout.saturating_sub(started.elapsed());
     let stderr = stderr
         .recv_timeout(remaining)
-        .map_err(|_| timeout_error(&resolved))??;
+        .map_err(|_| timeout_error(&resolved, timeout))??;
     if stdout.len() > MAX_VERSION_OUTPUT as usize || stderr.len() > MAX_VERSION_OUTPUT as usize {
         bail!("OpenCode version probe returned more than {MAX_VERSION_OUTPUT} bytes");
     }
@@ -119,10 +131,28 @@ pub(crate) fn resolve_generic(
     })
 }
 
-fn timeout_error(program: &std::path::Path) -> anyhow::Error {
+/// Retry a probe while an updater or a just-finished write still owns the
+/// executable. The total 80 ms retry window stays inside the probe timeout.
+fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<std::process::Child> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS =>
+            {
+                attempt += 1;
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn timeout_error(program: &std::path::Path, timeout: Duration) -> anyhow::Error {
     anyhow!(
         "OpenCode version probe timed out after {} seconds for {}; run `{} --version` and verify it exits promptly",
-        PROBE_TIMEOUT.as_secs(),
+        timeout.as_secs_f64(),
         program.display(),
         program.display()
     )
@@ -247,6 +277,30 @@ mod tests {
         assert_eq!(resolved.executable, executable);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn version_probe_retries_a_briefly_busy_executable() {
+        use std::fs::OpenOptions;
+
+        let temp = fake_version("opencode v2.0.23");
+        let executable = temp.path().join("opencode");
+        let writer = OpenOptions::new().write(true).open(&executable).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(writer);
+        });
+
+        let resolved = resolve_generic_with_timeout(
+            Some(executable.as_os_str()),
+            &EffectiveChildEnv::from_runtime(&crate::config::RuntimeEnv::default()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        release.join().unwrap();
+
+        assert_eq!(resolved.dialect, OpenCodeDialect::V2);
+    }
+
     #[cfg(unix)]
     #[test]
     fn version_probe_timeout_fails_actionably() {
@@ -259,13 +313,38 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
 
-        let error = resolve_generic(
+        let error = resolve_generic_with_timeout(
             Some(executable.as_os_str()),
             &EffectiveChildEnv::from_runtime(&crate::config::RuntimeEnv::default()),
+            Duration::from_millis(300),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("version probe timed out"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_budget_leaves_room_for_a_slow_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(10));
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("opencode");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nsleep 0.1\nprintf '%s\\n' '1.18.34'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved = resolve_generic_with_timeout(
+            Some(executable.as_os_str()),
+            &EffectiveChildEnv::from_runtime(&crate::config::RuntimeEnv::default()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(resolved.dialect, OpenCodeDialect::V1);
     }
 
     #[cfg(windows)]

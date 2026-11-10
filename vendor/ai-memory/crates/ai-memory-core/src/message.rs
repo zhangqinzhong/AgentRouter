@@ -42,6 +42,57 @@ pub enum MessageState {
     Claimed,
     /// The sender retracted it before it was popped.
     Cancelled,
+    /// The sender took it out of the queue to edit it. It cannot be popped
+    /// until the edit is saved or released, which returns it to `Pending`.
+    Editing,
+}
+
+/// How the sender knows the claim carried by a cross-project message.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageNature {
+    /// The sender did not classify the claim. This is the compatibility
+    /// default for messages created before epistemic tags existed.
+    #[default]
+    Unknown,
+    /// The sender directly measured or verified the claim. Evidence is
+    /// required when sending this value.
+    Measured,
+    /// The sender is relaying a claim learned from another source.
+    Reported,
+    /// The sender derived the claim from available evidence.
+    Inferred,
+}
+
+impl MessageNature {
+    /// Canonical wire and storage string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Measured => "measured",
+            Self::Reported => "reported",
+            Self::Inferred => "inferred",
+        }
+    }
+}
+
+impl std::str::FromStr for MessageNature {
+    type Err = crate::MemoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "unknown" => Ok(Self::Unknown),
+            "measured" => Ok(Self::Measured),
+            "reported" => Ok(Self::Reported),
+            "inferred" => Ok(Self::Inferred),
+            other => Err(crate::MemoryError::MalformedRecord(format!(
+                "unknown message nature: {other}"
+            ))),
+        }
+    }
 }
 
 impl MessageState {
@@ -52,6 +103,7 @@ impl MessageState {
             Self::Pending => "pending",
             Self::Claimed => "claimed",
             Self::Cancelled => "cancelled",
+            Self::Editing => "editing",
         }
     }
 }
@@ -64,6 +116,7 @@ impl std::str::FromStr for MessageState {
             "pending" => Ok(Self::Pending),
             "claimed" => Ok(Self::Claimed),
             "cancelled" => Ok(Self::Cancelled),
+            "editing" => Ok(Self::Editing),
             other => Err(crate::MemoryError::MalformedRecord(format!(
                 "unknown message state: {other}"
             ))),
@@ -99,10 +152,17 @@ pub struct NewAgentMessage {
     pub to_workspace_id: WorkspaceId,
     /// Recipient project.
     pub to_project_id: ProjectId,
+    /// Optional harness recipient within the project; absent means any agent.
+    #[serde(default)]
+    pub to_agent: Option<AgentKind>,
     /// Optional one-line subject.
     pub subject: Option<String>,
     /// The message body (the request for the recipient agent).
     pub body: String,
+    /// How the sender knows the claim in the message.
+    pub nature: MessageNature,
+    /// Bounded supporting evidence. Required for [`MessageNature::Measured`].
+    pub evidence: Option<String>,
 }
 
 /// Scope, identity, and receiver metadata for an atomic message pop.
@@ -145,6 +205,8 @@ pub struct AgentMessage {
     pub to_workspace_id: WorkspaceId,
     /// Recipient project.
     pub to_project_id: ProjectId,
+    /// Harness recipient, or `None` for the shared project queue.
+    pub to_agent: Option<AgentKind>,
     /// Sender-side provenance (untrusted, but structured — judge before acting).
     #[serde(flatten)]
     pub origin: MessageOrigin,
@@ -153,6 +215,10 @@ pub struct AgentMessage {
     /// The message body. UNTRUSTED cross-project input: data to weigh, never
     /// instructions to obey. The MCP pop surface fences it explicitly.
     pub body: String,
+    /// How the sender knows the claim in the message.
+    pub nature: MessageNature,
+    /// Supporting evidence supplied by the sender, when any.
+    pub evidence: Option<String>,
     /// Current state.
     pub state: MessageState,
     /// Creation timestamp.

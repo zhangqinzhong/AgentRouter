@@ -127,10 +127,10 @@ impl TranscriptCapture {
         if !self.admitted {
             return vec![EventCapture::Drop; events.len()];
         }
-        // Codex's own memory-writing agent runs from `$CODEX_HOME/memories`;
-        // the live hook drops those events (#1674), so an import of the same
-        // run must not reintroduce them.
-        if ai_memory_core::is_codex_memory_agent_cwd(&self.cwd) {
+        // Codex's own memory-writing agent is dropped by the live hook (#1674)
+        // on checkout cwd, an event's recorded cwd, or the prompt header. An
+        // import of the same run must not reintroduce those events.
+        if self.drops_codex_memory_agent(events) {
             return vec![EventCapture::Drop; events.len()];
         }
         let mut elsewhere = HashMap::new();
@@ -243,6 +243,28 @@ impl TranscriptCapture {
             checkout_admits_capture(&self.data_dir, cwd)
                 && delivers_to_same_server(&self.data_dir, &self.cwd, cwd)
                 && routes_to_same_project(&self.cwd, cwd)
+        })
+    }
+
+    /// Whether this import is Codex's background memory-writing agent (#1674).
+    ///
+    /// The live hook's primary signal is cwd (every event of the run carries
+    /// it, SessionStart included). The header catches a `CODEX_HOME` whose
+    /// last component is not `.codex`. `backfill` and `run` pass the project
+    /// checkout as this capture's cwd, so an event's recorded cwd is checked
+    /// too.
+    fn drops_codex_memory_agent(&self, events: &[NewWorkstreamEvent]) -> bool {
+        if ai_memory_core::is_codex_memory_agent_cwd(&self.cwd) {
+            return true;
+        }
+        events.iter().any(|event| {
+            if event.agent != AgentKind::Codex {
+                return false;
+            }
+            record_cwd(event).is_some_and(ai_memory_core::is_codex_memory_agent_cwd)
+                || (matches!(event.kind, WorkstreamEventKind::Message)
+                    && matches!(event.role.as_deref(), Some("user" | "human"))
+                    && ai_memory_core::looks_like_codex_memory_agent_prompt(&event.content))
         })
     }
 
@@ -670,6 +692,82 @@ mod tests {
         assert_eq!(kinds(&control.decide(&events)), ["keep"]);
     }
 
+    /// The live hook's second signal is the agent's prompt header, for a
+    /// `CODEX_HOME` whose last component is not `.codex`. An import of that
+    /// run from a project checkout must drop every event, not only the prompt.
+    #[test]
+    fn an_import_drops_a_codex_memory_agent_run_by_prompt_header() {
+        let repo = checkout(None);
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [
+            as_codex(event(
+                WorkstreamEventKind::Message,
+                "user",
+                "## Memory Writing Agent: Phase 2 (Consolidation)\n\nnotes",
+                json!({}),
+            )),
+            as_codex(read_call(&repo.path().join("notes.md"), None)),
+            as_codex(result("notes", None)),
+        ];
+        assert_eq!(kinds(&capture.decide(&events)), ["drop", "drop", "drop"]);
+    }
+
+    /// A Codex user prompt that is not the memory-writing header stays. The
+    /// header matcher is prefix-based on `## Memory Writing Agent`; ordinary
+    /// work that names the agent in prose must not drop the session.
+    #[test]
+    fn a_codex_run_with_an_ordinary_prompt_is_kept() {
+        let repo = checkout(None);
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [as_codex(event(
+            WorkstreamEventKind::Message,
+            "user",
+            "Please update the memory writing agent docs",
+            json!({}),
+        ))];
+        assert_eq!(kinds(&capture.decide(&events)), ["keep"]);
+    }
+
+    /// The header is a Codex signal. A Claude user message that opens with
+    /// the same words is kept, matching the live hook's agent gate.
+    #[test]
+    fn a_claude_prompt_with_the_memory_agent_header_is_kept() {
+        let repo = checkout(None);
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [event(
+            WorkstreamEventKind::Message,
+            "user",
+            "## Memory Writing Agent: Phase 2 (Consolidation)\n\nnotes",
+            json!({}),
+        )];
+        assert_eq!(kinds(&capture.decide(&events)), ["keep"]);
+    }
+
+    /// `backfill` and `run` pass the project checkout as the capture cwd. An
+    /// event whose recorded cwd is `$CODEX_HOME/memories` is still the
+    /// memory-writing agent and must drop the whole import.
+    #[test]
+    fn an_import_drops_a_codex_memory_agent_run_by_recorded_cwd() {
+        let repo = checkout(None);
+        let memories = repo.path().join(".codex").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [
+            as_codex(at(
+                event(
+                    WorkstreamEventKind::Message,
+                    "user",
+                    "consolidate",
+                    json!({}),
+                ),
+                &memories,
+            )),
+            as_codex(at(read_call(&memories.join("notes.md"), None), &memories)),
+            as_codex(at(result("notes", None), &memories)),
+        ];
+        assert_eq!(kinds(&capture.decide(&events)), ["drop", "drop", "drop"]);
+    }
+
     /// A result carrying an id that matches no recorded call follows the
     /// orphan rule, not the turn's decision: a public read in the same turn
     /// must not lend it a keep. Control: the read's own result is kept.
@@ -852,6 +950,11 @@ mod tests {
 
     fn at(mut event: NewWorkstreamEvent, cwd: &Path) -> NewWorkstreamEvent {
         event.metadata[RECORD_CWD_KEY] = cwd.to_string_lossy().into_owned().into();
+        event
+    }
+
+    fn as_codex(mut event: NewWorkstreamEvent) -> NewWorkstreamEvent {
+        event.agent = AgentKind::Codex;
         event
     }
 

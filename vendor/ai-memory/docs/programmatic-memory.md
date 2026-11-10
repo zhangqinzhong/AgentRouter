@@ -117,6 +117,29 @@ call fails with JSON-RPC `invalid_request` whose `data` is
 "current_page_id"}`; re-read the page and decide. A caller without write access
 gets the usual authorization error, never the current version.
 
+Exact `memory_read_page` and `memory_write_page` calls can select an existing
+destination by stable id with `workspace` + `project_id`. This is mutually
+exclusive with `project` and `scope`; it never creates a name-only project.
+
+Bulk importers can use `memory_write_pages_batch` for 1-100 page versions in
+one existing destination. Every entry must set exactly one of `create_only`
+or `expected_page_id`. The server refuses duplicate paths, bodies over 1 MiB,
+or more than 8 MiB of bodies in one call. Admission and persistence are
+atomic: any rejected entry or stale precondition writes nothing. A stale
+entry returns `reason: "precondition_failed"`, its zero-based `index`, path,
+and current page id. A successful response returns ordered `pages` containing
+the corresponding path and new page id, plus one git checkpoint for the
+batch.
+
+Before planning a multi-destination import, call
+`memory_resolve_write_target` once for every mapped destination. It requires
+`workspace` and exactly one existing `project` or `project_id`, checks write
+authorization without falling back, creating, or promoting anything, and
+returns the canonical workspace/project names plus stable project id. Resolve
+the complete mapping before the first batch so an invalid or unauthorized
+destination cannot leave an otherwise valid earlier destination partially
+imported.
+
 ## Read changed pages
 
 These JSON endpoints require `serve --enable-api` (or `--enable-web`, which
@@ -150,7 +173,7 @@ any caller the server's auth lets in.
 | Operation | Call | Notes |
 |---|---|---|
 | Delete a page (there is no separate archive) | MCP `memory_delete_page` with `path` (plus `workspace` and `project`) | Checkpoints the wiki in git first, then removes the file and every indexed version of the page. Returns `{path, deleted, pre_checkpoint, checkpoint}`. Idempotent. |
-| Restore a deleted or overwritten page | `POST /admin/restore-page` with `{workspace, project, path, rev}` | `rev` is any git revision that still holds the page: the delete's `pre_checkpoint`, or `<checkpoint>~1` when `pre_checkpoint` is `null` because the tree was already clean. Writes that version back as the latest page and reindexes it. After a delete, only that one version returns. |
+| Restore a deleted or overwritten page | `POST /admin/restore-page` with `{workspace, project, path, rev}` or `{workspace, project, path, page_id}` | `rev` is any git revision that still holds the page: the delete's `pre_checkpoint`, or `<checkpoint>~1` when `pre_checkpoint` is `null` because the tree was already clean. `page_id` selects a retained SQLite version already belonging to that exact project/path, including source history preserved by `merge-project`. Exactly one source is required. Writes that version back as the latest page and reindexes it. |
 | Find a revision | `GET /admin/checkpoints?limit=N` | Recent checkpoints (up to 100) with `oid` and `summary`. A delete's summary is `memory_delete_page: <path>`. |
 | Purge one session | `POST /admin/purge-session` with `{workspace, project, session_id, confirm}` | Irreversible. Optional `dry_run` and `compact`. |
 | Purge a whole project | `POST /admin/purge-project` with `{workspace, project, confirm}` | Irreversible. Optional `dry_run`, `compact`, and `force` (purge despite a live managed-workstream lease). |

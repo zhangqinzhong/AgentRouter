@@ -35,6 +35,7 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("AI_MEMORY_AUTH_TOKEN")
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("COPILOT_HOME")
         .env_remove("KIMI_CODE_HOME")
         .env_remove("KIRO_HOME");
     #[cfg(windows)]
@@ -370,6 +371,248 @@ fn antigravity_backup_round_trips_every_documented_skill_root() {
     );
 }
 
+fn backup_agents_args(archive: &Path, agent: &str) -> Vec<String> {
+    vec![
+        "backup-agents".to_string(),
+        "-o".to_string(),
+        archive.display().to_string(),
+        "--agents".to_string(),
+        agent.to_string(),
+    ]
+}
+
+fn restore_agents_args(archive: &Path, agent: &str) -> Vec<String> {
+    vec![
+        "restore-agents".to_string(),
+        "-i".to_string(),
+        archive.display().to_string(),
+        "--agents".to_string(),
+        agent.to_string(),
+        "--apply".to_string(),
+    ]
+}
+
+fn assert_success(output: &std::process::Output, what: &str) {
+    assert!(
+        output.status.success(),
+        "{what} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Copilot CLI reads personal skills from `$COPILOT_HOME/skills` (default
+/// `~/.copilot/skills`) and repository skills from `.github/skills`, the
+/// roots `install-skills --agent copilot-cli` writes:
+/// <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills>.
+/// The `~/.agents/skills`, `.agents/skills` and `.claude/skills` roots the
+/// same page lists are already collected for Codex and Claude Code.
+#[test]
+fn copilot_cli_backup_round_trips_personal_and_repository_skills() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let fixtures = [
+        (
+            home.path().join(".copilot/skills/personal/SKILL.md"),
+            "# Personal Copilot skill",
+        ),
+        (
+            home.path().join(".copilot/skills/personal/scripts/run.sh"),
+            "#!/bin/sh\necho personal",
+        ),
+        (
+            project.path().join(".github/skills/repo/SKILL.md"),
+            "# Repository Copilot skill",
+        ),
+    ];
+    for (path, body) in &fixtures {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let not_a_skill = home.path().join(".copilot/mcp-config.json");
+    fs::write(&not_a_skill, r#"{"mcpServers":{}}"#).unwrap();
+
+    let archive = project.path().join("copilot.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(backup_agents_args(&archive, "copilot-cli"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args(restore_agents_args(&archive, "copilot-cli"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    let restored = [
+        (
+            restored_home
+                .path()
+                .join(".copilot/skills/personal/SKILL.md"),
+            "# Personal Copilot skill",
+        ),
+        (
+            restored_home
+                .path()
+                .join(".copilot/skills/personal/scripts/run.sh"),
+            "#!/bin/sh\necho personal",
+        ),
+        (
+            restored_project.path().join(".github/skills/repo/SKILL.md"),
+            "# Repository Copilot skill",
+        ),
+    ];
+    for (path, body) in &restored {
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            *body,
+            "{}",
+            path.display()
+        );
+    }
+    assert!(
+        !restored_home
+            .path()
+            .join(".copilot/mcp-config.json")
+            .exists(),
+        "only Copilot CLI skills are collected, not its other config files"
+    );
+}
+
+#[test]
+fn copilot_cli_skills_follow_copilot_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let copilot_home = home.path().join("custom-copilot");
+    let skill = copilot_home.join("skills/moved/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(&skill, "# Moved Copilot skill").unwrap();
+    let default_root_skill = home.path().join(".copilot/skills/ignored/SKILL.md");
+    fs::create_dir_all(default_root_skill.parent().unwrap()).unwrap();
+    fs::write(&default_root_skill, "# Not the active root").unwrap();
+
+    let archive = project.path().join("copilot-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("COPILOT_HOME", &copilot_home)
+        .args(backup_agents_args(&archive, "copilot-cli"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_copilot_home = restored_home.path().join("elsewhere");
+    let restore = command_with_env(restored_home.path(), project.path())
+        .env("COPILOT_HOME", &restored_copilot_home)
+        .args(restore_agents_args(&archive, "copilot-cli"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    assert_eq!(
+        fs::read_to_string(restored_copilot_home.join("skills/moved/SKILL.md")).unwrap(),
+        "# Moved Copilot skill"
+    );
+    assert!(
+        !restored_home.path().join(".copilot").exists(),
+        "with COPILOT_HOME set, nothing lands in the default ~/.copilot"
+    );
+    assert!(
+        !restored_copilot_home.join("skills/ignored").exists(),
+        "the default root is not collected while COPILOT_HOME points elsewhere"
+    );
+}
+
+/// The Copilot allowlist entries cover skills only: an archive cannot use
+/// them to reach Copilot's MCP or hook configuration, or other `.github`
+/// files such as workflows. The skill paths stay restorable as a control.
+#[test]
+fn restore_agents_limits_copilot_destinations_to_skill_roots() {
+    let _guard = cli_test_lock();
+    let refused = [
+        ("global", ".copilot/mcp-config.json"),
+        ("global", ".copilot/hooks/ai-memory.json"),
+        ("project", ".github/workflows/ci.yml"),
+        ("project", ".github/hooks/ai-memory.json"),
+    ];
+    for (scope, target) in refused {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let archive = project.path().join("copilot-evil.tar.gz");
+        let body: &[u8] = b"payload";
+        write_agent_archive(
+            &archive,
+            serde_json::json!([{
+                "agent": "copilot-cli",
+                "asset_kind": "skill",
+                "scope": scope,
+                "archive_path": "payload",
+                "target_relative": target,
+                "sha256": sha256(body),
+            }]),
+            &[("payload", body)],
+        );
+        let restore = command_with_env(home.path(), project.path())
+            .args(restore_agents_args(&archive, "copilot-cli"))
+            .output()
+            .unwrap();
+        assert!(
+            !restore.status.success(),
+            "{scope} {target} must be refused"
+        );
+        assert!(
+            String::from_utf8_lossy(&restore.stderr).contains("unauthorized path"),
+            "{scope} {target}: {}",
+            String::from_utf8_lossy(&restore.stderr)
+        );
+        assert!(!home.path().join(target).exists());
+        assert!(!project.path().join(target).exists());
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let archive = project.path().join("copilot-ok.tar.gz");
+    let body: &[u8] = b"# ok";
+    write_agent_archive(
+        &archive,
+        serde_json::json!([
+            {
+                "agent": "copilot-cli",
+                "asset_kind": "skill",
+                "scope": "global",
+                "archive_path": "global",
+                "target_relative": ".copilot/skills/ok/SKILL.md",
+                "sha256": sha256(body),
+            },
+            {
+                "agent": "copilot-cli",
+                "asset_kind": "skill",
+                "scope": "project",
+                "archive_path": "project",
+                "target_relative": ".github/skills/ok/SKILL.md",
+                "sha256": sha256(body),
+            }
+        ]),
+        &[("global", body), ("project", body)],
+    );
+    let restore = command_with_env(home.path(), project.path())
+        .args(restore_agents_args(&archive, "copilot-cli"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore of skill paths");
+    assert_eq!(
+        fs::read(home.path().join(".copilot/skills/ok/SKILL.md")).unwrap(),
+        body
+    );
+    assert_eq!(
+        fs::read(project.path().join(".github/skills/ok/SKILL.md")).unwrap(),
+        body
+    );
+}
+
 #[test]
 fn qwen_backup_round_trips_every_documented_asset() {
     let _guard = cli_test_lock();
@@ -448,6 +691,78 @@ fn qwen_backup_round_trips_every_documented_asset() {
         ),
         (restored_project.path().join("QWEN.md"), fixtures[3].1),
         (restored_project.path().join("AGENTS.md"), fixtures[4].1),
+    ] {
+        assert_eq!(fs::read_to_string(path).unwrap(), body);
+    }
+}
+
+#[test]
+fn qoder_backup_round_trips_shared_assets() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let fixtures = [
+        (
+            home.path().join(".qoder/settings.json"),
+            r#"{"mcpServers":{"ai-memory":{"command":"ai-memory"}}}"#,
+        ),
+        (
+            home.path().join(".agents/skills/shared/SKILL.md"),
+            "# Shared skill",
+        ),
+        (project.path().join("AGENTS.md"), "# Shared instructions"),
+    ];
+    for (path, body) in &fixtures {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let archive = project.path().join("qoder.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            archive.to_str().unwrap(),
+            "--agents",
+            "qoder",
+            "--include-secrets",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        backup.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let restored_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restored_home.path(), restored_project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--agents",
+            "qoder",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    for (path, body) in [
+        (
+            restored_home.path().join(".qoder/settings.json"),
+            fixtures[0].1,
+        ),
+        (
+            restored_home.path().join(".agents/skills/shared/SKILL.md"),
+            fixtures[1].1,
+        ),
+        (restored_project.path().join("AGENTS.md"), fixtures[2].1),
     ] {
         assert_eq!(fs::read_to_string(path).unwrap(), body);
     }
@@ -742,6 +1057,150 @@ fn restore_agents_binary_safe_preserves_raw_bytes() {
             & 0o777;
         assert_eq!(mode, 0o750, "portable executable bits must be restored");
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn restore_agents_checks_permissions_before_skipping_identical_content() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let plugin_dir = home.path().join(".claude/plugins/test-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let script = plugin_dir.join("run.sh");
+    let body = b"#!/bin/sh\nexit 0\n";
+    fs::write(&script, body).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
+    let mode = || fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+
+    let archive = project.path().join("backup.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            archive.to_str().unwrap(),
+            "--agents",
+            "claude-code",
+            "--scope",
+            "global",
+        ])
+        .output()
+        .unwrap();
+    assert!(backup.status.success());
+
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o640)).unwrap();
+    let preview = command_with_env(home.path(), project.path())
+        .args(["restore-agents", "-i", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("[OVERWRITE]"));
+    assert_eq!(mode(), 0o640, "preview must not restore permissions");
+    assert_eq!(fs::read_dir(&plugin_dir).unwrap().count(), 1);
+
+    let without_force = command_with_env(home.path(), project.path())
+        .args(["restore-agents", "-i", archive.to_str().unwrap(), "--apply"])
+        .output()
+        .unwrap();
+    assert!(without_force.status.success());
+    assert!(String::from_utf8_lossy(&without_force.stdout).contains("[SKIP]"));
+    assert_eq!(mode(), 0o640, "permission changes still require --force");
+    assert_eq!(fs::read_dir(&plugin_dir).unwrap().count(), 1);
+
+    let restore = command_with_env(home.path(), project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--apply",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(mode(), 0o750, "identical bytes must not hide mode changes");
+    assert_eq!(fs::read(&script).unwrap(), body);
+    let backup_path = fs::read_dir(&plugin_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("run.sh.bak-"))
+        })
+        .expect("permission restore must keep a backup copy");
+    assert_eq!(fs::read(&backup_path).unwrap(), body);
+    assert_eq!(
+        fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+
+    let identical = command_with_env(home.path(), project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--apply",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(identical.status.success());
+    assert!(String::from_utf8_lossy(&identical.stdout).contains("already identical"));
+    assert_eq!(mode(), 0o750);
+    assert_eq!(fs::read_dir(&plugin_dir).unwrap().count(), 2);
+}
+
+#[test]
+#[cfg(unix)]
+fn restore_agents_without_archived_permissions_keeps_identical_file_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let body = b"# instructions";
+    let target = project.path().join("CLAUDE.md");
+    fs::write(&target, body).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o750)).unwrap();
+    let archive = project.path().join("without-mode.tar.gz");
+    write_agent_archive(
+        &archive,
+        serde_json::json!([{
+            "agent": "claude-code",
+            "asset_kind": "instruction",
+            "scope": "project",
+            "archive_path": "project/CLAUDE.md",
+            "target_relative": "CLAUDE.md",
+            "sha256": sha256(body),
+        }]),
+        &[("project/CLAUDE.md", body)],
+    );
+
+    let restore = command_with_env(home.path(), project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            archive.to_str().unwrap(),
+            "--apply",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(restore.status.success());
+    assert!(String::from_utf8_lossy(&restore.stdout).contains("already identical"));
+    assert_eq!(fs::read(&target).unwrap(), body);
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+    assert_eq!(fs::read_dir(project.path()).unwrap().count(), 2);
 }
 
 #[test]
@@ -1094,6 +1553,74 @@ fn backup_agents_does_not_follow_config_or_asset_root_symlinks() {
     assert!(
         !archive.exists(),
         "symlink-only Claude and Antigravity assets must not be archived"
+    );
+}
+
+/// A plugin's manifest lives in a dot-directory (`.claude-plugin`,
+/// `.codex-plugin`); skipping it with the other dot-directories archived
+/// plugins and marketplaces that no longer load after a restore.
+#[test]
+fn backup_agents_keeps_plugin_manifest_directories() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let plugins = home.path().join(".claude/plugins/marketplaces/acme");
+    for (relative, body) in [
+        (".claude-plugin/marketplace.json", "{}"),
+        ("plugins/demo/.claude-plugin/plugin.json", "{}"),
+        ("plugins/demo/skills/demo/SKILL.md", "# Demo"),
+        (".git/HEAD", "ref: refs/heads/main"),
+    ] {
+        let path = plugins.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let codex_manifest = home
+        .path()
+        .join(".codex/plugins/demo/.codex-plugin/plugin.json");
+    fs::create_dir_all(codex_manifest.parent().unwrap()).unwrap();
+    fs::write(&codex_manifest, "{}").unwrap();
+    let archive = project.path().join("backup.tar.gz");
+
+    let output = command_with_env(home.path(), project.path())
+        .args(["backup-agents", "-o", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "backup-agents failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(
+        fs::File::open(&archive).unwrap(),
+    ));
+    let paths: Vec<String> = tar
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    for expected in [
+        "claude/plugins/marketplaces/acme/.claude-plugin/marketplace.json",
+        "claude/plugins/marketplaces/acme/plugins/demo/.claude-plugin/plugin.json",
+        "claude/plugins/marketplaces/acme/plugins/demo/skills/demo/SKILL.md",
+        "codex/plugins/demo/.codex-plugin/plugin.json",
+    ] {
+        assert!(
+            paths.iter().any(|path| path == expected),
+            "missing {expected} in {paths:?}"
+        );
+    }
+    assert!(
+        !paths.iter().any(|path| path.contains("/.git/")),
+        "VCS state must stay out of the archive: {paths:?}"
     );
 }
 

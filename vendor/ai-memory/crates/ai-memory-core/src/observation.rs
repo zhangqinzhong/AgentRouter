@@ -12,6 +12,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentKind, ObservationId, ProjectId, SessionId, WorkspaceId};
 
+/// Splits a tool observation body into its metadata header (`tool_family:
+/// …`, ids, `outcome: …`) and its output excerpt.
+pub const TOOL_BODY_SEPARATOR: &str = "\n---\n";
+
+/// Starts the header's outcome line; the outcome follows.
+pub const TOOL_OUTCOME_LINE_PREFIX: &str = "\noutcome: ";
+
+/// The header's last line when the harness reported the call as failed.
+pub const FAILED_TOOL_OUTCOME_LINE: &str = "\noutcome: error";
+
+/// Readers check the header on this many leading characters only. Every
+/// header the router writes fits, so an output excerpt is never scanned.
+pub const TOOL_BODY_HEADER_MAX_CHARS: usize = 512;
+
+/// Longest checkout-relative path the file index stores, the bound the
+/// handoff file list uses for stored paths.
+pub const FILE_PATH_MAX_CHARS: usize = 512;
+
+/// Whether `path` is a checkout-relative file index key: non-empty, at most
+/// [`FILE_PATH_MAX_CHARS`], not rooted (`/`, `\` or a drive letter) and with no
+/// `..` segment. The client folds `..` before sending, so one reaching the
+/// server was forged.
+#[must_use]
+pub fn valid_file_path_key(path: &str) -> bool {
+    !path.is_empty()
+        && path.chars().count() <= FILE_PATH_MAX_CHARS
+        && !path.starts_with(['/', '\\'])
+        && !matches!(path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+        && !path.split(['/', '\\']).any(|segment| segment == "..")
+}
+
 /// Classification of a single observation, mirroring the headline
 /// Claude Code / Codex lifecycle hook events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -111,6 +142,11 @@ pub struct NewObservation {
     /// store fills it in at write time.
     #[serde(default)]
     pub occurred_at: Option<i64>,
+    /// Checkout-relative path of the one file a kept file-tool call named,
+    /// when `[ingest] index_file_paths` is on. [`crate::Sanitized::new`]
+    /// clears a value that fails [`crate::Sanitizer::admits_file_path`].
+    #[serde(default)]
+    pub file_path: Option<String>,
 }
 
 /// Materialised view of an observation row.
@@ -166,6 +202,29 @@ pub struct NewSession {
     pub occurred_at: Option<i64>,
 }
 
+/// Reported cumulative token usage for one session (token-cost visibility).
+/// Sourced client-side from the harness's own transcript at `session-end`;
+/// see `ai-memory-cli`'s `session_usage` module. Values are cumulative
+/// totals for the whole session, not deltas — the store's upsert keeps
+/// `MAX(existing, reported)` per column so a replayed or out-of-order hook
+/// can never lower a total (docs: session usage tracking).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NewSessionUsage {
+    /// Session this usage belongs to.
+    pub session_id: SessionId,
+    /// Fresh (non-cached) input tokens.
+    pub input_tokens: u64,
+    /// Output tokens (including any reasoning/thinking breakdown the
+    /// harness reports as part of the same total).
+    pub output_tokens: u64,
+    /// Tokens written to a prompt cache.
+    pub cache_write_tokens: u64,
+    /// Tokens served from a prompt cache.
+    pub cache_read_tokens: u64,
+    /// Last-seen model name, when the transcript records one.
+    pub model: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +261,75 @@ mod tests {
             "PostCompaction".parse::<ObservationKind>().unwrap(),
             ObservationKind::PostCompaction,
         );
+    }
+}
+
+/// Content-free usage of one model response, keyed by its native identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenCall {
+    /// Stable response identity; retries update the same row.
+    pub call_id: String,
+    /// Fresh input tokens (cached input excluded).
+    pub input_tokens: u64,
+    /// Output tokens, including reasoning when reported within output.
+    pub output_tokens: u64,
+    /// Input tokens written to cache.
+    pub cache_write_tokens: u64,
+    /// Input tokens read from cache.
+    pub cache_read_tokens: u64,
+    /// Reported model, if available.
+    pub model: Option<String>,
+    /// Optional transcript provenance; absent on older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<TokenCallContext>,
+}
+
+/// Reported transcript coordinates, without prompts, tool arguments or outputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenCallContext {
+    /// Native user-turn identity, when explicitly present in the transcript.
+    pub turn_id: Option<String>,
+    /// Native provider response identity, when supplied independently of counters.
+    pub response_id: Option<String>,
+    /// RFC 3339 response timestamp reported by the harness.
+    pub recorded_at: Option<String>,
+    /// Bounded tool references with an explicit relationship.
+    #[serde(default)]
+    pub tools: Vec<TokenToolRef>,
+}
+
+/// A tool identity associated with a response or its turn; never its payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenToolRef {
+    /// Native tool-call identity.
+    pub id: String,
+    /// Sanitized tool label.
+    pub name: String,
+    /// Strength and direction of the association.
+    pub relation: TokenToolRelation,
+    /// Explicit tool-result error flag, if the harness reported it.
+    pub is_error: Option<bool>,
+}
+
+/// Exact response links remain distinct from a shared-turn association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenToolRelation {
+    /// The response itself requested this tool.
+    Requested,
+    /// A tool result was supplied directly before this response.
+    Input,
+    /// Tool activity was recorded in the same native turn; causality is unknown.
+    Turn,
+}
+
+impl TokenToolRelation {
+    /// Stable storage and wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Input => "input",
+            Self::Turn => "turn",
+        }
     }
 }

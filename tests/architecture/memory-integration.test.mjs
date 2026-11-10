@@ -14,7 +14,7 @@ test("memory is bundled for desktop, CLI, and Docker instead of downloaded at ru
 });
 
 test("memory keeps upstream provenance and exposes profile-scoped client integration", () => {
-  assert.match(read("vendor/ai-memory.UPSTREAM.md"), /3829f6187d8e9b7e6f32a9b2ac8831a64c5eff6f/);
+  assert.match(read("vendor/ai-memory.UPSTREAM.md"), /ee73c04c542fa41ca629b046deb4ac108518f407/);
   assert.match(read("vendor/ai-memory/LICENSE"), /MIT License/);
   const ui = read("packages/ui/src/pages/home/components/memory.tsx");
   assert.doesNotMatch(ui, /<iframe|<webview|dangerouslySetInnerHTML/);

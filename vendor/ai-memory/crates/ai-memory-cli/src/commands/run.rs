@@ -14,20 +14,23 @@ use ai_memory_core::{
 };
 use ai_memory_workstream::{
     AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, FORWARDED_ENV_NAMES,
-    JailChecklistItem, JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode,
-    LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
-    allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env_lookup, claude_continued_session,
-    claude_live_background_attach_id, claude_session_ran_in_background, clean_path,
-    crush_global_config_path, discover_native_session, export_transcript,
-    has_native_session_selector, inside_ai_jail_here, inspect_repository,
-    is_interactive_session_invocation, jail_checklist, jail_toggle, kiro_explicit_session_id,
-    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
-    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
+    JailChecklistItem, JailHostFacts, JailRefusal, JailRisk, JailSupport, JailToggleChoice,
+    JailToggleKind, LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate,
+    ServerReach, ai_jail_contract, ai_jail_harness_name, ai_jail_support,
+    allows_native_session_adoption, apply_jail_process_isolation, apply_yolo,
+    build_ai_jail_invocation, build_launch_plan, build_launch_plan_with_env_lookup,
+    checklist_reason, claude_continued_session, claude_continued_sessions,
+    claude_live_background_attach_id, claude_session_ran_in_background, clean_path, contract_flags,
+    contract_invocation, contract_status_invocation, crush_global_config_path,
+    discover_native_session, export_transcript, harness_env_names, has_native_session_selector,
+    inside_ai_jail_here, inspect_repository, is_interactive_session_invocation, jail_checklist,
+    jail_spec, jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
+    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
+    kiro_v3_resume_uses_default_store, kiro_yolo_engine_is_unverified, list_native_sessions,
     marked_choices, native_session_exists, native_session_in_checkout, native_store_root,
-    omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, store_override_vars,
-    transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
-    wait_for_transcript_flush,
+    omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, parse_status, server_reach,
+    status_refusal, store_override_vars, transcript_baseline, transcript_interval_digests,
+    usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use clap::ValueEnum as _;
@@ -42,6 +45,7 @@ use crate::http_client::{
     ServerEndpoint, ServerProbe, ServerResponseError, augment_connect_error, get_json, post_empty,
     post_json, post_json_no_content, probe_server,
 };
+use crate::localization::diagnostic;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -208,7 +212,7 @@ impl HeartbeatHealth {
 
     fn notify(&mut self, notice: String) {
         if !self.defer_notices {
-            eprintln!("{notice}");
+            eprintln!("{}", super::show::terminal_text(&notice));
             return;
         }
         self.deferred_count = self.deferred_count.saturating_add(1);
@@ -255,6 +259,7 @@ enum HeartbeatFailureKind {
 }
 
 fn resolve_opencode_for_launch(
+    i18n: &ai_memory_core::i18n::Localizer,
     requested: Option<RunHarnessChoice>,
     executable: Option<&OsStr>,
     env: &EffectiveChildEnv,
@@ -269,7 +274,13 @@ fn resolve_opencode_for_launch(
     match super::opencode_dialect::resolve_generic(executable, env) {
         Ok(resolved) => Ok(Some(resolved)),
         Err(error) if automatic => {
-            eprintln!("ai-memory: automatic OpenCode scan skipped: {error:#}");
+            eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!("ai-memory: automatic OpenCode scan skipped: {error:#}")
+                )
+            );
             Ok(None)
         }
         Err(error) => Err(error),
@@ -308,9 +319,50 @@ pub(super) async fn run_from_with_wiring(
     cwd: &Path,
     wire_overrides: &super::run_autowire::WireOverrides,
 ) -> Result<i32> {
-    run_once_with_wiring(config, args, cwd, wire_overrides)
+    run_once_repairing_split(config, args, cwd, wire_overrides)
         .await
         .map(|outcome| outcome.exit_code)
+}
+
+/// [`run_once_with_wiring`], offering once on a terminal to join a project
+/// split by the git remote's arrival and then launching again (#1993).
+async fn run_once_repairing_split(
+    config: &Config,
+    args: RunArgs,
+    cwd: &Path,
+    wire_overrides: &super::run_autowire::WireOverrides,
+) -> Result<RunOutcome> {
+    let error = match run_once_with_wiring(config, args.clone(), cwd, wire_overrides).await {
+        Ok(outcome) => return Ok(outcome),
+        Err(error) => error,
+    };
+    let Some(split) = error
+        .downcast_ref::<super::run_project_split::ProjectSplit>()
+        .cloned()
+    else {
+        return Err(error);
+    };
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        return Err(error);
+    }
+    let i18n = config.i18n.clone();
+    let prompt_split = split.clone();
+    let accepted = tokio::task::spawn_blocking(move || {
+        super::run_project_split::confirm_repair(
+            &i18n,
+            &prompt_split,
+            &mut io::stdin().lock(),
+            &mut io::stderr(),
+        )
+    })
+    .await
+    .context("waiting for the project rename confirmation")?
+    .context("reading the project rename confirmation from stdin")?;
+    if !accepted {
+        return Err(error);
+    }
+    super::run_project_split::apply_repair(config, &split, cwd).await?;
+    run_once_with_wiring(config, args, cwd, wire_overrides).await
 }
 
 #[derive(Debug)]
@@ -334,21 +386,26 @@ enum AfterRunAction {
 }
 
 async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
+    let result = run_with_exit_prompt_loop(config, args, cwd).await;
+    print_next_run_hint(config);
+    result
+}
+
+async fn run_with_exit_prompt_loop(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
     let interactive_terminal =
         io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal();
-    let custom_executable = args.executable.is_some();
     let mut next_args = args;
     preserve_trailing_run_options(&mut next_args);
 
     loop {
-        let outcome = run_once_with_wiring(
+        let outcome = run_once_repairing_split(
             config,
             next_args.clone(),
             cwd,
             &super::run_autowire::WireOverrides::default(),
         )
         .await?;
-        if !should_offer_after_run(&outcome, interactive_terminal, custom_executable) {
+        if !should_offer_after_run(config, &next_args, &outcome, interactive_terminal) {
             return Ok(outcome.exit_code);
         }
 
@@ -358,6 +415,8 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
             let stdin = io::stdin();
             let stderr = io::stderr();
             choose_after_run(
+                &config.i18n,
+                Paint::for_stderr(config),
                 outcome.harness,
                 &outcome.workstream_name,
                 &available,
@@ -368,7 +427,13 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
         let action = match action {
             Ok(action) => action,
             Err(error) => {
-                eprintln!("ai-memory: could not read the post-run choice ({error}); exiting");
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!("ai-memory: could not read the post-run choice ({error}); exiting")
+                    )
+                );
                 return Ok(outcome.exit_code);
             }
         };
@@ -379,22 +444,26 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
 }
 
 fn should_offer_after_run(
+    config: &Config,
+    args: &RunArgs,
     outcome: &RunOutcome,
     interactive_terminal: bool,
-    custom_executable: bool,
 ) -> bool {
-    outcome.exit_code == 0
+    config.run.exit_prompt
+        && !args.no_exit_prompt
+        && outcome.exit_code == 0
         && outcome.mode == LaunchMode::Session
         && outcome.interactive_session
         && !outcome.degraded
         && interactive_terminal
-        && !custom_executable
+        && args.executable.is_none()
 }
 
 fn preserve_trailing_run_options(args: &mut RunArgs) {
     args.yolo |= remove_wrapper_yolo(&mut args.native_args);
     args.true_yolo |= remove_wrapper_true_yolo(&mut args.native_args);
     args.no_autowire |= remove_wrapper_no_autowire(&mut args.native_args);
+    args.no_exit_prompt |= remove_wrapper_no_exit_prompt(&mut args.native_args);
     let trailing_jail = remove_wrapper_jail(&mut args.native_args);
     if trailing_jail.jail.is_some() {
         args.jail = trailing_jail.jail;
@@ -418,6 +487,8 @@ fn available_switch_harnesses(
 }
 
 fn choose_after_run(
+    i18n: &ai_memory_core::i18n::Localizer,
+    paint: Paint,
     current: ManagedHarness,
     workstream_name: &str,
     available: &[RunHarnessChoice],
@@ -426,23 +497,47 @@ fn choose_after_run(
 ) -> io::Result<AfterRunAction> {
     writeln!(
         output,
-        "ai-memory: {} exited successfully in workstream '{}'.",
-        current.as_str(),
-        workstream_name
+        "{} {}",
+        paint.green("✓"),
+        paint.bold(&diagnostic(
+            i18n,
+            format!(
+                "ai-memory: {} exited successfully in workstream '{}'.",
+                current.as_str(),
+                workstream_name
+            )
+        ))
+    )?;
+    writeln!(
+        output,
+        "  {}",
+        paint.dim(
+            &i18n.diagnostic("A switch keeps this workstream, its options and the same jail.")
+        )
     )?;
     for (index, choice) in available.iter().enumerate() {
         writeln!(
             output,
-            "  {}) switch to {}",
-            index + 1,
-            managed_harness(*choice).as_str()
+            "{}",
+            diagnostic(
+                i18n,
+                format!(
+                    "  {}) switch to {}",
+                    index + 1,
+                    managed_harness(*choice).as_str()
+                )
+            )
         )?;
     }
-    writeln!(output, "  r) run {} again", current.as_str())?;
-    writeln!(output, "  q) quit (default)")?;
+    writeln!(
+        output,
+        "{}",
+        diagnostic(i18n, format!("  r) run {} again", current.as_str()))
+    )?;
+    writeln!(output, "{}", i18n.diagnostic("  q) quit (default)"))?;
 
     loop {
-        write!(output, "Select [q]: ")?;
+        write!(output, "{}", i18n.diagnostic("Select [q]: "))?;
         output.flush()?;
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -460,7 +555,11 @@ fn choose_after_run(
         {
             return Ok(AfterRunAction::Switch(*harness));
         }
-        writeln!(output, "Choose a listed number, r, or q.")?;
+        writeln!(
+            output,
+            "{}",
+            i18n.diagnostic("Choose a listed number, r, or q.")
+        )?;
     }
 }
 
@@ -488,6 +587,8 @@ fn apply_after_run_action(
     args.workstream = Some(outcome.workstream_name.clone());
     args.new_workstream = None;
     args.fresh = false;
+    // The first launch already noted that `--true-yolo` is `--yolo` now.
+    args.yolo |= std::mem::take(&mut args.true_yolo);
     true
 }
 
@@ -519,21 +620,32 @@ async fn run_once_with_wiring(
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
     let requested_harness = args.harness;
+    let jail_folder_flags: Vec<(PathBuf, bool)> = args
+        .jail_map
+        .iter()
+        .map(|path| (path.clone(), false))
+        .chain(args.jail_rw_map.iter().map(|path| (path.clone(), true)))
+        .collect();
+    let mut next_run = NextRun {
+        yolo: false,
+        no_autowire: args.no_autowire,
+        workspace: args.workspace.clone(),
+        project: args.project.clone(),
+        profile: args.profile.clone(),
+        env_file: args.env_file.clone(),
+        had_env: !args.env.is_empty(),
+        harness: requested_harness.map(super::show::harness_name),
+    };
     let mut executable = args.executable.map(PathBuf::into_os_string);
     let mut native_args = args.native_args;
-    let trailing_yolo = remove_wrapper_yolo(&mut native_args);
-    let trailing_true_yolo = remove_wrapper_true_yolo(&mut native_args);
+    let (yolo_requested, true_yolo_typed) =
+        take_wrapper_yolo(args.yolo, args.true_yolo, &mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
     let trailing_force_unlock = remove_wrapper_force_unlock(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
+    remove_wrapper_no_exit_prompt(&mut native_args);
     let trailing_jail = remove_wrapper_jail(&mut native_args);
     let jail_request = jail_request(args.jail, args.no_jail, trailing_jail)?;
-    let yolo_modes = yolo_modes(
-        args.yolo || trailing_yolo,
-        args.true_yolo || trailing_true_yolo,
-        config.claude_true_yolo,
-    );
-    let yolo_requested = yolo_modes.yolo;
     let force_fresh = args.fresh || trailing_fresh;
     let force_unlock = args.force_unlock || trailing_force_unlock;
     let no_autowire = args.no_autowire || trailing_no_autowire;
@@ -568,8 +680,12 @@ async fn run_once_with_wiring(
         args.claude_wrapper.as_deref(),
         executable_search,
     );
-    let resolved_opencode =
-        resolve_opencode_for_launch(requested_harness, executable.as_deref(), &child_env)?;
+    let resolved_opencode = resolve_opencode_for_launch(
+        &config.i18n,
+        requested_harness,
+        executable.as_deref(),
+        &child_env,
+    )?;
     if matches!(requested_harness, Some(RunHarnessChoice::OpenCode))
         && let Some(resolved) = &resolved_opencode
     {
@@ -578,6 +694,7 @@ async fn run_once_with_wiring(
     let auto_candidates = if automatic_harness {
         filter_usable_auto_sessions(
             list_auto_sessions(
+                &config.i18n,
                 &home,
                 &repository.cwd,
                 &child_env,
@@ -635,6 +752,12 @@ async fn run_once_with_wiring(
     // Inside ai-jail every jail flag is moot (no nesting), so neither the
     // binary lookup nor its errors apply there.
     let jailed = inside_ai_jail_here();
+    // Only the outer process speaks: a jailed re-run gets the same argv.
+    if interactive && !jailed {
+        for note in yolo_deprecation_notes(true_yolo_typed, config.claude_true_yolo) {
+            eprintln!("{}", config.i18n.diagnostic(note));
+        }
+    }
     let ai_jail = if jailed { None } else { usable_ai_jail_here() };
     let jail_facts = JailHostFacts::here(&repository);
     let jail_plan = jail_decision(
@@ -645,19 +768,61 @@ async fn run_once_with_wiring(
         ai_jail.is_some(),
         jail_facts.project_config,
     )?;
+    next_run.yolo = yolo_requested;
+    next_run.no_autowire = no_autowire;
+    // Inside the jail the folders are already mounted; the forwarded flags
+    // only describe them.
+    let jail_inputs = JailInputs {
+        checkout_key: repository.worktree_fingerprint.clone(),
+        checkout_root: repository.cwd.clone(),
+        home: home.clone(),
+        flag_folders: if jailed {
+            Vec::new()
+        } else {
+            validate_flag_folders(config, &repository.cwd, &home, &jail_folder_flags)?
+        },
+        next_run,
+    };
+    if jail_plan.mode == JailMode::Stay {
+        folders_need_a_jail(&jail_inputs)?;
+    }
     // An explicit `--jail` re-runs before any managed run is prepared: the
     // jailed process opens its own, so preparing one out here would only be
     // cancelled again.
     if let (JailMode::Explicit(spec), Some(ai_jail)) = (&jail_plan.mode, &ai_jail) {
         ensure_jail_does_not_export_config_token(config)?;
+        ensure_jail_does_not_need_a_server_profile(config, &repository.cwd)?;
         let support = ai_jail_support(ai_jail)
             .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
-        // With a project `.ai-jail` nothing is pre-checked, so a bare
-        // `--jail` defers to that file while a listed toggle still overrides it.
-        let toggles = parse_jail_toggles(spec, &jail_checklist(&jail_facts, &support), &support)?;
+        // Only a harness named on the command line is known this early; an
+        // automatic one is chosen by the server later, so it keeps the
+        // flag-based launch rather than declare a guess.
+        let contract = jail_contract_for(
+            ai_jail,
+            &support,
+            requested_harness.is_some().then_some(provisional_harness),
+        );
+        // With ai-jail's contract its own review owns the toggles, so a bare
+        // `--jail` adds none. Otherwise, with a project `.ai-jail` nothing is
+        // pre-checked, so a bare `--jail` defers to that file while a listed
+        // toggle still overrides it.
+        let checklist = if contract.is_some() {
+            Vec::new()
+        } else {
+            jail_checklist(&jail_facts, &support)
+        };
+        let toggles = parse_jail_toggles(spec, &checklist, &support)?;
         if jail_plan.warn {
-            let confirmation = tokio::task::spawn_blocking(|| {
-                read_yolo_confirmation(false, &mut io::stdin().lock(), &mut io::stderr())
+            let confirmation_i18n = config.i18n.clone();
+            let confirmation_paint = Paint::for_stderr(config);
+            let confirmation = tokio::task::spawn_blocking(move || {
+                read_yolo_confirmation(
+                    &confirmation_i18n,
+                    confirmation_paint,
+                    false,
+                    &mut io::stdin().lock(),
+                    &mut io::stderr(),
+                )
             })
             .await
             .context("waiting for the --yolo confirmation")?
@@ -669,18 +834,37 @@ async fn run_once_with_wiring(
         return Err(exec_under_ai_jail(
             ai_jail,
             config,
-            &support,
+            JailLaunch {
+                support: &support,
+                contract: contract.as_ref(),
+            },
             &toggles,
             jail_facts.project_config,
+            &jail_inputs.flag_folders,
+            None,
         ));
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout_at(config, &repository.cwd).await?;
+    let project_id = if let Some(id) = args.project_id {
+        Some(id)
+    } else if args.project.is_none() {
+        super::project_registry::project_binding(
+            config,
+            &endpoint,
+            &workspace,
+            &project,
+            &repository.cwd,
+        )?
+        .map(|scope| scope.project_id)
+    } else {
+        None
+    };
     // Probe before any server work: a homelab down for maintenance must
     // downgrade (or, with --require-server, fail) in ~2s, not after a
     // TCP-level timeout on the prepare POST. Any HTTP answer counts as
     // reachable — including 404/405 from a server older than /healthz.
-    let require_server = args.require_server || config.run.require_server;
+    let require_server = args.require_server || config.run.require_server || project_id.is_some();
     if let ServerProbe::Unreachable(probe_error) = probe_server(&endpoint).await {
         if require_server {
             // Fail closed exactly like the prepare below would: same
@@ -688,6 +872,9 @@ async fn run_once_with_wiring(
             let url = endpoint.build_url("/workstream/runs");
             return Err(augment_connect_error(probe_error, &endpoint, &url)
                 .context("opening managed workstream; the agent was not started"));
+        }
+        if jailed && apply_jail_process_isolation(provisional_harness, &mut native_args) {
+            eprintln!("{}", config.i18n.diagnostic("ai-memory: OpenCode is running --standalone so its server and tool processes stay inside ai-jail"));
         }
         return run_degraded_offline(
             config,
@@ -701,10 +888,11 @@ async fn run_once_with_wiring(
                 workspace: &workspace,
                 project: &project,
                 force_fresh,
-                yolo_modes,
+                yolo: yolo_requested,
                 jail_plan: &jail_plan,
                 ai_jail: ai_jail.as_deref(),
                 jail_facts: &jail_facts,
+                jail_inputs: &jail_inputs,
                 no_autowire,
                 child_env: &child_env,
                 run_env: &run_env,
@@ -714,9 +902,14 @@ async fn run_once_with_wiring(
         )
         .await;
     }
-    let prepare = PrepareManagedRunRequest {
+    let mut prepare = PrepareManagedRunRequest {
+        project_id,
         workspace: workspace.clone(),
-        project: project.clone(),
+        project: if project_id.is_some() {
+            String::new()
+        } else {
+            project.clone()
+        },
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint.clone(),
         worktree_fingerprint: repository.worktree_fingerprint.clone(),
@@ -727,13 +920,56 @@ async fn run_once_with_wiring(
         new_workstream: args.new_workstream,
         force_unlock,
         lease_owner: lease_owner(),
-        repository_identity: remote_identity_naming(&repository.cwd, &project, marker_project),
+        repository_identity: project_id
+            .is_none()
+            .then(|| remote_identity_naming(&repository.cwd, &project, marker_project))
+            .flatten(),
     };
     let interrupted_before_spawn = CancellationToken::new();
     let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
-    let prepared = prepare_managed_run(&endpoint, &prepare, interactive, &interrupted_before_spawn)
+    let prepared = async {
+        match prepare_managed_run(
+            &config.i18n,
+            &endpoint,
+            &prepare,
+            interactive,
+            &interrupted_before_spawn,
+        )
         .await
-        .context("opening managed workstream; the agent was not started");
+        {
+            Err(error)
+                if (super::managed_project::is_ambiguous(&error)
+                    && prepare.project_id.is_none())
+                    || (args.project_id.is_none()
+                        && prepare.project_id.is_some()
+                        && super::managed_project::is_missing(&error)) =>
+            {
+                let scope = super::managed_project::choose(
+                    &config.i18n,
+                    &endpoint,
+                    &workspace,
+                    &project,
+                    interactive,
+                    &interrupted_before_spawn,
+                )
+                .await?;
+                prepare.project_id = Some(scope.project_id);
+                prepare.project.clear();
+                prepare.repository_identity = None;
+                prepare_managed_run(
+                    &config.i18n,
+                    &endpoint,
+                    &prepare,
+                    interactive,
+                    &interrupted_before_spawn,
+                )
+                .await
+            }
+            result => result,
+        }
+    }
+    .await
+    .context("opening managed workstream; the agent was not started");
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -742,17 +978,9 @@ async fn run_once_with_wiring(
         }
     };
     if let Some(warning) = prepared.manifest_warning.as_deref() {
-        eprintln!("ai-memory: warning: {warning}");
-    }
-    if let Err(error) = super::project_registry::record_prepared_checkout(
-        config,
-        &endpoint,
-        &workspace,
-        &project,
-        &repository.cwd,
-    ) {
         eprintln!(
-            "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
+            "{}",
+            diagnostic(&config.i18n, format!("ai-memory: warning: {warning}"))
         );
     }
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
@@ -762,7 +990,7 @@ async fn run_once_with_wiring(
                 Ok(value) => value,
                 Err(error) => {
                     interrupt_task.abort();
-                    cancel_managed_run_after_failure(&endpoint, &run_path).await;
+                    cancel_managed_run_after_failure(&config.i18n, &endpoint, &run_path).await;
                     return Err(error);
                 }
             }
@@ -772,6 +1000,54 @@ async fn run_once_with_wiring(
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
         )));
+    }
+    acquired_try!(super::managed_project::validate_prepared_scope(
+        &prepare, &prepared
+    ));
+    if let Some(scope) = &prepared.resolved_project
+        && let Err(error) = super::project_registry::record_project_binding(
+            config,
+            &endpoint,
+            &project,
+            &repository.cwd,
+            scope,
+            &ai_memory_workstream::RepositoryFingerprints {
+                repo_fingerprint: prepare.repo_fingerprint.clone(),
+                worktree_fingerprint: prepare.worktree_fingerprint.clone(),
+            },
+        )
+    {
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not remember the project ID ({error:#}); use --project-id {} next time",
+                    scope.project_id
+                )
+            )
+        );
+    }
+    let resolved_name = prepared
+        .resolved_project
+        .as_ref()
+        .map_or(project.as_str(), |scope| scope.project.as_str());
+    if let Err(error) = super::project_registry::record_prepared_checkout(
+        config,
+        &endpoint,
+        &workspace,
+        resolved_name,
+        &repository.cwd,
+    ) {
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
+                )
+            )
+        );
     }
     let privacy = acquired_try!(Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from));
     if let Some(id) = prepared.native_session_id.as_deref() {
@@ -786,9 +1062,7 @@ async fn run_once_with_wiring(
     }
     let resolved_harness = if automatic_harness {
         let resolved = prepared.resolved_agent.unwrap_or_else(|| {
-            eprintln!(
-                "ai-memory: the server does not support managed harness precedence; using the newest checkout-local session. Upgrade the server for established-workstream selection"
-            );
+            eprintln!("{}", config.i18n.diagnostic("ai-memory: the server does not support managed harness precedence; using the newest checkout-local session. Upgrade the server for established-workstream selection"));
             provisional_harness.agent_kind()
         });
         let selected = acquired_try!(managed_harness_from_agent(resolved).ok_or_else(|| {
@@ -820,6 +1094,9 @@ async fn run_once_with_wiring(
     } else {
         resolved_harness
     };
+    if jailed && apply_jail_process_isolation(harness, &mut native_args) {
+        eprintln!("{}", config.i18n.diagnostic("ai-memory: OpenCode is running --standalone so its server and tool processes stay inside ai-jail"));
+    }
     if automatic_harness
         && matches!(
             harness,
@@ -843,8 +1120,12 @@ async fn run_once_with_wiring(
         confirm_yolo_and_maybe_reexec(
             config,
             &jail_plan,
-            ai_jail.as_deref(),
+            JailOffer {
+                ai_jail: ai_jail.as_deref(),
+                harness,
+            },
             &jail_facts,
+            &jail_inputs,
             Some((&endpoint, &run_path)),
             &interrupted_before_spawn,
         )
@@ -852,6 +1133,7 @@ async fn run_once_with_wiring(
     );
     let native_grok_rules = user_supplied_grok_rules(&native_args);
     let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
+        &config.i18n,
         harness,
         executable.clone(),
         native_args.clone(),
@@ -875,9 +1157,7 @@ async fn run_once_with_wiring(
             &orphaned_session,
         )
         .unwrap_or_else(|error| {
-            eprintln!(
-                "ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted"
-            );
+            eprintln!("{}", diagnostic(&config.i18n, format!("ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted")));
             None
         });
         let current = effective_store(harness, &home, &repository.cwd, plan.session_dir.as_deref());
@@ -885,22 +1165,54 @@ async fn run_once_with_wiring(
             acquired_try!(Err(error));
         }
         eprintln!(
-            "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
-            harness.as_str(),
-            display_session_id(&orphaned_session),
-            prepared.workstream_name
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
+                    harness.as_str(),
+                    display_session_id(&orphaned_session),
+                    prepared.workstream_name
+                )
+            )
         );
+        // The hint tells the user to repeat their own command with a selector
+        // right after the harness name, which only works when they typed one
+        // and launched an interactive session (`codex exec` and `opencode run`
+        // take their selector after the subcommand).
+        if interactive_session && !automatic_harness {
+            let sessions = list_native_sessions(
+                harness,
+                &home,
+                &repository.cwd,
+                plan.session_dir.as_deref(),
+                1,
+            )
+            .await;
+            if let Some(hint) =
+                orphan_resume_hint(harness, &orphaned_session, sessions, SystemTime::now())
+            {
+                eprintln!("{}", super::show::terminal_text(&hint));
+            }
+        }
     } else if force_fresh && plan.mode == LaunchMode::Session {
         eprintln!(
-            "ai-memory: starting a fresh {} session in workstream '{}'",
-            harness.as_str(),
-            prepared.workstream_name
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: starting a fresh {} session in workstream '{}'",
+                    harness.as_str(),
+                    prepared.workstream_name
+                )
+            )
         );
     }
     if automatic_harness
         && prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
         && may_adopt_native_session
+        && prepare.project_id.is_none()
     {
         let candidate = acquired_try!(
             auto_candidates
@@ -920,13 +1232,20 @@ async fn run_once_with_wiring(
             }),
         ));
         eprintln!(
-            "ai-memory: continuing newest checkout-local {} session {}",
-            harness.as_str(),
-            display_session_id(&candidate.session.native_session_id)
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: continuing newest checkout-local {} session {}",
+                    harness.as_str(),
+                    display_session_id(&candidate.session.native_session_id)
+                )
+            )
         );
     } else if prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
         && may_adopt_native_session
+        && prepare.project_id.is_none()
         && allows_native_session_adoption(harness, &native_args)
         && io::stdin().is_terminal()
         && io::stderr().is_terminal()
@@ -944,6 +1263,7 @@ async fn run_once_with_wiring(
             Ok(candidates) if !candidates.is_empty() => {
                 let selection = acquired_try!(
                     choose_native_session_interactive(
+                        &config.i18n,
                         harness,
                         prepared.workstream_name.clone(),
                         candidates,
@@ -969,39 +1289,44 @@ async fn run_once_with_wiring(
                     }
                     Ok(None) => {}
                     Err(error) => eprintln!(
-                        "ai-memory: could not read the native session choice ({error}); starting a new {} session",
-                        harness.as_str()
+                        "{}",
+                        diagnostic(
+                            &config.i18n,
+                            format!(
+                                "ai-memory: could not read the native session choice ({error}); starting a new {} session",
+                                harness.as_str()
+                            )
+                        )
                     ),
                 }
             }
             Ok(_) => {}
             Err(error) => eprintln!(
-                "ai-memory: could not inspect prior {} sessions ({error}); starting a new session",
-                harness.as_str()
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not inspect prior {} sessions ({error}); starting a new session",
+                        harness.as_str()
+                    )
+                )
             ),
         }
     }
     if yolo_requested {
-        // Kiro's official dangerous mode exists on the v2 engine only
-        // (`--trust-all-tools`); the v3 engine replaced it with
-        // permissions.yaml and documents no CLI equivalent, so the wrapper
-        // maps nothing there and says so instead of failing silently.
-        if harness == ManagedHarness::KiroV3
-            || harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
-        {
+        // Kiro's v2 and v3 engines take `--trust-all-tools`; an engine no
+        // adapter models gets nothing, and the wrapper says so instead of
+        // failing silently.
+        if kiro_yolo_engine_is_unverified(harness, &plan.args) {
             eprintln!(
-                "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
-                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+                "{}",
+                config.i18n.diagnostic(
+                    "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
+                 (only v2 and v3 take --trust-all-tools); launching without it"
+                )
             );
         }
         apply_yolo(harness, &mut plan.args);
-    }
-    // Claude's extra "true yolo" bypass (`docs/design-yolo-safety-ai-jail.md`
-    // §4), applied to the same env/args the child command is built from below.
-    // Every other harness already got the plain `--yolo` mapping above, which
-    // is all `--true-yolo` means for them.
-    if yolo_modes.claude_true_yolo && harness == ManagedHarness::Claude {
-        apply_claude_true_yolo(harness, &mut plan.args);
     }
     let planned_native_identity = acquired_try!(
         plan.expected_session_id
@@ -1023,9 +1348,7 @@ async fn run_once_with_wiring(
         false
     };
     if remove_kiro_home {
-        eprintln!(
-            "ai-memory: Kiro v3 stored this session under the default home despite custom KIRO_HOME; using the default home for this resume"
-        );
+        eprintln!("{}", config.i18n.diagnostic("ai-memory: Kiro v3 stored this session under the default home despite custom KIRO_HOME; using the default home for this resume"));
     }
     // Auto-wire this harness's ai-memory hooks + MCP the first time it launches
     // here, so managed launch "just works" for capture and recall without a
@@ -1081,7 +1404,15 @@ async fn run_once_with_wiring(
                 },
             )
             .await
-            .context("linking the managed native session; the agent was not started")
+            .map_err(|error| {
+                // A session recorded under this checkout's old project name
+                // gets the repair offer instead of a bare conflict (#1993).
+                match super::run_project_split::ProjectSplit::from_error(&error) {
+                    Some(split) => anyhow::Error::new(split),
+                    None => error
+                        .context("linking the managed native session; the agent was not started"),
+                }
+            })
         );
         remember_session_store(
             config,
@@ -1114,16 +1445,29 @@ async fn run_once_with_wiring(
     };
     if let Some(attach_id) = &attached_background {
         eprintln!(
-            "ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
-            plan.expected_session_id
-                .as_deref()
-                .map(display_session_id)
-                .unwrap_or_default()
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
+                    plan.expected_session_id
+                        .as_deref()
+                        .map(display_session_id)
+                        .unwrap_or_default()
+                )
+            )
         );
         plan.args = vec![OsString::from("attach"), OsString::from(attach_id)];
     }
 
-    let previous_history = match prepared.previous_native_session.as_ref() {
+    let previous_session = previous_session_for_history(
+        prepared.previous_native_session.as_ref(),
+        prepared.native_session_id.as_deref(),
+        force_fresh,
+        plan.mode,
+        harness,
+    );
+    let previous_history = match previous_session.as_ref() {
         Some(previous) => match prepare_previous_session_history(
             config,
             &endpoint,
@@ -1137,8 +1481,14 @@ async fn run_once_with_wiring(
             Ok(history) => history,
             Err(error) => {
                 eprintln!(
-                    "ai-memory: could not prepare the previous {} session history ({error:#}); continuing with the portable workstream packet",
-                    previous.agent.as_str()
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not prepare the previous {} session history ({error:#}); continuing with the portable workstream packet",
+                            previous.agent.as_str()
+                        )
+                    )
                 );
                 None
             }
@@ -1156,9 +1506,7 @@ async fn run_once_with_wiring(
         // rules flag wins and the packet stays undelivered (it is redelivered
         // on the next managed run that can accept it).
         if native_grok_rules {
-            eprintln!(
-                "ai-memory: --rules was supplied natively; the workstream context packet will be delivered on a later run"
-            );
+            eprintln!("{}", config.i18n.diagnostic("ai-memory: --rules was supplied natively; the workstream context packet will be delivered on a later run"));
             None
         } else {
             acquired_try!(fetch_grok_context(&endpoint, &run_path).await)
@@ -1237,7 +1585,7 @@ async fn run_once_with_wiring(
                 .is_ok();
             interrupt_task.abort();
             if !finished {
-                cancel_managed_run_after_failure(&endpoint, &run_path).await;
+                cancel_managed_run_after_failure(&config.i18n, &endpoint, &run_path).await;
             }
             return Err(anyhow!(spawn_message)).context(format!(
                 "starting managed {} executable {}",
@@ -1278,7 +1626,7 @@ async fn run_once_with_wiring(
         }
     };
     for notice in heartbeat_health.into_deferred() {
-        eprintln!("{notice}");
+        eprintln!("{}", super::show::terminal_text(&notice));
     }
     let status = acquired_try!(waited.context("waiting for managed harness"));
     let exit_code = status.code().unwrap_or(1);
@@ -1307,12 +1655,18 @@ async fn run_once_with_wiring(
                     .and_then(|status| status.native_session_id.as_deref())
             {
                 eprintln!(
-                    "ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
-                    harness.as_str(),
-                    harness.agent_kind().as_str(),
-                    SessionId::from_native(linked),
-                    super::render_shared::shell_quote(&workspace),
-                    super::render_shared::shell_quote(&project)
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
+                            harness.as_str(),
+                            harness.agent_kind().as_str(),
+                            SessionId::from_native(linked),
+                            super::render_shared::shell_quote(&workspace),
+                            super::render_shared::shell_quote(&project)
+                        )
+                    )
                 );
             }
             None
@@ -1320,6 +1674,7 @@ async fn run_once_with_wiring(
     };
     let native_session_id = acquired_try!(
         resolve_native_session_after_run(
+            &config.i18n,
             &plan,
             harness,
             &home,
@@ -1336,10 +1691,66 @@ async fn run_once_with_wiring(
         } else {
             None
         };
-    let (transcript, exact_export_available) = if plan.mode == LaunchMode::Session
+    let left_behind_session_ids = if let (Some(own), Some(followed)) =
+        (own_session_id.as_deref(), native_session_id.as_deref())
+    {
+        match claude_left_behind_session_ids(
+            harness,
+            &home,
+            &repository.cwd,
+            plan.session_dir.as_deref(),
+            own,
+            followed,
+            started_at,
+        ) {
+            Ok(ids) => ids,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported"
+                        )
+                    )
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut left_behind_transcripts = Vec::new();
+    let mut left_behind_losses = Vec::new();
+    for session_id in &left_behind_session_ids {
+        let source_cursor = (prepared.native_session_id.as_deref() == Some(session_id.as_str()))
+            .then_some(prepared.source_cursor.as_deref())
+            .flatten();
+        let mut exported = export_after_flush(
+            &config.i18n,
+            harness,
+            &home,
+            &repository.cwd,
+            plan.session_dir.as_deref(),
+            Some(session_id),
+            source_cursor,
+        )
+        .await;
+        left_behind_losses.extend(exported.losses.drain(..).map(|loss| {
+            format!(
+                "Claude session {} was left behind before continuation: {loss}",
+                display_session_id(session_id)
+            )
+        }));
+        if !exported.events.is_empty() {
+            left_behind_transcripts.push(exported);
+        }
+    }
+    let (mut transcript, exact_export_available) = if plan.mode == LaunchMode::Session
         && harness.transcript_capability() == ai_memory_workstream::TranscriptCapability::Export
     {
         let exported = export_after_flush(
+            &config.i18n,
             harness,
             &home,
             &repository.cwd,
@@ -1362,6 +1773,7 @@ async fn run_once_with_wiring(
             false,
         )
     };
+    transcript.losses.extend(left_behind_losses);
     let recovery_event_digests =
         exact_export_available.then(|| transcript_interval_digests(&transcript.events));
     let recovery_cursor = exact_export_available
@@ -1370,17 +1782,42 @@ async fn run_once_with_wiring(
     let checkpoint = inspect_repository(&repository.cwd)
         .map(|identity| identity.checkpoint)
         .unwrap_or(repository.checkpoint);
-    let imported = match import_batches(
-        &endpoint,
-        &run_path,
-        transcript,
-        checkpoint,
-        Some(exit_code),
-        &privacy,
-        &TranscriptCapture::for_checkout(&config.data_dir, &repository.cwd),
-    )
-    .await
-    {
+    let capture = TranscriptCapture::for_checkout(&config.data_dir, &repository.cwd);
+    let mut preliminary_imported = 0;
+    let mut preliminary_error = None;
+    for abandoned in left_behind_transcripts {
+        match import_incomplete_batches(
+            &endpoint,
+            &run_path,
+            abandoned,
+            checkpoint.clone(),
+            &privacy,
+            &capture,
+        )
+        .await
+        {
+            Ok(imported) => preliminary_imported += imported,
+            Err(error) => {
+                preliminary_error = Some(error);
+                break;
+            }
+        }
+    }
+    let import_result = match preliminary_error {
+        Some(error) => Err(error),
+        None => import_batches(
+            &endpoint,
+            &run_path,
+            transcript,
+            checkpoint,
+            Some(exit_code),
+            &privacy,
+            &capture,
+        )
+        .await
+        .map(|imported| preliminary_imported + imported),
+    };
+    let imported = match import_result {
         Ok(imported) => imported,
         // The child has already exited; an unreachable server must not turn
         // its exit code into an error. The transcript is not recorded, so say
@@ -1398,6 +1835,22 @@ async fn run_once_with_wiring(
                     &error,
                 )
             );
+            if !left_behind_session_ids.is_empty() {
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
+                            left_behind_session_ids
+                                .iter()
+                                .map(|id| display_session_id(id))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    )
+                );
+            }
             journal_finish_failed_run(
                 config,
                 &endpoint,
@@ -1442,12 +1895,19 @@ async fn run_once_with_wiring(
         && attached_background.is_none()
     {
         eprintln!(
-            "ai-memory: this harness did not acknowledge its managed context packet; refresh its ai-memory hooks before the next run"
+            "{}",
+            missing_context_warning(harness, resumes_linked_session)
         );
     }
     eprintln!(
-        "ai-memory: workstream '{}' saved {imported} new event(s)",
-        prepared.workstream_name
+        "{}",
+        diagnostic(
+            &config.i18n,
+            format!(
+                "ai-memory: workstream '{}' saved {imported} new event(s)",
+                prepared.workstream_name
+            )
+        )
     );
     interrupt_task.abort();
     if let Some((session, finalized)) = finalize_hookless_session(
@@ -1460,18 +1920,31 @@ async fn run_once_with_wiring(
     .await
     {
         let agent = harness.agent_kind().as_str();
+        let session = display_session_id(&session.to_string());
         match finalized {
             Ok(ids) if !ids.is_empty() => {
-                eprintln!("ai-memory: finalized the {agent} session {session}");
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!("ai-memory: finalized the {agent} session {session}")
+                    )
+                );
             }
             // No session under that id for this agent and owner in this
             // scope: its hooks are not installed or never fired, or they
             // filed it under another workspace/project.
             Ok(_) => {}
             Err(error) => eprintln!(
-                "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
-                super::render_shared::shell_quote(&workspace),
-                super::render_shared::shell_quote(&project)
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+                        super::render_shared::shell_quote(&workspace),
+                        super::render_shared::shell_quote(&project)
+                    )
+                )
             ),
         }
     }
@@ -1500,10 +1973,11 @@ struct DegradedLaunch<'a> {
     workspace: &'a str,
     project: &'a str,
     force_fresh: bool,
-    yolo_modes: YoloModes,
+    yolo: bool,
     jail_plan: &'a JailPlan,
     ai_jail: Option<&'a Path>,
     jail_facts: &'a JailHostFacts,
+    jail_inputs: &'a JailInputs,
     no_autowire: bool,
     child_env: &'a EffectiveChildEnv,
     run_env: &'a [(String, String)],
@@ -1545,6 +2019,7 @@ async fn degraded_launch(
     // resumes, because the user named the session themselves and no
     // arbitration is needed. Everything else starts a fresh session.
     let (mut plan, _) = build_preflighted_launch_plan(
+        &config.i18n,
         launch.harness,
         launch.executable.clone(),
         launch.native_args.to_vec(),
@@ -1559,27 +2034,29 @@ async fn degraded_launch(
     confirm_yolo_and_maybe_reexec(
         config,
         launch.jail_plan,
-        launch.ai_jail,
+        JailOffer {
+            ai_jail: launch.ai_jail,
+            harness: launch.harness,
+        },
         launch.jail_facts,
+        launch.jail_inputs,
         None,
         interrupted,
     )
     .await?;
-    if launch.yolo_modes.yolo {
-        // Same Kiro caveat as the online path: v3 has no verified dangerous
-        // mode, so the wrapper maps nothing there and says so.
-        if launch.harness == ManagedHarness::KiroV3
-            || launch.harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
-        {
+    if launch.yolo {
+        // Same Kiro caveat as the online path: an engine no adapter models
+        // gets no trust flag, and the wrapper says so.
+        if kiro_yolo_engine_is_unverified(launch.harness, &plan.args) {
             eprintln!(
-                "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
-                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+                "{}",
+                config.i18n.diagnostic(
+                    "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
+                 (only v2 and v3 take --trust-all-tools); launching without it"
+                )
             );
         }
         apply_yolo(launch.harness, &mut plan.args);
-    }
-    if launch.yolo_modes.claude_true_yolo && launch.harness == ManagedHarness::Claude {
-        apply_claude_true_yolo(launch.harness, &mut plan.args);
     }
     let launch_env = |name: &str| launch.child_env.get(name).map(OsStr::to_os_string);
     // Auto-wire keeps the hook install (it is local and idempotent, and
@@ -1670,8 +2147,14 @@ async fn degraded_launch(
     let exit_code = status.code().unwrap_or(1);
     let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&config.data_dir));
     eprintln!(
-        "ai-memory: this run was not recorded on the server; {}",
-        spooled_events_note(&spool)
+        "{}",
+        diagnostic(
+            &config.i18n,
+            format!(
+                "ai-memory: this run was not recorded on the server; {}",
+                spooled_events_note(&spool)
+            )
+        )
     );
     journal_degraded_run(
         config,
@@ -1723,24 +2206,33 @@ async fn journal_degraded_run(
         .await
         .unwrap_or_else(|error| {
             eprintln!(
-                "ai-memory: could not uniquely identify the session this run used ({error:#}); \
+                "{}",
+                diagnostic(&config.i18n, format!(
+                    "ai-memory: could not uniquely identify the session this run used ({error:#}); \
                  nothing was journaled; preserve the local transcript and run `ai-memory \
                  backfill --force --session <id>` after identifying it"
+                ))
             );
             None
         }),
         Err(error) => {
             eprintln!(
-                "ai-memory: could not record this run for recovery (privacy config: {error}); \
+                "{}",
+                diagnostic(&config.i18n, format!(
+                    "ai-memory: could not record this run for recovery (privacy config: {error}); \
                  nothing was journaled"
+                ))
             );
             return;
         }
     };
     let Some(native_session_id) = native_session_id else {
         eprintln!(
-            "ai-memory: no native session was discovered, so this run could not be journaled; \
+            "{}",
+            config.i18n.diagnostic(
+                "ai-memory: no native session was discovered, so this run could not be journaled; \
              retain the harness transcript for manual backfill"
+            )
         );
         return;
     };
@@ -1748,8 +2240,14 @@ async fn journal_degraded_run(
         Some(Ok(cursor)) => Some(cursor),
         Some(Err(error)) => {
             eprintln!(
-                "ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
-                display_session_id(&native_session_id)
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                        display_session_id(&native_session_id)
+                    )
+                )
             );
             return;
         }
@@ -1773,16 +2271,28 @@ async fn journal_degraded_run(
             Ok(export) => export,
             Err(error) => {
                 eprintln!(
-                    "ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
-                    display_session_id(&native_session_id)
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                            display_session_id(&native_session_id)
+                        )
+                    )
                 );
                 return;
             }
         };
         let Some(final_cursor) = exact_export.source_cursor.clone() else {
             eprintln!(
-                "ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
-                launch.harness.as_str()
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
+                        launch.harness.as_str()
+                    )
+                )
             );
             return;
         };
@@ -1819,15 +2329,24 @@ async fn journal_degraded_run(
     match super::recovery::append_journal_entry(&config.data_dir, entry) {
         Ok(()) => {
             eprintln!(
-                "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
+                "{}",
+                config.i18n.diagnostic(
+                    "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
                  is back to replay this session's exact native transcript"
+                )
             );
         }
         Err(error) => {
             eprintln!(
-                "ai-memory: could not record this run for recovery ({error:#}); the native \
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record this run for recovery ({error:#}); the native \
                  transcript remains in the harness store and can be imported with `ai-memory \
                  backfill --force --session <id>`"
+                    )
+                )
             );
         }
     }
@@ -2062,14 +2581,23 @@ fn journal_finish_failed_run(
     match super::recovery::append_journal_entry(&config.data_dir, entry) {
         Ok(()) => {
             eprintln!(
-                "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
+                "{}",
+                config.i18n.diagnostic(
+                    "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
                  is back to re-import this transcript"
+                )
             );
         }
         Err(error) => {
             eprintln!(
-                "ai-memory: could not record this run for recovery ({error:#}); retain the \
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record this run for recovery ({error:#}); retain the \
                  native transcript and original run id for manual repair"
+                    )
+                )
             );
         }
     }
@@ -2197,7 +2725,11 @@ async fn send_managed_heartbeat_with_timeout(
     result
 }
 
-async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &str) {
+async fn cancel_managed_run_after_failure(
+    i18n: &ai_memory_core::i18n::Localizer,
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+) {
     if let Err(error) = post_empty_with_retry(
         endpoint,
         &format!("{run_path}/cancel"),
@@ -2206,7 +2738,13 @@ async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &
     .await
     {
         eprintln!(
-            "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
+            "{}",
+            diagnostic(
+                i18n,
+                format!(
+                    "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
+                )
+            )
         );
     }
 }
@@ -2342,8 +2880,8 @@ fn jail_decision(
 /// else also proceeds — this is a `[Y/n]` prompt, not a strict allowlist.
 fn yolo_decision(confirmed_line: &str) -> bool {
     !matches!(
-        confirmed_line.trim().to_ascii_lowercase().as_str(),
-        "n" | "no"
+        confirmed_line.trim().to_lowercase().as_str(),
+        "n" | "no" | "não" | "nao"
     )
 }
 
@@ -2361,19 +2899,31 @@ struct YoloConfirmation {
 /// `input`/`output` are injected so the wording and default-yes semantics
 /// are unit-tested without a real terminal.
 fn read_yolo_confirmation(
+    i18n: &ai_memory_core::i18n::Localizer,
+    paint: Paint,
     ai_jail_available: bool,
     input: &mut impl io::BufRead,
     output: &mut impl io::Write,
 ) -> io::Result<YoloConfirmation> {
     writeln!(
         output,
-        "⚠  --yolo runs every tool call with no confirmation. An agent can delete"
+        "{}",
+        paint.yellow(&i18n.diagnostic(
+            "⚠  --yolo runs every tool call with no confirmation. An agent can delete"
+        ))
     )?;
     writeln!(
         output,
-        "   files, run any command, and reach the network unsupervised."
+        "{}",
+        paint.dim(
+            &i18n.diagnostic("   files, run any command, and reach the network unsupervised.")
+        )
     )?;
-    write!(output, "   Proceed? [Y/n] ")?;
+    write!(
+        output,
+        "{}",
+        paint.bold(&i18n.diagnostic("   Proceed? [Y/n] "))
+    )?;
     output.flush()?;
     let mut line = String::new();
     input.read_line(&mut line)?;
@@ -2391,7 +2941,8 @@ fn read_yolo_confirmation(
     }
     write!(
         output,
-        "ai-jail is installed. Re-run this session inside it? [Y/n] "
+        "🔒 {}",
+        paint.bold(&i18n.diagnostic("ai-jail is installed. Re-run this session inside it? [Y/n] "))
     )?;
     output.flush()?;
     let mut jail_line = String::new();
@@ -2413,17 +2964,24 @@ enum ChecklistAnswer {
     Accept,
     /// Marks changed; show the list again.
     Changed,
+    /// `f`: open the extra-folder picker.
+    Folders,
+    /// `reset`: back to the recommended marks and no extra folders.
+    Reset,
     /// Not understood; nothing changed.
     Invalid(String),
 }
 
-/// Apply one checklist line: empty accepts, `all`/`none` set every mark, and
-/// row numbers (separated by spaces or commas) flip those rows. A line with
-/// any bad number changes nothing.
+/// Apply one checklist line: empty accepts, `all`/`none` set every mark, `f`
+/// asks for the folder picker, `reset` restores the recommendation, and row
+/// numbers (separated by spaces or commas) flip those rows. A line with any
+/// bad number changes nothing.
 fn apply_checklist_answer(line: &str, checked: &mut [bool]) -> ChecklistAnswer {
     let answer = line.trim().to_ascii_lowercase();
     match answer.as_str() {
         "" => return ChecklistAnswer::Accept,
+        "f" | "folders" => return ChecklistAnswer::Folders,
+        "reset" => return ChecklistAnswer::Reset,
         "all" | "none" => {
             checked.fill(answer == "all");
             return ChecklistAnswer::Changed;
@@ -2451,28 +3009,200 @@ fn apply_checklist_answer(line: &str, checked: &mut [bool]) -> ChecklistAnswer {
     ChecklistAnswer::Changed
 }
 
+/// Terminal emphasis for the jail prompts. Off the terminal, with
+/// `NO_COLOR`, or on a dumb terminal it is plain text, and the marks and
+/// icons still carry the meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Paint {
+    color: bool,
+}
+
+impl Paint {
+    #[cfg(test)]
+    const PLAIN: Self = Self { color: false };
+
+    fn for_stderr(config: &Config) -> Self {
+        Self {
+            color: crate::terminal::color_enabled(io::stderr().is_terminal(), &config.runtime_env),
+        }
+    }
+
+    fn with(
+        self,
+        text: &str,
+        style: fn(String) -> crossterm::style::StyledContent<String>,
+    ) -> String {
+        if self.color {
+            style(text.to_owned()).to_string()
+        } else {
+            text.to_owned()
+        }
+    }
+
+    fn bold(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::bold)
+    }
+
+    fn green(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::green)
+    }
+
+    fn yellow(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::yellow)
+    }
+
+    fn red(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::red)
+    }
+
+    fn cyan(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::cyan)
+    }
+
+    fn dim(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::dark_grey)
+    }
+}
+
+/// What the checklist shows besides the rows: why each row is recommended,
+/// what changed since the remembered answers, and the extra folders.
+struct ChecklistView {
+    i18n: ai_memory_core::i18n::Localizer,
+    paint: Paint,
+    /// Per row, why its recommendation checks it ([`checklist_reason`]).
+    reasons: Vec<Option<&'static str>>,
+    /// The marks before any remembered answers: what `reset` restores.
+    recommended: Vec<bool>,
+    /// When the remembered answers were saved, if there are any.
+    last_saved: Option<String>,
+    /// Rows the remembered answers never covered.
+    new: Vec<&'static str>,
+    /// Remembered toggles no longer offered here.
+    gone: Vec<String>,
+    /// Whether the installed ai-jail can mount extra folders.
+    folders_supported: bool,
+}
+
+/// Opens the extra-folder picker on the current folders; `None` keeps them.
+type FolderPicker<'a> = dyn FnMut(
+        &[super::jail_folders::ExtraFolder],
+    ) -> io::Result<Option<Vec<super::jail_folders::ExtraFolder>>>
+    + 'a;
+
+/// The rows, the extra folders and the accepted marks of one checklist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChecklistOutcome {
+    marked: Vec<JailChecklistItem>,
+    folders: Vec<super::jail_folders::ExtraFolder>,
+}
+
+/// A folder's name is a directory entry, possibly inside a cloned
+/// repository, so it is neutralized like the folder picker's own summary.
+fn folder_names(folders: &[super::jail_folders::ExtraFolder]) -> String {
+    folders
+        .iter()
+        .map(|folder| super::show::terminal_text(&folder.label()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_checklist(
+    view: &ChecklistView,
     items: &[JailChecklistItem],
     checked: &[bool],
+    folders: &[super::jail_folders::ExtraFolder],
     output: &mut impl io::Write,
 ) -> io::Result<()> {
-    writeln!(
-        output,
-        "Enable in the jail (Enter = as marked; numbers flip, e.g. \"2 4\"; \"all\" / \"none\"):"
-    )?;
+    let i18n = &view.i18n;
+    let paint = view.paint;
+    if items.is_empty() {
+        // ai-jail 3.0.1+ reviews credentials and network itself; this screen
+        // keeps only the extra folders.
+        writeln!(
+            output,
+            "{} {}",
+            paint.bold(&i18n.diagnostic("🔒 ai-jail: extra folders for the agent")),
+            paint.dim(&i18n.diagnostic("(ai-jail reviews the rest next)"))
+        )?;
+    } else {
+        writeln!(
+            output,
+            "{} {}",
+            paint.bold(&i18n.diagnostic("🔒 ai-jail: what the agent can reach")),
+            paint.dim(&i18n.diagnostic("(Enter keeps the marks)"))
+        )?;
+    }
+    let mut changes = Vec::new();
+    if let Some(saved) = &view.last_saved {
+        changes.push(paint.dim(&diagnostic(i18n, format!("your choices from {saved}"))));
+    }
+    if !view.new.is_empty() {
+        changes.push(paint.cyan(&diagnostic(i18n, format!("new: {}", view.new.join(", ")))));
+    }
+    if !view.gone.is_empty() {
+        changes.push(paint.yellow(&diagnostic(
+            i18n,
+            format!("no longer offered: {}", view.gone.join(", ")),
+        )));
+    }
+    if !changes.is_empty() {
+        writeln!(output, "   {}", changes.join(&paint.dim(" · ")))?;
+    }
     let width = items
         .iter()
         .map(|item| item.toggle.label.chars().count())
         .max()
         .unwrap_or(0);
     for (index, (item, on)) in items.iter().zip(checked).enumerate() {
-        let mark = if *on { 'x' } else { ' ' };
+        let mark = if *on {
+            paint.green("[x]")
+        } else {
+            paint.dim("[ ]")
+        };
+        let note = match item.toggle.risk() {
+            JailRisk::HostRoot => paint.red(item.toggle.note),
+            JailRisk::Secret => format!("🔑 {}", paint.dim(item.toggle.note)),
+            JailRisk::Normal => paint.dim(item.toggle.note),
+        };
+        let mut extra = String::new();
+        if let Some(reason) = view.reasons.get(index).copied().flatten() {
+            extra.push_str(&paint.green(&format!(" · {}", i18n.diagnostic(reason))));
+        }
+        if view.new.contains(&item.toggle.stem) {
+            extra.push_str(&paint.cyan(&format!(" {}", i18n.diagnostic("new"))));
+        }
         writeln!(
             output,
-            "  [{mark}] {}) {:<width$}   {}",
+            "  {mark} {}) {:<width$}   {note}{extra}",
             index + 1,
             item.toggle.label,
-            item.toggle.note
+        )?;
+    }
+    if view.folders_supported {
+        let listed = if folders.is_empty() {
+            paint.dim(&i18n.diagnostic("none"))
+        } else {
+            paint.yellow(&folder_names(folders))
+        };
+        writeln!(
+            output,
+            "  📁 {} {listed}",
+            i18n.diagnostic("Extra folders:")
+        )?;
+        writeln!(
+            output,
+            "  {}",
+            paint.dim(&i18n.diagnostic(if items.is_empty() {
+                "f folders · reset · Enter go"
+            } else {
+                "numbers flip · f folders · all · none · reset · Enter go"
+            }))
+        )?;
+    } else {
+        writeln!(
+            output,
+            "  {}",
+            paint.dim(&i18n.diagnostic("numbers flip · all · none · reset · Enter go"))
         )?;
     }
     write!(output, "> ")?;
@@ -2480,19 +3210,25 @@ fn render_checklist(
 }
 
 /// The interactive toggle checklist (docs/design-yolo-safety-ai-jail.md §5),
-/// line-based with injected `input`/`output` like [`read_yolo_confirmation`].
-/// Enter or EOF accepts the marks. The result is every row as the user saw
-/// it ([`marked_choices`]): checked rows `--X`, unchecked rows `--no-X`, so an
-/// unchecked row stays off even if the user's own ai-jail config enables it.
+/// line-based with injected `input`/`output` like [`read_yolo_confirmation`],
+/// and `pick_folders` for the `f` answer. Enter or EOF accepts the marks. The
+/// result's choices are every row as the user saw it ([`marked_choices`]):
+/// checked rows `--X`, unchecked rows `--no-X`, so an unchecked row stays off
+/// even if the user's own ai-jail config enables it.
 fn read_jail_checklist(
+    view: &ChecklistView,
     items: &[JailChecklistItem],
+    folders: Vec<super::jail_folders::ExtraFolder>,
     input: &mut impl io::BufRead,
     output: &mut impl io::Write,
-) -> io::Result<Vec<JailToggleChoice>> {
+    pick_folders: &mut FolderPicker<'_>,
+) -> io::Result<ChecklistOutcome> {
+    let i18n = &view.i18n;
     let mut checked: Vec<bool> = items.iter().map(|item| item.checked).collect();
+    let mut folders = folders;
     let mut invalid = 0;
     loop {
-        render_checklist(items, &checked, output)?;
+        render_checklist(view, items, &checked, &folders, output)?;
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
             writeln!(output)?;
@@ -2501,13 +3237,31 @@ fn read_jail_checklist(
         match apply_checklist_answer(&line, &mut checked) {
             ChecklistAnswer::Accept => break,
             ChecklistAnswer::Changed => {}
+            ChecklistAnswer::Folders if view.folders_supported => {
+                if let Some(picked) = pick_folders(&folders)? {
+                    folders = picked;
+                }
+            }
+            ChecklistAnswer::Reset => {
+                checked.clone_from(&view.recommended);
+                folders.clear();
+            }
+            ChecklistAnswer::Folders => {
+                writeln!(
+                    output,
+                    "{}",
+                    i18n.diagnostic(
+                        "this ai-jail cannot mount extra folders; update it to use `f`"
+                    )
+                )?;
+            }
             ChecklistAnswer::Invalid(message) => {
                 invalid += 1;
-                writeln!(output, "{message}")?;
+                writeln!(output, "{}", i18n.diagnostic(&message))?;
                 if invalid >= CHECKLIST_MAX_INVALID {
-                    return Err(io::Error::other(
+                    return Err(io::Error::other(i18n.diagnostic(
                         "too many unrecognized answers to the ai-jail checklist",
-                    ));
+                    )));
                 }
             }
         }
@@ -2520,7 +3274,7 @@ fn read_jail_checklist(
             checked,
         })
         .collect();
-    Ok(marked_choices(&marked))
+    Ok(ChecklistOutcome { marked, folders })
 }
 
 /// The one-line account of what the jailed re-run enables, grouped the way
@@ -2528,7 +3282,11 @@ fn read_jail_checklist(
 /// user's own `no-X` entries, and — for an explicit selection — the visible
 /// rows it left out (forced off, summarized rather than spelled out) — and
 /// whether the project `.ai-jail` supplies the rest.
-fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
+fn jail_summary(
+    toggles: &[JailToggleChoice],
+    project_config: bool,
+    folders: &[super::jail_folders::ExtraFolder],
+) -> String {
     let labels = |kind: JailToggleKind| -> Vec<&'static str> {
         toggles
             .iter()
@@ -2559,6 +3317,9 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
     if toggles.iter().any(|choice| choice.implied) {
         parts.push("everything else in the checklist off".to_owned());
     }
+    if !folders.is_empty() {
+        parts.push(format!("folders: {}", folder_names(folders)));
+    }
     if project_config {
         parts.push("plus the project .ai-jail".to_owned());
     }
@@ -2572,6 +3333,214 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
     }
 }
 
+/// The launch's own options, kept to print the command that repeats it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NextRun {
+    yolo: bool,
+    no_autowire: bool,
+    workspace: Option<String>,
+    project: Option<String>,
+    profile: Option<String>,
+    env_file: Option<PathBuf>,
+    /// Whether `--env` was given: its values may be secrets, so the line
+    /// leaves them out and says so.
+    had_env: bool,
+    harness: Option<String>,
+}
+
+/// What the jail offer needs beyond the host facts: whose answers to recall,
+/// the folders named on the command line, and the launch to repeat.
+#[derive(Debug, Clone)]
+struct JailInputs {
+    /// The worktree fingerprint the checklist answers are remembered under.
+    checkout_key: String,
+    checkout_root: PathBuf,
+    home: PathBuf,
+    /// `--jail-map` / `--jail-rw-map`, already validated.
+    flag_folders: Vec<super::jail_folders::ExtraFolder>,
+    next_run: NextRun,
+}
+
+/// The environment variable that carries [`next_run_command`] into the jail,
+/// where the jailed `ai-memory run` prints it on quit.
+const NEXT_RUN_ENV: &str = "AI_MEMORY_JAIL_NEXT_RUN";
+
+fn folder_rules<'a>(
+    data_dir: &'a Path,
+    home: &'a Path,
+    checkout_root: &'a Path,
+) -> super::jail_folders::FolderRules<'a> {
+    super::jail_folders::FolderRules {
+        home: Some(home),
+        data_dir,
+        checkout_root,
+    }
+}
+
+/// Folder flags on a run that is not going into ai-jail would be silently
+/// ignored, so the launch stops and says how to get a jail.
+fn folders_need_a_jail(inputs: &JailInputs) -> Result<()> {
+    if inputs.flag_folders.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "--jail-map and --jail-rw-map need a jailed run: add --jail, or --yolo and accept the ai-jail offer"
+        ))
+    }
+}
+
+/// Validate `--jail-map` / `--jail-rw-map`; a refused folder stops the launch.
+fn validate_flag_folders(
+    config: &Config,
+    cwd: &Path,
+    home: &Path,
+    flags: &[(PathBuf, bool)],
+) -> Result<Vec<super::jail_folders::ExtraFolder>> {
+    let rules = folder_rules(&config.data_dir, home, cwd);
+    let mut folders: Vec<super::jail_folders::ExtraFolder> = Vec::new();
+    for (raw, writable) in flags {
+        let path = super::jail_folders::validate_extra_folder(raw, cwd, &rules)
+            .map_err(|refusal| anyhow!("cannot mount {} in the jail: {refusal}", raw.display()))?;
+        super::jail_folders::upsert(
+            &mut folders,
+            super::jail_folders::ExtraFolder {
+                path,
+                writable: *writable,
+            },
+        );
+    }
+    Ok(folders)
+}
+
+/// The `ai-memory run` line that repeats this launch's jail choices exactly:
+/// the wrapper options, the enabled toggles, the extra folders and the
+/// harness. One-off parts (a resume selector, native arguments that may hold a
+/// prompt, `--env` values that may hold secrets) are left out.
+fn next_run_command(
+    next: &NextRun,
+    choices: Option<&[JailToggleChoice]>,
+    folders: &[super::jail_folders::ExtraFolder],
+) -> String {
+    let mut words = vec!["ai-memory".to_owned(), "run".to_owned()];
+    if next.yolo {
+        words.push("--yolo".to_owned());
+    }
+    if next.no_autowire {
+        words.push("--no-autowire".to_owned());
+    }
+    let env_file = next
+        .env_file
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    for (flag, value) in [
+        ("--workspace", next.workspace.as_ref()),
+        ("--project", next.project.as_ref()),
+        ("--profile", next.profile.as_ref()),
+        ("--env-file", env_file.as_ref()),
+    ] {
+        if let Some(value) = value {
+            words.push(flag.to_owned());
+            words.push(super::render_shared::shell_quote(value));
+        }
+    }
+    // `None`: ai-jail's own review holds the access, so a bare `--jail`.
+    words.push(match choices {
+        Some(choices) => format!("--jail={}", jail_spec(choices)),
+        None => "--jail".to_owned(),
+    });
+    for folder in folders {
+        words.push(
+            if folder.writable {
+                "--jail-rw-map"
+            } else {
+                "--jail-map"
+            }
+            .to_owned(),
+        );
+        words.push(super::render_shared::shell_quote(
+            &folder.path.to_string_lossy(),
+        ));
+    }
+    if let Some(harness) = &next.harness {
+        words.push(harness.clone());
+    }
+    let mut line = words.join(" ");
+    if next.had_env {
+        line.push_str("   # add your --env values again");
+    }
+    line
+}
+
+/// Print the line that repeats the jail choices, when the launcher outside
+/// the jail handed one in. Only the jailed run prints it, on its way out.
+fn print_next_run_hint(config: &Config) {
+    if !inside_ai_jail_here() || !io::stderr().is_terminal() {
+        return;
+    }
+    let Some(command) = config.runtime_env.var_os(NEXT_RUN_ENV) else {
+        return;
+    };
+    eprint!(
+        "{}",
+        next_run_hint(
+            &config.i18n,
+            Paint::for_stderr(config),
+            &command.to_string_lossy()
+        )
+    );
+}
+
+/// The quit-time lines that offer [`next_run_command`]. The command repeats
+/// the extra folders' paths, directory entries that can come from a cloned
+/// repository, so it is neutralized like the jail summary's folder names.
+fn next_run_hint(i18n: &ai_memory_core::i18n::Localizer, paint: Paint, command: &str) -> String {
+    format!(
+        "\n{}\n  {}\n",
+        paint.dim(&i18n.diagnostic("Next time, start with the same jail choices:")),
+        paint.bold(&super::show::terminal_text(command))
+    )
+}
+
+/// Recall this checkout's answers onto `items`, keeping only folders that
+/// still pass validation, then add the command-line folders on top.
+fn recall_jail_answers(
+    config: &Config,
+    inputs: &JailInputs,
+    items: &mut [JailChecklistItem],
+) -> (
+    Option<String>,
+    super::jail_choices::Applied,
+    Vec<super::jail_folders::ExtraFolder>,
+) {
+    let remembered =
+        super::jail_choices::load(&config.data_dir, &inputs.checkout_key).unwrap_or_default();
+    let mut applied = if remembered == super::jail_choices::Remembered::default() {
+        super::jail_choices::Applied::default()
+    } else {
+        super::jail_choices::apply(items, &remembered)
+    };
+    let rules = folder_rules(&config.data_dir, &inputs.home, &inputs.checkout_root);
+    let mut folders = Vec::new();
+    for folder in remembered.folders {
+        match super::jail_folders::validate_extra_folder(
+            &folder.path,
+            &inputs.checkout_root,
+            &rules,
+        ) {
+            Ok(path) => folders.push(super::jail_folders::ExtraFolder {
+                path,
+                writable: folder.writable,
+            }),
+            Err(_) => applied.gone.push(format!("📁 {}", folder.path.display())),
+        }
+    }
+    for flag in &inputs.flag_folders {
+        super::jail_folders::upsert(&mut folders, flag.clone());
+    }
+    let saved = remembered.saved_at.get(..10).map(str::to_owned);
+    (saved, applied, folders)
+}
+
 /// The post-prepare `--yolo` gate (docs/design-yolo-safety-ai-jail.md). A
 /// no-op unless `plan.warn`. On confirmation it either returns (unjailed, or
 /// the user declined the ai-jail offer) or, on accepting the offer and the
@@ -2579,11 +3548,20 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
 /// the original invocation under `ai-jail` — which never returns on success.
 /// `lease` is the prepared run to release before that re-exec; a degraded
 /// offline launch passes `None` (it holds no lease).
+/// The ai-jail binary a `--yolo` offer re-execs under, and the harness the
+/// jailed run will launch.
+#[derive(Clone, Copy)]
+struct JailOffer<'a> {
+    ai_jail: Option<&'a Path>,
+    harness: ManagedHarness,
+}
+
 async fn confirm_yolo_and_maybe_reexec(
     config: &Config,
     plan: &JailPlan,
-    ai_jail: Option<&Path>,
+    offer: JailOffer<'_>,
     facts: &JailHostFacts,
+    inputs: &JailInputs,
     lease: Option<(&ServerEndpoint, &str)>,
     interrupted: &CancellationToken,
 ) -> Result<()> {
@@ -2597,12 +3575,16 @@ async fn confirm_yolo_and_maybe_reexec(
     // exact binary the re-exec runs. An explicit `--jail` re-exec'd earlier
     // and never reaches here.
     let (ai_jail, show_checklist) = match plan.mode {
-        JailMode::Offer { checklist } => (ai_jail, checklist),
+        JailMode::Offer { checklist } => (offer.ai_jail, checklist),
         JailMode::Stay | JailMode::Explicit(_) => (None, false),
     };
     let ai_jail_available = ai_jail.is_some();
+    let confirmation_i18n = config.i18n.clone();
+    let confirmation_paint = Paint::for_stderr(config);
     let confirmation = tokio::task::spawn_blocking(move || {
         read_yolo_confirmation(
+            &confirmation_i18n,
+            confirmation_paint,
             ai_jail_available,
             &mut io::stdin().lock(),
             &mut io::stderr(),
@@ -2615,38 +3597,288 @@ async fn confirm_yolo_and_maybe_reexec(
         return Err(anyhow!("aborted: --yolo not confirmed"));
     }
     let (true, Some(ai_jail)) = (confirmation.jail, ai_jail) else {
+        folders_need_a_jail(inputs)?;
         return Ok(());
     };
     let support = ai_jail_support(ai_jail)
         .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
-    let items = jail_checklist(facts, &support);
-    // A project `.ai-jail` owns the toggles: ai-jail loads it itself, so no
-    // checklist and no flags of ours.
-    let toggles = if !show_checklist || items.is_empty() {
+    let contract = jail_contract_for(ai_jail, &support, Some(offer.harness));
+    // With ai-jail's contract its own review owns credentials and network, so
+    // ai-memory's screen keeps only the extra folders. Otherwise a project
+    // `.ai-jail` owns the toggles: ai-jail loads it itself, so no checklist
+    // and no flags of ours.
+    let mut items = if contract.is_some() {
         Vec::new()
     } else {
-        tokio::task::spawn_blocking(move || {
-            read_jail_checklist(&items, &mut io::stdin().lock(), &mut io::stderr())
+        jail_checklist(facts, &support)
+    };
+    let show = if contract.is_some() {
+        support.mounts_folders()
+    } else {
+        show_checklist && !items.is_empty()
+    };
+    let (toggles, folders, next_run) = if !show {
+        (Vec::new(), inputs.flag_folders.clone(), None)
+    } else {
+        let reasons = items
+            .iter()
+            .map(|item| checklist_reason(facts, item.toggle))
+            .collect();
+        let recommended = items.iter().map(|item| item.checked).collect();
+        let (last_saved, mut applied, folders) = recall_jail_answers(config, inputs, &mut items);
+        if contract.is_some() {
+            // Remembered toggles are ai-jail's to review now, not gone.
+            applied.gone.retain(|gone| gone.starts_with("📁"));
+        }
+        let view = ChecklistView {
+            i18n: config.i18n.clone(),
+            paint: Paint::for_stderr(config),
+            reasons,
+            recommended,
+            last_saved,
+            new: applied.new,
+            gone: applied.gone,
+            folders_supported: support.mounts_folders(),
+        };
+        let picker_i18n = config.i18n.clone();
+        let color = view.paint.color;
+        let data_dir = config.data_dir.clone();
+        let home = inputs.home.clone();
+        let checkout_root = inputs.checkout_root.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut pick = |current: &[super::jail_folders::ExtraFolder]| {
+                let rules = folder_rules(&data_dir, &home, &checkout_root);
+                let start = checkout_root.parent().unwrap_or(&checkout_root);
+                super::jail_folders::pick_folders(&picker_i18n, start, current, &rules, color)
+                    .map_err(io::Error::other)
+            };
+            read_jail_checklist(
+                &view,
+                &items,
+                folders,
+                &mut io::stdin().lock(),
+                &mut io::stderr(),
+                &mut pick,
+            )
         })
         .await
         .context("waiting for the ai-jail checklist")?
-        .context("reading the ai-jail checklist from stdin")?
+        .context("reading the ai-jail checklist from stdin")?;
+        let saved_at = jiff::Timestamp::now().to_string();
+        let remembered = if contract.is_some() {
+            // Keep the toggle answers for a launch that falls back to flags
+            // (an older ai-jail, a harness ai-jail has no preset for).
+            let mut prior = super::jail_choices::load(&config.data_dir, &inputs.checkout_key)
+                .unwrap_or_default();
+            prior.folders.clone_from(&outcome.folders);
+            prior.saved_at = saved_at;
+            prior
+        } else {
+            super::jail_choices::remember(&outcome.marked, outcome.folders.clone(), saved_at)
+        };
+        if let Err(error) =
+            super::jail_choices::save(&config.data_dir, &inputs.checkout_key, remembered)
+        {
+            eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not remember the jail choices ({error:#}); they apply to this run only"
+                    )
+                )
+            );
+        }
+        let choices = marked_choices(&outcome.marked);
+        let next = next_run_command(
+            &inputs.next_run,
+            contract.is_none().then_some(choices.as_slice()),
+            &outcome.folders,
+        );
+        (choices, outcome.folders, Some(next))
     };
     ensure_jail_does_not_export_config_token(config)?;
+    ensure_jail_does_not_need_a_server_profile(config, &inputs.checkout_root)?;
     // The re-exec replaces this process (or, off Unix, this process exits
     // once the child does), so its own prepared lease must be released here
     // rather than left to the 90s orphan timeout — the jailed re-run opens
     // its own workstream cleanly. A degraded launch holds no lease.
     if let Some((endpoint, run_path)) = lease {
-        cancel_managed_run_after_failure(endpoint, run_path).await;
+        cancel_managed_run_after_failure(&config.i18n, endpoint, run_path).await;
     }
     Err(exec_under_ai_jail(
         ai_jail,
         config,
-        &support,
+        JailLaunch {
+            support: &support,
+            contract: contract.as_ref(),
+        },
         &toggles,
         facts.project_config,
+        &folders,
+        next_run,
     ))
+}
+
+/// The installed ai-jail speaks the wrapper contract for this harness.
+#[derive(Debug, Clone)]
+struct ContractTarget {
+    /// The harness launched.
+    managed: ManagedHarness,
+    /// The `--harness` name.
+    harness: &'static str,
+    /// ai-jail's version, for the summary line.
+    version: String,
+}
+
+/// The contract target for `harness`, or `None` to keep the flag-based
+/// launch: no harness known yet, one ai-jail has no preset for, or an
+/// ai-jail older than 3.0.1.
+fn jail_contract_for(
+    ai_jail: &Path,
+    support: &JailSupport,
+    harness: Option<ManagedHarness>,
+) -> Option<ContractTarget> {
+    let managed = harness?;
+    let name = ai_jail_harness_name(managed)?;
+    let contract = ai_jail_contract(ai_jail, support)?;
+    Some(ContractTarget {
+        managed,
+        harness: name,
+        version: contract.version,
+    })
+}
+
+/// How the jailed re-run is launched.
+#[derive(Clone, Copy)]
+struct JailLaunch<'a> {
+    support: &'a JailSupport,
+    contract: Option<&'a ContractTarget>,
+}
+
+/// What a contract launch needs from [`exec_under_ai_jail`].
+#[derive(Clone, Copy)]
+struct ContractExec<'a> {
+    contract: &'a ContractTarget,
+    exe: &'a Path,
+    forwarded: &'a [OsString],
+    present: &'a [&'static str],
+    resolved: &'a [(&'static str, String)],
+}
+
+/// Re-exec under ai-jail 3.0.1+ (docs/design-yolo-safety-ai-jail.md §6):
+/// declare the harness, pass what it needs as command-line grants, ask the
+/// read-only `status --json` whether the launch can start, and launch.
+/// Returns only on failure.
+fn exec_under_ai_jail_contract(
+    ai_jail: &Path,
+    config: &Config,
+    exec: ContractExec<'_>,
+    toggles: &[JailToggleChoice],
+    folders: &[super::jail_folders::ExtraFolder],
+) -> anyhow::Error {
+    let i18n = &config.i18n;
+    let reach = server_reach(&config.server_url);
+    let folder_pairs: Vec<(&Path, bool)> = folders
+        .iter()
+        .map(|folder| (folder.path.as_path(), folder.writable))
+        .collect();
+    let env_names = harness_env_names(exec.contract.managed, exec.present);
+    let flags = contract_flags(
+        exec.contract.harness,
+        reach,
+        &env_names,
+        toggles,
+        &folder_pairs,
+    );
+    let status = jail_status(
+        ai_jail,
+        &contract_status_invocation(&flags, exec.exe, exec.forwarded),
+        exec.resolved,
+    );
+    if let Some(refusal) = status.as_ref().and_then(status_refusal) {
+        return jail_refusal_error(i18n, ai_jail, exec.contract.harness, refusal);
+    }
+    eprintln!("{}", jail_summary(toggles, false, folders));
+    eprintln!(
+        "{}",
+        contract_summary(i18n, &exec.contract.version, exec.contract.harness, reach)
+    );
+    reexec_under_ai_jail(
+        ai_jail,
+        &contract_invocation(&flags, exec.exe, exec.forwarded),
+        exec.resolved,
+    )
+}
+
+/// The error for a launch `status --json` says cannot start, quoting
+/// ai-jail's reason. Drifted access names the command that reviews it again.
+fn jail_refusal_error(
+    i18n: &ai_memory_core::i18n::Localizer,
+    ai_jail: &Path,
+    harness: &str,
+    refusal: JailRefusal,
+) -> anyhow::Error {
+    match refusal {
+        JailRefusal::Backend(message) => anyhow!(diagnostic(
+            i18n,
+            format!("ai-jail cannot start its sandbox on this machine: {message}")
+        )),
+        JailRefusal::Drift(message) => {
+            let review = format!(
+                "{} configure {harness}",
+                super::render_shared::shell_quote(&ai_jail.to_string_lossy())
+            );
+            anyhow!(diagnostic(
+                i18n,
+                format!(
+                    "ai-jail's saved access for this project no longer matches this machine: {message}. Review it with: {review}"
+                )
+            ))
+        }
+    }
+}
+
+/// The second summary line of a contract launch: who reviews the rest of the
+/// access and how the memory server is reached.
+fn contract_summary(
+    i18n: &ai_memory_core::i18n::Localizer,
+    version: &str,
+    harness: &str,
+    reach: ServerReach,
+) -> String {
+    let server = match reach {
+        ServerReach::Loopback { port } => {
+            diagnostic(i18n, format!("memory server through forwarded port {port}"))
+        }
+        ServerReach::Network => {
+            i18n.diagnostic("full network, because the memory server is not on this machine")
+        }
+    };
+    diagnostic(
+        i18n,
+        format!(
+            "ai-memory: ai-jail {version} reviews the rest of the access for {harness} ({server})"
+        ),
+    )
+}
+
+/// Run `status --json` for the exact launch. `None` when it fails or prints
+/// something else: the launch then goes ahead and ai-jail explains any
+/// refusal itself.
+fn jail_status(
+    ai_jail: &Path,
+    args: &[OsString],
+    env: &[(&'static str, String)],
+) -> Option<ai_memory_workstream::JailStatus> {
+    let output = std::process::Command::new(ai_jail)
+        .args(args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_status(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Re-exec the original invocation under `ai_jail` with `toggles`, after the
@@ -2654,10 +3886,17 @@ async fn confirm_yolo_and_maybe_reexec(
 fn exec_under_ai_jail(
     ai_jail: &Path,
     config: &Config,
-    support: &JailSupport,
+    launch: JailLaunch<'_>,
     toggles: &[JailToggleChoice],
     project_config: bool,
+    folders: &[super::jail_folders::ExtraFolder],
+    next_run: Option<String>,
 ) -> anyhow::Error {
+    if !folders.is_empty() && !launch.support.mounts_folders() {
+        return anyhow!(
+            "this ai-jail cannot mount extra folders (--map / --rw-map); update ai-jail or drop --jail-map"
+        );
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -2665,9 +3904,27 @@ fn exec_under_ai_jail(
                 .context("resolving the current executable for the ai-jail re-exec");
         }
     };
-    let forwarded: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let resolved = jail_resolved_env(config);
+    let forwarded = jail_forwarded_args(config, std::env::args_os().skip(1));
+    let mut resolved = jail_resolved_env(config);
+    if let Some(command) = next_run {
+        resolved.push((NEXT_RUN_ENV, command));
+    }
     let present = jail_forwarded_names(config, &resolved);
+    if let Some(contract) = launch.contract {
+        return exec_under_ai_jail_contract(
+            ai_jail,
+            config,
+            ContractExec {
+                contract,
+                exe: &exe,
+                forwarded: &forwarded,
+                present: &present,
+                resolved: &resolved,
+            },
+            toggles,
+            folders,
+        );
+    }
     // `--agent-state` is a bare toggle: enable it so the harness's own login
     // state survives ai-jail's ephemeral private home (ai-jail derives the
     // per-harness state location from the wrapped `run <harness>` it parses).
@@ -2678,11 +3935,37 @@ fn exec_under_ai_jail(
         &forwarded,
         &present,
         true,
-        support.supports("no-save-config"),
+        launch.support.supports("no-save-config"),
         toggles,
+        &folders
+            .iter()
+            .map(|folder| (folder.path.as_path(), folder.writable))
+            .collect::<Vec<_>>(),
     );
-    eprintln!("{}", jail_summary(toggles, project_config));
+    eprintln!("{}", jail_summary(toggles, project_config, folders));
     reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
+}
+
+fn jail_forwarded_args(
+    config: &Config,
+    original: impl IntoIterator<Item = OsString>,
+) -> Vec<OsString> {
+    let mut args: Vec<_> = original.into_iter().collect();
+    // The jail's private home cannot reload the host config, and its env
+    // allowlist does not forward this setting. Carry the resolved opt-out
+    // as a wrapper flag instead.
+    // `resume`, `continue`, and `show` also reach this re-exec through
+    // `run_from`, but have no menu and do not accept this run-only flag.
+    let is_run = || {
+        crate::cli::try_parse_from(
+            std::iter::once(OsString::from("ai-memory")).chain(args.iter().cloned()),
+        )
+        .is_ok_and(|cli| matches!(cli.command, crate::cli::Command::Run(_)))
+    };
+    if !config.run.exit_prompt && !args.iter().any(|arg| arg == "--no-exit-prompt") && is_run() {
+        args.push(OsString::from("--no-exit-prompt"));
+    }
+    args
 }
 
 /// The [`FORWARDED_ENV_NAMES`] the re-exec passes with `--env NAME`: those set
@@ -2736,6 +4019,25 @@ fn ensure_jail_does_not_export_config_token(config: &Config) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// A checkout whose marker selects a server profile (#2016) talks to that
+/// profile's server with its stored token, which the jailed re-run cannot
+/// read from ai-jail's private home and which must not be copied into the
+/// harness's environment either. Refuse instead of letting the jailed run
+/// fail on the profile or fall back to another server.
+fn ensure_jail_does_not_need_a_server_profile(config: &Config, cwd: &Path) -> Result<()> {
+    match crate::http_client::checkout_route_at(config, cwd) {
+        crate::server_profiles::Route::InstallDefault => Ok(()),
+        route => Err(anyhow!(
+            "--jail cannot carry this checkout's server profile{} into the managed harness: \
+             the jailed run cannot read its stored token. Set AI_MEMORY_SERVER_URL and a \
+             least-privilege AI_MEMORY_AUTH_TOKEN for this launch, or run without --jail",
+            route
+                .profile_name()
+                .map_or_else(String::new, |name| format!(" `{name}`")),
+        )),
+    }
 }
 
 /// Replace this process with `<ai_jail> <jail_args>` on Unix (never returns
@@ -2812,6 +4114,7 @@ fn own_native_session(
 /// transcript, so the workstream follows it. Otherwise the next launch resumes
 /// the launch session, which holds none of the later conversation.
 fn follow_claude_continued_session(
+    i18n: &ai_memory_core::i18n::Localizer,
     plan: &LaunchPlan,
     harness: ManagedHarness,
     home: &Path,
@@ -2829,17 +4132,29 @@ fn follow_claude_continued_session(
                 ClaudeContinuation::Cleared(_) => "was cleared into session",
             };
             eprintln!(
-                "ai-memory: Claude session {} {how} {}; the workstream now follows it",
-                display_session_id(&own),
-                display_session_id(continuation.session_id())
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: Claude session {} {how} {}; the workstream now follows it",
+                        display_session_id(&own),
+                        display_session_id(continuation.session_id())
+                    )
+                )
             );
             continuation.session_id().to_owned()
         }
         Ok(None) => own,
         Err(error) => {
             eprintln!(
-                "ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
-                display_session_id(&own)
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
+                        display_session_id(&own)
+                    )
+                )
             );
             own
         }
@@ -2847,7 +4162,39 @@ fn follow_claude_continued_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn claude_left_behind_session_ids(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    own_session_id: &str,
+    followed_session_id: &str,
+    started_at: SystemTime,
+) -> Result<Vec<String>> {
+    if harness != ManagedHarness::Claude || own_session_id == followed_session_id {
+        return Ok(Vec::new());
+    }
+    let continuations =
+        claude_continued_sessions(home, cwd, session_dir, own_session_id, started_at)?;
+    let mut sessions = vec![own_session_id.to_owned()];
+    for continuation in continuations {
+        let id = continuation.session_id();
+        if id == followed_session_id {
+            return Ok(sessions);
+        }
+        if !sessions.iter().any(|known| known == id) {
+            sessions.push(id.to_owned());
+        }
+    }
+    Err(anyhow!(
+        "followed Claude session {} was absent from its continuation chain",
+        display_session_id(followed_session_id)
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn resolve_native_session_after_run(
+    i18n: &ai_memory_core::i18n::Localizer,
     plan: &LaunchPlan,
     harness: ManagedHarness,
     home: &Path,
@@ -2864,7 +4211,7 @@ async fn resolve_native_session_after_run(
     }
     if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status, sanitizer) {
         return Ok(Some(follow_claude_continued_session(
-            plan, harness, home, cwd, own, started_at,
+            i18n, plan, harness, home, cwd, own, started_at,
         )));
     }
     let linked = server_status
@@ -2886,7 +4233,13 @@ async fn resolve_native_session_after_run(
         // launch may not have touched it while another one did.
         Err(error) if error.is::<AmbiguousNativeSession>() => {
             eprintln!(
-                "ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it"
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it"
+                    )
+                )
             );
             return Ok(None);
         }
@@ -2908,6 +4261,7 @@ async fn resolve_native_session_after_run(
 }
 
 async fn list_auto_sessions(
+    i18n: &ai_memory_core::i18n::Localizer,
     home: &Path,
     cwd: &Path,
     env: &EffectiveChildEnv,
@@ -2949,7 +4303,10 @@ async fn list_auto_sessions(
         ));
     }
     for failure in failures {
-        eprintln!("ai-memory: session scan skipped {failure}");
+        eprintln!(
+            "{}",
+            diagnostic(i18n, format!("ai-memory: session scan skipped {failure}"))
+        );
     }
     found.sort_by(|left, right| {
         right
@@ -3123,29 +4480,35 @@ fn remove_wrapper_true_yolo(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
-/// The effective permission modes for a launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct YoloModes {
-    /// Map the harness's dangerous-mode option, with the `--yolo` warning and
-    /// ai-jail offer.
-    yolo: bool,
-    /// Additionally apply Claude's `bypassPermissions` + residual-prompt
-    /// silencing (only acted on for the Claude harness).
-    claude_true_yolo: bool,
+/// Whether the launch asked for yolo, and whether it used the retired
+/// `--true-yolo` spelling, from the parsed flags plus either flag left in the
+/// native argv (stripped there, so the harness never sees it). `--true-yolo`
+/// is a deprecated alias: one `--yolo` now does it all.
+fn take_wrapper_yolo(
+    yolo_flag: bool,
+    true_yolo_flag: bool,
+    native_args: &mut Vec<OsString>,
+) -> (bool, bool) {
+    let trailing_yolo = remove_wrapper_yolo(native_args);
+    let true_yolo = true_yolo_flag | remove_wrapper_true_yolo(native_args);
+    (yolo_flag || trailing_yolo || true_yolo, true_yolo)
 }
 
-/// `--true-yolo` is a superset of `--yolo`: it requests yolo on every harness
-/// (where, outside Claude, it is simply interchangeable with `--yolo`) plus the
-/// Claude-only bypass, so passing both is redundant but harmless. The
-/// `claude_true_yolo` config key only upgrades a launch that is already yolo —
-/// it never turns an ordinary run into a permission-bypassing one without the
-/// `--yolo` warning.
-fn yolo_modes(yolo_flag: bool, true_yolo_flag: bool, config_true_yolo: bool) -> YoloModes {
-    let yolo = yolo_flag || true_yolo_flag;
-    YoloModes {
-        yolo,
-        claude_true_yolo: yolo && (true_yolo_flag || config_true_yolo),
+/// Terminal notes for the retired true-yolo spellings. Both still load and
+/// launch: `--true-yolo` is a hidden alias of `--yolo`, and the
+/// `claude_true_yolo` config key is accepted and ignored, because a Claude
+/// `--yolo` now always forces `bypassPermissions`.
+fn yolo_deprecation_notes(true_yolo_flag: bool, config_true_yolo: bool) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if true_yolo_flag {
+        notes.push("ai-memory: --true-yolo is now the same as --yolo; use --yolo");
     }
+    if config_true_yolo {
+        notes.push(
+            "ai-memory: claude_true_yolo is deprecated and ignored: --yolo on Claude always forces bypassPermissions now; remove it from config.toml",
+        );
+    }
+    notes
 }
 
 fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
@@ -3163,6 +4526,12 @@ fn remove_wrapper_force_unlock(args: &mut Vec<OsString>) -> bool {
 fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     let before = args.len();
     args.retain(|arg| arg != OsStr::new("--no-autowire"));
+    args.len() != before
+}
+
+fn remove_wrapper_no_exit_prompt(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--no-exit-prompt"));
     args.len() != before
 }
 
@@ -3293,8 +4662,36 @@ fn blank_home_overrides(
         .collect()
 }
 
+fn previous_session_for_history(
+    previous: Option<&ManagedNativeSessionReference>,
+    linked_session_id: Option<&str>,
+    force_fresh: bool,
+    launch_mode: LaunchMode,
+    harness: ManagedHarness,
+) -> Option<ManagedNativeSessionReference> {
+    previous.cloned().or_else(|| {
+        (force_fresh && launch_mode == LaunchMode::Session)
+            .then(|| {
+                linked_session_id.map(|native_session_id| ManagedNativeSessionReference {
+                    agent: harness.agent_kind(),
+                    native_session_id: native_session_id.to_owned(),
+                })
+            })
+            .flatten()
+    })
+}
+
+fn missing_context_warning(harness: ManagedHarness, resumes_linked_session: bool) -> &'static str {
+    if harness == ManagedHarness::Codex && resumes_linked_session {
+        "ai-memory: Codex did not acknowledge the managed context in the linked thread; if you used `/new`, that new thread was not adopted because Codex exposes no trustworthy parent link. Resume the intended thread explicitly on the next managed run; otherwise refresh the ai-memory hooks"
+    } else {
+        "ai-memory: this harness did not acknowledge its managed context packet; refresh its ai-memory hooks before the next run"
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_preflighted_launch_plan(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: ManagedHarness,
     executable: Option<OsString>,
     native_args: Vec<OsString>,
@@ -3349,9 +4746,15 @@ fn build_preflighted_launch_plan(
         )),
         Err(error) => {
             eprintln!(
-                "ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
-                harness.as_str(),
-                display_session_id(linked_session_id)
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
+                        harness.as_str(),
+                        display_session_id(linked_session_id)
+                    )
+                )
             );
             Ok((plan, None))
         }
@@ -3412,7 +4815,13 @@ fn remember_session_store(
         store,
     ) {
         eprintln!(
-            "ai-memory: could not record the client-local session store ({error:#}); continuing the managed run"
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not record the client-local session store ({error:#}); continuing the managed run"
+                )
+            )
         );
     }
 }
@@ -3469,7 +4878,7 @@ fn default_claude_wrapper(
     let Some(spelling) = spelling else { return };
     match claude_wrapper_executable(spelling, search) {
         Ok(wrapper) => *executable = Some(wrapper),
-        Err(warning) => eprintln!("{warning}"),
+        Err(warning) => eprintln!("{}", super::show::terminal_text(&warning.to_string())),
     }
 }
 
@@ -3687,6 +5096,12 @@ async fn prepare_previous_session_history(
     cwd: &Path,
     env: &EffectiveChildEnv,
 ) -> Result<Option<PreviousSessionHistory>> {
+    // The dossier the next harness reads must carry no more than the ledger
+    // upload of the same session would: the checkout's `[capture] ignore_paths`
+    // drops a tool call and its result, and the sanitizer redacts credentials
+    // (GHSA-h8wj-74hc-vjjp).
+    let capture = TranscriptCapture::for_checkout(&config.data_dir, cwd);
+    let sanitizer = Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from)?;
     let mut failures = Vec::new();
     for &harness in previous_harness_candidates(previous.agent) {
         let recorded = match super::project_registry::recorded_session_store(
@@ -3747,6 +5162,7 @@ async fn prepare_previous_session_history(
                 continue;
             }
         };
+        let transcript = sanitize_previous_session_history(transcript, &capture, &sanitizer);
         if transcript.events.is_empty() {
             return Ok(None);
         }
@@ -3785,6 +5201,35 @@ fn previous_harness_candidates(agent: AgentKind) -> &'static [ManagedHarness] {
         AgentKind::AntigravityCli => &[ManagedHarness::Antigravity],
         AgentKind::CopilotCli => &[ManagedHarness::Copilot],
         _ => &[],
+    }
+}
+
+/// Run the exported transcript through the same two filters the ledger upload
+/// applies before it becomes the dossier the next harness reads: the checkout's
+/// `[capture] ignore_paths` (which drops a tool call together with its result)
+/// and the `Sanitizer` (which redacts credentials). Without this the dossier
+/// would hand the next agent — usually another vendor's — content the operator
+/// kept out of ai-memory (GHSA-h8wj-74hc-vjjp).
+fn sanitize_previous_session_history(
+    transcript: ExportedTranscript,
+    capture: &TranscriptCapture,
+    sanitizer: &Sanitizer,
+) -> ExportedTranscript {
+    let ExportedTranscript {
+        native_session_id,
+        source_cursor,
+        events,
+        losses,
+    } = transcript;
+    let mut events = capture.filter_ledger_events(events);
+    for event in &mut events {
+        event.content = sanitizer.scrub(&event.content);
+    }
+    ExportedTranscript {
+        native_session_id,
+        source_cursor,
+        events,
+        losses,
     }
 }
 
@@ -3976,6 +5421,7 @@ pub(crate) fn native_home(config: &Config) -> Option<PathBuf> {
 }
 
 async fn choose_native_session_interactive(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: ManagedHarness,
     workstream_name: String,
     candidates: Vec<NativeSessionCandidate>,
@@ -3983,10 +5429,12 @@ async fn choose_native_session_interactive(
     run_path: &str,
     interrupted: &CancellationToken,
 ) -> Result<io::Result<Option<String>>> {
+    let chooser_i18n = i18n.clone();
     let chooser = tokio::task::spawn_blocking(move || {
         let stdin = io::stdin();
         let mut stderr = io::stderr();
         choose_native_session(
+            &chooser_i18n,
             harness,
             &workstream_name,
             &candidates,
@@ -4039,6 +5487,7 @@ async fn wait_for_native_session_choice(
 }
 
 fn choose_native_session(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: ManagedHarness,
     workstream_name: &str,
     candidates: &[NativeSessionCandidate],
@@ -4048,24 +5497,47 @@ fn choose_native_session(
 ) -> io::Result<Option<String>> {
     writeln!(
         output,
-        "ai-memory: no {} session is linked to workstream '{}'.",
-        harness.as_str(),
-        workstream_name
+        "{}",
+        diagnostic(
+            i18n,
+            format!(
+                "ai-memory: no {} session is linked to workstream '{}'.",
+                harness.as_str(),
+                workstream_name
+            )
+        )
     )?;
-    writeln!(output, "Previous sessions for this checkout:")?;
+    writeln!(
+        output,
+        "{}",
+        i18n.diagnostic("Previous sessions for this checkout:")
+    )?;
     for (index, candidate) in candidates.iter().enumerate() {
         writeln!(
             output,
-            "  {}) {} (updated {})",
-            index + 1,
-            display_session_id(&candidate.native_session_id),
-            session_age(candidate.updated_at, now)
+            "{}",
+            diagnostic(
+                i18n,
+                format!(
+                    "  {}) {} (updated {})",
+                    index + 1,
+                    display_session_id(&candidate.native_session_id),
+                    session_age(candidate.updated_at, now)
+                )
+            )
         )?;
     }
-    writeln!(output, "  0) Start a new {} session", harness.as_str())?;
+    writeln!(
+        output,
+        "{}",
+        diagnostic(
+            i18n,
+            format!("  0) Start a new {} session", harness.as_str())
+        )
+    )?;
 
     loop {
-        write!(output, "Select [1]: ")?;
+        write!(output, "{}", i18n.diagnostic("Select [1]: "))?;
         output.flush()?;
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -4084,7 +5556,11 @@ fn choose_native_session(
         {
             return Ok(Some(candidate.native_session_id.clone()));
         }
-        writeln!(output, "Enter 0 through {}.", candidates.len())?;
+        writeln!(
+            output,
+            "{}",
+            diagnostic(i18n, format!("Enter 0 through {}.", candidates.len()))
+        )?;
     }
 }
 
@@ -4092,13 +5568,15 @@ fn choose_native_session(
 /// cannot flood the line. CodeQL's `rust/cleartext-logging` barrier model
 /// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
 /// names this function, so every session id the CLI prints goes through it.
+/// The id comes from a harness transcript or the server, so it is also
+/// neutralized for the terminal (#2000).
 pub(crate) fn display_session_id(value: &str) -> String {
     const MAX_CHARS: usize = 64;
     let mut output = value.chars().take(MAX_CHARS).collect::<String>();
     if value.chars().count() > MAX_CHARS {
         output.push_str("...");
     }
-    output
+    super::show::terminal_text(&output)
 }
 
 /// Age of a native session, rendered the way every other read-only listing
@@ -4108,6 +5586,89 @@ pub(crate) fn display_session_id(value: &str) -> String {
 fn session_age(updated_at: SystemTime, now: SystemTime) -> String {
     let secs = now.duration_since(updated_at).unwrap_or_default().as_secs();
     super::humanize_age_secs(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+/// What to tell the user about the rest of the checkout once the linked
+/// session is known to be missing: the newest other session of the harness and
+/// the native selector that resumes it, or why the checkout could not be
+/// listed. The launch itself still starts fresh, because picking another
+/// session for an established workstream stays the user's explicit choice.
+/// The caller only asks for an interactive launch that named its harness.
+fn orphan_resume_hint(
+    harness: ManagedHarness,
+    orphaned_session: &str,
+    sessions: Result<Vec<NativeSessionCandidate>>,
+    now: SystemTime,
+) -> Option<String> {
+    let sessions = match sessions {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            return Some(format!(
+                "ai-memory: could not list this checkout's other {} sessions ({error:#})",
+                harness.as_str()
+            ));
+        }
+    };
+    let newest = sessions
+        .into_iter()
+        .next()
+        .filter(|candidate| candidate.native_session_id != orphaned_session)?;
+    let found = format!(
+        "ai-memory: this checkout's newest {} session is {} (updated {})",
+        harness.as_str(),
+        display_session_id(&newest.native_session_id),
+        session_age(newest.updated_at, now)
+    );
+    Some(match resume_selector(harness, &newest.native_session_id) {
+        Some(selector) => format!(
+            "{found}; to continue it instead, stop this fresh session and run the same command again with `{selector}` right after `{}`",
+            run_harness_name(harness)
+        ),
+        None => format!(
+            "{found}; to continue it instead, stop this fresh session and resume that one by its id"
+        ),
+    })
+}
+
+/// The harness name as `ai-memory run` takes it. Kiro's v3 engine is chosen
+/// with `kiro --v3`, not by a harness name of its own.
+fn run_harness_name(harness: ManagedHarness) -> &'static str {
+    match harness {
+        ManagedHarness::KiroV3 => ManagedHarness::Kiro.as_str(),
+        other => other.as_str(),
+    }
+}
+
+/// The native arguments that resume `id`, rendered from the launch plan so
+/// each harness gets its own form (`resume <id>`, `--resume <id>`,
+/// `--resume=<id>`). The `--v3` the plan adds for Kiro's v3 engine is left
+/// out: the user's own command already selects the engine. `None` when the id
+/// would not print whole or a word would need shell quoting, since the line is
+/// meant to be typed as shown.
+fn resume_selector(harness: ManagedHarness, id: &str) -> Option<String> {
+    if display_session_id(id) != id {
+        return None;
+    }
+    build_launch_plan(harness, None, Vec::new(), Some(id))
+        .ok()?
+        .args
+        .iter()
+        .filter(|arg| !(harness == ManagedHarness::KiroV3 && *arg == "--v3"))
+        .map(|arg| {
+            let arg = arg.to_str()?;
+            let shown = match arg.strip_suffix(id) {
+                Some(flag) if flag.is_empty() || flag.ends_with('=') => {
+                    format!("{flag}{}", display_session_id(id))
+                }
+                _ => arg.to_owned(),
+            };
+            shown
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.=:/@+,".contains(c))
+                .then_some(shown)
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|words| words.join(" "))
 }
 
 async fn export_exact_after_run(
@@ -4131,6 +5692,7 @@ async fn export_exact_after_run(
 }
 
 async fn export_after_flush(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: ManagedHarness,
     home: &std::path::Path,
     cwd: &std::path::Path,
@@ -4149,7 +5711,13 @@ async fn export_after_flush(
     if let Err(error) =
         wait_for_transcript_flush(harness, home, cwd, session_dir, native_session_id).await
     {
-        eprintln!("ai-memory: transcript flush check failed: {error}");
+        eprintln!(
+            "{}",
+            diagnostic(
+                i18n,
+                format!("ai-memory: transcript flush check failed: {error}")
+            )
+        );
     }
     match export_transcript(
         harness,
@@ -4207,6 +5775,40 @@ pub(crate) async fn import_batches(
                 Vec::new()
             },
             exit_code: complete.then_some(exit_code).flatten(),
+        };
+        imported += finish_with_retry(endpoint, run_path, &request)
+            .await?
+            .imported_events;
+    }
+    Ok(imported)
+}
+
+async fn import_incomplete_batches(
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    transcript: ExportedTranscript,
+    checkpoint: ai_memory_core::WorkstreamCheckpoint,
+    sanitizer: &Sanitizer,
+    capture: &TranscriptCapture,
+) -> Result<usize> {
+    let native_identity = NativeSessionIdentity::parse(&transcript.native_session_id, sanitizer)?;
+    for event in &transcript.events {
+        NativeSessionIdentity::parse(&event.native_session_id, sanitizer)?;
+    }
+    let events = capture.filter_ledger_events(transcript.events);
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut imported = 0;
+    for batch in event_batches(events) {
+        let request = FinishManagedRunRequest {
+            native_session_id: Some(native_identity.as_str().to_owned()),
+            source_cursor: None,
+            events: batch,
+            complete: false,
+            checkpoint: checkpoint.clone(),
+            losses: Vec::new(),
+            exit_code: None,
         };
         imported += finish_with_retry(endpoint, run_path, &request)
             .await?
@@ -4282,6 +5884,7 @@ impl PrepareRunOutcome {
 }
 
 fn complete_prepare_run(
+    i18n: &ai_memory_core::i18n::Localizer,
     outcome: PrepareRunOutcome,
     output: &mut impl io::Write,
 ) -> Result<PrepareManagedRunResponse> {
@@ -4292,7 +5895,11 @@ fn complete_prepare_run(
         }
         Err(error) => {
             if let Some(warning) = outcome.manifest_warning {
-                let _ = writeln!(output, "ai-memory: warning: {warning}");
+                let _ = writeln!(
+                    output,
+                    "{}",
+                    diagnostic(i18n, format!("ai-memory: warning: {warning}"))
+                );
             }
             Err(error)
         }
@@ -4300,6 +5907,7 @@ fn complete_prepare_run(
 }
 
 async fn prepare_managed_run(
+    i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
     interactive: bool,
@@ -4313,9 +5921,14 @@ async fn prepare_managed_run(
             )),
             other => other,
         };
-        return complete_prepare_run(PrepareRunOutcome::from_result(result), &mut io::stderr());
+        return complete_prepare_run(
+            i18n,
+            PrepareRunOutcome::from_result(result),
+            &mut io::stderr(),
+        );
     }
     let outcome = prepare_managed_run_with_retry(
+        i18n,
         endpoint,
         request,
         PREPARE_BUSY_RETRY_WINDOW,
@@ -4327,6 +5940,7 @@ async fn prepare_managed_run(
         // Scripts, hooks, and CI keep the short window: they must never hang
         // silently for up to a full lease.
         wait_out_held_lease(
+            i18n,
             endpoint,
             request,
             outcome,
@@ -4338,7 +5952,7 @@ async fn prepare_managed_run(
     } else {
         outcome
     };
-    complete_prepare_run(outcome, &mut io::stderr())
+    complete_prepare_run(i18n, outcome, &mut io::stderr())
 }
 
 /// After the quick retry window, an interactive launch waits out a lease left
@@ -4348,6 +5962,7 @@ async fn prepare_managed_run(
 /// launcher that is still running; that is reported, never waited on or taken
 /// over (the server's busy check stays the only arbiter of ownership).
 async fn wait_out_held_lease(
+    i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
     outcome: PrepareRunOutcome,
@@ -4378,12 +5993,18 @@ async fn wait_out_held_lease(
         };
     };
     eprintln!(
-        "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
+        "{}",
+        diagnostic(
+            i18n,
+            format!(
+                "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
          without releasing it. Waiting {}s for that lease to lapse (Ctrl-C to abort; \
          `--new <name>` starts a separate workstream).",
-        held.owner,
-        held.expires,
-        wait.as_secs_f64().ceil()
+                held.owner,
+                held.expires,
+                wait.as_secs_f64().ceil()
+            )
+        )
     );
     tokio::select! {
         biased;
@@ -4396,6 +6017,7 @@ async fn wait_out_held_lease(
         () = tokio::time::sleep(wait) => {}
     }
     let retry = prepare_managed_run_with_retry(
+        i18n,
         endpoint,
         request,
         retry_window,
@@ -4454,6 +6076,7 @@ fn held_lease_wait(
 }
 
 async fn prepare_managed_run_with_retry(
+    i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
     retry_window: Duration,
@@ -4477,9 +6100,7 @@ async fn prepare_managed_run_with_retry(
                     manifest_warning = server_manifest_warning(&error);
                 }
                 if !reported_wait {
-                    eprintln!(
-                        "ai-memory: another launcher owns this workstream; waiting briefly in case it is finalizing"
-                    );
+                    eprintln!("{}", i18n.diagnostic("ai-memory: another launcher owns this workstream; waiting briefly in case it is finalizing"));
                     reported_wait = true;
                 }
                 tokio::time::sleep(retry_interval).await;
@@ -4986,15 +6607,412 @@ mod tests {
             .collect()
     }
 
-    fn run_checklist(input: &str) -> (io::Result<Vec<String>>, String) {
+    fn checklist_view(items: &[JailChecklistItem]) -> ChecklistView {
+        ChecklistView {
+            i18n: ai_memory_core::i18n::Localizer::default(),
+            paint: Paint::PLAIN,
+            reasons: vec![None; items.len()],
+            recommended: items.iter().map(|item| item.checked).collect(),
+            last_saved: None,
+            new: Vec::new(),
+            gone: Vec::new(),
+            folders_supported: true,
+        }
+    }
+
+    fn folder(path: &str, writable: bool) -> super::super::jail_folders::ExtraFolder {
+        super::super::jail_folders::ExtraFolder {
+            path: path.into(),
+            writable,
+        }
+    }
+
+    fn run_checklist_with(
+        view: &ChecklistView,
+        items: &[JailChecklistItem],
+        input: &str,
+        picked: Option<Vec<super::super::jail_folders::ExtraFolder>>,
+    ) -> (io::Result<ChecklistOutcome>, String, usize) {
         let mut output = Vec::new();
+        let mut opened = 0;
+        let mut pick = |_: &[super::super::jail_folders::ExtraFolder]| {
+            opened += 1;
+            Ok(picked.clone())
+        };
         let result = read_jail_checklist(
-            &checklist_items(),
+            view,
+            items,
+            Vec::new(),
             &mut Cursor::new(input.as_bytes().to_vec()),
             &mut output,
+            &mut pick,
+        );
+        (result, String::from_utf8(output).unwrap(), opened)
+    }
+
+    /// The folder-only screen ai-jail 3.0.1+ gets: no toggle rows, `f`
+    /// still opens the picker, and a number is refused instead of flipping a
+    /// row that is not there.
+    #[test]
+    fn the_folder_only_screen_offers_folders_and_refuses_row_numbers() {
+        let items: Vec<JailChecklistItem> = Vec::new();
+        let view = checklist_view(&items);
+        let (result, printed, opened) = run_checklist_with(
+            &view,
+            &items,
+            "1\nf\n\n",
+            Some(vec![folder("/src/sibling", false)]),
+        );
+        let outcome = result.unwrap();
+        assert_eq!(opened, 1);
+        assert!(outcome.marked.is_empty());
+        assert_eq!(outcome.folders, [folder("/src/sibling", false)]);
+        assert!(
+            printed.contains("ai-jail: extra folders for the agent"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("f folders · reset · Enter go"),
+            "{printed}"
+        );
+        assert!(!printed.contains("numbers flip"), "{printed}");
+        assert!(!printed.contains("what the agent can reach"), "{printed}");
+    }
+
+    #[test]
+    fn the_next_run_under_ai_jail_3_is_a_bare_jail_with_the_folders() {
+        let next = NextRun {
+            harness: Some("claude".into()),
+            ..NextRun::default()
+        };
+        assert_eq!(
+            next_run_command(&next, None, &[folder("/src/sibling", true)]),
+            "ai-memory run --jail --jail-rw-map /src/sibling claude"
+        );
+    }
+
+    #[test]
+    fn the_contract_summary_names_how_the_server_is_reached() {
+        let i18n = ai_memory_core::i18n::Localizer::default();
+        assert_eq!(
+            contract_summary(
+                &i18n,
+                "3.0.1",
+                "claude",
+                ServerReach::Loopback { port: 49374 }
+            ),
+            "ai-memory: ai-jail 3.0.1 reviews the rest of the access for claude (memory server through forwarded port 49374)"
+        );
+        assert!(
+            contract_summary(&i18n, "3.0.1", "codex", ServerReach::Network)
+                .contains("full network, because the memory server is not on this machine")
+        );
+    }
+
+    fn run_checklist(input: &str) -> (io::Result<Vec<String>>, String) {
+        let items = checklist_items();
+        let (result, printed, _) = run_checklist_with(&checklist_view(&items), &items, input, None);
+        let flags = result.map(|outcome| {
+            marked_choices(&outcome.marked)
+                .iter()
+                .map(JailToggleChoice::flag)
+                .collect()
+        });
+        (flags, printed)
+    }
+
+    /// `f` opens the picker and keeps what it returns; Esc there (None)
+    /// keeps the previous folders. `reset` restores the recommended marks
+    /// and clears the folders.
+    #[test]
+    fn checklist_f_opens_the_folder_picker_and_reset_restores_the_recommendation() {
+        let items = checklist_items();
+        let view = checklist_view(&items);
+        let picked = vec![folder("/home/u/Projects/ai-jail", false)];
+        let (outcome, printed, opened) =
+            run_checklist_with(&view, &items, "f\n\n", Some(picked.clone()));
+        let outcome = outcome.unwrap();
+        assert_eq!(opened, 1);
+        assert_eq!(outcome.folders, picked);
+        assert!(
+            printed.contains("📁 Extra folders: ai-jail (ro)"),
+            "{printed}"
+        );
+
+        let (outcome, _, _) = run_checklist_with(&view, &items, "f\n\n", None);
+        assert!(
+            outcome.unwrap().folders.is_empty(),
+            "a cancelled picker changes nothing"
+        );
+
+        let (outcome, _, _) = run_checklist_with(&view, &items, "1 3\nf\nreset\n\n", Some(picked));
+        let outcome = outcome.unwrap();
+        assert!(outcome.folders.is_empty());
+        assert_eq!(
+            marked_choices(&outcome.marked)
+                .iter()
+                .map(JailToggleChoice::flag)
+                .collect::<Vec<_>>(),
+            ["--github", "--aws", "--no-ssh", "--no-docker"]
+        );
+    }
+
+    #[test]
+    fn checklist_without_folder_support_hides_f_and_refuses_it() {
+        let items = checklist_items();
+        let mut view = checklist_view(&items);
+        view.folders_supported = false;
+        let (outcome, printed, opened) = run_checklist_with(&view, &items, "f\n\n", None);
+        assert!(outcome.is_ok());
+        assert_eq!(opened, 0);
+        assert!(!printed.contains("f folders"), "{printed}");
+        assert!(printed.contains("cannot mount extra folders"), "{printed}");
+    }
+
+    /// Each row says why it is recommended, the header names the remembered
+    /// answers and what changed since, and the risk shows on the row.
+    #[test]
+    fn checklist_explains_recommendations_and_changes_tersely() {
+        let items = checklist_items();
+        let mut view = checklist_view(&items);
+        view.reasons = vec![
+            Some("found on this machine"),
+            None,
+            Some("origin pushes over SSH"),
+            None,
+        ];
+        view.last_saved = Some("2026-11-05".into());
+        view.new = vec!["ssh"];
+        view.gone = vec!["kube".into()];
+        let (_, printed, _) = run_checklist_with(&view, &items, "\n", None);
+        assert!(
+            printed.contains("🔒 ai-jail: what the agent can reach"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("your choices from 2026-11-05"),
+            "{printed}"
+        );
+        assert!(printed.contains("new: ssh"), "{printed}");
+        assert!(printed.contains("no longer offered: kube"), "{printed}");
+        assert!(
+            printed.contains("GitHub CLI credentials   🔑 "),
+            "{printed}"
+        );
+        assert!(printed.contains("· found on this machine"), "{printed}");
+        assert!(
+            printed.contains("· origin pushes over SSH new"),
+            "{printed}"
+        );
+        assert!(printed.contains("⚠ grants host root"), "{printed}");
+        assert!(printed.contains("numbers flip · f folders · all · none · reset · Enter go"));
+        assert!(
+            !printed.contains('\u{1b}'),
+            "plain output carries no escape codes"
+        );
+    }
+
+    #[test]
+    fn next_run_command_repeats_the_choices_without_one_off_parts() {
+        let next = NextRun {
+            yolo: true,
+            workspace: Some("team".into()),
+            harness: Some("claude".into()),
+            ..NextRun::default()
+        };
+        let choices = [
+            JailToggleChoice {
+                stem: "github",
+                enable: true,
+                implied: false,
+            },
+            JailToggleChoice {
+                stem: "docker",
+                enable: false,
+                implied: true,
+            },
+            JailToggleChoice {
+                stem: "ssh",
+                enable: true,
+                implied: false,
+            },
+        ];
+        let folders = [
+            folder("/home/u/Projects/ai-jail", false),
+            folder("/home/u/My Projects/tap", true),
+        ];
+        assert_eq!(
+            next_run_command(&next, Some(&choices), &folders),
+            "ai-memory run --yolo --workspace team --jail=github,ssh \
+             --jail-map /home/u/Projects/ai-jail --jail-rw-map '/home/u/My Projects/tap' claude"
+        );
+        // A launch typed with the retired `--true-yolo` repeats as `--yolo`.
+        let bare = NextRun {
+            yolo: true,
+            ..NextRun::default()
+        };
+        let off = [JailToggleChoice {
+            stem: "github",
+            enable: false,
+            implied: false,
+        }];
+        assert_eq!(
+            next_run_command(&bare, Some(&off), &[]),
+            "ai-memory run --yolo --jail=none"
+        );
+        let full = NextRun {
+            yolo: true,
+            no_autowire: true,
+            profile: Some("work".into()),
+            env_file: Some("/home/u/.env.ai".into()),
+            had_env: true,
+            harness: Some("codex".into()),
+            ..NextRun::default()
+        };
+        assert_eq!(
+            next_run_command(&full, Some(&off), &[]),
+            "ai-memory run --yolo --no-autowire --profile work --env-file /home/u/.env.ai \
+             --jail=none codex   # add your --env values again"
+        );
+    }
+
+    /// Remembered answers come back for the same checkout only; a folder
+    /// that no longer exists (or no longer passes the rules) is dropped and
+    /// reported, and a command-line folder is added on top.
+    #[test]
+    fn recalled_answers_drop_folders_that_no_longer_qualify() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let checkout = home.join("Projects/api");
+        let sibling = home.join("Projects/ai-jail");
+        let tap = home.join("Projects/tap");
+        for dir in [&checkout, &sibling, &tap] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let config = Config {
+            data_dir: root.path().join("data"),
+            ..Config::default()
+        };
+        let gone = home.join("Projects/deleted");
+        super::super::jail_choices::save(
+            &config.data_dir,
+            "worktree-a",
+            super::super::jail_choices::Remembered {
+                enabled: vec!["ssh".into()],
+                disabled: vec!["github".into(), "aws".into(), "docker".into()],
+                folders: vec![
+                    folder(&sibling.to_string_lossy(), false),
+                    folder(&gone.to_string_lossy(), true),
+                ],
+                saved_at: "2026-11-05T12:00:00Z".into(),
+            },
         )
-        .map(|choices| choices.iter().map(JailToggleChoice::flag).collect());
-        (result, String::from_utf8(output).unwrap())
+        .unwrap();
+        let inputs = JailInputs {
+            checkout_key: "worktree-a".into(),
+            checkout_root: checkout.clone(),
+            home: home.clone(),
+            flag_folders: vec![folder(&tap.to_string_lossy(), true)],
+            next_run: NextRun::default(),
+        };
+        let mut items = checklist_items();
+        let (saved, applied, folders) = recall_jail_answers(&config, &inputs, &mut items);
+        assert_eq!(saved.as_deref(), Some("2026-11-05"));
+        assert_eq!(
+            items.iter().map(|item| item.checked).collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            folders,
+            [
+                folder(&sibling.to_string_lossy(), false),
+                folder(&tap.to_string_lossy(), true)
+            ]
+        );
+        assert_eq!(applied.gone, [format!("📁 {}", gone.display())]);
+
+        let other = JailInputs {
+            checkout_key: "worktree-b".into(),
+            flag_folders: Vec::new(),
+            ..inputs
+        };
+        let mut items = checklist_items();
+        let (saved, applied, folders) = recall_jail_answers(&config, &other, &mut items);
+        assert_eq!(saved, None, "another checkout has its own answers");
+        assert_eq!(applied, super::super::jail_choices::Applied::default());
+        assert!(folders.is_empty());
+        assert_eq!(
+            items.iter().map(|item| item.checked).collect::<Vec<_>>(),
+            [true, true, false, false],
+            "the smart defaults stay"
+        );
+    }
+
+    #[test]
+    fn the_next_run_hint_is_two_terse_lines_and_plain_without_color() {
+        let hint = next_run_hint(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
+            "ai-memory run --yolo --jail=github claude",
+        );
+        assert_eq!(
+            hint,
+            "\nNext time, start with the same jail choices:\n  ai-memory run --yolo --jail=github claude\n"
+        );
+    }
+
+    #[test]
+    fn the_next_run_hint_neutralizes_terminal_controls_in_folder_paths() {
+        let next = NextRun {
+            harness: Some("claude".into()),
+            ..NextRun::default()
+        };
+        let command = next_run_command(
+            &next,
+            None,
+            &[folder("/w/evil\u{1b}]0;x\u{7}\u{202e}dir", true)],
+        );
+        let hint = next_run_hint(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
+            &command,
+        );
+        assert!(!hint.contains('\u{1b}'), "{hint:?}");
+        assert!(!hint.contains('\u{7}'), "{hint:?}");
+        assert!(!hint.contains('\u{202e}'), "{hint:?}");
+        assert!(hint.contains("--jail-rw-map"), "{hint:?}");
+        assert!(hint.contains("evil"), "{hint:?}");
+    }
+
+    #[test]
+    fn flag_folders_are_validated_and_deduplicated() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let checkout = home.join("Projects/api");
+        let sibling = home.join("Projects/ai-jail");
+        for dir in [&checkout, &sibling, &home.join(".ssh")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let config = Config {
+            data_dir: root.path().join("data"),
+            ..Config::default()
+        };
+        let folders = validate_flag_folders(
+            &config,
+            &checkout,
+            &home,
+            &[
+                (PathBuf::from("../ai-jail"), false),
+                (sibling.clone(), true),
+            ],
+        )
+        .unwrap();
+        assert_eq!(folders, [folder(&sibling.to_string_lossy(), true)]);
+        let refused =
+            validate_flag_folders(&config, &checkout, &home, &[(home.join(".ssh"), false)])
+                .unwrap_err()
+                .to_string();
+        assert!(refused.contains("cannot mount"), "{refused}");
     }
 
     #[test]
@@ -5005,7 +7023,7 @@ mod tests {
             ["--github", "--aws", "--no-ssh", "--no-docker"],
             "every row as seen: unchecked rows are forced off"
         );
-        assert!(printed.contains("Enable in the jail (Enter = as marked"));
+        assert!(printed.contains("🔒 ai-jail: what the agent can reach (Enter keeps the marks)"));
         assert!(printed.contains("[x] 1) GitHub CLI credentials"));
         assert!(printed.contains("[x] 2) AWS credentials"));
         assert!(printed.contains("[ ] 3) SSH keys + agent"));
@@ -5072,6 +7090,50 @@ mod tests {
         );
     }
 
+    /// #2016: a checkout routed to a server profile cannot be jailed, since
+    /// the jailed run cannot read the profile's token; an explicit
+    /// `AI_MEMORY_SERVER_URL` or an unrouted checkout still can.
+    #[test]
+    fn jail_refuses_a_checkout_routed_to_a_server_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("team-b").join("repo");
+        let data_dir = home.join("data");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::server_profiles::add(
+            &data_dir,
+            &crate::server_profiles::ProfileName::parse("team-b").unwrap(),
+            "https://b.example",
+            &[],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        let config = |server_url: Option<&str>| Config {
+            data_dir: data_dir.clone(),
+            runtime_env: crate::config::RuntimeEnv::for_checkout_tests(
+                home.to_string_lossy(),
+                home.to_string_lossy(),
+                server_url,
+                false,
+            ),
+            ..Config::default()
+        };
+
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None), &repo).is_ok());
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"team-b\"\n").unwrap();
+        let error = ensure_jail_does_not_need_a_server_profile(&config(None), &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`team-b`"), "{error}");
+        assert!(!error.contains("PROFILE-TOKEN"), "{error}");
+        assert!(
+            ensure_jail_does_not_need_a_server_profile(&config(Some("https://env.example")), &repo)
+                .is_ok()
+        );
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"nobody\"\n").unwrap();
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None), &repo).is_err());
+    }
+
     /// A jailed re-run keeps routing but must not turn a server bearer loaded
     /// from a private config file into a secret exposed to the harness.
     #[test]
@@ -5105,6 +7167,30 @@ mod tests {
                 FORWARDED_ENV_NAMES.contains(name),
                 "{name} is set on ai-jail but never forwarded into the jail"
             );
+        }
+    }
+
+    #[test]
+    fn jail_reexec_preserves_the_resolved_exit_prompt_opt_out() {
+        let mut config = Config::default();
+        let original = ["run", "codex", "--model", "model"].map(OsString::from);
+        assert_eq!(jail_forwarded_args(&config, original.clone()), original);
+
+        config.run.exit_prompt = false;
+        let forwarded = jail_forwarded_args(&config, original);
+        let mut argv = vec![OsString::from("ai-memory")];
+        argv.extend(forwarded.clone());
+        let CliCommand::Run(mut args) = crate::cli::try_parse_from(argv).unwrap().command else {
+            panic!("expected run command");
+        };
+        preserve_trailing_run_options(&mut args);
+        assert!(args.no_exit_prompt);
+        assert_eq!(args.native_args, ["--model", "model"].map(OsString::from));
+        assert_eq!(jail_forwarded_args(&config, forwarded.clone()), forwarded);
+
+        for command in ["resume", "continue", "show"] {
+            let original = ["--config", "/tmp/run", command].map(OsString::from);
+            assert_eq!(jail_forwarded_args(&config, original.clone()), original);
         }
     }
 
@@ -5154,6 +7240,19 @@ mod tests {
     }
 
     #[test]
+    fn jail_summary_neutralizes_terminal_controls_in_folder_names() {
+        let summary = jail_summary(
+            &[],
+            false,
+            &[folder("/w/evil\u{1b}]0;x\u{7}\u{202e}dir", false)],
+        );
+        assert!(!summary.contains('\u{1b}'), "{summary:?}");
+        assert!(!summary.contains('\u{7}'), "{summary:?}");
+        assert!(!summary.contains('\u{202e}'), "{summary:?}");
+        assert!(summary.contains("evil"), "{summary:?}");
+    }
+
+    #[test]
     fn jail_summary_groups_credentials_capabilities_and_forced_off() {
         let choice = |stem, enable| JailToggleChoice {
             stem,
@@ -5173,21 +7272,22 @@ mod tests {
                     choice("ssh", true),
                     choice("mise", false),
                 ],
-                false
+                false,
+                &[]
             ),
             "ai-memory: re-running inside ai-jail (credentials: GitHub CLI credentials, \
              SSH keys + agent; capabilities: GPU devices; forced off: --no-mise)"
         );
         assert_eq!(
-            jail_summary(&[], false),
+            jail_summary(&[], false, &[]),
             "ai-memory: re-running inside ai-jail with no extra mounts"
         );
         assert_eq!(
-            jail_summary(&[], true),
+            jail_summary(&[], true, &[]),
             "ai-memory: re-running inside ai-jail (plus the project .ai-jail)"
         );
         assert_eq!(
-            jail_summary(&[choice("gpu", true)], true),
+            jail_summary(&[choice("gpu", true)], true, &[]),
             "ai-memory: re-running inside ai-jail (capabilities: GPU devices; plus the \
              project .ai-jail)"
         );
@@ -5201,13 +7301,26 @@ mod tests {
                     implied_off("docker"),
                     implied_off("gpu"),
                 ],
-                false
+                false,
+                &[]
             ),
             "ai-memory: re-running inside ai-jail (credentials: GitHub CLI credentials; \
              forced off: --no-mise; everything else in the checklist off)"
         );
         assert_eq!(
-            jail_summary(&[implied_off("docker")], false),
+            jail_summary(
+                &[choice("github", true)],
+                false,
+                &[super::super::jail_folders::ExtraFolder {
+                    path: "/home/u/Projects/ai-jail".into(),
+                    writable: false,
+                }]
+            ),
+            "ai-memory: re-running inside ai-jail (credentials: GitHub CLI credentials; \
+             folders: ai-jail (ro))"
+        );
+        assert_eq!(
+            jail_summary(&[implied_off("docker")], false, &[]),
             "ai-memory: re-running inside ai-jail (everything else in the checklist off)"
         );
     }
@@ -5232,13 +7345,23 @@ mod tests {
         assert!(!yolo_decision("N"));
         assert!(!yolo_decision("no"));
         assert!(!yolo_decision("NO\n"));
+        assert!(!yolo_decision("não"));
+        assert!(!yolo_decision("NÃO\n"));
+        assert!(!yolo_decision("nao"));
     }
 
     #[test]
     fn read_yolo_confirmation_default_enter_proceeds_without_jail_offer() {
         let mut input = Cursor::new(b"\n".to_vec());
         let mut output = Vec::new();
-        let confirmation = read_yolo_confirmation(false, &mut input, &mut output).unwrap();
+        let confirmation = read_yolo_confirmation(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(
             confirmation,
             YoloConfirmation {
@@ -5255,7 +7378,14 @@ mod tests {
     fn read_yolo_confirmation_decline_aborts_before_the_jail_offer() {
         let mut input = Cursor::new(b"n\n".to_vec());
         let mut output = Vec::new();
-        let confirmation = read_yolo_confirmation(true, &mut input, &mut output).unwrap();
+        let confirmation = read_yolo_confirmation(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(
             confirmation,
             YoloConfirmation {
@@ -5274,7 +7404,14 @@ mod tests {
     fn read_yolo_confirmation_offers_ai_jail_and_reads_its_answer() {
         let mut input = Cursor::new(b"\nn\n".to_vec());
         let mut output = Vec::new();
-        let confirmation = read_yolo_confirmation(true, &mut input, &mut output).unwrap();
+        let confirmation = read_yolo_confirmation(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(
             confirmation,
             YoloConfirmation {
@@ -5288,6 +7425,7 @@ mod tests {
 
     fn run_args_for_after_run_test() -> RunArgs {
         RunArgs {
+            project_id: None,
             workspace: Some("work".into()),
             project: Some("repo".into()),
             workstream: None,
@@ -5297,9 +7435,12 @@ mod tests {
             true_yolo: true,
             jail: None,
             no_jail: true,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: true,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: Some("work".into()),
             env: vec![("MODEL_HOME".into(), "custom".into())],
@@ -5315,6 +7456,8 @@ mod tests {
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
         let action = choose_after_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
             ManagedHarness::Claude,
             "research",
             &[RunHarnessChoice::Codex],
@@ -5331,12 +7474,86 @@ mod tests {
         assert!(output.contains("q) quit (default)"));
     }
 
+    /// A session id read from a transcript is printed by `backfill`,
+    /// `finalize-session` and `reorg` as well as by `run`, all through this
+    /// helper: it stays bounded and prints inert, and an ordinary id is
+    /// unchanged.
+    #[test]
+    fn display_session_id_is_bounded_and_inert() {
+        let id = "01a16548-23e9-7cf1-b3d6-ab3405055748";
+        assert_eq!(display_session_id(id), id);
+        assert_eq!(
+            display_session_id("abc\u{1b}]52;c;eA==\u{7}\u{202e}def"),
+            "abc?]52;c;eA==??def"
+        );
+        let long = "x".repeat(80);
+        assert_eq!(display_session_id(&long), format!("{}...", "x".repeat(64)));
+    }
+
+    /// #2010: the workstream name comes back from the server and a session
+    /// id from a harness transcript. A hostile value carrying an OSC 52
+    /// clipboard write, a CSI and a bidi override prints inert in both
+    /// prompts, in English and in Portuguese, while the rest of the line is
+    /// still there.
+    #[test]
+    fn server_and_transcript_names_print_inert_in_run_prompts() {
+        use ai_memory_core::i18n::{Language, Localizer};
+        let name = "re\u{1b}]52;c;cHduZWQ=\u{7}search\u{1b}[2J\u{202e}";
+        let id = "new\u{1b}[31mest";
+        let has_control = |text: &str| text.contains(['\u{1b}', '\u{7}', '\u{202e}']);
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let i18n = Localizer::new(language);
+            let mut output = Vec::new();
+            choose_after_run(
+                &i18n,
+                Paint::PLAIN,
+                ManagedHarness::Claude,
+                name,
+                &[RunHarnessChoice::Codex],
+                &mut Cursor::new(b"\n"),
+                &mut output,
+            )
+            .unwrap();
+            let after_run = String::from_utf8(output).unwrap();
+            assert!(!has_control(&after_run), "{after_run:?}");
+            assert!(
+                after_run.contains("re?]52;c;cHduZWQ=?search?[2J?"),
+                "{after_run:?}"
+            );
+
+            let mut output = Vec::new();
+            let candidates = [NativeSessionCandidate {
+                native_session_id: id.into(),
+                updated_at: SystemTime::UNIX_EPOCH,
+            }];
+            choose_native_session(
+                &i18n,
+                ManagedHarness::Codex,
+                name,
+                &candidates,
+                &mut Cursor::new(b"0\n"),
+                &mut output,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            )
+            .unwrap();
+            let adoption = String::from_utf8(output).unwrap();
+            assert!(!has_control(&adoption), "{adoption:?}");
+            assert!(
+                adoption.contains("re?]52;c;cHduZWQ=?search?[2J?"),
+                "{adoption:?}"
+            );
+            assert!(adoption.contains("new?[31mest"), "{adoption:?}");
+        }
+    }
+
     #[test]
     fn post_run_choice_selects_an_installed_harness_by_number() {
         let mut input = Cursor::new(b"1\n");
         let mut output = Vec::new();
         assert_eq!(
             choose_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
+                Paint::PLAIN,
                 ManagedHarness::Claude,
                 "research",
                 &[RunHarnessChoice::Codex],
@@ -5398,7 +7615,10 @@ mod tests {
         assert!(!args.fresh);
         assert!(args.native_args.is_empty());
         assert!(args.yolo);
-        assert!(args.true_yolo);
+        assert!(
+            !args.true_yolo,
+            "a relaunch carries --yolo, not the alias that prints its note again"
+        );
         assert!(args.no_jail);
         assert!(args.no_autowire);
         assert_eq!(args.env, [("MODEL_HOME".into(), "custom".into())]);
@@ -5436,16 +7656,64 @@ mod tests {
             workstream_name: "research".into(),
             degraded: false,
         };
-        assert!(should_offer_after_run(&outcome, true, false));
-        assert!(!should_offer_after_run(&outcome, false, false));
-        assert!(!should_offer_after_run(&outcome, true, true));
+        let config = Config::default();
+        let mut args = run_args_for_after_run_test();
+        assert!(should_offer_after_run(&config, &args, &outcome, true));
+        assert!(!should_offer_after_run(&config, &args, &outcome, false));
+        args.executable = Some(PathBuf::from("custom-harness"));
+        assert!(!should_offer_after_run(&config, &args, &outcome, true));
+        args.executable = None;
 
         let mut failed = outcome;
         failed.exit_code = 1;
-        assert!(!should_offer_after_run(&failed, true, false));
+        assert!(!should_offer_after_run(&config, &args, &failed, true));
         failed.exit_code = 0;
         failed.mode = LaunchMode::Passthrough;
-        assert!(!should_offer_after_run(&failed, true, false));
+        assert!(!should_offer_after_run(&config, &args, &failed, true));
+    }
+
+    #[test]
+    fn post_run_prompt_respects_config_env_and_flag_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::Claude,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "research".into(),
+            degraded: false,
+        };
+        for (file, env, enabled) in [
+            ("", None, true),
+            ("[run]\nrequire_server = false\n", None, true),
+            ("[run]\nexit_prompt = false\n", None, false),
+            ("[run]\nexit_prompt = true\n", None, true),
+            ("", Some("false"), false),
+            ("[run]\nexit_prompt = true\n", Some("false"), false),
+            ("[run]\nexit_prompt = false\n", Some("true"), true),
+        ] {
+            std::fs::write(&config_path, file).unwrap();
+            let pairs: Vec<_> = env
+                .map(|value| ("AI_MEMORY_RUN_EXIT_PROMPT", value))
+                .into_iter()
+                .collect();
+            let config = Config::load_with_runtime_env(
+                Some(&config_path),
+                Some(dir.path().to_path_buf()),
+                crate::config::RuntimeEnv::with_process_env_for_tests(&pairs),
+            )
+            .unwrap();
+            for no_exit_prompt in [false, true] {
+                let mut args = run_args_for_after_run_test();
+                args.no_exit_prompt = no_exit_prompt;
+                assert_eq!(
+                    should_offer_after_run(&config, &args, &outcome, true),
+                    enabled && !no_exit_prompt,
+                    "file={file:?}, env={env:?}, flag={no_exit_prompt}",
+                );
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -6033,10 +8301,8 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_notice_reports_an_unreachable_server_as_unavailable() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+        let refusing = ai_memory_test_support::refusing_port();
+        let endpoint = ServerEndpoint::from_pair(Some(refusing.url()), None);
         let mut health = HeartbeatHealth::default();
 
         let error = send_managed_heartbeat_with_timeout(
@@ -6119,6 +8385,7 @@ mod tests {
                             .into_response();
                     }
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -6140,6 +8407,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
         let request = PrepareManagedRunRequest {
+            project_id: None,
             workspace: "default".into(),
             project: "project".into(),
             cwd: "/tmp/project".into(),
@@ -6156,6 +8424,7 @@ mod tests {
         };
 
         let prepared = prepare_managed_run_with_retry(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             // A wall-clock give-up deadline, not a latency assertion. This
@@ -6224,6 +8493,7 @@ mod tests {
         );
         let (endpoint, server) = serve(app).await;
         let outcome = prepare_managed_run_with_retry(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &held_lease_request(),
             Duration::from_secs(5),
@@ -6239,7 +8509,12 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        let error = complete_prepare_run(outcome, &mut output).expect_err("final 404 is preserved");
+        let error = complete_prepare_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            outcome,
+            &mut output,
+        )
+        .expect_err("final 404 is preserved");
         let response = error.downcast_ref::<ServerResponseError>().unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         assert!(response.body().contains("final missing workstream"));
@@ -6274,6 +8549,7 @@ mod tests {
                             .into_response();
                     }
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -6292,6 +8568,7 @@ mod tests {
         );
         let (endpoint, server) = serve(app).await;
         let outcome = prepare_managed_run_with_retry(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &held_lease_request(),
             Duration::from_secs(5),
@@ -6300,7 +8577,12 @@ mod tests {
         )
         .await;
         let mut output = Vec::new();
-        let response = complete_prepare_run(outcome, &mut output).unwrap();
+        let response = complete_prepare_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            outcome,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             response.manifest_warning.as_deref(),
@@ -6393,6 +8675,7 @@ mod tests {
                             .into_response();
                     }
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -6414,6 +8697,7 @@ mod tests {
 
     fn held_lease_request() -> PrepareManagedRunRequest {
         PrepareManagedRunRequest {
+            project_id: None,
             workspace: "default".into(),
             project: "project".into(),
             cwd: "/tmp/project".into(),
@@ -6453,6 +8737,7 @@ mod tests {
                 .expect_err("the first attempt sees the held lease");
         let started = std::time::Instant::now();
         let prepared = wait_out_held_lease(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             PrepareRunOutcome::from_result(Err(first)),
@@ -6489,6 +8774,7 @@ mod tests {
             .to_string(),
         );
         let outcome = wait_out_held_lease(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             PrepareRunOutcome::from_result(Err(first)),
@@ -6498,7 +8784,12 @@ mod tests {
         )
         .await;
         let mut output = Vec::new();
-        let response = complete_prepare_run(outcome, &mut output).unwrap();
+        let response = complete_prepare_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            outcome,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(
             response.manifest_warning.as_deref(),
@@ -6520,6 +8811,7 @@ mod tests {
                 .await
                 .expect_err("held");
         let error = wait_out_held_lease(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             PrepareRunOutcome::from_result(Err(first)),
@@ -6545,9 +8837,15 @@ mod tests {
         request.force_unlock = true;
         let started = std::time::Instant::now();
 
-        let error = prepare_managed_run(&endpoint, &request, true, &CancellationToken::new())
-            .await
-            .expect_err("a server that refuses the takeover must fail immediately");
+        let error = prepare_managed_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            &endpoint,
+            &request,
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a server that refuses the takeover must fail immediately");
 
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -6571,6 +8869,7 @@ mod tests {
         interrupted.cancel();
         let started = std::time::Instant::now();
         let error = wait_out_held_lease(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             PrepareRunOutcome::from_result(Err(first)),
@@ -6621,9 +8920,14 @@ mod tests {
         let search = env.executable_search();
 
         assert!(
-            resolve_opencode_for_launch(None, None, &env)
-                .unwrap()
-                .is_none()
+            resolve_opencode_for_launch(
+                &ai_memory_core::i18n::Localizer::default(),
+                None,
+                None,
+                &env
+            )
+            .unwrap()
+            .is_none()
         );
         let usable = filter_usable_auto_sessions(
             vec![auto_candidate(ManagedHarness::Codex, 100)],
@@ -6633,8 +8937,13 @@ mod tests {
         assert_eq!(usable.len(), 1);
         assert_eq!(usable[0].harness, ManagedHarness::Codex);
 
-        let explicit =
-            resolve_opencode_for_launch(Some(RunHarnessChoice::OpenCode), None, &env).unwrap_err();
+        let explicit = resolve_opencode_for_launch(
+            &ai_memory_core::i18n::Localizer::default(),
+            Some(RunHarnessChoice::OpenCode),
+            None,
+            &env,
+        )
+        .unwrap_err();
         assert!(
             format!("{explicit:#}").contains("could not determine the OpenCode major"),
             "{explicit:#}"
@@ -6666,6 +8975,7 @@ mod tests {
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
         let selected = choose_native_session(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Codex,
             "default",
             &candidates(),
@@ -6681,12 +8991,94 @@ mod tests {
         assert!(rendered.contains("Start a new codex session"));
     }
 
+    /// The hint names the newest checkout session and the native selector to
+    /// put right after the harness, in that harness's own form. It falls back
+    /// to plain advice when the id would not print whole or would need shell
+    /// quoting, reports a listing error, and says nothing when there is no
+    /// other session to offer.
+    #[test]
+    fn orphan_resume_hint_names_the_newest_session_and_its_selector() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(7_200);
+        let id = "01a16548-23e9-7cf1-b3d6-ab3405055748";
+        let newest = |id: &str| {
+            Ok(vec![NativeSessionCandidate {
+                native_session_id: id.into(),
+                updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(3_600),
+            }])
+        };
+        let hint = |harness, sessions| orphan_resume_hint(harness, "gone", sessions, now);
+
+        let codex = hint(ManagedHarness::Codex, newest(id)).unwrap();
+        assert!(
+            codex.starts_with(&format!(
+                "ai-memory: this checkout's newest codex session is {id} (updated 1 hour ago)"
+            )),
+            "{codex}"
+        );
+        assert!(
+            codex.ends_with(&format!("with `resume {id}` right after `codex`")),
+            "{codex}"
+        );
+        let claude = hint(ManagedHarness::Claude, newest(id)).unwrap();
+        assert!(
+            claude.ends_with(&format!("with `--resume {id}` right after `claude`")),
+            "{claude}"
+        );
+        let kiro_id = "sess_01a16548-23e9-7cf1-b3d6-ab3405055748";
+        let kiro = hint(ManagedHarness::KiroV3, newest(kiro_id)).unwrap();
+        assert!(
+            kiro.ends_with(&format!("with `--resume-id {kiro_id}` right after `kiro`")),
+            "{kiro}"
+        );
+        let omp = hint(ManagedHarness::Omp, newest(id)).unwrap();
+        assert!(
+            omp.ends_with(&format!("with `--resume={id}` right after `omp`")),
+            "{omp}"
+        );
+
+        let long = "a".repeat(80);
+        let unprintable = hint(ManagedHarness::Codex, newest(&long)).unwrap();
+        assert!(
+            unprintable.ends_with("stop this fresh session and resume that one by its id"),
+            "{unprintable}"
+        );
+        assert!(!unprintable.contains('`'), "{unprintable}");
+        let quoted = hint(ManagedHarness::Pi, newest("odd session;id")).unwrap();
+        assert!(!quoted.contains('`'), "{quoted}");
+
+        let error = hint(ManagedHarness::Codex, Err(anyhow!("store unreadable"))).unwrap();
+        assert_eq!(
+            error,
+            "ai-memory: could not list this checkout's other codex sessions (store unreadable)"
+        );
+        assert!(hint(ManagedHarness::Codex, newest("gone")).is_none());
+        assert!(hint(ManagedHarness::Codex, Ok(Vec::new())).is_none());
+
+        // The launch asks for the hint only for an interactive session: in
+        // `codex exec` or `opencode run` the selector belongs after the
+        // subcommand, not right after the harness name.
+        let args = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &args(&[])
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &args(&["exec", "fix it"])
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::OpenCode,
+            &args(&["run", "fix it"])
+        ));
+    }
+
     #[test]
     fn adoption_prompt_can_start_fresh_or_select_an_older_session() {
         let mut fresh_input = Cursor::new(b"0\n");
         let mut output = Vec::new();
         assert!(
             choose_native_session(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Claude,
                 "default",
                 &candidates(),
@@ -6700,6 +9092,7 @@ mod tests {
 
         let mut older_input = Cursor::new(b"invalid\n2\n");
         let selected = choose_native_session(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Codex,
             "default",
             &candidates(),
@@ -6905,18 +9298,21 @@ mod tests {
             .unwrap(),
             ManagedHarness::KiroV3
         );
-        assert_eq!(
-            resolve_kiro_harness(
-                &[OsString::from("--agent-engine=v2")],
+        for selector in ["--v2", "--agent-engine=v2"] {
+            let args = ["chat", selector].map(OsString::from);
+            let harness = resolve_kiro_harness(
+                &args,
                 Some("sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e"),
                 Some(&v3_cursor),
                 ManagedHarness::KiroV3,
                 temp.path(),
                 &cwd,
             )
-            .unwrap(),
-            ManagedHarness::Kiro
-        );
+            .unwrap();
+            let plan = build_launch_plan(harness, None, args.to_vec(), None).unwrap();
+            assert_eq!(harness, ManagedHarness::Kiro, "{selector}: {:?}", plan.args);
+            assert_eq!(plan.args, args);
+        }
         assert_eq!(
             resolve_kiro_harness(
                 &[
@@ -6990,6 +9386,7 @@ mod tests {
 
         let env = EffectiveChildEnv::default();
         let (fresh, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::KiroV3,
             None,
             vec![OsString::from("--v3")],
@@ -7071,60 +9468,98 @@ mod tests {
         assert_eq!(native, ["--model", "opus"].map(OsString::from));
     }
 
+    /// `--true-yolo` stays a hidden alias so 3.4.x aliases, scripts and
+    /// printed next-run lines keep launching; it parses in `run`, `show`,
+    /// `continue` and `resume`, and is gone from `--help`.
     #[test]
-    fn true_yolo_flag_implies_yolo_on_every_harness() {
+    fn true_yolo_is_a_hidden_alias_on_every_launch_command() {
+        for argv in [
+            &["ai-memory", "run", "--true-yolo", "claude"][..],
+            &["ai-memory", "show", "--true-yolo"],
+            &["ai-memory", "continue", "--true-yolo"],
+            &["ai-memory", "resume", "--true-yolo"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        let mut command = <Cli as clap::CommandFactory>::command();
+        for name in ["run", "show", "continue", "resume"] {
+            let help = command
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(!help.contains("true-yolo"), "{name} --help: {help}");
+        }
+    }
+
+    /// `--true-yolo` in either position requests exactly what `--yolo` does,
+    /// so a 3.4.x alias still gets the warning, the ai-jail offer and the
+    /// harness's dangerous mode (Claude's `--settings` included).
+    #[test]
+    fn true_yolo_alias_requests_yolo_in_either_position() {
+        let parse = |argv: &[&str]| {
+            let CliCommand::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("expected run command");
+            };
+            args
+        };
+        let take = |argv: &[&str]| {
+            let mut args = parse(argv);
+            let taken = take_wrapper_yolo(args.yolo, args.true_yolo, &mut args.native_args);
+            (taken, args.native_args)
+        };
+        let opus = ["--model", "opus"].map(OsString::from).to_vec();
         assert_eq!(
-            yolo_modes(false, true, false),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: true
-            },
-            "--true-yolo alone must still warn/offer ai-jail and map the harness's yolo"
+            take(&[
+                "ai-memory",
+                "run",
+                "--true-yolo",
+                "claude",
+                "--model",
+                "opus"
+            ]),
+            ((true, true), opus.clone())
         );
-        // Both together are redundant, never an error or a different result.
         assert_eq!(
-            yolo_modes(true, true, false),
-            yolo_modes(false, true, false)
+            take(&[
+                "ai-memory",
+                "run",
+                "claude",
+                "--model",
+                "opus",
+                "--true-yolo"
+            ]),
+            ((true, true), opus.clone())
+        );
+        assert_eq!(
+            take(&["ai-memory", "run", "claude", "--model", "opus", "--yolo"]),
+            ((true, false), opus.clone())
+        );
+        assert_eq!(
+            take(&["ai-memory", "run", "claude", "--model", "opus"]),
+            ((false, false), opus)
         );
     }
 
     #[test]
-    fn plain_yolo_does_not_bypass_claude_permissions_by_itself() {
-        assert_eq!(
-            yolo_modes(true, false, false),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: false
-            }
-        );
-        assert_eq!(
-            yolo_modes(false, false, false),
-            YoloModes {
-                yolo: false,
-                claude_true_yolo: false
-            }
-        );
-    }
-
-    /// The config key upgrades a yolo launch, but alone must never turn an
-    /// ordinary managed run into a `bypassPermissions` one with no `--yolo`
-    /// warning (it previously did).
-    #[test]
-    fn claude_true_yolo_config_only_upgrades_a_yolo_launch() {
-        assert_eq!(
-            yolo_modes(false, false, true),
-            YoloModes {
-                yolo: false,
-                claude_true_yolo: false
-            }
-        );
-        assert_eq!(
-            yolo_modes(true, false, true),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: true
-            }
-        );
+    fn retired_true_yolo_spellings_print_a_note_each() {
+        assert!(yolo_deprecation_notes(false, false).is_empty());
+        let flag = yolo_deprecation_notes(true, false);
+        assert_eq!(flag.len(), 1);
+        assert!(flag[0].contains("--true-yolo is now the same as --yolo"));
+        let key = yolo_deprecation_notes(false, true);
+        assert_eq!(key.len(), 1);
+        assert!(key[0].contains("claude_true_yolo is deprecated and ignored"));
+        assert_eq!(yolo_deprecation_notes(true, true).len(), 2);
+        let catalog =
+            ai_memory_core::i18n::Localizer::new(ai_memory_core::i18n::Language::PortugueseBrazil);
+        for note in yolo_deprecation_notes(true, true) {
+            assert_ne!(
+                catalog.diagnostic(note),
+                note,
+                "pt-BR catalog entry for {note}"
+            );
+        }
     }
 
     #[test]
@@ -7185,6 +9620,59 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_no_exit_prompt_parses_before_or_after_the_harness() {
+        for argv in [
+            vec![
+                "ai-memory",
+                "run",
+                "--no-exit-prompt",
+                "codex",
+                "--model",
+                "model",
+            ],
+            vec![
+                "ai-memory",
+                "run",
+                "codex",
+                "--no-exit-prompt",
+                "--model",
+                "model",
+            ],
+            vec![
+                "ai-memory",
+                "run",
+                "codex",
+                "--model",
+                "model",
+                "--no-exit-prompt",
+            ],
+            vec![
+                "ai-memory",
+                "run",
+                "--no-exit-prompt",
+                "codex",
+                "--model",
+                "model",
+                "--no-exit-prompt",
+            ],
+        ] {
+            let mut args = parse_run(&argv);
+            preserve_trailing_run_options(&mut args);
+            assert!(args.no_exit_prompt, "{argv:?}");
+            assert_eq!(args.native_args, ["--model", "model"].map(OsString::from));
+        }
+        let mut native = [
+            "--no-exit-prompt=literal",
+            "prompt with --no-exit-prompt inside",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let original = native.clone();
+        assert!(!remove_wrapper_no_exit_prompt(&mut native));
+        assert_eq!(native, original);
+    }
+
+    #[test]
     fn resolve_run_env_merges_profile_file_then_cli_pairs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vars.env");
@@ -7241,6 +9729,7 @@ mod tests {
         let mut config = Config::load(None, Some(tmp.path().join("data"))).unwrap();
         config.server_url = "http://127.0.0.1:1".into();
         let args = RunArgs {
+            project_id: None,
             workspace: None,
             project: None,
             workstream: None,
@@ -7250,9 +9739,12 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: true,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: Some("missing".into()),
             env: Vec::new(),
@@ -7520,6 +10012,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -7588,6 +10081,7 @@ mod tests {
         );
 
         let args = RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -7597,9 +10091,12 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: Some("work".into()),
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
@@ -7695,6 +10192,7 @@ mod tests {
         config.run_autowire = false;
 
         let args = RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -7704,9 +10202,12 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: true,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env: Vec::new(),
@@ -7865,6 +10366,97 @@ mod tests {
                 .unwrap_or(0)
                 == 0,
             "an offline half-wiring must not gate the next online launch"
+        );
+    }
+
+    /// A picker can launch a checkout other than the command's cwd. Its
+    /// managed prepare must reach the same server, with the same bearer, as
+    /// that checkout's hooks; the install's endpoint is a hostile control.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_checkout_routes_managed_prepare_to_its_profile() {
+        let (temp, mut config, mut args) = offline_run_fixture(0).await;
+        let repo = temp.path().join("repo").canonicalize().unwrap();
+        let home = temp.path().join("home");
+        config.runtime_env = crate::config::RuntimeEnv::for_checkout_tests(
+            home.to_string_lossy(),
+            home.to_string_lossy(),
+            None,
+            false,
+        );
+        config.auth.bearer_token = Some("INSTALL-TOKEN".into());
+        args.require_server = true;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().unwrap().push((
+                    request.method().clone(),
+                    request.uri().path().to_owned(),
+                    request.headers().get("authorization").cloned(),
+                ));
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "selected-profile-prepare",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/memory", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        crate::server_profiles::add(
+            &config.data_dir,
+            &crate::server_profiles::ProfileName::parse("selected").unwrap(),
+            &url,
+            &[repo.to_string_lossy().into_owned()],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"selected\"\n").unwrap();
+
+        let error = run_from_with_wiring(&config, args, &repo, &WireOverrides::default())
+            .await
+            .unwrap_err();
+        server.abort();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("selected-profile-prepare"), "{detail}");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                (reqwest::Method::GET, "/memory/healthz".into(), None),
+                (
+                    reqwest::Method::POST,
+                    "/memory/workstream/runs".into(),
+                    Some("Bearer PROFILE-TOKEN".parse().unwrap())
+                ),
+            ],
+            "the probe is anonymous and the managed write uses only the selected profile's token"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_checkout_refuses_its_invalid_profile_before_any_server_request() {
+        let (temp, mut config, mut args) = offline_run_fixture(0).await;
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        config.runtime_env = crate::config::RuntimeEnv::for_checkout_tests(
+            home.to_string_lossy(),
+            home.to_string_lossy(),
+            None,
+            false,
+        );
+        args.require_server = true;
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"missing\"\n").unwrap();
+        let error = run_from_with_wiring(&config, args, &repo, &WireOverrides::default())
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("rejected-unknown-profile"), "{detail}");
+        assert!(
+            !detail.contains(&config.server_url),
+            "no fallback: {detail}"
         );
     }
 
@@ -8042,6 +10634,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -8123,6 +10716,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -8188,6 +10782,7 @@ mod tests {
 
         let default_home = home.path().join(".claude");
         let args = RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -8197,9 +10792,12 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: true,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             // Pinned so a contributor's own CLAUDE_CONFIG_DIR cannot leak in.
@@ -8257,6 +10855,7 @@ mod tests {
         let env = EffectiveChildEnv::default();
 
         let (resumed, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Pi,
             None,
             native_args.clone(),
@@ -8273,6 +10872,7 @@ mod tests {
 
         std::fs::remove_file(transcript).unwrap();
         let (fresh, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Pi,
             None,
             native_args.clone(),
@@ -8288,6 +10888,7 @@ mod tests {
         assert!(!fresh.args.iter().any(|arg| arg == "linked"));
 
         let (explicit, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Pi,
             None,
             [
@@ -8329,6 +10930,7 @@ mod tests {
         let env = EffectiveChildEnv::default();
         let plan = || {
             build_preflighted_launch_plan(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Codex,
                 None,
                 Vec::new(),
@@ -8487,9 +11089,15 @@ mod tests {
                 .map(|(key, value)| (OsString::from(key), OsString::from(value))),
         );
 
-        let found = list_auto_sessions(&home, &cwd, &env, Some(ManagedHarness::OpenCode))
-            .await
-            .unwrap();
+        let found = list_auto_sessions(
+            &ai_memory_core::i18n::Localizer::default(),
+            &home,
+            &cwd,
+            &env,
+            Some(ManagedHarness::OpenCode),
+        )
+        .await
+        .unwrap();
         let claude: Vec<&str> = found
             .iter()
             .filter(|candidate| candidate.harness == ManagedHarness::Claude)
@@ -8505,6 +11113,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let env = EffectiveChildEnv::default();
         let (fresh, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Claude,
             None,
             Vec::new(),
@@ -8520,6 +11129,7 @@ mod tests {
         assert!(!fresh.args.iter().any(|arg| arg == "--resume"));
 
         let error = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Claude,
             None,
             [OsString::from("--resume"), OsString::from("chosen")].to_vec(),
@@ -8531,6 +11141,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--fresh cannot be combined"));
+    }
+
+    #[test]
+    fn fresh_session_uses_the_linked_session_as_local_history_fallback() {
+        let linked = previous_session_for_history(
+            None,
+            Some("linked-claude-session"),
+            true,
+            LaunchMode::Session,
+            ManagedHarness::Claude,
+        )
+        .unwrap();
+        assert_eq!(linked.agent, AgentKind::ClaudeCode);
+        assert_eq!(linked.native_session_id, "linked-claude-session");
+
+        assert!(
+            previous_session_for_history(
+                None,
+                Some("linked-claude-session"),
+                true,
+                LaunchMode::Passthrough,
+                ManagedHarness::Claude,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_harness_history_precedes_the_fresh_session_fallback() {
+        let previous = ManagedNativeSessionReference {
+            agent: AgentKind::OpenCode,
+            native_session_id: "previous-opencode-session".into(),
+        };
+        assert_eq!(
+            previous_session_for_history(
+                Some(&previous),
+                Some("linked-claude-session"),
+                true,
+                LaunchMode::Session,
+                ManagedHarness::Claude,
+            ),
+            Some(previous)
+        );
+    }
+
+    #[test]
+    fn linked_codex_context_warning_explains_unowned_new_threads() {
+        let warning = missing_context_warning(ManagedHarness::Codex, true);
+        assert!(warning.contains("if you used `/new`"));
+        assert!(warning.contains("no trustworthy parent link"));
+
+        assert!(!missing_context_warning(ManagedHarness::Codex, false).contains("`/new`"));
+        assert!(!missing_context_warning(ManagedHarness::Claude, true).contains("`/new`"));
     }
 
     #[tokio::test]
@@ -8566,6 +11229,7 @@ mod tests {
             let cwd = cwd.clone();
             async move {
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Claude,
                     &home,
@@ -8618,6 +11282,7 @@ mod tests {
             let cwd = cwd.clone();
             async move {
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Claude,
                     &home,
@@ -8714,6 +11379,7 @@ mod tests {
             );
             assert_eq!(
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Codex,
                     temp.path(),
@@ -8737,6 +11403,7 @@ mod tests {
             let status = status(linked, "nested");
             assert_eq!(
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Codex,
                     temp.path(),
@@ -8789,6 +11456,7 @@ mod tests {
         assert_eq!(utility.mode, LaunchMode::Passthrough);
         assert!(
             resolve_native_session_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 &utility,
                 ManagedHarness::Codex,
                 temp.path(),
@@ -8806,6 +11474,7 @@ mod tests {
         session.session_dir = None;
         assert_eq!(
             resolve_native_session_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 &session,
                 ManagedHarness::Codex,
                 temp.path(),
@@ -8873,6 +11542,7 @@ mod tests {
             args.extend(extra.iter().map(OsString::from));
             let plan = build_launch_plan(ManagedHarness::Crush, None, args, None).unwrap();
             resolve_native_session_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 &plan,
                 ManagedHarness::Crush,
                 temp.path(),
@@ -8934,6 +11604,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -8993,6 +11664,7 @@ mod tests {
             ..WireOverrides::default()
         };
         let args = RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -9003,9 +11675,12 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             env: vec![
                 ("PATH".into(), executable_dir.display().to_string()),
@@ -9066,6 +11741,7 @@ mod tests {
                 "/workstream/runs",
                 post(|| async {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -9123,6 +11799,7 @@ mod tests {
             ..WireOverrides::default()
         };
         let args = || RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -9132,9 +11809,12 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env: Vec::new(),
@@ -9215,6 +11895,7 @@ mod tests {
                 "/workstream/runs",
                 post(move || async move {
                     axum::Json(PrepareManagedRunResponse {
+                        resolved_project: None,
                         workstream_id: WorkstreamId::new(),
                         workstream_name: "default".into(),
                         run_id: ManagedRunId::new(),
@@ -9267,6 +11948,7 @@ mod tests {
                     "/workstream/runs",
                     post(|| async {
                         axum::Json(PrepareManagedRunResponse {
+                            resolved_project: None,
                             workstream_id: WorkstreamId::new(),
                             workstream_name: "default".into(),
                             run_id: ManagedRunId::new(),
@@ -9391,6 +12073,133 @@ mod tests {
         (script, captured)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_project_id_launch_reuses_binding_honors_override_and_refuses_old_server() {
+        use ai_memory_core::ManagedProjectScope;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let scope = ManagedProjectScope {
+            workspace_id: ai_memory_core::WorkspaceId::new(),
+            project_id: ai_memory_core::ProjectId::new(),
+            workspace: "ws".into(),
+            project: "selected".into(),
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<PrepareManagedRunRequest>::new()));
+        let confirms = Arc::new(AtomicBool::new(true));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post({
+                    let scope = scope.clone();
+                    let requests = requests.clone();
+                    let confirms = confirms.clone();
+                    move |axum::Json(request): axum::Json<PrepareManagedRunRequest>| {
+                        let mut scope = scope.clone();
+                        let requests = requests.clone();
+                        let confirms = confirms.clone();
+                        async move {
+                            if request.project_id.is_none() {
+                                scope.project = request.project.clone();
+                            }
+                            requests.lock().unwrap().push(request);
+                            axum::Json(PrepareManagedRunResponse {
+                                resolved_project: confirms.load(Ordering::SeqCst).then_some(scope),
+                                workstream_id: WorkstreamId::new(),
+                                workstream_name: "default".into(),
+                                run_id: ManagedRunId::new(),
+                                resolved_agent: None,
+                                native_session_id: None,
+                                source_cursor: None,
+                                previous_native_session: None,
+                                sync_after: 0,
+                                sync_through: 0,
+                                may_adopt_existing_session: false,
+                                manifest_warning: None,
+                            })
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/cancel",
+                post({
+                    let cancelled = cancelled.clone();
+                    move || {
+                        let cancelled = cancelled.clone();
+                        async move {
+                            cancelled.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "AI_MEMORY_RUN_ID");
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run_autowire = false;
+        let mut args = run_args(RunHarnessChoice::Claude, script, Vec::new(), &["--version"]);
+        args.project = None;
+        args.project_id = Some(scope.project_id);
+        args.no_autowire = true;
+        assert_eq!(
+            run_from(&config, args.clone(), repo.path()).await.unwrap(),
+            0
+        );
+        args.project_id = None;
+        assert_eq!(
+            run_from(&config, args.clone(), repo.path()).await.unwrap(),
+            0
+        );
+        args.project = Some("override".into());
+        assert_eq!(
+            run_from(&config, args.clone(), repo.path()).await.unwrap(),
+            0
+        );
+        let before = std::fs::read_to_string(&captured).unwrap();
+        confirms.store(false, Ordering::SeqCst);
+        args.project = None;
+        args.project_id = Some(scope.project_id);
+        let error = run_from(&config, args, repo.path()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("did not confirm project-ID"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            before,
+            "old-server response must not start the child"
+        );
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for index in [0, 1, 3] {
+            assert_eq!(requests[index].project_id, Some(scope.project_id));
+            assert!(
+                requests[index].project.is_empty(),
+                "old servers must reject the selector before creation"
+            );
+            assert!(requests[index].repository_identity.is_none());
+        }
+        assert_eq!(requests[2].project, "override");
+        assert!(requests[2].project_id.is_none());
+        server.abort();
+    }
+
     fn launch_config(home: &Path, data: &Path, address: std::net::SocketAddr) -> Config {
         let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
         config.data_dir = data.to_path_buf();
@@ -9408,6 +12217,7 @@ mod tests {
         native_args: &[&str],
     ) -> RunArgs {
         RunArgs {
+            project_id: None,
             workspace: Some("ws".into()),
             project: Some("proj".into()),
             workstream: None,
@@ -9417,9 +12227,12 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: false,
+            no_exit_prompt: false,
             require_server: false,
             profile: None,
             env,
@@ -10124,6 +12937,7 @@ mod tests {
             "native\u{200b}tail",
         ] {
             let result = build_preflighted_launch_plan(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Codex,
                 None,
                 Vec::new(),
@@ -10141,6 +12955,7 @@ mod tests {
         }
         assert!(
             build_preflighted_launch_plan(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Claude,
                 None,
                 Vec::new(),
@@ -10154,6 +12969,7 @@ mod tests {
             "fresh mode must validate the original prepared identity before discarding it"
         );
         let (plan, _) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Claude,
             None,
             Vec::new(),
@@ -10297,6 +13113,71 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn abandoned_session_batches_do_not_finalize_the_followed_run() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let transcript = ExportedTranscript {
+            native_session_id: "abandoned".into(),
+            source_cursor: Some("must-not-advance".into()),
+            events: vec![ai_memory_core::NewWorkstreamEvent {
+                event_id: "abandoned-event".into(),
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "abandoned".into(),
+                source_record_id: None,
+                kind: ai_memory_core::WorkstreamEventKind::Message,
+                role: Some("user".into()),
+                content: "before clear".into(),
+                occurred_at: None,
+                metadata: serde_json::json!({}),
+            }],
+            losses: vec!["reported on the final transcript".into()],
+        };
+
+        assert_eq!(
+            import_incomplete_batches(
+                &endpoint,
+                "/workstream/runs/test",
+                transcript,
+                Default::default(),
+                &Sanitizer::builtin(),
+                &TranscriptCapture::for_checkout(home.path(), home.path()),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let request = &requests.lock().unwrap()[0];
+        assert_eq!(request.native_session_id.as_deref(), Some("abandoned"));
+        assert!(!request.complete);
+        assert!(request.source_cursor.is_none());
+        assert!(request.losses.is_empty());
+        assert!(request.exit_code.is_none());
+        server.abort();
+    }
+
     /// GHSA-gcpc-88hm-3xqr: the ledger upload applies the checkout's
     /// `[capture] ignore_paths`. An excluded read's call and output never reach
     /// the finish request (and so never a raw segment); a public read in the
@@ -10396,6 +13277,89 @@ mod tests {
             requests.lock().unwrap()[0].source_cursor.as_deref(),
             Some("cursor"),
             "the cursor still advances past the excluded events"
+        );
+    }
+
+    /// GHSA-h8wj-74hc-vjjp: the previous-session dossier the next harness reads
+    /// must carry no more than the ledger upload above would. The capture policy
+    /// drops an `ignore_paths` call with its result, and the sanitizer redacts a
+    /// credential in a kept result, before either reaches the rendered dossier.
+    #[test]
+    fn previous_session_dossier_carries_no_more_than_the_ledger() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let event = |kind, content: String, metadata: serde_json::Value| {
+            ai_memory_core::NewWorkstreamEvent {
+                event_id: format!("e-{}", content.len()),
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "sid-1".into(),
+                source_record_id: None,
+                kind,
+                role: None,
+                content,
+                occurred_at: None,
+                metadata,
+            }
+        };
+        let read = |path: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolCall,
+                format!(
+                    "Read: {}",
+                    serde_json::json!({"file_path": repo.path().join(path)})
+                ),
+                serde_json::json!({"tool": "Read", "tool_use_id": id}),
+            )
+        };
+        let output = |text: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolResult,
+                text.into(),
+                serde_json::json!({"tool_use_id": id}),
+            )
+        };
+        let transcript = ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                read("docs/adr/1.md", "adr"),
+                read("src/lib.rs", "pub"),
+                output("ADRSENTINEL private decision", "adr"),
+                // FAKE token shape, never a live value.
+                output(
+                    "PUBLICCONTROL token ghp_FAKEfakeFAKEfakeFAKEfake012345678",
+                    "pub",
+                ),
+            ],
+            losses: Vec::new(),
+        };
+        let filtered = sanitize_previous_session_history(
+            transcript,
+            &TranscriptCapture::for_checkout(repo.path(), repo.path()),
+            &Sanitizer::builtin(),
+        );
+        let dossier = render_previous_session_history(ManagedHarness::Claude, &filtered);
+        assert!(
+            dossier.contains("PUBLICCONTROL"),
+            "public control: {dossier}"
+        );
+        assert!(dossier.contains("src/lib.rs"), "public call: {dossier}");
+        assert!(
+            !dossier.contains("ADRSENTINEL"),
+            "excluded output: {dossier}"
+        );
+        assert!(!dossier.contains("docs/adr"), "excluded call: {dossier}");
+        assert!(
+            !dossier.contains("ghp_FAKEfakeFAKEfakeFAKEfake012345678"),
+            "unsanitized credential: {dossier}"
+        );
+        assert!(
+            dossier.contains("[REDACTED:github_token]"),
+            "redaction marker: {dossier}"
         );
     }
 
@@ -10652,6 +13616,7 @@ mod tests {
             );
             assert!(
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Codex,
                     home.path(),
@@ -10723,6 +13688,7 @@ mod tests {
                     "/workstream/runs",
                     post(|| async {
                         axum::Json(PrepareManagedRunResponse {
+                            resolved_project: None,
                             workstream_id: WorkstreamId::new(),
                             workstream_name: "default".into(),
                             run_id: ManagedRunId::new(),
@@ -10835,6 +13801,7 @@ mod tests {
                 build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
             plan.session_dir = None;
             let result = resolve_native_session_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 &plan,
                 ManagedHarness::Codex,
                 home.path(),

@@ -682,13 +682,13 @@ async fn s1_dedup_collapses_near_duplicate_cold_pages() {
     );
 }
 
-/// A5. Contradiction lint. Two cold semantic pages whose embeddings sit in the
-/// 0.4–0.75 cosine band produce ONE advisory `contradiction` finding naming
+/// A5. Similarity lint. Two cold semantic pages whose embeddings sit in the
+/// 0.4–0.75 cosine band produce ONE advisory `similarity_candidate` naming
 /// both — and nothing is deleted or superseded (advisory only, invariant #16).
 /// Embeddings are seeded as exact 2-D unit vectors so the similarity is pinned
 /// squarely inside the band.
 #[tokio::test]
-async fn s1_contradiction_lint_flags_band_pair_without_deleting() {
+async fn s1_similarity_lint_flags_band_pair_without_deleting() {
     const PROVIDER: &str = "test-embedder";
     const MODEL: &str = "unit-2d";
     let fx = seed_fixture(false).await;
@@ -738,19 +738,20 @@ async fn s1_contradiction_lint_flags_band_pair_without_deleting() {
     .await
     .unwrap();
 
-    let contradictions: Vec<_> = report
+    let candidates: Vec<_> = report
         .findings
         .iter()
-        .filter(|f| f.kind == "contradiction")
+        .filter(|f| f.kind == "similarity_candidate")
         .collect();
     assert_eq!(
-        contradictions.len(),
+        candidates.len(),
         1,
         "one band pair ⇒ one finding: {:?}",
         report.findings
     );
-    let f = contradictions[0];
-    assert_eq!(f.severity, "info", "contradiction findings are advisory");
+    let f = candidates[0];
+    assert_eq!(f.severity, "info", "similarity candidates are advisory");
+    assert!(!report.findings.iter().any(|f| f.kind == "contradiction"));
     assert!(f.pages.contains(&"concepts/old-claim.md".to_string()));
     assert!(f.pages.contains(&"concepts/new-claim.md".to_string()));
     assert_eq!(

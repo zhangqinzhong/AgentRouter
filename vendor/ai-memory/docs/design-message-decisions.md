@@ -361,7 +361,7 @@ control, and fails with its guard removed.
 ## 9. Alternatives
 
 - The convention-only route has no rule and no link.
-- A `memory_message_reply` tool is one more tool (the 25th, since
+- A `memory_message_reply` tool is one more tool (the 26th, since
   `release/3.1` added `memory_restore_page`) and a copy of the send path (Q7).
 - An answer on the question row needs a read of the decision project, which
   the asker cannot do.

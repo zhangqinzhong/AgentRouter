@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "answerable-server-port",
+      "question": "Which port does the ai-memory server use?",
+      "expected_verdict": "answerable",
+      "slice": "baseline",
+      "evidence": [
+        {
+          "path": "rules/server.md",
+          "snippet": "The ai-memory server listens on port 49374.",
+          "score": 0.92,
+          "belief_strength": 0.88
+        }
+      ],
+      "target_evidence": ["rules/server.md"],
+      "gold_answer": "49374"
+    },
+    {
+      "id": "unrelated-coffee-question",
+      "question": "Which coffee grinder does the user own?",
+      "expected_verdict": "unanswerable",
+      "slice": "unrelated",
+      "evidence": [
+        {
+          "path": "rules/server.md",
+          "snippet": "The ai-memory server listens on port 49374.",
+          "score": 0.04
+        }
+      ]
+    },
+    {
+      "id": "hard-negative-backup-schedule",
+      "question": "At what exact time does the nightly backup start?",
+      "expected_verdict": "unanswerable",
+      "slice": "hard_negative",
+      "evidence": [
+        {
+          "path": "operations/backups.md",
+          "snippet": "Nightly backups upload encrypted archives and retain seven daily copies. The schedule is managed by the home server.",
+          "score": 0.89,
+          "belief_strength": 0.91
+        },
+        {
+          "path": "operations/restore.md",
+          "snippet": "Use the newest nightly backup when testing restore procedures.",
+          "score": 0.73
+        }
+      ]
+    },
+    {
+      "id": "conflicting-timeout-values",
+      "question": "What request timeout is active?",
+      "expected_verdict": "conflicting",
+      "slice": "conflicting",
+      "evidence": [
+        {
+          "path": "decisions/timeout-old.md",
+          "snippet": "The active request timeout is 15 seconds.",
+          "score": 0.86,
+          "belief_strength": 0.65
+        },
+        {
+          "path": "decisions/timeout-new.md",
+          "snippet": "The active request timeout is 45 seconds.",
+          "score": 0.84,
+          "belief_strength": 0.65
+        }
+      ],
+      "target_evidence": [
+        "decisions/timeout-old.md",
+        "decisions/timeout-new.md"
+      ]
+    },
+    {
+      "id": "partial-host-and-port",
+      "question": "Which host and port does the remote server use?",
+      "expected_verdict": "partial",
+      "slice": "partial",
+      "evidence": [
+        {
+          "path": "rules/server.md",
+          "snippet": "The remote server uses port 49374. Its hostname is not recorded here.",
+          "score": 0.82
+        }
+      ],
+      "target_evidence": ["rules/server.md"]
+    },
+    {
+      "id": "answerable-with-vector-channel-missing",
+      "question": "Which database stores the derived memory index?",
+      "expected_verdict": "answerable",
+      "slice": "missing_channel",
+      "channels": {"fts": true, "vector": false},
+      "evidence": [
+        {
+          "path": "architecture/storage.md",
+          "snippet": "SQLite stores the derived memory index; Markdown in git remains the source of truth.",
+          "score": 0.77,
+          "belief_strength": 0.94
+        }
+      ],
+      "target_evidence": ["architecture/storage.md"],
+      "gold_answer": "SQLite"
+    }
+  ]
+}

@@ -1,8 +1,6 @@
-# The web UI and `/api/v1` are read-only by design (docs/frontend-api.md §10).
-# `WebState` holds a `Wiki`, which can write, so the lint keeps every mutating
-# entry point out of this crate. Writes go through MCP tools or `/admin/*`,
-# where admission, attribution and the audit trail apply. The integration
-# tests seed fixtures through these methods and carry an `allow`.
+# Wiki browsing and /api/v1 stay read-only. The inbox composer is the explicit
+# exception: Wiki::send_agent_message scrubs, admits, attributes and queues mail.
+# It cannot write pages or expose the raw writer; these methods stay forbidden.
 disallowed-methods = [
     { path = "ai_memory_wiki::Wiki::write_page", reason = "the web surface is read-only" },
     { path = "ai_memory_wiki::Wiki::write_page_if", reason = "the web surface is read-only" },

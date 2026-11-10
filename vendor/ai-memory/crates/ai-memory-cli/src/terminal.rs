@@ -7,14 +7,22 @@ use crossterm::style::{Color, Stylize as _};
 
 use crate::config::RuntimeEnv;
 
+/// Whether output to a stream should be colored: it is a terminal, `NO_COLOR`
+/// is unset, and `TERM` is not `dumb`.
+pub(crate) fn color_enabled(tty: bool, env: &RuntimeEnv) -> bool {
+    tty && env.var_os("NO_COLOR").is_none() && env.var_os("TERM").is_none_or(|term| term != "dumb")
+}
+
 pub(crate) struct Terminal {
+    pub(crate) i18n: ai_memory_core::i18n::Localizer,
     color: bool,
     columns: usize,
 }
 
 impl Terminal {
-    pub(crate) fn stdout(env: &RuntimeEnv) -> Self {
+    pub(crate) fn stdout(env: &RuntimeEnv, i18n: &ai_memory_core::i18n::Localizer) -> Self {
         Self {
+            i18n: i18n.clone(),
             columns: crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns)),
             ..Self::new(std::io::stdout().is_terminal(), env)
         }
@@ -22,10 +30,9 @@ impl Terminal {
 
     fn new(tty: bool, env: &RuntimeEnv) -> Self {
         Self {
+            i18n: ai_memory_core::i18n::Localizer::default(),
             columns: 80,
-            color: tty
-                && env.var_os("NO_COLOR").is_none()
-                && env.var_os("TERM").is_none_or(|term| term != "dumb"),
+            color: color_enabled(tty, env),
         }
     }
 
@@ -148,6 +155,7 @@ mod tests {
     #[test]
     fn interactive_margins_and_wrapping_keep_words_and_nested_indentation() {
         let terminal = Terminal {
+            i18n: ai_memory_core::i18n::Localizer::default(),
             color: true,
             columns: 48,
         };

@@ -33,7 +33,7 @@ takes two commands, and neither needs root or administrator rights.
    `<self>` is one of `claude-code`, `codex`, `opencode`, `opencode2`,
    `gemini-cli`, `cursor`, `kimi-code`, `kiro-cli`, `grok`, `copilot-cli`,
    `antigravity-cli`, `command-code`, `devin`, `droid`, `muse`, `omp`, `pi`,
-   `openclaw`, `qwen-code`
+   `openclaw`, `qwen-code`, `qoder`
    (`ai-memory setup --help` lists every value). Repeat `--agent` to wire
    several harnesses. Without `--agent`, `setup` wires every harness it finds
    under the home directory.

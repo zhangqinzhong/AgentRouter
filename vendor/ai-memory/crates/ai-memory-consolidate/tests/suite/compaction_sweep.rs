@@ -150,6 +150,151 @@ fn superseded_bodies(fx: &Fixture, path: &str) -> Vec<String> {
 
 const COLD_DAYS: i64 = 400;
 
+#[tokio::test]
+async fn compaction_does_not_supersede_a_concurrent_fresh_write() {
+    use ai_memory_wiki::{AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig};
+    use std::io::{Read, Write};
+
+    let fx = seed_fixture().await;
+    let path = "sessions/concurrent.md";
+    write(
+        &fx,
+        path,
+        "Old session",
+        Tier::Episodic,
+        false,
+        "Old session body that the sweep is allowed to compact.",
+    )
+    .await;
+    backdate_latest(&fx, path, COLD_DAYS);
+
+    // Pause admission after A2 derived its replacement but before the batch
+    // obtains the page lock. Channels make the interleaving deterministic.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0);
+            bytes.extend_from_slice(&buf[..read]);
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).to_lowercase();
+        let length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        while bytes.len() < header_end + length {
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0);
+            bytes.extend_from_slice(&buf[..read]);
+        }
+        started_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let sweep_wiki = fx.wiki.clone().with_admission_chain(
+        AdmissionChain::new(vec![WebhookConfig {
+            name: "pause-stale-compaction".into(),
+            url,
+            timeout_ms: 2_000,
+            failure_policy: FailurePolicy::Reject,
+            events: vec![AdmissionOp::WritePage],
+            blocking: true,
+        }])
+        .unwrap(),
+    );
+    let params = DecayParams::default();
+    let sweep = run_sweep_with_compaction(
+        &fx.store.reader,
+        &fx.store.writer,
+        Some(&sweep_wiki),
+        fx.ws,
+        fx.proj,
+        &params,
+        0.0,
+        ObservationRetention::default(),
+        true,
+        false,
+    );
+    let fresh_body = "New user correction: this information is current and must remain latest.";
+    let update = async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let fresh_id = write(
+            &fx,
+            path,
+            "Fresh correction",
+            Tier::Semantic,
+            true,
+            fresh_body,
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        fresh_id
+    };
+    let (report, fresh_id) = tokio::join!(sweep, update);
+    server.join().unwrap();
+    let report = report.unwrap();
+    let (marker, latest_body) = latest_marker_and_body(&fx, path);
+    let conn = rusqlite::Connection::open(fx.tmp.path().join("db/memory.sqlite")).unwrap();
+    let metadata: (String, bool) = conn
+        .query_row(
+            "SELECT tier, pinned FROM pages WHERE workspace_id = ?1 \
+             AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![fx.ws.as_bytes(), fx.proj.as_bytes(), path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let disk = fx
+        .wiki
+        .read_page(fx.ws, fx.proj, &PagePath::new(path).unwrap())
+        .unwrap();
+
+    assert_eq!(disk.body, latest_body, "file and DB should still agree");
+    assert_eq!(latest_body, fresh_body);
+    assert_eq!(metadata, ("semantic".to_string(), true));
+    assert!(marker.is_none());
+    assert_eq!(
+        report.compacted.len(),
+        1,
+        "the selected page remains visible as a skipped compaction"
+    );
+    assert!(!report.compacted[0].compacted);
+    assert_eq!(report.compacted[0].new_id, None);
+    assert_eq!(
+        fx.store
+            .reader
+            .latest_page_id_by_ids(fx.ws, fx.proj, path.to_string())
+            .await
+            .unwrap(),
+        Some(fresh_id)
+    );
+    assert_eq!(
+        superseded_bodies(&fx, path),
+        vec!["Old session body that the sweep is allowed to compact."]
+    );
+}
+
 /// Test 1: with the flag OFF the sweep evicts a cold episodic page exactly as it
 /// always has — no compaction, no upgrade surprise.
 #[tokio::test]

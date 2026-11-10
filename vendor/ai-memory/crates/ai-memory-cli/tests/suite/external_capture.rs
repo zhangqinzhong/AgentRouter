@@ -260,6 +260,81 @@ fn external_capture_still_delivers_the_compaction_recap() {
     }
 }
 
+/// The subagent brief is context delivery too: under an external capture
+/// owner, a repository that opted into `[briefing] inject_on_subagent_start`
+/// still hands the subagent its brief, and the event itself is
+/// left to the owner.
+#[test]
+fn external_capture_still_delivers_the_subagent_brief() {
+    const BRIEF: &str = "SUBAGENT_BRIEF_SENTINEL";
+    let guard = tempfile::tempdir().unwrap();
+    let root = guard.path().to_path_buf();
+    std::fs::write(
+        root.join(".ai-memory.toml"),
+        "[briefing]\ninject_on_subagent_start = true\n",
+    )
+    .unwrap();
+    let (server, stop, served) = serve_one_request(BRIEF);
+
+    let mut child = hermetic(BIN)
+        .args(["--data-dir"])
+        .arg(root.join("data"))
+        .args([
+            "hook",
+            "--agent",
+            "claude-code",
+            "--event",
+            "subagent-start",
+            "--server-url",
+            &server,
+        ])
+        .env("AI_MEMORY_HOME", &root)
+        .env("HOME", &root)
+        .env("AI_MEMORY_CAPTURE_OWNER", "example.runtime")
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({
+                "session_id": "external-subagent-test",
+                "cwd": root,
+                "hook_event_name": "SubagentStart",
+                "agent_id": "agent-1",
+                "agent_type": "Explore"
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    stop.store(true, Ordering::SeqCst);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let request = served
+        .join()
+        .unwrap()
+        .unwrap_or_else(|| panic!("the brief GET never reached the server; stdout was {stdout:?}"));
+    assert!(request.starts_with("GET /brief?"), "{request}");
+    let envelope: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        envelope["hookSpecificOutput"]["hookEventName"],
+        "SubagentStart"
+    );
+    assert_eq!(envelope["hookSpecificOutput"]["additionalContext"], BRIEF);
+    let spooled = std::fs::read_dir(root.join("data/hook-spool"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(spooled, 0, "the event must be left to its capture owner");
+}
+
 mod slow {
     use super::*;
     use std::process::Command;
@@ -507,8 +582,14 @@ mod slow {
         );
     }
 
+    /// Under external capture the owner's own runs share the project with the
+    /// captured harness, so a pending handoff is *offered*, never consumed: the
+    /// start announces the baton by id with `memory_handoff_accept` and leaves
+    /// it open for an explicit claim, rather than delivering (and consuming) its
+    /// body as a claim would. Native capture stays suppressed and MCP recall
+    /// still finds the seeded content (#2148).
     #[tokio::test]
-    async fn external_capture_preserves_native_handoffs_and_mcp_recall() {
+    async fn external_capture_offers_handoffs_without_consuming_them_and_keeps_mcp_recall() {
         let fixture = Fixture::start().await;
         for (agent, event) in [
             ("claude-code", "session-start"),
@@ -516,19 +597,27 @@ mod slow {
         ] {
             fixture.seed_handoff().await;
             let receiver = SessionId::new();
-            let output = fixture.native(receiver, agent, event);
-            assert!(output.contains(MARKER), "handoff was lost: {output}");
+            let offered = fixture.native(receiver, agent, event);
+            assert!(
+                offered.contains("memory_handoff_accept") && !offered.contains(MARKER),
+                "external capture must offer the baton, not deliver its body: {offered}"
+            );
             assert!(
                 fixture
                     .reader
                     .observations_for_session(receiver)
                     .await
                     .unwrap()
-                    .is_empty()
+                    .is_empty(),
+                "external capture must still suppress native capture"
             );
+            // Offer mode never consumes the baton: a fresh start still sees it.
+            let next = SessionId::new();
             assert!(
-                !fixture.native(receiver, agent, event).contains(MARKER),
-                "handoff was delivered twice"
+                fixture
+                    .native(next, agent, event)
+                    .contains("memory_handoff_accept"),
+                "an offered handoff must stay open for the next start"
             );
             fixture.native(receiver, agent, "session-end");
             assert!(!fixture.root.as_path().join("data/hook-spool").exists());
@@ -657,16 +746,35 @@ mod slow {
     async fn post_batch_until_accepted(client: &reqwest::Client, endpoint: &str, items: &[Value]) {
         let mut pending = items.to_vec();
         let mut ack = Value::Null;
-        for attempt in 0..10u64 {
-            let response = client
+        for attempt in 0..20u64 {
+            // A shared server saturated by every session draining at once can
+            // take longer than the client request timeout to answer a single
+            // batch. The real spool drain treats a transient timeout as a
+            // retryable attempt and resends, so model the same bounded backoff
+            // here instead of failing the whole batch on one slow response.
+            let response = match client
                 .post(endpoint)
                 .bearer_auth(TOKEN)
                 .json(&pending)
                 .send()
                 .await
-                .unwrap();
+            {
+                Ok(response) => response,
+                Err(err) if err.is_timeout() => {
+                    tokio::time::sleep(Duration::from_millis(20 * (attempt + 1))).await;
+                    continue;
+                }
+                Err(err) => panic!("unexpected transport error posting batch: {err}"),
+            };
             let status = response.status();
-            ack = response.json().await.unwrap();
+            ack = match response.json().await {
+                Ok(ack) => ack,
+                Err(err) if err.is_timeout() => {
+                    tokio::time::sleep(Duration::from_millis(20 * (attempt + 1))).await;
+                    continue;
+                }
+                Err(err) => panic!("unexpected error reading batch response: {err}"),
+            };
             assert!(
                 status.is_success() || status == reqwest::StatusCode::TOO_MANY_REQUESTS,
                 "{status} {ack}"
@@ -689,7 +797,7 @@ mod slow {
                 .collect();
             tokio::time::sleep(Duration::from_millis(20 * (attempt + 1))).await;
         }
-        panic!("batch never fully accepted after 10 attempts: {ack}");
+        panic!("batch never fully accepted after 20 attempts: {ack}");
     }
 
     #[tokio::test]

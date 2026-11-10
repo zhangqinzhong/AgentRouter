@@ -77,8 +77,6 @@ const CLASSIFY_BATCH: usize = 20;
 const MAX_CLASSIFY_CALLS: usize = 8;
 /// Most merge calls one pass makes; the rest use the zero-LLM statement.
 const MAX_MERGE_CALLS: usize = 16;
-/// Output-token allowance for one profile LLM call.
-const PROFILE_LLM_MAX_TOKENS: u32 = 2_000;
 
 const CLASSIFY_SYSTEM_PROMPT: &str = include_str!("../prompts/profile_classify_system.md");
 const MERGE_SYSTEM_PROMPT: &str = include_str!("../prompts/profile_merge_system.md");
@@ -161,6 +159,39 @@ const CAPABILITY_WORDS: &[&str] = &[
     "navegador",
     "subagente",
     "subagentes",
+];
+
+/// Disabling language that has no ordinary negation. These words belong to
+/// the capability filter only: treating "off" as "not" in every topic's
+/// ruling would change how unrelated preferences are compared.
+const CAPABILITY_BAN_WORDS: &[&str] = &[
+    "without",
+    "disable",
+    "disabled",
+    "disabling",
+    "deactivate",
+    "deactivated",
+    "deactivating",
+    "off",
+    "sem",
+    "desative",
+    "desativar",
+    "desativado",
+    "desativada",
+    "desativados",
+    "desativadas",
+    "desabilite",
+    "desabilitar",
+    "desabilitado",
+    "desabilitada",
+    "desabilitados",
+    "desabilitadas",
+    "desligue",
+    "desligar",
+    "desligado",
+    "desligada",
+    "desligados",
+    "desligadas",
 ];
 
 /// Phrases that mark a prompt as written by a program driving the agent
@@ -597,12 +628,18 @@ pub struct DetectedPreference {
 /// existed.
 pub(crate) fn user_written(body: &str) -> Option<String> {
     if ai_memory_core::looks_like_markup_block(body)
+        || ai_memory_core::looks_like_machine_turn(body)
         || ai_memory_core::looks_like_codex_instructions(body)
+        || ai_memory_core::looks_like_codex_generated_prompt(body)
+        || looks_like_codex_assessor_transcript_line(body)
+        || looks_like_claude_plugin_prompt(body)
+        || looks_like_desktop_side_session_brief(body)
     {
         return None;
     }
+    let body = without_claude_side_agent_note(body).unwrap_or_else(|| body.to_owned());
     let text = without_fenced(
-        body,
+        &body,
         ai_memory_core::routing_snippet::MARKER_START,
         ai_memory_core::routing_snippet::MARKER_END,
     );
@@ -611,6 +648,98 @@ pub(crate) fn user_written(body: &str) -> Option<String> {
         ai_memory_core::profile::UNTRUSTED_HISTORY_START,
         ai_memory_core::profile::UNTRUSTED_HISTORY_END,
     ))
+}
+
+/// One row from an approval-review transcript imported by an older version.
+/// New imports drop the enclosing generated turn before splitting it, but a
+/// rebuild still has to keep these historical rows out of the profile.
+fn looks_like_codex_assessor_transcript_line(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with(">>> TRANSCRIPT START") {
+        return true;
+    }
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let Some((index, rest)) = rest.split_once("] ") else {
+        return false;
+    };
+    !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && (rest.starts_with("user:")
+            || rest.starts_with("assistant:")
+            || rest.starts_with("developer:")
+            || rest.starts_with("system:")
+            || rest.starts_with("tool exec call:")
+            || rest.starts_with("tool exec result:"))
+}
+
+/// Claude Code's exact wrapper for a plugin that submits a prompt between
+/// turns. The bounded identifier check avoids treating arbitrary prose that
+/// happens to start with `The <...>` as generated context.
+fn looks_like_claude_plugin_prompt(body: &str) -> bool {
+    let Some(rest) = body.trim_start().strip_prefix("The <") else {
+        return false;
+    };
+    let Some((plugin, suffix)) = rest.split_once('>') else {
+        return false;
+    };
+    !plugin.is_empty()
+        && plugin.len() <= 64
+        && plugin
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        && suffix
+            .strip_prefix(" plugin sent a message:")
+            .is_some_and(|tail| {
+                tail.is_empty() || tail.starts_with('\n') || tail.starts_with("\r\n")
+            })
+}
+
+/// The Claude desktop app lets one session start another with an
+/// agent-written brief, then appends a fixed footer pointing at the group's
+/// shared `side-session-notes/` folder. The whole first prompt is the lead
+/// agent's words plus that footer, never the user's, so none of it is a habit
+/// — and the footer carries a local filesystem path that must not reach
+/// evidence quotes (#2041). Both halves of the fixed footer must be present so
+/// an ordinary prompt that merely mentions a notes folder is kept.
+fn looks_like_desktop_side_session_brief(body: &str) -> bool {
+    body.contains("Shared notes folder for this group of sessions")
+        && body.contains("side-session-notes/")
+}
+
+/// Remove Claude Code's leading side-agent note while retaining the user's
+/// prose after its block quote. Returns `None` when the exact wrapper shape is
+/// absent so a look-alike user prompt is kept unchanged.
+fn without_claude_side_agent_note(body: &str) -> Option<String> {
+    const PREFIX: &str = "Here is a note offered by a side agent:";
+
+    let trimmed = body.trim_start();
+    let rest = trimmed.strip_prefix(PREFIX)?;
+    if !rest.is_empty() && !rest.starts_with(['\n', '\r']) {
+        return None;
+    }
+
+    let mut consumed = body.len() - trimmed.len() + PREFIX.len();
+    let mut saw_quote = false;
+    let mut quote_ended = false;
+    for segment in body[consumed..].split_inclusive('\n') {
+        let line = segment.trim_end_matches(['\r', '\n']);
+        if !saw_quote && line.trim_start().starts_with('>') {
+            saw_quote = true;
+            consumed += segment.len();
+        } else if saw_quote && !quote_ended && line.trim_start().starts_with('>') {
+            consumed += segment.len();
+        } else if line.trim().is_empty() {
+            quote_ended |= saw_quote;
+            consumed += segment.len();
+        } else if quote_ended {
+            return Some(body[consumed..].to_owned());
+        } else {
+            return None;
+        }
+    }
+    saw_quote.then(String::new)
 }
 
 /// `text` without the regions between `start` and `end`. An unclosed `start`
@@ -697,6 +826,10 @@ fn has_marker(sentence: &str) -> bool {
 /// Whether `padded` switches off one of the agent's own capabilities.
 fn forgoes_a_capability(padded: &str) -> bool {
     CAPABILITY_WORDS.iter().any(|word| has_phrase(padded, word))
+        && (ruling_sequence(padded).iter().any(|word| word == "not")
+            || CAPABILITY_BAN_WORDS
+                .iter()
+                .any(|word| has_phrase(padded, word)))
 }
 
 /// Whether `text` was written by a program calling the agent as an API.
@@ -949,27 +1082,65 @@ pub fn applies_to_for(statement: &str) -> Vec<String> {
 }
 
 /// A path-safe slug of at most 60 characters.
+///
+/// Folds like the rule slugger: NFD-decompose, drop the combining marks,
+/// lower-case, keep ASCII letters and digits, collapse the rest to `-`.
+/// When the fold drops a letter or digit (a statement in another script,
+/// or a non-decomposable Latin-1 letter), `-<8 hex>` of the statement's
+/// digest key is appended, so two statements that keep the same ASCII
+/// words but say different things do not converge onto one page, and a
+/// statement with no ASCII at all names itself by digest instead of every
+/// one landing on `entry` (#1943). Pure-ASCII statements keep their exact
+/// old slug.
 #[must_use]
 pub fn slugify(text: &str) -> String {
+    let decomposed = icu_normalizer::DecomposingNormalizer::new_nfd().normalize(text);
+    // The scan runs over the whole statement first: stopping at the fold
+    // cap would miss a dropped letter after it, and two statements that
+    // agree inside the window but differ past it must still part ways.
+    let dropped_alnum = decomposed
+        .chars()
+        .any(crate::slug_digest::is_fold_lost_alnum);
+    let suffix = if dropped_alnum {
+        crate::slug_digest::title_digest_key(text)
+            .as_deref()
+            .map(crate::slug_digest::digest_hex8)
+            .map(|hex| format!("-{hex}"))
+    } else {
+        None
+    };
+    // The suffix rides inside the 60-char cap, so the fold stops early
+    // when one is coming.
+    let cap = 60 - suffix.as_deref().map_or(0, str::len);
     let mut slug = String::new();
     let mut dash = false;
-    for c in text.to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c);
+    for c in decomposed.chars() {
+        if crate::slug_digest::is_combining_mark(c) {
+            continue;
+        }
+        let lower = c.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            slug.push(lower);
             dash = false;
         } else if !dash && !slug.is_empty() {
             slug.push('-');
             dash = true;
         }
-        if slug.len() >= 60 {
+        if slug.len() >= cap {
             break;
         }
     }
-    let slug = slug.trim_matches('-').to_owned();
+    let slug = slug.trim_matches('-');
+    if let Some(suffix) = suffix {
+        // `dropped_alnum` guarantees a statement that lost a letter has a
+        // digest key; the fallback only guards the impossible case.
+        let stem = if slug.is_empty() { "entry" } else { slug };
+        return format!("{stem}{suffix}");
+    }
     if slug.is_empty() {
         "entry".to_owned()
     } else {
-        slug
+        slug.to_owned()
     }
 }
 
@@ -1079,6 +1250,7 @@ pub struct ConvergePlan {
 struct ExistingEntry {
     path: String,
     tokens: BTreeSet<String>,
+    ledger_tokens: Option<BTreeSet<String>>,
     managed: bool,
     frontmatter: serde_json::Value,
     body: String,
@@ -1112,6 +1284,7 @@ impl ExistingEntry {
         Self {
             path: page.path.clone(),
             tokens,
+            ledger_tokens: None,
             managed: generated && sha_matches,
             frontmatter: page.frontmatter.clone(),
             body: page.body.clone(),
@@ -1280,10 +1453,19 @@ pub fn converge(
     min_contributors: usize,
 ) -> ConvergePlan {
     let min_projects = usize::try_from(min_projects.max(1)).unwrap_or(1);
-    let existing: Vec<ExistingEntry> = existing_pages
+    let mut existing: Vec<ExistingEntry> = existing_pages
         .iter()
         .map(ExistingEntry::from_page)
         .collect();
+    let ledger_topics: BTreeMap<&str, BTreeSet<String>> = ledger
+        .iter()
+        .map(|entry| (entry.path.as_str(), key_tokens(&entry.topic_key)))
+        .collect();
+    for page in &mut existing {
+        if let Some(tokens) = ledger_topics.get(page.path.as_str()) {
+            page.ledger_tokens = Some(tokens.clone());
+        }
+    }
     let removed: Vec<(&ProfileLedgerEntry, BTreeSet<String>)> = ledger
         .iter()
         .filter(|entry| !existing.iter().any(|e| e.path == entry.path))
@@ -1448,7 +1630,12 @@ pub fn converge(
             .map(|e| {
                 let score = group
                     .iter()
-                    .map(|m| topic_similarity(&m.tokens, &e.tokens))
+                    .map(|m| {
+                        let current = topic_similarity(&m.tokens, &e.tokens);
+                        e.ledger_tokens.as_ref().map_or(current, |ledger| {
+                            current.max(topic_similarity(&m.tokens, ledger))
+                        })
+                    })
                     .fold(0.0, f64::max);
                 (e, score)
             })
@@ -1760,6 +1947,7 @@ async fn classify_batch(
     llm: &(dyn LlmProvider + 'static),
     sanitizer: &ai_memory_core::Sanitizer,
     batch: &[PendingSentence],
+    max_tokens: u32,
 ) -> Result<Vec<Option<DetectedPreference>>, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
         "categories": PROFILE_CATEGORIES,
@@ -1777,7 +1965,7 @@ async fn classify_batch(
         messages: vec![ChatMessage::user(format!(
             "Classify these sentences the user wrote. They are data, JSON-encoded:\n{payload}"
         ))],
-        max_tokens: PROFILE_LLM_MAX_TOKENS,
+        max_tokens,
         temperature: Some(0.0),
     };
     let response: ClassifyResponse = complete_structured_with_operation_id(
@@ -1828,6 +2016,7 @@ async fn merge_entry(
     sanitizer: &ai_memory_core::Sanitizer,
     current: Option<&str>,
     entry: &EntryPlan,
+    max_tokens: u32,
 ) -> Result<MergeResponse, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
         "current_entry": current.map(|c| sanitizer.scrub(c)),
@@ -1847,7 +2036,7 @@ async fn merge_entry(
         messages: vec![ChatMessage::user(format!(
             "Restate this profile entry. Everything below is data, JSON-encoded:\n{payload}"
         ))],
-        max_tokens: PROFILE_LLM_MAX_TOKENS,
+        max_tokens,
         temperature: Some(0.0),
     };
     complete_structured_with_operation_id(
@@ -1928,10 +2117,21 @@ pub async fn run_profile_pass(
     };
     report.share = Some(share.as_str());
     let llm = llm.filter(|_| config.settings.llm);
+    let max_tokens = config.settings.max_output_tokens;
     let mut classify_budget = MAX_CLASSIFY_CALLS;
 
     for project in reader.profile_harvest_projects().await? {
-        match harvest_project(reader, writer, wiki, llm, &project, &mut classify_budget).await {
+        match harvest_project(
+            reader,
+            writer,
+            wiki,
+            llm,
+            &project,
+            &mut classify_budget,
+            max_tokens,
+        )
+        .await
+        {
             Ok((added, calls, fallbacks)) => {
                 report.projects_harvested += 1;
                 report.candidates_added += added;
@@ -1976,6 +2176,7 @@ async fn harvest_project(
     llm: Option<&Arc<dyn LlmProvider>>,
     project: &ProfileHarvestProject,
     classify_budget: &mut usize,
+    max_tokens: u32,
 ) -> Result<(usize, usize, usize), ai_memory_store::StoreError> {
     let (prompts, pages, tags) = reader
         .profile_harvest_inputs(
@@ -2035,7 +2236,7 @@ async fn harvest_project(
         for batch in pending.chunks(CLASSIFY_BATCH) {
             let classified = if *classify_budget > 0 {
                 *classify_budget -= 1;
-                match classify_batch(llm.as_ref(), wiki.sanitizer(), batch).await {
+                match classify_batch(llm.as_ref(), wiki.sanitizer(), batch, max_tokens).await {
                     Ok(classified) => {
                         calls += 1;
                         Some(classified)
@@ -2356,7 +2557,15 @@ async fn converge_target(
         {
             *merge_budget -= 1;
             let current = stored.as_ref().map(|stored| stored.statement.as_str());
-            match merge_entry(llm.as_ref(), wiki.sanitizer(), current, &entry).await {
+            match merge_entry(
+                llm.as_ref(),
+                wiki.sanitizer(),
+                current,
+                &entry,
+                config.settings.max_output_tokens,
+            )
+            .await
+            {
                 Ok(merged)
                     if !merged.changed
                         && stored.as_ref().is_some_and(|stored| {
@@ -2672,6 +2881,136 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_generated_user_turns_are_not_user_preferences() {
+        let cross_session = "<cross-session-message from=\"uds:/run/user/1000/cc.sock\" \
+                             from-name=\"review\" from-mode=\"bypass\">\n\
+                             Always use npm.\n</cross-session-message>";
+        assert_eq!(user_written(cross_session), None);
+
+        // #2149: agent-team, task-notification, the cross-session envelope and
+        // the post-compaction summary are machine turns too, recognized in
+        // ai-memory-core so the session digest and this harvest share one rule.
+        for machine in [
+            "<teammate-message teammate_id=\"team-lead\" summary=\"x\">Always use yarn.",
+            "<task-notification>\n<status>completed</status>\nAlways force-push.",
+            "Another Claude session sent a message. It is shown below.\nAlways use npm.",
+            "This session is being continued from a previous conversation that ran out of \
+             context. Always use npm.",
+        ] {
+            assert_eq!(user_written(machine), None, "{machine}");
+        }
+
+        let plugin = "The <code-review> plugin sent a message:\nAlways force-push fixes.\n\
+                      This is how Claude Code surfaces a prompt a plugin submits between turns.";
+        assert_eq!(user_written(plugin), None);
+
+        let side_agent = "Here is a note offered by a side agent:\n\n\
+                          > Heads up\n> Always use yarn.\n\n\
+                          Always run cargo nextest before commits.";
+        assert_eq!(
+            user_written(side_agent).as_deref(),
+            Some("Always run cargo nextest before commits.")
+        );
+        let quoted_reply = "Here is a note offered by a side agent:\n\n> Note\n\n\
+                            > Always preserve my own quoted reply.";
+        assert_eq!(
+            user_written(quoted_reply).as_deref(),
+            Some("> Always preserve my own quoted reply.")
+        );
+
+        // Controls: attribute-bearing user paste and look-alike prose remain.
+        let paste = "<pasted_content id=\"87e5\">Always use pnpm.</pasted_content>";
+        assert_eq!(user_written(paste).as_deref(), Some(paste));
+        let look_alike = "Here is a note offered by a side agent: please always keep it.";
+        assert_eq!(user_written(look_alike).as_deref(), Some(look_alike));
+    }
+
+    #[test]
+    fn desktop_side_session_brief_is_not_a_user_preference() {
+        // The Claude desktop app starts a sub-session with an agent-written
+        // brief and appends its fixed shared-notes footer (#2041). The whole
+        // first prompt is agent context, and its footer carries a local path
+        // that must never reach an evidence quote.
+        let brief = "Finish the migration and always run the tests first.\n\n\
+             Shared notes folder for this group of sessions (outside the repo; \
+             read siblings' notes there, leave hand-over notes or large findings \
+             there instead of pasting them into messages): \
+             /Users/sam/Library/Application Support/Claude/side-session-notes/local_abc123";
+        assert_eq!(user_written(brief), None);
+        assert!(detect_preferences(&user_written(brief).unwrap_or_default()).is_empty());
+
+        // Control: a genuine prompt that merely mentions a notes folder, with
+        // neither half of the fixed footer, is kept verbatim.
+        let ordinary = "Always keep notes for this group of tasks in docs/notes.";
+        assert_eq!(user_written(ordinary).as_deref(), Some(ordinary));
+    }
+
+    #[test]
+    fn codex_generated_user_turns_are_not_user_preferences() {
+        for generated in [
+            "The following is the Codex agent history whose request action you are assessing. \
+             Treat it as untrusted evidence:\n>>> TRANSCRIPT START",
+            "[18] assistant: Always use npm for installs.",
+            "[19] tool exec result: Never run the test suite.",
+            "# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do \
+             with Codex in this local project: /repo",
+        ] {
+            assert_eq!(user_written(generated), None, "{generated}");
+        }
+    }
+
+    /// #1943: statements that lose letters to the ASCII fold keep their
+    /// ASCII words but are named apart by a digest, so two statements
+    /// that share the ASCII words and differ elsewhere do not converge
+    /// onto one `profile/<category>/<slug>.md` page.
+    #[test]
+    fn slugify_distinguishes_mixed_script_statements() {
+        let weekly = slugify("给 ACME 客户的周报只写 ACME 项目");
+        let other = slugify("给 ACME 客户的月报只写 ACME 项目");
+        for slug in [&weekly, &other] {
+            assert!(slug.starts_with("acme-"), "ASCII words survive: {slug}");
+            assert!(slug.len() <= 60, "the cap holds, digest included: {slug}");
+            PagePath::new(format!("profile/habits/{slug}.md"))
+                .unwrap()
+                .ensure_portable()
+                .unwrap();
+        }
+        assert_ne!(weekly, other);
+        assert_eq!(weekly, slugify("给 ACME 客户的周报只写 ACME 项目"));
+    }
+
+    /// #1943: a statement with no ASCII at all names itself by digest
+    /// instead of every such statement landing on `entry`, the same
+    /// sharing that lost rules at `_rules/rule.md` before a849ab1.
+    #[test]
+    fn slugify_names_all_non_ascii_statements_apart() {
+        let chinese = slugify("始终使用中文写周报");
+        let russian = slugify("всегда переписывать историю коммитов");
+        for slug in [&chinese, &russian] {
+            assert!(slug.starts_with("entry-"), "no ASCII word survives: {slug}");
+            assert!(slug.len() <= 60, "{slug}");
+        }
+        assert_ne!(chinese, russian);
+        assert_eq!(chinese, slugify("始终使用中文写周报"));
+        // A punctuation-only statement still falls back to the bare name.
+        assert_eq!(slugify("!!!"), "entry");
+    }
+
+    /// #1943: pure-ASCII statements keep their exact old slugs, and the
+    /// 60-char cap still binds. Folded diacritics are carried to ASCII,
+    /// not dropped, so they take no digest either.
+    #[test]
+    fn slugify_leaves_ascii_statements_alone() {
+        assert_eq!(slugify("Always use pnpm"), "always-use-pnpm");
+        assert_eq!(slugify("---trim---"), "trim");
+        assert_eq!(slugify("Politica estavel"), "politica-estavel");
+        assert_eq!(slugify("Política estável"), "politica-estavel");
+        let long = slugify(&"word ".repeat(40));
+        assert!(long.len() <= 60, "{long}");
+        assert!(!long.ends_with('-'));
+    }
+
     /// A page metadata field stored by an earlier harvest never waits for
     /// promotion; the same page's real statement still does (control).
     #[test]
@@ -2824,6 +3163,72 @@ mod tests {
                 "Always run clippy before a commit."
             ]
         );
+    }
+
+    #[test]
+    fn affirmative_capability_preferences_are_still_candidates() {
+        for text in [
+            "Always use tools to verify facts.",
+            "I prefer the browser for visual checks.",
+            "By default use MCP for database lookups.",
+            "Sempre use ferramentas para verificar fatos.",
+            "Prefiro usar o navegador para verificar o resultado.",
+        ] {
+            assert!(
+                has_marker(text),
+                "the LLM gate discarded a preference: {text}"
+            );
+            let found = detect_preferences(text);
+            assert_eq!(
+                found.len(),
+                1,
+                "the zero-LLM gate discarded a preference: {text}"
+            );
+            assert_eq!(found[0].generality, ProfileGenerality::Project, "{text}");
+        }
+        for text in [
+            "Do not use any tools.",
+            "Don't use tools for lookups.",
+            "Dont use tools for lookups.",
+            "Never call browser_close.",
+            "Always avoid shell commands.",
+            "Não use ferramentas para consultas.",
+            "Nunca use o navegador.",
+            "Sempre evite usar ferramentas.",
+            "I prefer to work without tools.",
+            "Prefiro trabalhar sem ferramentas.",
+            "I prefer to disable tools.",
+            "By default keep tools disabled.",
+            "Always keep browsing turned off.",
+            "I prefer deactivating browser tools.",
+            "Prefiro desativar ferramentas.",
+            "Prefiro desabilitar ferramentas.",
+            "Prefiro desligar o navegador.",
+            "Sempre mantenha as ferramentas desativadas.",
+            "Sempre mantenha as ferramentas desabilitadas.",
+            "Sempre mantenha o navegador desligado.",
+        ] {
+            assert!(
+                !has_marker(text),
+                "the LLM gate admitted a capability ban: {text}"
+            );
+            assert!(
+                detect_preferences(text).is_empty(),
+                "the zero-LLM gate admitted a capability ban: {text}"
+            );
+        }
+        for text in [
+            "In all my projects, I prefer to work without tools.",
+            "Em todos os meus projetos, prefiro desativar ferramentas.",
+        ] {
+            assert!(
+                has_marker(text),
+                "an explicitly scoped preference was dropped: {text}"
+            );
+            let found = detect_preferences(text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(found[0].generality, ProfileGenerality::General, "{text}");
+        }
     }
 
     #[test]
@@ -3124,6 +3529,33 @@ mod tests {
     }
 
     #[test]
+    fn a_reworded_entry_without_generated_metadata_keeps_its_ledger_topic() {
+        let candidate = row(
+            "alpha",
+            "Always keep pull requests small.",
+            day(1),
+            ProfileGenerality::General,
+        );
+        let first = converge(&[&candidate], &[], &[], 2, 1);
+        let path = first.writes[0].path.clone();
+        let rewritten = ProfileScopePage {
+            path: path.clone(),
+            title: "Mudanças pequenas".into(),
+            body: "Limite cada mudança proposta a poucas linhas.".into(),
+            frontmatter: serde_json::json!({}),
+        };
+        let ledger = [ProfileLedgerEntry {
+            path: path.clone(),
+            topic_key: candidate.candidate.topic_key.clone(),
+            written_at: day(2),
+        }];
+
+        let plan = converge(&[&candidate], &[rewritten], &ledger, 2, 1);
+        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+        assert_eq!(plan.skipped_manual, [path]);
+    }
+
+    #[test]
     fn a_forgotten_entry_stays_gone_until_the_user_says_it_again() {
         let a = row(
             "alpha",
@@ -3241,6 +3673,7 @@ mod tests {
         ExistingEntry {
             path: plan.path,
             tokens: topic_tokens(statement),
+            ledger_tokens: None,
             managed: true,
             frontmatter,
             body,

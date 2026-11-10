@@ -1644,6 +1644,34 @@ fn dsh_subagents_nest_under_the_session_that_started_them() {
     assert_eq!(store.child_counts(&filter).unwrap().get(parent), Some(&1));
 }
 
+/// MiMo Code 同会话子代理的道是子会话:父会话写在 id 里,停在直接父会话上——peer 子会话自己派的
+/// 道挂在 peer 子会话下、不往上压到根(peer 子会话经 parent_id 挂在根下);顶层只有根
+#[test]
+fn mimo_code_lanes_nest_under_the_session_they_run_in() {
+    use agentrouter_session_core::adapters::mimo::MimoAdapter;
+    let data = tempfile::tempdir().unwrap();
+    common::build_mimo_db(&data.path().join("mimocode.db"));
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![MimoAdapter::new().with_custom_root(data.path().to_path_buf())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let key = |id: &str| format!("mimo:{id}");
+    let parent = |id: &str| store.parent_key_of(&key(id)).unwrap();
+    assert_eq!(parent("ses_mimo_0001"), None);
+    assert_eq!(
+        parent("ses_mimo_0001/explore-1"),
+        Some(key("ses_mimo_0001"))
+    );
+    assert_eq!(parent("ses_mimo_0002"), Some(key("ses_mimo_0001")));
+    assert_eq!(
+        parent("ses_mimo_0002/explore-1"),
+        Some(key("ses_mimo_0002")),
+        "peer 子会话派的道停在 peer 子会话上"
+    );
+}
+
 /// Kimi 分叉:关系写在子会话自己的 state.json(`forkedFrom`),全量扫描后子会话挂在父会话
 /// 下面;state.json 的 archived 照搬进索引
 #[test]

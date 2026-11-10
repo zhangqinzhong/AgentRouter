@@ -1,6 +1,6 @@
-//! LongMemEval (v1, S variant) dataset loading.
+//! Pinned retrieval datasets in the LongMemEval question/session format.
 //!
-//! The file is NOT committed (278 MB); it lives gitignored under
+//! The LongMemEval file is NOT committed (278 MB); it lives gitignored under
 //! `evals/datasets/` and is fetched on demand from HuggingFace with a
 //! pinned sha256. Dataset: `xiaowu0162/longmemeval` (MIT license).
 //!
@@ -9,6 +9,7 @@
 //! which keeps the same 500 questions and evidence labels but replaces
 //! distractor sessions that also held the answer. Other systems publish on
 //! the cleaned file, so a comparison has to say which one it ran.
+//! The small synthetic `coding-v1` corpus is committed for offline smoke runs.
 
 use std::path::Path;
 
@@ -32,8 +33,8 @@ pub struct DatasetVariant {
     pub name: &'static str,
     /// Default location under the repo root.
     pub default_path: &'static str,
-    /// Download URL (revision-pinned where upstream allows it).
-    pub url: &'static str,
+    /// Download URL, or `None` for a fixture committed with the evaluator.
+    pub url: Option<&'static str>,
     /// Expected sha256 of the file.
     pub sha256: &'static str,
 }
@@ -42,7 +43,7 @@ pub struct DatasetVariant {
 pub const VARIANT_S: DatasetVariant = DatasetVariant {
     name: "longmemeval_s",
     default_path: "evals/datasets/longmemeval_s.json",
-    url: LONGMEMEVAL_S_URL,
+    url: Some(LONGMEMEVAL_S_URL),
     sha256: LONGMEMEVAL_S_SHA256,
 };
 
@@ -51,8 +52,18 @@ pub const VARIANT_S: DatasetVariant = DatasetVariant {
 pub const VARIANT_S_CLEANED: DatasetVariant = DatasetVariant {
     name: "longmemeval_s_cleaned",
     default_path: "evals/datasets/longmemeval_s_cleaned.json",
-    url: "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json",
+    url: Some(
+        "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json",
+    ),
     sha256: "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+};
+
+/// Small synthetic coding-session evidence corpus, bundled for offline checks.
+pub const VARIANT_CODING_V1: DatasetVariant = DatasetVariant {
+    name: "coding_v1",
+    default_path: "evals/fixtures/retrieval/coding-v1.json",
+    url: None,
+    sha256: "af3382663a3e4e969c8bcfa744b3a794de86cb5932393a88bea16f014193d467",
 };
 
 /// One chat turn inside a haystack session.
@@ -113,10 +124,12 @@ impl Question {
 /// Load the dataset, verifying `variant`'s pinned sha256 first.
 pub fn load(path: &Path, variant: &DatasetVariant) -> Result<Vec<Question>> {
     let bytes = std::fs::read(path).with_context(|| {
-        format!(
-            "reading dataset at {} (use --fetch to download)",
-            path.display()
-        )
+        let recovery = if variant.url.is_some() {
+            "use --fetch to download"
+        } else {
+            "restore the bundled fixture from the repository"
+        };
+        format!("reading dataset at {} ({recovery})", path.display())
     })?;
     let digest = hex::encode(Sha256::digest(&bytes));
     if digest != variant.sha256 {
@@ -129,7 +142,7 @@ pub fn load(path: &Path, variant: &DatasetVariant) -> Result<Vec<Question>> {
         );
     }
     let questions: Vec<Question> =
-        serde_json::from_slice(&bytes).context("parsing longmemeval_s JSON")?;
+        serde_json::from_slice(&bytes).context("parsing retrieval dataset JSON")?;
     for q in &questions {
         if q.haystack_sessions.len() != q.haystack_session_ids.len()
             || q.haystack_sessions.len() != q.haystack_dates.len()
@@ -149,11 +162,17 @@ pub fn load(path: &Path, variant: &DatasetVariant) -> Result<Vec<Question>> {
 /// Download the dataset to `path` (atomically: tmp + rename) and verify
 /// the pinned sha256 before the rename lands it.
 pub async fn fetch(path: &Path, variant: &DatasetVariant) -> Result<()> {
+    let url = variant.url.with_context(|| {
+        format!(
+            "{} is bundled with the repository; restore {} instead of downloading it",
+            variant.name, variant.default_path
+        )
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    tracing::info!(url = variant.url, "downloading {} (~278 MB)", variant.name);
-    let resp = reqwest::get(variant.url).await?.error_for_status()?;
+    tracing::info!(url, "downloading {}", variant.name);
+    let resp = reqwest::get(url).await?.error_for_status()?;
     let bytes = resp.bytes().await?;
     let digest = hex::encode(Sha256::digest(&bytes));
     if digest != variant.sha256 {
@@ -194,6 +213,102 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coding_corpus_pin_and_evidence_labels_are_consistent() {
+        use std::collections::HashSet;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/retrieval/coding-v1.json");
+        let questions = load(&path, &VARIANT_CODING_V1).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(questions.len(), 4);
+        let mut question_ids = HashSet::new();
+        for (q, labels) in questions.iter().zip(raw.as_array().unwrap()) {
+            assert!(question_ids.insert(&q.question_id));
+            assert!(!q.is_abstention());
+            assert!(!q.gold_answer_text().is_empty());
+            let ids: HashSet<_> = q.haystack_session_ids.iter().collect();
+            assert_eq!(ids.len(), q.haystack_session_ids.len());
+            assert!(
+                ids.len() > 10,
+                "recall@10 must not include every session by construction"
+            );
+            let evidence: HashSet<_> = q.answer_session_ids.iter().collect();
+            assert!(!evidence.is_empty());
+            let incorrect: HashSet<_> = labels["incorrect_session_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            for (id, turns) in q.haystack_session_ids.iter().zip(&q.haystack_sessions) {
+                let expected = evidence.contains(id);
+                assert_eq!(
+                    turns.iter().any(Turn::is_evidence),
+                    expected,
+                    "{}: {id}",
+                    q.question_id
+                );
+                assert_eq!(
+                    incorrect.contains(id.as_str()),
+                    !expected,
+                    "alternatives must partition the haystack"
+                );
+            }
+            assert!(evidence.iter().all(|id| ids.contains(id)));
+            assert_eq!(incorrect.len() + evidence.len(), ids.len());
+        }
+    }
+
+    #[test]
+    fn coding_corrections_follow_their_stale_alternatives() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/retrieval/coding-v1.json");
+        let questions = load(&path, &VARIANT_CODING_V1).unwrap();
+        for (id, old, current) in [
+            (
+                "coding-correction",
+                "coding-correction-stale",
+                "coding-correction-current",
+            ),
+            (
+                "coding-long-session",
+                "coding-long-session-wrong-header",
+                "coding-long-session-investigation",
+            ),
+        ] {
+            let q = questions.iter().find(|q| q.question_id == id).unwrap();
+            let old_index = q
+                .haystack_session_ids
+                .iter()
+                .position(|sid| sid == old)
+                .unwrap();
+            let current_index = q
+                .haystack_session_ids
+                .iter()
+                .position(|sid| sid == current)
+                .unwrap();
+            assert!(q.haystack_dates[old_index] < q.haystack_dates[current_index]);
+            assert!(!q.answer_session_ids.iter().any(|sid| sid == old));
+            assert!(q.answer_session_ids.iter().any(|sid| sid == current));
+        }
+    }
+
+    #[test]
+    fn missing_bundled_corpus_points_to_repository_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = load(&tmp.path().join("missing.json"), &VARIANT_CODING_V1).unwrap_err();
+        assert!(err.to_string().contains("restore the bundled fixture"));
+        assert!(!err.to_string().contains("--fetch"));
+    }
+
+    #[tokio::test]
+    async fn bundled_corpus_fetch_fails_before_creating_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing/coding.json");
+        let err = fetch(&path, &VARIANT_CODING_V1).await.unwrap_err();
+        assert!(err.to_string().contains("bundled with the repository"));
+        assert!(!path.parent().unwrap().exists());
+    }
 
     fn sample_json() -> serde_json::Value {
         serde_json::json!([{

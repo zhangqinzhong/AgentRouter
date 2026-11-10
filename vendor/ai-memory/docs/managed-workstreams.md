@@ -1,11 +1,26 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro
+between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
 CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
+
+When `show` selects another checkout, the launch resolves that checkout's
+server profile before probing or opening a workstream. Local state and
+transcript writes use the same endpoint and profile token as its hooks.
+`AI_MEMORY_SERVER_URL` still takes precedence, and an invalid profile fails
+closed. `resume` and `continue` also check that a saved link still belongs to
+the checkout's selected server, including its mount path. If the route has
+changed, run `ai-memory run` in that checkout to establish the new link.
+
+On Linux, a jailed OpenCode session uses a private `--standalone` server by
+default. This keeps its server and tool processes inside ai-jail's PID
+namespace so they cannot survive the jail. An explicit native `--server`
+still wins because it deliberately selects an external service. The legacy
+`opencode2`, `opencode-v2`, and `open-code2` names force the V2 adapter for old
+scripts; they are compatibility aliases, not a second OpenCode harness.
 
 When the server runs with `--enable-web`, root can inspect all managed ledgers
 at `/web/workstreams`. The read-only page shows trusted lifecycle state, the
@@ -147,6 +162,8 @@ tells the agent to read that session with `memory_read_session_observations`,
 newest first. `memory_briefing` (`recent_sessions`) and `memory_handoff_list`
 (`newer_unended_session`) expose the same pointer to clients whose session start
 injects nothing.
+Pass `recent_sessions_limit` to `memory_briefing` to raise its default five
+entries (clamped to 1–50) when checking active harnesses in a busy project.
 
 The dossier is evidence, not instructions: it is fenced as untrusted history,
 contains no hidden reasoning or unsupported/private records, and disappears
@@ -180,13 +197,35 @@ was a session, and `--executable` was not used; utility commands, failed or
 interrupted exits, and non-interactive launches do not prompt. A switch or
 re-run does not replay the previous harness's native arguments, which may be
 specific to that CLI; wrapper settings such as `--workspace`, `--project`,
-`--yolo` / `--true-yolo`, ai-jail controls, `--no-autowire`, `--env`, and
-`--env-file` remain in effect. The initial `--fresh` choice applies only to the
-first launch.
+`--yolo`, ai-jail controls, `--no-autowire`, `--no-exit-prompt`,
+`--env`, and `--env-file` remain in effect. The initial `--fresh` choice applies
+only to the first launch.
+
+To return to the shell without the menu, pass `--no-exit-prompt` before or
+after the harness name:
+
+```bash
+ai-memory run --no-exit-prompt codex
+ai-memory run claude --no-exit-prompt
+```
+
+To disable it for all launches, set `AI_MEMORY_RUN_EXIT_PROMPT=false` or add
+this to `config.toml`:
+
+```toml
+[run]
+exit_prompt = false
+```
+
+The default is `true`. The environment variable accepts `true` or `false` and
+overrides the config file; `--no-exit-prompt` disables the menu even when the
+environment enables it. These settings affect only the exit menu. The managed
+session still launches, captures history, and finishes as usual.
 
 Everything after the harness name is native argv except the wrapper-owned exact
-flags `--yolo`, `--fresh`, and `--force-unlock`. No `--` separator is needed,
-and ai-memory does not maintain a second copy of each harness's option schema.
+flags `--yolo`, `--fresh`, `--force-unlock`, and `--no-exit-prompt`. No `--`
+separator is needed, and ai-memory does not maintain a second copy of each
+harness's option schema.
 Other wrapper options come first:
 
 Portable events, handoffs, and project briefs are injected as explicitly
@@ -196,10 +235,17 @@ change permissions or policy, or use tools merely because that content asks.
 Current system/developer/user instructions, the canonical project instruction
 file, and the current checkout remain authoritative.
 
+The startup packet keeps user and assistant messages, checkpoints, compaction
+summaries, and import annotations inline. Completed tool calls and results use
+small stubs with the tool name and original character count, so generated file
+contents or command output cannot crowd the conversation out of the bounded
+resume context. Their full sanitized payloads remain in the ledger and are
+available through `ai-memory workstream-search`.
+
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
-              [--yolo] [--fresh] [--force-unlock] [--profile NAME]
+              [--yolo] [--fresh] [--force-unlock] [--no-exit-prompt] [--profile NAME]
               [--env KEY=VALUE]... [--env-file PATH] [--require-server]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity|copilot]
               [native arguments...]
@@ -258,6 +304,66 @@ Probably not at first. Hooks alone already carry most continuity.
 
 If you never switch harnesses mid-workstream, the default path is
 simpler and you lose nothing by staying on it.
+
+## Recovering an ambiguous project
+
+Older installations can contain two populated projects that answer to the
+same name, for example `widget` and `acme-widget` with legacy key `widget`.
+Name resolution deliberately refuses that collision. A unique checkout path
+does not make the server's name selector unambiguous.
+
+`run` can select an existing project by its stable ID inside a workspace:
+
+```sh
+ai-memory run --workspace default --project-id <project-uuid> claude
+ai-memory run --workspace default --project-id <project-uuid> codex
+ai-memory workstreams --workspace default --project-id <project-uuid> --json
+```
+
+With a terminal, an ambiguous `run` offers a numbered choice of matching
+projects the caller may write. Enter cancels without opening a run. Scripts
+receive an actionable error containing authorized IDs and must pass
+`--project-id`; they never select the first match automatically. The candidate
+query examines a bounded set of matches and reports when more exist. An
+explicit ID remains available when the intended project is not shown.
+
+After a successful prepare, the client remembers the resolved ID in
+`<data-dir>/client-projects.json`. An explicit authorized choice during
+workstream discovery is also remembered after the read succeeds. Bindings
+include the normalized server origin and mount, workspace, requested project,
+canonical checkout path, and repository/worktree fingerprints. Changed
+remotes, other checkouts, servers and scopes do not reuse the binding. The
+server checks workspace membership and current permissions on every request;
+the local record grants no access. An unreadable local registry is left unchanged
+and falls back to name resolution, which still refuses ambiguous names. `resume` uses the same binding when listing
+and launching a workstream. An explicit `--project` overrides a cached ID;
+`--project-id` replaces the checkout's choice after successful preparation.
+Neither operation moves, merges or deletes project history.
+
+An empty workstream selected by ID starts a fresh native session instead of
+automatically adopting an unlinked session found at the same path. A native
+session already captured under another project or operator is refused; native
+sessions already linked to the selected workstream remain resumable.
+
+ID-selected runs require a reachable server. Their SessionStart context and
+capture hooks use the run's pinned project after validating the launching
+operator, active lease, harness and native session. Startup and initial binding
+also require the original checkout. A stale, expired or foreign pinned run is
+refused rather than routed by the ambiguous name. Existing runs retain their
+original marker/name routing; the additive schema flag defaults to off.
+
+The wire requests for `/workstream/runs` and `/workstream/recent` accept an
+optional `project_id`, mutually exclusive with a non-empty `project`. Clients
+send an empty `project` for ID selection so older servers reject it before
+creating anything. Prepare responses include optional `resolved_project`
+coordinates; a client requesting an ID refuses to start the harness unless
+the server confirms that exact ID and workspace. Upgrade the server before
+using ID selection. Name-only clients continue to work.
+
+`POST /workstream/project-candidates` accepts `workspace` and `project` names
+and returns `candidates` plus `truncated`. It works without the web UI, uses the
+normal authentication middleware, includes only writable matches, and returns
+IDs and names without server filesystem paths.
 
 ## Project-first launcher
 
@@ -414,15 +520,15 @@ flavor remains exact. OMP, Grok, Antigravity, and Copilot remain available expli
 but are not in the automatic pool. OpenCode's resolved major contributes one
 adapter to the pool, so shared V1/V2 storage never duplicates a candidate.
 
-OpenCode 2 sessions run inside a shared background service, so its plugin
-cannot see a managed run's environment the way in-process plugins do. Managed
-`run opencode2` legs launch with the correct resume selectors, capture through
-hooks, and import the beta transcript (all verified live), but the
+Non-jailed OpenCode V2 sessions normally run inside a shared background service,
+so its plugin cannot see a managed run's environment the way in-process plugins
+do. Managed OpenCode V2 legs launch with the correct resume selectors, capture
+through hooks, and import the V2 transcript (all verified live), but the
 ledger-delta acknowledgement (`context_delivered`) does not fire, because the
 accept path requires the run id on the session-start hook. When this fails the
 range is redelivered, never lost: a later leg into another harness may receive the range
-again. Until the beta offers per-invocation plugin context, cross-harness
-continuity into opencode2 arrives through the ordinary handoff loop rather
+again. Until the shared service offers per-invocation plugin context, cross-harness
+continuity into OpenCode V2 arrives through the ordinary handoff loop rather
 than the ledger delta.
 
 Bare mode accepts wrapper options but not harness-native arguments or
@@ -464,7 +570,26 @@ it. The compressed copy counts as the linked session, so the launch resumes it
 and the transcript import reads it like the plain file. Use
 `ai-memory run --fresh <harness>` to deliberately skip the linked
 session and the adoption chooser. `--fresh` cannot be combined with a native
-resume, continue, session, or fork selector.
+resume, continue, session, or fork selector. A fresh interactive launch still
+exports the linked session as `AI_MEMORY_PREVIOUS_SESSION_HISTORY` when it is
+available locally. This matters when Claude's new session uses a different
+configuration home: the harness can read the bounded, checkout-validated old
+session without ai-memory copying it into the server.
+
+Codex's in-session `/new` command does not expose a trustworthy parent-thread
+relationship. ai-memory therefore never guesses that the new thread owns the
+managed workstream. If the linked thread exits without acknowledging its
+context after `/new`, the wrapper explains that the intended thread must be
+selected explicitly on the next managed run.
+
+When the linked session is missing and the checkout still holds another
+session of that harness, an interactive launch that names its harness still
+starts fresh but also names the newest one and the native selector that
+resumes it, such as `resume <id>` for Codex. Running the same command again
+with that selector right after the harness name is an explicit selector, so
+that session is linked instead. The launcher never picks it on its own, and
+it cannot tell whether that session is open in another terminal or linked to
+another workstream; adoption stays a bootstrap operation.
 
 ## What happens on each run
 
@@ -531,8 +656,28 @@ resume, continue, session, or fork selector.
    result whose call was imported by an earlier run is dropped under a
    policy. Messages are unaffected. Under allowlist capture mode a checkout
    without a marker uploads no events at all, as the live hook emits none
-   there; the run still finishes. Each delivered
-   workstream packet begins with a versioned origin marker. If Claude Code
+   there; the run still finishes.
+
+   Claude process can write one run across several native transcripts when
+   `/clear` starts a new conversation. The launcher enumerates those
+   continuations, imports each abandoned transcript oldest first as a
+   non-final ledger segment, and only then finalizes the run on the newest
+   session. Thus pre-clear turns keep their original native-session identity,
+   while the next managed launch still resumes the conversation after the last
+   `/clear`.
+
+   For ID-selected runs, Claude's `SessionStart` with `source: "clear"` also
+   updates the live hook binding, so capture continues before the launcher
+   exits. The transition requires the same operator, harness and checkout,
+   an active lease and current Write access. Ordinary events cannot change
+   the binding; a replayed `clear` for an abandoned native session is
+   refused. The previous transcript remains in the workstream's
+   native-session history, so an in-session `/resume` back to it
+   (`SessionStart` with `source: "resume"`) moves the binding back under the
+   same checks. A `resume` is admitted only for a native session this
+   workstream already held and that no other live run currently holds.
+
+   Each delivered workstream packet begins with a versioned origin marker. If Claude Code
    persists that packet and its `Read` tool returns it, the Claude transcript
    normalizer excludes the marked result instead of feeding delivered history
    into the ledger again. It also recognizes the pre-marker packet header for
@@ -561,6 +706,24 @@ ai-memory workstream-search --limit 50 --json "failed migration"
 another shell, pass `--workstream-id <uuid>` explicitly. Search results preserve
 the source harness, role, event sequence, and content. Historical tool activity
 is labelled completed evidence and must never be replayed as a pending call.
+
+OpenCode V1 tool failures contribute their visible `state.error` text as a
+result, with `status: "error"` and `is_error: true` in the ledger metadata.
+Successful calls keep their ordinary `state.output` result.
+
+OpenCode 2 tool failures contribute their visible error text as a result, with
+`status: "error"` and `is_error: true` in the ledger metadata. Successful calls
+keep their ordinary `state.content` text parts.
+
+OpenCode 2 compaction messages import their `summary` as a compaction event
+(and, when a failed compaction has no summary, `error.message`). The V1 adapter
+already imported compaction parts the same way.
+
+Crush cursors fingerprint every message revision in the newest one-second
+timestamp bucket. This preserves inserts whose UUID sorts below the prior
+cursor and edits whose native timestamp did not advance. Exact recovery ranges
+also retain the captured endpoint fingerprints, so a revision written later in
+that second is not pulled backward into an earlier interval.
 
 Search and tail also return optional `source_record_id` and `metadata` fields.
 The text CLI prints the source record and correlation metadata as escaped JSON;
@@ -691,6 +854,9 @@ journal entries; correlated entries are quarantined before that pass and can
 only be deleted after a later clean pass and exact transcript replay. If the
 server is still unreachable, `recover` exits successfully
 and prints the remaining spool/journal counts and startup guidance.
+When the server is reachable but the journal is unreadable, `recover` still
+drains the hook spool. It preserves the journal for repair, reports its error
+alongside the spool counts, and exits with status 1.
 
 To restore the strict behavior (fail with the usual "could not reach …"
 diagnosis and never start the agent), pass `--require-server`, set
@@ -901,8 +1067,10 @@ Crush `--yolo`, Kimi Code `--yolo`, Command Code `--yolo`, Kiro CLI v2
 `--trust-all-tools`, Grok Build CLI `--yolo` (equivalent to its
 `--always-approve` option), Antigravity CLI
 `--dangerously-skip-permissions`, and GitHub Copilot CLI `--yolo` (equivalent
-to its `--allow-all` option). Kiro v3 replaced the trust-all flag with
-`permissions.yaml`, so ai-memory prints a notice and adds no unverified flag.
+to its `--allow-all` option). Kiro takes `--trust-all-tools` on both engines,
+but only as a `chat` option, so ai-memory places it right after `chat`, or
+starts the launch with `chat --trust-all-tools` when it has no subcommand. An
+`--agent-engine` other than v2 or v3 gets a notice and no unverified flag.
 OMP currently needs no added flag. ai-memory does not add a duplicate when the
 translated native flag is already present.
 
@@ -1001,10 +1169,10 @@ operations, malformed records, and unknown schema versions are not imported.
 The engines can never cross-resume: exact store metadata is checked before a
 linked `--resume-id` is injected, and the incompatible engine flavor is also
 stored in the opaque incremental cursor. Explicit `--v3`, v3-only `--mode`,
-or `--agent-engine v3` selects v3; explicit `--agent-engine v2` selects v2; an
-unknown engine value remains passthrough instead of being guessed. Once a v3
-session is linked, a later plain `ai-memory run kiro` recovers that engine
-transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
+or `--agent-engine v3` selects v3. Both `--v2` and `--agent-engine v2` select
+v2, even when the workstream last used v3. An unknown engine value remains
+passthrough. Once a v3 session is linked, a later plain `ai-memory run kiro`
+recovers that engine transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
 `~/.kiro/sessions` even when `KIRO_HOME` redirected other state, so ai-memory
 checks the configured v3 root first and that default root as a compatibility
 fallback. If a linked session exists only in the fallback, ai-memory removes
@@ -1013,10 +1181,12 @@ uses its default-home v3 settings/hooks for that process, and first-launch
 auto-wire wires that default home rather than `KIRO_HOME`. Fresh launches and
 versions that store the session below the configured root keep `KIRO_HOME`
 unchanged. Every candidate still needs exact id, schema, and checkout metadata.
-The v2 `--yolo` translation is `--trust-all-tools`; an explicit narrower
-`--trust-tools` choice is never widened. V3 documents no equivalent CLI flag.
-See Kiro's current
-[session management](https://kiro.dev/docs/cli/chat/session-management/) and
+The `--yolo` translation is `--trust-all-tools` after `chat` on both engines;
+v3 keeps applying `permissions.yaml` denies under it, and an explicit narrower
+`--trust-tools` choice is never widened. Other subcommands (`mcp`, `login`)
+and help or version requests get no trust flag. See Kiro's current
+[session management](https://kiro.dev/docs/cli/chat/session-management/),
+[CLI commands](https://kiro.dev/docs/reference/cli-commands/) and
 [v3 compatibility](https://kiro.dev/docs/cli/v3/) references.
 
 Grok needs no ai-memory hook installation for managed delivery either. Grok
@@ -1275,6 +1445,41 @@ a renamed checkout, use an explicit harness and its documented session selector
 to seed the new managed workstream. Keep the old checkout path available until
 recovery is verified. Automatic discovery intentionally requires the recorded
 checkout to match exactly.
+
+### A repository that gained its remote after capture began
+
+A project's name comes from the git remote, or from the folder name when the
+checkout has no remote. Sessions captured before the remote was added stay in
+the folder-named project, while `ai-memory run` resolves the remote-derived
+one, so resuming one of those sessions cannot link it to the run. The server
+refuses the link with the `native_session_in_other_project` conflict, which
+names both projects (only for the operator and harness that recorded the
+session).
+
+When the folder-named project is the remote-derived project's old name and
+the remote-derived project has no sessions or pages yet, the repair loses
+nothing. The server moves the repository identity from the empty project onto
+the folder-named one, gives it the remote-derived name, and keeps the empty
+project as `<name>-split-<date>`. The project id stays, so sessions,
+observations and pages follow, and identity-based capture and later launches
+reach them. This client's checkout links and saved project binding are
+re-pointed too.
+
+On a terminal, `ai-memory run` explains this and offers the repair (default
+yes), then starts the session again. Closing the prompt's input without an
+answer cancels it; pressing Enter accepts the default. Off a terminal it stops
+before the agent starts and prints the command:
+
+```
+ai-memory repair-split --workspace <ws> --project-id <folder project id> \
+  --from-project-id <remote project id>
+```
+
+The same command repairs a pair that was renamed by hand, where renaming
+alone left the identity on the archived project. It refuses when the
+remote-derived project holds its own sessions or pages, or a managed run is
+still active in it, because joining them would hide data. Compare the two
+projects first ([lifecycle operations](lifecycle-ops.md)).
 
 ## Manual acceptance
 

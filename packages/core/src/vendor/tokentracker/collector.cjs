@@ -6,6 +6,7 @@ const rollout = require('./lib/rollout');
 const { queryOffline } = require('./lib/offline-api');
 const { getUsageLimits, resetUsageLimitsCache } = require('./lib/usage-limits');
 const subscriptions = require('./lib/subscription-manager');
+const {collectionInstances,attributeFiles}=require('./usage-instances.cjs');
 const {ensurePricingLoaded}=require('./lib/pricing');
 
 // Parsing runs in a worker. Source files are read-only; only aggregate queues and
@@ -37,9 +38,15 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
       try { cursors=JSON.parse(await fs.readFile(cursorsPath,'utf8')); }
       catch (e) { if(e.code !== 'ENOENT') throw e; cursors={}; }
       const roots = await require('./collection-roots.cjs').collectionRoots({home});
-      const codexFiles = [...new Set((await Promise.all(roots.codexStores.map(dir => rollout.listRolloutFilesDeep(dir)))).flat())].sort();
-      const claudeFiles = [...new Set((await Promise.all(roots.claudeProjects.map(dir => rollout.listClaudeProjectFiles(dir)))).flat())].sort();
-      await require('./rebuild-codex.cjs').rebuildCodex({dataDir,cursors,files:codexFiles});
+      const instances=await collectionInstances({home,dataDir,roots});
+      await fs.writeFile(path.join(dataDir,'instances.json.tmp'),JSON.stringify(instances),{mode:0o600});
+      await fs.rename(path.join(dataDir,'instances.json.tmp'),path.join(dataDir,'instances.json'));
+      const codexPaths = [...new Set((await Promise.all(roots.codexStores.map(dir => rollout.listRolloutFilesDeep(dir)))).flat())].sort();
+      const claudePaths = [...new Set((await Promise.all(roots.claudeProjects.map(dir => rollout.listClaudeProjectFiles(dir)))).flat())].sort();
+      await require('./rebuild-codex.cjs').rebuildCodex({dataDir,cursors,files:codexPaths});
+      const codexFiles=await attributeFiles(codexPaths,'codex',instances);
+      const claudeFiles=await attributeFiles(claudePaths,'claude',instances);
+      await require('./rebuild-instances.cjs').rebuildInstances({dataDir,cursors,codexFiles,claudeFiles});
       await rollout.parseRolloutIncremental({rolloutFiles:codexFiles,cursors,queuePath,projectQueuePath,source:'codex'});
       await rollout.parseClaudeIncremental({projectFiles:claudeFiles,cursors,queuePath,projectQueuePath,source:'claude'});
       const includeCursor = force || Date.now() - lastRemoteSync >= 60000;
@@ -57,6 +64,16 @@ function createCollector({ home = os.homedir(), dataDir = path.join(home, '.agen
     return inFlight;
   }
   async function queryEndpoint(endpoint, query = {}) {
+    if(endpoint.endsWith('instance-names')) {
+      const roots=await require('./collection-roots.cjs').collectionRoots({home});
+      if(query.path)await require('./usage-instances.cjs').setInstanceName(dataDir,query.source,query.path,query.name||'');
+      return {instances:await collectionInstances({home,dataDir,roots})};
+    }
+    if(endpoint.endsWith('usage-instances')) {
+      const roots=await require('./collection-roots.cjs').collectionRoots({home});
+      const instances=await collectionInstances({home,dataDir,roots});
+      return {instances:instances.map(({id,source,name})=>({id,source,name}))};
+    }
     if(endpoint.endsWith('usage-trend')) return require('./trend.cjs').queryTrend(query,(path,params)=>queryEndpoint(path,params));
     if(endpoint.endsWith('usage-category-breakdown')) {
       const {getCategoryBreakdown}=require('./context.cjs');

@@ -18,8 +18,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ai_memory_core::{
-    AgentKind, NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier,
-    WorkspaceId, looks_like_markup_block, looks_like_scaffolding, truncate_for_title,
+    AgentKind, FAILED_TOOL_OUTCOME_LINE, NewPage, Observation, ObservationKind, PagePath,
+    ProjectId, SessionId, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, Tier, WorkspaceId,
+    looks_like_machine_turn, looks_like_markup_block, looks_like_scaffolding, truncate_for_title,
+    truncate_utf8_bytes,
 };
 use ai_memory_store::{
     ObservationOrder, ReaderPool, SessionKindSummary, SessionLine, SessionObservationSnapshot,
@@ -29,7 +31,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::capture_policy::ToolFamily;
-use crate::payload::{is_safe_tool_title, tool_family_from_title};
+use crate::payload::{listable_tool_name, tool_family_from_title, tool_title_display};
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
@@ -118,6 +120,71 @@ struct SessionEndFact {
     body: String,
 }
 
+/// Bytes of error text the page and the handoff quote.
+const FAILED_TOOL_EXCERPT_BYTES: usize = 240;
+
+/// A tool call the harness reported as failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailedToolFact {
+    /// A recorded tool name or a family label.
+    pub(crate) title: String,
+    /// Error text after the header, whitespace-collapsed and capped at
+    /// [`FAILED_TOOL_EXCERPT_BYTES`]; empty when none was stored.
+    pub(crate) error: String,
+}
+
+impl FailedToolFact {
+    /// `"Bash: Exit code 1 …"`, or the error alone when the title is a family
+    /// label, which names no tool.
+    pub(crate) fn describe(&self) -> String {
+        let error = if self.error.is_empty() {
+            "(no error text captured)"
+        } else {
+            self.error.as_str()
+        };
+        match listable_tool_name(&self.title) {
+            Some(name) => format!("{name}: {error}"),
+            None => error.to_string(),
+        }
+    }
+}
+
+/// A `post-tool-use` whose header (the text before the first
+/// [`TOOL_BODY_SEPARATOR`], within the first [`TOOL_BODY_HEADER_MAX_CHARS`]
+/// characters) ends in [`FAILED_TOOL_OUTCOME_LINE`]. The store counts with
+/// the same rule, so an `outcome: error` line inside a tool's output never
+/// counts.
+fn is_failed_tool(obs: &Observation) -> bool {
+    if obs.kind != ObservationKind::PostToolUse {
+        return false;
+    }
+    let body = obs.body.as_str();
+    let head = body
+        .char_indices()
+        .nth(TOOL_BODY_HEADER_MAX_CHARS)
+        .map_or(body, |(end, _)| &body[..end]);
+    let header = head
+        .split_once(TOOL_BODY_SEPARATOR)
+        .map_or(head, |(header, _)| header);
+    header.ends_with(FAILED_TOOL_OUTCOME_LINE)
+}
+
+/// [`is_failed_tool`] with the quoted error text.
+fn failed_tool_fact(obs: &Observation) -> Option<FailedToolFact> {
+    if !is_failed_tool(obs) {
+        return None;
+    }
+    let output = obs
+        .body
+        .split_once(TOOL_BODY_SEPARATOR)
+        .map_or("", |(_, output)| output);
+    let collapsed = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(FailedToolFact {
+        title: obs.title.clone(),
+        error: truncate_utf8_bytes(&collapsed, FAILED_TOOL_EXCERPT_BYTES),
+    })
+}
+
 /// Everything the auto-handoff and the abrupt-ending note read from a
 /// session's observations, besides what [`SessionDigest`] already counts.
 ///
@@ -135,6 +202,8 @@ pub(crate) struct HandoffFacts {
     pub(crate) question_prompt: Option<PromptFact>,
     /// Title of the last completed tool call.
     pub(crate) last_tool_title: Option<String>,
+    /// The newest failed call.
+    pub(crate) last_failed_tool: Option<FailedToolFact>,
     /// Body of the last `Stop` that carries assistant text.
     pub(crate) latest_assistant: Option<String>,
     /// The session recorded a `Stop`.
@@ -177,6 +246,8 @@ pub struct SessionDigest {
     prompt_count: usize,
     /// Completed calls per tool name, keyed for stable ordering.
     tool_counts: BTreeMap<String, usize>,
+    /// Calls the harness reported as failed.
+    failed_tool_calls: usize,
     /// The page title.
     title: String,
     /// What the handoff and the abrupt-ending note read.
@@ -220,6 +291,9 @@ impl SessionDigest {
     /// The idle auto-end tick binds that count to the end stamp (review R36
     /// F3): an observation landing after the digest was built must invalidate
     /// the stamp instead of reaching the watermark without reaching the page.
+    /// It is the whole session's count, not the digest's own total: the digest
+    /// holds only this scope's rows, the stamp counts every project's, and a
+    /// session that crossed repositories would otherwise never end.
     ///
     /// # Errors
     /// Propagates any store error.
@@ -232,10 +306,7 @@ impl SessionDigest {
         reader
             .read_session_observations(workspace_id, project_id, session_id, move |snapshot| {
                 let (digest, _stats) = build_digest(snapshot, session_id)?;
-                // Overflow only with more than 9.2e18 observations: fail
-                // toward `Lost` at the stamp (an unrepresentable count never
-                // matches the stamp-time COUNT), never toward a wrong stamp.
-                let total = i64::try_from(snapshot.kind_summary()?.total).unwrap_or(i64::MAX);
+                let total = snapshot.whole_session_observation_count()?;
                 Ok((digest, total))
             })
             .await
@@ -273,6 +344,12 @@ impl SessionDigest {
     pub(crate) fn handoff_facts(&self) -> &HandoffFacts {
         &self.handoff
     }
+
+    /// For tests in other modules; the renderers read the field.
+    #[cfg(test)]
+    pub(crate) fn failed_tool_calls(&self) -> usize {
+        self.failed_tool_calls
+    }
 }
 
 fn micros_to_timestamp(micros: i64) -> StoreResult<Timestamp> {
@@ -284,19 +361,25 @@ fn micros_to_timestamp(micros: i64) -> StoreResult<Timestamp> {
 }
 
 /// The handoff prompt predicate: a user prompt whose text is not empty and not
-/// a harness block delivered as a user turn (`<task-notification>`).
+/// a harness turn delivered as a user prompt — a markup block
+/// (`<task-notification>`) or a machine turn (`<teammate-message …>`, #2149).
 fn handoff_prompt(obs: &Observation) -> Option<String> {
     if obs.kind != ObservationKind::UserPrompt {
         return None;
     }
     let text = prompt_text(obs);
-    (!text.is_empty() && !looks_like_markup_block(text)).then(|| text.to_string())
+    (!text.is_empty() && !looks_like_markup_block(text) && !looks_like_machine_turn(text))
+        .then(|| text.to_string())
 }
 
 /// The open-question prompt predicate: a user prompt that is not a harness
-/// block. An empty text still counts, as it always did.
+/// markup block or machine turn. An empty text still counts, as it always did.
 fn question_prompt(obs: &Observation) -> Option<PromptFact> {
-    if obs.kind != ObservationKind::UserPrompt || looks_like_markup_block(prompt_text(obs)) {
+    let text = prompt_text(obs);
+    if obs.kind != ObservationKind::UserPrompt
+        || looks_like_markup_block(text)
+        || looks_like_machine_turn(text)
+    {
         return None;
     }
     Some(PromptFact {
@@ -323,14 +406,6 @@ fn session_line(obs: &Observation) -> SessionLine {
             .collect(),
         created_at: obs.created_at,
     }
-}
-
-/// Tool names worth listing: a harness's own tool name. Skip `tool <family>` /
-/// bare-`<family>` labels: a family is a partition of the calls, not a name
-/// for a tool, so "Tools used: tool file, tool non-file" tells the receiver
-/// nothing.
-fn is_listable_tool_title(title: &str) -> bool {
-    !title.is_empty() && tool_family_from_title(title).is_none()
 }
 
 fn build_digest(
@@ -394,7 +469,12 @@ fn build_digest(
     };
 
     let tools = snapshot.tool_titles()?;
-    let tool_counts: BTreeMap<String, usize> = tools.completed.into_iter().collect();
+    let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (title, count) in tools.completed {
+        *tool_counts
+            .entry(tool_title_display(&title).to_owned())
+            .or_insert(0) += count;
+    }
 
     let handoff = HandoffFacts {
         first_prompt: if summary.prompts > 0 {
@@ -425,6 +505,15 @@ fn build_digest(
             summary.last_post_tool_at,
             |obs| Some(obs.title.clone()),
         )?,
+        last_failed_tool: match summary.last_failed_tool_at {
+            Some(at) => snapshot.scan(
+                ObservationOrder::Desc,
+                &[ObservationKind::PostToolUse],
+                Some(at),
+                failed_tool_fact,
+            )?,
+            None => None,
+        },
         latest_assistant: match summary.last_stop_with_body_at {
             Some(at) => snapshot.scan(
                 ObservationOrder::Desc,
@@ -438,8 +527,9 @@ fn build_digest(
         has_session_end: summary.last_session_end_at.is_some(),
         tools: tools
             .titles
-            .into_iter()
-            .filter(|title| is_listable_tool_title(title))
+            .iter()
+            .filter_map(|title| listable_tool_name(title))
+            .map(str::to_owned)
             .collect(),
     };
 
@@ -459,6 +549,7 @@ fn build_digest(
             prompt_titles,
             prompt_count: prompts.total,
             tool_counts,
+            failed_tool_calls: summary.failed_tool_calls,
             title,
             handoff,
         },
@@ -575,7 +666,7 @@ fn fallback_title(obs: &Observation) -> Option<String> {
     // ("tool non-file") would take the label as its page title.
     (!obs.title.is_empty()
         && !looks_like_title_scaffolding(&obs.title)
-        && !is_safe_tool_title(&obs.title))
+        && tool_family_from_title(&obs.title).is_none())
     .then(|| obs.title.clone())
 }
 
@@ -640,7 +731,7 @@ fn session_summary(digest: &SessionDigest) -> String {
         let nameable: Vec<&str> = by_calls
             .iter()
             .map(|(name, _)| *name)
-            .filter(|name| !is_safe_tool_title(name))
+            .filter(|name| tool_family_from_title(name).is_none())
             .collect();
         parts.push(if nameable.is_empty() {
             format!("{calls} completed tool call{}", plural(calls))
@@ -664,6 +755,9 @@ fn session_summary(digest: &SessionDigest) -> String {
                 plural(calls)
             )
         });
+    }
+    if digest.failed_tool_calls > 0 {
+        parts.push(format!("{} failed", digest.failed_tool_calls));
     }
 
     if let (Some(start), Some(end)) = (digest.start_at, digest.end.as_ref())
@@ -774,6 +868,16 @@ fn render_body(session_id: SessionId, digest: &SessionDigest, title: &str) -> St
         buf.push_str("## Tool calls\n\n");
         for (name, count) in &digest.tool_counts {
             buf.push_str(&format!("- `{name}`: {count}\n"));
+        }
+        buf.push('\n');
+    }
+
+    // What broke: the count and the newest error text.
+    if digest.failed_tool_calls > 0 {
+        buf.push_str("## Failed tool calls\n\n");
+        buf.push_str(&format!("- **count:** {}\n", digest.failed_tool_calls));
+        if let Some(failed) = &digest.handoff.last_failed_tool {
+            buf.push_str(&format!("- **last:** {}\n", failed.describe()));
         }
         buf.push('\n');
     }
@@ -913,17 +1017,22 @@ impl SessionDigest {
         let mut tool_counts = BTreeMap::new();
         for obs in observations {
             if obs.kind == ObservationKind::PostToolUse && !obs.title.is_empty() {
-                *tool_counts.entry(obs.title.clone()).or_insert(0) += 1;
+                *tool_counts
+                    .entry(tool_title_display(&obs.title).to_owned())
+                    .or_insert(0) += 1;
             }
         }
         let prompt_titles_all: Vec<String> = observations
             .iter()
             .filter(|o| o.kind == ObservationKind::UserPrompt)
             .map(|o| o.title.clone())
+            .filter(|title| !looks_like_machine_turn(title))
             .collect();
-        // The store's bounded read keeps every title when the session fits in
-        // the cap and the first/last slice when it does not; mirror that here
-        // so the row-list digest and the database digest stay equal.
+        // The store drops machine turns from the `## Prompts` list and its
+        // count (other scaffolding stays), then keeps every remaining title
+        // when the session fits the cap and the first/last slice when it does
+        // not; mirror both here so the row-list digest and the database digest
+        // stay equal (#2149).
         let (prompt_count, prompt_titles) = if prompt_titles_all.len() <= PROMPT_TITLES_MAX {
             (prompt_titles_all.len(), prompt_titles_all)
         } else {
@@ -956,6 +1065,7 @@ impl SessionDigest {
             prompt_titles,
             prompt_count,
             tool_counts,
+            failed_tool_calls: observations.iter().filter(|o| is_failed_tool(o)).count(),
             title,
             handoff: HandoffFacts::from_observations(observations),
         }
@@ -974,6 +1084,7 @@ impl HandoffFacts {
                 .rev()
                 .find(|o| o.kind == ObservationKind::PostToolUse)
                 .map(|o| o.title.clone()),
+            last_failed_tool: observations.iter().rev().find_map(failed_tool_fact),
             latest_assistant: observations.iter().rev().find_map(assistant_response),
             has_stop: observations.iter().any(|o| o.kind == ObservationKind::Stop),
             has_session_end: observations
@@ -985,9 +1096,10 @@ impl HandoffFacts {
                     matches!(
                         o.kind,
                         ObservationKind::PostToolUse | ObservationKind::PreToolUse
-                    ) && is_listable_tool_title(&o.title)
+                    )
                 })
-                .map(|o| o.title.clone())
+                .filter_map(|o| listable_tool_name(&o.title))
+                .map(str::to_owned)
                 .collect(),
         }
     }
@@ -1052,6 +1164,12 @@ mod tests {
     fn obs_at(kind: ObservationKind, title: &str, at: &str) -> Observation {
         let mut o = obs(kind, title);
         o.created_at = at.parse::<Timestamp>().expect("fixture timestamp");
+        o
+    }
+
+    fn obs_with_body(kind: ObservationKind, title: &str, body: &str) -> Observation {
+        let mut o = obs(kind, title);
+        o.body = body.into();
         o
     }
 
@@ -1253,6 +1371,31 @@ mod tests {
             !summary.contains("across"),
             "nothing nameable is left, so the clause must go rather than be filled: {summary}"
         );
+    }
+
+    /// The reserved-protocol path titles a call with the bare family name
+    /// ("non-file", "file") rather than "tool non-file". Both spellings are
+    /// family labels: counted, never named, never a page title.
+    #[test]
+    fn bare_family_labels_are_counted_but_not_named() {
+        let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
+        for (tool, calls) in [("non-file", 9), ("file", 4), ("unknown", 2)] {
+            for _ in 0..calls {
+                observations.push(obs(ObservationKind::PostToolUse, tool));
+            }
+        }
+        assert_eq!(
+            session_summary(&tally_session(&observations)),
+            "1 prompt, 15 completed tool calls."
+        );
+
+        let sid = test_session_id();
+        let labels_only = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+            obs(ObservationKind::PostToolUse, "file"),
+        ];
+        assert_eq!(derive_title(&labels_only, sid), format!("Session {sid}"));
     }
 
     /// A session that mixes both keeps the names it has. The families still
@@ -1517,6 +1660,42 @@ mod tests {
     }
 
     #[test]
+    fn claude_machine_turns_are_kept_out_of_the_title_and_the_prompts_list() {
+        // #2149: Claude Code delivers agent-team and cross-session traffic to
+        // the prompt channel. It must neither title the page nor appear in the
+        // `## Prompts` list, while the user's own prompt does both.
+        let obs = vec![
+            obs(
+                ObservationKind::UserPrompt,
+                "<teammate-message teammate_id=\"team-lead\" summary=\"heads up\">rollout note",
+            ),
+            obs(ObservationKind::UserPrompt, "fix the auth bug"),
+            obs(
+                ObservationKind::UserPrompt,
+                "Another Claude session sent a message. It is shown below.",
+            ),
+            obs(ObservationKind::UserPrompt, "<task-notification>\ndone"),
+        ];
+        let tally = tally_session(&obs);
+        assert_eq!(tally.title, "fix the auth bug");
+        assert_eq!(tally.prompt_count, 1, "only the user's prompt is counted");
+        assert_eq!(tally.prompt_titles, vec!["fix the auth bug".to_string()]);
+
+        let body = render_body(test_session_id(), &tally, &tally.title);
+        // The `## Prompts` list carries only the user's prompt. The machine
+        // turns are still real session history and remain in `## Raw
+        // observations`, which is the right home for them (#2149).
+        let prompts = body
+            .split("## Prompts\n\n")
+            .nth(1)
+            .expect("the page lists its prompts")
+            .split("\n## Raw observations")
+            .next()
+            .unwrap();
+        assert_eq!(prompts.trim(), "1. fix the auth bug");
+    }
+
+    #[test]
     fn title_falls_back_through_kinds() {
         let no_prompt = vec![obs(ObservationKind::PostToolUse, "Edit")];
         assert_eq!(derive_title(&no_prompt, test_session_id()), "Edit");
@@ -1561,6 +1740,200 @@ mod tests {
         assert!(page.body.contains("`Edit`: 2"));
         assert!(page.body.contains("`Bash`: 1"));
         assert!(page.body.contains("build the thing"));
+    }
+
+    /// `[ingest] record_tool_names` titles count under their tool name, a bare
+    /// family label still counts under the label, and the file family they
+    /// carry still marks an abrupt ending.
+    #[test]
+    fn recorded_tool_names_count_by_name_and_keep_the_file_signal() {
+        let observations = vec![
+            obs(ObservationKind::SessionStart, "session"),
+            obs(ObservationKind::UserPrompt, "rework the retry loop"),
+            obs(ObservationKind::PostToolUse, "tool non-file: Bash"),
+            obs(ObservationKind::PostToolUse, "tool non-file: Bash"),
+            obs(ObservationKind::PostToolUse, "tool unknown: Skill"),
+            obs(ObservationKind::PostToolUse, "tool non-file"),
+            obs(ObservationKind::PostToolUse, "tool file: Edit"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::ClaudeCode,
+            &observations,
+        );
+        assert!(page.body.contains("- `Bash`: 2\n"), "{}", page.body);
+        assert!(page.body.contains("- `Skill`: 1\n"), "{}", page.body);
+        assert!(page.body.contains("- `Edit`: 1\n"), "{}", page.body);
+        assert!(
+            page.body.contains("- `tool non-file`: 1\n"),
+            "{}",
+            page.body
+        );
+        assert!(
+            !page.body.contains("`tool non-file: Bash`"),
+            "{}",
+            page.body
+        );
+        assert!(
+            page.body
+                .contains("Session ended without a normal stop while working with files"),
+            "{}",
+            page.body
+        );
+    }
+
+    /// Failed calls are counted in the summary and the newest one is quoted,
+    /// with the tool name when recorded and never its arguments.
+    #[test]
+    fn failed_tool_calls_are_counted_and_the_last_one_is_quoted() {
+        let page_for = |rows: &[Observation]| {
+            synthesize_session_page(
+                WorkspaceId::new(),
+                ProjectId::new(),
+                SessionId::new(),
+                AgentKind::ClaudeCode,
+                rows,
+            )
+        };
+        let observations = vec![
+            obs(ObservationKind::UserPrompt, "make the tests pass"),
+            obs_with_body(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\ntool_call_id: toolu_1\noutcome: error\n---\n\
+                 Exit code 1\nError: Cannot find module 'express'\n    at require",
+            ),
+            obs_with_body(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\ntool_call_id: toolu_2\noutcome: unknown\n---\n\
+                 {\"stdout\":\"42 passing\"}",
+            ),
+        ];
+        let digest = tally_session(&observations);
+        assert_eq!(digest.failed_tool_calls(), 1);
+        assert_eq!(
+            session_summary(&digest),
+            "1 prompt, 2 completed tool calls across Bash, 1 failed."
+        );
+        let page = page_for(&observations);
+        assert!(
+            page.body
+                .contains("## Failed tool calls\n\n- **count:** 1\n"),
+            "{}",
+            page.body
+        );
+        assert!(
+            page.body.contains(
+                "- **last:** Bash: Exit code 1 Error: Cannot find module 'express' at require\n"
+            ),
+            "{}",
+            page.body
+        );
+        assert!(!page.body.contains("toolu_1"), "{}", page.body);
+
+        // A family label names no tool; a header-only body still counts.
+        let bare = vec![
+            obs_with_body(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: error\n---\nENOENT: no such file",
+            ),
+            obs_with_body(
+                ObservationKind::PostToolUse,
+                "tool unknown",
+                "tool_family: unknown\nmcp_server: aim\nmcp_tool: memory_query\noutcome: error",
+            ),
+        ];
+        let digest = tally_session(&bare);
+        assert_eq!(digest.failed_tool_calls(), 2);
+        assert_eq!(
+            digest
+                .handoff_facts()
+                .last_failed_tool
+                .as_ref()
+                .map(FailedToolFact::describe),
+            Some("(no error text captured)".to_string())
+        );
+        assert_eq!(
+            session_summary(&digest),
+            "2 completed tool calls, 2 failed."
+        );
+        let page = page_for(&bare);
+        assert!(
+            page.body.contains("- **last:** (no error text captured)\n"),
+            "{}",
+            page.body
+        );
+
+        // Control: no failures, nothing added.
+        let fine = vec![obs_with_body(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            "tool_family: non-file\noutcome: unknown\n---\nok",
+        )];
+        let digest = tally_session(&fine);
+        assert_eq!(digest.failed_tool_calls(), 0);
+        assert!(digest.handoff_facts().last_failed_tool.is_none());
+        assert_eq!(
+            session_summary(&digest),
+            "1 completed tool call across Bash."
+        );
+        let page = page_for(&fine);
+        assert!(!page.body.contains("Failed tool calls"), "{}", page.body);
+    }
+
+    /// Adversarial: the marker is read from the header only, so a tool output
+    /// that echoes a stored body is not a failure. A long error is capped.
+    #[test]
+    fn an_outcome_marker_inside_tool_output_is_not_a_failure() {
+        let echoed = obs_with_body(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            "tool_family: non-file\noutcome: unknown\n---\n\
+             tool_family: file\noutcome: error\n---\nquoted from a page\noutcome: error",
+        );
+        let prompt = obs_with_body(
+            ObservationKind::UserPrompt,
+            "why outcome: error",
+            "tool_family: file\noutcome: error\n---\nnot a tool row",
+        );
+        let digest = tally_session(&[prompt, echoed]);
+        assert_eq!(digest.failed_tool_calls(), 0);
+        assert!(digest.handoff_facts().last_failed_tool.is_none());
+
+        let long = obs_with_body(
+            ObservationKind::PostToolUse,
+            "Bash",
+            &format!(
+                "tool_family: non-file\noutcome: error\n---\n{}",
+                "e ".repeat(400)
+            ),
+        );
+        let fact = failed_tool_fact(&long).expect("a failed call");
+        assert!(
+            fact.error.len() <= FAILED_TOOL_EXCERPT_BYTES,
+            "{}",
+            fact.error
+        );
+        assert!(fact.error.ends_with('…'));
+        assert_eq!(fact.describe(), format!("Bash: {}", fact.error));
+    }
+
+    /// The store and the router spell the marker in different crates; keep
+    /// them equal.
+    #[test]
+    fn the_failed_outcome_marker_is_the_one_the_router_writes() {
+        assert_eq!(
+            format!(
+                "{}{}",
+                ai_memory_core::TOOL_OUTCOME_LINE_PREFIX,
+                crate::capture_policy::ToolOutcome::Error.as_str()
+            ),
+            FAILED_TOOL_OUTCOME_LINE
+        );
     }
 
     #[test]
@@ -1760,6 +2133,34 @@ mod load_with_count_scopes {
 
     use super::*;
 
+    async fn insert_obs(
+        store: &Store,
+        sid: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        kind: ObservationKind,
+        body: &str,
+    ) {
+        let obs = NewObservation {
+            session_id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            kind,
+            extension: None,
+            source_event: None,
+            title: "scoped test event".into(),
+            body: body.into(),
+            importance: 5,
+            occurred_at: None,
+            file_path: None,
+        };
+        store
+            .writer
+            .insert_observation(Sanitized::new(obs, &Sanitizer::builtin()))
+            .await
+            .unwrap();
+    }
+
     /// The new raw-id entry point must refuse foreign tuples the way the
     /// bounded read refuses them: the idle tick's digest can never load a
     /// session's observations through a scope the session does not belong
@@ -1803,32 +2204,6 @@ mod load_with_count_scopes {
             })
             .await
             .unwrap();
-        async fn insert_obs(
-            store: &Store,
-            sid: SessionId,
-            ws: WorkspaceId,
-            proj: ProjectId,
-            kind: ObservationKind,
-            body: &str,
-        ) {
-            let obs = NewObservation {
-                session_id: sid,
-                workspace_id: ws,
-                project_id: proj,
-                kind,
-                extension: None,
-                source_event: None,
-                title: "scoped test event".into(),
-                body: body.into(),
-                importance: 5,
-                occurred_at: None,
-            };
-            store
-                .writer
-                .insert_observation(Sanitized::new(obs, &Sanitizer::builtin()))
-                .await
-                .unwrap();
-        }
         insert_obs(&store, sid, ws, proj, ObservationKind::UserPrompt, "prompt").await;
         insert_obs(&store, sid, ws, proj, ObservationKind::PostToolUse, "tool").await;
         let reader = store.reader.clone();
@@ -1859,5 +2234,53 @@ mod load_with_count_scopes {
             .unwrap();
         assert_eq!(count, 2, "the digest's snapshot counts both rows");
         assert_eq!(digest.total, 2);
+    }
+
+    /// The digest holds only this scope's rows, but the count it hands the
+    /// idle end's stamp is the whole session's, the population the stamp
+    /// re-counts. When they were the same number a session that crossed into
+    /// another project could never pass the stamp's check.
+    #[tokio::test]
+    async fn the_count_covers_every_project_while_the_digest_keeps_to_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "idle", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+            })
+            .await
+            .unwrap();
+        insert_obs(&store, sid, ws, proj, ObservationKind::UserPrompt, "home").await;
+        insert_obs(&store, sid, ws, other, ObservationKind::UserPrompt, "away").await;
+        insert_obs(&store, sid, ws, other, ObservationKind::PostToolUse, "away").await;
+
+        let (digest, count) = SessionDigest::load_with_count(&store.reader.clone(), ws, proj, sid)
+            .await
+            .unwrap();
+        assert_eq!(count, 3, "the count covers every project's rows");
+        assert_eq!(digest.total, 1, "the digest holds only this project's row");
     }
 }

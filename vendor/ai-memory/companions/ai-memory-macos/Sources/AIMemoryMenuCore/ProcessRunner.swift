@@ -52,6 +52,10 @@ public struct ProcessRunner: CommandRunning {
 
         try process.run()
 
+        // A child can fill either pipe before exiting, so both must be drained
+        // while the timeout loop waits for it.
+        let outReader = ProcessOutput(stdout.fileHandleForReading)
+        let errReader = ProcessOutput(stderr.fileHandleForReading)
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning, Date() < deadline {
             Thread.sleep(forTimeInterval: 0.05)
@@ -61,13 +65,31 @@ public struct ProcessRunner: CommandRunning {
             throw CliError.timeout
         }
 
-        let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderr.fileHandleForReading.readDataToEndOfFile()
         return ProcessResult(
             exitCode: process.terminationStatus,
-            stdout: String(data: outData, encoding: .utf8) ?? "",
-            stderr: String(data: errData, encoding: .utf8) ?? ""
+            stdout: String(data: outReader.read(), encoding: .utf8) ?? "",
+            stderr: String(data: errReader.read(), encoding: .utf8) ?? ""
         )
+    }
+}
+
+private final class ProcessOutput: @unchecked Sendable {
+    private let completed = DispatchGroup()
+    private let lock = NSLock()
+    private var data = Data()
+
+    init(_ handle: FileHandle) {
+        completed.enter()
+        DispatchQueue.global().async {
+            let output = handle.readDataToEndOfFile()
+            self.lock.withLock { self.data = output }
+            self.completed.leave()
+        }
+    }
+
+    func read() -> Data {
+        completed.wait()
+        return lock.withLock { data }
     }
 }
 

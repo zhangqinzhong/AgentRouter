@@ -10,7 +10,7 @@ import { ProviderIcon } from "@/vendor/tokentracker/ui/dashboard/components/Prov
 import { Spinner } from "@/components/ui/spinner";
 
 type Source = { agent: string; name: string; paths: string[]; enabled: boolean; available: boolean };
-type Snapshot = { sources: Source[]; locations: Array<[string, string]> };
+type Snapshot = { instances?: Array<{root:string;name:string;source:string}>; sources: Source[]; locations: Array<[string, string]> };
 type LocationRow = Source & { path: string; configuredPath?: string };
 type LocationGroup = { agent: string; root: string; kind: "custom" | "profile" | "default"; name?: string; configuredPath?: string; rows: LocationRow[] };
 type PageProps = { configDir?: string; profiles?: Pick<ProfileConfig, "id" | "name">[] };
@@ -42,7 +42,7 @@ export function collectionLocationGroups(snapshot: Snapshot, { configDir, profil
     if (!groups.has(key)) groups.set(key, {
       agent: row.agent, root, configuredPath: row.configuredPath,
       kind: row.configuredPath ? "custom" : profileId ? "profile" : "default",
-      name: profileId ? profiles.find(profile => profile.id === profileId)?.name || profileId : undefined,
+      name: snapshot.instances?.find(instance => instance.source === (row.agent === "claude-code" ? "claude" : "codex") && normalize(instance.root) === normalize(root).replace(/\/(projects|sessions|archived_sessions)$/, ""))?.name || (profileId ? profiles.find(profile => profile.id === profileId)?.name || profileId : undefined),
       rows: []
     });
     groups.get(key)!.rows.push(row);
@@ -56,6 +56,8 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
   const [adding, setAdding] = useState(false);
   const [agent, setAgent] = useState("claude-code");
   const [directory, setDirectory] = useState("");
+  const [instanceName, setInstanceName] = useState("");
+  const [editedNames, setEditedNames] = useState<Record<string,string>>({});
   const [busy, setBusy] = useState(false);
   const [collecting, setCollecting] = useState(false);
   const [error, setError] = useState("");
@@ -75,11 +77,11 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
     setBusy(true); setError("");
     try {
       for (const { op, args } of operations) await api(op, args);
-      if (operations.some(({ op }) => op === "location-add")) { setDirectory(""); setAdding(false); }
+      if (operations.some(({ op }) => op === "location-add")) { setDirectory(""); setInstanceName(""); setAdding(false); }
       await load();
       // A scan preference changes future collection. Existing usage stays in
       // place; toggling one location must not force a full history rebuild.
-      if (operations.some(({ op }) => op !== "location-state")) void collect();
+      if (operations.some(({ op }) => op !== "location-state" && op !== "location-label")) void collect();
     } catch (error) {
       setError(t((error instanceof Error ? error.message : String(error)).trim()));
       // A grouped update can partly succeed. Reflect persisted state even if a later path fails.
@@ -110,6 +112,12 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
           <ChevronRight className="mt-1 h-3.5 w-3.5 shrink-0 text-muted-foreground/50 transition-transform group-open/location:rotate-90" />
         </summary>
         <div className="ml-[30px] mt-3 rounded-lg bg-muted/35 px-3 py-2.5">
+          {group.configuredPath && <div className="mb-3 flex items-end gap-2">
+            <label className="min-w-0 flex-1 space-y-1 text-xs">{t("Instance name")}
+              <Input aria-label={`${t("Instance name")} ${group.root}`} value={editedNames[group.root] ?? group.name ?? ""} maxLength={100} onChange={event => setEditedNames(current => ({...current,[group.root]:event.target.value}))} />
+            </label>
+            <Button size="sm" disabled={busy} onClick={() => void mutate([{op:"location-label",args:{agent:group.agent,path:group.configuredPath,name:editedNames[group.root] ?? group.name ?? ""}}])}>{t("Save")}</Button>
+          </div>}
           <ul className="space-y-3">{group.rows.filter(row => row.available || group.configuredPath).map(row => <li key={row.path} className="space-y-1">
             <div className="flex flex-wrap items-center gap-2 text-label">
               <span className={`h-1.5 w-1.5 rounded-full ${row.available && row.enabled ? "bg-emerald-500" : "bg-muted-foreground/30"}`} />
@@ -137,7 +145,7 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
         <Button type="button" variant="outline" size="sm" aria-expanded={adding} onClick={() => setAdding(value => !value)}><Plus className="h-3.5 w-3.5" />{t("Add directory")}</Button>
       </div>
     </header>
-    {adding && <form className="space-y-3 rounded-xl border border-border/70 bg-muted/20 p-4" onSubmit={event => { event.preventDefault(); void mutate([{ op: "location-add", args: { agent, path: directory.trim() } }]); }}>
+    {adding && <form className="space-y-3 rounded-xl border border-border/70 bg-muted/20 p-4" onSubmit={event => { event.preventDefault(); void mutate([{ op: "location-add", args: { agent, path: directory.trim(), name: instanceName.trim() } }]); }}>
       <div className="grid gap-3 sm:grid-cols-[140px_minmax(0,1fr)]">
         <label className="space-y-1.5 text-xs font-medium">{t("Client")}
           <SelectControl value={agent} onChange={setAgent} options={clients.map(client => ({ value: client.agent, label: client.name }))} />
@@ -146,6 +154,7 @@ export function DataSourcesSettingsPage({ configDir, profiles }: PageProps = {})
           <Input aria-label={t("Data directory")} value={directory} onChange={event => setDirectory(event.target.value)} placeholder={agent === "claude-code" ? "~/.claude" : "~/.codex"} autoComplete="off" spellCheck={false} />
         </label>
       </div>
+      <label className="block space-y-1.5 text-xs font-medium">{t("Instance name")}<Input value={instanceName} onChange={event => setInstanceName(event.target.value)} maxLength={100} placeholder={t("Optional")} /></label>
       <div className="flex justify-end gap-2"><Button type="button" size="sm" variant="ghost" onClick={() => setAdding(false)}>{t("Cancel")}</Button><Button type="submit" size="sm" disabled={busy || collecting || !directory.trim()}>{t("Add")}</Button></div>
     </form>}
     {error && <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{error}</div>}

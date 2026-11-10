@@ -1,0 +1,780 @@
+//! Presentation-only localization of clap metadata and parser diagnostics.
+
+use ai_memory_core::i18n::{Language, Localizer};
+use std::ffi::{OsStr, OsString};
+
+pub(crate) fn language_hint(args: &[OsString], environment: Option<&OsStr>) -> Language {
+    let mut selected = environment
+        .and_then(OsStr::to_str)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default();
+    let mut args = args.iter().skip(1).take_while(|value| *value != "--");
+    while let Some(value) = args.next() {
+        let value = value.to_string_lossy();
+        let language = if value == "--language" {
+            args.next().and_then(|value| value.to_str())
+        } else {
+            value.strip_prefix("--language=")
+        };
+        if let Some(language) = language.and_then(|value| value.parse().ok()) {
+            selected = language;
+        }
+    }
+    selected
+}
+
+/// Translate a message from a path that never loads configuration. Hooks run
+/// before `Config::load`, so only `AI_MEMORY_LANGUAGE` reaches them.
+///
+/// Hook warnings quote transport and server errors (a failed handoff fetch,
+/// a spool error), so the rendered line is neutralized like [`diagnostic`].
+pub(crate) fn process_diagnostic(text: &str) -> String {
+    let language = language_hint(
+        &[],
+        crate::config::RuntimeEnv::from_process()
+            .var_os("AI_MEMORY_LANGUAGE")
+            .as_deref(),
+    );
+    let rendered = if language == Language::English {
+        text.to_owned()
+    } else {
+        Localizer::new(language).diagnostic(text)
+    };
+    crate::commands::show::terminal_text(&rendered)
+}
+
+/// A failure already rendered for the terminal in the operator's language.
+#[derive(Debug)]
+struct RenderedFailure(String);
+
+impl std::fmt::Display for RenderedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RenderedFailure {}
+
+/// Translate an error chain where it leaves the process. English keeps the
+/// error untouched, so the source chain and its exit output stay as they were.
+pub(crate) fn localize_failure(error: anyhow::Error, language: Language) -> anyhow::Error {
+    if language == Language::English {
+        return error;
+    }
+    let i18n = Localizer::new(language);
+    let mut causes = error
+        .chain()
+        .map(|cause| i18n.diagnostic(&cause.to_string()));
+    let mut text = i18n.format(
+        "cli-error-report",
+        &[("message", causes.next().unwrap_or_default())],
+    );
+    let causes = causes.collect::<Vec<_>>();
+    if !causes.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&i18n.text("cli-error-caused-by"));
+        for (index, cause) in causes.iter().enumerate() {
+            let indented = cause.replace('\n', "\n       ");
+            text.push_str(&if causes.len() == 1 {
+                format!("\n    {indented}")
+            } else {
+                format!("\n{index:>5}: {indented}")
+            });
+        }
+    }
+    anyhow::Error::new(RenderedFailure(text))
+}
+
+/// The text `main` prints for a failed run, matching Rust's own `Error: {:?}`
+/// for anything that was not rendered above.
+///
+/// An error chain can quote server text that never passed a renderer: a
+/// decode error names the unknown enum variant or field it was sent, and a
+/// `bail!` can interpolate a response field. This is the one place every
+/// failure leaves the process, so terminal controls are neutralized here.
+pub fn failure_report(error: &anyhow::Error) -> String {
+    let report = error
+        .downcast_ref::<RenderedFailure>()
+        .map_or_else(|| format!("Error: {error:?}"), ToString::to_string);
+    // A configuration parse error echoes the offending source line, which can
+    // hold `bearer_token = "…"` or a `user:password@` URL (GHSA-6pmr-q79m-87vp
+    // item 3). This is the one place every fatal failure leaves the process, so
+    // redact the credential out of any echoed assignment or URL here.
+    let report = crate::commands::render_shared::redact_config_echo(&report);
+    crate::commands::show::terminal_body(&report)
+}
+
+/// The text of a diagnostic printed while the command keeps running.
+///
+/// A recoverable failure continues the run, so its message never reaches
+/// [`failure_report`]: the one place every *fatal* failure is neutralized.
+/// These messages quote the same foreign text, though — a decode error names
+/// the value it was sent, and an HTTP detail is whatever the server returned —
+/// so the rendered line is neutralized here. Translating first keeps the
+/// language catalog keyed on the untouched English text (#2000).
+pub(crate) fn diagnostic(i18n: &Localizer, text: impl std::fmt::Display) -> String {
+    crate::commands::show::terminal_text(&i18n.diagnostic(&text.to_string()))
+}
+
+/// A catalog line printed by `ai-memory run` and the commands that recover,
+/// resume or report its workstreams. Their values are server or transcript
+/// text (workstream, project and session names, journaled failure reasons),
+/// so each one is neutralized before it is placed in the message (#2010).
+pub(crate) fn format(i18n: &Localizer, id: &str, values: &[(&str, String)]) -> String {
+    let values = values
+        .iter()
+        .map(|(name, value)| (*name, crate::commands::show::terminal_text(value)))
+        .collect::<Vec<_>>();
+    i18n.format(id, &values)
+}
+
+pub(crate) fn command(mut command: clap::Command, path: &str, i18n: &Localizer) -> clap::Command {
+    if i18n.language() == Language::English {
+        return command;
+    }
+    if command.get_name() == "help" {
+        return command.about(i18n.text("cli-help-option-help"));
+    }
+    command.build();
+    if command.get_about().is_some() {
+        command = command.about(i18n.text(&format!("cli-help-{path}-about")));
+    }
+    if command.get_long_about().is_some() {
+        command = command.long_about(i18n.text(&format!("cli-help-{path}-long-about")));
+    }
+    let ids = command
+        .get_arguments()
+        .map(|arg| arg.get_id().clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == &id)
+            .cloned();
+        let Some(arg) = arg else {
+            continue;
+        };
+        let path = if arg.is_global_set() { "root" } else { path };
+        let base = format!("cli-help-{path}-{}", id.as_str().replace('_', "-"));
+        let help = if id == "help" {
+            Some(i18n.text("cli-help-option-help"))
+        } else if id == "version" {
+            Some(i18n.text("cli-help-option-version"))
+        } else {
+            arg.get_help().map(|_| i18n.text(&format!("{base}-help")))
+        };
+        let long_help = if id == "help" || id == "version" {
+            help.clone()
+        } else {
+            arg.get_long_help()
+                .map(|_| i18n.text(&format!("{base}-long-help")))
+        };
+        command = command.mut_arg(id, |mut arg| {
+            if let Some(help) = help {
+                arg = arg.help(help);
+            }
+            if let Some(help) = long_help {
+                arg = arg.long_help(help);
+            }
+            let heading = if arg.is_positional() {
+                "cli-help-arguments"
+            } else {
+                "cli-help-options"
+            };
+            arg.help_heading(i18n.text(heading))
+        });
+    }
+    command = command
+        .subcommand_help_heading(i18n.text("cli-help-commands"))
+        .help_template(i18n.text("cli-help-template"));
+    command.mut_subcommands(|subcommand| {
+        let subpath = format!("{path}-{}", subcommand.get_name());
+        self::command(subcommand, &subpath, i18n)
+    })
+}
+
+pub(crate) fn exit(error: clap::Error, i18n: &Localizer) -> ! {
+    use clap::error::ErrorKind;
+    if i18n.language() == Language::English
+        || matches!(
+            error.kind(),
+            ErrorKind::DisplayHelp
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                | ErrorKind::DisplayVersion
+        )
+    {
+        error.exit();
+    }
+    eprintln!("{}", parse_error(&error, i18n));
+    std::process::exit(error.exit_code());
+}
+
+fn parse_error(error: &clap::Error, i18n: &Localizer) -> String {
+    use clap::error::{ContextKind, ErrorKind};
+    let id = match error.kind() {
+        ErrorKind::UnknownArgument => "cli-parse-unknown-argument",
+        ErrorKind::InvalidSubcommand => "cli-parse-unknown-command",
+        ErrorKind::MissingSubcommand => "cli-parse-missing-command",
+        ErrorKind::MissingRequiredArgument => "cli-parse-required-argument",
+        ErrorKind::ArgumentConflict => "cli-parse-conflicting-arguments",
+        ErrorKind::TooManyValues | ErrorKind::TooFewValues | ErrorKind::WrongNumberOfValues => {
+            "cli-parse-value-count"
+        }
+        _ => "cli-parse-invalid-value",
+    };
+    let detail = [
+        ContextKind::InvalidArg,
+        ContextKind::InvalidSubcommand,
+        ContextKind::InvalidValue,
+    ]
+    .into_iter()
+    .filter_map(|kind| error.get(kind))
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("; ");
+    format!(
+        "{}: {}\n\n{}",
+        i18n.text(id),
+        detail,
+        i18n.text("cli-parse-help-hint")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// GHSA-6pmr item 3: a configuration parse error echoes the offending
+    /// source line, which can hold the bearer. `failure_report` is the single
+    /// place every fatal error leaves the process, so it must redact the
+    /// credential out of that echo. Fails if the redaction is removed.
+    #[test]
+    fn failure_report_redacts_a_credential_echoed_by_a_config_parse_error() {
+        let echoed = "TOML parse error at line 2, column 16\n  |\n2 | bearer_token = \"aim_SYNTHETICsecretvalue\" trailing\n  |                ^";
+        let error = anyhow::anyhow!("{echoed}").context("loading config.toml");
+        let report = failure_report(&error);
+        assert!(
+            !report.contains("aim_SYNTHETICsecretvalue"),
+            "leaked: {report}"
+        );
+        assert!(report.contains("bearer_token = [REDACTED]"), "{report}");
+        // The error's shape is kept.
+        assert!(
+            report.contains("line 2") && report.contains("2 |"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn help_catalogs_track_the_command_tree() {
+        fn visit(command: clap::Command, path: &str, i18n: &Localizer) {
+            for (suffix, value) in [
+                ("about", command.get_about()),
+                ("long-about", command.get_long_about()),
+            ] {
+                if let Some(value) = value {
+                    assert_eq!(
+                        i18n.text(&format!("cli-help-{path}-{suffix}")),
+                        value.to_string()
+                    );
+                }
+            }
+            for arg in command.get_arguments() {
+                for (suffix, value) in
+                    [("help", arg.get_help()), ("long-help", arg.get_long_help())]
+                {
+                    if let Some(value) = value {
+                        let id = format!(
+                            "cli-help-{path}-{}-{suffix}",
+                            arg.get_id().as_str().replace('_', "-")
+                        );
+                        assert_eq!(
+                            i18n.text(&id),
+                            value.to_string(),
+                            "{id}: update both help catalogs when changing CLI metadata"
+                        );
+                    }
+                }
+            }
+            for sub in command.get_subcommands() {
+                visit(sub.clone(), &format!("{path}-{}", sub.get_name()), i18n);
+            }
+        }
+        visit(crate::cli::Cli::command(), "root", &Localizer::default());
+    }
+
+    #[test]
+    fn portuguese_help_contains_translated_descriptions_and_keeps_command_names() {
+        let i18n = Localizer::new(Language::PortugueseBrazil);
+        let mut command = command(crate::cli::Cli::command(), "root", &i18n);
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("Comandos:"), "{help}");
+        assert!(help.contains("Uso:"), "{help}");
+        assert!(help.contains("--language"));
+        assert!(help.contains("Exibir ajuda"));
+        fn visit(command: &mut clap::Command) {
+            let help = command.render_long_help().to_string();
+            assert!(
+                !help.contains("cli-help-"),
+                "unresolved translation in {help}"
+            );
+            for sub in command.get_subcommands_mut() {
+                visit(sub);
+            }
+        }
+        visit(&mut command);
+    }
+
+    #[test]
+    fn wrapper_language_does_not_consume_a_native_language_flag() {
+        let cli = crate::cli::try_parse_from([
+            "ai-memory",
+            "--language",
+            "pt-BR",
+            "run",
+            "codex",
+            "--language",
+            "en",
+        ])
+        .unwrap();
+        assert_eq!(cli.language, Some(Language::PortugueseBrazil));
+        let crate::cli::Command::Run(run) = cli.command else {
+            panic!("run command");
+        };
+        assert_eq!(run.native_args, ["--language", "en"]);
+    }
+
+    #[test]
+    fn failures_are_translated_for_the_terminal_and_keep_english_unchanged() {
+        let failure = || anyhow::anyhow!("permission denied").context("reading /tmp/x");
+        let english = localize_failure(failure(), Language::English);
+        assert_eq!(failure_report(&english), format!("Error: {:?}", failure()));
+        let report = failure_report(&localize_failure(failure(), Language::PortugueseBrazil));
+        assert_eq!(
+            report,
+            "Erro: lendo /tmp/x\n\nCausado por:\n    permission denied"
+        );
+    }
+
+    #[test]
+    fn failure_report_neutralizes_terminal_controls_in_every_language() {
+        let failure = || {
+            anyhow::anyhow!("unknown variant `x\u{1b}]52;c;cHduZWQ=\u{7}`")
+                .context("decoding caf\u{e9} \u{202e}reply")
+        };
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let report = failure_report(&localize_failure(failure(), language));
+            assert!(
+                !report.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+                "terminal control survived: {report:?}"
+            );
+            // Control: the text stays readable, accents and the multi-line
+            // cause layout included.
+            assert!(report.contains("x?]52;c;cHduZWQ=?"), "{report:?}");
+            assert!(report.contains("caf\u{e9} ?reply"), "{report:?}");
+            assert!(report.contains('\n'), "{report:?}");
+        }
+    }
+
+    /// #2000: a recoverable failure keeps the command running, so it never
+    /// passes `failure_report`. Its diagnostic still quotes a server value —
+    /// a decode error names the token it was sent — and must print inert.
+    #[test]
+    fn mid_run_diagnostic_neutralizes_terminal_controls_in_every_language() {
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Status {
+            Ready,
+        }
+        let error =
+            serde_json::from_str::<Status>("\"\\u001b]52;c;cHduZWQ=\\u0007\\u202e\\u200f\"")
+                .expect_err("the payload is not a known status");
+        assert!(
+            format!("{error:#}").contains('\u{1b}'),
+            "control: serde quotes the decoded value"
+        );
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let line = diagnostic(
+                &Localizer::new(language),
+                format!("decoding reply ({error:#})"),
+            );
+            assert!(
+                !line.contains(['\u{1b}', '\u{7}', '\u{202e}', '\u{200f}']),
+                "terminal control survived: {line:?}"
+            );
+            assert!(line.contains("?]52;c;cHduZWQ=???"), "{line:?}");
+            assert!(!line.contains('\n'), "{line:?}");
+        }
+    }
+
+    /// #2000: hook warnings quote transport and server errors too; whatever
+    /// language the process runs in, the line prints inert.
+    #[test]
+    fn process_diagnostic_neutralizes_terminal_controls() {
+        let line = process_diagnostic(
+            "ai-memory hook warning: handoff fetch failed (\u{1b}]52;c;eA==\u{7}\u{202e}); \
+             recover a pending one with memory_handoff_accept",
+        );
+        assert!(
+            !line.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+            "terminal control survived: {line:?}"
+        );
+        assert!(line.contains("?]52;c;eA==??"), "{line:?}");
+    }
+
+    /// #2010: a catalog line around `ai-memory run` quotes a workspace,
+    /// project or workstream name the server returned; each value prints
+    /// inert in both languages.
+    #[test]
+    fn run_catalog_lines_neutralize_their_values() {
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let line = format(
+                &Localizer::new(language),
+                "cli-workstreams-managed-workstreams-for-workspace-project",
+                &[
+                    ("value0", "default".to_owned()),
+                    ("value1", "api\u{1b}]0;owned\u{7}\u{202e}".to_owned()),
+                ],
+            );
+            assert!(
+                !line.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+                "terminal control survived: {line:?}"
+            );
+            assert!(line.contains("default/api?]0;owned??"), "{line:?}");
+        }
+    }
+
+    /// #2000, #2010: a diagnostic that interpolates a value prints error,
+    /// server or transcript text (a workstream, project or session name, a
+    /// profile name, a failure reason), so it goes through [`diagnostic`],
+    /// which neutralizes it, never the bare `Localizer::diagnostic` that only
+    /// translates. The one exception is a multi-line message, which
+    /// `diagnostic` would flatten: each of its values is passed positionally
+    /// and wrapped in `terminal_text`/`terminal_body` at the call. The
+    /// commands around `ai-memory run` print catalog lines only through
+    /// [`format`], and anywhere else a catalog line that quotes an error, a
+    /// reason, or a workspace or project name does too: those names come from
+    /// a marker the repository shipped or from the server.
+    #[test]
+    fn interpolated_cli_lines_use_the_neutralizing_helpers() {
+        fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        /// The text between `open` (just past a `(`) and its matching `)`,
+        /// skipping string literals.
+        fn call_body(source: &str, open: usize) -> &str {
+            let bytes = source.as_bytes();
+            let (mut depth, mut index) = (1usize, open);
+            while depth > 0 && index < bytes.len() {
+                match bytes[index] {
+                    b'"' => {
+                        index += 1;
+                        while index < bytes.len() && bytes[index] != b'"' {
+                            index += if bytes[index] == b'\\' { 2 } else { 1 };
+                        }
+                    }
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                index += 1;
+            }
+            &source[open..index.saturating_sub(1)]
+        }
+        /// Split top-level arguments on commas outside parentheses, brackets
+        /// and strings.
+        fn arguments(body: &str) -> Vec<&str> {
+            let bytes = body.as_bytes();
+            let (mut depth, mut start, mut index, mut out) = (0i32, 0, 0, Vec::new());
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'"' => {
+                        index += 1;
+                        while index < bytes.len() && bytes[index] != b'"' {
+                            index += if bytes[index] == b'\\' { 2 } else { 1 };
+                        }
+                    }
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    b',' if depth == 0 => {
+                        out.push(body[start..index].trim());
+                        start = index + 1;
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+            out.push(body[start..].trim());
+            out.retain(|argument| !argument.is_empty());
+            out
+        }
+        const RUN_COMMANDS: &[&str] = &[
+            "continue_session.rs",
+            "finalize_session.rs",
+            "project_registry.rs",
+            "recovery.rs",
+            "rename_workstream.rs",
+            "resume.rs",
+            "run.rs",
+            "run_autowire.rs",
+            "run_project_split.rs",
+            "workstream_search.rs",
+            "workstreams.rs",
+        ];
+        let bare = regex::Regex::new(r"\.diagnostic\(\s*&format!\(").unwrap();
+        let bare_format = regex::Regex::new(r"\bi18n\s*\.\s*format\(").unwrap();
+        let placeholder = regex::Regex::new(r"\{[^{}]*\}").unwrap();
+        let foreign =
+            regex::Regex::new(r"\b(?:err|error|e|reason|problem|stderr|server_problem)\b").unwrap();
+        let scope_name = regex::Regex::new(
+            r"\b(?:workspace|project|from_workspace|from_project|to_workspace|to_project)\b",
+        )
+        .unwrap();
+        let named = regex::Regex::new(r"\{[A-Za-z_][\w.]*(?::[^{}]*)?\}").unwrap();
+        let test_module =
+            regex::Regex::new(r"(?m)^\s*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\(crate\))? )?mod \w+")
+                .unwrap();
+        let mut files = Vec::new();
+        visit(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut raw = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n");
+            let body = test_module
+                .find(&source)
+                .map_or(source.as_str(), |found| &source[..found.start()]);
+            let at = |offset: usize| {
+                format!(
+                    "{}:{}",
+                    file.display(),
+                    body[..offset].lines().count().max(1)
+                )
+            };
+            for call in bare.find_iter(body) {
+                let args = arguments(call_body(body, call.end()));
+                let Some(literal) = args.first() else {
+                    continue;
+                };
+                let literal = literal.replace("{{", "").replace("}}", "");
+                if !placeholder.is_match(&literal) {
+                    continue;
+                }
+                let multi_line = literal.replace("\\\n", "").contains("\\n");
+                let wrapped = args[1..].iter().all(|argument| {
+                    [
+                        "terminal_text(",
+                        "terminal_body(",
+                        "super::show::terminal_text(",
+                    ]
+                    .iter()
+                    .any(|helper| argument.starts_with(helper))
+                });
+                if !multi_line || named.is_match(&literal) || !wrapped {
+                    raw.push(at(call.start()));
+                }
+            }
+            let name = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            for call in bare_format.find_iter(body) {
+                if RUN_COMMANDS.contains(&name) {
+                    raw.push(at(call.start()));
+                    continue;
+                }
+                // Elsewhere a catalog line that quotes an error, a reason or
+                // a scope name is the same mid-run shape as a diagnostic.
+                let args = arguments(call_body(body, call.end()));
+                let values = args.get(1).map_or("", |values| {
+                    values
+                        .trim_start_matches('&')
+                        .trim()
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                });
+                let quotes_error = arguments(values).iter().any(|pair| {
+                    let pair = pair.trim().trim_start_matches('(').trim_end_matches(')');
+                    arguments(pair).get(1).is_some_and(|value| {
+                        (foreign.is_match(value) || scope_name.is_match(value))
+                            && !["terminal_text(", "terminal_body(", "super::show::terminal_"]
+                                .iter()
+                                .any(|helper| value.starts_with(helper))
+                    })
+                });
+                if quotes_error {
+                    raw.push(at(call.start()));
+                }
+            }
+        }
+        assert!(
+            raw.is_empty(),
+            "neutralize these through localization::diagnostic / localization::format:\n{}",
+            raw.join("\n")
+        );
+    }
+
+    /// Catches a new English error or status line that never reached the
+    /// catalog. Add it to both `diagnostics.ftl` files with the source wording.
+    #[test]
+    fn every_cli_diagnostic_has_a_catalog_entry() {
+        fn unescape(raw: &str) -> String {
+            let mut out = String::new();
+            let mut chars = raw.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch != '\\' {
+                    out.push(ch);
+                    continue;
+                }
+                match chars.next() {
+                    Some('\n') => {
+                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('x') => {
+                        chars.next();
+                        chars.next();
+                        out.push(' ');
+                    }
+                    Some(other) => out.push(other),
+                    None => {}
+                }
+            }
+            out
+        }
+        fn render_format(text: &str) -> String {
+            let mut out = String::new();
+            let mut chars = text.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match (ch, chars.peek()) {
+                    ('{', Some('{')) | ('}', Some('}')) => {
+                        out.push(ch);
+                        chars.next();
+                    }
+                    ('{', _) => {
+                        chars.find(|c| *c == '}');
+                        out.push('x');
+                    }
+                    _ => out.push(ch),
+                }
+            }
+            out
+        }
+        fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let call = regex::Regex::new(
+            // `diagnostic(i18n, format!("…"))` is the neutralizing form (#2000);
+            // its receiver argument comes before the literal.
+            r#"(?:\bbail!|\banyhow!|\.context|\.with_context|\bdiagnostic)\s*\(\s*(?:\|\|\s*)?(?:&?[\w.]+,\s*)?&?(?:format!\(\s*)?"((?:[^"\\]|\\[\s\S])*)""#,
+        )
+        .unwrap();
+        let test_module =
+            regex::Regex::new(r"(?m)^\s*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\(crate\))? )?mod \w+")
+                .unwrap();
+        // Literal arguments that name an operation, internal invariants, and
+        // messages assembled from a variable part.
+        let exempt = |text: &str| {
+            text.starts_with("internal:")
+                || text.starts_with("unterminated Grok")
+                || text.starts_with("auto_improve.scheduler.experience_")
+                || matches!(text, "reindex" | "reset" | "restore" | "purge data")
+        };
+        let i18n = Localizer::new(Language::PortugueseBrazil);
+        let mut files = Vec::new();
+        visit(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut missing = Vec::new();
+        for file in files {
+            // A Windows checkout has CRLF, which rustc treats as a plain newline.
+            let source = std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n");
+            let body = test_module
+                .find(&source)
+                .map_or(source.as_str(), |found| &source[..found.start()]);
+            for captures in call.captures_iter(body) {
+                let text = unescape(&captures[1]);
+                let rendered = render_format(&text);
+                let has_words = rendered
+                    .split(|c: char| !c.is_ascii_alphabetic())
+                    .any(|word| word.len() > 1);
+                if has_words && !exempt(&text) && !i18n.knows_diagnostic(&rendered) {
+                    missing.push(format!("{}: {text}", file.display()));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "missing from diagnostics.ftl:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn parser_errors_have_localized_context() {
+        let error =
+            crate::cli::try_parse_from(["ai-memory", "status", "--not-a-flag"]).unwrap_err();
+        let message = parse_error(&error, &Localizer::new(Language::PortugueseBrazil));
+        assert!(message.contains("Argumento desconhecido"), "{message}");
+        assert!(message.contains("--not-a-flag"));
+    }
+
+    /// `handoffs --expire-all` confirms the sweep by printing the server's
+    /// count. The line is built with `format!` and translated at the print
+    /// boundary, so the singular and the plural shapes must each be in the
+    /// catalog — a lone plural entry would leave "1 open handoff" in English.
+    #[test]
+    fn handoff_expire_reports_are_translated() {
+        let i18n = Localizer::new(Language::PortugueseBrazil);
+        let tail = "The rows are kept and remain visible in the audit log; they are no longer \
+                    offered to an agent.";
+
+        let none = i18n.diagnostic("No open handoffs to expire in default/x.");
+        assert!(
+            none.contains("Nenhum handoff aberto para expirar em default/x."),
+            "{none}"
+        );
+
+        let one = i18n.diagnostic(&format!("Expired 1 open handoff in default/x. {tail}"));
+        assert!(
+            one.starts_with("1 handoff aberto expirou em default/x."),
+            "{one}"
+        );
+        assert!(one.contains("log de auditoria"), "{one}");
+
+        let many = i18n.diagnostic(&format!("Expired 3 open handoffs in default/x. {tail}"));
+        assert!(
+            many.starts_with("3 handoffs abertos expiraram em default/x."),
+            "{many}"
+        );
+
+        let english = Localizer::new(Language::English);
+        let line = format!("Expired 3 open handoffs in default/x. {tail}");
+        assert_eq!(english.diagnostic(&line), line);
+    }
+}

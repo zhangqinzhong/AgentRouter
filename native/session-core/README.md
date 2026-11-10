@@ -45,3 +45,21 @@ node --test tests/collector/session-workspace.test.cjs
 Deletion is split into reviewed server-owned batches and execution, revalidates
 file ownership and timestamps, and uses the OS Trash. Remote synchronization is
 only run against an explicitly configured host and only reads whitelisted sources.
+
+## November 2026 upstream backports
+
+Reviewed Wake 0.10.2 (`3aabdc1d5ff903b4ef4de4e7fc21cfb39b52484c`), and adapted:
+
+- `aba10d5`: two-character CJK full-text search, incremental backfill and safe
+  fallback while the auxiliary index is unavailable.
+- `6bd9757`: Claude-generated titles, including inherited titles on branches.
+- `8c8cfcf`: MiMo native sessions, subagent lanes, imported-history folding and
+  system-session filtering. AgentRouter retains `AgentId::Mimo`, legacy database
+  schemas and the `MIMO_HOME`/`MIMO_DB` roots alongside official MiMo discovery.
+
+The parsing format is `ar-17`, triggering one derived-index reparse; CJK indexing
+has its own version and transactionally follows message updates and deletions.
+No upstream application or database dependency is introduced.
+
+The opt-in `upstream_real_data` test accepts only an explicitly supplied disposable
+snapshot path containing `upstream-audit`; it is ignored in ordinary test runs.

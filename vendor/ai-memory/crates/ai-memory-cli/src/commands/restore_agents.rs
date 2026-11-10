@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use ai_memory_core::agent_backup::{
@@ -17,13 +17,14 @@ use tracing::info;
 
 use crate::cli::{AgentBackupScope, McpClient, RestoreAgentsArgs};
 use crate::commands::backup_agents::matches_agent_filter;
-use crate::commands::path_util::{claude_config_dir, home_dir};
+use crate::commands::path_util::{agent_config_home, claude_config_dir, home_dir};
 use crate::config::Config;
 
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_TAR_PADDING_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 struct StagedAsset {
@@ -53,26 +54,41 @@ struct AppliedRestore {
 /// Returns an error when the archive is malformed, over budget, incomplete,
 /// inconsistent with its manifest, or cannot be restored safely.
 pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
-    let home = home_dir().context("locating user home directory")?;
-    let cwd = std::env::current_dir().context("locating current working directory")?;
+    let i18n = &_config.i18n;
+    let home = home_dir().context(i18n.text("cli-backup-agents-locating-user-home-directory"))?;
+    let cwd = std::env::current_dir()
+        .context(i18n.text("cli-backup-agents-locating-current-working-directory"))?;
 
     if !args.from.is_file() {
-        bail!("backup archive not found at {}", args.from.display());
+        bail!(
+            "{}",
+            i18n.format(
+                "cli-restore-agents-backup-archive-not-found-at",
+                &[("value0", format!("{}", args.from.display()))]
+            )
+        );
     }
 
-    let staging = tempfile::tempdir().context("creating restore staging directory")?;
+    let staging = tempfile::tempdir()
+        .context(i18n.text("cli-restore-agents-creating-restore-staging-directory"))?;
     let (manifest_raw, files_by_path) = stage_archive(&args.from, staging.path())?;
-    let manifest: AgentBackupManifest =
-        serde_json::from_slice(&manifest_raw).context("parsing agent backup manifest")?;
+    let manifest: AgentBackupManifest = serde_json::from_slice(&manifest_raw)
+        .context(i18n.text("cli-restore-agents-parsing-agent-backup-manifest"))?;
     if manifest.version == 0 || manifest.version > AGENT_BACKUP_SCHEMA_VERSION {
         bail!(
-            "archive manifest schema version {} is not supported (supported: 1..={})",
-            manifest.version,
-            AGENT_BACKUP_SCHEMA_VERSION
+            "{}",
+            i18n.format(
+                "cli-restore-agents-archive-manifest-schema-version-is-not-supported-supported-1",
+                &[
+                    ("value0", format!("{}", manifest.version)),
+                    ("value1", format!("{}", AGENT_BACKUP_SCHEMA_VERSION))
+                ]
+            )
         );
     }
 
     let claude_override = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let copilot_override = agent_config_home(std::env::var_os("COPILOT_HOME"));
     let mut archive_paths = HashSet::with_capacity(manifest.entries.len());
     let mut target_paths = HashSet::with_capacity(manifest.entries.len());
     let mut planned = Vec::new();
@@ -83,45 +99,71 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
         validate_target_relative(entry.scope, &entry.target_relative)?;
         if !archive_paths.insert(entry.archive_path.clone()) {
             bail!(
-                "archive manifest contains duplicate asset path {:?}",
-                entry.archive_path
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-archive-manifest-contains-duplicate-asset-path",
+                    &[("value0", format!("{:?}", entry.archive_path))]
+                )
             );
         }
 
         let staged = files_by_path.get(&entry.archive_path).ok_or_else(|| {
             anyhow!(
-                "archive manifest references missing asset {:?}",
-                entry.archive_path
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-archive-manifest-references-missing-asset",
+                    &[("value0", format!("{:?}", entry.archive_path))]
+                )
             )
         })?;
         let expected_sha = entry.sha256.as_deref().ok_or_else(|| {
             anyhow!(
-                "archive asset {:?} is missing its required SHA-256 checksum",
-                entry.archive_path
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-archive-asset-is-missing-its-required-sha-256-checksum",
+                    &[("value0", format!("{:?}", entry.archive_path))]
+                )
             )
         })?;
         validate_sha256(expected_sha, &entry.archive_path)?;
         if !staged.sha256.eq_ignore_ascii_case(expected_sha) {
             bail!(
-                "SHA-256 integrity mismatch for asset {}: expected {}, got {}",
-                entry.archive_path,
-                expected_sha,
-                staged.sha256
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-sha-256-integrity-mismatch-for-asset-expected-got",
+                    &[
+                        ("value0", entry.archive_path.to_string()),
+                        ("value1", expected_sha.to_string()),
+                        ("value2", staged.sha256.to_string())
+                    ]
+                )
             );
         }
         if entry.mode.is_some_and(|mode| mode > 0o777) {
             bail!(
-                "archive asset {:?} has unsafe permission bits {:o}",
-                entry.archive_path,
-                entry.mode.unwrap_or_default()
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-archive-asset-has-unsafe-permission-bits-o",
+                    &[
+                        ("value0", format!("{:?}", entry.archive_path)),
+                        ("value1", format!("{:o}", entry.mode.unwrap_or_default()))
+                    ]
+                )
             );
         }
 
-        let (base, target_path) = resolve_target(entry, &home, &cwd, claude_override.as_deref())?;
+        let overrides = TargetOverrides {
+            claude: claude_override.as_deref(),
+            copilot: copilot_override.as_deref(),
+        };
+        let (base, target_path) = resolve_target(entry, &home, &cwd, overrides)?;
         if !target_paths.insert(target_path.clone()) {
             bail!(
-                "archive manifest maps more than one asset to {}",
-                target_path.display()
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-archive-manifest-maps-more-than-one-asset-to",
+                    &[("value0", format!("{}", target_path.display()))]
+                )
             );
         }
         reject_symlinked_target(&base, &target_path)?;
@@ -142,15 +184,23 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
         let exists = match fs::symlink_metadata(&target_path) {
             Ok(metadata) if metadata.file_type().is_file() => true,
             Ok(_) => bail!(
-                "refusing to replace non-file destination {}",
-                target_path.display()
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-refusing-to-replace-non-file-destination",
+                    &[("value0", format!("{}", target_path.display()))]
+                )
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => {
                 return Err(error).with_context(|| format!("inspecting {}", target_path.display()));
             }
         };
-        let identical = exists && files_have_same_digest(&target_path, staged)?;
+        let identical = exists
+            && files_have_same_digest(&target_path, staged)?
+            && entry
+                .mode
+                .zip(portable_mode(&target_path)?)
+                .is_none_or(|(expected, actual)| expected == actual);
         if identical {
             identical_count += 1;
         } else {
@@ -165,28 +215,33 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
 
     for archive_path in files_by_path.keys() {
         if !archive_paths.contains(archive_path) {
-            bail!("archive contains unmanifested asset {:?}", archive_path);
+            bail!(
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-archive-contains-unmanifested-asset",
+                    &[("value0", format!("{:?}", archive_path))]
+                )
+            );
         }
     }
 
     if planned.is_empty() {
         if identical_count > 0 {
             println!(
-                "All {identical_count} selected assets are already identical on host. Nothing to restore."
-            );
+                "{}", i18n.format("cli-restore-agents-all-identical-count-selected-assets-are-already-identical-on-host-nothing-to", &[("value0", format!("{}", identical_count))]));
         } else {
-            println!("No archive assets matched the selected agent and scope filters.");
+            println!("{}", i18n.text("cli-restore-agents-no-archive-assets-matched-the-selected-agent-and-scope-filters"));
         }
         return Ok(());
     }
 
     let any_sanitized = manifest.sanitized || manifest.entries.iter().any(|entry| entry.sanitized);
     if !args.apply {
-        print_dry_run(&planned, identical_count, any_sanitized);
+        print_dry_run(i18n, &planned, identical_count, any_sanitized);
         return Ok(());
     }
 
-    let summary = apply_planned(&planned, args.force)?;
+    let summary = apply_planned(i18n, &planned, args.force)?;
     info!(
         created = summary.created,
         updated = summary.updated,
@@ -195,13 +250,20 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
         "restored agent assets"
     );
     println!(
-        "\nRestoration complete: {} created, {} updated, {} identical, {} skipped (existing).",
-        summary.created, summary.updated, identical_count, summary.skipped_existing
+        "{}",
+        i18n.format(
+            "cli-restore-agents-restoration-complete-created-updated-identical-skipped-existing",
+            &[
+                ("value0", format!("{}", summary.created)),
+                ("value1", format!("{}", summary.updated)),
+                ("value2", format!("{}", identical_count)),
+                ("value3", format!("{}", summary.skipped_existing))
+            ]
+        )
     );
     if any_sanitized {
         eprintln!(
-            "Note: this archive contains sanitized configurations. Restored MCP configs may require replacing '[REDACTED:...]' values with valid credentials."
-        );
+            "{}", i18n.text("cli-restore-agents-note-this-archive-contains-sanitized-configurations-restored-mcp-configs-may"));
     }
     Ok(())
 }
@@ -287,6 +349,17 @@ fn stage_archive(src: &Path, staging: &Path) -> Result<(Vec<u8>, HashMap<String,
         );
     }
 
+    // The tar reader stops at its first zero block. Read through the gzip
+    // trailer without allowing an unbounded expansion after that block.
+    let padding = io::copy(
+        &mut archive.into_inner().take(MAX_TAR_PADDING_BYTES + 1),
+        &mut io::sink(),
+    )
+    .with_context(|| format!("verifying gzip stream in {}", src.display()))?;
+    if padding > MAX_TAR_PADDING_BYTES {
+        bail!("archive has more than {MAX_TAR_PADDING_BYTES} bytes after the tar end marker");
+    }
+
     Ok((
         manifest_bytes
             .ok_or_else(|| anyhow!("archive at {} is missing manifest.json", src.display()))?,
@@ -294,11 +367,20 @@ fn stage_archive(src: &Path, staging: &Path) -> Result<(Vec<u8>, HashMap<String,
     ))
 }
 
+/// Agent homes moved by environment variables, read once per restore.
+#[derive(Clone, Copy)]
+struct TargetOverrides<'a> {
+    /// `CLAUDE_CONFIG_DIR`.
+    claude: Option<&'a Path>,
+    /// `COPILOT_HOME`.
+    copilot: Option<&'a Path>,
+}
+
 fn resolve_target(
     entry: &AgentBackupEntry,
     home: &Path,
     cwd: &Path,
-    claude_override: Option<&Path>,
+    overrides: TargetOverrides<'_>,
 ) -> Result<(PathBuf, PathBuf)> {
     if entry.scope == AgentAssetScope::Project {
         return Ok((cwd.to_path_buf(), cwd.join(&entry.target_relative)));
@@ -328,8 +410,14 @@ fn resolve_target(
         return Ok((base.clone(), base.join(relative)));
     }
     if entry.agent == AgentKind::ClaudeCode
-        && let Some(custom_dir) = claude_override
+        && let Some(custom_dir) = overrides.claude
         && let Some(relative) = entry.target_relative.strip_prefix(".claude/")
+    {
+        return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
+    }
+    if entry.agent == AgentKind::CopilotCli
+        && let Some(custom_dir) = overrides.copilot
+        && let Some(relative) = entry.target_relative.strip_prefix(".copilot/")
     {
         return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
     }
@@ -395,15 +483,22 @@ struct RestoreSummary {
     skipped_existing: usize,
 }
 
-fn apply_planned(planned: &[PlannedRestore<'_>], force: bool) -> Result<RestoreSummary> {
+fn apply_planned(
+    i18n: &ai_memory_core::i18n::Localizer,
+    planned: &[PlannedRestore<'_>],
+    force: bool,
+) -> Result<RestoreSummary> {
     let mut summary = RestoreSummary::default();
     let mut applied = Vec::new();
 
     for item in planned {
         if item.exists && !force {
             println!(
-                "  [SKIP] {} (already exists, pass --force to overwrite)",
-                item.target_path.display()
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-skip-already-exists-pass-force-to-overwrite",
+                    &[("value0", format!("{}", item.target_path.display()))]
+                )
             );
             summary.skipped_existing += 1;
             continue;
@@ -423,10 +518,22 @@ fn apply_planned(planned: &[PlannedRestore<'_>], force: bool) -> Result<RestoreS
             ));
         }
         if item.exists {
-            println!("  updated {}", item.target_path.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-updated",
+                    &[("value0", format!("{}", item.target_path.display()))]
+                )
+            );
             summary.updated += 1;
         } else {
-            println!("  created {}", item.target_path.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-restore-agents-created",
+                    &[("value0", format!("{}", item.target_path.display()))]
+                )
+            );
             summary.created += 1;
         }
     }
@@ -536,8 +643,16 @@ fn set_portable_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     Ok(())
 }
 
-fn print_dry_run(planned: &[PlannedRestore<'_>], identical_count: usize, any_sanitized: bool) {
-    println!("Restore preview (dry-run, pass --apply to execute):\n");
+fn print_dry_run(
+    i18n: &ai_memory_core::i18n::Localizer,
+    planned: &[PlannedRestore<'_>],
+    identical_count: usize,
+    any_sanitized: bool,
+) {
+    println!(
+        "{}",
+        i18n.text("cli-restore-agents-restore-preview-dry-run-pass-apply-to-execute")
+    );
     for item in planned {
         let status = if item.exists {
             "[OVERWRITE]"
@@ -545,22 +660,33 @@ fn print_dry_run(planned: &[PlannedRestore<'_>], identical_count: usize, any_san
             "[CREATE]"
         };
         println!(
-            "  {status:<12} [{}] {} ({} bytes) -> {}",
-            item.entry.agent.as_str(),
-            item.entry.asset_kind.label(),
-            item.staged.size,
-            item.target_path.display()
+            "{}",
+            i18n.format(
+                "cli-restore-agents-asset-row",
+                &[
+                    ("value0", format!("{:<12}", status)),
+                    ("value1", item.entry.agent.as_str().to_string()),
+                    ("value2", item.entry.asset_kind.label().to_string()),
+                    ("value3", format!("{}", item.staged.size)),
+                    ("value4", format!("{}", item.target_path.display()))
+                ]
+            )
         );
     }
     if identical_count > 0 {
-        println!("\n  (skipped {identical_count} identical files)");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-restore-agents-skipped-identical-count-identical-files",
+                &[("value0", format!("{}", identical_count))]
+            )
+        );
     }
     if any_sanitized {
-        println!("\n  Note: archive contains sanitized configurations with redacted credentials.");
+        println!("{}", i18n.text("cli-restore-agents-note-archive-contains-sanitized-configurations-with-redacted-credentials"));
     }
     println!(
-        "\nReview the archive source and listed destinations: skills, plugins, and instructions are active content. Rerun with `--apply` to restore."
-    );
+        "{}", i18n.text("cli-restore-agents-review-the-archive-source-and-listed-destinations-skills-plugins-and-instruc"));
 }
 
 fn validate_sha256(value: &str, archive_path: &str) -> Result<()> {
@@ -617,6 +743,8 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".commandcode/",
                 ".kimi/",
                 ".qwen/",
+                ".qoder/",
+                ".copilot/skills/",
             ];
             let allowed = rel_path == ".claude.json"
                 || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
@@ -647,6 +775,7 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".gemini/skills/",
                 ".devin/skills/",
                 ".grok/skills/",
+                ".github/skills/",
             ];
             let allowed = EXACT.contains(&rel_path)
                 || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
@@ -664,6 +793,53 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_archive_checks_the_gzip_trailer() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("assets.tar.gz");
+        let manifest = b"{}";
+        let make_archive = |padding| {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "manifest.json", manifest.as_slice())
+                .unwrap();
+            let mut encoder = archive.into_inner().unwrap();
+            io::copy(&mut io::repeat(0).take(padding), &mut encoder).unwrap();
+            encoder.finish().unwrap()
+        };
+
+        let bytes = make_archive(0);
+        for valid in [&bytes, &make_archive(8 * 1024)] {
+            fs::write(&source, valid).unwrap();
+            let (staged_manifest, _) = stage_archive(&source, root.path()).unwrap();
+            assert_eq!(staged_manifest, manifest);
+        }
+
+        let trailer = bytes.len() - 8;
+        let mut invalid_crc = bytes.clone();
+        invalid_crc[trailer] ^= 1;
+        for invalid in [&bytes[..trailer], invalid_crc.as_slice()] {
+            fs::write(&source, invalid).unwrap();
+            let error = stage_archive(&source, root.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("verifying gzip stream"),
+                "{error:#}"
+            );
+        }
+
+        fs::write(&source, make_archive(MAX_TAR_PADDING_BYTES)).unwrap();
+        let error = stage_archive(&source, root.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("after the tar end marker"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn rollback_removes_new_files_and_restores_overwrites() {

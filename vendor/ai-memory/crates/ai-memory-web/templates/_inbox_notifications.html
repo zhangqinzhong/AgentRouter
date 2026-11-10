@@ -1,0 +1,39 @@
+<script>
+(function(){
+  var badge=document.getElementById("inbox-pending-count"),panel=document.getElementById("inbox-notifications"),summary=document.getElementById("inbox-notification-summary"),list=document.getElementById("inbox-notification-projects"),status=document.getElementById("inbox-notification-status"),link=document.querySelector('[data-nav="inbox"]');
+  var timer,controller,stopped=false,busy=false,signature="";
+  function announce(text){if(status.textContent!==text)status.textContent=text;}
+  function clear(){badge.hidden=true;panel.hidden=true;list.replaceChildren();link.removeAttribute("aria-label");signature="";}
+  async function refreshInboxNotifications(){
+    if(stopped||busy)return;
+    clearTimeout(timer);
+    if(document.hidden){timer=setTimeout(refreshInboxNotifications,10000);return;}
+    busy=true;controller=new AbortController();var timeout=setTimeout(function(){controller.abort();},5000);
+    try{
+      var response=await fetch(new URL("inbox/notifications",document.baseURI),{credentials:"same-origin",cache:"no-store",signal:controller.signal,headers:{"Accept":"application/json"}});
+      if(response.redirected||response.status===401||response.status===403){clear();announce({{ i18n.js("web-sign-in-to-check-pending-messages")|safe }});return;}
+      if(!response.ok)throw new Error({{ i18n.js("web-notifications-unavailable")|safe }});
+      var data=await response.json(),next=JSON.stringify(data);
+      if(next!==signature){
+        signature=next;badge.textContent=String(data.pending);badge.hidden=data.pending===0;panel.hidden=data.pending===0;
+        link.setAttribute("aria-label",data.pending?"Inbox, "+data.pending+(" "+{{ i18n.js("web-messages-waiting-for-agents")|safe }}+""):"Inbox");
+        summary.textContent=data.pending===1?{{ i18n.js("web-1-message-waiting-for-an-agent")|safe }}:data.pending+(" "+{{ i18n.js("web-messages-waiting-for-agents")|safe }}+"");
+        list.replaceChildren();data.projects.forEach(function(project){
+          var item=document.createElement("li"),a=document.createElement("a"),url=new URL("inbox",document.baseURI);
+          url.searchParams.set("workspace",project.workspace);url.searchParams.set("project",project.project);url.searchParams.set("state","pending");
+          a.href=url.href;a.textContent=project.workspace+" / "+project.project+" · "+project.pending;a.dataset.notificationProject=project.project;a.dataset.notificationWorkspace=project.workspace;
+          item.appendChild(a);list.appendChild(item);
+        });
+        if(data.project_count>data.projects.length){var item=document.createElement("li"),a=document.createElement("a");a.href=new URL("inbox",document.baseURI).href;a.textContent=(""+{{ i18n.js("web-view-all")|safe }}+" ")+data.project_count+" projects →";item.appendChild(a);list.appendChild(item);}
+      }
+      announce(data.pending?summary.textContent:{{ i18n.js("web-no-messages-waiting-for-agents")|safe }});
+    }catch(_){if(!stopped)announce({{ i18n.js("web-could-not-refresh-messages-open-inbox-to-check-the-latest-status")|safe }});}
+    finally{clearTimeout(timeout);busy=false;if(!stopped)timer=setTimeout(refreshInboxNotifications,10000);}
+  }
+  document.addEventListener("visibilitychange",function(){if(!document.hidden)refreshInboxNotifications();});
+  document.addEventListener("inbox:changed",refreshInboxNotifications);
+  window.addEventListener("pagehide",function(){stopped=true;clearTimeout(timer);if(controller)controller.abort();});
+  window.addEventListener("pageshow",function(event){if(event.persisted){stopped=false;refreshInboxNotifications();}});
+  refreshInboxNotifications();
+})();
+</script>

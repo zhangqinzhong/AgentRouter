@@ -2,11 +2,12 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import os from 'node:os';
 import {queryLocalCollector} from './service';
-export type LocalUsageRange = {from:string;to:string;tz?:string;since?:string};
+export type LocalUsageRange = {from:string;to:string;tz?:string;since?:string;source?:string;instance?:string};
 export type LocalUsagePeriod = 'day'|'week'|'month'|'year'|'total'|'custom';
 export type LocalUsagePageData = {
   totals: Record<string,number|string>;
   sources: Array<Record<string,unknown>>;
+  instances?: Array<{id:string;source:string;name:string}>;
   firstActivityDay?: string;
   collectionState?: "loading" | "ready" | "error";
 };
@@ -108,15 +109,16 @@ export function rollingWindow(period:LocalUsagePeriod,tz:string,now:Date=new Dat
 export async function getLocalUsagePage(range:LocalUsageRange):Promise<LocalUsagePageData>{
   if(!range || (range.from!==''&&!validDay(range.from)) || !validDay(range.to) || range.from>range.to)throw new Error('Invalid usage date range');
   if(range.since!==undefined&&range.since!==''&&!Number.isFinite(Date.parse(range.since)))throw new Error('Invalid usage date range');
-  const query={from:range.from,to:range.to,tz:zone(range.tz),background:'1',...(range.since?{since:range.since}:{})};
+  const query={from:range.from,to:range.to,tz:zone(range.tz),background:'1',...(range.source?{source:range.source}:{}),...(range.instance?{instance:range.instance}:{}),...(range.since?{since:range.since}:{})};
   // Same collector and aggregation contract as the native menu. Gateway
   // request usage is deliberately not added to these local-session totals.
-  const [summary,models,daily]=await Promise.all([
+  const [summary,models,daily,instances]=await Promise.all([
     queryLocalCollector('/functions/tokentracker-usage-summary',query),
     queryLocalCollector('/functions/tokentracker-usage-model-breakdown',query),
-    queryLocalCollector('/functions/tokentracker-usage-daily',query)
-  ]) as [{totals:LocalUsagePageData['totals'];collectionState?:LocalUsagePageData['collectionState']},{sources:LocalUsagePageData['sources']},{data:Array<{day:string;total_tokens:number}>}];
-  return {totals:summary.totals,sources:models.sources,collectionState:summary.collectionState,firstActivityDay:daily.data.find(row=>Number(row.total_tokens)>0)?.day};
+    queryLocalCollector('/functions/tokentracker-usage-daily',query),
+    queryLocalCollector('/functions/tokentracker-usage-instances')
+  ]) as [{totals:LocalUsagePageData['totals'];collectionState?:LocalUsagePageData['collectionState']},{sources:LocalUsagePageData['sources']},{data:Array<{day:string;total_tokens:number}>},{instances:NonNullable<LocalUsagePageData["instances"]>}];
+  return {totals:summary.totals,sources:models.sources,instances:instances.instances,collectionState:summary.collectionState,firstActivityDay:daily.data.find(row=>Number(row.total_tokens)>0)?.day};
 }
 
 export async function getLocalUsageOverview(range:LocalUsageRange, period:LocalUsageOverviewPeriod, filter?:{source?:string;model?:string}):Promise<LocalUsageOverviewData>{

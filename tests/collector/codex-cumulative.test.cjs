@@ -10,7 +10,14 @@ test('Codex cumulative counters and cache tokens are counted once across persona
   const data=[meta,event].map(JSON.stringify).join('\n')+'\n';const filename='rollout-2026-09-14T01-00-00-00000000-0000-0000-0000-000000000001.jsonl';await fs.writeFile(path.join(personal,filename),data);await fs.writeFile(path.join(managed,filename),data);
   const collector=createCollector({home,fetchImpl:async()=>{throw Error('offline')}});await collector.sync(true);const query={from:'2026-09-14',to:'2026-09-14'};const first=await collector.query('/functions/tokentracker-usage-summary',query);
   assert.equal(first.totals.total_tokens,120);assert.equal(first.totals.cached_input_tokens,60);
+  const instances=(await collector.query('/functions/tokentracker-usage-instances')).instances;
+  assert.equal(instances.length,2);
+  const perInstance=async()=>Promise.all(instances.map(i=>collector.query('/functions/tokentracker-usage-summary',{...query,source:'codex',instance:i.id})));
+  assert.equal((await perInstance()).reduce((sum,r)=>sum+r.totals.total_tokens,0),120);
   const cumulative=Object.fromEntries(Object.entries(usage).map(([k,v])=>[k,v*2]));const next={...event,timestamp:'2026-09-14T01:01:00Z',payload:{type:'token_count',info:{last_token_usage:usage,total_token_usage:cumulative}}};await fs.appendFile(path.join(personal,filename),JSON.stringify(next)+'\n');await collector.sync(true);const second=await collector.query('/functions/tokentracker-usage-summary',query);assert.equal(second.totals.total_tokens,240);
   await collector.sync(true);assert.deepEqual((await collector.query('/functions/tokentracker-usage-summary',query)).totals,second.totals);
+  assert.equal((await perInstance()).reduce((sum,r)=>sum+r.totals.total_tokens,0),240);
+  const models=await collector.query('/functions/tokentracker-usage-model-breakdown',query);
+  assert.ok(models.sources.every(s=>!s.source.includes('@ar-instance:')));
  }finally{await fs.rm(home,{recursive:true,force:true})}
 });

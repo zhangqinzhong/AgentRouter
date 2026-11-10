@@ -4,6 +4,7 @@ use ai_memory_store::SkippedProposal;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::AutoImproveArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -67,7 +68,7 @@ struct ProposalOutcome {
 /// # Errors
 /// Returns an error if the server is unreachable or rejects the review request.
 pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let settings = &config.auto_improve;
@@ -103,35 +104,45 @@ pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
-        println!("{}", render_human(&response));
+        println!("{}", render_human(&config.i18n, &response));
     }
     Ok(())
 }
 
-fn render_human(response: &StageResponse) -> String {
+fn render_human(i18n: &ai_memory_core::i18n::Localizer, response: &StageResponse) -> String {
     let mut lines = Vec::new();
     if response.approval_required {
-        lines.push(format!(
-            "Staged auto-improve run {} for manual approval",
-            response.run_id
+        lines.push(i18n.format(
+            "cli-auto-improve-staged-auto-improve-run-for-manual-approval",
+            &[("value0", terminal_text(&response.run_id))],
         ));
     } else {
-        lines.push(format!(
-            "Auto-approved auto-improve run {}",
-            response.run_id
+        lines.push(i18n.format(
+            "cli-auto-improve-auto-approved-auto-improve-run",
+            &[("value0", terminal_text(&response.run_id))],
         ));
     }
-    lines.push(format!("Approval policy: {}", response.approval_policy));
+    lines.push(i18n.format(
+        "cli-auto-improve-approval-policy",
+        &[("value0", terminal_text(&response.approval_policy))],
+    ));
     for proposal in &response.proposals {
         if let Some(page_id) = &proposal.page_id {
-            lines.push(format!(
-                "  - {} [{}] page {} ({})",
-                proposal.id, proposal.status, page_id, proposal.sidecar_path
+            lines.push(i18n.format(
+                "cli-auto-improve-page",
+                &[
+                    ("value0", terminal_text(&proposal.id)),
+                    ("value1", terminal_text(&proposal.status)),
+                    ("value2", terminal_text(page_id)),
+                    ("value3", terminal_text(&proposal.sidecar_path)),
+                ],
             ));
         } else {
             lines.push(format!(
                 "  - {} [{}] ({})",
-                proposal.id, proposal.status, proposal.sidecar_path
+                terminal_text(&proposal.id),
+                terminal_text(&proposal.status),
+                terminal_text(&proposal.sidecar_path)
             ));
         }
     }
@@ -185,7 +196,7 @@ mod tests {
             "reason": "a proposal is already pending review for this path",
         }])))
         .expect("server body parses");
-        let human = render_human(&response);
+        let human = render_human(&ai_memory_core::i18n::Localizer::default(), &response);
         assert!(human.contains("procedures/release.md"), "{human}");
         assert!(human.contains("already pending review"), "{human}");
     }
@@ -194,7 +205,10 @@ mod tests {
     fn a_clean_run_prints_no_skipped_section() {
         let response: StageResponse =
             serde_json::from_value(wire(serde_json::json!([]))).expect("server body parses");
-        assert!(!render_human(&response).contains("Skipped"));
+        assert!(
+            !render_human(&ai_memory_core::i18n::Localizer::default(), &response)
+                .contains("Skipped")
+        );
     }
 
     #[test]

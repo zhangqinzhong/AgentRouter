@@ -201,7 +201,10 @@ and only while its body still matches: a page written or edited by hand is
 never rewritten, and the group it would have updated is reported as skipped.
 `profile_entry_ledger` records the entries it wrote; a ledger row whose page
 is gone was removed by the user, and that topic is not recreated until a
-candidate newer than the entry's last write arrives.
+candidate newer than the entry's last write arrives. When the path still
+exists but its generated metadata was removed by a manual or public page
+rewrite, the ledger topic remains a matching alias: convergence leaves that
+page alone instead of recreating the former wording at a suffixed path.
 
 ### 5.4 Deliver
 

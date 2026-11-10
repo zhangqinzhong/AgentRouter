@@ -10,6 +10,8 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use ai_memory_core::ManagedProjectScope;
+use ai_memory_workstream::inspect_repository_fingerprints;
 use anyhow::{Context, Result, bail};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -65,6 +67,19 @@ struct ProjectRegistry {
     // binaries ignore it and simply drop it on their next write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     session_stores: Vec<SessionStore>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bindings: Vec<CheckoutBinding>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckoutBinding {
+    server: String,
+    workspace: String,
+    requested_project: String,
+    path: PathBuf,
+    repo_fingerprint: String,
+    worktree_fingerprint: String,
+    scope: ManagedProjectScope,
 }
 
 impl Default for ProjectRegistry {
@@ -73,6 +88,7 @@ impl Default for ProjectRegistry {
             version: REGISTRY_VERSION,
             links: Vec::new(),
             session_stores: Vec::new(),
+            bindings: Vec::new(),
         }
     }
 }
@@ -90,6 +106,102 @@ pub(super) fn links_for_server(
         .collect())
 }
 
+/// Reuse only a binding for this server, scope and unchanged checkout identity.
+/// The server still validates the ID and current permissions on every request.
+pub(super) fn project_binding(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    path: &Path,
+) -> Result<Option<ManagedProjectScope>> {
+    project_binding_for_server(config, &endpoint.identity(), workspace, project, path)
+}
+
+pub(super) fn project_binding_for_server(
+    config: &Config,
+    server: &str,
+    workspace: &str,
+    project: &str,
+    path: &Path,
+) -> Result<Option<ManagedProjectScope>> {
+    let i18n = &config.i18n;
+    let canonical = path
+        .canonicalize()
+        .context(i18n.text("cli-project-registry-canonicalizing-project-binding-checkout"))?;
+    let fingerprints = inspect_repository_fingerprints(&canonical)?;
+    let registry = match load_registry(&registry_path(config)) {
+        Ok(registry) => registry,
+        Err(error) => {
+            // A damaged optional registry must not break ordinary checkout
+            // discovery. Select no ID and leave the file untouched; the server
+            // still refuses ambiguous names and an explicit choice is required.
+            eprintln!(
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-project-registry-ai-memory-could-not-read-the-checkout-binding-error-using-guarded-project-na",
+                    &[("value0", format!("{:#}", error))]
+                )
+            );
+            return Ok(None);
+        }
+    };
+    Ok(registry
+        .bindings
+        .into_iter()
+        .find(|binding| {
+            binding.server == server
+                && binding.workspace == workspace
+                && (binding.requested_project == project || binding.scope.project == project)
+                && binding.scope.workspace == workspace
+                && binding.path == canonical
+                && binding.repo_fingerprint == fingerprints.repo_fingerprint
+                && binding.worktree_fingerprint == fingerprints.worktree_fingerprint
+        })
+        .map(|binding| binding.scope))
+}
+
+/// Persist only a server-confirmed scope or an explicit authorized selection.
+pub(super) fn record_project_binding(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    requested_project: &str,
+    path: &Path,
+    scope: &ManagedProjectScope,
+    expected: &ai_memory_workstream::RepositoryFingerprints,
+) -> Result<()> {
+    let i18n = &config.i18n;
+    let canonical = path
+        .canonicalize()
+        .context(i18n.text("cli-project-registry-canonicalizing-project-binding-checkout"))?;
+    let fingerprints = inspect_repository_fingerprints(&canonical)?;
+    if &fingerprints != expected {
+        bail!(
+            "{}", i18n.text("cli-project-registry-checkout-identity-changed-while-selecting-the-project-refusing-to-remember-a"));
+    }
+    let server = endpoint.identity();
+    update_registry(config, |registry| {
+        // One current choice per checkout and workspace, including a deliberate
+        // replacement via --project-id. Never choose the first of stale peers.
+        registry.bindings.retain(|binding| {
+            !(binding.server == server
+                && binding.workspace == scope.workspace
+                && binding.path == canonical)
+        });
+        registry.bindings.push(CheckoutBinding {
+            server,
+            workspace: scope.workspace.clone(),
+            requested_project: requested_project.to_owned(),
+            path: canonical,
+            repo_fingerprint: fingerprints.repo_fingerprint,
+            worktree_fingerprint: fingerprints.worktree_fingerprint,
+            scope: scope.clone(),
+        });
+        Ok(true)
+    })
+}
+
 /// Record the checkout only after the server accepted a managed run prepare.
 ///
 /// The path is canonicalized before persistence. A later picker rejects a
@@ -102,11 +214,19 @@ pub(super) fn record_prepared_checkout(
     project: &str,
     path: &Path,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     let canonical = path
         .canonicalize()
         .with_context(|| format!("canonicalizing checkout {}", path.display()))?;
     if !canonical.is_dir() {
-        bail!("checkout is not a directory: {}", canonical.display());
+        bail!(
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-project-registry-checkout-is-not-a-directory",
+                &[("value0", format!("{}", canonical.display()))]
+            )
+        );
     }
     let server = endpoint.identity();
     update_registry(config, |registry| {
@@ -156,6 +276,35 @@ pub(super) fn rekey_scope(
             registry.links.push(source);
         }
         Ok(true)
+    })
+}
+
+/// Point every checkout binding of this server that named `from` at `into`,
+/// under its current name, after the server moved `from`'s repository
+/// identity onto `into` (#1993). Without it a checkout bound to the emptied
+/// project would keep selecting it by id.
+pub(super) fn rebind_project(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    from: ai_memory_core::ProjectId,
+    into: ai_memory_core::ProjectId,
+    into_name: &str,
+) -> Result<()> {
+    let server = endpoint.identity();
+    update_registry(config, |registry| {
+        let mut changed = false;
+        for binding in registry
+            .bindings
+            .iter_mut()
+            .filter(|binding| binding.server == server)
+        {
+            if binding.scope.project_id == from || binding.scope.project_id == into {
+                binding.scope.project_id = into;
+                binding.scope.project = into_name.to_owned();
+                changed = true;
+            }
+        }
+        Ok(changed)
     })
 }
 
@@ -222,6 +371,7 @@ fn update_registry(
     config: &Config,
     mutate: impl FnOnce(&mut ProjectRegistry) -> Result<bool>,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     fs::create_dir_all(&config.data_dir).with_context(|| {
         format!(
             "creating client data directory {}",
@@ -230,17 +380,27 @@ fn update_registry(
     })?;
     let lock = open_private_lock(&lock_path(config))?;
     lock.lock_exclusive()
-        .context("locking client project registry")?;
+        .context(i18n.text("cli-project-registry-locking-client-project-registry"))?;
 
     let path = registry_path(config);
     let mut registry = load_registry(&path)?;
     if mutate(&mut registry)? {
-        if registry.links.len() > MAX_LINKS {
-            bail!("client project registry exceeds {MAX_LINKS} links");
+        if registry.links.len() > MAX_LINKS || registry.bindings.len() > MAX_LINKS {
+            bail!(
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-project-registry-client-project-registry-exceeds-max-links-links",
+                    &[("value0", format!("{}", MAX_LINKS))]
+                )
+            );
         }
-        let mut rendered =
-            serde_json::to_vec_pretty(&registry).context("serializing client project registry")?;
+        let mut rendered = serde_json::to_vec_pretty(&registry)
+            .context(i18n.text("cli-project-registry-serializing-client-project-registry"))?;
         rendered.push(b'\n');
+        if rendered.len() as u64 > MAX_REGISTRY_BYTES {
+            bail!("{}", i18n.text("cli-project-registry-client-project-registry-exceeds-the-byte-limit-keeping-the-previous-registry"));
+        }
         refuse_symlink(&path)?;
         ai_memory_wiki::write_atomic(&path, &rendered)
             .with_context(|| format!("writing client project registry {}", path.display()))?;
@@ -280,10 +440,16 @@ fn load_registry(path: &Path) -> Result<ProjectRegistry> {
             REGISTRY_VERSION
         );
     }
-    if registry.links.len() > MAX_LINKS {
+    if registry.links.len() > MAX_LINKS || registry.bindings.len() > MAX_LINKS {
         bail!("client project registry exceeds {MAX_LINKS} links");
     }
     let mut keys = HashSet::with_capacity(registry.links.len());
+    let mut binding_keys = HashSet::with_capacity(registry.bindings.len());
+    for binding in &registry.bindings {
+        if !binding_keys.insert((&binding.server, &binding.workspace, &binding.path)) {
+            bail!("duplicate checkout project binding; refusing ambiguous client state");
+        }
+    }
     for link in &registry.links {
         if !keys.insert((&link.server, &link.workspace, &link.project)) {
             bail!(
@@ -351,6 +517,222 @@ mod tests {
 
     fn endpoint(url: &str) -> ServerEndpoint {
         ServerEndpoint::from_pair(Some(url.to_owned()), None)
+    }
+
+    /// After the server moves a split project's identity (#1993), a checkout
+    /// bound to the emptied project selects the session project instead, and
+    /// another server's bindings are left alone.
+    #[test]
+    fn rebind_project_points_bindings_at_the_session_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&checkout)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let config = config_at(&tmp.path().join("data"));
+        let server = endpoint("http://memory:49374");
+        let other_server = endpoint("http://other:49374");
+        let emptied = ai_memory_core::ProjectId::new();
+        let sessions = ai_memory_core::ProjectId::new();
+        let scope = ManagedProjectScope {
+            workspace_id: ai_memory_core::WorkspaceId::new(),
+            project_id: emptied,
+            workspace: "default".into(),
+            project: "acme-api".into(),
+        };
+        let fingerprints = inspect_repository_fingerprints(&checkout).unwrap();
+        record_project_binding(
+            &config,
+            &server,
+            "acme-api",
+            &checkout,
+            &scope,
+            &fingerprints,
+        )
+        .unwrap();
+        record_project_binding(
+            &config,
+            &other_server,
+            "acme-api",
+            &checkout,
+            &scope,
+            &fingerprints,
+        )
+        .unwrap();
+
+        rebind_project(&config, &server, emptied, sessions, "acme-api").unwrap();
+
+        let bound = project_binding(&config, &server, "default", "acme-api", &checkout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (bound.project_id, bound.project.as_str()),
+            (sessions, "acme-api")
+        );
+        let untouched = project_binding(&config, &other_server, "default", "acme-api", &checkout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            untouched.project_id, emptied,
+            "another server keeps its own binding"
+        );
+    }
+
+    #[test]
+    fn project_id_bindings_survive_reload_and_reject_changed_checkout_or_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        let other = tmp.path().join("other");
+        fs::create_dir(&checkout).unwrap();
+        fs::create_dir(&other).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&checkout)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.test/acme/api.git",
+        ]);
+        let config = config_at(&tmp.path().join("data"));
+        let server = endpoint("http://memory:49374/mount");
+        let scope = ManagedProjectScope {
+            workspace_id: ai_memory_core::WorkspaceId::new(),
+            project_id: ai_memory_core::ProjectId::new(),
+            workspace: "default".into(),
+            project: "acme-api".into(),
+        };
+        let fingerprints = inspect_repository_fingerprints(&checkout).unwrap();
+        record_project_binding(&config, &server, "api", &checkout, &scope, &fingerprints).unwrap();
+        let reloaded = config_at(&tmp.path().join("data"));
+        assert_eq!(
+            project_binding(&reloaded, &server, "default", "api", &checkout).unwrap(),
+            Some(scope.clone())
+        );
+        assert!(
+            project_binding(
+                &reloaded,
+                &endpoint("http://other:49374/mount"),
+                "default",
+                "api",
+                &checkout
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            project_binding(
+                &reloaded,
+                &endpoint("http://memory:49374/another"),
+                "default",
+                "api",
+                &checkout
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            project_binding(&reloaded, &server, "foreign", "api", &checkout)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            project_binding(&reloaded, &server, "default", "different", &checkout)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            project_binding(&reloaded, &server, "default", "api", &other)
+                .unwrap()
+                .is_none()
+        );
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.test/other/api.git",
+        ]);
+        assert!(
+            project_binding(&reloaded, &server, "default", "api", &checkout)
+                .unwrap()
+                .is_none()
+        );
+        let before = fs::read(registry_path(&config)).unwrap();
+        assert!(
+            record_project_binding(&config, &server, "api", &checkout, &scope, &fingerprints)
+                .is_err()
+        );
+        assert_eq!(fs::read(registry_path(&config)).unwrap(), before);
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.test/acme/api.git",
+        ]);
+        let replacement = ManagedProjectScope {
+            project_id: ai_memory_core::ProjectId::new(),
+            ..scope
+        };
+        record_project_binding(
+            &reloaded,
+            &server,
+            "api",
+            &checkout,
+            &replacement,
+            &fingerprints,
+        )
+        .unwrap();
+        assert_eq!(
+            project_binding(&reloaded, &server, "default", "api", &checkout).unwrap(),
+            Some(replacement)
+        );
+        assert_eq!(
+            load_registry(&registry_path(&reloaded))
+                .unwrap()
+                .bindings
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn project_id_registry_upgrade_and_failed_write_preserve_existing_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_at(&tmp.path().join("data"));
+        fs::create_dir_all(&config.data_dir).unwrap();
+        let old = b"{\"version\":1,\"links\":[]}";
+        fs::write(registry_path(&config), old).unwrap();
+        assert!(
+            load_registry(&registry_path(&config))
+                .unwrap()
+                .bindings
+                .is_empty()
+        );
+        let error = update_registry(&config, |registry| {
+            registry.version = 123;
+            bail!("injected failure before atomic replacement")
+        });
+        assert!(error.is_err());
+        assert_eq!(fs::read(registry_path(&config)).unwrap(), old);
     }
 
     #[test]

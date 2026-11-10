@@ -387,8 +387,8 @@ impl OpencodeAdapter {
                 &ro,
                 &r.native_id,
                 decode_images,
-                &V1Order::OPENCODE,
-                |md, role, built| {if role==Role::Assistant {
+                &V1Query::OPENCODE,
+                |md, _parts, role, built| {if role==Role::Assistant {
                     if let Some(model)=md.get("modelID").or_else(||md.pointer("/model/id")).and_then(|m|m.as_str()){message_model=Some(model.to_string());if let Some(m)=built{m.model=Some(model.to_string());}}
                     if let Some(t)=md.get("tokens"){tokens+= ["input","output","reasoning"].iter().filter_map(|k|t.get(k).and_then(|v|v.as_i64())).sum::<i64>();}
                 }},
@@ -405,17 +405,21 @@ impl OpencodeAdapter {
     }
 }
 
-/// v1 两表路径的排序子句。OpenCode 按 id(前缀时间有序);ZCode 的两张表另有
-/// autofill 的 sequence 列,优先按它
-pub(crate) struct V1Order {
+/// v1 两表路径的取法:排序子句,与 message 表上的筛选。OpenCode 按 id(前缀时间有序)读整个
+/// 会话;ZCode 的两张表另有 autofill 的 sequence 列,优先按它;MiMo Code 只读要显示的那一段
+pub(crate) struct V1Query {
     pub(crate) part: &'static str,
     pub(crate) message: &'static str,
+    /// message 表上追加的条件。`?1` 是会话 id;条件既拼进 message 查询,也拼进 part 查询里挑消息
+    /// 的子查询,不带表名的列都要落在 message 表上;part 只取被选中的消息的。None = 整个会话
+    pub(crate) filter: Option<String>,
 }
 
-impl V1Order {
-    pub(crate) const OPENCODE: V1Order = V1Order {
+impl V1Query {
+    pub(crate) const OPENCODE: V1Query = V1Query {
         part: "message_id, id",
         message: "time_created, id",
+        filter: None,
     };
 }
 
@@ -429,21 +433,31 @@ fn json_at(r: &rusqlite::Row<'_>, ix: usize) -> rusqlite::Result<Option<Value>> 
 }
 
 /// v1 正文:message 表(角色/时间)+ part 表(内容块)按 message_id 分组。
-/// `on_message` 对每一行 message 都调一次——带上已判好的角色,第三个参数是这一行拼出的消息,
-/// 全空(如只有 error 的失败 turn)时为 None;ZCode 用它拿 model / token /
-/// semantics,OpenCode 传空闭包。两家的差异只在这里和排序子句
+/// `on_message` 对每一行 message 都调一次——带上这一行的 part 与已判好的角色,第四个参数是这一行
+/// 拼出的消息,全空(如只有 error 的失败 turn)时为 None;ZCode / MiMo Code 用它拿 model / token /
+/// semantics(MiMo 还从 part 里认派活的道与检查点),OpenCode 传空闭包。各家的差异只在这里和取法
+/// (`V1Query`)
 pub(crate) fn parse_v1_messages(
     ro: &SqliteRo,
     sid: &str,
     decode_images: bool,
-    order: &V1Order,
-    mut on_message: impl FnMut(&Value, Role, Option<&mut TranscriptMessage>),
+    query: &V1Query,
+    mut on_message: impl FnMut(&Value, &[Value], Role, Option<&mut TranscriptMessage>),
 ) -> Result<(Vec<TranscriptMessage>, u32)> {
+    // 筛过的只取被选中消息的 part,按 message_id 走索引:挑消息的子查询已经钉住了会话,再写
+    // `session_id = ?1` 会让 SQLite 改走会话索引,把整个会话的 part 读一遍再排序
+    let (part_where, message_filter) = match &query.filter {
+        Some(f) => (
+            format!("message_id IN (SELECT id FROM message WHERE session_id = ?1 AND {f})"),
+            format!(" AND {f}"),
+        ),
+        None => ("session_id = ?1".to_string(), String::new()),
+    };
     let mut parts_by_msg: HashMap<String, Vec<Value>> = HashMap::new();
     {
         let mut stmt = ro.conn.prepare(&format!(
-            "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY {}",
-            order.part
+            "SELECT message_id, data FROM part WHERE {part_where} ORDER BY {}",
+            query.part
         ))?;
         let rows = stmt.query_map([sid], |p| Ok((p.get::<_, String>(0)?, json_at(p, 1)?)))?;
         for (mid, data) in rows.flatten() {
@@ -456,8 +470,8 @@ pub(crate) fn parse_v1_messages(
     let mut messages: Vec<TranscriptMessage> = Vec::new();
     let mut unknown = 0u32;
     let mut stmt = ro.conn.prepare(&format!(
-        "SELECT id, data FROM message WHERE session_id = ?1 ORDER BY {}",
-        order.message
+        "SELECT id, data FROM message WHERE session_id = ?1{message_filter} ORDER BY {}",
+        query.message
     ))?;
     let msg_rows = stmt.query_map([sid], |m| Ok((m.get::<_, String>(0)?, json_at(m, 1)?)))?;
     for (mid, data) in msg_rows.flatten() {
@@ -476,13 +490,14 @@ pub(crate) fn parse_v1_messages(
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         let mut acc = BlockAcc::default();
-        for p in parts_by_msg.remove(&mid).unwrap_or_default() {
-            if !acc.push_part(&p, decode_images) {
+        let parts = parts_by_msg.remove(&mid).unwrap_or_default();
+        for p in &parts {
+            if !acc.push_part(p, decode_images) {
                 unknown += 1;
             }
         }
         let mut built = acc.into_message(role, ts, None);
-        on_message(&md, role, built.as_mut());
+        on_message(&md, &parts, role, built.as_mut());
         if let Some(m) = built {
             messages.push(m);
         }
@@ -632,7 +647,7 @@ struct BlockAcc {
 
 impl BlockAcc {
     /// 一个 part 块 → 累加器;返回 false = 表外类型(调用方计 unknown)。
-    /// ZCode 的 part 与这里同形(它的运行时是 OpenCode 衍生物),两家共用这一个分派
+    /// ZCode 与 MiMo Code 的 part 与这里同形(都是 OpenCode 的衍生物),共用这一个分派
     fn push_part(&mut self, p: &Value, decode_images: bool) -> bool {
         match p.get("type").and_then(|v| v.as_str()) {
             Some("text") => {
@@ -663,9 +678,11 @@ impl BlockAcc {
             }
             // agent = 正文里 @ 了哪个代理(文字本身在 text 块里);retry = 请求重试的记录;
             // compaction = 触发压缩的标记(摘要本身是后面那条助手消息);timeline = ZCode 画在
-            // 对话里的分隔条(分叉、压缩进度),没有正文
+            // 对话里的分隔条(分叉、压缩进度),没有正文;checkpoint = MiMo Code 的上下文检查点
+            // (那条消息怎么折由 MiMo 的钩子定)
             Some("step-start") | Some("step-finish") | Some("snapshot") | Some("patch")
-            | Some("agent") | Some("retry") | Some("compaction") | Some("timeline") => {}
+            | Some("agent") | Some("retry") | Some("compaction") | Some("timeline")
+            | Some("checkpoint") => {}
             Some("file") if is_image_part(p) => self.push_image(p, decode_images),
             Some("file") => {}
             _ => return false,

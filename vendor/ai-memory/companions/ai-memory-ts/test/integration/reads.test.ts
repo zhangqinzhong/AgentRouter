@@ -146,6 +146,41 @@ describe("api namespace", () => {
 });
 
 describe("servers in other modes", () => {
+  it("callTool works as the first MCP call in stateless and stateful modes", async () => {
+    for (const stateful of [true, false]) {
+      const fresh = await startServer({ stateful, basePath: "/wiki" });
+      try {
+        const methods: string[] = [];
+        const client = new AiMemoryClient({
+          serverUrl: fresh.url,
+          token: fresh.rootToken,
+          scope,
+          fetch: async (url, init) => {
+            const body = JSON.parse(init.body as string) as { method: string };
+            methods.push(body.method);
+            return fetch(url, init);
+          },
+        });
+        await client.callTool("memory_write_page", {
+          ...scope,
+          path: "notes/raw-first.md",
+          body: "# Raw first\ncreated through callTool",
+        });
+        assert.deepEqual(
+          methods,
+          stateful
+            ? ["initialize", "notifications/initialized", "tools/call"]
+            : ["initialize", "tools/call"],
+        );
+        assert.equal((await client.pages.read({ path: "notes/raw-first.md" })).title, "Raw first");
+        assert.equal(methods.filter((method) => method === "initialize").length, 1);
+        assert.equal(methods.filter((method) => method === "tools/list").length, 1);
+      } finally {
+        await fresh.stop();
+      }
+    }
+  });
+
   it("every /api/v1 route is NotFoundError without --enable-api", async () => {
     const bare = await startServer({ api: false });
     try {

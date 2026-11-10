@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::CommitArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -29,6 +30,7 @@ struct CommitResponse {
 /// Returns an error if the server is unreachable or returns a non-2xx
 /// response.
 pub async fn run(config: &Config, args: CommitArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: CommitResponse = post_json(
         &endpoint,
@@ -39,14 +41,31 @@ pub async fn run(config: &Config, args: CommitArgs) -> Result<()> {
     )
     .await?;
     if resp.committed {
-        println!("committed: {}", resp.oid.as_deref().unwrap_or("(unknown)"));
+        println!(
+            "{}",
+            i18n.format(
+                "cli-commit-committed",
+                &[(
+                    "value0",
+                    terminal_text(resp.oid.as_deref().unwrap_or("(unknown)"))
+                )]
+            )
+        );
     } else {
         println!(
-            "nothing to commit{}",
-            resp.reason
-                .as_deref()
-                .map(|r| format!(" ({r})"))
-                .unwrap_or_default()
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-commit-nothing-to-commit",
+                &[(
+                    "value0",
+                    resp.reason
+                        .as_deref()
+                        .map(|r| format!(" ({})", terminal_text(r)))
+                        .unwrap_or_default()
+                        .to_string()
+                )]
+            )
         );
     }
     Ok(())

@@ -330,14 +330,18 @@ fn path_tombstoned(store: &Store, r: &SessionFileRef) -> bool {
     }
 }
 
-/// 扫描收尾的索引维护:到期才压缩 FTS(见 `Store::compact_fts`),压完有大块空闲再
-/// VACUUM。在扫描门外跑,自己一把门:前一次维护还没完就跳过,下一轮扫描照样到期再来。
+/// 扫描收尾的索引维护:老库升级后补两字组表(`Store::backfill_cjk`),到期才压缩 FTS(见
+/// `Store::compact_fts`),压完有大块空闲再 VACUUM。在扫描门外跑,自己一把门:前一次维护还没完就跳过,下一轮扫描照样到期再来。
 /// 失败只记日志——维护做不成不影响这一轮扫描的结果
 fn maintain_index(store: &Store) {
     static MAINTENANCE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let Ok(_maintaining) = MAINTENANCE.try_lock() else {
         return;
     };
+    // 老库升级后把已有的消息补进两字组表:有旗子就做,不等压缩的节奏(补齐之前两字词走 LIKE)
+    if let Err(e) = store.backfill_cjk() {
+        eprintln!("wake: filling the CJK word index failed: {e:#}");
+    }
     let now = crate::db::now_ms();
     if !store.fts_compaction_due(now) {
         return;

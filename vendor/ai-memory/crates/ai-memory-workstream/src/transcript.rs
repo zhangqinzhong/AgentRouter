@@ -1,7 +1,7 @@
 //! Incremental, read-only extraction from native harness session stores.
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -155,6 +155,20 @@ const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
 struct SqlCursor {
     updated: i64,
     id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CrushCursor {
+    updated: i64,
+    id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    boundary: Vec<CrushRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CrushRevision {
+    id: String,
+    digest: String,
 }
 
 /// Export unseen visible transcript records for one native session.
@@ -339,9 +353,22 @@ fn validate_cursor_range(
     source_cursor: Option<&str>,
     final_cursor: &str,
 ) -> Result<()> {
-    if matches!(
+    if harness == ManagedHarness::Crush {
+        let start = source_cursor
+            .map(serde_json::from_str::<CrushCursor>)
+            .transpose()
+            .context("invalid native transcript Crush cursor")?
+            .unwrap_or_default();
+        let end: CrushCursor = serde_json::from_str(final_cursor)
+            .context("invalid native transcript final Crush cursor")?;
+        if (end.updated, end.id.as_str()) < (start.updated, start.id.as_str()) {
+            return Err(anyhow!(
+                "native transcript final cursor precedes its start cursor"
+            ));
+        }
+    } else if matches!(
         harness,
-        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 | ManagedHarness::Crush
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2
     ) {
         let start = source_cursor
             .map(serde_json::from_str::<SqlCursor>)
@@ -377,9 +404,14 @@ fn validate_transcript_cursor(
     native_session_id: &str,
     source_cursor: &str,
 ) -> Result<()> {
+    if harness == ManagedHarness::Crush {
+        serde_json::from_str::<CrushCursor>(source_cursor)
+            .context("invalid native transcript Crush cursor")?;
+        return Ok(());
+    }
     if matches!(
         harness,
-        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 | ManagedHarness::Crush
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2
     ) {
         serde_json::from_str::<SqlCursor>(source_cursor)
             .context("invalid native transcript SQL cursor")?;
@@ -525,10 +557,14 @@ fn transcript_baseline_blocking(
             opencode_db(home, session_dir),
             "SELECT time_updated, id FROM session_message WHERE session_id = ?1 ORDER BY time_updated DESC, id DESC LIMIT 1",
         ),
-        ManagedHarness::Crush => sql_cursor(
-            crush_db(home, cwd, session_dir),
-            "SELECT updated_at, id FROM messages WHERE session_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1",
-        ),
+        ManagedHarness::Crush => crush_cursor(
+            &Connection::open_with_flags(
+                crush_db(home, cwd, session_dir),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?,
+            native_session_id,
+        )
+        .and_then(|cursor| serde_json::to_string(&cursor).map_err(Into::into)),
         ManagedHarness::Antigravity => Err(anyhow!(
             "{} does not expose a reliable transcript cursor",
             harness.as_str()
@@ -704,12 +740,17 @@ pub fn claude_session_ran_in_background(
         return Ok(false);
     };
     let reader = BufReader::new(File::open(&path)?);
-    for line in reader.lines() {
+    // Split on bytes: a line that is not UTF-8 is one unreadable record, not
+    // a failed scan (`lines()` would end it with an error).
+    for line in reader.split(b'\n') {
         let line = line?;
+        let Ok(line) = std::str::from_utf8(&line) else {
+            continue;
+        };
         if !line.contains("\"sessionKind\"") {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if value.get("sessionKind").and_then(Value::as_str) == Some("bg")
@@ -801,8 +842,21 @@ pub fn claude_continued_session(
     native_session_id: &str,
     started_at: SystemTime,
 ) -> Result<Option<ClaudeContinuation>> {
+    Ok(claude_continued_sessions(home, cwd, session_dir, native_session_id, started_at)?.pop())
+}
+
+/// Find every session a Claude Code process continued in during this run,
+/// oldest first. This lets callers preserve turns from each transcript in a
+/// chain of `/clear` commands while still following the newest session.
+pub fn claude_continued_sessions(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    started_at: SystemTime,
+) -> Result<Vec<ClaudeContinuation>> {
     if !valid_native_session_id(native_session_id) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut candidates = collect_session_files(ManagedHarness::Claude, home, session_dir)?;
     candidates.sort_by(|left, right| {
@@ -811,7 +865,8 @@ pub fn claude_continued_session(
             .then_with(|| left.cmp(right))
     });
     let attached_marker = format!("\"session_id\":\"{native_session_id}\"");
-    for path in candidates.into_iter().take(512) {
+    let mut continuations = Vec::new();
+    'candidate: for path in candidates.into_iter().take(512) {
         if modified(&path).is_some_and(|time| time + Duration::from_secs(2) < started_at) {
             break;
         }
@@ -824,13 +879,18 @@ pub fn claude_continued_session(
         let reader = BufReader::new(File::open(&path)?);
         let mut cleared = false;
         let mut cleared_in_checkout = false;
-        for line in reader.lines() {
+        // Other projects' live transcripts are read too: a line that is not
+        // UTF-8 (one cut mid-write) is skipped instead of failing the scan.
+        for line in reader.split(b'\n') {
             let line = line?;
+            let Ok(line) = std::str::from_utf8(&line) else {
+                continue;
+            };
             let clear_command = line.contains(CLAUDE_CLEAR_COMMAND);
             if !clear_command && !line.contains(&attached_marker) {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
             let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
@@ -848,7 +908,8 @@ pub fn claude_continued_session(
             }
             if value.get("sessionKind").and_then(Value::as_str) == Some("bg") {
                 if recorded_cwd.is_some_and(|recorded| same_path(recorded, cwd)) {
-                    return Ok(Some(ClaudeContinuation::Background(session.to_string())));
+                    continuations.push(ClaudeContinuation::Background(session.to_string()));
+                    continue 'candidate;
                 }
             } else if session == stem
                 && recorded_cwd.is_some_and(|recorded| path_within(recorded, cwd))
@@ -857,10 +918,11 @@ pub fn claude_continued_session(
             }
         }
         if cleared && cleared_in_checkout {
-            return Ok(Some(ClaudeContinuation::Cleared(stem.to_string())));
+            continuations.push(ClaudeContinuation::Cleared(stem.to_string()));
         }
     }
-    Ok(None)
+    continuations.reverse();
+    Ok(continuations)
 }
 
 const CLAUDE_CLEAR_COMMAND: &str = "<command-name>/clear</command-name>";
@@ -931,6 +993,68 @@ pub async fn list_native_sessions(
     Ok(sessions)
 }
 
+/// Find one named session without truncating it out of a recent-session list.
+/// Uses the same native identity, checkout and top-level-session checks as
+/// listing: file adapters verify the transcript header, OpenCode checks the
+/// recorded directory, and Crush excludes sub-agent/title sessions.
+pub fn find_native_session(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<Option<NativeSessionCandidate>> {
+    if !valid_native_session_id(native_session_id) {
+        return Ok(None);
+    }
+    let updated_at = match harness {
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 | ManagedHarness::Crush => {
+            let db = if harness == ManagedHarness::Crush {
+                crush_db(home, cwd, session_dir)
+            } else {
+                opencode_db(home, session_dir)
+            };
+            if !db.is_file() {
+                return Ok(None);
+            }
+            let connection = Connection::open_with_flags(
+                db,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            if harness == ManagedHarness::Crush {
+                connection
+                    .query_row(
+                        "SELECT updated_at FROM sessions WHERE id = ?1 AND parent_session_id IS NULL",
+                        [native_session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .and_then(native_timestamp)
+            } else {
+                let sql = if harness == ManagedHarness::OpenCode {
+                    "SELECT time_updated FROM session WHERE id = ?1 AND directory IN (?2, ?3)"
+                } else {
+                    "SELECT time_updated FROM session_v2 WHERE id = ?1 AND directory IN (?2, ?3)"
+                };
+                let (native, forward) = opencode_directories(cwd);
+                connection
+                    .query_row(sql, params![native_session_id, native, forward], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .optional()?
+                    .and_then(|updated| u64::try_from(updated).ok())
+                    .and_then(|updated| UNIX_EPOCH.checked_add(Duration::from_millis(updated)))
+            }
+        }
+        _ => locate_session_file(harness, home, cwd, session_dir, native_session_id)?
+            .and_then(|path| modified(&path)),
+    };
+    Ok(updated_at.map(|updated_at| NativeSessionCandidate {
+        native_session_id: native_session_id.to_owned(),
+        updated_at,
+    }))
+}
+
 /// Resolve the on-disk directory holding this harness's native "memory"
 /// store for the given checkout, when the harness has one and a session
 /// recorded for this cwd can be found.
@@ -945,6 +1069,9 @@ pub async fn list_native_sessions(
 /// content-based match [`list_native_sessions`] uses — read each session
 /// file's own recorded `cwd` until one matches — and returns that file's
 /// parent directory, which is correct on any platform by construction.
+///
+/// Antigravity CLI keeps Knowledge Items under `<home>/.gemini/antigravity-cli/knowledge/`
+/// beside its `conversations/` directory.
 ///
 /// Callers should pass the checkout's **repository root**, not an arbitrary
 /// subdirectory: Claude Code keys this store by repository root, so a
@@ -964,7 +1091,7 @@ pub fn native_memory_dir(
     cwd: &Path,
     session_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    if harness != ManagedHarness::Claude {
+    if harness != ManagedHarness::Claude && harness != ManagedHarness::Antigravity {
         return None;
     }
     let mut files = collect_session_files(harness, home, session_dir).ok()?;
@@ -978,7 +1105,11 @@ pub fn native_memory_dir(
             continue;
         };
         if same_path(&recorded_cwd, cwd) {
-            let memory_dir = path.parent()?.join("memory");
+            let memory_dir = match harness {
+                ManagedHarness::Claude => path.parent()?.join("memory"),
+                ManagedHarness::Antigravity => path.parent()?.parent()?.join("knowledge"),
+                _ => return None,
+            };
             return memory_dir.is_dir().then_some(memory_dir);
         }
     }
@@ -1161,6 +1292,13 @@ fn export_jsonl_range(
             "native transcript final cursor is past the current transcript end"
         ));
     }
+    // `occurrences` tracks how many times each content-hashed record identity
+    // has been seen so far in document order, so a rewrite-in-place harness's
+    // byte-identical records get distinct ids (#2053). It is seeded from the
+    // validated prefix so an incremental export numbers a repeated record the
+    // same way a full export does. Non-rewrite harnesses key records by their
+    // own source ids and never consult it.
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
     let (start, mut prefix_hasher) = if journal_rewrites_in_place(harness) {
         let validated = if let Some(cursor) = cursor.as_ref().filter(|cursor| cursor.offset <= len)
             && let Some(expected) = cursor.prefix_sha256.as_deref()
@@ -1171,7 +1309,13 @@ fn export_jsonl_range(
         } else {
             None
         };
-        validated.unwrap_or_else(|| (0, Sha256::new()))
+        match validated {
+            Some((offset, hasher)) => {
+                occurrences = count_prefix_record_occurrences(&mut file, offset)?;
+                (offset, hasher)
+            }
+            None => (0, Sha256::new()),
+        }
     } else {
         (
             cursor.map_or(0, |cursor| cursor.offset.min(len)),
@@ -1333,7 +1477,23 @@ fn export_jsonl_range(
             // exchange's Prompt/AssistantMessage/ToolResults records, so
             // the line hash is its unique record id as well.
             let raw = line.strip_suffix(b"\n").unwrap_or(&line);
-            format!("{:x}", Sha256::digest(raw))
+            let base = format!("{:x}", Sha256::digest(raw));
+            // The first occurrence keeps the bare content hash, so every unique
+            // record (and the first of any repeated set) stays byte-stable
+            // across a rewrite exactly as before; only a later byte-identical
+            // record gains a deterministic occurrence suffix so it no longer
+            // collides on one ingest key (#2053). A rewrite that drops an
+            // earlier identical record shifts later suffixes, which can
+            // re-import a retained duplicate but never drops a distinct turn —
+            // the same duplicate-over-loss trade the content-hash identity
+            // already makes.
+            let seen = occurrences.entry(base.clone()).or_insert(0);
+            *seen += 1;
+            if *seen == 1 {
+                base
+            } else {
+                format!("{base}#{seen}")
+            }
         } else {
             source_id(&value).unwrap_or_else(|| format!("byte-{}", offset - read as u64))
         };
@@ -1473,6 +1633,40 @@ fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
             metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
         }
     }
+}
+
+/// Count how many times each rewrite-in-place record identity (the SHA-256 of
+/// a raw JSONL line) occurs in the first `len` committed bytes. Seeds the
+/// occurrence tally so an incremental export after the cursor numbers a
+/// repeated record exactly as a full export does, keeping both byte-identical
+/// records distinct instead of colliding on one id (#2053).
+fn count_prefix_record_occurrences(file: &mut File, len: u64) -> Result<HashMap<String, usize>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(file);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut remaining = len;
+    let mut line = Vec::new();
+    while remaining > 0 {
+        line.clear();
+        let read = reader
+            .by_ref()
+            .take(remaining)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        remaining -= read as u64;
+        // Only a complete, newline-terminated record has a stable identity,
+        // matching the main scan's own record boundary.
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+        *counts
+            .entry(format!("{:x}", Sha256::digest(raw)))
+            .or_insert(0) += 1;
+    }
+    Ok(counts)
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -1661,6 +1855,36 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
+/// Codex writes a tool output as a plain string, or as an array of
+/// `input_text` / `input_image` / `input_audio` / `encrypted_content` items
+/// for MCP results and `view_image` (`FunctionCallOutputPayload` in
+/// https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs).
+/// The text items are joined the way Codex's own
+/// `function_call_output_content_items_to_text` joins them.
+fn codex_tool_output(payload: &Value, losses: &mut Vec<String>) -> String {
+    if let Some(text) = first_string(payload, &["output", "content", "text"]) {
+        return text.to_string();
+    }
+    let Some(items) = payload.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        match (
+            item.get("type").and_then(Value::as_str),
+            item.get("text").and_then(Value::as_str),
+        ) {
+            (Some("input_text"), Some(text)) => {
+                if !text.trim().is_empty() {
+                    texts.push(text);
+                }
+            }
+            _ => losses.push("Codex non-text tool-output items were intentionally excluded".into()),
+        }
+    }
+    texts.join("\n")
+}
+
 fn parse_codex(
     value: &Value,
     session: &str,
@@ -1703,6 +1927,16 @@ fn parse_codex(
             if !matches!(role, "user" | "assistant") {
                 return;
             }
+            if role == "user"
+                && payload
+                    .get("content")
+                    .map(value_text)
+                    .is_some_and(|text| ai_memory_core::looks_like_codex_generated_prompt(&text))
+            {
+                losses
+                    .push("Codex generated background prompts were intentionally excluded".into());
+                return;
+            }
             parse_content_blocks(
                 AgentKind::Codex,
                 session,
@@ -1731,7 +1965,7 @@ fn parse_codex(
             );
         }
         "function_call_output" | "custom_tool_call_output" | "tool_result" => {
-            let body = first_string(payload, &["output", "content", "text"]).unwrap_or("");
+            let body = codex_tool_output(payload, losses);
             push_event(
                 events,
                 AgentKind::Codex,
@@ -1740,7 +1974,7 @@ fn parse_codex(
                 0,
                 WorkstreamEventKind::ToolResult,
                 Some("tool"),
-                body,
+                &body,
                 timestamp(value),
                 with_tool_use_id(json!({}), first_string(payload, &["call_id"])),
             );
@@ -1811,7 +2045,7 @@ fn parse_pi_family(
                     losses,
                 ),
                 "tool" | "toolResult" | "tool_result" => {
-                    let body = message.get("content").map(value_text).unwrap_or_default();
+                    let body = tool_result_text(agent, message.get("content"), losses);
                     let tool = first_string(message, &["toolName", "tool", "name"]);
                     push_event(
                         events,
@@ -1959,7 +2193,7 @@ fn parse_kimi(
                             Some("assistant"),
                             &format!("{name}: {arguments}"),
                             occurred_at.clone(),
-                            json!({"tool": name}),
+                            with_tool_use_id(json!({"tool": name}), first_string(call, &["id"])),
                         );
                     }
                 }
@@ -1976,7 +2210,10 @@ fn parse_kimi(
                         Some("tool"),
                         &body,
                         occurred_at,
-                        json!({}),
+                        with_tool_use_id(
+                            json!({}),
+                            first_string(message, &["toolCallId", "tool_call_id"]),
+                        ),
                     );
                 }
                 _ => {}
@@ -2782,7 +3019,7 @@ fn parse_grok(
                     Some("assistant"),
                     &format!("{name}: {arguments}"),
                     timestamp(value),
-                    json!({"tool": name}),
+                    with_tool_use_id(json!({"tool": name}), first_string(call, &["id"])),
                 );
             }
         }
@@ -2798,7 +3035,10 @@ fn parse_grok(
                 Some("tool"),
                 &body,
                 timestamp(value),
-                json!({}),
+                with_tool_use_id(
+                    json!({}),
+                    first_string(value, &["tool_call_id", "toolCallId"]),
+                ),
             );
         }
         "backend_tool_call" => {
@@ -3050,7 +3290,7 @@ fn parse_content_blocks(
                 );
             }
             "tool_result" | "toolResult" => {
-                let body = block.get("content").map(value_text).unwrap_or_default();
+                let body = tool_result_text(agent, block.get("content"), losses);
                 if claude_managed_packet_echo(agent, &body) {
                     losses.push(
                         "Claude managed workstream delivery packets were intentionally excluded"
@@ -3088,6 +3328,32 @@ fn parse_content_blocks(
     }
 }
 
+/// An image block in a tool result has no text field, so `value_text` would
+/// store the whole block, base64 data included, as the result's content.
+fn tool_result_text(agent: AgentKind, content: Option<&Value>, losses: &mut Vec<String>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    let Value::Array(items) = content else {
+        return value_text(content);
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) == Some("image") {
+            losses.push(format!(
+                "{} image tool results were intentionally excluded",
+                agent.as_str()
+            ));
+            continue;
+        }
+        let text = value_text(item);
+        if !text.is_empty() {
+            texts.push(text);
+        }
+    }
+    texts.join("\n")
+}
+
 fn claude_managed_packet_echo(agent: AgentKind, body: &str) -> bool {
     if agent != AgentKind::ClaudeCode {
         return false;
@@ -3105,6 +3371,7 @@ fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
     match agent {
         AgentKind::Codex => {
             ai_memory_core::looks_like_codex_instructions(trimmed)
+                || ai_memory_core::looks_like_codex_generated_prompt(trimmed)
                 || trimmed.starts_with("<environment_context>")
                 || trimmed.starts_with("<permissions instructions>")
                 || trimmed.starts_with("<INSTRUCTIONS>")
@@ -3247,6 +3514,70 @@ fn export_crush(
     export_crush_range(home, cwd, session_dir, session, source_cursor, None)
 }
 
+fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> CrushRevision {
+    let seed = format!("{id}\0{role}\0{is_summary}\0{parts}");
+    CrushRevision {
+        id: id.to_owned(),
+        digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
+    }
+}
+
+fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
+    let newest = connection
+        .query_row(
+            "SELECT updated_at, id FROM messages WHERE session_id = ?1 \
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+            [session],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((updated, id)) = newest else {
+        return Ok(CrushCursor::default());
+    };
+    let mut statement = connection.prepare(
+        "SELECT id, role, parts, is_summary_message FROM messages \
+         WHERE session_id = ?1 AND updated_at = ?2 ORDER BY id LIMIT ?3",
+    )?;
+    let revisions = statement
+        .query_map(
+            params![session, updated, (MAX_SOURCE_RECORDS + 1) as i64],
+            |row| {
+                let id = row.get::<_, String>(0)?;
+                let role = row.get::<_, String>(1)?;
+                let parts = row.get::<_, String>(2)?;
+                let summary = row.get::<_, i64>(3)?;
+                Ok(crush_revision(&id, &role, &parts, summary))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if revisions.len() > MAX_SOURCE_RECORDS {
+        return Err(anyhow!(
+            "Crush cursor boundary exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+        ));
+    }
+    Ok(CrushCursor {
+        updated,
+        id,
+        boundary: revisions,
+    })
+}
+
+fn crush_revision_is_known(cursor: &CrushCursor, revision: &CrushRevision) -> bool {
+    if cursor.boundary.is_empty() {
+        revision.id <= cursor.id
+    } else {
+        cursor.boundary.iter().any(|known| known == revision)
+    }
+}
+
+fn crush_revision_is_within(cursor: &CrushCursor, revision: &CrushRevision) -> bool {
+    if cursor.boundary.is_empty() {
+        revision.id <= cursor.id
+    } else {
+        cursor.boundary.iter().any(|known| known == revision)
+    }
+}
+
 fn export_crush_range(
     home: &Path,
     cwd: &Path,
@@ -3262,35 +3593,40 @@ fn export_crush_range(
     )
     .with_context(|| format!("opening Crush session database {} read-only", db.display()))?;
     let cursor = source_cursor
-        .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
+        .and_then(|raw| serde_json::from_str::<CrushCursor>(raw).ok())
         .unwrap_or_default();
     let upper = final_cursor
-        .map(serde_json::from_str::<SqlCursor>)
+        .map(serde_json::from_str::<CrushCursor>)
         .transpose()
-        .context("invalid native transcript final SQL cursor")?
-        .unwrap_or(SqlCursor {
+        .context("invalid native transcript final Crush cursor")?
+        .unwrap_or(CrushCursor {
             updated: i64::MAX,
             id: "\u{10ffff}".to_string(),
+            boundary: Vec::new(),
         });
+    let revisit_boundary = i64::from(!cursor.boundary.is_empty());
+    let query_limit = MAX_SOURCE_RECORDS
+        .checked_add(cursor.boundary.len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("Crush transcript query limit overflow"))?;
     let mut statement = connection.prepare(
         "SELECT id, role, length(parts), parts, updated_at, is_summary_message \
          FROM messages \
          WHERE session_id = ?1 \
-           AND (updated_at > ?2 OR (updated_at = ?2 AND id > ?3)) \
-           AND (updated_at < ?4 OR (updated_at = ?4 AND id <= ?5)) \
+           AND (updated_at > ?2 OR (updated_at = ?2 AND (?3 = 1 OR id > ?4))) \
+           AND updated_at <= ?5 \
          ORDER BY updated_at, id LIMIT ?6",
     )?;
     let mut rows = statement.query(params![
         session,
         cursor.updated,
+        revisit_boundary,
         cursor.id,
         upper.updated,
-        upper.id,
-        (MAX_SOURCE_RECORDS + 1) as i64
+        query_limit as i64
     ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
-    let mut next_cursor = cursor;
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
@@ -3315,10 +3651,13 @@ fn export_crush_range(
         let parts_raw = row.get::<_, String>(3)?;
         let updated = row.get::<_, i64>(4)?;
         let is_summary = row.get::<_, i64>(5)?;
-        next_cursor = SqlCursor {
-            updated,
-            id: id.clone(),
-        };
+        let revision = crush_revision(&id, &role, &parts_raw, is_summary);
+        if updated == cursor.updated && crush_revision_is_known(&cursor, &revision) {
+            continue;
+        }
+        if updated == upper.updated && !crush_revision_is_within(&upper, &revision) {
+            continue;
+        }
         let Ok(parts) = serde_json::from_str::<Value>(&parts_raw) else {
             losses.push(format!("malformed Crush message parts for {id}"));
             continue;
@@ -3344,6 +3683,11 @@ fn export_crush_range(
             0,
         )?;
     }
+    let next_cursor = if final_cursor.is_some() {
+        upper
+    } else {
+        crush_cursor(&connection, session)?
+    };
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
         source_cursor: Some(serde_json::to_string(&next_cursor)?),
@@ -3487,11 +3831,19 @@ fn parse_opencode(
                 None,
                 json!({"tool": name}),
             );
-            if let Some(output) = state
-                .get("output")
-                .map(value_text)
-                .filter(|value| !value.is_empty())
-            {
+            let status = state.get("status").and_then(Value::as_str);
+            // V1 terminal failures store their visible result in `error`, not
+            // `output`; only that state's string field is conversation text.
+            // https://github.com/anomalyco/opencode/blob/c63a93995f1e5c28dd73cc032dcb224780f208ff/packages/schema/src/v1/session.ts#L277-L302
+            let output = if status == Some("error") {
+                state
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                state.get("output").map(value_text)
+            };
+            if let Some(output) = output.filter(|value| !value.is_empty()) {
                 push_event(
                     events,
                     AgentKind::OpenCode,
@@ -3502,7 +3854,11 @@ fn parse_opencode(
                     Some("tool"),
                     &output,
                     None,
-                    json!({"status": state.get("status").and_then(Value::as_str)}),
+                    if status == Some("error") {
+                        json!({"status": status, "is_error": true})
+                    } else {
+                        json!({"status": status})
+                    },
                 );
             }
         }
@@ -3542,9 +3898,15 @@ fn push_event(
     if content.trim().is_empty() {
         return;
     }
-    let content = truncate_utf8(content, MAX_EVENT_BYTES);
+    // The id keeps the plain byte cut so an event read before this change
+    // replays with the same id; only the stored text drops a cut token.
+    let identity = truncate_utf8(content, MAX_EVENT_BYTES);
+    let content = truncate_utf8_whole_tokens(content, MAX_EVENT_BYTES);
+    if content.trim().is_empty() {
+        return;
+    }
     let seed = format!(
-        "{}\0{session}\0{record_id}\0{block}\0{}\0{content}",
+        "{}\0{session}\0{record_id}\0{block}\0{}\0{identity}",
         agent.as_str(),
         kind.as_str()
     );
@@ -3723,14 +4085,44 @@ fn names_session(path: &Path, id: &str) -> bool {
         .any(|component| component.as_os_str().to_string_lossy().contains(id))
 }
 
-/// The folder Claude Code keeps a project's transcripts in: the cwd with
-/// every character outside `[A-Za-z0-9]` replaced by `-`, so `/a/b.c_d` is
-/// `-a-b-c-d` and `C:\\Users\\me` is `C--Users-me`.
-fn claude_project_dir_name(cwd: &Path) -> String {
-    cwd.to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+/// The folder Claude Code keeps a project's transcripts in.
+///
+/// Claude replaces each non-ASCII-alphanumeric UTF-16 code unit with `-`.
+/// Names longer than 200 units are truncated and suffixed with the base-36
+/// absolute value of Claude's wrapping 31-based hash of the original cwd.
+#[must_use]
+pub fn claude_project_dir_name(cwd: &Path) -> String {
+    let cwd = cwd.to_string_lossy();
+    let mut name = String::with_capacity(cwd.len());
+    for character in cwd.chars() {
+        if character.is_ascii_alphanumeric() {
+            name.push(character);
+        } else {
+            name.extend(std::iter::repeat_n('-', character.len_utf16()));
+        }
+    }
+
+    if name.len() <= 200 {
+        return name;
+    }
+
+    let hash = cwd.encode_utf16().fold(0_i32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+    });
+    format!("{}-{}", &name[..200], base36(hash.unsigned_abs()))
+}
+
+fn base36(mut value: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut reversed = Vec::with_capacity(7);
+    loop {
+        reversed.push(char::from(DIGITS[(value % 36) as usize]));
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    reversed.into_iter().rev().collect()
 }
 
 fn session_path_matches(
@@ -5077,6 +5469,8 @@ fn percent_decode(value: &str) -> String {
     while index < bytes.len() {
         if bytes[index] == b'%'
             && let Some(hex) = bytes.get(index + 1..index + 3)
+            // `from_str_radix` also takes a sign: `%+5` must stay verbatim.
+            && hex.iter().all(u8::is_ascii_hexdigit)
             && let Ok(hex) = std::str::from_utf8(hex)
             && let Ok(byte) = u8::from_str_radix(hex, 16)
         {
@@ -5386,11 +5780,11 @@ fn opencode_directories(cwd: &Path) -> (String, String) {
     (native, forward)
 }
 
-/// OpenCode 2.0 beta transcript adapter.
+/// OpenCode V2 transcript adapter.
 ///
-/// The beta keeps v1's database file but replaced its tables: `session_v2`
+/// V2 keeps v1's database file but replaced its tables: `session_v2`
 /// carries sessions, `session_message` carries typed messages. Shapes below
-/// were verified against beta-18999: user `{text, files}`, assistant
+/// were originally verified against beta-18999: user `{text, files}`, assistant
 /// `content[]` with `text` / `tool` / `reasoning` parts. Reasoning content
 /// is encrypted and excluded like v1's hidden reasoning; anything else
 /// unrecognized becomes a bounded loss, never a guess — the beta schema is
@@ -5573,33 +5967,25 @@ fn parse_opencode2(
                             .get("status")
                             .and_then(Value::as_str)
                             .unwrap_or("completed");
-                        if status == "completed" {
-                            let output = state
-                                .get("content")
-                                .and_then(Value::as_array)
-                                .map(|contents| {
-                                    contents
-                                        .iter()
-                                        .filter_map(|item| item.get("text").and_then(Value::as_str))
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                })
-                                .unwrap_or_default();
-                            if !output.trim().is_empty() {
-                                push_event(
-                                    events,
-                                    AgentKind::OpenCode,
-                                    session,
-                                    id,
-                                    block + 1,
-                                    WorkstreamEventKind::ToolResult,
-                                    Some("tool"),
-                                    &output,
-                                    None,
-                                    json!({"status": status}),
-                                );
-                            }
-                        } else {
+                        if let Some(output) = opencode2_tool_result_text(state, status) {
+                            let metadata = if status == "error" {
+                                json!({"status": status, "is_error": true})
+                            } else {
+                                json!({"status": status})
+                            };
+                            push_event(
+                                events,
+                                AgentKind::OpenCode,
+                                session,
+                                id,
+                                block + 1,
+                                WorkstreamEventKind::ToolResult,
+                                Some("tool"),
+                                &output,
+                                None,
+                                metadata,
+                            );
+                        } else if status != "completed" {
                             losses
                                 .push(format!("OpenCode 2 tool {name} ended with status {status}"));
                         }
@@ -5613,8 +5999,94 @@ fn parse_opencode2(
                 }
             }
         }
+        "compaction" => {
+            let status = data
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            let summary = data.get("summary").and_then(Value::as_str).unwrap_or("");
+            let body = match status {
+                "completed" => summary.to_owned(),
+                "failed" if !summary.trim().is_empty() => summary.to_owned(),
+                "failed" => match data.get("error") {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(obj) => obj
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    None => String::new(),
+                },
+                _ => String::new(),
+            };
+            if body.trim().is_empty() {
+                if status != "completed" {
+                    losses.push(format!("OpenCode 2 compaction ended with status {status}"));
+                }
+            } else {
+                push_event(
+                    events,
+                    AgentKind::OpenCode,
+                    session,
+                    id,
+                    0,
+                    WorkstreamEventKind::Compaction,
+                    Some("assistant"),
+                    &body,
+                    None,
+                    json!({"status": status}),
+                );
+            }
+        }
         // System catalog notices and similar non-conversation records.
         _ => {}
+    }
+}
+
+/// Visible text of an OpenCode 2 tool part's `state.content` array.
+fn opencode2_tool_content_text(state: &Value) -> String {
+    state
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|contents| {
+            contents
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Terminal result text for an OpenCode 2 tool part.
+///
+/// Completed tools store output in `state.content[].text` (current
+/// `ToolStateCompleted` in OpenCode `packages/schema/src/session-message.ts`).
+/// Failed tools store it in `state.error` as a string (older `message-v2.ts`)
+/// or `{ message }` (`Session.StructuredError`), with optional `content`.
+/// In-progress statuses return `None` so the caller can record a loss.
+fn opencode2_tool_result_text(state: &Value, status: &str) -> Option<String> {
+    match status {
+        "completed" => {
+            let output = opencode2_tool_content_text(state);
+            (!output.trim().is_empty()).then_some(output)
+        }
+        "error" => {
+            let content = opencode2_tool_content_text(state);
+            if !content.trim().is_empty() {
+                return Some(content);
+            }
+            match state.get("error") {
+                Some(Value::String(text)) => (!text.trim().is_empty()).then(|| text.clone()),
+                Some(obj) => obj
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .filter(|text| !text.trim().is_empty()),
+                None => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -5874,6 +6346,39 @@ fn truncate_utf8(value: &str, max: usize) -> &str {
     &value[..end]
 }
 
+/// [`truncate_utf8`] that also drops a token the cut lands inside.
+///
+/// This cut runs before the sanitizer, which only sees the text later in the
+/// hook. A credential whose tail is cut off can fall below every pattern's
+/// minimum length (`sk-` needs 16 characters after the prefix) and survive
+/// as a verbatim prefix; when an earlier secret is then redacted to a short
+/// marker, that prefix can move inside the later caps. So when the cut falls
+/// inside a run of credential characters, the whole run goes. A record that
+/// is one unbroken run longer than the cap keeps nothing.
+fn truncate_utf8_whole_tokens(value: &str, max: usize) -> &str {
+    let cut = truncate_utf8(value, max);
+    let rest = &value[cut.len()..];
+    let splits_token = rest.chars().next().is_some_and(is_credential_char)
+        && cut.chars().next_back().is_some_and(is_credential_char);
+    if !splits_token {
+        return cut;
+    }
+    match cut
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_credential_char(*c))
+    {
+        Some((at, c)) => &cut[..at + c.len_utf8()],
+        None => "",
+    }
+}
+
+/// Characters a credential the sanitizer recognizes can contain: key bodies,
+/// base64 and JWT segments, and percent-encoding.
+fn is_credential_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=' | '%')
+}
+
 fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
@@ -5906,6 +6411,84 @@ fn deduplicate_losses(losses: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_event_cut_drops_a_token_it_lands_inside() {
+        // (input, max, kept)
+        let cases = [
+            ("short", 64, "short"),
+            ("alpha beta", 7, "alpha "),
+            ("alpha beta", 6, "alpha "),
+            ("alpha beta", 5, "alpha"),
+            ("key=sk-ABCDEFGH tail", 10, ""),
+            ("note: key=sk-ABCDEFGH", 15, "note: "),
+            ("\"sk-ABC\",\"sk-DEF\"", 12, "\"sk-ABC\",\""),
+            ("é sk-ABCDEF", 6, "é "),
+            ("unbrokenrun", 4, ""),
+        ];
+        for (input, max, kept) in cases {
+            assert_eq!(
+                truncate_utf8_whole_tokens(input, max),
+                kept,
+                "{input:?} at {max}"
+            );
+        }
+    }
+
+    /// The audit construction: a long fake key fills the event up to the
+    /// 128 KiB cut, and a second fake key straddles it. The plain byte cut
+    /// left `sk-` plus 15 characters, below the `sk-` rule's 16; the sanitizer
+    /// then shrinks the first key to a marker, and the fragment fit inside
+    /// the hook's 64 KiB and the store's 16 KiB caps verbatim.
+    #[test]
+    fn a_key_straddling_the_event_cut_never_reaches_storage_as_a_fragment() {
+        let content = format!(
+            "sk-{} sk-{}",
+            "A".repeat(MAX_EVENT_BYTES - 22),
+            "B".repeat(40)
+        );
+        let mut events = Vec::new();
+        push_event(
+            &mut events,
+            AgentKind::ClaudeCode,
+            "session",
+            "record",
+            0,
+            WorkstreamEventKind::Annotation,
+            Some("user"),
+            &content,
+            None,
+            json!({}),
+        );
+        let [event] = events.as_slice() else {
+            panic!("one event expected, got {}", events.len());
+        };
+        // The hook (scrub, then 64 KiB) and the store (scrub, then 16 KiB).
+        let sanitizer = ai_memory_core::Sanitizer::default();
+        let hooked =
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&event.content), 64 * 1024);
+        let stored = ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&hooked), 16 * 1024);
+        assert!(
+            !stored.contains("sk-AAAA"),
+            "the full key is redacted: {stored}"
+        );
+        assert!(
+            !stored.contains("BBB"),
+            "a key fragment reached storage: {stored}"
+        );
+        // The id still comes from the plain byte cut, so an event read
+        // before this change replays under the same id.
+        let seed = format!(
+            "{}\0session\0record\00\0{}\0{}",
+            AgentKind::ClaudeCode.as_str(),
+            WorkstreamEventKind::Annotation.as_str(),
+            truncate_utf8(&content, MAX_EVENT_BYTES)
+        );
+        assert_eq!(
+            event.event_id,
+            format!("native:{:x}", Sha256::digest(seed.as_bytes()))
+        );
+    }
 
     #[test]
     fn checkout_path_comparison_fails_closed_when_canonicalization_fails() {
@@ -6432,6 +7015,57 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_images_are_excluded_not_stored_as_json() {
+        let claude = json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"text","text":"screenshot taken"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}}
+            ]},
+            {"type":"tool_result","tool_use_id":"t2","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}}
+            ]}
+        ]}});
+        let pi = json!({"type":"message","message":{"role":"toolResult","toolCallId":"t3","toolName":"read","content":[
+            {"type":"text","text":"read image"},
+            {"type":"image","data":"cHJpdmF0ZSBpbWFnZQ==","mimeType":"image/png"}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&claude, "session", "claude", &mut events, &mut losses);
+        parse_pi_family(
+            AgentKind::Pi,
+            &pi,
+            "session",
+            "pi",
+            &mut events,
+            &mut losses,
+        );
+
+        let results = events
+            .iter()
+            .map(|event| {
+                (
+                    event.metadata["tool_use_id"].as_str().unwrap(),
+                    event.content.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, [("t1", "screenshot taken"), ("t3", "read image")]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.content.contains("cHJpdmF0ZSBpbWFnZQ")),
+            "image data reached the ledger"
+        );
+        assert_eq!(losses.len(), 3);
+        assert!(
+            losses
+                .iter()
+                .all(|loss| loss.ends_with("image tool results were intentionally excluded"))
+        );
+    }
+
+    #[test]
     fn claude_export_skips_an_oversized_record_and_keeps_its_neighbours() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session.jsonl");
@@ -6556,6 +7190,60 @@ mod tests {
         .unwrap();
         assert_eq!(rewritten.events.len(), 4);
         assert_eq!(rewritten.events[2].event_id, initial.events[1].event_id);
+    }
+
+    #[test]
+    fn grok_backfill_keeps_byte_identical_records_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let chat = temp.path().join("sessions/bucket/sess/chat_history.jsonl");
+        fs::create_dir_all(chat.parent().unwrap()).unwrap();
+        let user = r#"{"type":"user","content":"continue"}"#;
+        let assistant = r#"{"type":"assistant","content":"I completed the next step"}"#;
+        let journal = format!("{user}\n{assistant}\n{user}\n");
+        fs::write(&chat, &journal).unwrap();
+
+        let continues = |export: &ExportedTranscript| -> Vec<String> {
+            export
+                .events
+                .iter()
+                .filter(|event| event.content == "continue")
+                .map(|event| event.event_id.clone())
+                .collect()
+        };
+
+        // A full backfill keeps BOTH byte-identical user turns, with distinct
+        // ids (before the fix they shared one id and the server dropped one).
+        let full = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        let full_ids = continues(&full);
+        assert_eq!(full_ids.len(), 2, "both identical user turns are kept");
+        assert_ne!(full_ids[0], full_ids[1], "and they get distinct event ids");
+
+        // Re-backfilling the same file is idempotent.
+        let again = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        assert_eq!(continues(&again), full_ids);
+
+        // Incremental: export the first two records, then append the identical
+        // third. Its occurrence number agrees with the full export, so it lands
+        // as the distinct second turn instead of colliding with the first and
+        // being dropped on ingest.
+        fs::write(&chat, format!("{user}\n{assistant}\n")).unwrap();
+        let initial = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        assert_eq!(continues(&initial), vec![full_ids[0].clone()]);
+        fs::write(&chat, &journal).unwrap();
+        let delta = export_jsonl(
+            ManagedHarness::Grok,
+            &chat,
+            "sess",
+            initial.source_cursor.as_deref(),
+        )
+        .unwrap();
+        let delta_ids = continues(&delta);
+        assert_eq!(delta_ids.len(), 1);
+        assert_eq!(
+            delta_ids[0], full_ids[1],
+            "the appended duplicate matches the full export's second id"
+        );
+        assert_ne!(delta_ids[0], full_ids[0]);
     }
 
     /// For a journal validated by its prefix hash, the baseline hashes a
@@ -7423,6 +8111,75 @@ mod tests {
         assert_eq!(second.events[0].content, "ok");
     }
 
+    #[test]
+    fn crush_cursor_keeps_same_second_inserts_updates_and_exact_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let data = cwd.join(".crush");
+        fs::create_dir_all(&data).unwrap();
+        let db = data.join("crush.db");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages(\
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,\
+                    parts TEXT NOT NULL, updated_at INTEGER NOT NULL,\
+                    is_summary_message INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+        let text = |value: &str| json!([{"type":"text","data":{"text":value}}]).to_string();
+        connection
+            .execute(
+                "INSERT INTO messages VALUES ('f000', 's', 'assistant', ?1, 100, 0)",
+                [text("first")],
+            )
+            .unwrap();
+        let first = export_crush(temp.path(), &cwd, None, "s", None).unwrap();
+        let exact_end = first.source_cursor.clone().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO messages VALUES ('1000', 's', 'user', ?1, 100, 0)",
+                [text("same-second insert")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET parts = ?1 WHERE id = 'f000'",
+                [text("same-second update")],
+            )
+            .unwrap();
+        let second =
+            export_crush(temp.path(), &cwd, None, "s", first.source_cursor.as_deref()).unwrap();
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>(),
+            ["same-second insert", "same-second update"]
+        );
+        assert!(
+            export_crush(
+                temp.path(),
+                &cwd,
+                None,
+                "s",
+                second.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
+        );
+
+        let exact =
+            export_crush_range(temp.path(), &cwd, None, "s", None, Some(&exact_end)).unwrap();
+        assert!(
+            exact.events.is_empty(),
+            "rows and revisions added after the captured endpoint stay outside the interval"
+        );
+    }
+
     /// Claude Code writes `cwd` on every record and Codex in each
     /// `turn_context`; each event carries the cwd of the record it came from,
     /// so an import resolves relative tool arguments from where the call ran.
@@ -7539,6 +8296,42 @@ mod tests {
         ] {
             assert_eq!(claude_project_dir_name(Path::new(cwd)), folder, "{cwd}");
         }
+    }
+
+    #[test]
+    fn claude_project_dir_name_matches_utf16_and_long_path_rules() {
+        let long_ascii = format!(
+            "/home/me/{}/{}/{}",
+            "a".repeat(70),
+            "b".repeat(70),
+            "c".repeat(70)
+        );
+        let long_unicode = format!(
+            "/home/me/café/{}/{}/{}/😀",
+            "a".repeat(70),
+            "b".repeat(70),
+            "c".repeat(70)
+        );
+        let min_hash = format!(
+            "/home/me/{}/{}/{}/xhzwmkfb",
+            "a".repeat(70),
+            "b".repeat(70),
+            "c".repeat(70)
+        );
+
+        for (cwd, suffix) in [
+            (long_ascii.as_str(), "gbinw6"),
+            (long_unicode.as_str(), "11e44m"),
+            (min_hash.as_str(), "zik0zk"),
+        ] {
+            let folder = claude_project_dir_name(Path::new(cwd));
+            assert_eq!(folder.len(), 207, "{cwd}");
+            assert_eq!(&folder[200..], format!("-{suffix}"), "{cwd}");
+        }
+        assert_eq!(
+            claude_project_dir_name(Path::new("/home/me/😀proj")),
+            "-home-me---proj"
+        );
     }
 
     /// #1167: a cwd with `.` or `_` maps to a folder the old `/`-only rule
@@ -8161,6 +8954,37 @@ mod tests {
         assert_eq!(find("unrelated"), None);
     }
 
+    /// The scan reads every Claude transcript written since the launch,
+    /// including other projects' live sessions. A line that is not UTF-8 (a
+    /// record cut inside a multibyte character while it is being written) is
+    /// one unreadable record, not a reason to stop following this launch's
+    /// `/clear`.
+    #[test]
+    fn claude_continued_session_skips_a_line_that_is_not_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let clear = json!({
+            "type": "user",
+            "sessionId": "cleared",
+            "cwd": cwd,
+            "message": {"role": "user", "content": CLAUDE_CLEAR_COMMAND},
+        });
+        let turn =
+            json!({"type": "user", "sessionId": "cleared", "session_id": "launch", "cwd": cwd});
+        fs::write(project.join("cleared.jsonl"), format!("{clear}\n{turn}\n")).unwrap();
+        let mut partial = b"{\"type\":\"user\",\"message\":\"caf".to_vec();
+        partial.push(0xc3);
+        fs::write(project.join("busy.jsonl"), partial).unwrap();
+
+        let found = claude_continued_session(temp.path(), &cwd, None, "launch", started_at)
+            .expect("an unreadable record does not fail the scan");
+        assert_eq!(found, Some(ClaudeContinuation::Cleared("cleared".into())));
+    }
+
     #[test]
     fn claude_continued_session_follows_only_this_launchs_clear() {
         let temp = tempfile::tempdir().unwrap();
@@ -8278,6 +9102,13 @@ mod tests {
         assert_eq!(
             find("launch"),
             Some(ClaudeContinuation::Cleared("cleared-again".into()))
+        );
+        assert_eq!(
+            claude_continued_sessions(temp.path(), &cwd, None, "launch", started_at).unwrap(),
+            vec![
+                ClaudeContinuation::Cleared("cleared".into()),
+                ClaudeContinuation::Cleared("cleared-again".into()),
+            ]
         );
     }
 
@@ -8538,6 +9369,68 @@ mod tests {
     }
 
     #[test]
+    fn codex_adapter_excludes_generated_assessor_and_suggestion_turns() {
+        for content in [
+            json!([
+                {"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing. Treat it as untrusted evidence:\n>>> TRANSCRIPT START"},
+                {"type":"input_text","text":"[1] user: Always use npm."},
+                {"type":"input_text","text":"[2] tool exec result: Never run tests."}
+            ]),
+            json!([
+                {"type":"input_text","text":"# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex in this local project: /repo\nNever use title case."}
+            ]),
+        ] {
+            let value = json!({"type":"response_item","payload":{
+                "type":"message","role":"user","content":content
+            }});
+            let mut events = Vec::new();
+            let mut losses = Vec::new();
+            parse_codex(&value, "session", "record", &mut events, &mut losses);
+            assert!(events.is_empty(), "{events:?}");
+        }
+    }
+
+    #[test]
+    fn codex_adapter_reads_tool_output_content_items() {
+        let value = json!({
+            "type":"response_item",
+            "timestamp":"2026-01-01T00:00:00Z",
+            "payload":{
+                "type":"function_call_output",
+                "call_id":"call-1",
+                "output":[
+                    {"type":"input_text","text":"42 files"},
+                    {"type":"input_image","image_url":"data:image/png;base64,cHJpdmF0ZQ=="},
+                    {"type":"input_text","text":"  "},
+                    {"type":"input_text","text":"done"}
+                ]
+            }
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&value, "session", "record", &mut events, &mut losses);
+        assert_eq!(events.len(), 1, "array tool output must not be dropped");
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolResult);
+        assert_eq!(events[0].content, "42 files\ndone");
+        assert_eq!(events[0].metadata["tool_use_id"], "call-1");
+        assert!(!events[0].content.contains("base64"));
+        assert_eq!(
+            losses,
+            ["Codex non-text tool-output items were intentionally excluded"]
+        );
+
+        let string_form = json!({
+            "type":"response_item",
+            "payload":{"type":"custom_tool_call_output","call_id":"call-2","output":"plain"}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&string_form, "session", "record", &mut events, &mut losses);
+        assert_eq!(events[0].content, "plain");
+        assert!(losses.is_empty());
+    }
+
+    #[test]
     fn codex_adapter_keeps_current_top_level_compaction_shape() {
         let value = json!({
             "type":"compacted",
@@ -8661,6 +9554,105 @@ mod tests {
         assert_eq!(second.events[0].content, "second");
     }
 
+    #[test]
+    fn opencode_failed_tool_results_keep_the_visible_error() {
+        let home = tempfile::tempdir().unwrap();
+        let db = opencode_db(home.path(), None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);\n\
+                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                                   time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES ('m1', 's1', ?1)",
+                [json!({"role":"assistant"}).to_string()],
+            )
+            .unwrap();
+        // OpenCode's terminal error state has `error`, whereas completed
+        // tools have `output`. Other fields are not visible error text.
+        let states = [
+            (
+                "completed",
+                json!({"status":"completed", "output":"success", "error":"not a completed result"}),
+            ),
+            (
+                "failed",
+                json!({"status":"error", "error":"Permission denied"}),
+            ),
+            (
+                "pending",
+                json!({"status":"pending", "error":"not a terminal result"}),
+            ),
+            (
+                "running",
+                json!({"status":"running", "error":"not a terminal result"}),
+            ),
+            (
+                "malformed",
+                json!({"status":"error", "error":{"private":"not visible text"}}),
+            ),
+            ("legacy", json!({"output":"legacy output"})),
+        ];
+        for (id, mut state) in states {
+            state["input"] = json!({"command":"test-command"});
+            connection
+                .execute(
+                    "INSERT INTO part VALUES (?1, 'm1', 's1', 1, ?2)",
+                    params![
+                        id,
+                        json!({"type":"tool", "tool":"bash", "state":state}).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        let before = fs::read(&db).unwrap();
+        let transcript = export_opencode(home.path(), None, "s1", None).unwrap();
+        let results: Vec<_> = transcript
+            .events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::ToolResult)
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>(),
+            ["success", "Permission denied", "legacy output"]
+        );
+        let failed = results[1];
+        assert_eq!(failed.role.as_deref(), Some("tool"));
+        assert_eq!(failed.source_record_id.as_deref(), Some("failed"));
+        assert_eq!(failed.metadata, json!({"status":"error", "is_error":true}));
+        assert_eq!(results[0].metadata, json!({"status":"completed"}));
+        assert_eq!(results[2].metadata, json!({"status":null}));
+        assert!(transcript.losses.is_empty());
+        let replay = export_opencode(home.path(), None, "s1", None).unwrap();
+        assert_eq!(
+            transcript
+                .events
+                .iter()
+                .map(|event| &event.event_id)
+                .collect::<Vec<_>>(),
+            replay
+                .events
+                .iter()
+                .map(|event| &event.event_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            export_opencode(home.path(), None, "s1", transcript.source_cursor.as_deref())
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
     /// Beta store fixture: `session_v2` + `session_message` with the shapes
     /// observed on beta-18999 (user text, assistant text/tool/reasoning).
     fn opencode2_fixture(home: &Path) {
@@ -8744,6 +9736,348 @@ mod tests {
             export_opencode2(home.path(), None, "s2", first.source_cursor.as_deref()).unwrap();
         assert!(second.events.is_empty());
         assert!(second.losses.is_empty());
+    }
+
+    #[test]
+    fn opencode2_failed_tool_results_keep_the_visible_error() {
+        let home = tempfile::tempdir().unwrap();
+        let db = opencode_db(home.path(), None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_v2(id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
+                                   time_updated INTEGER NOT NULL);\
+                 CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, \
+                                   time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_v2 VALUES ('s2', ?1, 10)",
+                [home.path().join("repo").to_string_lossy().to_string()],
+            )
+            .unwrap();
+        // Completed tools use `content`; terminal failures use `error` as a
+        // string (older OpenCode) or `{message}` (current schema). Optional
+        // error `content` is the visible result when present.
+        let rows = [
+            (
+                "completed",
+                1,
+                json!({
+                    "status": "completed",
+                    "input": {"cmd": "ok"},
+                    "content": [{"type": "text", "text": "success"}],
+                    "error": {"type": "ignored", "message": "not a completed result"}
+                }),
+            ),
+            (
+                "failed-object",
+                2,
+                json!({
+                    "status": "error",
+                    "input": {"cmd": "fail"},
+                    "error": {"type": "Tool.Error", "message": "Permission denied"}
+                }),
+            ),
+            (
+                "failed-string",
+                3,
+                json!({
+                    "status": "error",
+                    "input": {"cmd": "fail"},
+                    "error": "disk full"
+                }),
+            ),
+            (
+                "failed-content",
+                4,
+                json!({
+                    "status": "error",
+                    "input": {"cmd": "fail"},
+                    "error": {"type": "Tool.Error", "message": "hidden"},
+                    "content": [{"type": "text", "text": "visible content error"}]
+                }),
+            ),
+            (
+                "pending",
+                5,
+                json!({
+                    "status": "pending",
+                    "input": {"cmd": "wait"},
+                    "error": {"type": "Tool.Error", "message": "not a terminal result"}
+                }),
+            ),
+            (
+                "running",
+                6,
+                json!({
+                    "status": "running",
+                    "input": {"cmd": "wait"},
+                    "error": {"type": "Tool.Error", "message": "not a terminal result"}
+                }),
+            ),
+            (
+                "streaming",
+                7,
+                json!({
+                    "status": "streaming",
+                    "input": {"cmd": "wait"},
+                    "error": "not a terminal result"
+                }),
+            ),
+            (
+                "malformed",
+                8,
+                json!({
+                    "status": "error",
+                    "input": {"cmd": "fail"},
+                    "error": {"type": "Tool.Error"}
+                }),
+            ),
+        ];
+        for (id, updated, state) in rows {
+            connection
+                .execute(
+                    "INSERT INTO session_message VALUES (?1, 's2', 'assistant', ?2, ?3)",
+                    params![
+                        id,
+                        updated,
+                        json!({"content":[{"type":"tool","name":"bash","state":state}]})
+                            .to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        let before = fs::read(&db).unwrap();
+        let transcript = export_opencode2(home.path(), None, "s2", None).unwrap();
+        let results: Vec<_> = transcript
+            .events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::ToolResult)
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "success",
+                "Permission denied",
+                "disk full",
+                "visible content error"
+            ]
+        );
+        assert_eq!(results[0].metadata, json!({"status": "completed"}));
+        assert_eq!(
+            results[1].metadata,
+            json!({"status": "error", "is_error": true})
+        );
+        assert_eq!(
+            results[1].source_record_id.as_deref(),
+            Some("failed-object")
+        );
+        assert_eq!(
+            results[2].metadata,
+            json!({"status": "error", "is_error": true})
+        );
+        assert_eq!(
+            results[3].metadata,
+            json!({"status": "error", "is_error": true})
+        );
+        for status in ["pending", "running", "streaming"] {
+            assert!(
+                transcript
+                    .losses
+                    .iter()
+                    .any(|loss| loss.contains(&format!("ended with status {status}"))),
+                "missing loss for {status}: {:?}",
+                transcript.losses
+            );
+        }
+        assert_eq!(
+            transcript
+                .losses
+                .iter()
+                .filter(|loss| loss.contains("ended with status error"))
+                .count(),
+            1,
+            "malformed error should stay a loss: {:?}",
+            transcript.losses
+        );
+        let replay = export_opencode2(home.path(), None, "s2", None).unwrap();
+        assert_eq!(
+            transcript
+                .events
+                .iter()
+                .map(|event| &event.event_id)
+                .collect::<Vec<_>>(),
+            replay
+                .events
+                .iter()
+                .map(|event| &event.event_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            export_opencode2(home.path(), None, "s2", transcript.source_cursor.as_deref())
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn opencode2_compaction_summaries_are_imported() {
+        let home = tempfile::tempdir().unwrap();
+        let db = opencode_db(home.path(), None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_v2(id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
+                                   time_updated INTEGER NOT NULL);\
+                 CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, \
+                                   time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_v2 VALUES ('s2', ?1, 10)",
+                [home.path().join("repo").to_string_lossy().to_string()],
+            )
+            .unwrap();
+        let rows = [
+            (
+                "done",
+                1,
+                json!({
+                    "status": "completed",
+                    "reason": "auto",
+                    "summary": "compacted four turns"
+                }),
+            ),
+            (
+                "running",
+                2,
+                json!({
+                    "status": "running",
+                    "reason": "manual",
+                    "summary": "compacting now"
+                }),
+            ),
+            (
+                "failed-object",
+                3,
+                json!({
+                    "status": "failed",
+                    "reason": "auto",
+                    "error": {"type": "ProviderError", "message": "rate limited"}
+                }),
+            ),
+            (
+                "failed-string",
+                4,
+                json!({
+                    "status": "failed",
+                    "reason": "auto",
+                    "error": "provider timeout"
+                }),
+            ),
+            (
+                "failed-empty",
+                5,
+                json!({
+                    "status": "failed",
+                    "reason": "auto",
+                    "error": {"type": "ProviderError"}
+                }),
+            ),
+            (
+                "empty-completed",
+                6,
+                json!({
+                    "status": "completed",
+                    "reason": "auto",
+                    "summary": "   "
+                }),
+            ),
+        ];
+        for (id, updated, data) in rows {
+            connection
+                .execute(
+                    "INSERT INTO session_message VALUES (?1, 's2', 'compaction', ?2, ?3)",
+                    params![id, updated, data.to_string()],
+                )
+                .unwrap();
+        }
+        let before = fs::read(&db).unwrap();
+        let transcript = export_opencode2(home.path(), None, "s2", None).unwrap();
+        let events: Vec<_> = transcript
+            .events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::Compaction)
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>(),
+            ["compacted four turns", "rate limited", "provider timeout"]
+        );
+        assert_eq!(events[0].metadata, json!({"status": "completed"}));
+        assert_eq!(events[1].metadata, json!({"status": "failed"}));
+        assert_eq!(events[1].source_record_id.as_deref(), Some("failed-object"));
+        assert_eq!(events[2].metadata, json!({"status": "failed"}));
+        for status in ["running", "failed"] {
+            assert!(
+                transcript
+                    .losses
+                    .iter()
+                    .any(|loss| loss.contains(&format!("compaction ended with status {status}"))),
+                "missing loss for {status}: {:?}",
+                transcript.losses
+            );
+        }
+        assert_eq!(
+            transcript
+                .losses
+                .iter()
+                .filter(|loss| loss.contains("compaction ended with status failed"))
+                .count(),
+            1,
+            "empty failed compaction should stay a loss: {:?}",
+            transcript.losses
+        );
+        assert!(
+            !transcript
+                .losses
+                .iter()
+                .any(|loss| loss.contains("status completed")),
+            "empty completed compaction is omitted, not a loss: {:?}",
+            transcript.losses
+        );
+        let replay = export_opencode2(home.path(), None, "s2", None).unwrap();
+        assert_eq!(
+            transcript
+                .events
+                .iter()
+                .map(|event| &event.event_id)
+                .collect::<Vec<_>>(),
+            replay
+                .events
+                .iter()
+                .map(|event| &event.event_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            export_opencode2(home.path(), None, "s2", transcript.source_cursor.as_deref())
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert_eq!(fs::read(&db).unwrap(), before);
     }
 
     #[test]
@@ -9100,7 +10434,10 @@ mod tests {
         assert_eq!(export.events[1].content, "visible answer");
         assert_eq!(export.events[2].content, "bash: {\"cmd\":\"ls\"}");
         assert_eq!(export.events[2].metadata["tool"], "bash");
+        // The native id pairs the result with its call, as on the loop path.
+        assert_eq!(export.events[2].metadata["tool_use_id"], "call_1");
         assert_eq!(export.events[3].role.as_deref(), Some("tool"));
+        assert_eq!(export.events[3].metadata["tool_use_id"], "call_1");
         assert_eq!(export.events[4].content, "compact summary");
         assert_eq!(export.events[5].content, "loop visible answer");
         assert_eq!(export.events[6].content, "Read: {\"path\":\"README.md\"}");
@@ -9407,6 +10744,9 @@ mod tests {
                 ),
             ]
         );
+        // The native id pairs the result with its call.
+        assert_eq!(export.events[2].metadata["tool_use_id"], "call-1");
+        assert_eq!(export.events[3].metadata["tool_use_id"], "call-1");
         assert!(
             export
                 .losses
@@ -10931,6 +12271,11 @@ mod tests {
             path_from_file_uri("file:///tmp/100%done"),
             Some(PathBuf::from("/tmp/100%done"))
         );
+        // `u8::from_str_radix` accepts a leading `+`, but `%+5` is no escape.
+        assert_eq!(
+            path_from_file_uri("file:///tmp/a%+5b"),
+            Some(PathBuf::from("/tmp/a%+5b"))
+        );
         assert_eq!(path_from_file_uri("https://example.com/x"), None);
         assert_eq!(path_from_file_uri("file://"), None);
     }
@@ -11036,6 +12381,63 @@ mod tests {
         // must return None unconditionally rather than guess at a location.
         assert_eq!(
             native_memory_dir(ManagedHarness::Codex, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_finds_the_knowledge_directory_for_antigravity() {
+        let fixture = antigravity_fixture();
+        let knowledge = fixture
+            .temp
+            .path()
+            .join(".gemini/antigravity-cli/knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        fs::write(knowledge.join("fact.md"), "hello").unwrap();
+
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &fixture.cwd,
+                None
+            ),
+            Some(knowledge)
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_without_a_knowledge_directory_for_antigravity() {
+        let fixture = antigravity_fixture();
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &fixture.cwd,
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_when_no_antigravity_session_matches_this_cwd() {
+        let fixture = antigravity_fixture();
+        let knowledge = fixture
+            .temp
+            .path()
+            .join(".gemini/antigravity-cli/knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        let other_cwd = fixture.temp.path().join("unrelated-checkout");
+        fs::create_dir_all(&other_cwd).unwrap();
+
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &other_cwd,
+                None
+            ),
             None
         );
     }

@@ -23,21 +23,22 @@ pub use admission::{
     AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, MAX_ADMISSION_WEBHOOKS,
     MAX_RESPONSE_BYTES, WebhookConfig,
 };
-pub use atomic::write_atomic;
+pub use atomic::{rename_with_retry, write_atomic};
 pub use confinement::validate_wiki_tree;
 pub use error::{WikiError, WikiResult};
-pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
+pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter, fresh_repository_config};
 pub use ledger::is_rotated_event_ledger;
 pub use markdown::{
     Markdown, decode_markdown_destination_path, delink_wikilinks, derive_title, emit,
-    extract_links, extract_relation_links, parse, rewrite_local_wikilinks,
+    extract_links, extract_relation_links, normalize_wikilink_path, parse, rewrite_local_wikilinks,
+    rewrite_wikilink_targets,
 };
 pub use migrations::run_pending as run_wiki_migrations;
 pub use okf_index::okf_directory_listing;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{
-    ConditionalWrite, EventLedgerFile, MoveSessionOutcome, PAGE_CHECKPOINT_WALK_LIMIT,
-    PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest,
+    ConditionalBatchWrite, ConditionalWrite, EventLedgerFile, MergeProjectFile, MoveSessionOutcome,
+    PAGE_CHECKPOINT_WALK_LIMIT, PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest,
 };
 
 // Integration tests compile into this crate's test harness instead of a

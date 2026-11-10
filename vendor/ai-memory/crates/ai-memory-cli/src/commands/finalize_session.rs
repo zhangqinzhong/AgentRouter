@@ -7,9 +7,10 @@ use ai_memory_workstream::ManagedHarness;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::FinalizeSessionArgs;
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, ServerResponseError, get_json};
+use crate::http_client::{ServerEndpoint, ServerResponseError, get_json, http_client};
 
 #[derive(Debug, Serialize)]
 struct SessionEndPayload<'a> {
@@ -52,12 +53,14 @@ struct FinalizeSessionReport {
 /// Run the `finalize-session` subcommand.
 ///
 /// # Errors
-/// Returns an error if the configured server cannot list the scope's open
-/// sessions or rejects a synthetic `session-end` hook.
+/// Returns an error if an explicit scope flag is empty, the configured server
+/// cannot list the scope's open sessions, or the server rejects a synthetic
+/// `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (workspace, project, finalized) = finalize(config, &args).await?;
     let agent = args.agent;
-    print_report(args, workspace, project, agent, finalized)
+    print_report(i18n, args, workspace, project, agent, finalized)
 }
 
 /// Finalizes the sessions `args` selects (open ones, plus the exact ended
@@ -67,10 +70,12 @@ pub(crate) async fn finalize(
     config: &Config,
     args: &FinalizeSessionArgs,
 ) -> Result<(String, String, Vec<String>)> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     let agent = args.agent;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let sessions = fetch_open_sessions(
         &endpoint,
         &workspace,
@@ -86,7 +91,7 @@ pub(crate) async fn finalize(
         return Ok((workspace, project, Vec::new()));
     }
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let fallback_cwd = effective_cwd(config)?;
     let mut finalized = Vec::with_capacity(sessions.len());
     for session in &sessions {
@@ -146,6 +151,7 @@ async fn replay_prompts(
     cwd: &str,
     session_id: &str,
 ) {
+    let i18n = &config.i18n;
     if !super::hook::admits_capture_at(&config.data_dir, Path::new(cwd)) {
         return;
     }
@@ -156,8 +162,15 @@ async fn replay_prompts(
     }
     let Some(home) = super::run::native_home(config) else {
         eprintln!(
-            "ai-memory: no home directory; session {} is finalized without its prompts",
-            super::run::display_session_id(session_id)
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-finalize-session-ai-memory-no-home-directory-session-is-finalized-without-its-prompts",
+                &[(
+                    "value0",
+                    super::run::display_session_id(session_id).to_string()
+                )]
+            )
         );
         return;
     };
@@ -173,8 +186,18 @@ async fn replay_prompts(
     .await
     {
         eprintln!(
-            "ai-memory: could not replay the prompts of session {} ({error:#}); finalizing without them",
-            super::run::display_session_id(session_id)
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-finalize-session-ai-memory-could-not-replay-the-prompts-of-session-error-finalizing-without-t",
+                &[
+                    (
+                        "value0",
+                        super::run::display_session_id(session_id).to_string()
+                    ),
+                    ("value1", format!("{:#}", error))
+                ]
+            )
         );
     }
 }
@@ -226,6 +249,7 @@ async fn fetch_open_sessions(
 }
 
 fn print_report(
+    i18n: &ai_memory_core::i18n::Localizer,
     args: FinalizeSessionArgs,
     workspace: String,
     project: String,
@@ -242,19 +266,33 @@ fn print_report(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report.finalized.is_empty() {
         println!(
-            "No open {} sessions matched {}/{}",
-            report.agent, report.workspace, report.project
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-finalize-session-no-open-sessions-matched",
+                &[
+                    ("value0", report.agent.to_string()),
+                    ("value1", report.workspace.to_string()),
+                    ("value2", report.project.to_string())
+                ]
+            )
         );
     } else {
         println!(
-            "Finalized {} {} session(s) for {}/{}",
-            report.finalized.len(),
-            report.agent,
-            report.workspace,
-            report.project
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-finalize-session-finalized-session-s-for",
+                &[
+                    ("value0", format!("{}", report.finalized.len())),
+                    ("value1", report.agent.to_string()),
+                    ("value2", report.workspace.to_string()),
+                    ("value3", report.project.to_string())
+                ]
+            )
         );
         for session_id in &report.finalized {
-            println!("  - {session_id}");
+            println!("  - {}", terminal_text(session_id));
         }
     }
     Ok(())
@@ -290,7 +328,7 @@ async fn post_session_end_batch(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        bail!("server returned {status}: {body}");
+        bail!("server returned {status}: {}", terminal_body(&body));
     }
     let ack: HookBatchAck = response
         .json()
@@ -629,5 +667,44 @@ mod tests {
                 ("project".to_string(), "project".to_string()),
             ]
         );
+    }
+
+    fn finalize_args(workspace: Option<&str>, project: Option<&str>) -> FinalizeSessionArgs {
+        FinalizeSessionArgs {
+            agent: AgentKind::AntigravityCli,
+            workspace: workspace.map(Into::into),
+            project: project.map(Into::into),
+            all_owners: false,
+            all: false,
+            session_id: None,
+            reopen: false,
+            json: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_is_refused_before_server_or_scope_work() {
+        for empty in ["", " \t "] {
+            let error = finalize(&Config::default(), &finalize_args(Some(empty), None))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("--workspace was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_is_refused_before_server_or_scope_work() {
+        for empty in ["", " \t "] {
+            let error = finalize(&Config::default(), &finalize_args(None, Some(empty)))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("--project was passed empty"),
+                "unexpected error: {error}"
+            );
+        }
     }
 }

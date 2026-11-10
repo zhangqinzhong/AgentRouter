@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 
+use super::show::terminal_text;
 use crate::cli::RenameProjectArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -19,10 +20,12 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// Returns an error when the server is unreachable or returns a non-2xx
 /// response (e.g. 404 workspace/project not found, 422 name taken or invalid).
 pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
     super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    super::refuse_empty_explicit(Some(args.to.as_str()), "--to")?;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     // Rename happens inside one workspace, so the marker resolves it the same
     // way it does for every other command. `--to` stays literal: it names the
     // new project, it does not select a scope.
@@ -41,7 +44,7 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     let requested = from
         .clone()
         .or_else(|| project_id.clone())
-        .context("one of --from or --project-id is required")?;
+        .context(i18n.text("cli-rename-project-one-of-from-or-project-id-is-required"))?;
     let body = serde_json::json!({
         "workspace": workspace,
         "from": from,
@@ -52,18 +55,39 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     let pages = summary["pages"].as_u64().unwrap_or(0);
     let old_name = renamed_from(&summary, requested);
     if let Some(warning) = summary["manifest_warning"].as_str() {
-        eprintln!("ai-memory: warning: {warning}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-move-project-ai-memory-warning-warning",
+                &[("value0", terminal_text(warning))]
+            )
+        );
     }
     if let Err(error) = super::project_registry::rekey_scope(
         config, &endpoint, &workspace, &old_name, &workspace, &args.to,
     ) {
         eprintln!(
-            "ai-memory: project renamed, but the client-local checkout link could not be updated ({error:#})"
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-rename-project-ai-memory-project-renamed-but-the-client-local-checkout-link-could-not-be-up",
+                &[("value0", format!("{:#}", error))]
+            )
         );
     }
     println!(
-        "Renamed {}/{} → {}/{} ({} pages now under the new name).",
-        workspace, old_name, workspace, args.to, pages
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-rename-project-renamed-pages-now-under-the-new-name",
+            &[
+                ("value0", workspace.to_string()),
+                ("value1", terminal_text(&old_name)),
+                ("value2", workspace.to_string()),
+                ("value3", args.to.to_string()),
+                ("value4", format!("{}", pages))
+            ]
+        )
     );
     Ok(())
 }
@@ -77,7 +101,7 @@ fn renamed_from(summary: &serde_json::Value, requested: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::renamed_from;
+    use super::*;
 
     #[test]
     fn a_rename_by_id_rekeys_the_link_under_the_resolved_name() {
@@ -85,5 +109,50 @@ mod tests {
         let summary = serde_json::json!({ "from": "api", "to": "api-v2" });
         assert_eq!(renamed_from(&summary, id.clone()), "api");
         assert_eq!(renamed_from(&serde_json::json!({}), id.clone()), id);
+    }
+
+    fn test_args() -> RenameProjectArgs {
+        RenameProjectArgs {
+            workspace: None,
+            from: Some("old".into()),
+            project_id: None,
+            to: "new".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_to_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.to = "   ".into();
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--to was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_from_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.from = Some("".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--from was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_flag_is_refused_before_any_request() {
+        let config = Config::default();
+        let mut a = test_args();
+        a.workspace = Some("  ".into());
+        let error = run(&config, a).await.unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
     }
 }
