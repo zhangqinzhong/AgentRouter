@@ -1,5 +1,6 @@
 {
   "baseVersion": "1.12.1",
   "change": "minor",
-  "reason": "Add client and configuration-instance usage filters, local Claude Official quota, two-character CJK search and native MiMo subagent support; update collection and memory integration while preserving existing data."
+  "reason": "Add client and configuration-instance usage filters, local Claude Official quota, two-character CJK search and native MiMo subagent support; update collection and memory integration while preserving existing data.",
+  "candidate": "v1.13.0-rc.2"
 }

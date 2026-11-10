@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## 1.13.0 - 2026-11-10
+
+### Features
+- Display Claude Official subscription quota using account- and organization-matched local snapshots, with no additional Claude API requests.
+- Filter usage by client and configuration instance, including separate Claude Code and Claude Official activity.
+- Apply overview model selection to collected usage and preserve localized client choices.
+- Refresh the overview layout and shared theme, controls and status components.
+
+### Fixes
+- Preserve observed Codex model attribution per configuration instance, including safe migration of historical buckets without duplicating usage.
+- Keep incomplete WorkBuddy records for the next scan, recognize ZCode provider IDs, and deduplicate DeepSeek Harness fork history without dropping unreadable historical data.
+- Retain valid Cursor and Grok quota snapshots during transient failures, with account, product, reset-time and concurrent-refresh guards.
+- Recognize Claude-generated session titles and MiMo subagents and imported history while preserving existing custom directory discovery.
+- Refresh Grok and Gemini model pricing and aliases.
+
+### Performance
+- Reuse unchanged session analytics sidecars on refresh and rebuild corrupt caches safely.
+- Index two-character Chinese, Japanese and Korean search terms locally.
+
+### Maintenance
+- Upgrade the bundled ai-memory source and pinned runtimes from 3.2.5 to 3.4.5; preserve MiMo's completed-turn recall contract and verify migration from the old database format.
+
 ## 1.13.0-rc.2 - 2026-11-10
 
 ### Features
