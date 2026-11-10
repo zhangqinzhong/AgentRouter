@@ -30,6 +30,7 @@ use agentrouter_session_core::adapters::hermes::HermesAdapter;
 use agentrouter_session_core::adapters::kilo::{legacy_task_key, migrated_session_id, KiloLegacyAdapter};
 use agentrouter_session_core::adapters::kimi::KimiAdapter;
 use agentrouter_session_core::adapters::kiro::KiroAdapter;
+use agentrouter_session_core::adapters::mimo::MimoAdapter;
 use agentrouter_session_core::adapters::openclaw::OpenclawAdapter;
 use agentrouter_session_core::adapters::opencode::OpencodeAdapter;
 use agentrouter_session_core::adapters::pi::PiAdapter;
@@ -58,6 +59,7 @@ struct TestEnv {
     kilo_db: PathBuf,
     kilo_tasks: PathBuf,
     kilo_cursor_tasks: PathBuf,
+    mimo_db: PathBuf,
     /// Grok Bot 的缓存目录(`<userData>/sand-client-persistence`)
     grok_bot_store: PathBuf,
     /// 假 HOME 目录本体,持有 TempDir 保证整个测试进程期间不被清理
@@ -113,6 +115,7 @@ fn setup() -> &'static TestEnv {
             kilo_db: sc.kilo_db,
             kilo_tasks: sc.kilo_tasks,
             kilo_cursor_tasks: sc.kilo_cursor_tasks,
+            mimo_db: sc.mimo_db,
             grok_bot_store,
             _home: home,
         }
@@ -979,6 +982,113 @@ fn claude_branches_fold_the_copied_history_and_nest_under_the_original() {
     assert_eq!(sb.meta.title, "修复登录超时");
     assert_eq!(sb.meta.tokens_used, Some(460));
     assert_eq!(adapter.parent_links(), Some(Vec::new()));
+}
+
+/// Claude Code 2.1 起命令行自己给会话起名(`ai-title`,#74):没有 custom-title 时它就是标题,
+/// 不算未知行;分支照抄原件的 AI 标题与 custom-title 一样不用;用户改过的名字照旧压过它
+#[test]
+fn claude_ai_titles_name_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let (dir, a, b) = common::stage_claude_branch(&projects);
+    // 两份文件里的自定义标题都换成 AI 标题:命令行起的名字,分支照抄了原件那一条
+    let path = |id: &str| dir.join(format!("{id}.jsonl"));
+    for id in [&a, &b] {
+        let text = fs::read_to_string(path(id))
+            .unwrap()
+            .replace(r#""type":"custom-title""#, r#""type":"ai-title""#)
+            .replace(r#""customTitle":"#, r#""aiTitle":"#);
+        fs::write(path(id), text).unwrap();
+    }
+    let adapter = ClaudeAdapter::new().with_custom_root(projects);
+    let parse = |id: &str| {
+        adapter
+            .parse_session(&adapter.file_ref(&path(id)).unwrap())
+            .unwrap()
+    };
+
+    let sa = parse(&a);
+    assert_eq!(sa.meta.title, "修复登录超时");
+    assert_eq!(sa.unknown_line_count, 0);
+    assert_eq!(
+        parse(&b).meta.title,
+        "换个思路:登录改成异步队列",
+        "照抄的 AI 标题不用"
+    );
+
+    let renamed =
+        serde_json::json!({"type": "custom-title", "customTitle": "登录超时排查", "sessionId": a});
+    let text = fs::read_to_string(path(&a)).unwrap() + &format!("{renamed}\n");
+    fs::write(path(&a), text).unwrap();
+    assert_eq!(
+        parse(&a).meta.title,
+        "登录超时排查",
+        "改过的名字压过 AI 标题"
+    );
+}
+
+/// 分支的分支:A 分出 B、B 改了名再分出 C,C 开头照抄的是 B 的名字——只和原件 A 比去不掉,
+/// C 就和 B 同名。要与每一份更早的同根文件比。自定义标题与 AI 标题同一条规则,各搭一遍
+/// (Codex review 2026-10-21)
+#[test]
+fn claude_branch_of_a_branch_drops_the_title_it_copied() {
+    for (kind, field) in [("custom-title", "customTitle"), ("ai-title", "aiTitle")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let (dir, a, b) = common::stage_claude_branch(&projects);
+        let path = |id: &str| dir.join(format!("{id}.jsonl"));
+        let renamed = |session: &str| serde_json::json!({ "type": kind, field: "登录改成异步队列", "sessionId": session });
+        if kind == "ai-title" {
+            for id in [&a, &b] {
+                let text = fs::read_to_string(path(id))
+                    .unwrap()
+                    .replace(r#""type":"custom-title""#, r#""type":"ai-title""#)
+                    .replace(r#""customTitle":"#, r#""aiTitle":"#);
+                fs::write(path(id), text).unwrap();
+            }
+        }
+        let text = fs::read_to_string(path(&b)).unwrap() + &format!("{}\n", renamed(&b));
+        fs::write(path(&b), text).unwrap();
+
+        // C 从 B 分出:开头照抄 B 的名字与 B 的消息行,之后问了自己的一句;照抄来的名字在分叉点
+        // 之后还会再写(本机的分支文件里就是这样)
+        let c = "c1a0de00-0000-4000-8000-0000000000c3";
+        let mut rows = vec![
+            renamed(c),
+            serde_json::json!({ "type": "queue-operation", "operation": "enqueue", "timestamp": "2026-09-03T10:00:00.000Z", "sessionId": c }),
+        ];
+        for line in fs::read_to_string(path(&b)).unwrap().lines() {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row.get("uuid").is_some() {
+                row["sessionId"] = c.into();
+                rows.push(row);
+            }
+        }
+        rows.push(serde_json::json!({
+            "parentUuid": "c1a0de00-2222-4000-8000-000000000004",
+            "isSidechain": false,
+            "cwd": "/Users/tester/Github/branchfx",
+            "sessionId": c,
+            "type": "user",
+            "message": { "role": "user", "content": "队列满了怎么办" },
+            "uuid": "c1a0de00-3333-4000-8000-000000000005",
+            "timestamp": "2026-09-03T10:00:10.000Z",
+        }));
+        rows.push(renamed(c));
+        let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        fs::write(path(c), text).unwrap();
+
+        let adapter = ClaudeAdapter::new().with_custom_root(projects);
+        let title = |id: &str| {
+            adapter
+                .parse_session(&adapter.file_ref(&path(id)).unwrap())
+                .unwrap()
+                .meta
+                .title
+        };
+        assert_eq!(title(&b), "登录改成异步队列", "{kind}: B 自己改的名字照用");
+        assert_eq!(title(c), "队列满了怎么办", "{kind}: C 照抄 B 的名字不用");
+    }
 }
 
 #[test]
@@ -3449,7 +3559,14 @@ fn data_roots_contract() {
         .filter(|a| a.detect())
         .map(|a| a.agent().as_str())
         .collect();
-    for expect in ["copilot", "opencode", "antigravity", "dsh", "kilo"] {
+    for expect in [
+        "copilot",
+        "opencode",
+        "antigravity",
+        "dsh",
+        "kilo",
+        "mimo",
+    ] {
         assert!(
             detected.contains(&expect),
             "{expect} 应被检出,实际 {detected:?}"
@@ -3822,7 +3939,7 @@ fn dsh_reads_the_newest_format_generation() {
 #[test]
 fn seq_contract_holds_for_all_agents() {
     let env = setup();
-    let checks: Vec<(Box<dyn AgentAdapter>, SessionFileRef)> = vec![
+    let mut checks: Vec<(Box<dyn AgentAdapter>, SessionFileRef)> = vec![
         (Box::new(ClaudeAdapter::new()), claude_ref()),
         (Box::new(CodexAdapter::new()), codex_ref()),
         (Box::new(QoderAdapter::new()), qoder_ref()),
@@ -3920,6 +4037,21 @@ fn seq_contract_holds_for_all_agents() {
             grok_bot_ref(GB_SCOUT, true),
         ),
     ];
+    // MiMo Code:主线、道子会话、peer 子会话、旁问宿主、导入后接着聊、fork——各从不同的道读、
+    // 各有折叠
+    for id in [
+        "ses_mimo_0001",
+        "ses_mimo_0001/explore-1",
+        "ses_mimo_0002",
+        "ses_mimo_0004",
+        "ses_mimo_0006",
+        "ses_mimo_0008",
+    ] {
+        checks.push((
+            Box::new(MimoAdapter::new()),
+            db_ref(AgentId::Mimo, &env.mimo_db, id),
+        ));
+    }
     for (adapter, r) in &checks {
         assert_seq_contract(adapter.as_ref(), r);
     }
@@ -4560,6 +4692,13 @@ fn unreadable_session_databases_freeze_instead_of_emptying() {
     let openclaw = OpenclawAdapter::new().with_custom_root(agents);
     assert!(openclaw.list_session_files().is_err());
     assert_eq!(openclaw.parent_links(), None);
+
+    let mimo = MimoAdapter::new().with_custom_root({ let p = tmp.path().join("bad/mimocode.db"); not_sqlite(&p); p });
+    assert!(mimo.list_session_files().is_err());
+    assert_eq!(mimo.parent_links(), None);
+    let mimo = MimoAdapter::new().with_custom_root({ let p = tmp.path().join("fresh/mimocode.db"); rusqlite::Connection::open(&p).unwrap().execute_batch("CREATE TABLE other (x)").unwrap(); p });
+    assert!(mimo.list_session_files().unwrap().is_empty());
+    assert_eq!(mimo.parent_links(), Some(Vec::new()));
 }
 
 /// 只有 agent 派生的子会话不算 Insights 里的会话:sessions_spawn 起的可见子会话只记
@@ -5035,6 +5174,424 @@ fn devin_custom_root_normalization() {
     let lone = PathBuf::from("/backup/sessions.db");
     let adapter = DevinAdapter::new().with_custom_root(lone.clone());
     assert_eq!(adapter.data_roots(), vec![lone]);
+}
+
+// ---------------------------------------------------------------- MiMo Code
+
+/// MiMo Code:OpenCode 形状的 v1 两表,但一个会话里有好几条道(主线 main、同会话的子代理、peer
+/// 子会话以自己的 id 命名的那条);照 MiMo 自己的规则挑会话显示哪条道、挑哪些会话显示,其余的道
+/// 各是一条子会话;导入别家的会话只有在 MiMo 里接着聊过才列;fork 复制来的那段折成一条
+#[test]
+fn mimo_code_parse_contract() {
+    let env = setup();
+    let adapter: Box<dyn AgentAdapter> = Box::new(MimoAdapter::new());
+    let mimo_ref = |id: &str| db_ref(AgentId::Mimo, &env.mimo_db, id);
+    let mut ids: Vec<String> = adapter
+        .list_session_files()
+        .expect("mimo code list")
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    ids.sort();
+    // 0003 是 checkpoint-writer 的宿主,0005 是没聊过的导入,0007 是分不清哪些是导入的老记录,
+    // 0012 没有正文;0001 里 checkpoint-writer 的道是簿记,0008 里的 explore-1 道全是 fork 复制来的
+    assert_eq!(
+        ids,
+        vec![
+            "ses_mimo_0001",
+            "ses_mimo_0001/explore-1",
+            "ses_mimo_0002",
+            "ses_mimo_0002/explore-1",
+            "ses_mimo_0004",
+            "ses_mimo_0006",
+            "ses_mimo_0008",
+            "ses_mimo_0009",
+            "ses_mimo_0010",
+            "ses_mimo_0011",
+            "ses_mimo_0011/explore-1",
+        ]
+    );
+    assert_eq!(
+        sorted_links(adapter.as_ref()),
+        vec![
+            edge("mimo:ses_mimo_0002", "mimo:ses_mimo_0001"),
+            edge("mimo:ses_mimo_0004", "mimo:ses_mimo_0001"),
+        ]
+    );
+    // 道子会话的父会话写在 id 里,停在直接父会话上(peer 子会话自己的道挂在 peer 子会话下)
+    assert_eq!(
+        path_links(adapter.as_ref()),
+        vec![
+            edge(
+                "mimo:ses_mimo_0001/explore-1",
+                "mimo:ses_mimo_0001"
+            ),
+            edge(
+                "mimo:ses_mimo_0002/explore-1",
+                "mimo:ses_mimo_0002"
+            ),
+            edge(
+                "mimo:ses_mimo_0011/explore-1",
+                "mimo:ses_mimo_0011"
+            ),
+        ]
+    );
+    // agent 派出去的(peer 子会话、旁问的宿主、同会话子代理的道)与自动整理记忆的 Auto Dream 不算
+    // 用户开的会话
+    assert_eq!(
+        spawned_ids(adapter.as_ref()),
+        vec![
+            "ses_mimo_0001/explore-1",
+            "ses_mimo_0002",
+            "ses_mimo_0002/explore-1",
+            "ses_mimo_0004",
+            "ses_mimo_0010",
+            "ses_mimo_0011/explore-1",
+        ]
+    );
+
+    // 主线:同会话子代理的道各是一条子会话,不进转录、token 也各算各的(150 + 25 + 20)
+    let r = mimo_ref("ses_mimo_0001");
+    let s = adapter.parse_session(&r).expect("mimo code parse_session");
+    let t = adapter
+        .parse_transcript(&r)
+        .expect("mimo code parse_transcript");
+    assert_eq!(s.meta.key, "mimo:ses_mimo_0001");
+    assert_eq!(s.meta.agent, AgentId::Mimo);
+    assert_eq!(s.meta.title, "MiMo 二维码泄漏排查");
+    assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
+    assert_eq!(s.meta.model.as_deref(), Some("mimo-v2.5-pro"));
+    assert_eq!(s.meta.tokens_used, Some(195));
+    assert_eq!(s.meta.created_at, 1790000000000);
+    assert_eq!(s.meta.updated_at, 1790000080000);
+    assert_eq!(s.meta.message_count, 3);
+    assert!(!s.meta.archived);
+    assert_eq!(
+        s.unknown_line_count, 0,
+        "checkpoint / compaction 都是已知的 part"
+    );
+    assert_eq!(
+        roles_kinds(&t.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            // 钩子带着 provenance 发来的,不是人打的字
+            (Role::User, MessageKind::Meta),
+            (Role::Assistant, MessageKind::Text),
+            // 检查点重建的上下文、压缩出的摘要;只有 compaction 标记的那条没有正文
+            (Role::User, MessageKind::CompactSummary),
+            (Role::Assistant, MessageKind::CompactSummary),
+        ]
+    );
+    assert!(
+        t.mainline
+            .iter()
+            .all(|m| !m.text.contains("useEffect(() =>")),
+        "子代理那条道不进转录"
+    );
+    let a = &t.mainline[1];
+    assert_eq!(a.text, "找到了:卸载时没有停止扫描。");
+    assert_eq!(a.thinking.as_deref(), Some("先看清理函数"));
+    assert_eq!(a.model.as_deref(), Some("mimo-v2.5-pro"));
+    // 派同会话子代理的调用跳到那条道子会话,派 peer 的跳到子会话
+    assert_eq!(
+        a.tool_calls[0].child_id.as_deref(),
+        Some("ses_mimo_0001/explore-1")
+    );
+    assert_eq!(
+        t.mainline[3].tool_calls[0].child_id.as_deref(),
+        Some("ses_mimo_0002")
+    );
+    assert!(t.mainline[4].text.contains("Recent activity"));
+    assert_eq!(t.mainline[5].text, "Summary of the QR work so far.");
+
+    // 道子会话:标题是派活时那句 description,时间、token 只算它那条道;不能单独恢复
+    let lane = mimo_ref("ses_mimo_0001/explore-1");
+    let sl = adapter.parse_session(&lane).unwrap();
+    let tl = adapter.parse_transcript(&lane).unwrap();
+    assert_eq!(sl.meta.key, "mimo:ses_mimo_0001/explore-1");
+    assert_eq!(sl.meta.title, "find the QR hook");
+    assert_eq!(sl.meta.project_path, "/Users/tester/Github/wakefx");
+    assert_eq!(sl.meta.model.as_deref(), Some("mimo-v2.5-flash"));
+    assert_eq!(sl.meta.tokens_used, Some(35));
+    assert_eq!(
+        (sl.meta.created_at, sl.meta.updated_at),
+        (1790000020000, 1790000030000)
+    );
+    assert!(!sl.meta.archived);
+    assert!(!resumable(&adapter, &sl.meta));
+    assert_eq!(
+        roles_kinds(&tl.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text)
+        ]
+    );
+    assert_eq!(
+        tl.mainline[1].text,
+        "src/QrScanner.tsx:42 useEffect(() => {"
+    );
+
+    // peer 子会话:消息在以它自己的 id 命名的道上
+    let s2 = adapter.parse_session(&mimo_ref("ses_mimo_0002")).unwrap();
+    assert_eq!(s2.meta.title, "general: run the QR tests");
+    assert_eq!(s2.meta.message_count, 2);
+    assert_eq!(s2.meta.tokens_used, Some(15));
+    // 它派的道没给 description(等于 agent 类型名):标题退回收到的任务
+    let s2l = adapter
+        .parse_session(&mimo_ref("ses_mimo_0002/explore-1"))
+        .unwrap();
+    assert_eq!(s2l.meta.title, "list the QR test files");
+    assert_eq!(s2l.meta.tokens_used, Some(5));
+
+    // 旁问的宿主:没有主线、也没有以自己命名的道,读最新的那条(build-1)
+    let t4 = adapter
+        .parse_transcript(&mimo_ref("ses_mimo_0004"))
+        .unwrap();
+    assert_eq!(
+        roles_kinds(&t4.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text)
+        ]
+    );
+    assert_eq!(
+        t4.mainline[1].text,
+        "Because the cleanup never stops the camera."
+    );
+
+    // 从 Codex 导入后在 MiMo 里接着聊过:导入的两条折成一条标记,不进 FTS、token 不算
+    let r6 = mimo_ref("ses_mimo_0006");
+    let s6 = adapter.parse_session(&r6).unwrap();
+    let t6 = adapter.parse_transcript(&r6).unwrap();
+    assert_eq!(
+        roles_kinds(&t6.mainline),
+        vec![
+            (Role::System, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert!(t6.mainline[0]
+        .text
+        .contains("2 messages imported from Codex"));
+    assert_eq!(s6.meta.title, "Codex 那边问过的");
+    assert_eq!(s6.meta.tokens_used, Some(8));
+    assert!(s6.units.iter().all(|u| !u.text.contains("Codex 那边的")));
+
+    // fork:开头复制来的两条(时间早于 fork 的创建时间)折成一条;token 与模型只算之后的,
+    // 子代理道里复制来的那条也不算
+    let r8 = mimo_ref("ses_mimo_0008");
+    let s8 = adapter.parse_session(&r8).unwrap();
+    let t8 = adapter.parse_transcript(&r8).unwrap();
+    assert_eq!(
+        roles_kinds(&t8.mainline),
+        vec![
+            (Role::System, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert!(t8.mainline[0]
+        .text
+        .contains("2 messages inherited from the parent session"));
+    assert_eq!(s8.meta.tokens_used, Some(7));
+    assert_eq!(s8.meta.model.as_deref(), Some("mimo-v2.5-flash"));
+    assert!(s8.units.iter().all(|u| !u.text.contains("二维码")));
+
+    // 占位标题退回首条提问
+    let s9 = adapter.parse_session(&mimo_ref("ses_mimo_0009")).unwrap();
+    assert_eq!(s9.meta.title, "占位标题取这句");
+
+    // Auto Dream:任务那句是钩子发的(synthetic),不是提问
+    let s10 = adapter.parse_session(&mimo_ref("ses_mimo_0010")).unwrap();
+    assert_eq!(s10.meta.title, "Auto Dream");
+    assert_eq!(s10.meta.message_count, 1);
+
+    let s11 = adapter.parse_session(&mimo_ref("ses_mimo_0011")).unwrap();
+    assert!(s11.meta.archived);
+    // 道子会话跟着所在会话归档:不跟的话会话被藏、它的子代理冒成顶层
+    let s11l = adapter
+        .parse_session(&mimo_ref("ses_mimo_0011/explore-1"))
+        .unwrap();
+    assert!(s11l.meta.archived);
+}
+
+/// 老库(2026-05 之前没有 message.agent_id、2026-09 之前没有 title_source,也没有导入表与
+/// actor_registry)不能让整家消失:一个会话只有一条道,parent_id 照样挂
+#[test]
+fn mimo_code_degrades_on_old_schema() {
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("mimocode.db")).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, slug TEXT,
+                              directory TEXT, title TEXT, version TEXT, time_created INTEGER,
+                              time_updated INTEGER, time_archived INTEGER);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                              time_updated INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                           time_created INTEGER, time_updated INTEGER, data TEXT);
+        INSERT INTO session VALUES ('old-1','p',NULL,'a','/work/old','','0.0.9',1780000000000,1780000002000,NULL);
+        INSERT INTO session VALUES ('old-2','p','old-1','b','/work/old','explore: grep','0.0.9',1780000001000,1780000001500,NULL);
+        INSERT INTO message VALUES ('m1','old-1',1780000000000,1780000000000,'{"role":"user","time":{"created":1780000000000}}');
+        INSERT INTO part VALUES ('p1','m1','old-1',1780000000000,1780000000000,'{"type":"text","text":"老库也要能读"}');
+        INSERT INTO message VALUES ('m2','old-1',1780000002000,1780000002000,'{"role":"assistant","time":{"created":1780000002000},"modelID":"mimo-v1","tokens":{"input":4,"output":1,"reasoning":0}}');
+        INSERT INTO part VALUES ('p2','m2','old-1',1780000002000,1780000002000,'{"type":"text","text":"能。"}');
+        INSERT INTO message VALUES ('m3','old-2',1780000001000,1780000001000,'{"role":"user","time":{"created":1780000001000}}');
+        INSERT INTO part VALUES ('p3','m3','old-2',1780000001000,1780000001000,'{"type":"text","text":"grep"}');
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let adapter = MimoAdapter::new().with_custom_root(dir.path().to_path_buf());
+    let mut refs = adapter.list_session_files().unwrap();
+    refs.sort_by(|a, b| a.native_id.cmp(&b.native_id));
+    assert_eq!(refs.len(), 2, "老 schema 不得整家消失");
+    assert_eq!(
+        sorted_links(adapter.as_ref()),
+        vec![edge("mimo:old-2", "mimo:old-1")]
+    );
+    let s = adapter.parse_session(&refs[0]).unwrap();
+    // 老库的占位标题是空串:退回首条提问
+    assert_eq!(s.meta.title, "老库也要能读");
+    assert_eq!(s.meta.message_count, 2);
+    assert_eq!(s.meta.tokens_used, Some(5));
+    assert_eq!(s.meta.model.as_deref(), Some("mimo-v1"));
+    assert_eq!(spawned_ids(adapter.as_ref()), vec!["old-2"]);
+}
+
+/// 道的引用在 part 字节数不变的改动之后也得变,增量扫描才会重解析它:消息原地改写(事后补写
+/// token)、会话归档(MiMo 只改会话那一行,道子会话跟着会话归档)
+#[test]
+fn mimo_code_lane_refs_change_without_new_parts() {
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("mimocode.db");
+    common::build_mimo_db(&db);
+    let lane = "ses_mimo_0001/explore-1";
+    // 每次现建一个实例:不靠行缓存认出库变了
+    let adapter = || MimoAdapter::new().with_custom_root(db.clone());
+    let lane_ref = || {
+        adapter()
+            .list_session_files()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.native_id == lane)
+            .expect("道子会话列得出")
+    };
+    let stamp = |r: &SessionFileRef| (r.mtime_ms, r.size);
+    let write = |sql: &str| {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(sql, [])
+            .unwrap();
+    };
+
+    // 子代理那条回复事后补写 token:消息改了,part 一个字节都没动
+    let before = lane_ref();
+    write(
+        "UPDATE message SET data = json_set(data, '$.tokens.output', 15), time_updated = 1790000040000
+         WHERE id = 'msg_m1_03'",
+    );
+    let updated = lane_ref();
+    assert_ne!(stamp(&before), stamp(&updated));
+    assert_eq!(
+        adapter().parse_session(&updated).unwrap().meta.tokens_used,
+        Some(45)
+    );
+
+    // 会话归档
+    write(
+        "UPDATE session SET time_archived = 1790009000000, time_updated = 1790009000000
+         WHERE id = 'ses_mimo_0001'",
+    );
+    let archived = lane_ref();
+    assert_ne!(stamp(&updated), stamp(&archived));
+    assert!(adapter().parse_session(&archived).unwrap().meta.archived);
+}
+
+/// 2026-05-21 到 05-26 之间的库:message.agent_id 已经有了、还可以为空,主线的消息是 NULL。NULL
+/// 当作 main——不然主线一条都读不到,子代理那条道反倒成了会话显示的那条
+#[test]
+fn mimo_code_reads_null_agent_id_as_main() {
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("mimocode.db")).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, slug TEXT,
+                              directory TEXT, title TEXT, version TEXT, time_created INTEGER,
+                              time_updated INTEGER, time_archived INTEGER);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, agent_id TEXT,
+                              time_created INTEGER, time_updated INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                           time_created INTEGER, time_updated INTEGER, data TEXT);
+        INSERT INTO session VALUES ('win-1','p',NULL,'a','/work/win','','0.1.0',1780000000000,1780000003000,NULL);
+        INSERT INTO message VALUES ('m1','win-1',NULL,1780000000000,1780000000000,'{"role":"user","time":{"created":1780000000000}}');
+        INSERT INTO part VALUES ('p1','m1','win-1',1780000000000,1780000000000,'{"type":"text","text":"主线的消息还是 NULL"}');
+        INSERT INTO message VALUES ('m2','win-1',NULL,1780000002000,1780000002000,'{"role":"assistant","time":{"created":1780000002000},"modelID":"mimo-v1","tokens":{"input":4,"output":1,"reasoning":0}}');
+        INSERT INTO part VALUES ('p2','m2','win-1',1780000002000,1780000002000,'{"type":"text","text":"照样读得到。"}');
+        INSERT INTO message VALUES ('m3','win-1','explore-1',1780000003000,1780000003000,'{"role":"user","time":{"created":1780000003000}}');
+        INSERT INTO part VALUES ('p3','m3','win-1',1780000003000,1780000003000,'{"type":"text","text":"子代理那条道"}');
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let adapter = MimoAdapter::new().with_custom_root(dir.path().to_path_buf());
+    let mut refs = adapter.list_session_files().unwrap();
+    refs.sort_by(|a, b| a.native_id.cmp(&b.native_id));
+    let ids: Vec<&str> = refs.iter().map(|r| r.native_id.as_str()).collect();
+    assert_eq!(ids, vec!["win-1", "win-1/explore-1"]);
+    let t = adapter.parse_transcript(&refs[0]).unwrap();
+    let texts: Vec<&str> = t.mainline.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, vec!["主线的消息还是 NULL", "照样读得到。"]);
+    assert_eq!(t.meta.title, "主线的消息还是 NULL");
+    assert_eq!(t.meta.tokens_used, Some(5));
+    let lane = adapter.parse_transcript(&refs[1]).unwrap();
+    let texts: Vec<&str> = lane.mainline.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, vec!["子代理那条道"]);
+}
+
+/// 自定义 location:选中库文件本身、数据目录、`MIMOCODE_HOME`(data/ 在里面)或 XDG data 根
+/// (mimocode/ 在里面)都落到同一个库;什么都没有就当数据目录本身
+#[test]
+fn mimo_code_custom_root_shapes() {
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("mimo-home");
+    let data = home.join("data");
+    fs::create_dir_all(&data).unwrap();
+    let db = data.join("mimocode.db");
+    common::build_mimo_db(&db);
+    for picked in [db.clone(), data.clone(), home] {
+        let adapter = MimoAdapter::new().with_custom_root(picked.clone());
+        assert_eq!(
+            adapter.data_roots(),
+            vec![db.clone()],
+            "{}",
+            picked.display()
+        );
+        assert_eq!(adapter.list_session_files().unwrap().len(), 11);
+    }
+    let share = dir.path().join("share");
+    let xdg_db = share.join("mimocode").join("mimocode.db");
+    fs::create_dir_all(xdg_db.parent().unwrap()).unwrap();
+    common::build_mimo_db(&xdg_db);
+    assert_eq!(
+        MimoAdapter::new().with_custom_root(share).data_roots(),
+        vec![xdg_db]
+    );
+    let empty = dir.path().join("nothing-here");
+    assert_eq!(
+        MimoAdapter::new()
+            .with_custom_root(empty.clone())
+            .data_roots(),
+        vec![empty.join("mimocode.db")]
+    );
 }
 
 // ---------------------------------------------------------------- Kilo Code

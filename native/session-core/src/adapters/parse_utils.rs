@@ -241,6 +241,30 @@ pub fn title_from_messages(messages: &[TranscriptMessage]) -> Option<String> {
         .find(|title| !title.is_empty())
 }
 
+/// 会话标题:存着的名字为准,没有就退回首条提问;`placeholder` 时反过来——存着的只是占位
+/// (ZCode 的 default、MiMo Code 的 fallback),有提问就用提问。都没有给 UNTITLED
+pub fn session_title(stored: &str, placeholder: bool, messages: &[TranscriptMessage]) -> String {
+    let stored = Some(clean_title_candidate(stored)).filter(|t| !t.is_empty());
+    let asked = || title_from_messages(messages);
+    if placeholder {
+        asked().or(stored)
+    } else {
+        stored.or_else(asked)
+    }
+    .unwrap_or_else(|| UNTITLED.to_string())
+}
+
+/// 折掉的一段留下的那条标记:"── N messages <来由> ──",System 角色的 Meta
+pub fn collapsed_marker(count: usize, origin: &str, ts: i64) -> TranscriptMessage {
+    meta_msg(
+        &format!(
+            "── {count} message{} {origin} ──",
+            crate::text::plural(count as i64)
+        ),
+        ts,
+    )
+}
+
 /// 会话开头从父会话原样复制来的那段(Codex `spawn_agent` 的 fork_turns、Craft Agents
 /// 的分支)折成一条 Meta 标记。原样入库就是:子会话偷走父会话的标题、父会话的每一句
 /// 在 FTS 里出现两次、Insights 的 prompt 数翻倍。Meta 不进 FTS、不算 message_count、
@@ -260,15 +284,7 @@ pub fn collapse_inherited(messages: &mut Vec<TranscriptMessage>, cut: usize, par
         .iter()
         .find_map(|m| m.timestamp)
         .unwrap_or_default();
-    let mut marker = text_msg(
-        Role::System,
-        &format!(
-            "── {turns} message{} inherited from the parent {parent} ──",
-            crate::text::plural(turns as i64)
-        ),
-        ts,
-    );
-    marker.kind = MessageKind::Meta;
+    let marker = collapsed_marker(turns, &format!("inherited from the parent {parent}"), ts);
     messages.splice(..cut, std::iter::once(marker));
 }
 

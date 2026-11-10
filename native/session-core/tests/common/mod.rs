@@ -330,6 +330,7 @@ pub struct Sidecars {
     /// Kilo Code 旧版扩展装在 VS Code / Cursor 里各自的任务目录
     pub kilo_tasks: PathBuf,
     pub kilo_cursor_tasks: PathBuf,
+    pub mimo_db: PathBuf,
 }
 
 /// 侧档与 SQLite 型 fixture 库:copilot/opencode(两代)/antigravity 现建库,
@@ -446,6 +447,11 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
     let kilo_cursor_tasks = cursor_ide_dir.join("kilocode.kilo-code").join("tasks");
     copy_tree(&fixture("kilo-legacy/Cursor/tasks"), &kilo_cursor_tasks);
 
+    let mimo_dir = home.join(".local").join("share").join("mimocode");
+    fs::create_dir_all(&mimo_dir).expect("mkdir mimocode data dir");
+    let mimo_db = mimo_dir.join("mimocode.db");
+    build_mimo_db(&mimo_db);
+
     Sidecars {
         copilot_db,
         opencode_db,
@@ -461,6 +467,7 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
         kilo_db,
         kilo_tasks,
         kilo_cursor_tasks,
+        mimo_db,
     }
 }
 
@@ -1241,6 +1248,9 @@ pub fn clear_agent_env_overrides() {
         "WORKBUDDY_CONFIG_DIR",
         "ZCODE_STORAGE_DIR",
         "KIMI_CODE_HOME",
+        "MIMOCODE_HOME",
+        "MIMO_HOME",
+        "MIMO_DB",
         // 库路径的覆盖:指向现存文件时会被加进数据根,读到合成 HOME 之外的真实库
         "OPENCODE_DB",
         "KILO_DB",
@@ -1428,6 +1438,185 @@ pub fn build_devin_db(path: &Path) {
         "#,
     )
     .expect("populate devin fixture db");
+}
+
+/// MiMo Code `~/.local/share/mimocode/mimocode.db`(OpenCode 分支,列按源码 session.sql.ts 的
+/// 建表取子集):
+/// - `ses_mimo_0001`:主线(main 道);同会话的子代理 explore-1 写在自己的道上,是一条道子会话
+///   (`ses_mimo_0001/explore-1`,标题是派活时的 description),派它的工具调用跳到那里,派 peer
+///   的跳到子会话;老版本留下的 checkpoint-writer-1 道是簿记、不列;一条带 provenance 的钩子消息、
+///   一条检查点、一对压缩(compaction 标记 + summary 回复)
+/// - `ses_mimo_0002`:peer 子会话,消息写在以它自己的 id 命名的道上;它自己派的 explore-1 道没给
+///   description(等于 agent 类型名),标题退回收到的任务
+/// - `ses_mimo_0003`:checkpoint-writer 的宿主子会话(簿记,不列)
+/// - `ses_mimo_0004`:`ask:` 旁问的宿主子会话,消息在 build-1 道上(照列)
+/// - `ses_mimo_0005`:从 Claude Code 导入、没在 MiMo 里聊过(不列)
+/// - `ses_mimo_0006`:从 Codex 导入后在 MiMo 里接着聊过(照列,导入的两条折成一条)
+/// - `ses_mimo_0007`:message_ids 为空的老导入(分不清,不列)
+/// - `ses_mimo_0008`:0001 的 fork,复制来的(主线两条、子代理道一条)时间都早于它的创建时间
+/// - `ses_mimo_0009`:占位标题(title_source = fallback)
+/// - `ses_mimo_0010`:自动整理记忆的 "Auto Dream"
+/// - `ses_mimo_0011`:已归档,它的 explore-1 道跟着归档;`ses_mimo_0012`:没有正文(不列)
+///
+/// 另有 account 表与一行假凭证:真库就长这样,adapter 绝不读它
+pub fn build_mimo_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create mimo code fixture db");
+    conn.execute_batch(
+        r###"
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workspace_id TEXT, parent_id TEXT,
+            context_from TEXT, context_watermark TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL,
+            title TEXT NOT NULL, title_source TEXT NOT NULL DEFAULT 'user',
+            title_revision INTEGER NOT NULL DEFAULT 0, version TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            time_compacting INTEGER, time_archived INTEGER
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT 'main',
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE external_import (
+            source TEXT NOT NULL, source_key TEXT NOT NULL, session_id TEXT NOT NULL,
+            source_path TEXT NOT NULL, source_mtime INTEGER NOT NULL, time_imported INTEGER NOT NULL,
+            message_ids TEXT, PRIMARY KEY (source, source_key)
+        );
+        CREATE TABLE actor_registry (
+            session_id TEXT NOT NULL, actor_id TEXT NOT NULL, mode TEXT NOT NULL,
+            parent_actor_id TEXT, status TEXT NOT NULL, lifecycle TEXT NOT NULL, agent TEXT NOT NULL,
+            description TEXT NOT NULL, context_mode TEXT NOT NULL, background INTEGER NOT NULL,
+            last_turn_time INTEGER NOT NULL, turn_count INTEGER NOT NULL DEFAULT 0,
+            instance_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            PRIMARY KEY (session_id, actor_id)
+        );
+        CREATE TABLE account (
+            id TEXT PRIMARY KEY, email TEXT NOT NULL, url TEXT NOT NULL, access_token TEXT NOT NULL,
+            refresh_token TEXT NOT NULL, token_expiry INTEGER,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+        );
+        INSERT INTO account VALUES
+            ('acc-1','tester@example.com','https://mimo.xiaomi.com','NOT-A-REAL-TOKEN','NOT-A-REAL-REFRESH',NULL,0,0);
+
+        INSERT INTO session (id, project_id, parent_id, context_from, slug, directory, title,
+                             title_source, version, time_created, time_updated, time_archived) VALUES
+            ('ses_mimo_0001','prj1',NULL,NULL,'brave-otter','/Users/tester/Github/wakefx','MiMo 二维码泄漏排查','generated','0.1.15',1790000000000,1790000080000,NULL),
+            ('ses_mimo_0002','prj1','ses_mimo_0001','ses_mimo_0001','calm-pine','/Users/tester/Github/wakefx','general: run the QR tests','user','0.1.15',1790000045000,1790000048000,NULL),
+            ('ses_mimo_0003','prj1','ses_mimo_0001',NULL,'quiet-lake','/Users/tester/Github/wakefx','checkpoint-writer: msg_m1_01..msg_m1_06','user','0.1.15',1790000061000,1790000062000,NULL),
+            ('ses_mimo_0004','prj1','ses_mimo_0001',NULL,'bold-reed','/Users/tester/Github/wakefx','ask: why does the scanner leak','user','0.1.15',1790000089000,1790000095000,NULL),
+            ('ses_mimo_0005','prj1',NULL,NULL,'old-fern','/Users/tester/Github/wakefx','Imported Claude session','user','claude-code',1789000000000,1789000005000,NULL),
+            ('ses_mimo_0006','prj1',NULL,NULL,'warm-sky','/Users/tester/Github/wakefx','Codex 那边问过的','user','codex',1789100000000,1790000105000,NULL),
+            ('ses_mimo_0007','prj1',NULL,NULL,'dry-moss','/Users/tester/Github/wakefx','老导入','user','claude-code',1789200000000,1790000110000,NULL),
+            ('ses_mimo_0008','prj1',NULL,NULL,'fast-hare','/Users/tester/Github/wakefx','MiMo 二维码泄漏排查 (fork #1)','user','0.1.15',1790001000000,1790001020000,NULL),
+            ('ses_mimo_0009','prj1',NULL,NULL,'new-moon','/Users/tester/Github/wakefx','Untitled','fallback','0.1.15',1790002000000,1790002005000,NULL),
+            ('ses_mimo_0010','prj1',NULL,NULL,'deep-dream','/Users/tester/Github/wakefx','Auto Dream','user','0.1.15',1790003000000,1790003005000,NULL),
+            ('ses_mimo_0011','prj1',NULL,NULL,'gray-owl','/Users/tester/Github/wakefx','Archived MiMo session','user','0.1.15',1790004000000,1790004001000,1790005000000),
+            ('ses_mimo_0012','prj1',NULL,NULL,'empty-sky','/Users/tester/Github/wakefx','Untitled','fallback','0.1.15',1790006000000,1790006000000,NULL);
+
+        INSERT INTO actor_registry (session_id, actor_id, mode, parent_actor_id, status, lifecycle,
+                                    agent, description, context_mode, background, last_turn_time,
+                                    instance_id, time_created, time_updated) VALUES
+            ('ses_mimo_0001','explore-1','subagent',NULL,'idle','ephemeral','explore','find the QR hook','none',0,1790000030000,'i1',1790000015000,1790000030000),
+            ('ses_mimo_0001','checkpoint-writer-1','subagent',NULL,'idle','ephemeral','checkpoint-writer','checkpoint writer','full',1,1790000065000,'i1',1790000065000,1790000065000),
+            ('ses_mimo_0002','ses_mimo_0002','peer',NULL,'idle','persistent','general','run the QR tests','full',0,1790000048000,'i1',1790000045000,1790000048000),
+            ('ses_mimo_0002','explore-1','subagent',NULL,'idle','ephemeral','explore','explore','none',0,1790000047000,'i1',1790000046400,1790000047000),
+            ('ses_mimo_0011','explore-1','subagent',NULL,'idle','ephemeral','explore','look around','none',0,1790004000500,'i1',1790004000400,1790004000500),
+            ('ses_mimo_0003','checkpoint-writer-1','subagent',NULL,'idle','ephemeral','checkpoint-writer','checkpoint writer','full',1,1790000062000,'i1',1790000061000,1790000062000),
+            ('ses_mimo_0004','build-1','subagent',NULL,'idle','ephemeral','build','fork-query','full',0,1790000095000,'i1',1790000089000,1790000095000);
+
+        INSERT INTO external_import VALUES
+            ('cc','55555555-aaaa-bbbb-cccc-000000000005','ses_mimo_0005','/Users/tester/.claude/projects/-Users-tester-Github-wakefx/55555555-aaaa-bbbb-cccc-000000000005.jsonl',1,1790000000000,'["msg_m5_01","msg_m5_02"]'),
+            ('codex','66666666-aaaa-bbbb-cccc-000000000006','ses_mimo_0006','/Users/tester/.codex/sessions/2026/09/01/rollout-2026-09-01T09-00-00-66666666-aaaa-bbbb-cccc-000000000006.jsonl',1,1790000000000,'["msg_m6_01","msg_m6_02"]'),
+            ('cc','77777777-aaaa-bbbb-cccc-000000000007','ses_mimo_0007','/Users/tester/.claude/projects/-Users-tester-Github-wakefx/77777777-aaaa-bbbb-cccc-000000000007.jsonl',1,1789200000000,NULL);
+
+        INSERT INTO message (id, session_id, agent_id, time_created, time_updated, data) VALUES
+            ('msg_m1_01','ses_mimo_0001','main',1790000010000,1790000010000,'{"role":"user","time":{"created":1790000010000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m1_02','ses_mimo_0001','explore-1',1790000020000,1790000020000,'{"role":"user","time":{"created":1790000020000},"agent":"explore","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-flash"}}'),
+            ('msg_m1_03','ses_mimo_0001','explore-1',1790000030000,1790000030000,'{"role":"assistant","time":{"created":1790000030000},"parentID":"msg_m1_02","modelID":"mimo-v2.5-flash","providerID":"xiaomi","mode":"explore","agent":"explore","cost":0,"tokens":{"input":30,"output":5,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m1_04','ses_mimo_0001','main',1790000035000,1790000039000,'{"role":"assistant","time":{"created":1790000035000,"completed":1790000039000},"parentID":"msg_m1_01","modelID":"mimo-v2.5-pro","providerID":"xiaomi","mode":"build","agent":"build","cost":0,"tokens":{"input":100,"output":40,"reasoning":10,"cache":{"read":500,"write":0}}}'),
+            ('msg_m1_05','ses_mimo_0001','main',1790000040000,1790000040000,'{"role":"user","time":{"created":1790000040000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"},"provenance":{"hookPhase":"post","hookIteration":0,"pluginNames":["lint-gate"],"hookIDs":["h1"]}}'),
+            ('msg_m1_06','ses_mimo_0001','main',1790000050000,1790000050000,'{"role":"assistant","time":{"created":1790000050000},"parentID":"msg_m1_05","modelID":"mimo-v2.5-pro","providerID":"xiaomi","mode":"build","agent":"build","cost":0,"tokens":{"input":20,"output":5,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m1_07','ses_mimo_0001','main',1790000060000,1790000060000,'{"role":"user","time":{"created":1790000060000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m1_08','ses_mimo_0001','main',1790000070000,1790000070000,'{"role":"user","time":{"created":1790000070000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m1_09','ses_mimo_0001','main',1790000080000,1790000080000,'{"role":"assistant","time":{"created":1790000080000},"parentID":"msg_m1_08","modelID":"mimo-v2.5-pro","providerID":"xiaomi","mode":"compaction","agent":"compaction","summary":true,"cost":0,"tokens":{"input":10,"output":10,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m2_01','ses_mimo_0002','ses_mimo_0002',1790000046000,1790000046000,'{"role":"user","time":{"created":1790000046000},"agent":"general","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-flash"}}'),
+            ('msg_m2_02','ses_mimo_0002','ses_mimo_0002',1790000048000,1790000048000,'{"role":"assistant","time":{"created":1790000048000},"parentID":"msg_m2_01","modelID":"mimo-v2.5-flash","providerID":"xiaomi","mode":"general","agent":"general","cost":0,"tokens":{"input":12,"output":3,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m2_03','ses_mimo_0002','explore-1',1790000046500,1790000046500,'{"role":"user","time":{"created":1790000046500},"agent":"explore","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-flash"}}'),
+            ('msg_m2_04','ses_mimo_0002','explore-1',1790000047000,1790000047000,'{"role":"assistant","time":{"created":1790000047000},"modelID":"mimo-v2.5-flash","tokens":{"input":4,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m1_0w','ses_mimo_0001','checkpoint-writer-1',1790000065000,1790000065000,'{"role":"user","time":{"created":1790000065000},"agent":"checkpoint-writer","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m11_02','ses_mimo_0011','explore-1',1790004000500,1790004000500,'{"role":"user","time":{"created":1790004000500},"agent":"explore","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-flash"}}'),
+            ('msg_m3_01','ses_mimo_0003','checkpoint-writer-1',1790000061000,1790000061000,'{"role":"user","time":{"created":1790000061000},"agent":"checkpoint-writer","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m3_02','ses_mimo_0003','checkpoint-writer-1',1790000062000,1790000062000,'{"role":"assistant","time":{"created":1790000062000},"modelID":"mimo-v2.5-pro","tokens":{"input":50,"output":20,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m4_01','ses_mimo_0004','build-1',1790000090000,1790000090000,'{"role":"user","time":{"created":1790000090000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m4_02','ses_mimo_0004','build-1',1790000095000,1790000095000,'{"role":"assistant","time":{"created":1790000095000},"parentID":"msg_m4_01","modelID":"mimo-v2.5-pro","tokens":{"input":9,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m5_01','ses_mimo_0005','main',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000},"agent":"build","model":{"providerID":"anthropic","modelID":"claude-opus-5-5"}}'),
+            ('msg_m5_02','ses_mimo_0005','main',1789000005000,1789000005000,'{"role":"assistant","time":{"created":1789000005000},"modelID":"claude-opus-5-5","tokens":{"input":80,"output":20,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m6_01','ses_mimo_0006','main',1789100000000,1789100000000,'{"role":"user","time":{"created":1789100000000},"agent":"build","model":{"providerID":"openai","modelID":"gpt-5.5"}}'),
+            ('msg_m6_02','ses_mimo_0006','main',1789100005000,1789100005000,'{"role":"assistant","time":{"created":1789100005000},"modelID":"gpt-5.5","tokens":{"input":100,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m6_03','ses_mimo_0006','main',1790000100000,1790000100000,'{"role":"user","time":{"created":1790000100000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m6_04','ses_mimo_0006','main',1790000105000,1790000105000,'{"role":"assistant","time":{"created":1790000105000},"modelID":"mimo-v2.5-pro","tokens":{"input":6,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m7_01','ses_mimo_0007','main',1789200000000,1789200000000,'{"role":"user","time":{"created":1789200000000},"agent":"build","model":{"providerID":"anthropic","modelID":"claude-opus-5-5"}}'),
+            ('msg_m7_02','ses_mimo_0007','main',1790000110000,1790000110000,'{"role":"user","time":{"created":1790000110000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m8_01','ses_mimo_0008','main',1790000010000,1790000010000,'{"role":"user","time":{"created":1790000010000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m8_02','ses_mimo_0008','main',1790000035000,1790000035000,'{"role":"assistant","time":{"created":1790000035000},"modelID":"mimo-v2.5-pro","tokens":{"input":100,"output":40,"reasoning":10,"cache":{"read":0,"write":0}}}'),
+            ('msg_m8_0x','ses_mimo_0008','explore-1',1790000030000,1790000030000,'{"role":"assistant","time":{"created":1790000030000},"modelID":"mimo-v2.5-flash","tokens":{"input":30,"output":5,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m8_03','ses_mimo_0008','main',1790001010000,1790001010000,'{"role":"user","time":{"created":1790001010000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-flash"}}'),
+            ('msg_m8_04','ses_mimo_0008','main',1790001020000,1790001020000,'{"role":"assistant","time":{"created":1790001020000},"modelID":"mimo-v2.5-flash","tokens":{"input":5,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m9_01','ses_mimo_0009','main',1790002001000,1790002001000,'{"role":"user","time":{"created":1790002001000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m9_02','ses_mimo_0009','main',1790002005000,1790002005000,'{"role":"assistant","time":{"created":1790002005000},"modelID":"mimo-v2.5-pro","tokens":{"input":3,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m10_01','ses_mimo_0010','main',1790003000000,1790003000000,'{"role":"user","time":{"created":1790003000000},"agent":"dream","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}'),
+            ('msg_m10_02','ses_mimo_0010','main',1790003005000,1790003005000,'{"role":"assistant","time":{"created":1790003005000},"modelID":"mimo-v2.5-pro","agent":"dream","tokens":{"input":40,"output":10,"reasoning":0,"cache":{"read":0,"write":0}}}'),
+            ('msg_m11_01','ses_mimo_0011','main',1790004000000,1790004000000,'{"role":"user","time":{"created":1790004000000},"agent":"build","model":{"providerID":"xiaomi","modelID":"mimo-v2.5-pro"}}');
+
+        INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES
+            ('prt_m1_01a','msg_m1_01','ses_mimo_0001',1790000010000,1790000010000,'{"type":"text","text":"MiMo 修一下二维码扫描的 useEffect() 泄漏"}'),
+            ('prt_m1_02a','msg_m1_02','ses_mimo_0001',1790000020000,1790000020000,'{"type":"text","text":"grep the scanner for useEffect"}'),
+            ('prt_m1_03a','msg_m1_03','ses_mimo_0001',1790000030000,1790000030000,'{"type":"text","text":"src/QrScanner.tsx:42 useEffect(() => {"}'),
+            ('prt_m1_04a','msg_m1_04','ses_mimo_0001',1790000035000,1790000035000,'{"type":"step-start"}'),
+            ('prt_m1_04b','msg_m1_04','ses_mimo_0001',1790000035000,1790000035000,'{"type":"reasoning","text":"先看清理函数"}'),
+            ('prt_m1_04c','msg_m1_04','ses_mimo_0001',1790000036000,1790000038000,'{"type":"tool","callID":"call_1","tool":"actor","state":{"status":"completed","input":{"op":"spawn","agent":"explore","task":"grep the scanner for useEffect"},"output":"explore-1 finished","title":"actor","metadata":{"sessionId":"ses_mimo_0001","actorId":"explore-1","model":"mimo-v2.5-flash"}}}'),
+            ('prt_m1_04d','msg_m1_04','ses_mimo_0001',1790000039000,1790000039000,'{"type":"text","text":"找到了:卸载时没有停止扫描。"}'),
+            ('prt_m1_04e','msg_m1_04','ses_mimo_0001',1790000039000,1790000039000,'{"type":"step-finish","reason":"stop","tokens":{"input":100,"output":40,"reasoning":10,"cache":{"read":500,"write":0}}}'),
+            ('prt_m1_05a','msg_m1_05','ses_mimo_0001',1790000040000,1790000040000,'{"type":"text","text":"lint-gate: 2 warnings in src/QrScanner.tsx"}'),
+            ('prt_m1_06a','msg_m1_06','ses_mimo_0001',1790000050000,1790000050000,'{"type":"tool","callID":"call_2","tool":"actor","state":{"status":"completed","input":{"op":"spawn","mode":"peer","agent":"general","task":"run the QR tests"},"output":"spawned ses_mimo_0002","title":"actor","metadata":{"sessionId":"ses_mimo_0002","actorId":"ses_mimo_0002"}}}'),
+            ('prt_m1_06b','msg_m1_06','ses_mimo_0001',1790000050000,1790000050000,'{"type":"text","text":"派了一个 peer 去跑测试。"}'),
+            ('prt_m1_07a','msg_m1_07','ses_mimo_0001',1790000060000,1790000060000,'{"type":"checkpoint","checkpointDir":"","checkpointNumber":0,"coveredUpTo":"msg_m1_06"}'),
+            ('prt_m1_07b','msg_m1_07','ses_mimo_0001',1790000060000,1790000060000,'{"type":"text","synthetic":true,"text":"## Recent activity\n- fixed the QR leak"}'),
+            ('prt_m1_08a','msg_m1_08','ses_mimo_0001',1790000070000,1790000070000,'{"type":"compaction","auto":true}'),
+            ('prt_m1_09a','msg_m1_09','ses_mimo_0001',1790000080000,1790000080000,'{"type":"text","text":"Summary of the QR work so far."}'),
+            ('prt_m2_01a','msg_m2_01','ses_mimo_0002',1790000046000,1790000046000,'{"type":"text","text":"run the QR tests"}'),
+            ('prt_m2_02a','msg_m2_02','ses_mimo_0002',1790000048000,1790000048000,'{"type":"text","text":"All QR tests pass."}'),
+            ('prt_m2_03a','msg_m2_03','ses_mimo_0002',1790000046500,1790000046500,'{"type":"text","text":"list the QR test files"}'),
+            ('prt_m2_04a','msg_m2_04','ses_mimo_0002',1790000047000,1790000047000,'{"type":"text","text":"tests/qr.test.ts"}'),
+            ('prt_m1_0wa','msg_m1_0w','ses_mimo_0001',1790000065000,1790000065000,'{"type":"text","text":"Write the checkpoint for msg_m1_01..msg_m1_06"}'),
+            ('prt_m11_02a','msg_m11_02','ses_mimo_0011',1790004000500,1790004000500,'{"type":"text","text":"look around the archived repo"}'),
+            ('prt_m3_01a','msg_m3_01','ses_mimo_0003',1790000061000,1790000061000,'{"type":"text","text":"Write the checkpoint for msg_m1_01..msg_m1_06"}'),
+            ('prt_m3_02a','msg_m3_02','ses_mimo_0003',1790000062000,1790000062000,'{"type":"text","text":"checkpoint written"}'),
+            ('prt_m4_01a','msg_m4_01','ses_mimo_0004',1790000090000,1790000090000,'{"type":"text","text":"why does the scanner leak?"}'),
+            ('prt_m4_02a','msg_m4_02','ses_mimo_0004',1790000095000,1790000095000,'{"type":"text","text":"Because the cleanup never stops the camera."}'),
+            ('prt_m5_01a','msg_m5_01','ses_mimo_0005',1789000000000,1789000000000,'{"type":"text","text":"Claude 那边的提问"}'),
+            ('prt_m5_02a','msg_m5_02','ses_mimo_0005',1789000005000,1789000005000,'{"type":"text","text":"Claude 那边的回答"}'),
+            ('prt_m6_01a','msg_m6_01','ses_mimo_0006',1789100000000,1789100000000,'{"type":"text","text":"Codex 那边的提问"}'),
+            ('prt_m6_02a','msg_m6_02','ses_mimo_0006',1789100005000,1789100005000,'{"type":"text","text":"Codex 那边的回答"}'),
+            ('prt_m6_03a','msg_m6_03','ses_mimo_0006',1790000100000,1790000100000,'{"type":"text","text":"在 MiMo 里接着问"}'),
+            ('prt_m6_04a','msg_m6_04','ses_mimo_0006',1790000105000,1790000105000,'{"type":"text","text":"接着答"}'),
+            ('prt_m7_01a','msg_m7_01','ses_mimo_0007',1789200000000,1789200000000,'{"type":"text","text":"老版本导入的"}'),
+            ('prt_m7_02a','msg_m7_02','ses_mimo_0007',1790000110000,1790000110000,'{"type":"text","text":"后来接着问的"}'),
+            ('prt_m8_01a','msg_m8_01','ses_mimo_0008',1790000010000,1790000010000,'{"type":"text","text":"MiMo 修一下二维码扫描的 useEffect() 泄漏"}'),
+            ('prt_m8_02a','msg_m8_02','ses_mimo_0008',1790000035000,1790000035000,'{"type":"text","text":"找到了:卸载时没有停止扫描。"}'),
+            ('prt_m8_0xa','msg_m8_0x','ses_mimo_0008',1790000030000,1790000030000,'{"type":"text","text":"src/QrScanner.tsx:42 useEffect(() => {"}'),
+            ('prt_m8_03a','msg_m8_03','ses_mimo_0008',1790001010000,1790001010000,'{"type":"text","text":"fork 之后的问题"}'),
+            ('prt_m8_04a','msg_m8_04','ses_mimo_0008',1790001020000,1790001020000,'{"type":"text","text":"fork 之后的回答"}'),
+            ('prt_m9_01a','msg_m9_01','ses_mimo_0009',1790002001000,1790002001000,'{"type":"text","text":"占位标题取这句"}'),
+            ('prt_m9_02a','msg_m9_02','ses_mimo_0009',1790002005000,1790002005000,'{"type":"text","text":"好。"}'),
+            ('prt_m10_01a','msg_m10_01','ses_mimo_0010',1790003000000,1790003000000,'{"type":"text","synthetic":true,"text":"Run one automatic dream memory consolidation pass for the current project."}'),
+            ('prt_m10_02a','msg_m10_02','ses_mimo_0010',1790003005000,1790003005000,'{"type":"text","text":"Consolidated 3 memories."}'),
+            ('prt_m11_01a','msg_m11_01','ses_mimo_0011',1790004000000,1790004000000,'{"type":"text","text":"an archived question"}');
+        "###,
+    )
+    .expect("populate mimo code fixture db");
 }
 
 /// 以某种身份持住索引锁,拿不到就 panic 点名——各测试文件里"扮演 GUI / 另一个

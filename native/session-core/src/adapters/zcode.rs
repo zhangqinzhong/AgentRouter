@@ -58,7 +58,7 @@
 //! 本机目录还是空的:目录名规则对真机核过(`default-0e81bcb7a4286b1b` 正是库里唯一
 //! 工作区 `~/.zcode/workspace/default` 的 hash),文件格式按源码推断、**未经真机验证**
 //! (OpenClaw / CodeBuddy 同款),fixture 合成。
-use super::opencode::{parse_v1_messages, V1Order};
+use super::opencode::{parse_v1_messages, V1Query};
 use super::parse_utils::*;
 use super::sqlite_ro::{
     db_cache_stamp, open_sqlite_ro, strip_virtual_path, table_columns, virtual_path, SqliteRo,
@@ -144,17 +144,18 @@ impl ZcSchema {
     }
 
     /// 两张表都有 autofill 触发器给的 sequence 列;老库没有就退回 OpenCode 的序
-    fn order(&self) -> V1Order {
-        V1Order {
+    fn order(&self) -> V1Query {
+        V1Query {
+            filter: None,
             part: if self.part_sequence {
                 "message_id, sequence, id"
             } else {
-                V1Order::OPENCODE.part
+                V1Query::OPENCODE.part
             },
             message: if self.message_sequence {
                 "sequence, time_created, id"
             } else {
-                V1Order::OPENCODE.message
+                V1Query::OPENCODE.message
             },
         }
     }
@@ -477,14 +478,14 @@ fn parse_messages(
     ro: &SqliteRo,
     sid: &str,
     decode_images: bool,
-    order: &V1Order,
+    order: &V1Query,
 ) -> Result<Parsed> {
     let mut tokens = 0i64;
     // 已拼出几条消息;最后一条复制边界(含)之前有几条
     let mut built = 0usize;
     let mut inherited = 0usize;
     let (mut messages, unknown) =
-        parse_v1_messages(ro, sid, decode_images, order, |md, role, message| {
+        parse_v1_messages(ro, sid, decode_images, order, |md, _parts, role, message| {
             let semantics = md.get("semantics");
             let semantic = |key: &str| semantics.and_then(|s| s.get(key)).and_then(Value::as_str);
             if role == Role::Assistant {

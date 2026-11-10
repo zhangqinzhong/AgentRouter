@@ -63,11 +63,240 @@ fn search_roundtrip_hits_correct_seq() {
     let (hits, _) = store.search("useEffect(", &[], None, 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].seq, 3);
+}
 
-    // <3 码点降级 LIKE
-    let (hits, degraded) = store.search("好的", &[], None, 10).unwrap();
-    assert!(degraded, "2 码点应降级");
-    assert_eq!(hits.len(), 1);
+/// 正文命中里的 seq(标题命中不算)
+fn body_seqs(hits: &[SearchHit]) -> Vec<i64> {
+    hits.iter()
+        .filter(|h| h.role != "title")
+        .map(|h| h.seq)
+        .collect()
+}
+
+/// 两个中日韩字符的词走两字组表、按相关度排(issue #79):原先整条退回 LIKE、按时间倒序,只提了
+/// 一次的新消息排在反复说它的老消息前面。日文、韩文同样走它;单字照旧 LIKE
+#[test]
+fn two_character_cjk_terms_rank_by_relevance() {
+    let (_dir, store) = temp_store();
+    let m = meta("claude-code:cjk", "发布");
+    store
+        .write_session(
+            &m,
+            m.updated_at,
+            &[
+                unit(0, Role::User, "部署,部署,还是部署"),
+                unit(
+                    1,
+                    Role::Assistant,
+                    "今天先把下周的发布计划过一遍,顺便确认部署窗口、回滚预案和值班的负责人,别的明天再说",
+                ),
+                unit(2, Role::Assistant, "没有这个词的回复"),
+                unit(3, Role::User, "ログの設定を変えた"),
+                unit(4, Role::User, "로그인 화면을 고쳤다"),
+            ],
+        )
+        .unwrap();
+    let (hits, degraded) = store.search("部署", &[], None, 10).unwrap();
+    assert!(!degraded);
+    assert_eq!(body_seqs(&hits), [0, 1], "反复说它的老消息排在前面");
+    for (q, seq) in [("ログ", 3), ("設定", 3), ("로그", 4)] {
+        let (hits, degraded) = store.search(q, &[], None, 10).unwrap();
+        assert!(!degraded, "{q}");
+        assert_eq!(body_seqs(&hits), [seq], "{q}");
+    }
+    let (hits, degraded) = store.search("署", &[], None, 10).unwrap();
+    assert!(degraded, "单字只能 LIKE");
+    assert_eq!(body_seqs(&hits), [1, 0], "LIKE 按时间倒序");
+}
+
+/// 混合查询不再整条降级(issue #79):三字以上的词取候选、按它排,两字中文词在两字组表里过滤,
+/// `js` 这类两个字符的词在候选里 LIKE;全是不能走索引的词才整条退回 LIKE。标题同样只拿短词过滤,
+/// 命中里每个词都高亮
+#[test]
+fn mixed_queries_only_narrow_with_their_short_terms() {
+    let (_dir, store) = temp_store();
+    let m = meta("claude-code:mix", "混合查询");
+    store
+        .write_session(
+            &m,
+            m.updated_at,
+            &[
+                unit(0, Role::User, "用 docker 部署服务"),
+                unit(1, Role::User, "docker compose 起不来"),
+                unit(2, Role::User, "部署脚本挂了"),
+                unit(3, Role::User, "在 docker 里跑 js 测试"),
+            ],
+        )
+        .unwrap();
+    let (hits, degraded) = store.search("部署 docker", &[], None, 10).unwrap();
+    assert!(!degraded);
+    assert_eq!(body_seqs(&hits), [0]);
+    let (hits, degraded) = store.search("docker js", &[], None, 10).unwrap();
+    assert!(!degraded);
+    assert_eq!(body_seqs(&hits), [3]);
+    let (hits, degraded) = store.search("js", &[], None, 10).unwrap();
+    assert!(degraded);
+    assert_eq!(body_seqs(&hits), [3]);
+
+    let t = meta("codex:title", "部署 deploy pipeline");
+    store.write_meta_only(&[(t, 1)]).unwrap();
+    let (hits, _) = store.search("部署 deploy", &[], None, 10).unwrap();
+    let title = hits.iter().find(|h| h.role == "title").expect("标题命中");
+    assert_eq!(title.session.key, "codex:title");
+    for word in ["部署", "deploy"] {
+        assert!(
+            title
+                .snippet
+                .contains(&format!("{HL_OPEN}{word}{HL_CLOSE}")),
+            "{}",
+            title.snippet
+        );
+    }
+}
+
+/// 两字组表跟着会话的改写与删除走:改写掉的尾部、删掉的会话、整库重建都不留旧行——留着的话
+/// 之后写入的消息沿用旧 rowid,旧词就会搜到新消息上。所以每次删完都写几条沿用这些 rowid 的
+/// 消息再搜(行删掉了、没有消息接它的 rowid 时,留下的旧词搜不出东西,断言什么也卡不住)
+#[test]
+fn the_cjk_index_follows_rewrites_and_deletes() {
+    let (_dir, store) = temp_store();
+    let m = meta("claude-code:rw", "改写");
+    store
+        .write_session(
+            &m,
+            m.updated_at,
+            &[
+                unit(0, Role::User, "部署服务"),
+                unit(1, Role::Assistant, "好的"),
+            ],
+        )
+        .unwrap();
+    store
+        .write_session(
+            &m,
+            m.updated_at + 1,
+            &[
+                unit(0, Role::User, "部署服务"),
+                unit(1, Role::Assistant, "上线了"),
+            ],
+        )
+        .unwrap();
+    assert!(store.search("好的", &[], None, 10).unwrap().0.is_empty());
+    assert_eq!(
+        body_seqs(&store.search("上线", &[], None, 10).unwrap().0),
+        [1]
+    );
+    assert_eq!(
+        body_seqs(&store.search("部署", &[], None, 10).unwrap().0),
+        [0]
+    );
+    store.remove_session(&m.key).unwrap();
+    let other = meta("claude-code:other", "另一场");
+    let others = [
+        unit(0, Role::User, "上线了"),
+        unit(1, Role::User, "回滚了"),
+        unit(2, Role::User, "收尾了"),
+    ];
+    store
+        .write_session(&other, other.updated_at, &others)
+        .unwrap();
+    assert!(store.search("部署", &[], None, 10).unwrap().0.is_empty());
+    store.remove_session(&other.key).unwrap();
+    store
+        .write_session(&m, m.updated_at + 2, &[unit(0, Role::User, "部署服务")])
+        .unwrap();
+    assert_eq!(
+        body_seqs(&store.search("部署", &[], None, 10).unwrap().0),
+        [0]
+    );
+    store.rebuild_all().unwrap();
+    store
+        .write_session(&other, other.updated_at, &others)
+        .unwrap();
+    assert!(store.search("部署", &[], None, 10).unwrap().0.is_empty());
+}
+
+/// 老库升级:只读的 MCP / CLI 不建两字组表,两字词照旧 LIKE;GUI 首开建表、挂回填旗子,补齐之前
+/// 照旧 LIKE(表里只有升级后写的行,不能因此少结果);补齐时与升级后写进来的行不冲突。换了切法
+/// (库里记的版本对不上)同样:只读读者不用这张表,GUI 开库时整张重建,按旧切法写进去的词不留
+#[test]
+fn older_databases_fill_the_cjk_index_before_searching_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    {
+        let store = Store::open(&path).unwrap();
+        let m = meta("claude-code:old", "旧会话");
+        store
+            .write_session(
+                &m,
+                m.updated_at,
+                &[
+                    unit(0, Role::User, "部署脚本挂了"),
+                    unit(1, Role::Assistant, "先回滚部署"),
+                    unit(2, Role::User, "plain text"),
+                ],
+            )
+            .unwrap();
+    }
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE messages_cjk; DELETE FROM schema_meta WHERE key = 'cjk_format'")
+        .unwrap();
+    {
+        let ro = Store::open_read_only(&path).unwrap();
+        let (hits, degraded) = ro.search("部署", &[], None, 10).unwrap();
+        assert!(degraded);
+        assert_eq!(body_seqs(&hits), [1, 0]);
+    }
+    {
+        let store = Store::open(&path).unwrap();
+        let new = meta("claude-code:new", "新会话");
+        store
+            .write_session(&new, new.updated_at, &[unit(0, Role::User, "部署完成")])
+            .unwrap();
+        let (hits, degraded) = store.search("部署", &[], None, 10).unwrap();
+        assert!(degraded, "补齐之前照旧 LIKE");
+        assert_eq!(body_seqs(&hits).len(), 3);
+        store.backfill_cjk().unwrap();
+        let (hits, degraded) = store.search("部署", &[], None, 10).unwrap();
+        assert!(!degraded);
+        assert_eq!(body_seqs(&hits).len(), 3, "每行只进一次");
+    }
+
+    // 换了切法:表里留着按旧切法写的词——挂在一条按现在的切法没有两字组的消息上,补齐时逐行的
+    // 先删再写碰不到它,只有整张表重建才清得掉;库里记的是别的版本
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO messages_cjk(rowid, text) SELECT id, '旧词' FROM messages WHERE text = 'plain text'",
+        [],
+    )
+    .unwrap();
+    {
+        let ro = Store::open_read_only(&path).unwrap();
+        let (hits, _) = ro.search("旧词", &[], None, 10).unwrap();
+        assert_eq!(body_seqs(&hits), [2], "对照:旧词确实在表里");
+    }
+    raw.execute(
+        "UPDATE schema_meta SET value = 'older' WHERE key = 'cjk_format'",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+    {
+        let ro = Store::open_read_only(&path).unwrap();
+        let (hits, degraded) = ro.search("旧词", &[], None, 10).unwrap();
+        assert!(degraded, "版本对不上,只读读者不用这张表");
+        assert!(hits.is_empty());
+    }
+    let store = Store::open(&path).unwrap();
+    store.backfill_cjk().unwrap();
+    let (hits, degraded) = store.search("旧词", &[], None, 10).unwrap();
+    assert!(!degraded);
+    assert!(hits.is_empty(), "整张表重建过,旧切法的词不留");
+    assert_eq!(
+        body_seqs(&store.search("部署", &[], None, 10).unwrap().0).len(),
+        3
+    );
 }
 
 /// messages_fts 的段数据行数:FTS 每写一次都长新段,原样重写与压缩看的都是它
@@ -1529,9 +1758,9 @@ fn titles_are_searchable_and_tracked_with_the_session() {
         .snippet
         .contains(&format!("{HL_OPEN}部署脚本{HL_CLOSE}")));
 
-    // 短词走 LIKE 降级,标题同样命中
+    // 两字词:正文走两字组表(这里正文没有它),标题没有两字组表、按 LIKE 照样命中
     let (hits, degraded) = store.search("部署", &[], None, 10).unwrap();
-    assert!(degraded);
+    assert!(!degraded);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].role, "title");
 
@@ -2010,6 +2239,18 @@ fn memories_replace_list_and_search() {
         degraded.iter().any(|h| h.doc.key == b.key),
         "<3 码点走 LIKE: {degraded:?}"
     );
+    // 混合查询:三字以上的词走 memories_fts,短词只在候选里过滤
+    let hits = store
+        .search_memories("guard fi", &MemoryFilter::default())
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.doc.key.as_str()).collect::<Vec<_>>(),
+        [a.key.as_str()]
+    );
+    assert!(store
+        .search_memories("tabs fi", &MemoryFilter::default())
+        .unwrap()
+        .is_empty());
 
     // b 变了、u 消失:替换后 b 是新正文,u 从列表与搜索里都不见
     let mut b2 = b.clone();

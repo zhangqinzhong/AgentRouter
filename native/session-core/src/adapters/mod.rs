@@ -16,6 +16,7 @@ pub mod kilo;
 pub mod kimi;
 pub mod kiro;
 pub mod openclaw;
+pub mod mimo;
 pub mod opencode;
 pub mod pi;
 pub mod qoder;
@@ -386,7 +387,7 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
 /// kilo.db 在前,旧版扩展的任务目录在后(自定义 location 与远程挂载按
 /// `claims_custom_root` 挑实例)
 pub fn create_adapters() -> Vec<Box<dyn AgentAdapter>> {
-    vec![
+    let mut adapters: Vec<Box<dyn AgentAdapter>> = vec![
         Box::new(claude::ClaudeAdapter::new()),
         Box::new(codex::CodexAdapter::new()),
         Box::new(qoder::QoderAdapter::new()),
@@ -410,10 +411,11 @@ pub fn create_adapters() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(craft::CraftAdapter::new()),
         Box::new(devin::DevinAdapter::new()),
         Box::new(opencode::OpencodeAdapter::kilo()),
-        Box::new(opencode::OpencodeAdapter::mimo()),
         Box::new(kilo::KiloLegacyAdapter::new()),
         Box::new(grok_bot::GrokBotAdapter::new()),
-    ]
+    ];
+    adapters.extend(mimo::MimoAdapter::default_adapters());
+    adapters
 }
 
 /// 用户 location 配置下的完整 roster:默认实例在前(被用户移除的家除外),
