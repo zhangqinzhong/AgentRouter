@@ -43,7 +43,7 @@ import { getOpenRouterProviderCatalog } from "@agentrouter/core/providers/openro
 import { getProviderPresets } from "@agentrouter/core/providers/presets/index";
 import { checkGatewayProviderConnectivity, probeGatewayProvider, probeGatewayProviderCandidates } from "@agentrouter/core/providers/probe";
 import { syncProviderModelAutoRefreshService } from "@agentrouter/core/providers/model-auto-refresh";
-import { applyProfileConfig } from "@agentrouter/core/profiles/service";
+import { applyProfileConfig, recoverGlobalAgentProfile } from "@agentrouter/core/profiles/service";
 import { desktopCliCommandName, getProfileOpenCommand, getProfileRuntimeStatus, openProfileFromAr, stopProfileFromAr } from "@agentrouter/core/profiles/launch-service";
 import { findProfileForOpen, resolveProfileOpenSurface } from "@agentrouter/core/profiles/launch-core";
 import { getPluginMarketplace } from "@agentrouter/core/plugins/marketplace";
@@ -288,6 +288,7 @@ ipcMain.handle(IPC_CHANNELS.appApplyProfile, async () => {
   const config = await loadAppConfig();
   return applyProfileConfig(config);
 });
+ipcMain.handle(IPC_CHANNELS.appRecoverGlobalProfile, (_event, profileId: string) => recoverGlobalAgentProfile(profileId));
 ipcMain.handle(IPC_CHANNELS.appCheckProviderConnectivity, (_event, request: GatewayProviderConnectivityCheckRequest) => {
   return checkGatewayProviderConnectivity(request);
 });

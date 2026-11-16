@@ -16,6 +16,7 @@ import type {
   AppRenderHtmlPngRequest,
   AppRenderHtmlPngResult,
   AppSaveConfigOptions,
+  GlobalProfileRecoveryResult,
   AppUpdateStatus,
   ApiKeyConfig,
   BotGatewayQrLoginCancelRequest,
@@ -96,6 +97,7 @@ declare global {
       memory: (request: MemoryRequest) => Promise<unknown>;
       applyClaudeAppGateway: (config?: AppConfig) => Promise<ClaudeAppGatewayApplyResult>;
       applyProfile: () => Promise<ProfileApplyResult>;
+      recoverGlobalProfile: (profileId: string) => Promise<GlobalProfileRecoveryResult>;
       cancelBotGatewayQrLogin: (request: BotGatewayQrLoginCancelRequest) => Promise<BotGatewayQrLoginCancelResult>;
       captureElementPng?: (request: AppCaptureElementPngRequest) => Promise<AppCaptureElementPngResult>;
       checkProviderConnectivity: (request: GatewayProviderConnectivityCheckRequest) => Promise<GatewayProviderConnectivityCheckReport>;

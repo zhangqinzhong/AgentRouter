@@ -108,6 +108,7 @@ const webClientBridge: AgentRouterApi = {
   memory: (request) => rpc("memory", [request]),
   applyClaudeAppGateway: (config) => rpc("applyClaudeAppGateway", [config]) as ReturnType<AgentRouterApi["applyClaudeAppGateway"]>,
   applyProfile: () => rpc("applyProfile") as ReturnType<AgentRouterApi["applyProfile"]>,
+  recoverGlobalProfile: (profileId) => rpc("recoverGlobalProfile", [profileId]) as ReturnType<AgentRouterApi["recoverGlobalProfile"]>,
   cancelBotGatewayQrLogin: (request) => rpc("cancelBotGatewayQrLogin", [request]) as ReturnType<AgentRouterApi["cancelBotGatewayQrLogin"]>,
   checkProviderConnectivity: (request) => rpc("checkProviderConnectivity", [request]) as ReturnType<AgentRouterApi["checkProviderConnectivity"]>,
   clearProxyNetworkCaptures: () => rpc("clearProxyNetworkCaptures") as ReturnType<AgentRouterApi["clearProxyNetworkCaptures"]>,

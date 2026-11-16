@@ -81,6 +81,7 @@ export function ProfileView({
   openProfileApp,
   profileActionBusy,
   profileRuntimeStatus,
+  recoverGlobalProfile,
   removeProfile,
   stopProfileApp,
   updateProfileItem,
@@ -96,6 +97,7 @@ export function ProfileView({
   openProfileApp: (index: number) => void;
   profileActionBusy?: ProfileActionBusy;
   profileRuntimeStatus: ProfileRuntimeStatus;
+  recoverGlobalProfile?: (index: number) => void;
   removeProfile: (index: number) => void;
   stopProfileApp: (index: number) => void;
   updateProfileItem: (index: number, patch: Partial<ProfileConfig>) => void;
@@ -191,6 +193,11 @@ export function ProfileView({
                   ) : null}
                     </div>
                   </div>
+                  {scope === "global" && ["claude-code", "codex"].includes(profile.agent) && recoverGlobalProfile ? (
+                    <Button className="mt-2 self-start" disabled={profileActionDisabled} onClick={() => recoverGlobalProfile(index)} size="sm" type="button" variant="outline">
+                      {t("Restore original settings")}
+                    </Button>
+                  ) : null}
                   <div
                     aria-label={`${profile.name || t("Profile")} ${t("Profile actions")}`}
                     className="flex min-w-0 items-center justify-between gap-2 sm:justify-end"

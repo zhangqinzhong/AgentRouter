@@ -47,6 +47,7 @@ export const IPC_CHANNELS = {
   appOpenProfile: "ar:app:open-profile",
   appApplyClaudeAppGateway: "ar:app:apply-claude-app-gateway",
   appApplyProfile: "ar:app:apply-profile",
+  appRecoverGlobalProfile: "ar:app:recover-global-profile",
   appBotGatewayQrLoginCancel: "ar:app:bot-gateway-qr-login-cancel",
   appBotGatewayQrLoginStart: "ar:app:bot-gateway-qr-login-start",
   appBotGatewayQrLoginWait: "ar:app:bot-gateway-qr-login-wait",

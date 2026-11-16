@@ -1147,7 +1147,7 @@ function readProviderUsageSeries(
       SELECT
         provider,
         ${bucketExpression} AS bucket,
-        ${usageTotalsSelect}
+        ${usageTotalsSelect()}
       FROM usage_events
       WHERE ${query.where}
       GROUP BY provider, bucket
@@ -1419,6 +1419,7 @@ function usageTotalsFromRow(row: Record<string, SqlValue> | undefined): UsageTot
     return { ...emptyTotals };
   }
   const successfulRequests = normalizeCount(row?.success_count);
+  const errorCount = normalizeCount(row?.error_count);
   const promptTokens = normalizeCount(row?.prompt_tokens);
   const cacheTokens = normalizeCount(row?.cache_read_tokens);
   return {
@@ -1426,11 +1427,11 @@ function usageTotalsFromRow(row: Record<string, SqlValue> | undefined): UsageTot
     cacheRatio: ratio(cacheTokens, promptTokens),
     cacheTokens,
     costUsd: normalizeCost(row?.cost_usd),
-    errorCount: requestCount - successfulRequests,
+    errorCount,
     inputTokens: normalizeCount(row?.input_tokens),
     outputTokens: normalizeCount(row?.output_tokens),
     requestCount,
-    successRate: successfulRequests / requestCount,
+    successRate: ratio(successfulRequests, successfulRequests + errorCount),
     totalTokens: normalizeCount(row?.computed_total_tokens)
   };
 }

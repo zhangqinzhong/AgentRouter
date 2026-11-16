@@ -382,6 +382,29 @@ export async function saveAppConfig(config: AppConfig): Promise<AppConfig> {
   return enqueueAppConfigWrite(() => saveAppConfigNow(config));
 }
 
+/** Recovery changes only the selected takeover; unrelated invalid settings must not block it. */
+export async function disableGlobalAgentProfile(profileId: string): Promise<AppConfig> {
+  return enqueueAppConfigWrite(async () => {
+    await loadAppConfig();
+    const current = await loadPersistedAppConfig();
+    {
+      if (!isObject(current) || !isObject(current.profile) || !Array.isArray(current.profile.profiles)) {
+        throw new Error("No saved agent profiles are available to restore.");
+      }
+      const profiles = current.profile.profiles as ProfileConfig[];
+      const target = profiles.find(profile => profile.id === profileId);
+      if (!target || !["claude-code", "codex"].includes(target.agent) || target.scope === "agentrouter" || (target.scope as string) === "ccr" || target.scope === "custom") {
+        throw new Error("Select a system-default Claude Code or Codex profile to restore.");
+      }
+      await replacePersistedAppConfig({ ...current, profile: synchronizeLegacyProfileConfig({
+        ...current.profile as AppConfig["profile"],
+        profiles: profiles.map(profile => profile.id === profileId ? { ...profile, enabled: false } : profile)
+      }) });
+    }
+    return loadAppConfig();
+  });
+}
+
 export async function saveAppThemePreference(theme: unknown): Promise<AppConfig["theme"]> {
   const normalizedTheme = normalizeAppThemePreference(theme);
   appThemePreferenceOverride = normalizedTheme;

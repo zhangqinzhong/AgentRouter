@@ -959,7 +959,11 @@ export class GatewayRequestPipeline {
           response.end();
           return;
         }
-        const outboundErrorText = appendAggregateErrorAttemptSummary(bufferedErrorText) ?? bufferedErrorText;
+        const outboundErrorText = appendAggregateErrorAttemptSummary(bufferedErrorText, {
+          requestedModel: modelBeforeRouting,
+          recoveryProfile: authenticatedProfile && authenticatedProfile.scope === "global" && ["claude-code", "codex"].includes(authenticatedProfile.agent)
+            ? authenticatedProfile.name || authenticatedProfile.id : undefined
+        }) ?? bufferedErrorText;
         if (outboundErrorText !== bufferedErrorText) {
           responseHeaders.delete("content-length");
         }

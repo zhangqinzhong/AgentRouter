@@ -2223,7 +2223,7 @@ test("profile service keeps a default ~/.claude profile on Claude Code's own glo
     const result = await applyProfileFixture(config);
     assert.equal(result.clients.some((client) => client.client === "claude-code" && client.ok), true);
 
-    const wrapperContent = readFileSync(path.join(CONFIGDIR, "bin", `ccr-claude-code-wrapper-${profileId}${commandExtension}`), "utf8");
+    const wrapperContent = readFileSync(path.join(CONFIGDIR, "bin", `ar-claude-code-wrapper-${profileId}${commandExtension}`), "utf8");
     if (process.platform === "win32") {
       assert.match(wrapperContent, /^set CLAUDE_CONFIG_DIR=\r?$/m);
     } else {
