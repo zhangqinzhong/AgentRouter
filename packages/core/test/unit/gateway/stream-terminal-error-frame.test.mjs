@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { Readable, Writable } from "node:stream";
 import test from "node:test";
-import { ClaudeCodeRouterPlugin } from "@agentrouter/core/gateway/agentrouter-plugin.ts";
+import { ClaudeCodeRouterPlugin } from "@agentrouter/core/gateway/claude-code-router-plugin.ts";
 import { GatewayRequestPipeline } from "@agentrouter/core/gateway/request/pipeline.ts";
 import {
   clientSafeTransportCode,
@@ -141,7 +141,7 @@ async function proxyTruncatedStream(input) {
   try {
     return await withTruncatedUpstream(input.events, async (url) => {
       globalThis.fetch = (target, init) => {
-        if (String(target).includes("/__ccr/route")) {
+        if (String(target).includes("/__ar/route")) {
           return Promise.reject(new Error("core gateway route endpoint is not running"));
         }
         return originalFetch(url, { method: "POST", signal: init?.signal });

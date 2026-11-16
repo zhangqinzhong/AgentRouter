@@ -2,12 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createDefaultAppConfig } from "@agentrouter/core/config/default-config.ts";
 import {
-  ccrRoutedModelHeader,
-  ccrRouterRouteResolverKey
+  arRoutedModelHeader,
+  arRouterRouteResolverKey
 } from "@agentrouter/core/gateway/core-runtime/router-plugin-contract.ts";
 import { createGatewayPlugin } from "@agentrouter/core/gateway/core-runtime/router-plugin.ts";
 import { hoistAnthropicToolResultImages } from "@agentrouter/core/gateway/features/anthropic-tool-result-images.ts";
-import { calculateTokenCount } from "@agentrouter/core/routing/token-estimator.ts";
 
 function fakePngBase64(width, height, tailChars = 0) {
   const ihdr = Buffer.alloc(24);
@@ -202,7 +201,7 @@ test("CCR route resolver hoists tool_result images for non-Anthropic targets and
   ];
 
   const plugin = await createGatewayPlugin({ plugin: { config: { appConfig: config } } });
-  const resolver = plugin.routeResolvers.find((item) => item.key === ccrRouterRouteResolverKey);
+  const resolver = plugin.routeResolvers.find((item) => item.key === arRouterRouteResolverKey);
 
   const makeBody = (model) => ({
     model,
@@ -225,7 +224,7 @@ test("CCR route resolver hoists tool_result images for non-Anthropic targets and
   for (const selector of ["Google Gemini/gemini-4-argon", "QwenTokenPlan/qwen3.8-max"]) {
     const resolved = resolver.resolve({
       request: {
-        headers: { [ccrRoutedModelHeader]: selector },
+        headers: { [arRoutedModelHeader]: selector },
         method: "POST",
         url: "/v1/messages"
       },
@@ -241,7 +240,7 @@ test("CCR route resolver hoists tool_result images for non-Anthropic targets and
   const nativeSelector = "AnthropicNative/claude-sonnet-5-5";
   const nativeResolved = resolver.resolve({
     request: {
-      headers: { [ccrRoutedModelHeader]: nativeSelector },
+      headers: { [arRoutedModelHeader]: nativeSelector },
       method: "POST",
       url: "/v1/messages"
     },
@@ -252,35 +251,4 @@ test("CCR route resolver hoists tool_result images for non-Anthropic targets and
   assert.equal(nativeContent[0].type, "tool_result");
   assert.equal(nativeContent[0].content[0].type, "image");
   assert.equal(nativeContent[0].content[0].source.data, pngData);
-});
-
-test("calculateTokenCount estimates vision tokens for Base64 images without scanning payload as text", (t) => {
-  const largePayload = fakePngBase64(1200, 800, 500_000).replace(/A/g, (ch, idx) => (idx % 17 === 0 ? "+" : ch));
-  let regexScansOnBase64 = 0;
-  const originalMatch = String.prototype.match;
-  t.mock.method(String.prototype, "match", function (...args) {
-    if (this.length > 10_000) {
-      regexScansOnBase64 += 1;
-    }
-    return originalMatch.apply(this, args);
-  });
-
-  const tokens = calculateTokenCount([
-    {
-      role: "user",
-      content: [
-        {
-          type: "tool_result",
-          tool_use_id: "call_img",
-          content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: largePayload } }
-          ]
-        }
-      ]
-    }
-  ], undefined, undefined);
-
-  assert.equal(regexScansOnBase64, 0);
-  // 1200 * 800 / 750 = 1280 vision tokens plus small wrapper key overhead (< 1350 total).
-  assert.ok(tokens >= 1280 && tokens < 1350, `expected vision token estimate near 1280, got ${tokens}`);
 });

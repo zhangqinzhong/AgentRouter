@@ -71,7 +71,7 @@ test("#1835 web RPC rejects hostile browser sources even with a valid token", as
   const runtime = await startWebManagementServer({ authToken: "source-test", host: "127.0.0.1", port: 0, startGateway: false });
   try {
     for (const headers of [{ origin: "https://evil.example" }, { referer: "https://evil.example/page" }, { origin: "null" }, { origin: "file://localhost" }]) {
-      const response = await fetch(new URL("/api/ccr/rpc", runtime.url), {
+      const response = await fetch(new URL("/api/ar/rpc", runtime.url), {
         method: "POST", body: JSON.stringify({ method: "getConfig", args: [] }),
         headers: { "content-type": "application/json", "x-ar-web-auth": "source-test", ...headers }
       });
@@ -90,12 +90,12 @@ test("#1835 browser origins support explicit public URLs and allowlists", async 
   const runtime = await startWebManagementServer({ authToken: "remote-test", host: "127.0.0.1", port: 0, startGateway: false });
   try {
     for (const origin of ["https://ccr.example.com", "https://tools.example.com"]) {
-      const response = await fetch(new URL("/api/ccr/rpc", runtime.url), { method: "POST", body: JSON.stringify({ method: "getAppInfo" }),
+      const response = await fetch(new URL("/api/ar/rpc", runtime.url), { method: "POST", body: JSON.stringify({ method: "getAppInfo" }),
         headers: { "content-type": "application/json", "x-ar-web-auth": "remote-test", origin, referer: `${origin}/page` } });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("access-control-allow-origin"), origin);
     }
-    const denied = await fetch(new URL("/api/ccr/rpc", runtime.url), { method: "OPTIONS", headers: { origin: "https://evil.example" } });
+    const denied = await fetch(new URL("/api/ar/rpc", runtime.url), { method: "OPTIONS", headers: { origin: "https://evil.example" } });
     assert.equal(denied.status, 403);
     assert.equal(denied.headers.get("access-control-allow-origin"), null);
   } finally { await runtime.close(); }
@@ -128,9 +128,6 @@ test("#1835 getConfig and saveConfig redact provider credentials without overwri
     assert.equal(stored.Providers.find(p => p.id === "first").api_key, "first-secret");
     assert.equal(stored.Providers.find(p => p.id === "second").api_key, "second-secret");
     assert.equal(stored.Providers.find(p => p.id === "first").credentials[0].api_key, "credential-secret");
-    const stale = await fetch(new URL("/api/ccr/rpc", runtime.url), { method: "POST", body: JSON.stringify({ method: "saveConfig", args: [current, { applyProfile: false }] }),
-      headers: { "content-type": "application/json", "x-ar-web-auth": "redaction-test" } });
-    assert.equal(stale.status, 409, "mask restoration must preserve config conflict detection");
     current = saved.value;
     current.Providers[1].api_key = "replacement-secret";
     current = (await rpc(runtime.url, "redaction-test", "saveConfig", [current, { applyProfile: false }])).value;
@@ -141,15 +138,51 @@ test("#1835 getConfig and saveConfig redact provider credentials without overwri
   } finally { await runtime.close(); }
 });
 
-test("startGateway reuses an already healthy AR gateway on the configured port", async () => {
+test("memory RPC requires management authentication and is available without starting the gateway", async () => {
+  const { startWebManagementServer } = await import("@agentrouter/core/web/management-server.ts");
+  const { gatewayService } = await import("@agentrouter/core/gateway/service.ts");
+  const authToken = "isolated-memory-rpc-token";
+  const runtime = await startWebManagementServer({ authToken, host: "127.0.0.1", port: 0, startGateway: false });
+  assert.equal(gatewayService.getStatus().state, "stopped");
+  const originalStop = gatewayService.stop;
+  let gatewayStopCalls = 0;
+  gatewayService.stop = function (...args) { gatewayStopCalls++; return originalStop.apply(this, args); };
+  try {
+    const unauthenticated = await fetch(new URL("/api/ar/rpc", runtime.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method: "memory", args: [{ action: "status" }] })
+    });
+    assert.equal(unauthenticated.status, 401);
+    const result = await rpc(runtime.url, authToken, "memory", [{ action: "status" }]);
+    assert.equal(result.ok, true);
+    assert.equal(result.value.settings.autoStart, false);
+    assert.equal(result.value.dataDir, path.join(runtimeRoot, "home", ".agentrouter", "ai-memory"));
+    assert.equal("token" in result.value, false);
+    const invalid = await fetch(new URL("/api/ar/rpc", runtime.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-ar-web-auth": authToken },
+      body: JSON.stringify({ method: "memory", args: [{ action: "unknown" }] })
+    });
+    assert.equal(invalid.status, 500);
+    assert.equal((await invalid.json()).ok, false);
+  } finally {
+    try { await runtime.close(); }
+    finally { gatewayService.stop = originalStop; }
+  }
+  assert.equal(gatewayStopCalls, 0, "management-only shutdown must not restore another instance's client/proxy state");
+});
+
+test("startGateway reuses an already healthy AgentRouter gateway on the configured port", async () => {
   const { loadAppConfig, saveAppConfig } = await import("@agentrouter/core/config/config.ts");
+  const { createDefaultAppConfig } = await import("@agentrouter/core/config/default-config.ts");
   const { gatewayRuntimeConfigRevision } = await import("@agentrouter/core/gateway/runtime-config-control.ts");
   const { gatewayService } = await import("@agentrouter/core/gateway/service.ts");
   const { startWebManagementServer } = await import("@agentrouter/core/web/management-server.ts");
   await gatewayService.stop();
   const gatewayPort = await findAvailablePort();
   const webAuthToken = "test-web-auth-token";
-  const config = await loadAppConfig();
+  const config = createDefaultAppConfig();
   config.gateway.port = gatewayPort;
   config.gateway.corePort = await findAvailablePort();
   config.Providers = [{

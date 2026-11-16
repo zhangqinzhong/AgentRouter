@@ -1,3 +1,4 @@
+import { prepareLogBodyForWorker, logBodyFullTextLimit } from "../shared/log-body-worker-protocol";
 import { PageHeader, SectionHeading, tablePageClassName } from "./page-primitives";
 import { outputRateForRequestLog } from "@/lib/token-rate";
 import { memo, useId } from "react";
@@ -1689,7 +1690,7 @@ function useLogBodyWorkerView(
     };
 
     worker.postMessage({
-      body,
+      body: prepareLogBodyForWorker(body, mode),
       bodyKey,
       id: formatRequestId,
       kind: "format",
@@ -2005,6 +2006,10 @@ function LogJsonPanel({
         if (!chunk) {
           throw new Error(t("Request log body is not available."));
         }
+        if (offset + chunk.length > logBodyFullTextLimit || chunk.sizeBytes > logBodyFullTextLimit) {
+          await loadBodyChunk(0);
+          return;
+        }
         chunks.push(chunk.text);
         lastChunk = chunk;
         if (chunk.eof) {
@@ -2036,7 +2041,7 @@ function LogJsonPanel({
   useEffect(() => {
     if (
       !effectiveBody?.bodyRef ||
-      !effectiveBody.preview ||
+      (!effectiveBody.preview && effectiveBody.text.length <= logBodyFullTextLimit) ||
       loadedBody ||
       fullBodyLoading ||
       fullBodyError ||

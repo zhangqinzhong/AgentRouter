@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { RequestLogBody } from "@agentrouter/core/contracts/app";
-import { formatLogBodyForWorker } from "@agentrouter/ui/pages/home/shared/log-body-worker-protocol.ts";
+import { formatLogBodyForWorker, prepareLogBodyForWorker, logBodyFullTextLimit, logBodyPreviewTextLimit } from "@agentrouter/ui/pages/home/shared/log-body-worker-protocol.ts";
 import { formatRouteTracePath } from "@agentrouter/ui/pages/home/shared/network.ts";
 
 test("route trace paths use request and response dotted notation", () => {
@@ -133,4 +133,22 @@ test("SSE bodies expose complete event blocks for timeline rendering", () => {
   assert.equal(view.streamEvents?.[2]?.done, true);
   assert.deepEqual(view.streamEvents?.[2]?.dataText, "[DONE]");
   assert.match(view.text, /streamed_data/);
+});
+
+test("#1945 full mode bounds formatting and the worker transport for huge JSON", () => {
+  const body: RequestLogBody = { contentType: "application/json", encoding: "utf8", sizeBytes: 0, truncated: false,
+    text: JSON.stringify({ messages: Array.from({ length: 120000 }, () => ({ role: "user", content: "large body" })) }) };
+  assert.ok(body.text.length > logBodyFullTextLimit);
+  const result = formatLogBodyForWorker(body, "full");
+  assert.equal(result.json, undefined);
+  assert.equal(result.preview, true);
+  assert.ok(result.text.length < logBodyPreviewTextLimit + 200);
+  for (const mode of ["preview", "full"] as const) {
+    const transported = prepareLogBodyForWorker(body, mode)!;
+    assert.equal(transported.preview, true);
+    assert.ok(transported.text.length < logBodyPreviewTextLimit + 200);
+    assert.equal(transported.sizeBytes, body.text.length);
+    assert.equal(formatLogBodyForWorker(transported, mode).preview, true);
+  }
+  assert.ok(!body.preview, "transport preparation must not mutate the stored body");
 });

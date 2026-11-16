@@ -64,8 +64,8 @@ export function gatewayChildPreloadEnvAndArgs(config: Pick<AppConfig, "API_TIMEO
   }
   return {
     env: {
-      CCR_UPSTREAM_TIMEOUT_MS: String(timeoutMs),
-      CCR_UNDICI_MODULE: resolveUndiciProxyAgentModule()
+      AR_UPSTREAM_TIMEOUT_MS: String(timeoutMs),
+      AR_UNDICI_MODULE: resolveUndiciProxyAgentModule()
     },
     extraArgs: ["--require", writeGatewayFetchPreloadFile()]
   };

@@ -202,12 +202,18 @@ if [ "${AR_WEB_AUTH_TOKEN_GENERATED}" = "1" ]; then
   echo "AR management UI: ${AR_PUBLIC_BASE_URL%/}/?ar_web_token=${AR_WEB_AUTH_TOKEN_QUERY}"
 fi
 
-if [ "$#" -gt 0 ]; then
-  exec "$@"
+if [ "$#" -eq 0 ]; then
+  PM2_RUNTIME=/app/packages/core/node_modules/.bin/pm2-runtime
+  if [ -x /app/node_modules/.bin/pm2-runtime ]; then
+    PM2_RUNTIME=/app/node_modules/.bin/pm2-runtime
+  fi
+  set -- "${PM2_RUNTIME}" docker/pm2.config.cjs
 fi
 
-if [ -x /app/node_modules/.bin/pm2-runtime ]; then
-  exec /app/node_modules/.bin/pm2-runtime docker/pm2.config.cjs
+# Bootstrap config as root, then hand the data volume and all services to ar.
+# An explicit docker --user is respected.
+if [ "$(id -u)" = "0" ]; then
+  chown -R ar:ar "${AR_DATA_DIR}" /run/nginx /var/lib/nginx /var/log/nginx
+  exec setpriv --reuid=ar --regid=ar --init-groups -- "$@"
 fi
-
-exec /app/packages/core/node_modules/.bin/pm2-runtime docker/pm2.config.cjs
+exec "$@"

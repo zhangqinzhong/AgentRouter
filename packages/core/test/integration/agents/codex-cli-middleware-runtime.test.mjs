@@ -546,8 +546,8 @@ test("Codex app-server preserves catalog image and reasoning capabilities over n
     encoding: "utf8",
     env: {
       ...process.env,
-      CCR_CODEX_CHATGPT_AUTH_FILE: "",
-      CCR_CODEX_MODEL_CATALOG: JSON.stringify({
+      AR_CODEX_CHATGPT_AUTH_FILE: "",
+      AR_CODEX_MODEL_CATALOG: JSON.stringify({
         models: [{
           slug: "aicodemirror/gpt-6.1-sol",
           input_modalities: ["text", "image"],
@@ -555,8 +555,8 @@ test("Codex app-server preserves catalog image and reasoning capabilities over n
           default_reasoning_effort: "medium"
         }, { slug: "undeclared-model" }, "string-model"]
       }),
-      CCR_CODEX_REMOTE_FRONTEND_MODE: "app",
-      CCR_REAL_CODEX_CLI_PATH: fakeCodex,
+      AR_CODEX_REMOTE_FRONTEND_MODE: "app",
+      AR_REAL_CODEX_CLI_PATH: fakeCodex,
       CODEX_HOME: codexHome,
       CODEXL_CODEX_CHATGPT_AUTH_FILE: "",
       HOME: isolatedHome

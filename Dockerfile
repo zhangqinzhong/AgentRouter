@@ -43,7 +43,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates libstdc++6 nginx \
+  && apt-get install -y --no-install-recommends ca-certificates libstdc++6 nginx util-linux \
   && rm -rf /var/lib/apt/lists/* \
   && rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf \
   && rm -rf \
@@ -69,7 +69,10 @@ COPY docker/entrypoint.sh /usr/local/bin/ar-docker-entrypoint
 COPY docker/pm2.config.cjs docker/pm2.config.cjs
 
 RUN chmod +x /usr/local/bin/ar-docker-entrypoint \
-  && mkdir -p /data /run/nginx /var/lib/nginx /var/log/nginx
+  && mkdir -p /data /run/nginx /var/lib/nginx /var/log/nginx \
+  && sed -i -e 's#^pid .*#pid /run/nginx/nginx.pid;#' -e '/^user /d' /etc/nginx/nginx.conf \
+  && groupadd --system --gid 10001 ar \
+  && useradd --system --uid 10001 --gid ar --home-dir /data --no-create-home --shell /usr/sbin/nologin ar
 
 VOLUME ["/data"]
 EXPOSE 8080
