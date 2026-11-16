@@ -3,6 +3,7 @@ import { normalizeProfileProviderName } from "@agentrouter/core/profiles/provide
 import { CONFIGDIR, LEGACY_CONFIGDIR, PROVIDER_ICON_CACHE_DIR } from "@agentrouter/core/config/constants";
 import { normalizePageDefaultRanges } from "@agentrouter/core/config/page-default-ranges";
 import { validateProfileAliasFiles } from "@agentrouter/core/profiles/aliases";
+import { reconcileProfileModelSelections } from "@agentrouter/core/profiles/model-selection";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -395,7 +396,7 @@ export async function saveAppThemePreference(theme: unknown): Promise<AppConfig[
 }
 
 async function saveAppConfigNow(config: AppConfig): Promise<AppConfig> {
-  const normalizedConfig = withSingleEnabledGlobalProfiles(migrateXiaomiModels(config).config);
+  const normalizedConfig = reconcileProfileModelSelections(withSingleEnabledGlobalProfiles(migrateXiaomiModels(config).config));
   assertProviderApiKeysAreSafe(normalizedConfig);
   validateProfileAliasFiles(normalizedConfig.profile.profiles, path.join(CONFIGDIR, "bin"));
   const pluginMigration = migrateKnownGatewayPluginConfigs(normalizedConfig.plugins);
@@ -1331,6 +1332,7 @@ function parseProviders(value: unknown): GatewayProviderConfig[] | undefined {
         extraBody: item.extraBody,
         extraHeaders: item.extraHeaders ?? item.extra_headers ?? item.headers,
         forwardThinkingParameters: readBoolean(item.forwardThinkingParameters ?? item.forward_thinking_parameters),
+        supportsDeferredTools: readBoolean(item.supportsDeferredTools ?? item.supports_deferred_tools),
         icon: normalizeProviderIconPath(readString(item.icon)),
         id: readString(item.id),
         enabled: item.enabled === false ? false : undefined,

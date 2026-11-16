@@ -1,3 +1,4 @@
+import { ModelMultiSelector } from "@agentrouter/ui/pages/home/components/model-selector.tsx";
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as React from "react";
@@ -820,4 +821,13 @@ test("profile launch permissions and arguments survive editing", () => {
   const reloaded = normalizeUnknownProfileItem(saved, 0)!;
   assert.equal(createProfileDraftFromProfile(reloaded).permissionMode, "yolo");
   assert.equal(createProfileDraftFromProfile(reloaded).launchArgsText, draft.launchArgsText);
+});
+
+test("#1910 stale selected model names remain visible and removable", () => {
+  const html = renderToStaticMarkup(<ModelMultiSelector providers={[{ name: "Local", models: ["valid"] }]}
+    value={["Local/valid", "Gone/stale", "Local/removed"]} onChange={() => undefined} />);
+  assert.match(html, /Unavailable selected models/);
+  assert.match(html, /Gone\/stale/);
+  assert.match(html, /Local\/removed/);
+  assert.equal((html.match(/>Remove<\/button>/g) ?? []).length, 2);
 });

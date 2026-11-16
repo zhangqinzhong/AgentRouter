@@ -1,4 +1,5 @@
 import { createGatewayStreamMetrics, recordGatewayResponseStatus } from "@agentrouter/core/observability/gateway-stream-metrics";
+import { withoutDeferredToolFlags } from "@agentrouter/core/gateway/features/deferred-tools";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { pipeline, Readable } from "node:stream";
@@ -150,6 +151,7 @@ type GatewayRequestTransformInput = {
 
 type UpstreamRequest = {
   body?: unknown;
+  bodyEncoding?: string;
   headers?: Record<string, string>;
   method?: string;
   url?: string;
@@ -382,6 +384,21 @@ export async function createGatewayPlugin(input: GatewayPluginFactoryInput = {})
         const apiKey = await resolveApiKey(config, requestInput.request?.headers);
         setApiKeyAuthContextHeaders(requestInput.request?.headers, apiKey);
         return undefined;
+      }
+    }],
+    // Apply compatibility after protocol conversion, to this attempt only.
+    // Editing the ingress body here would leak the change into later fallback providers.
+    providerHooks: [{
+      key: "ar-deferred-tool-compatibility",
+      transformRequest: (input: { upstreamRequest: UpstreamRequest; targetProviderConfig?: { name?: string } }) => {
+        const provider = modelRegistryForConfig(config).findProvider(input.targetProviderConfig?.name);
+        const upstream = input.upstreamRequest;
+        if (provider?.supportsDeferredTools !== false || (upstream.bodyEncoding && upstream.bodyEncoding !== "json")) return { ok: true, value: upstream };
+        const body = readJsonObjectBody(upstream.body);
+        const clean = withoutDeferredToolFlags(body);
+        const encoded = typeof upstream.body === "string" ? JSON.stringify(clean)
+          : Buffer.isBuffer(upstream.body) || upstream.body instanceof Uint8Array ? Buffer.from(JSON.stringify(clean)) : clean;
+        return { ok: true, value: clean === body ? upstream : { ...upstream, body: encoded } };
       }
     }],
     requestTransforms: [{

@@ -236,6 +236,8 @@ export function ModelMultiSelector({
     () => profileModelProviderOptions(providers, virtualModelProfiles),
     [providers, virtualModelProfiles]
   );
+  const configuredValues = new Set(providerOptions.flatMap((provider) => provider.models.map((model) => modelSelectionKey(`${provider.name}/${model}`))));
+  const unavailable = value.filter((model) => !configuredValues.has(modelSelectionKey(model)));
   const normalizedQuery = query.trim().toLowerCase();
   const models = providerOptions.flatMap((provider) => provider.models
     .map((model) => ({
@@ -290,6 +292,19 @@ export function ModelMultiSelector({
           {t("Clear")}
         </Button>
       </div>
+      {unavailable.length > 0 ? (
+        <div className="space-y-1 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-label">
+          <p className="font-medium text-destructive">{t("Unavailable selected models")}</p>
+          {unavailable.map((model) => (
+            <div className="flex items-center gap-2" key={model}>
+              <span className="min-w-0 flex-1 truncate text-foreground" title={model}>{model}</span>
+              <Button onClick={() => onChange(value.filter((candidate) => candidate !== model))} size="sm" type="button" variant="outline">
+                {t("Remove")}
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : null}
       <div className="border-y border-border/70">
         <div className="flex min-h-9 items-center justify-between gap-3 border-b border-border/60 px-2.5 py-1.5">
           <span className="text-label font-semibold uppercase tracking-widest text-muted-foreground">
