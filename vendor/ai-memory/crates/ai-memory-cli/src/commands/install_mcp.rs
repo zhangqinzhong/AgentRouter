@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
-use crate::commands::path_util::{claude_config_dir, home_dir};
+use crate::commands::path_util::{claude_config_dir, home_dir, strip_windows_verbatim_prefix};
 use crate::commands::render_shared::{
     bearer_header_value, hook_embedded_exe_path, mask_secret, shell_quote, yaml_single_quote,
 };
@@ -227,6 +227,7 @@ fn preview_snippet(mut args: InstallMcpArgs) -> Result<String> {
         McpClient::GeminiCli => render_gemini_cli(&args)?,
         McpClient::QwenCode => render_qwen_code(&args)?,
         McpClient::Qoder => render_json_mcp_fragment(&args)?,
+        McpClient::WorkBuddy => render_json_mcp_fragment(&args)?,
         McpClient::Openclaw => render_openclaw(&args)?,
         McpClient::Pi => render_pi(&args)?,
         McpClient::Omp => render_omp(&args)?,
@@ -393,9 +394,13 @@ fn bridge_data_dir_args(args: &InstallMcpArgs) -> Vec<String> {
     args.bridge_data_dir
         .as_ref()
         .map_or_else(Vec::new, |data_dir| {
+            // The data dir is canonical, so on Windows it carries the `\\?\`
+            // verbatim prefix. Hermes rewrote that into `C:\?\C:\...` and the
+            // bridge could not start (#2203); pass the plain drive path, as
+            // `setup` and the DSH configPath (#2032) already do.
             vec![
                 "--data-dir".to_owned(),
-                data_dir.to_string_lossy().into_owned(),
+                strip_windows_verbatim_prefix(&data_dir.to_string_lossy()).into_owned(),
             ]
         })
 }
@@ -551,9 +556,11 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
             "args": bridge,
             "timeout": GEMINI_MCP_TIMEOUT_MS,
         }),
-        McpClient::Cursor | McpClient::VsCodeCopilot | McpClient::Swival | McpClient::Zero => {
-            typed("stdio")
-        }
+        McpClient::Cursor
+        | McpClient::VsCodeCopilot
+        | McpClient::Swival
+        | McpClient::Zero
+        | McpClient::WorkBuddy => typed("stdio"),
         McpClient::Freebuff => {
             let env = args
                 .auth_token
@@ -744,6 +751,9 @@ pub(crate) fn mcp_config_path_with(
     };
     Ok(match client {
         McpClient::ClaudeCode => claude_code_config_path_in(env("CLAUDE_CONFIG_DIR"))?,
+        // WorkBuddy keeps MCP servers in a dedicated mcp.json beside its
+        // settings.json, under the root `mcpServers` map.
+        McpClient::WorkBuddy => home()?.join(".workbuddy").join("mcp.json"),
         McpClient::Codex => codex_config_path_in(env("CODEX_HOME"))?,
         // Project scope is `.grok/config.toml` under cwd/repo; pass
         // --config-file for that case rather than inventing a second default.
@@ -1302,6 +1312,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::GeminiCli
         | McpClient::QwenCode
         | McpClient::Qoder
+        | McpClient::WorkBuddy
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::Devin
@@ -1359,7 +1370,7 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             bail!("internal: DeepSeek Harness MCP config is a Cordis YAML patch, not JSON")
         }
         McpClient::Hermes => {
-            bail!("internal: Hermes Agent MCP config is ~/.hermes/config.yaml, not JSON")
+            bail!("internal: Hermes Agent MCP config is its home's config.yaml, not JSON")
         }
         _ => build_mcp_entry(args),
     }
@@ -1807,8 +1818,8 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let server_url = flavored.as_str();
     let mut entry = serde_json::Map::new();
     match args.client {
-        McpClient::ClaudeCode => {
-            if args.session_aware {
+        McpClient::ClaudeCode | McpClient::WorkBuddy => {
+            if args.client == McpClient::ClaudeCode && args.session_aware {
                 entry.insert("type".into(), json!("stdio"));
                 entry.insert("command".into(), json!(bridge_command()));
                 let mut argv = vec![
@@ -2358,7 +2369,12 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
             .bridge_data_dir
             .as_ref()
             .map_or_else(String::new, |path| {
-                format!(" --data-dir {}", shell_quote(&path.to_string_lossy()))
+                // The canonical data dir carries the Windows `\\?\` verbatim
+                // prefix; strip it as `bridge_data_dir_args` does so the
+                // `claude mcp add` snippet names the plain drive path, not the
+                // prefix Hermes mangled into `C:\?\C:\...` (#2203).
+                let data_dir = strip_windows_verbatim_prefix(&path.to_string_lossy()).into_owned();
+                format!(" --data-dir {}", shell_quote(&data_dir))
             });
         format!(
             "claude mcp add --transport stdio{env} {name} -- \\\n    {command} mcp-bridge --server-url {url}{data_dir}",
@@ -2764,13 +2780,14 @@ fn render_hermes(args: &InstallMcpArgs) -> String {
     };
     format!(
         "# Hermes Agent - merge the entry below into the `mcp_servers:` map of\n\
-         # ~/.hermes/config.yaml ($HERMES_HOME/config.yaml), then restart\n\
+         # the Hermes home's config.yaml (`$HERMES_HOME`, else `~/.hermes` or\n\
+         # `%LOCALAPPDATA%\\hermes` on Windows), then restart\n\
          # Hermes; a running gateway reloads MCP servers within about a minute.\n\
          #\n\
          # Hermes does not read an MCP server's instructions, so the routing\n\
          # rules reach the model through the ai-memory skills\n\
          # (`ai-memory install-skills --scope global --agent hermes`, into\n\
-         # ~/.hermes/skills) and the handoff `install-hooks --agent hermes`\n\
+         # that home's skills/) and the handoff `install-hooks --agent hermes`\n\
          # brings into the next primary-session turn.\n\
          {token_note}\
          {snippet}\n",
@@ -2796,7 +2813,7 @@ fn render_hermes_snippet(args: &InstallMcpArgs) -> String {
 }
 
 /// Why `install-mcp --client hermes --apply` writes nothing, and what to do.
-const HERMES_MCP_APPLY_GUIDANCE: &str = "Hermes Agent keeps MCP servers in ~/.hermes/config.yaml, a YAML file ai-memory does not edit; refusing to write MCP config. Re-run without --apply to print the mcp_servers entry, then merge it into ~/.hermes/config.yaml ($HERMES_HOME/config.yaml).";
+const HERMES_MCP_APPLY_GUIDANCE: &str = "Hermes Agent keeps MCP servers in its home's config.yaml (`$HERMES_HOME`, else `~/.hermes`, or `%LOCALAPPDATA%\\hermes` on Windows), a YAML file ai-memory does not edit; refusing to write MCP config. Re-run without --apply to print the mcp_servers entry, then merge it into that config.yaml.";
 
 fn render_pi(args: &InstallMcpArgs) -> Result<String> {
     Ok(pi_mcp_render_guidance(args))
@@ -3047,6 +3064,22 @@ mod tests {
             stdio_bridge: false,
             bridge_data_dir: None,
         }
+    }
+
+    #[test]
+    fn bridge_data_dir_args_strip_windows_verbatim_prefix() {
+        // The canonical data dir carries `\\?\` on Windows, which Hermes
+        // mangled into `C:\?\C:\...` so the bridge never started (#2203).
+        // The strip is lexical, so this runs on any host.
+        let mut args = args_for(McpClient::Hermes);
+        args.bridge_data_dir = Some(PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory"));
+        assert_eq!(
+            bridge_data_dir_args(&args),
+            [
+                "--data-dir".to_owned(),
+                r"C:\Users\me\AppData\Local\ai-memory".to_owned(),
+            ]
+        );
     }
 
     fn args_with_token(client: McpClient) -> InstallMcpArgs {
@@ -4053,7 +4086,7 @@ mod tests {
         // The model never sees ai-memory's MCP instructions in Hermes, so the
         // header points at what carries them instead.
         assert!(rendered.contains("does not read an MCP server's instructions"));
-        assert!(rendered.contains("~/.hermes/skills"));
+        assert!(rendered.contains("that home's skills/"));
         assert!(rendered.contains("next primary-session turn"));
     }
 
@@ -4076,11 +4109,11 @@ mod tests {
         let error = apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args)
             .expect_err("apply must be refused");
         let message = format!("{error}");
-        assert!(message.contains("~/.hermes/config.yaml"), "{message}");
+        assert!(message.contains("config.yaml"), "{message}");
         assert!(message.contains("without --apply"), "{message}");
         assert!(!message.contains("test-token-deadbeef"), "{message}");
         let error = mcp_config_path(McpClient::Hermes).expect_err("no writable config");
-        assert!(format!("{error}").contains("~/.hermes/config.yaml"));
+        assert!(format!("{error}").contains("config.yaml"));
         assert!(json_mcp_location(McpClient::Hermes).is_none());
         assert!(build_json_mcp_entry(&args_for(McpClient::Hermes)).is_err());
     }
@@ -4595,6 +4628,29 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_session_aware_render_strips_the_windows_verbatim_data_dir() {
+        // The `claude mcp add` snippet renders `args.bridge_data_dir` directly,
+        // not through `bridge_data_dir_args`, so it is a second site of the
+        // same bug: the canonical dir carries the Windows `\\?\` prefix Hermes
+        // mangled into `C:\?\C:\...` (#2203). The snippet must name the plain
+        // drive path, as the bridge entry does. The strip is lexical, so this
+        // runs on any host.
+        let mut args = args_for(McpClient::ClaudeCode);
+        args.session_aware = true;
+        args.bridge_data_dir = Some(PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory"));
+        let out =
+            render_claude_code(&args, std::path::Path::new("/stores/claude/.claude.json")).unwrap();
+        assert!(
+            out.contains(r"C:\Users\me\AppData\Local\ai-memory"),
+            "the snippet must name the data dir:\n{out}"
+        );
+        assert!(
+            !out.contains(r"\\?\"),
+            "the snippet must not carry the verbatim prefix:\n{out}"
+        );
+    }
+
+    #[test]
     fn bridge_command_names_the_binary_by_absolute_path_outside_a_container() {
         let exe = PathBuf::from("/opt/ai-memory/ai-memory");
         assert_eq!(
@@ -4721,6 +4777,7 @@ mod tests {
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::QwenCode => render_qwen_code(&args).unwrap(),
             McpClient::Qoder => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::WorkBuddy => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
@@ -4765,6 +4822,7 @@ mod tests {
             McpClient::GeminiCli,
             McpClient::QwenCode,
             McpClient::Qoder,
+            McpClient::WorkBuddy,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -4815,6 +4873,7 @@ mod tests {
             McpClient::GeminiCli,
             McpClient::QwenCode,
             McpClient::Qoder,
+            McpClient::WorkBuddy,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -4868,6 +4927,34 @@ mod tests {
         assert!(entry.get("url").is_none());
     }
 
+    /// WorkBuddy reads MCP servers from `~/.workbuddy/mcp.json` under the
+    /// root `mcpServers` map, in Claude Code's HTTP shape (`type: "http"`,
+    /// `url`, `headers`). A token from a file instead routes it to the
+    /// session-less stdio bridge.
+    #[test]
+    fn workbuddy_writes_a_claude_shaped_http_entry_at_its_own_path() {
+        let mut args = args_with_token(McpClient::WorkBuddy);
+        // `build_json_mcp_entry` takes the endpoint as given; the `/mcp`
+        // suffix is added by `effective_mcp_server_url` in `run`.
+        args.server_url = Some("http://memory:49374/mcp".into());
+        let entry = build_json_mcp_entry(&args).unwrap();
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://memory:49374/mcp");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert!(matches!(
+            json_mcp_location(McpClient::WorkBuddy),
+            Some(JsonMcpLocation::RootMcpServers)
+        ));
+        assert!(
+            mcp_config_path(McpClient::WorkBuddy)
+                .unwrap()
+                .ends_with(".workbuddy/mcp.json")
+        );
+    }
+
     fn render_for_test(client: McpClient) -> String {
         let args = args_for(client);
         match args.client {
@@ -4883,6 +4970,7 @@ mod tests {
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::QwenCode => render_qwen_code(&args).unwrap(),
             McpClient::Qoder => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::WorkBuddy => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),

@@ -115,6 +115,8 @@ export interface CallToolOptions extends CallOptions {
 
 const TIERS: readonly string[] = ["working", "episodic", "semantic", "procedural"];
 const RELATIONS: readonly RelationName[] = ["causes", "fixes", "contradicts"];
+// The maximum memory_read_page accepts for max_chars.
+const MAX_PAGE_UPDATE_READ_CHARS = 64_000;
 
 function scopeWire(scope: Scope): { workspace: string; project: string } {
   return { workspace: scope.workspace, project: scope.project };
@@ -165,6 +167,12 @@ function metadataFromFrontmatter(frontmatter: Raw): PageMetadata {
   if (abstractText !== undefined) meta.abstract = abstractText;
   const expiresAt = text("expires_at");
   if (expiresAt !== undefined) meta.expiresAt = expiresAt;
+  const appliesTo = texts("applies_to");
+  const singleStack = text("applies_to");
+  if (appliesTo !== undefined) meta.appliesTo = appliesTo;
+  else if (singleStack !== undefined) meta.appliesTo = [singleStack];
+  const enforcedBy = text("enforced_by");
+  if (enforcedBy !== undefined) meta.enforcedBy = enforcedBy;
   const relations = frontmatter["relations"];
   if (relations !== null && typeof relations === "object" && !Array.isArray(relations)) {
     const kept: Partial<Record<RelationName, string[]>> = {};
@@ -337,6 +345,8 @@ export class PagesNamespace {
         abstract: a.abstract,
         relations: a.relations,
         expires_at: a.expiresAt,
+        applies_to: a.appliesTo,
+        enforced_by: a.enforcedBy,
         source_files: a.sourceFiles,
         expected_page_id: a.expectedPageId,
         create_only: a.createOnly === true ? true : undefined,
@@ -449,14 +459,17 @@ export class PagesNamespace {
     );
     const o = record(decoded, "memory_read_page");
     const frontmatter = o["frontmatter"];
-    const sections = requiredList(o, "sections", "memory_read_page", (value, where) => {
-      const section = record(value, where);
-      return {
-        anchor: str(section, "anchor", where),
-        level: num(section, "level", where),
-        sha256: str(section, "sha256", where),
-      };
-    });
+    const hasSectionMetadata = Object.hasOwn(o, "sections") || Object.hasOwn(o, "sections_truncated");
+    const sections = hasSectionMetadata
+      ? requiredList(o, "sections", "memory_read_page", (value, where) => {
+          const section = record(value, where);
+          return {
+            anchor: str(section, "anchor", where),
+            level: num(section, "level", where),
+            sha256: str(section, "sha256", where),
+          };
+        })
+      : [];
     return {
       pageId: str(o, "page_id", "memory_read_page"),
       path: str(o, "path", "memory_read_page"),
@@ -469,7 +482,9 @@ export class PagesNamespace {
           ? (frontmatter as Raw)
           : {},
       sections,
-      sectionsTruncated: bool(o, "sections_truncated", "memory_read_page"),
+      sectionsTruncated: hasSectionMetadata
+        ? bool(o, "sections_truncated", "memory_read_page")
+        : false,
       related: Array.isArray(o["related"])
         ? list(o, "related", "memory_read_page", relatedPage)
         : undefined,
@@ -518,6 +533,10 @@ export class PagesNamespace {
    * re-run it. The page must exist; create new pages with
    * `write({ createOnly: true })`.
    *
+   * If the first body is truncated and fits within 64,000 characters, read
+   * it once more with that cap. A body that still cannot be read in full
+   * causes {@link ProtocolError} before `change` is called.
+   *
    * Calls `memory_read_page`, then `memory_write_page`.
    */
   async update(
@@ -533,7 +552,17 @@ export class PagesNamespace {
     const callOptions: CallOptions = {};
     if (signal !== undefined) callOptions.signal = signal;
     if (timeoutMs !== undefined) callOptions.timeoutMs = timeoutMs;
-    const current = await this.read({ path, scope }, callOptions);
+    let current = await this.read({ path, scope }, callOptions);
+    if (current.truncated === true) {
+      if (current.totalChars !== undefined && current.totalChars <= MAX_PAGE_UPDATE_READ_CHARS) {
+        current = await this.read({ path, scope, maxChars: MAX_PAGE_UPDATE_READ_CHARS }, callOptions);
+      }
+      if (current.truncated !== false) {
+        throw new ProtocolError(
+          "pages.update requires a complete page body. memory_read_page can return at most 64,000 characters.",
+        );
+      }
+    }
     const delta = await change(current);
     if (delta === null || typeof delta !== "object" || Array.isArray(delta)) {
       throw new ArgumentError(`${where}: change must return an object`);
@@ -741,9 +770,10 @@ export class MessagesNamespace {
     if (a.box !== undefined && a.box !== "inbox" && a.box !== "outbox") {
       throw new ArgumentError(`${where}: box must be "inbox" or "outbox"`);
     }
+    if (a.afterId !== undefined) requireText(a.afterId, "afterId", where);
     const decoded = await this.#core.invoke(
       "memory_message_list",
-      wire({ ...scopeWire(scope), box: a.box, limit: a.limit }),
+      wire({ ...scopeWire(scope), box: a.box, limit: a.limit, after_id: a.afterId }),
       false,
       options,
     );

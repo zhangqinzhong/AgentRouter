@@ -345,6 +345,15 @@ async fn stage_then_swap(
         ConfigPlacement::Divert
     };
 
+    if placement == ConfigPlacement::Install {
+        let source = std::fs::read_to_string(staging.join(CONFIG_FILE))
+            .context(i18n.text("cli-restore-reading-backup-config"))?;
+        // Parser errors can include the input line and its credentials.
+        source
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|_| anyhow::anyhow!(i18n.text("cli-restore-backup-config-invalid-toml")))?;
+    }
+
     // 2. Open + drop the staged store so refinery applies any pending
     //    migrations and the SQLite file is validated — still before anything
     //    live is touched. Dropping the store joins the writer thread and
@@ -380,11 +389,30 @@ async fn stage_then_swap(
             bail!("the restored API-key pepper verifier could not be bound");
         }
     }
-    // Keeping the live config must not leave a server that refuses to start:
-    // its loaded pepper must match the restored API keys.
-    if placement != ConfigPlacement::Install && has_api_credentials {
+    // The restore must not leave a server that refuses to start: the pepper
+    // the next `serve` loads must match the restored API keys. That is the
+    // live one, unless the backup's config.toml is being installed, in which
+    // case it is whatever that config (plus the environment) supplies (#2172).
+    if has_api_credentials {
+        let installed_pepper = if placement == ConfigPlacement::Install {
+            Config::load_with_runtime_env(
+                Some(&staging.join(CONFIG_FILE)),
+                Some(data_dir.to_path_buf()),
+                crate::config::RuntimeEnv::from_process(),
+            )
+            .context("loading the backup's config.toml (the live data was not changed)")?
+            .auth
+            .token_pepper
+        } else {
+            None
+        };
+        let effective_pepper = if placement == ConfigPlacement::Install {
+            installed_pepper.as_deref()
+        } else {
+            token_pepper
+        };
         let matches = match (
-            token_pepper.filter(|value| !value.trim().is_empty()),
+            effective_pepper.filter(|value| !value.trim().is_empty()),
             store.reader.api_credential_pepper_verifier().await?,
         ) {
             (Some(pepper), Some(verifier)) => {
@@ -395,6 +423,14 @@ async fn stage_then_swap(
             _ => false,
         };
         if !matches {
+            if placement == ConfigPlacement::Install {
+                bail!(
+                    "the backup's config.toml does not supply the [auth].token_pepper its API \
+                     keys were hashed with, so the restored server would refuse to start; set \
+                     the original pepper (AI_MEMORY_AUTH__TOKEN_PEPPER, or token_pepper in that \
+                     config) before retrying (the live data was not changed)"
+                );
+            }
             if placement == ConfigPlacement::Absent {
                 bail!(
                     "the backup does not contain config.toml and the configured \
@@ -1429,6 +1465,56 @@ mod tests {
         drop(Store::open(data.path()).unwrap());
     }
 
+    #[tokio::test]
+    async fn restore_refuses_invalid_toml_only_when_installing_the_archived_config() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = migrated_sqlite_bytes();
+        let archived = b"llm_headers = [\"archive-config-canary\"\n";
+        let from = write_tarball(
+            scratch.path(),
+            "invalid-config.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", db.as_slice()),
+                ("config.toml", archived),
+            ]),
+        );
+        let i18n = ai_memory_core::i18n::Localizer::default();
+        let fresh = scratch.path().join("fresh");
+        for (target, force, with_config) in
+            [(data.path(), true, true), (fresh.as_path(), false, false)]
+        {
+            let error = restore_data_dir(&i18n, target, &from, force, with_config)
+                .await
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("the backup's config.toml is not valid TOML"));
+            assert!(!message.contains("archive-config-canary"));
+        }
+        assert_live_data_untouched(data.path());
+        assert!(!fresh.join("wiki").exists());
+        assert!(!fresh.join("db").exists());
+        assert!(!fresh.join(CONFIG_FILE).exists());
+        assert!(restore_scratch_dirs(&fresh).is_empty());
+
+        let outcome = restore_data_dir(&i18n, data.path(), &from, true, false)
+            .await
+            .unwrap();
+        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
+        assert_eq!(outcome, ConfigOutcome::SavedBeside(beside.clone()));
+        assert_eq!(std::fs::read(beside).unwrap(), archived);
+        assert_eq!(
+            std::fs::read(data.path().join(CONFIG_FILE)).unwrap(),
+            b"# old config\n"
+        );
+        assert_eq!(
+            std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
+            b"new page"
+        );
+    }
+
     /// A backup's config can run commands, so by default the live one stays
     /// and the archived one is saved beside it, owner-only, for review.
     #[tokio::test]
@@ -1984,6 +2070,48 @@ mod tests {
             assert!(restore_scratch_dirs(data.path()).is_empty());
             let restored = Store::open(data.path()).unwrap();
             assert!(restored.reader.api_credentials_exist().await.unwrap());
+        }
+    }
+
+    /// #2172: installing the backup's `config.toml` must not swap in API keys
+    /// that the next `serve` cannot verify. The pepper that matters is the one
+    /// the installed config will supply, not the live one it replaces, and a
+    /// refusal must not send the operator back to `--with-config`.
+    #[tokio::test]
+    async fn installing_an_archived_config_without_the_pepper_is_refused_before_swap() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = api_key_sqlite_bytes(Some("archive-pepper")).await;
+        let from = write_tarball(
+            scratch.path(),
+            "keys-config-without-pepper.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", db.as_slice()),
+                ("config.toml", b"# no token_pepper here\n"),
+            ]),
+        );
+
+        // Even the right live pepper does not help: it lives in the config
+        // that `--with-config` replaces.
+        for live_pepper in [Some("archive-pepper"), Some("other-pepper"), None] {
+            let data = tempfile::TempDir::new().unwrap();
+            seed_live_data(data.path());
+            let err = restore_data_dir_with_legacy_pepper(
+                &ai_memory_core::i18n::Localizer::default(),
+                data.path(),
+                &from,
+                true,
+                true,
+                live_pepper,
+                false,
+            )
+            .await
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("[auth].token_pepper"), "{err:#}");
+            assert!(!message.contains("rerun with --with-config"), "{err:#}");
+            assert_live_data_untouched(data.path());
+            assert!(restore_scratch_dirs(data.path()).is_empty());
         }
     }
 

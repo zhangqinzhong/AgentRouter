@@ -46,6 +46,8 @@ Methods: `pages.write`, `pages.update`
 | `abstract` | `abstract` |
 | `relations` | `relations` |
 | `expires_at` | `expiresAt` |
+| `applies_to` | `appliesTo` |
+| `enforced_by` | `enforcedBy` |
 | `source_files` | `sourceFiles` |
 | `expected_page_id` | `expectedPageId` |
 | `create_only` | `createOnly` |
@@ -205,6 +207,7 @@ Methods: `messages.list`
 | `project` | `project` |
 | `box` | `box` |
 | `limit` | `limit` |
+| `after_id` | `afterId` |
 
 ## `memory_message_pop`
 

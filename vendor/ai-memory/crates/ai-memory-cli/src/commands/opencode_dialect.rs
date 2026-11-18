@@ -150,11 +150,19 @@ fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<std::process::C
 }
 
 fn timeout_error(program: &std::path::Path, timeout: Duration) -> anyhow::Error {
+    let mut rerun = super::render_shared::native_shell_quote(
+        &super::path_util::strip_windows_verbatim_prefix(&program.to_string_lossy()),
+    );
+    // PowerShell reads a leading quoted word as a string expression, so a
+    // quoted program only runs behind the call operator (#1462).
+    if cfg!(windows) && rerun.starts_with('\'') {
+        rerun.insert_str(0, "& ");
+    }
     anyhow!(
         "OpenCode version probe timed out after {} seconds for {}; run `{} --version` and verify it exits promptly",
         timeout.as_secs_f64(),
         program.display(),
-        program.display()
+        rerun
     )
 }
 
@@ -181,6 +189,23 @@ mod tests {
     use ai_memory_workstream::ManagedHarness;
 
     use super::*;
+
+    /// The timeout names a command to run by hand. An npm global install on
+    /// Windows lives under the user's profile, which can hold a space, so the
+    /// program must be quoted, and PowerShell only runs a quoted program behind
+    /// its call operator (#1462).
+    #[test]
+    fn the_timeout_hint_is_a_pasteable_command() {
+        let program = std::path::Path::new(r"C:\Users\Ana Maria\AppData\Roaming\npm\opencode.cmd");
+        let error = timeout_error(program, Duration::from_secs(5)).to_string();
+        let call = if cfg!(windows) { "& " } else { "" };
+        assert!(
+            error.contains(&format!(
+                r"run `{call}'C:\Users\Ana Maria\AppData\Roaming\npm\opencode.cmd' --version`"
+            )),
+            "{error}"
+        );
+    }
 
     #[test]
     fn explicit_v2_alias_choices_force_v2_without_probing() {
@@ -357,9 +382,17 @@ mod tests {
             "@echo off\r\necho opencode v2.0.23\r\n",
         )
         .unwrap();
+        // A child started with a completely empty environment cannot run a
+        // batch file on every Windows build: Windows 11 23H2's cmd.exe exits 1
+        // without `SystemRoot`. A real install always carries it, so give the
+        // otherwise empty test environment just that.
+        let system_root = std::env::var("SystemRoot").unwrap();
         let resolved = resolve_generic(
             Some(base.as_os_str()),
-            &EffectiveChildEnv::from_runtime(&crate::config::RuntimeEnv::default()),
+            &EffectiveChildEnv::with_overrides(
+                &crate::config::RuntimeEnv::default(),
+                &[("SystemRoot".to_string(), system_root)],
+            ),
         )
         .unwrap();
         assert_eq!(resolved.dialect, OpenCodeDialect::V2);

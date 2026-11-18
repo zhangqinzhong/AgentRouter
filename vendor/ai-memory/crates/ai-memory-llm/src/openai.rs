@@ -40,6 +40,23 @@ pub(crate) const STRUCTURED_OUTPUT_SCHEMA_NAME: &str = "Result";
 /// and OpenCode providers keep their own contracts.
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 
+/// Request metadata headers the `openai-compat` provider sends next to
+/// [`REQUEST_ID_HEADER`] when `llm_request_metadata_headers` is on: the
+/// operation's [`crate::LlmWorkload`] label, then the workspace, project and
+/// username of its [`crate::LlmSubject`], each only when the call site named
+/// one. Reserved the same way: the factory refuses a static
+/// `AI_MEMORY_LLM_HEADERS` entry for any of them on that path.
+pub(crate) const WORKLOAD_HEADER: &str = "x-ai-memory-workload";
+pub(crate) const WORKSPACE_HEADER: &str = "x-ai-memory-workspace";
+pub(crate) const PROJECT_HEADER: &str = "x-ai-memory-project";
+pub(crate) const USER_HEADER: &str = "x-ai-memory-user";
+pub(crate) const REQUEST_METADATA_HEADERS: [&str; 4] = [
+    WORKLOAD_HEADER,
+    WORKSPACE_HEADER,
+    PROJECT_HEADER,
+    USER_HEADER,
+];
+
 /// Build the full URL for an OpenAI-style endpoint. Tolerates the
 /// conventions found in the wild:
 ///   * `https://api.openai.com`           (OpenAI's own docs)
@@ -117,6 +134,10 @@ pub struct OpenAiProvider {
     /// turns it on only for the configured `openai-compat` provider, so
     /// the official OpenAI and OpenCode providers never gain the header.
     request_id_header: bool,
+    /// OpenAI-compat only: send [`REQUEST_METADATA_HEADERS`] on every chat
+    /// attempt. Off unless the operator opts in, and, like
+    /// `request_id_header`, only ever turned on for `openai-compat`.
+    request_metadata_headers: bool,
     /// OpenAI-compat only: send `chat_template_kwargs` with every chat
     /// request (see [`Self::with_disable_thinking`]). Ignored by the
     /// `Official` dialect, which would 400 on the unknown parameter.
@@ -154,6 +175,7 @@ impl OpenAiProvider {
             extra_headers: ExtraHeaders::default(),
             client_headers: None,
             request_id_header: false,
+            request_metadata_headers: false,
             disable_thinking: false,
         })
     }
@@ -241,6 +263,15 @@ impl OpenAiProvider {
     #[must_use]
     pub(crate) fn with_request_id_header(mut self) -> Self {
         self.request_id_header = true;
+        self
+    }
+
+    /// Send [`REQUEST_METADATA_HEADERS`] on every chat attempt, carried by
+    /// the operation id the same way [`REQUEST_ID_HEADER`] is, so every
+    /// attempt of one operation sends the same values.
+    #[must_use]
+    pub(crate) fn with_request_metadata_headers(mut self, enabled: bool) -> Self {
+        self.request_metadata_headers = enabled;
         self
     }
 
@@ -626,6 +657,9 @@ impl OpenAiProvider {
                         headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
                     }
                 }
+                if self.request_metadata_headers {
+                    insert_request_metadata(&mut headers, &operation_id);
+                }
                 headers.apply(builder)
             }
             Some(client) => {
@@ -654,12 +688,40 @@ impl OpenAiProvider {
     }
 }
 
+/// Add the opt-in request metadata for one attempt: the workload label
+/// always, and each subject value only when the call site named one. A value
+/// that is not a valid header value (a non-ASCII project name) is left out
+/// like an unknown one: the operation is worth more than its annotation.
+fn insert_request_metadata(headers: &mut ExtraHeaders, operation_id: &LlmOperationId) {
+    let subject = operation_id.subject();
+    let values = [
+        (WORKLOAD_HEADER, Some(operation_id.workload().as_str())),
+        (
+            WORKSPACE_HEADER,
+            subject.and_then(|s| s.workspace.as_deref()),
+        ),
+        (PROJECT_HEADER, subject.and_then(|s| s.project.as_deref())),
+        (USER_HEADER, subject.and_then(|s| s.user.as_deref())),
+    ];
+    for (name, value) in values {
+        if let Some(Ok(value)) = value.map(HeaderValue::from_str) {
+            headers.insert(HeaderName::from_static(name), value);
+        }
+    }
+}
+
 /// `true` when the engine reports the output stopped at the token budget
 /// rather than at a natural end. OpenAI and the local engines spell it
-/// `length`; engines that omit the field report `None` and are never
-/// truncated by this classifier.
+/// `length`. Some OpenAI-compatible gateways in front of Claude (seen with
+/// 9router relaying Claude Haiku) pass Anthropic's own `max_tokens` stop
+/// reason through unchanged
+/// (<https://docs.anthropic.com/en/api/handling-stop-reasons>). Engines that
+/// omit the field report `None` and are never truncated by this classifier.
 pub(crate) fn is_length_truncated(finish_reason: Option<&str>) -> bool {
-    finish_reason.is_some_and(|reason| reason.trim().eq_ignore_ascii_case("length"))
+    finish_reason.is_some_and(|reason| {
+        let reason = reason.trim();
+        reason.eq_ignore_ascii_case("length") || reason.eq_ignore_ascii_case("max_tokens")
+    })
 }
 
 /// Recursively normalise a JSON schema for OpenAI Structured Outputs
@@ -1484,6 +1546,9 @@ mod tests {
         // still classify, and every other stop reason must not.
         assert!(is_length_truncated(Some(" length ")));
         assert!(is_length_truncated(Some("LENGTH")));
+        // Anthropic's spelling, relayed as-is by some compatible gateways.
+        assert!(is_length_truncated(Some("max_tokens")));
+        assert!(is_length_truncated(Some("MAX_TOKENS")));
         assert!(!is_length_truncated(None));
         assert!(!is_length_truncated(Some("stop")));
         assert!(!is_length_truncated(Some("tool_calls")));

@@ -241,6 +241,7 @@ async fn dashboard_metric_links_sort_filter_and_reject_unknown_views() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -780,6 +781,63 @@ async fn smoke_search_returns_200() {
 /// Seeds `n` pages matching one term and returns the `/search` body for it.
 async fn search_body_with_pages(n: usize) -> String {
     search_body_with_pages_at(n, "/search?q=capnoticeterm").await
+}
+
+/// With no search term the page lists the most recently updated pages instead
+/// of an empty prompt: the project's own when one is selected, every readable
+/// project's otherwise. A project with no pages keeps the plain prompt.
+#[tokio::test]
+async fn web_search_without_a_term_lists_recent_pages() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let with_pages = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "empty", None)
+        .await
+        .unwrap();
+    for (project, path, title) in [
+        (with_pages, "a.md", "Scratch Recent Page"),
+        (other, "b.md", "Other Recent Page"),
+    ] {
+        store
+            .writer
+            .upsert_page(new_page(ws, project, path, title, "body"))
+            .await
+            .unwrap();
+    }
+    let web = router(store.reader.clone(), wiki.clone());
+
+    let (status, all) = get_text(&web, "/search", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(all.contains("Scratch Recent Page"), "{all}");
+    assert!(all.contains("Other Recent Page"), "{all}");
+    assert!(all.contains("most recently updated pages"), "{all}");
+
+    let (_, scoped) = get_text(&web, "/search?scope=default/scratch", None).await;
+    assert!(scoped.contains("Scratch Recent Page"), "{scoped}");
+    assert!(
+        !scoped.contains("Other Recent Page"),
+        "a project search lists only its own pages: {scoped}"
+    );
+
+    let (status, empty) = get_text(&web, "/search?scope=default/empty", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(empty.contains("Enter a search term above."), "{empty}");
+    assert!(!empty.contains("most recently updated pages"), "{empty}");
 }
 
 async fn search_body_with_pages_at(n: usize, uri: &str) -> String {
@@ -1956,6 +2014,7 @@ async fn seed_session(
             agent_kind: AgentKind::OpenCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -3594,6 +3653,123 @@ async fn viewer_filtered_api_reads_are_never_served_from_cache() {
 }
 
 #[tokio::test]
+async fn api_cors_supports_conditional_page_reads() {
+    use ai_memory_web::{WebMountSpec, api_cors_mw, split_web_routers};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, project, "cache.md", "# Conditional page read"))
+        .await
+        .unwrap();
+
+    let origin = "https://app.example.com";
+    let cors_origins = [origin.to_string()];
+    let split = split_web_routers(
+        false,
+        store.reader.clone(),
+        wiki,
+        WebMountSpec {
+            enable_api: true,
+            web_ui_dir: None,
+            cors_origins: &cors_origins,
+            web_slug: "/web",
+            base_href: "/web/",
+            base_path: "",
+            trusted_proxy_identity: false,
+            recall: ai_memory_web::Recall::default(),
+            runtime: None,
+            health: None,
+        },
+    )
+    .unwrap();
+    let router = split.protected.layer(axum::middleware::from_fn_with_state(
+        split.api_cors.unwrap(),
+        api_cors_mw,
+    ));
+    let request = |method| {
+        Request::builder()
+            .method(method)
+            .uri("/api/v1/workspaces/default/projects/scratch/pages/cache.md")
+            .header(header::ORIGIN, origin)
+    };
+    let preflight = router
+        .clone()
+        .oneshot(
+            request(Method::OPTIONS)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization, if-none-match",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    let allowed = preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap();
+    for name in [header::AUTHORIZATION, header::IF_NONE_MATCH] {
+        assert!(
+            allowed
+                .split(',')
+                .any(|value| value.trim() == name.as_str()),
+            "preflight does not allow {name}: {allowed}"
+        );
+    }
+
+    let resp = router
+        .clone()
+        .oneshot(request(Method::GET).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+        "true"
+    );
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+        "etag"
+    );
+    let etag = resp.headers()[header::ETAG].clone();
+    let conditional = router
+        .oneshot(
+            request(Method::GET)
+                .header(header::IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        conditional.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_eq!(
+        conditional.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+        "etag"
+    );
+    assert_eq!(conditional.headers()[header::ETAG], etag);
+}
+
+#[tokio::test]
 async fn api_page_handler_emits_etag_and_supports_if_none_match() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
@@ -3656,26 +3832,44 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         "a single-page read must be revalidated so authorize_read runs every time: {cc}"
     );
 
-    // Second request with the returned ETag: must return 304 with empty body.
-    let resp304 = app
-        .oneshot(
-            Request::builder()
-                .uri("/workspaces/default/projects/scratch/pages/etag-test.md")
-                .header(header::IF_NONE_MATCH, &etag)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        resp304.status(),
-        StatusCode::NOT_MODIFIED,
-        "matching ETag must yield 304"
-    );
-    let body_bytes = axum::body::to_bytes(resp304.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(body_bytes.is_empty(), "304 body must be empty");
+    for (validators, expected) in [
+        (vec![etag.clone()], StatusCode::NOT_MODIFIED),
+        (vec![format!("W/{etag}")], StatusCode::NOT_MODIFIED),
+        (
+            vec![format!(r#""other,tag", W/{etag}"#)],
+            StatusCode::NOT_MODIFIED,
+        ),
+        (
+            vec![r#""other""#.into(), format!("W/{etag}")],
+            StatusCode::NOT_MODIFIED,
+        ),
+        (vec!["*".into()], StatusCode::NOT_MODIFIED),
+        (vec![r#""other,tag""#.into()], StatusCode::OK),
+        (vec![format!("{etag}, invalid")], StatusCode::OK),
+        (vec!["*".into(), etag.clone()], StatusCode::OK),
+    ] {
+        let mut req =
+            Request::builder().uri("/workspaces/default/projects/scratch/pages/etag-test.md");
+        for validator in &validators {
+            req = req.header(header::IF_NONE_MATCH, validator);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "{validators:?}");
+        assert_eq!(resp.headers()[header::ETAG], etag, "{validators:?}");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-cache");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.is_empty(),
+            expected == StatusCode::NOT_MODIFIED,
+            "{validators:?}"
+        );
+    }
 }
 
 /// The ETag stands for the whole JSON page, not just its markdown. Pinning a
@@ -4167,6 +4361,7 @@ async fn project_view_shows_agent_attribution() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4176,6 +4371,7 @@ async fn project_view_shows_agent_attribution() {
             evidence: vec![PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: session_id.to_string(),
+                observations: Default::default(),
             }],
             ..new_page(
                 ws,
@@ -4239,6 +4435,7 @@ async fn project_view_shows_session_token_usage() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4311,6 +4508,7 @@ async fn project_view_ranks_live_token_responses_and_flags_large_usage() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4391,6 +4589,7 @@ async fn project_view_session_without_usage_shows_dash_not_zero() {
             agent_kind: AgentKind::OpenCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4639,6 +4838,24 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
         assert_eq!(get(app.clone(), uri, None).await.0, StatusCode::OK, "{uri}");
     }
 
+    let conditional_get = |viewer: UserId, validator: &str| {
+        let req = Request::builder()
+            .uri("/workspaces/default/projects/alice-client-work/pages/secrets/rates.md")
+            .header(header::IF_NONE_MATCH, validator)
+            .extension(AuthorizedViewer(viewer))
+            .body(Body::empty())
+            .unwrap();
+        api.clone().oneshot(req)
+    };
+    let authorized = conditional_get(alice, "*").await.unwrap();
+    assert_eq!(authorized.status(), StatusCode::NOT_MODIFIED);
+    let weak_etag = format!("W/{}", authorized.headers()[header::ETAG].to_str().unwrap());
+    for validator in ["*", &weak_etag] {
+        let refused = conditional_get(bob, validator).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{validator}");
+        assert!(refused.headers().get(header::ETAG).is_none());
+    }
+
     // Finding it, through the API's global search and the wiki search box.
     for (app, uri) in [
         (&api, "/search?q=confidential"),
@@ -4783,6 +5000,75 @@ async fn web_read_of_an_ambiguous_project_name_is_a_400() {
         .await
         .unwrap();
     assert_eq!(ok.status(), StatusCode::OK);
+}
+
+/// A name two projects answer to must not take the whole mailbox console down:
+/// the default mailbox opens through the project's id, and an explicit request
+/// by the clashing name keeps the page and says why it has nothing to show.
+#[tokio::test]
+async fn web_inbox_survives_an_ambiguous_project_name() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let declared = store
+        .writer
+        .get_or_create_project(ws, "widget", None)
+        .await
+        .unwrap();
+    let sender = store
+        .writer
+        .get_or_create_project(ws, "sender", None)
+        .await
+        .unwrap();
+    let (clone, _) = store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/widget".to_owned(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::Path,
+            "acme-widget",
+            Some("/work/widget".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(declared, clone);
+    send_mail(
+        &store,
+        (ws, sender),
+        (ws, declared),
+        "Queued for widget",
+        "body",
+    )
+    .await;
+    let web = router(store.reader.clone(), wiki.clone());
+
+    // No selection: the project with queued mail is opened by id.
+    let (status, body) = get_text(&web, "/inbox", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Queued for widget"), "{body}");
+    assert!(!body.contains("Mailbox unavailable"), "{body}");
+
+    // By the clashing name: the console stays up with a warning and no mail.
+    let (status, body) = get_text(&web, "/inbox?workspace=default&project=widget", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Mailbox unavailable"), "{body}");
+    assert!(body.contains("is ambiguous in workspace"), "{body}");
+    assert!(!body.contains("Queued for widget"), "{body}");
+
+    // Control: the unambiguous project opens without a warning.
+    let (status, body) = get_text(&web, "/inbox?workspace=default&project=acme-widget", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("Mailbox unavailable"), "{body}");
 }
 
 /// Pins a documented, by-design boundary (see `docs/users.md`): under a
@@ -5020,6 +5306,26 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
         }
         let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if content_type.is_some_and(|value| value.starts_with("text/html")) {
+            assert_eq!(
+                resp.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store"),
+                "{viewer:?} must not reuse another viewer's HTML at {uri}"
+            );
+            assert_eq!(content_type, Some("text/html; charset=utf-8"));
+            assert_eq!(
+                resp.headers()
+                    .get(header::VARY)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Accept-Language, Cookie")
+            );
+        }
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -6468,7 +6774,7 @@ async fn page_outline_links_to_the_ids_on_the_headings() {
         html.matches(r#"lg:hidden">"#).count(),
         "{html}"
     );
-    assert!(html.contains(r#"lg:block text-xs"#) && html.contains(">On this page</h2>"));
+    assert!(html.contains(r#"hidden lg:block""#) && html.contains(">On this page</h2>"));
     for id in ["intro", "intro-1", "intro-2"] {
         assert!(html.contains(&format!(r#" id="{id}">"#)), "{id}: {html}");
         // Anchored on the page URL, since `#id` alone resolves against <base>.
@@ -6977,4 +7283,128 @@ async fn search_alias_links_require_a_grant_and_refuse_ambiguous_names() {
     .await;
     assert_eq!(status, StatusCode::OK, "{html}");
     assert!(html.contains("notes/alias.md"), "{html}");
+}
+
+/// A `/web` page is rendered per request: the session cookie, the viewer's
+/// grants, the project's access mode and the memory itself decide what it
+/// shows. Every page therefore refuses browser caching, the same promise
+/// `/api/v1` makes. Static assets are the deliberate exception.
+#[tokio::test]
+async fn web_pages_refuse_browser_caching() {
+    use ai_memory_web::{WebMountSpec, split_web_routers};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "concepts/retrieval.md",
+        "# Retrieval\n\nA stored page.",
+    ))
+    .await
+    .unwrap();
+    let split = split_web_routers(
+        true,
+        store.reader.clone(),
+        wiki,
+        WebMountSpec {
+            enable_api: false,
+            web_ui_dir: None,
+            cors_origins: &[],
+            web_slug: "",
+            base_href: "/",
+            base_path: "",
+            trusted_proxy_identity: false,
+            recall: ai_memory_web::Recall::default(),
+            runtime: None,
+            health: None,
+        },
+    )
+    .unwrap();
+    let app = split.protected.merge(split.public);
+
+    for uri in [
+        "/",
+        "/w/default/scratch",
+        "/w/default/scratch/p/concepts/retrieval.md",
+        "/w/default/scratch/h/concepts/retrieval.md",
+        "/search?q=retrieval",
+        "/inbox",
+        "/graph",
+        "/w/default/scratch/graph",
+        // The not-found page renders the same chrome, so it carries the same
+        // header.
+        "/w/default/scratch/p/no/such/page.md",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let expected_status = if uri.ends_with("/p/no/such/page.md") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(resp.status(), expected_status, "{uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "{uri}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|value| value.to_str().ok()),
+            Some("Accept-Language, Cookie"),
+            "{uri}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "{uri} must refuse browser caching (status {})",
+            resp.status()
+        );
+    }
+
+    // Control: an asset carries no identity, so it keeps its own caching and
+    // must not be dragged under the page rule.
+    let asset = app
+        .oneshot(
+            Request::builder()
+                .uri("/static/tailwind.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/css; charset=utf-8")
+    );
+    assert_eq!(
+        asset
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        None,
+        "a static asset keeps its own caching"
+    );
 }

@@ -99,6 +99,10 @@ export interface PageMetadata {
   relations?: Partial<Record<RelationName, string[]>>;
   /** TTL: an RFC 3339 instant or a bare `YYYY-MM-DD` date. Expired pages are hidden. */
   expiresAt?: string;
+  /** Profile entries only: stack tags that limit where the rule applies. */
+  appliesTo?: string[];
+  /** Profile entries only: what enforces the rule and keeps it out of the digest. */
+  enforcedBy?: string;
   /**
    * Up to 16 repository files the page describes. The server stores them and
    * never reads the files; compare each with your checkout and record `stale`
@@ -153,8 +157,8 @@ export interface ResolvedWriteTarget {
   readonly raw: Raw;
 }
 
-/** One complete, conditional page version in an atomic batch. */
-export type BatchWritePage = PageMetadata & {
+/** One complete, conditional page version in a batch, which excludes profile metadata. */
+export type BatchWritePage = Omit<PageMetadata, "appliesTo" | "enforcedBy"> & {
   /** Relative wiki path. */
   path: string;
   /** Complete Markdown body for this version. */
@@ -332,9 +336,9 @@ export interface Page {
   readonly totalChars: number | undefined;
   /** Parsed frontmatter (tags, tier, pinned and other metadata). Untrusted. */
   readonly frontmatter: Readonly<Record<string, unknown>>;
-  /** Bounded heading hashes for anchored patches. */
+  /** Bounded heading hashes for anchored patches, or an empty list on servers before 3.3.0. */
   readonly sections: readonly PageSection[];
-  /** True when the page has more sections than the response cap. */
+  /** True when the server reports more sections than the response cap. */
   readonly sectionsTruncated: boolean;
   /** Pages reachable through links, present only with `includeRelated`. */
   readonly related: readonly RelatedPage[] | undefined;
@@ -1006,6 +1010,11 @@ export interface ListMessagesArgs extends ScopedArgs {
   box?: "inbox" | "outbox";
   /** Maximum messages (default 50, clamped to 200). */
   limit?: number;
+  /**
+   * Page after this message id. Pass the last id from the previous page;
+   * omit it for the first page. An unknown or foreign id yields an empty page.
+   */
+  afterId?: string;
 }
 
 /** Result of {@link MessagesNamespace.list}. */

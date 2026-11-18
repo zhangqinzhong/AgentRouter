@@ -24,6 +24,8 @@ pub mod experience;
 pub mod keep_tokens;
 mod link_guard;
 pub mod lint;
+mod llm_subject;
+mod output_language;
 mod path_sanitize;
 pub mod profile;
 pub mod projection;
@@ -70,8 +72,9 @@ pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
     DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN, DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
     DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS, MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
-    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request, disambiguate_colliding_session_title,
-    effective_input_chars, existing_session_page_titles, redacted_error_summary,
+    MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, SessionPageConsolidation, build_batch_request,
+    disambiguate_colliding_session_title, effective_input_chars, existing_session_page_titles,
+    redacted_error_summary,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
@@ -92,6 +95,7 @@ pub use lint::{
     DEFAULT_CONTRADICTION_SIM_HIGH, DEFAULT_CONTRADICTION_SIM_LOW, LintError, LintFinding,
     LintOptions, LintReport, run_lint, stale_days_for,
 };
+pub use output_language::with_output_language;
 pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
     LedgerRetention, MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,

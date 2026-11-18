@@ -374,6 +374,7 @@ async fn digest_inputs_read_entries_stack_and_newness() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo/app".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -413,6 +414,145 @@ async fn digest_inputs_read_entries_stack_and_newness() {
         inputs.project_tags
     );
     assert!(inputs.project_has_pages);
+}
+
+/// The hook-ingest path (the only writer of a non-NULL origin) stamps it both
+/// when it creates the session row and when the row already exists (a
+/// handoff-accept or any prior event beat the first automation-tagged capture).
+/// `harvest_prompts = "interactive"` then skips both automation sessions'
+/// prompts while an ordinary origin-less session still contributes; the default
+/// keeps everything (#2180).
+#[tokio::test]
+async fn hook_ingest_stamps_origin_on_create_and_on_an_existing_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = default_workspace(&store).await;
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_owned(), None)
+        .await
+        .unwrap();
+
+    // An ordinary interactive session: `begin_session` leaves origin NULL, so it
+    // is never filtered. Its prompt is the control the filter must keep.
+    let interactive = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: interactive,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: interactive,
+                workspace_id: ws,
+                project_id: app,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: String::new(),
+                body: "use pnpm here".to_owned(),
+                importance: 5,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+
+    // Session A: the automation capture event creates the row itself.
+    let created_by_capture = SessionId::new();
+    // Session B: an origin-less row exists first (e.g. handoff accept), then the
+    // automation capture event arrives and must stamp it.
+    let pre_existing = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: pre_existing,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+
+    for (session, body) in [
+        (created_by_capture, "created by the automation capture"),
+        (pre_existing, "stamped onto the existing row"),
+    ] {
+        let new_session = NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+            origin: Some(ai_memory_core::SessionOrigin::Automation),
+        };
+        let obs = NewObservation {
+            occurred_at: None,
+            session_id: session,
+            workspace_id: ws,
+            project_id: app,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: String::new(),
+            body: body.to_owned(),
+            importance: 5,
+            file_path: None,
+        };
+        store
+            .writer
+            .admit_hook_session_event(
+                new_session,
+                Sanitized::new(obs, &Sanitizer::builtin()),
+                ai_memory_core::OwnerFilter::Any,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let mark = ai_memory_store::ProfileHarvestMark::default();
+    // With the policy off every prompt is read (control).
+    let (all, _, _) = store
+        .reader
+        .profile_harvest_inputs(ws, app, mark, 50, false)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3, "all three prompts present without the filter");
+    // With the policy on, both automation sessions are filtered (the one the
+    // capture created and the one whose row already existed), and only the
+    // interactive session's prompt remains.
+    let (kept, _, _) = store
+        .reader
+        .profile_harvest_inputs(ws, app, mark, 50, true)
+        .await
+        .unwrap();
+    let bodies: Vec<&str> = kept.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(bodies, vec!["use pnpm here"], "only the interactive prompt");
+    assert!(
+        kept.iter().all(|p| p.session_id == interactive),
+        "both automation sessions must be filtered out"
+    );
 }
 
 /// Newness honours the TTL, both directions. A project whose every page has
@@ -595,5 +735,104 @@ async fn session_start_digest_read_is_bounded_but_scope_reads_are_not() {
         scope_pages.len(),
         cap + 1,
         "the harvester's convergence read stays uncapped"
+    );
+}
+
+/// Imported prompts keep their own `occurred_at`, so several can share one
+/// timestamp, and a page batch can share one `updated_at`. A harvest pass
+/// that ends inside such a group must still return the rest of it, or the
+/// mark moves past the group and the rest is never read.
+#[tokio::test]
+async fn harvest_reads_every_row_of_a_timestamp_group_split_by_the_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = default_workspace(&store).await;
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_owned(), None)
+        .await
+        .unwrap();
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: Some(1_000_000),
+            id: session,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    for body in ["Always use pnpm.", "Never force-push to main."] {
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: app,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: body.into(),
+                    importance: 5,
+                    occurred_at: Some(2_000_000),
+                    file_path: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+    }
+    for path in ["decisions/a.md", "decisions/b.md"] {
+        store
+            .writer
+            .upsert_page(profile_page(ws, app, path, "# Decision\n\nUse tokio."))
+            .await
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET updated_at = 3000000 WHERE path IN ('decisions/a.md', 'decisions/b.md')",
+        [],
+    )
+    .unwrap();
+
+    let mut mark = ai_memory_store::ProfileHarvestMark::default();
+    let (mut prompts, mut pages) = (Vec::new(), Vec::new());
+    for _ in 0..4 {
+        let (new_prompts, new_pages, _) = store
+            .reader
+            .profile_harvest_inputs(ws, app, mark, 1, false)
+            .await
+            .unwrap();
+        if new_prompts.is_empty() && new_pages.is_empty() {
+            break;
+        }
+        for prompt in new_prompts {
+            mark.observations_until = mark.observations_until.max(prompt.created_at);
+            prompts.push(prompt.body);
+        }
+        for page in new_pages {
+            mark.pages_until = mark.pages_until.max(page.updated_at);
+            pages.push(page.path);
+        }
+    }
+    prompts.sort();
+    pages.sort();
+    assert_eq!(
+        prompts,
+        vec!["Always use pnpm.", "Never force-push to main."],
+        "a prompt sharing the batch's last timestamp was never harvested"
+    );
+    assert_eq!(
+        pages,
+        vec!["decisions/a.md", "decisions/b.md"],
+        "a page sharing the batch's last timestamp was never harvested"
     );
 }

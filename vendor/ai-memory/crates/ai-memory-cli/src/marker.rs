@@ -417,6 +417,12 @@ pub(crate) fn path_contains(root: &Path, candidate: &Path) -> bool {
 }
 
 fn parse_absolute_selector(raw: &str) -> Result<PathSelector, ()> {
+    // A Windows verbatim path (`\\?\C:\work`, `\\?\UNC\server\share`) names the
+    // same location as its plain form but would otherwise be read here as a UNC
+    // path with server `?` and share `C:`. `fs::canonicalize` and some harnesses
+    // report that spelling, so fold it to the plain form before parsing, or a
+    // profile root and the checkout it admits stop matching on Windows.
+    let raw = crate::commands::path_util::strip_windows_verbatim_prefix(raw);
     let replaced = raw.replace('\\', "/");
     let (root, rest) = if let Some(rest) = replaced.strip_prefix("//") {
         let mut parts = rest.split('/').filter(|part| !part.is_empty());
@@ -1238,8 +1244,9 @@ impl MarkerMemo {
 /// section: any root-level scope key (`workspace`/`project`/
 /// `project_strategy`), or any of the other settings
 /// `hook_capture::marker_query_suffix_impl` forwards (`[recall]
-/// default_global`, `[briefing]` and `[profile]` keys, top-level
-/// `drop_subagent_captures`), or `[messaging] inbox_notice_on_prompt`,
+/// default_global`, `[briefing]` and `[profile]` keys, `[retrieval]
+/// default_result_limit`, top-level `drop_subagent_captures`), or
+/// `[messaging] inbox_notice_on_prompt`,
 /// which the hook reads locally instead of forwarding but must still read
 /// from the nearest settings-declaring marker (#1942).
 /// A marker with any of these is a resolution boundary; only a marker whose
@@ -1258,7 +1265,7 @@ fn declares_more_than_capture(text: &str) -> bool {
         "identity",
         "identity_style",
     ];
-    const FLAG_KEYS: [&str; 8] = [
+    const FLAG_KEYS: [&str; 10] = [
         "default_global",
         "inject_on_session_start",
         "inject_on_subagent_start",
@@ -1267,6 +1274,8 @@ fn declares_more_than_capture(text: &str) -> bool {
         "consume",
         "deliver_on_session_start",
         "inbox_notice_on_prompt",
+        "default_result_limit",
+        "min_relevance",
     ];
     QUOTED_KEYS
         .iter()
@@ -2424,6 +2433,8 @@ project = "infra" # this is fine
             "[briefing]\ninject_on_subagent_start = true\n",
             "[briefing]\nmax_chars = 4000\n",
             "[handoff]\ndeliver_on_session_start = false\n",
+            "[retrieval]\ndefault_result_limit = 25\n",
+            "[retrieval]\nmin_relevance = 0.4\n",
         ] {
             assert!(
                 declares_more_than_capture(text),
@@ -2683,6 +2694,42 @@ project = "infra" # this is fine
         assert!(path_contains(
             Path::new("/work/team-b"),
             Path::new("/work/team-b/repo")
+        ));
+    }
+
+    /// A Windows verbatim path (`\\?\C:\...`, which `fs::canonicalize` and some
+    /// harnesses report) names the same location as its plain form. Either side
+    /// of a containment check may carry it, so a profile root registered as a
+    /// verbatim path must still admit a plain-drive checkout and vice versa
+    /// (#2186). Parsed textually, so this holds on every host. Without the
+    /// verbatim fold, `\\?\C:\work` reads as UNC server `?` / share `C:` and
+    /// matches neither.
+    #[test]
+    fn path_contains_folds_windows_verbatim_prefixes() {
+        assert!(path_contains(
+            Path::new(r"\\?\C:\work\team-b"),
+            Path::new(r"C:\work\team-b\repo")
+        ));
+        assert!(path_contains(
+            Path::new(r"C:\work\team-b"),
+            Path::new(r"\\?\C:\work\team-b\repo")
+        ));
+        assert!(path_contains(
+            Path::new(r"\\?\C:\work\team-b"),
+            Path::new(r"\\?\C:\work\team-b\repo")
+        ));
+        assert!(path_contains(
+            Path::new(r"\\?\UNC\server\share\work"),
+            Path::new(r"\\server\share\work\repo")
+        ));
+        // The component boundary and the drive still bind after folding.
+        assert!(!path_contains(
+            Path::new(r"\\?\C:\work\team-b"),
+            Path::new(r"C:\work\team-bb\repo")
+        ));
+        assert!(!path_contains(
+            Path::new(r"\\?\C:\work\team-b"),
+            Path::new(r"D:\work\team-b\repo")
         ));
     }
 }

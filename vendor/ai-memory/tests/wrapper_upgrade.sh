@@ -484,8 +484,9 @@ tar -czf "${VERIFY_ROOT}/fixture/archive.tar.gz" -C "${VERIFY_ROOT}/fixture/payl
 GOOD_DIGEST="$(sha256sum "${VERIFY_ROOT}/fixture/archive.tar.gz" | awk '{ print $1 }')"
 
 run_verify_case() {
-  # $1 case name, $2 digest written into the .sha256 sidecar
+  # $1 case name, $2 digest written into the .sha256 sidecar, then wrapper argv.
   local name="$1" digest="$2" case_dir stub
+  shift 2
   case_dir="${VERIFY_ROOT}/${name}"
   stub="${case_dir}/bin"
   mkdir -p "${case_dir}/home" "${case_dir}/cache" "${case_dir}/data" "${stub}"
@@ -502,7 +503,7 @@ while [ \$# -gt 0 ]; do
 done
 base="\${url##*/}"
 case "\${url}" in
-  *.sha256) printf '%s  %s\n' "${digest}" "\${base%.sha256}" >"\${out}" ;;
+  *.sha256) printf '%s  %s\n' "${digest}" "\${base%.sha256}" >"\${out:-/dev/stdout}" ;;
   *) cp "${VERIFY_ROOT}/fixture/archive.tar.gz" "\${out}" ;;
 esac
 CURL
@@ -514,9 +515,10 @@ CURL
     XDG_CACHE_HOME="${case_dir}/cache" \
     XDG_DATA_HOME="${case_dir}/data" \
     AI_MEMORY_DOCKER="${FAKE_DOCKER_NO_CONTAINER}" \
+    AI_MEMORY_NATIVE_BIN="" \
     AI_MEMORY_SKIP_SELF_UPGRADE=1 \
     AI_MEMORY_WRAPPER_TEST_LOG="${case_dir}/docker.log" \
-      "${ROOT}/bin/ai-memory" upgrade >"${case_dir}/output.log" 2>&1
+      "${ROOT}/bin/ai-memory" "$@" >"${case_dir}/output.log" 2>&1
   )
 }
 
@@ -535,7 +537,7 @@ esac
 DOCKER
 chmod 0755 "${FAKE_DOCKER_NO_CONTAINER}"
 
-if run_verify_case mismatch "0000000000000000000000000000000000000000000000000000000000000000"; then
+if run_verify_case mismatch "0000000000000000000000000000000000000000000000000000000000000000" upgrade; then
   fail "upgrade with a mismatched native-client checksum returned success"
 fi
 assert_contains "${VERIFY_ROOT}/mismatch/output.log" "checksum mismatch"
@@ -543,10 +545,127 @@ if [ -e "${VERIFY_ROOT}/mismatch/data/ai-memory/native-runner/ai-memory" ]; then
   fail "a mismatched native-client archive was installed anyway"
 fi
 
-run_verify_case valid "${GOOD_DIGEST}" \
+run_verify_case valid "${GOOD_DIGEST}" upgrade \
   || fail "upgrade with a valid native-client checksum did not succeed"
 [ -x "${VERIFY_ROOT}/valid/data/ai-memory/native-runner/ai-memory" ] \
   || fail "a verified native-client archive was not installed"
 printf 'wrapper native-client checksum verification checks passed\n'
+
+# A failed daily refresh must leave the previous cache record intact so a
+# subsequent host command retries the installation immediately.
+run_verify_case refresh "${GOOD_DIGEST}" upgrade
+REFRESH_DIR="${VERIFY_ROOT}/refresh"
+REFRESH_NATIVE="${REFRESH_DIR}/data/ai-memory/native-runner"
+REFRESH_ARCHIVES=("${REFRESH_NATIVE}"/*.tar.gz)
+REFRESH_ARCHIVE="${REFRESH_ARCHIVES[0]}"
+[ "${#REFRESH_ARCHIVES[@]}" -eq 1 ] && [ -f "${REFRESH_ARCHIVE}" ] \
+  || fail "expected one cached native-client archive"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "old native client\n"' >"${REFRESH_NATIVE}/ai-memory"
+cp "${REFRESH_NATIVE}/ai-memory" "${REFRESH_DIR}/old-client"
+tar -czf "${REFRESH_ARCHIVE}" -C "${REFRESH_NATIVE}" ai-memory hooks
+cp "${REFRESH_ARCHIVE}" "${REFRESH_DIR}/old-archive"
+touch -t 200001010000 "${REFRESH_NATIVE}/last-check"
+
+assert_failed_refresh_preserves_cache() {
+  cmp -s "${REFRESH_DIR}/old-client" "${REFRESH_NATIVE}/ai-memory" \
+    || fail "failed native-client refresh replaced the executable"
+  cmp -s "${REFRESH_DIR}/old-archive" "${REFRESH_ARCHIVE}" \
+    || fail "failed native-client refresh replaced the cached archive"
+  [ -n "$(find "${REFRESH_NATIVE}/last-check" -mtime +0)" ] \
+    || fail "failed native-client refresh advanced last-check"
+  [ -z "$(find "${REFRESH_NATIVE}" -name '.install-*')" ] \
+    || fail "failed native-client refresh left a staging directory"
+}
+
+cat >"${REFRESH_DIR}/bin/mv" <<'MV'
+#!/usr/bin/env bash
+case "${1:-}" in */.install-*/ai-memory) exit 42 ;; esac
+exec /bin/mv "$@"
+MV
+chmod 0755 "${REFRESH_DIR}/bin/mv"
+if run_verify_case refresh "${GOOD_DIGEST}" workstreams; then
+  fail "refresh with a failed native-client executable move returned success"
+fi
+assert_contains "${REFRESH_DIR}/output.log" "could not install the native host-launch executable"
+assert_not_contains "${REFRESH_DIR}/output.log" "old native client"
+assert_failed_refresh_preserves_cache
+rm "${REFRESH_DIR}/bin/mv"
+
+cat >"${REFRESH_DIR}/bin/tar" <<'TAR'
+#!/usr/bin/env bash
+exit 42
+TAR
+chmod 0755 "${REFRESH_DIR}/bin/tar"
+if run_verify_case refresh "${GOOD_DIGEST}" workstreams; then
+  fail "refresh with a failed native-client extraction returned success"
+fi
+assert_contains "${REFRESH_DIR}/output.log" "could not extract the native host-launch client"
+assert_failed_refresh_preserves_cache
+rm "${REFRESH_DIR}/bin/tar"
+
+run_verify_case refresh "${GOOD_DIGEST}" workstreams \
+  || fail "native-client refresh did not retry after a failed install"
+cmp -s "${VERIFY_ROOT}/fixture/payload/ai-memory" "${REFRESH_NATIVE}/ai-memory" \
+  || fail "retry did not install the verified executable"
+cmp -s "${VERIFY_ROOT}/fixture/archive.tar.gz" "${REFRESH_ARCHIVE}" \
+  || fail "retry did not install the verified archive"
+[ -z "$(find "${REFRESH_NATIVE}/last-check" -mtime +0)" ] \
+  || fail "successful native-client refresh did not advance last-check"
+printf 'wrapper native-client refresh retry checks passed\n'
+
+# ---- the self-upgrade keeps the mode the wrapper was installed with --------
+# `mktemp` creates the staging file 0600 on GNU and BSD alike, so replacing the
+# wrapper after only `chmod +x` installed a 0700 script: the operator who ran
+# the upgrade kept working, while anyone else running that wrapper from a
+# shared directory could no longer execute it.
+SELF_ROOT="${TMP_ROOT}/self-upgrade"
+SELF_STUB="${SELF_ROOT}/bin"
+SELF_WRAPPER="${SELF_ROOT}/ai-memory"
+mkdir -p "${SELF_STUB}" "${SELF_ROOT}/home" "${SELF_ROOT}/cache" "${SELF_ROOT}/data"
+cat >"${SELF_ROOT}/released" <<'RELEASED'
+#!/usr/bin/env bash
+printf 'released wrapper ran\n'
+exit 0
+RELEASED
+SELF_DIGEST="$(sha256sum "${SELF_ROOT}/released" | awk '{ print $1 }')"
+cat >"${SELF_STUB}/curl" <<CURL
+#!/usr/bin/env bash
+set -euo pipefail
+url=""; out=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+case "\${url}" in
+  *.sha256) printf '%s  released\n' "${SELF_DIGEST}" >"\${out}" ;;
+  *) cp "${SELF_ROOT}/released" "\${out}" ;;
+esac
+CURL
+chmod 0755 "${SELF_STUB}/curl"
+cp "${ROOT}/bin/ai-memory" "${SELF_WRAPPER}"
+chmod 0755 "${SELF_WRAPPER}"
+SELF_MODE_BEFORE="$(stat -c '%a' "${SELF_WRAPPER}" 2>/dev/null || stat -f '%Lp' "${SELF_WRAPPER}")"
+(
+  cd "${SELF_ROOT}"
+  PATH="${SELF_STUB}:${PATH}" \
+  HOME="${SELF_ROOT}/home" \
+  XDG_CACHE_HOME="${SELF_ROOT}/cache" \
+  XDG_DATA_HOME="${SELF_ROOT}/data" \
+  AI_MEMORY_DOCKER="${FAKE_DOCKER_NO_CONTAINER}" \
+  AI_MEMORY_NATIVE_BIN="" \
+  AI_MEMORY_WRAPPER_URL="http://fixture.invalid/ai-memory-wrapper" \
+  AI_MEMORY_WRAPPER_SHA256_URL="http://fixture.invalid/ai-memory-wrapper.sha256" \
+    "${SELF_WRAPPER}" upgrade >"${SELF_ROOT}/output.log" 2>&1
+)
+assert_contains "${SELF_ROOT}/output.log" "released wrapper ran"
+cmp -s "${SELF_ROOT}/released" "${SELF_WRAPPER}" \
+  || fail "the self-upgrade did not install the released wrapper"
+SELF_MODE_AFTER="$(stat -c '%a' "${SELF_WRAPPER}" 2>/dev/null || stat -f '%Lp' "${SELF_WRAPPER}")"
+[ "${SELF_MODE_AFTER}" = "${SELF_MODE_BEFORE}" ] \
+  || fail "self-upgrade changed the wrapper mode from ${SELF_MODE_BEFORE} to ${SELF_MODE_AFTER}"
+printf 'wrapper self-upgrade mode checks passed\n'
 
 printf 'wrapper upgrade ownership checks passed\n'

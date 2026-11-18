@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `messages.list` accepts `afterId` (sent as `after_id`) to page the pending
+  queue with the last id from the previous page. (#2295)
 - `observations` documents the server's new `session_id: "current"`: the
   server resolves it only for a request carrying the caller's hook session
   id, which this client does not send, so SDK callers pass the id. (#1983)
@@ -18,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit it was checked against; `pages.update` carries it over. (#1957)
 
 ### Fixed
+
+- `pages.update` preserves profile stack filters and enforcement metadata on
+  a body edit. `pages.write` and `pages.update` accept `appliesTo` and
+  `enforcedBy` for profile entries. (#2207)
 
 - Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
   GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
@@ -30,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initialized the MCP session before the first `callTool`, so raw tool calls
   work with `--http-stateful` without a preceding wrapped call. Raw calls
   still skip `tools/list` and schema checks. (#1816)
+
+- Restored `pages.read` and `pages.update` compatibility with servers that
+  predate the section metadata added in 3.3.0.
+
+- `api.page` accepts literal `%2e` and `%2e%2e` segments in stored page paths. (#2217)
 
 ### Added
 

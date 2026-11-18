@@ -11,7 +11,7 @@
 //! and can fall back to the stored OIDC device-flow token used by native hooks.
 
 use std::fmt;
-use std::io::{BufWriter, Write as _};
+use std::io::{BufWriter, Read as _, Seek as _, Write as _};
 use std::path::Path;
 use std::time::Duration;
 
@@ -96,6 +96,18 @@ pub(crate) fn server_response_error_for_test(
         body,
     }
     .into()
+}
+
+/// Whether `error` is a 404 for a route this server does not have, as opposed
+/// to a route that answered 404 with a JSON `error`, such as a missing project.
+pub(crate) fn is_missing_route(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerResponseError>()
+        .is_some_and(|e| {
+            e.status == reqwest::StatusCode::NOT_FOUND
+                && serde_json::from_str::<serde_json::Value>(&e.body)
+                    .map_or(true, |body| body.get("error").is_none())
+        })
 }
 
 /// Pass a 2xx response through, else consume the body into a
@@ -403,8 +415,8 @@ pub(crate) fn is_loopback_url(url: &str) -> bool {
 
 /// Shared reqwest client for thin-client CLI subcommands. Redirects are
 /// disabled so a 3xx from an SSO portal or proxy cannot be followed: JSON
-/// GET/POST would otherwise consume a login page, a 307/308 would replay the
-/// body, and [`post_to_file`] would write that page as a backup tarball.
+/// GET/POST would otherwise consume a login page, and a 307/308 would replay
+/// the body.
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -657,17 +669,18 @@ async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration)
 
 /// POST an empty body to `<endpoint>{path}`, streaming the response to `dest`.
 ///
-/// Intended for routes whose response is binary (e.g. `POST /admin/backup`
-/// returns an `application/gzip` tarball). On non-2xx the response body is
-/// consumed and returned as an error string. Returns bytes written. A completed
-/// download atomically replaces the destination path; a destination symlink is
-/// replaced rather than modifying the file it points to. Replacement symlinks
-/// and new destinations use private permissions; only existing regular files
-/// retain their permissions.
+/// Intended for routes returning gzip archives, such as `POST /admin/backup`.
+/// On non-2xx the response body is consumed and returned as an error string.
+/// A complete download that is a valid gzip stream atomically replaces the
+/// destination path and returns the number of bytes written. A destination
+/// symlink is replaced rather than modifying the file it points to. Replacement
+/// symlinks and new destinations use private permissions; only existing regular
+/// files retain their permissions.
 ///
 /// # Errors
 /// Returns an error when the connection fails, the response is non-2xx,
-/// or the body cannot be read or written.
+/// the body cannot be read or written, the gzip signature is missing, or the
+/// gzip stream is corrupt or truncated.
 pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) -> Result<u64> {
     let client = http_client();
     let url = endpoint.build_url(path);
@@ -696,8 +709,35 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
         .flush()
         .with_context(|| format!("flushing {}", dest.display()))?;
     drop(writer);
-    // A failed response must leave the previous archive usable. The temporary
-    // file stays private until the entire response has arrived.
+    // A gateway can return a login page with a success status. Check the body
+    // because an intermediary may omit or rewrite the media type.
+    const GZIP_SIGNATURE: [u8; 3] = [0x1f, 0x8b, 0x08];
+    let mut signature = [0; GZIP_SIGNATURE.len()];
+    if written >= signature.len() as u64 {
+        let staged = temporary.as_file_mut();
+        staged
+            .rewind()
+            .and_then(|()| staged.read_exact(&mut signature))
+            .context(endpoint.i18n.text("cli-archive-download-reading-signature"))?;
+    }
+    if signature != GZIP_SIGNATURE {
+        anyhow::bail!("{}", endpoint.i18n.text("cli-archive-download-not-gzip"));
+    }
+    // The signature only proves the first bytes; a complete body can still
+    // carry a corrupt CRC or a truncated trailer, which `restore` would reject
+    // after this archive had already replaced a usable one. Decode the staged
+    // file to its end — that validates the CRC and length trailer — before the
+    // rename. Bounded memory: the inflated output streams into a sink (#2206).
+    {
+        let staged = temporary.as_file_mut();
+        staged
+            .rewind()
+            .context(endpoint.i18n.text("cli-archive-download-reading-signature"))?;
+        let mut decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(staged));
+        std::io::copy(&mut decoder, &mut std::io::sink())
+            .context(endpoint.i18n.text("cli-archive-download-corrupt-gzip"))?;
+    }
+    // Keep the staged file private until the complete response passes the check.
     if let Some(permissions) = permissions {
         temporary
             .as_file()
@@ -1678,5 +1718,97 @@ mod tests {
             !contacted.load(Ordering::SeqCst),
             "redirect target must never be contacted"
         );
+    }
+
+    /// Serves one `200` response carrying `body` verbatim with a matching
+    /// `Content-Length`, so a test controls the exact bytes a complete,
+    /// successful download delivers.
+    async fn archive_server(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A complete `200` whose gzip body is valid is persisted, replacing a
+    /// previous archive — the control the corruption cases are measured against.
+    #[tokio::test]
+    async fn post_to_file_persists_a_valid_gzip_archive() {
+        let good = gzip(b"wiki/example.md\nhello\n");
+        let url = archive_server(good.clone()).await;
+        let endpoint = ServerEndpoint::from_pair(Some(url), None);
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("saved.tar.gz");
+        std::fs::write(&dest, b"previous usable archive").unwrap();
+
+        let written = post_to_file(&endpoint, "/admin/backup", &dest)
+            .await
+            .unwrap();
+        assert_eq!(written, good.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), good);
+    }
+
+    /// A complete `200` whose gzip body has a flipped CRC byte is rejected and
+    /// the previous archive is left in place (#2206). The signature check alone
+    /// would have replaced it with bytes `restore` then refuses.
+    #[tokio::test]
+    async fn post_to_file_rejects_a_corrupt_gzip_and_keeps_the_previous_archive() {
+        let mut bad = gzip(b"wiki/example.md\nhello\n");
+        let crc_byte = bad.len() - 8;
+        bad[crc_byte] ^= 1;
+        let url = archive_server(bad).await;
+        let endpoint = ServerEndpoint::from_pair(Some(url), None);
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("saved.tar.gz");
+        std::fs::write(&dest, b"previous usable archive").unwrap();
+
+        let err = post_to_file(&endpoint, "/admin/backup", &dest)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("gzip"),
+            "corrupt download must name a gzip failure, got: {err:#}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous usable archive");
+    }
+
+    /// A complete `200` whose gzip body is missing its 8-byte trailer is
+    /// rejected and the previous archive survives (#2206).
+    #[tokio::test]
+    async fn post_to_file_rejects_a_truncated_gzip_trailer_and_keeps_the_previous_archive() {
+        let full = gzip(b"wiki/example.md\nhello\n");
+        let truncated = full[..full.len() - 8].to_vec();
+        let url = archive_server(truncated).await;
+        let endpoint = ServerEndpoint::from_pair(Some(url), None);
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("saved.tar.gz");
+        std::fs::write(&dest, b"previous usable archive").unwrap();
+
+        let err = post_to_file(&endpoint, "/admin/backup", &dest)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("gzip"),
+            "truncated download must name a gzip failure, got: {err:#}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous usable archive");
     }
 }

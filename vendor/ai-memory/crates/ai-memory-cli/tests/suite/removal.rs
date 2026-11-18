@@ -660,6 +660,66 @@ fn only_hooks_preserves_mcp_in_same_file() {
     );
 }
 
+/// install-hooks wires Gemini CLI's BeforeAgent and AfterAgent beside a hook
+/// of the user's own, and uninstall takes ours out of both and leaves theirs.
+#[test]
+fn gemini_round_trip_wires_and_removes_before_and_after_agent() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".gemini/settings.json");
+    write_file(
+        &settings,
+        r#"{"mcpServers":{"other":{"httpUrl":"https://other.example/mcp"}},"hooks":{"BeforeAgent":[{"matcher":"","hooks":[{"type":"command","command":"/usr/local/bin/prompt-guard.sh"}]}]}}"#,
+    );
+
+    let install = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "gemini-cli", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install-hooks failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let wired: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let before = wired["hooks"]["BeforeAgent"].as_array().unwrap();
+    assert_eq!(before.len(), 2, "{wired}");
+    let prompt = before[1]["hooks"][0]["command"].as_str().unwrap();
+    assert!(
+        prompt.contains("--event user-prompt-submit") && prompt.contains("--agent gemini-cli"),
+        "{wired}"
+    );
+    let stop = wired["hooks"]["AfterAgent"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(
+        stop.contains("--event stop") && stop.contains("--agent gemini-cli"),
+        "{wired}"
+    );
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let unwired = std::fs::read_to_string(&settings).unwrap();
+    assert!(!unwired.contains("--agent gemini-cli"), "{unwired}");
+    let unwired: serde_json::Value = serde_json::from_str(&unwired).unwrap();
+    assert_eq!(
+        unwired["hooks"]["BeforeAgent"][0]["hooks"][0]["command"],
+        "/usr/local/bin/prompt-guard.sh"
+    );
+    assert_eq!(
+        unwired["mcpServers"]["other"]["httpUrl"],
+        "https://other.example/mcp"
+    );
+}
+
 #[test]
 fn uninstall_preserves_user_opencode_plugin_at_ai_memory_path() {
     let _guard = cli_test_lock();
@@ -958,6 +1018,79 @@ fn uninstall_antigravity_hooks_preserves_user_entries() {
     assert!(after.get("other-group").is_some());
 }
 
+/// WorkBuddy stores its native hooks under the `hooks` key of
+/// `~/.workbuddy/settings.json` (Claude Code-shaped, no script bundle, no
+/// `SessionEnd`). Installing then uninstalling withdraws every ai-memory event
+/// while the user's own hook and sibling settings survive.
+#[test]
+fn workbuddy_install_hooks_then_uninstall_withdraws_capture_and_keeps_user_config() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let workbuddy = home.path().join(".workbuddy");
+    std::fs::create_dir_all(&workbuddy).unwrap();
+    // Pre-seed a third-party hook and an unrelated setting we must NOT touch.
+    std::fs::write(
+        workbuddy.join("settings.json"),
+        r#"{"model":"workbuddy-pro","hooks":{"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/n.sh"}]}]}}"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "workbuddy", "--apply"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "install-hooks failed");
+
+    // Install populated our six events (WorkBuddy fires no SessionEnd).
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(workbuddy.join("settings.json")).unwrap())
+            .unwrap();
+    for ours in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PreCompact",
+        "Stop",
+    ] {
+        assert!(
+            installed["hooks"].get(ours).is_some(),
+            "{ours} should be installed"
+        );
+    }
+    assert!(
+        installed["hooks"].get("SessionEnd").is_none(),
+        "WorkBuddy fires no SessionEnd, so none should be installed"
+    );
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(workbuddy.join("settings.json")).unwrap())
+            .unwrap();
+    // Sibling setting and third-party hook survived.
+    assert_eq!(after["model"], "workbuddy-pro");
+    assert!(after["hooks"]["Notification"].is_array());
+    // None of our events remain.
+    for ours in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PreCompact",
+        "Stop",
+    ] {
+        assert!(
+            after["hooks"].get(ours).is_none(),
+            "{ours} should be removed"
+        );
+    }
+}
+
 #[test]
 fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
     let _guard = cli_test_lock();
@@ -1043,6 +1176,110 @@ fn zcode_mcp_install_and_uninstall_round_trip_preserves_siblings() {
     assert_eq!(
         removed["mcp"]["servers"]["other"]["url"], "https://other.example/mcp",
         "uninstall must preserve sibling servers"
+    );
+}
+
+/// GHSA-qmg7-f7fg-rg4x: `install-hooks --agent zcode` writes capture under
+/// `hooks.events` in `~/.zcode/cli/config.json`, and `uninstall --only hooks`
+/// must withdraw every ai-memory entry while the user's own hook, model and
+/// hook-level settings survive. Before the fix, uninstall skipped this shape
+/// entirely: it exited 0 reporting nothing to remove while all generated
+/// capture hooks stayed live.
+#[test]
+fn zcode_install_hooks_then_uninstall_withdraws_capture_and_keeps_user_config() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".zcode/cli/config.json");
+    // Seed a pre-existing third-party SessionStart hook plus hook-level
+    // settings the uninstall must not touch.
+    write_file(
+        &config,
+        r#"{
+            "model": "fixture-model",
+            "hooks": {
+                "enabled": true,
+                "maxOutputBytes": 65536,
+                "events": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": "printf unrelated", "statusMessage": "unrelated hook"}]}
+                    ]
+                }
+            }
+        }"#,
+    );
+
+    let install = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "zcode", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    // After install our capture hooks are present.
+    let count_ours = |path: &Path| -> usize {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let events = v["hooks"]["events"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        events
+            .values()
+            .filter_map(|slot| slot.as_array())
+            .flat_map(|groups| groups.iter())
+            .filter_map(|group| group["hooks"].as_array())
+            .flat_map(|hooks| hooks.iter())
+            .filter(|hook| {
+                hook["statusMessage"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("ai-memory"))
+            })
+            .count()
+    };
+    assert!(
+        count_ours(&config) > 0,
+        "install must write ai-memory capture hooks"
+    );
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+
+    // Every ai-memory capture hook is gone.
+    assert_eq!(
+        count_ours(&config),
+        0,
+        "uninstall --only hooks must withdraw every ai-memory ZCode hook"
+    );
+    // The user's own hook, model and hook-level settings survive.
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(after["model"], "fixture-model", "model must survive");
+    assert_eq!(
+        after["hooks"]["enabled"], true,
+        "hook-level settings must survive"
+    );
+    assert_eq!(after["hooks"]["maxOutputBytes"], 65536);
+    let session_start = after["hooks"]["events"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart must survive for the unrelated hook");
+    let unrelated_survives = session_start
+        .iter()
+        .filter_map(|group| group["hooks"].as_array())
+        .flat_map(|hooks| hooks.iter())
+        .any(|hook| hook["statusMessage"].as_str() == Some("unrelated hook"));
+    assert!(
+        unrelated_survives,
+        "the third-party hook must survive: {after}"
     );
 }
 
@@ -2404,6 +2641,103 @@ fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
             path.display()
         );
     }
+}
+
+fn assert_uninstall_preserves_configured_root_token(
+    only: Option<&str>,
+    root_name: &str,
+    absolute: bool,
+) {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let data = home.path().join(".ai-memory-data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data = data.canonicalize().unwrap();
+    let relative = Path::new("auth-tokens").join(root_name);
+    let root = data.join(&relative);
+    let setting = if absolute { root.clone() } else { relative };
+    let config = format!(
+        "[auth]\nbearer_token_file = {}\n",
+        serde_json::to_string(&setting.to_string_lossy()).unwrap()
+    );
+    write_file(&data.join("config.toml"), &config);
+    write_file(&root, "persistent-root-token\n");
+    let installed = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "claude-code", "--apply"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let profile = data.join("auth-tokens/remote");
+    write_file(&profile, "profile-token\n");
+    write_file(&data.join("auth-token"), "stored-hook-token\n");
+    write_file(
+        &data.join("auth-header"),
+        "Authorization: Bearer stored-hook-token\n",
+    );
+    let mut command = command_with_home(home.path());
+    command
+        .env("AI_MEMORY_AUTH_TOKEN", "temporary-uninstall-token")
+        .args(["uninstall", "--apply", "--yes"])
+        .current_dir(project.path());
+    if let Some(only) = only {
+        command.args(["--only", only]);
+    }
+    let removed = command.output().unwrap();
+    assert!(
+        removed.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&root).ok().as_deref(),
+        Some("persistent-root-token\n"),
+        "an environment override must not delete the server's configured token"
+    );
+    assert_eq!(
+        std::fs::read_to_string(data.join("config.toml")).unwrap(),
+        config
+    );
+    assert!(
+        !profile.exists(),
+        "a profile credential must still be removed"
+    );
+    for file in ["auth-token", "auth-header"] {
+        assert!(
+            !data.join(file).exists(),
+            "the hooks' {file} must be removed"
+        );
+    }
+}
+
+#[test]
+fn full_uninstall_keeps_relative_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(None, "default", false);
+}
+
+#[test]
+fn hooks_uninstall_keeps_relative_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(Some("hooks"), "default", false);
+}
+
+#[test]
+fn uninstall_keeps_custom_relative_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(None, "custom-root", false);
+}
+
+#[test]
+fn full_uninstall_keeps_absolute_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(None, "custom-root", true);
+}
+
+#[test]
+fn hooks_uninstall_keeps_absolute_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(Some("hooks"), "custom-root", true);
 }
 
 /// `install-mcp --apply --auth-token` for Claude Code stores the key where the

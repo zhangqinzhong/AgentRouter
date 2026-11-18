@@ -53,7 +53,7 @@ Four MCP tools (documented in the installed `ai-memory-messaging` skill):
 | Tool | Role |
 |---|---|
 | `memory_message_send` | Send to `to_workspace` + `to_project`'s inbox; optional `to_agent` restricts claiming to a registered harness. The same project is a valid recipient. |
-| `memory_message_list` | List pending mail. `box="inbox"` (default) or `box="outbox"`. Read-only. |
+| `memory_message_list` | List pending mail. `box="inbox"` (default) or `box="outbox"`. Read-only. Pass `after_id` with the last id from one page to read the next; an unknown or foreign id returns an empty page. |
 | `memory_message_pop` | Claim the next inbox message (oldest, or a specific `message_id`). |
 | `memory_message_cancel` | Retract a sent message (`message_id`), or clear the whole outbox. |
 
@@ -93,6 +93,11 @@ queue. If you only want to look without consuming, `memory_message_list`.
 Kimi calls `memory_message_cancel`. With no id it clears every pending message A
 has sent; with a `message_id` it retracts just that one. A message already
 popped by B cannot be cancelled.
+
+For pop and cancel, omit `message_id` to use that default. An explicitly empty
+or whitespace-only id is refused without claiming or cancelling any message.
+A valid UUID may have surrounding whitespace. The HTTP/admin endpoints apply
+the same rule, and the CLI refuses an empty `--id` before sending a request.
 
 ### Naming the project: pop, cancel, and send refuse a guess
 
@@ -148,7 +153,8 @@ ai-memory message cancel --all         # clear this project's outbox
 ```
 
 The CLI resolves the current project as the sender/reader scope, the same way
-`ai-memory handoffs` does.
+`ai-memory handoffs` does. Its message text caps count Unicode characters after
+secret scrubbing.
 
 Both CLI and MCP sends run `message_send` admission against the **recipient**
 scope: deciding webhooks run before insertion, and observers run asynchronously
@@ -399,7 +405,11 @@ The design enforces this on several levels:
   outbox/cancel by the sender coordinate.
 
 On a shared/multi-user server, sending requires the normal write capability, and
-each message records who sent it for audit.
+each message records who sent it for audit. The CLI and the MCP tools apply the
+same per-project grants: `ai-memory message` calls `/messages*` with the
+operator's own key. Listing needs read access to the project. Popping,
+cancelling and receiving a message need write access. Naming a project as the
+sender needs read access to it. The `/admin/messages*` routes remain root-only.
 
 ## On-start "hot context" and the inbox notice
 
@@ -484,3 +494,15 @@ Both notice clients need a server with this release. An older server ignores
 `inbox_only` and still returns only the notice (the clients also send
 `handoff=0&recovery=0&profile_digest=0`), but it republishes the active
 project on each fetch.
+
+### Waking a long-running bot
+
+A bot or other long-running agent that is not a Claude Code session can be
+woken by an observer webhook on `message_send` ([admission
+webhooks](admission-webhooks.md)). Limit the webhook to the bot's project with
+`projects`, and give the bot's endpoint its credential with `headers`, whose
+value the server reads from a file at startup. The webhook's context names the
+queued message (`message_id`), the addressed harness and the sending project,
+never the text, so the bot pops exactly that message with
+`memory_message_pop` and `message_id`. Delivery is best effort: keep a periodic
+`memory_message_list` as the fallback for a dropped event.

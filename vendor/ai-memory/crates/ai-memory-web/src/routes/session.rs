@@ -14,7 +14,7 @@ use ai_memory_store::{ObservationOrder, ObservationPage};
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use super::api::{
@@ -191,6 +191,11 @@ pub(crate) async fn handler(
         project: project.clone(),
         project_href: project_href(&workspace, &project),
         session_href: base.clone(),
+        retrievals_href: crate::templates::retrievals_href(
+            &workspace,
+            &project,
+            &session_id.to_string(),
+        ),
         session_id: session_id.to_string(),
         agent_kind: session.agent_kind,
         started_at: session.started_at,
@@ -224,7 +229,7 @@ pub(crate) async fn handler(
         observations: rows,
     };
     match view.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

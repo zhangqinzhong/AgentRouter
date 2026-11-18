@@ -197,7 +197,7 @@ maybe_warn_outdated() {
 self_upgrade_script() {
   command -v curl >/dev/null 2>&1 || { echo "  curl not found; skipping wrapper self-upgrade" >&2; return 0; }
   # Portable script-path resolution (works without GNU readlink/realpath).
-  local script_dir script_path tmp checksum_file expected_sum actual_sum
+  local script_dir script_path tmp checksum_file expected_sum actual_sum installed_mode
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
   echo "→ checking for wrapper script updates (${script_path})"
@@ -241,7 +241,18 @@ self_upgrade_script() {
     rm -f "${tmp}"
     return 0
   fi
-  chmod +x "${tmp}"
+  # Keep the mode the installed wrapper had. `mktemp` creates the staging file
+  # 0600 on GNU and BSD alike, so `chmod +x` alone would install a 0700
+  # wrapper: invisible to the operator who ran the upgrade, fatal for anyone
+  # else who runs that wrapper from a shared directory. Packaged installs are
+  # 0755, which is also the mode the permission-denied branch below suggests.
+  installed_mode="$(stat -c '%a' "${script_path}" 2>/dev/null || stat -f '%Lp' "${script_path}" 2>/dev/null || true)"
+  case "${installed_mode}" in
+    [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7])
+      chmod "${installed_mode}" "${tmp}" 2>/dev/null || chmod 0755 "${tmp}"
+      ;;
+    *) chmod 0755 "${tmp}" ;;
+  esac
   if ! mv "${tmp}" "${script_path}" 2>/dev/null; then
     echo "  could not replace ${script_path} (permission denied?)"
     echo "  rerun with: sudo install -m 0755 ${tmp} ${script_path}"
@@ -548,8 +559,9 @@ native_host_binary() {
     fi
     if [ -n "${remote_sum}" ] && [ "${remote_sum}" != "${local_sum}" ]; then
       need_refresh=1
+    else
+      touch "${check_file}"
     fi
-    touch "${check_file}"
   fi
 
   if [ "${need_refresh}" -eq 1 ]; then
@@ -592,16 +604,38 @@ native_host_binary() {
         return 1
       }
     fi
-    tar -xzf "${tmp}/${artifact}.tar.gz" -C "${tmp}"
-    [ -x "${tmp}/ai-memory" ] || chmod +x "${tmp}/ai-memory"
-    mv "${tmp}/${artifact}.tar.gz" "${archive}"
-    mv "${tmp}/ai-memory" "${binary}"
+    tar -xzf "${tmp}/${artifact}.tar.gz" -C "${tmp}" || {
+      echo "ai-memory: could not extract the native host-launch client" >&2
+      rm -rf "${tmp}"
+      return 1
+    }
+    if [ ! -f "${tmp}/ai-memory" ] \
+       || { [ ! -x "${tmp}/ai-memory" ] && ! chmod +x "${tmp}/ai-memory"; }; then
+      echo "ai-memory: the native host-launch client archive did not provide a usable executable" >&2
+      rm -rf "${tmp}"
+      return 1
+    fi
+    if [ -d "${binary}" ] || ! mv "${tmp}/ai-memory" "${binary}"; then
+      echo "ai-memory: could not install the native host-launch executable" >&2
+      rm -rf "${tmp}"
+      return 1
+    fi
     # `run` auto-wires hooks through this client, and install-hooks looks for
     # its script bundle beside the binary. Without it, auto-wiring fails for
     # every script-based harness on a host where nothing was staged yet.
     if [ -d "${tmp}/hooks" ]; then
-      rm -rf "${native_dir}/hooks"
-      mv "${tmp}/hooks" "${native_dir}/hooks"
+      if ! rm -rf "${native_dir}/hooks" || ! mv "${tmp}/hooks" "${native_dir}/hooks"; then
+        echo "ai-memory: could not install the native host-launch hook bundle" >&2
+        rm -rf "${tmp}"
+        return 1
+      fi
+    fi
+    # The daily check compares the remote checksum with this archive. Keep
+    # the old archive and timestamp until the verified payload is installed.
+    if [ -d "${archive}" ] || ! mv "${tmp}/${artifact}.tar.gz" "${archive}"; then
+      echo "ai-memory: could not cache the native host-launch client archive" >&2
+      rm -rf "${tmp}"
+      return 1
     fi
     rm -rf "${tmp}"
     touch "${check_file}"

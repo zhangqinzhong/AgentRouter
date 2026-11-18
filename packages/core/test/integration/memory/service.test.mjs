@@ -37,7 +37,7 @@ test("memory 3.2.5 data migrates to the bundled runtime with pages and authentic
     execFileSync(previousRuntime, ["--data-dir", dataDir, "write-page", "--workspace", "upgrade", "--project", "fixture", "--path", "notes/preserved.md", "--body", "# Preserved\nOld-version migration evidence."], { env, stdio: "pipe" });
     const stopped = new Promise(resolve => child.once("exit", resolve)); child.kill("SIGTERM"); await stopped; child = undefined;
     const status = await service.request({ action: "start" });
-    assert.equal(status.version, "3.4.5");
+    assert.equal(status.version, "3.5.0");
     assert.equal((await fetch(`${endpoint}/api/v1/projects`)).status, 401);
     const page = await service.request({ action: "read", request: { resource: "page", scope: { workspace: "upgrade", project: "fixture" }, path: "notes/preserved.md" } });
     assert.match(page.body_markdown, /Old-version migration evidence/);

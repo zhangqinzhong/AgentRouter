@@ -67,7 +67,7 @@ async fn message_evidence_is_bounded_at_the_store_boundary() {
     let b = project(&store, "default", "project-b").await;
     let mut measured = message(a, b, "the benchmark improved");
     measured.nature = MessageNature::Measured;
-    measured.evidence = Some("x".repeat(2_000));
+    measured.evidence = Some("x".repeat(8_000));
     store.writer.insert_message(measured).await.unwrap();
 
     let listed = store
@@ -75,7 +75,7 @@ async fn message_evidence_is_bounded_at_the_store_boundary() {
         .list_messages(b.0, b.1, MessageBox::Inbox, 50)
         .await
         .unwrap();
-    assert_eq!(listed[0].evidence.as_deref().unwrap().len(), 1_000);
+    assert_eq!(listed[0].evidence.as_deref().unwrap().len(), 4 * 1024);
 }
 
 #[tokio::test]
@@ -778,4 +778,292 @@ async fn collected_or_cancelled_mail_cannot_be_taken_for_editing() {
                 .is_none()
         );
     }
+}
+
+/// A message whose body is within the published 8 000-character budget must
+/// survive the store boundary whole, on both the insert and the edit-save
+/// paths. The store field cap used to reuse the 16 KiB handoff budget, which
+/// silently truncated multibyte bodies well inside that character budget
+/// (#2241); the dedicated 32 KiB message cap holds 8 000 characters even at
+/// UTF-8's four-byte worst case.
+#[tokio::test]
+async fn a_message_within_the_character_budget_is_not_truncated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+
+    // 6 000 three-byte characters plus a tail sentinel: 18 015 bytes, over the
+    // old 16 KiB cap that would have cut the sentinel off.
+    let three_byte = format!("{}{}", "界".repeat(6000), " FINAL-SENTINEL");
+    assert_eq!(three_byte.chars().count(), 6015);
+    assert!(three_byte.len() > 16 * 1024 && three_byte.len() < 32 * 1024);
+
+    // insert_message path.
+    let id = store
+        .writer
+        .insert_message(message(a, b, &three_byte))
+        .await
+        .unwrap();
+    let popped = store
+        .writer
+        .pop_message(claim(b), Some(id))
+        .await
+        .unwrap()
+        .expect("the message is in the inbox");
+    assert_eq!(
+        popped.body, three_byte,
+        "insert_message must not truncate a body inside the character budget"
+    );
+
+    // finish_message_edit path, worst case: 8 000 four-byte characters =
+    // 32 000 bytes, the largest a body within the 8 000-character budget can
+    // be, still under the 32 KiB cap.
+    let four_byte = "𝐀".repeat(8000);
+    assert_eq!(four_byte.chars().count(), 8000);
+    assert_eq!(four_byte.len(), 32_000);
+
+    let edit_id = store
+        .writer
+        .insert_message(message(a, b, "placeholder"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_message_edit(b.0, b.1, edit_id)
+        .await
+        .unwrap()
+        .expect("a pending message can be held");
+    assert!(
+        store
+            .writer
+            .finish_message_edit(b.0, b.1, edit_id, Some((None, four_byte.clone())))
+            .await
+            .unwrap()
+    );
+    let edited = store
+        .writer
+        .pop_message(claim(b), Some(edit_id))
+        .await
+        .unwrap()
+        .expect("the saved message is back in the queue");
+    assert_eq!(
+        edited.body, four_byte,
+        "finish_message_edit must not truncate a body inside the character budget"
+    );
+}
+
+/// Evidence within the published 1 000-character budget (even at UTF-8's
+/// four-byte worst case plus an MCP character-cap notice) must survive the
+/// store boundary intact (#2283).
+#[tokio::test]
+async fn message_evidence_within_character_budget_is_not_truncated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+
+    // 500 three-byte characters plus a tail sentinel: 1 515 bytes, well over
+    // the old 1 000-byte cap.
+    let three_byte = format!("{} FINAL-SENTINEL", "界".repeat(500));
+    assert_eq!(three_byte.chars().count(), 515);
+    assert!(three_byte.len() > 1_000 && three_byte.len() < 4 * 1024);
+
+    let mut first = message(a, b, "multibyte evidence");
+    first.nature = MessageNature::Measured;
+    first.evidence = Some(three_byte.clone());
+    let first_id = store.writer.insert_message(first).await.unwrap();
+    let first_popped = store
+        .writer
+        .pop_message(claim(b), Some(first_id))
+        .await
+        .unwrap()
+        .expect("the first message is in the inbox");
+    assert_eq!(first_popped.evidence.as_deref(), Some(three_byte.as_str()));
+
+    // Worst case: 1 000 four-byte characters (4 000 bytes) plus an MCP
+    // character-cap notice, still under the 4 KiB store cap.
+    let four_byte_capped = format!(
+        "{}\n[message evidence truncated; 500 chars omitted]",
+        "𝐀".repeat(1_000)
+    );
+    assert!(four_byte_capped.len() > 4_000 && four_byte_capped.len() <= 4 * 1024);
+
+    let mut second = message(a, b, "four-byte evidence");
+    second.nature = MessageNature::Measured;
+    second.evidence = Some(four_byte_capped.clone());
+    let second_id = store.writer.insert_message(second).await.unwrap();
+    let second_popped = store
+        .writer
+        .pop_message(claim(b), Some(second_id))
+        .await
+        .unwrap()
+        .expect("the second message is in the inbox");
+    assert_eq!(
+        second_popped.evidence.as_deref(),
+        Some(four_byte_capped.as_str())
+    );
+}
+
+#[tokio::test]
+async fn list_messages_after_pages_without_gaps_or_overlap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    for i in 0..5 {
+        store
+            .writer
+            .insert_message(message(a, b, &format!("message {i}")))
+            .await
+            .unwrap();
+    }
+    let all = store
+        .reader
+        .list_messages(b.0, b.1, MessageBox::Inbox, 50)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 5);
+
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .reader
+            .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, after)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "the page ignored its limit");
+        after = page.last().map(|m| m.id);
+        paged.extend(page.into_iter().map(|m| m.id));
+    }
+    assert_eq!(
+        paged,
+        all.iter().map(|m| m.id).collect::<Vec<_>>(),
+        "paging must cover the queue once, in order"
+    );
+
+    let unknown = ai_memory_core::MessageId::new();
+    let empty = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, Some(unknown))
+        .await
+        .unwrap();
+    assert!(
+        empty.is_empty(),
+        "an unknown cursor must not page another mailbox"
+    );
+}
+
+/// The list hands out the ids `pop` and `cancel` consume, so the message a
+/// cursor names can leave the queue before the next page. Its place in its own
+/// mailbox still holds, while a cursor from another mailbox stays an empty page
+/// whether that message is pending or consumed (#2356).
+#[tokio::test]
+async fn list_messages_after_keeps_its_place_once_the_cursor_is_consumed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    let c = project(&store, "default", "project-c").await;
+    // Sent first, so a cursor resolved outside B's mailbox would page all of it.
+    let foreign = store
+        .writer
+        .insert_message(message(a, c, "for project c"))
+        .await
+        .unwrap();
+    for i in 0..5 {
+        store
+            .writer
+            .insert_message(message(a, b, &format!("message {i}")))
+            .await
+            .unwrap();
+    }
+    let all: Vec<_> = store
+        .reader
+        .list_messages(b.0, b.1, MessageBox::Inbox, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(all.len(), 5);
+
+    // Inbox: the recipient pops the last message of the first page by id.
+    let first = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, None)
+        .await
+        .unwrap();
+    let cursor = first.last().map(|m| m.id).unwrap();
+    assert_eq!(cursor, all[1]);
+    store
+        .writer
+        .pop_message(claim(b), Some(cursor))
+        .await
+        .unwrap()
+        .expect("the cursor's message is popped");
+    let next: Vec<_> = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, Some(cursor))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        next,
+        all[2..4].to_vec(),
+        "a popped cursor must not end the paging"
+    );
+
+    // Outbox: the sender cancels the message its cursor names.
+    let cancelled = store
+        .writer
+        .cancel_messages(a.0, a.1, Some(all[3]))
+        .await
+        .unwrap();
+    assert_eq!(cancelled, 1);
+    let rest: Vec<_> = store
+        .reader
+        .list_messages_after(a.0, a.1, MessageBox::Outbox, 2, Some(all[3]))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        rest,
+        vec![all[4]],
+        "a cancelled cursor must not end the paging"
+    );
+
+    // A cursor from C's inbox never pages B's, pending or consumed.
+    let page = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 50, Some(foreign))
+        .await
+        .unwrap();
+    assert!(
+        page.is_empty(),
+        "a pending foreign cursor must not page B's inbox"
+    );
+    store
+        .writer
+        .pop_message(claim(c), Some(foreign))
+        .await
+        .unwrap()
+        .expect("project c pops its own message");
+    let page = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 50, Some(foreign))
+        .await
+        .unwrap();
+    assert!(
+        page.is_empty(),
+        "a consumed foreign cursor must not page B's inbox"
+    );
 }

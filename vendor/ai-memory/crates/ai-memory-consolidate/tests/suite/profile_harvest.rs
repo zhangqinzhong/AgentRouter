@@ -17,7 +17,10 @@ use ai_memory_core::{
     ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, NewUser, ObservationKind,
     PagePath, ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, UserRole, WorkspaceId,
 };
-use ai_memory_llm::{ChatRequest, ChatResponse, LlmError, LlmProvider, LlmResult};
+use ai_memory_llm::{
+    ChatRequest, ChatResponse, LlmError, LlmOperationId, LlmProvider, LlmResult, LlmSubject,
+    LlmWorkload,
+};
 use ai_memory_store::{AccessMode, ProjectProfileFlags, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use tempfile::TempDir;
@@ -97,6 +100,7 @@ async fn say(
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: owner.map(|name| IdentityKey::User(name.into()).storage_key()),
+            origin: None,
         })
         .await
         .unwrap();
@@ -1283,8 +1287,15 @@ struct FakeProfileLlm {
     /// Report `changed: false` from the merge: the evidence only corroborates.
     merge_unchanged: bool,
     fail: bool,
+    /// Answer a classification of at least this many sentences as cut at
+    /// the output budget.
+    truncate_from: Option<usize>,
     seen: Arc<Mutex<Vec<String>>>,
     budgets: Arc<Mutex<Vec<(String, u32)>>>,
+    /// `("classify" | "merge", operation id)` for every structured call.
+    operations: Arc<Mutex<Vec<(String, LlmOperationId)>>>,
+    /// Sentence count of every classification call, in order.
+    classify_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
 #[async_trait::async_trait]
@@ -1327,6 +1338,13 @@ impl LlmProvider for FakeProfileLlm {
         if system.contains("You classify sentences") {
             let payload = request.messages[0].content.clone();
             let count = payload.matches("\"index\"").count();
+            self.classify_sizes.lock().unwrap().push(count);
+            if self.truncate_from.is_some_and(|from| count >= from) {
+                return Err(LlmError::TruncatedResponse {
+                    model: "fake-model".into(),
+                    completion_tokens: None,
+                });
+            }
             let items: Vec<serde_json::Value> = (0..count)
                 .map(|index| {
                     serde_json::json!({
@@ -1354,6 +1372,123 @@ impl LlmProvider for FakeProfileLlm {
             }))
         }
     }
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        let operation = if request
+            .system
+            .as_deref()
+            .is_some_and(|system| system.contains("You classify sentences"))
+        {
+            "classify"
+        } else {
+            "merge"
+        };
+        self.operations
+            .lock()
+            .unwrap()
+            .push((operation.to_owned(), operation_id));
+        self.complete_structured_raw(request, schema).await
+    }
+}
+
+/// The subject of every `operation` call the fake recorded.
+fn subjects_of(
+    operations: &Mutex<Vec<(String, LlmOperationId)>>,
+    operation: &str,
+) -> Vec<Option<LlmSubject>> {
+    operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name == operation)
+        .inspect(|(_, id)| assert_eq!(id.workload(), LlmWorkload::Profile))
+        .map(|(_, id)| id.subject().cloned())
+        .collect()
+}
+
+/// Classification reads one project and names its author only when every
+/// sentence in the batch has the same one; a private profile's merge acts
+/// for its operator and reads no single scope.
+#[tokio::test]
+async fn profile_operations_name_only_a_single_scope_and_user() {
+    let fx = fixture().await;
+    user(&fx, "alice").await;
+    user(&fx, "bob").await;
+    let shared = project(&fx, "shared").await;
+    say(
+        &fx,
+        shared,
+        Some("alice"),
+        ObservationKind::UserPrompt,
+        "Always use pnpm in every project.",
+        1,
+    )
+    .await;
+    say(
+        &fx,
+        shared,
+        Some("bob"),
+        ObservationKind::UserPrompt,
+        "Always use yarn berry in every project.",
+        2,
+    )
+    .await;
+    let llm = FakeProfileLlm {
+        merge_statement: "Use pnpm for every JavaScript project.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let operations = llm.operations.clone();
+    pass_with(&fx, &multi_user(ProfileShare::User), Arc::new(llm)).await;
+
+    assert_eq!(
+        subjects_of(&operations, "classify"),
+        vec![Some(LlmSubject {
+            workspace: Some("default".into()),
+            project: Some("shared".into()),
+            user: None,
+        })],
+        "a batch mixing operators names no user"
+    );
+    let mut merges = subjects_of(&operations, "merge");
+    merges.sort_by_key(|subject| subject.as_ref().and_then(|s| s.user.clone()));
+    assert_eq!(
+        merges,
+        ["alice", "bob"]
+            .map(|name| Some(LlmSubject {
+                user: Some(name.into()),
+                ..LlmSubject::default()
+            }))
+            .to_vec(),
+    );
+
+    // Control: a batch with one author names that author.
+    let fx = fixture().await;
+    user(&fx, "alice").await;
+    let solo = project(&fx, "solo").await;
+    say(
+        &fx,
+        solo,
+        Some("alice"),
+        ObservationKind::UserPrompt,
+        "Always use pnpm in every project.",
+        1,
+    )
+    .await;
+    let llm = FakeProfileLlm::default();
+    let operations = llm.operations.clone();
+    pass_with(&fx, &multi_user(ProfileShare::User), Arc::new(llm)).await;
+    assert_eq!(
+        subjects_of(&operations, "classify"),
+        vec![Some(LlmSubject {
+            workspace: Some("default".into()),
+            project: Some("solo".into()),
+            user: Some("alice".into()),
+        })],
+    );
 }
 
 /// With a provider, classification normalizes the statement and the merge
@@ -1468,6 +1603,95 @@ async fn a_provider_failure_falls_back_to_the_zero_llm_path() {
             .1
             .contains("Always use pnpm for installs in every project.")
     );
+}
+
+/// A classification cut at the output budget is halved and the halves are
+/// classified, so every sentence still gets an LLM verdict instead of falling
+/// back to the zero-LLM detector.
+#[tokio::test]
+async fn a_truncated_classification_is_split_and_retried() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let body = (0..6)
+        .map(|i| format!("Always run check number {i} before pushing."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    prompt(&fx, alpha, &body, 1).await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(3),
+        merge_statement: "Run the checks before pushing.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let budgets = llm.budgets.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    assert_eq!(report.llm_fallbacks, 0, "{report:?}");
+    // Of the classification calls, only the four that answered count (1 + 2
+    // + 1 + 2 sentences); `llm_calls` also counts the merges.
+    let merges = budgets
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(operation, _)| operation == "merge")
+        .count();
+    assert_eq!(report.llm_calls, 4 + merges, "{report:?}");
+    let sizes = sizes.lock().unwrap();
+    // 6 truncates, then 3 and 3, which split into 1 + 2 each.
+    assert_eq!(*sizes, vec![6, 3, 1, 2, 3, 1, 2], "{sizes:?}");
+}
+
+/// The pass's call cap still holds while splitting: halves it can no longer
+/// pay for fall back to the zero-LLM detector, counted once as a fallback.
+#[tokio::test]
+async fn splitting_stops_at_the_classification_call_cap() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let body = (0..6)
+        .map(|i| format!("Always run check number {i} before pushing."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    prompt(&fx, alpha, &body, 1).await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(2),
+        merge_statement: "Run the checks before pushing.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    // 6, 3, 1, 2, 1, 1, 3, 1: eight calls spend the cap before the last
+    // sentences of the second half get theirs.
+    assert_eq!(
+        *sizes.lock().unwrap(),
+        vec![6, 3, 1, 2, 1, 1, 3, 1],
+        "{report:?}"
+    );
+    assert_eq!(report.llm_fallbacks, 1, "{report:?}");
+}
+
+/// A single sentence whose classification still truncates cannot be split:
+/// it falls back to the zero-LLM detector.
+#[tokio::test]
+async fn a_single_truncated_sentence_falls_back_to_the_zero_llm_path() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(
+        &fx,
+        alpha,
+        "Always use pnpm for installs in every project.",
+        1,
+    )
+    .await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(1),
+        merge_statement: "Use pnpm for installs.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    assert_eq!(report.llm_fallbacks, 1, "{report:?}");
+    assert_eq!(*sizes.lock().unwrap(), vec![1]);
+    // The zero-LLM detector still turns the sentence into an entry.
+    assert_eq!(profile_pages(&fx, "_global").len(), 1, "{report:?}");
 }
 
 /// The core scenario on the LLM path: a habit said loosely in one project is

@@ -404,9 +404,16 @@ impl Wiki {
                 Vec::new(),
             )
             .await?;
+        let (to_agent, from_ws, from_proj) = (
+            message.to_agent,
+            message.from_workspace_id,
+            message.from_project_id,
+        );
         let id = self.writer.insert_message(message).await?;
-        if let Some(ctx) = admission.as_ref() {
-            self.notify_operation_observers(ctx);
+        if let Some(mut ctx) = admission {
+            self.describe_queued_message(&mut ctx, id, to_agent, from_ws, from_proj)
+                .await;
+            self.notify_operation_observers(&ctx);
         }
         Ok(id)
     }
@@ -470,10 +477,56 @@ impl Wiki {
             .writer
             .finish_message_edit(to_workspace_id, to_project_id, id, Some((subject, body)))
             .await?;
-        if saved && let Some(ctx) = admission.as_ref() {
-            self.notify_operation_observers(ctx);
+        if saved && let Some(mut ctx) = admission {
+            ctx.message_id = Some(id.to_string());
+            // The requeued message keeps its sender and harness; read them back
+            // so the observer hears the same fields a first send carries.
+            if let Some(reader) = &self.store_reader
+                && let Ok(Some(message)) = reader
+                    .message_in_mailbox(to_workspace_id, to_project_id, id)
+                    .await
+            {
+                self.describe_queued_message(
+                    &mut ctx,
+                    id,
+                    message.to_agent,
+                    message.origin.from_workspace_id,
+                    message.origin.from_project_id,
+                )
+                .await;
+            }
+            self.notify_operation_observers(&ctx);
         }
         Ok(saved)
+    }
+
+    /// Tell `message_send` observers which message was queued: its id, the
+    /// harness it is addressed to and the sender's names. Never its text, which
+    /// reaches an agent only through a deliberate pop. Every path that queues a
+    /// message calls this between the commit and
+    /// [`Self::notify_operation_observers`], so a bot woken by the webhook gets
+    /// the same fields whichever surface sent the mail.
+    pub async fn describe_queued_message(
+        &self,
+        ctx: &mut AdmissionContext,
+        id: ai_memory_core::MessageId,
+        to_agent: Option<ai_memory_core::AgentKind>,
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+    ) {
+        ctx.message_id = Some(id.to_string());
+        ctx.to_agent = to_agent;
+        if let Some(reader) = &self.store_reader {
+            if let Ok(Some(name)) = reader.workspace_name_by_id(from_workspace_id).await {
+                ctx.from_workspace = Some(name);
+            }
+            if let Ok(Some(name)) = reader
+                .project_name_by_id(from_workspace_id, from_project_id)
+                .await
+            {
+                ctx.from_project = Some(name);
+            }
+        }
     }
 
     /// Attach an embedder. When set, every page-writing path (`write_page`,
@@ -591,6 +644,22 @@ impl Wiki {
         })
         .await
         .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Resolve a checkpoint revision to its immutable commit OID.
+    ///
+    /// Callers that save a pre-operation checkpoint use this before advancing
+    /// HEAD, so a symbolic or relative source keeps its original meaning.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the repository is not confined or `rev` does
+    /// not resolve to a commit.
+    pub async fn resolve_checkpoint_rev(&self, rev: &str) -> WikiResult<String> {
+        let git = self.git.clone();
+        let rev = rev.to_owned();
+        tokio::task::spawn_blocking(move || git.resolve_commit(&rev))
+            .await
+            .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?
     }
 
     /// Parse one page as stored at checkpoint `rev`, without touching the
@@ -1171,6 +1240,25 @@ impl Wiki {
         Ok(())
     }
 
+    /// Load persisted watcher file fingerprints from the store, if a reader is attached.
+    pub(crate) async fn load_file_fingerprints(
+        &self,
+    ) -> WikiResult<Vec<ai_memory_store::WikiFileFingerprintRow>> {
+        let Some(reader) = &self.store_reader else {
+            return Ok(Vec::new());
+        };
+        Ok(reader.load_wiki_file_fingerprints().await?)
+    }
+
+    /// Persist the current watcher file fingerprints to the store.
+    pub(crate) async fn replace_file_fingerprints(
+        &self,
+        rows: Vec<ai_memory_store::WikiFileFingerprintRow>,
+    ) -> WikiResult<()> {
+        self.writer.replace_wiki_file_fingerprints(rows).await?;
+        Ok(())
+    }
+
     /// Write the workspace and project `_meta.md` manifests the first time
     /// this process writes into a scope, so a project that first materializes
     /// *while the server is up* is rebuildable immediately instead of only
@@ -1645,6 +1733,8 @@ impl Wiki {
     /// Delete a single page file. When an admission chain is attached, it is
     /// notified (`op=delete`) BEFORE the file is removed, so a mirror can
     /// `git rm` the same path. A `Reject`-policy webhook aborts the delete.
+    /// Idempotent; returns `true` when a page existed and was removed, `false`
+    /// when the path held no page (nothing was changed).
     ///
     /// # Errors
     /// Returns [`WikiError`] on a filesystem error or a rejecting webhook.
@@ -1655,7 +1745,7 @@ impl Wiki {
         path: &PagePath,
         admission_ctx: Option<AdmissionContext>,
         author_id: Option<ai_memory_core::UserId>,
-    ) -> WikiResult<()> {
+    ) -> WikiResult<bool> {
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.read().await;
         // Same-path writers hold this from file rename through upsert; without
@@ -1675,7 +1765,6 @@ impl Wiki {
             },
         )
         .await
-        .map(|_| ())
     }
 
     /// Delete a page only when `expected_latest_id` is still its latest
@@ -1908,11 +1997,13 @@ impl Wiki {
             PageStoreRemoval::Delete {
                 author_id,
                 expected_latest_id: None,
-            } => self
-                .writer
-                .delete_page(workspace_id, project_id, path.clone(), author_id)
-                .await
-                .map(|()| true),
+            } => {
+                // A hand-edited file can exist before the watcher indexes it.
+                self.writer
+                    .delete_page(workspace_id, project_id, path.clone(), author_id)
+                    .await
+                    .map(|deleted| deleted || quarantined.is_some())
+            }
             PageStoreRemoval::Decay { expected_latest_id } => {
                 self.writer
                     .soft_delete_for_decay_if_latest(
@@ -2837,7 +2928,7 @@ impl Wiki {
         // the only place that can embed a page an external editor created or
         // rewrote. Resolve the pre-upsert latest id (when an embedder and a
         // store reader are both available) so a no-op reindex — the
-        // reconcile pass walks every page every 30s — never re-embeds a
+        // reconcile pass walks every page every 300s — never re-embeds a
         // stable tree; only a genuine new/rewritten version, recognised by
         // `upsert_page` minting a fresh id, does.
         //
@@ -3384,6 +3475,7 @@ impl Wiki {
                     .unwrap_or(false);
             markdown.frontmatter =
                 canonicalize_index_frontmatter(markdown.frontmatter, req.tier, req.pinned);
+            persist_explicit_title(&mut markdown.frontmatter, req.title.as_deref());
             conform_frontmatter_for_disk(
                 &self.abs_path(req.workspace_id, req.project_id, &req.path),
                 req.path.as_str(),
@@ -3739,6 +3831,8 @@ impl Wiki {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
         markdown.frontmatter = canonicalize_index_frontmatter(markdown.frontmatter, tier, pinned);
+        let explicit_title = explicit_title.map(|title| self.sanitizer.scrub(&title));
+        persist_explicit_title(&mut markdown.frontmatter, explicit_title.as_deref());
         conform_frontmatter_for_disk(
             &self.abs_path(workspace_id, project_id, &path),
             path.as_str(),
@@ -3750,8 +3844,6 @@ impl Wiki {
         // mutations and webhooks that rename or restructure the body
         // still get the right title/links extracted.
         let title = explicit_title
-            .clone()
-            .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
         let links =
             crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
@@ -4246,6 +4338,18 @@ fn conform_frontmatter_for_disk_keeping(
     ai_memory_core::okf::stamp_generated_at(&mut markdown.frontmatter, &at);
 }
 
+// An explicit title keeps its existing precedence over webhook changes. It
+// must also live in Markdown, or the watcher replaces the indexed title on its
+// first reindex and creates another version of an otherwise unchanged page.
+fn persist_explicit_title(frontmatter: &mut serde_json::Value, title: Option<&str>) {
+    if let Some(title) = title {
+        if !frontmatter.is_object() {
+            *frontmatter = serde_json::json!({});
+        }
+        frontmatter["title"] = serde_json::Value::String(title.to_string());
+    }
+}
+
 fn canonicalize_index_frontmatter(
     frontmatter: serde_json::Value,
     tier: Tier,
@@ -4398,6 +4502,10 @@ fn rollback_or_inconsistent<E: std::fmt::Display>(
 }
 
 fn quarantine_file(git: &GitAdapter, path: &Path) -> WikiResult<Option<PathBuf>> {
+    // A path with no page at it can still be the parent of other pages.
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Ok(None);
+    }
     let Some(parent) = path.parent() else {
         return Err(WikiError::Io(std::io::Error::other(
             "page path has no parent (cannot quarantine delete)",
@@ -4409,7 +4517,15 @@ fn quarantine_file(git: &GitAdapter, path: &Path) -> WikiResult<Option<PathBuf>>
     let (_file, quarantine) = tmp.keep().map_err(|e| e.error)?;
     git.remove_file_checked(&quarantine)?;
     match git.rename_checked(path, &quarantine) {
-        Ok(()) => Ok(Some(quarantine)),
+        Ok(()) => match std::fs::symlink_metadata(&quarantine) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(quarantine)),
+            metadata => {
+                // An external edit can change the file type during the rename.
+                git.rename_checked(&quarantine, path)?;
+                metadata?;
+                Ok(None)
+            }
+        },
         Err(e) => {
             let _ = git.remove_file_checked(&quarantine);
             Err(e)
@@ -5425,6 +5541,8 @@ mod tests {
                 failure_policy: FailurePolicy::Ignore,
                 events: vec![AdmissionOp::WritePage, AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6622,6 +6740,119 @@ mod tests {
         );
     }
 
+    async fn assert_title_matches_disk_and_reindex(
+        wiki: &Wiki,
+        store: &Store,
+        mut request: WritePageRequest,
+        expected: &str,
+    ) {
+        for batch in [false, true] {
+            request.path = PagePath::new(format!("notes/title-{batch}.md")).unwrap();
+            let id = if batch {
+                wiki.apply_batch(vec![request.clone()]).await.unwrap()[0]
+            } else {
+                wiki.write_page(request.clone()).await.unwrap()
+            };
+            let disk = wiki
+                .read_page(request.workspace_id, request.project_id, &request.path)
+                .unwrap();
+            assert_eq!(
+                derive_title(&disk.frontmatter, &disk.body, &request.path),
+                expected,
+                "disk title (batch={batch})"
+            );
+            let indexed = store.reader.page_meta_by_id(id).await.unwrap().unwrap();
+            assert_eq!(indexed.title, expected, "indexed title (batch={batch})");
+            assert_eq!(
+                wiki.reindex_page(
+                    request.workspace_id,
+                    request.project_id,
+                    request.path.clone()
+                )
+                .await
+                .unwrap(),
+                id,
+                "an unchanged file must not mint another version (batch={batch})"
+            );
+            let rewritten = if batch {
+                wiki.apply_batch(vec![request.clone()]).await.unwrap()[0]
+            } else {
+                wiki.write_page(request.clone()).await.unwrap()
+            };
+            assert_eq!(
+                rewritten, id,
+                "an identical rewrite must remain idempotent (batch={batch})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_titles_survive_admission_and_reindex_for_single_and_batch_writes() {
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/mutate",
+            post(|Json(mut payload): Json<serde_json::Value>| async move {
+                payload["page"]["frontmatter"]["title"] = "Webhook title".into();
+                Json(serde_json::json!({ "page": payload["page"] }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "title-normalizer".into(),
+                url: format!("http://{addr}/mutate"),
+                timeout_ms: 1000,
+                failure_policy: FailurePolicy::Reject,
+                events: vec![AdmissionOp::WritePage],
+                blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
+            }])
+            .unwrap(),
+        );
+        let mut request = req(
+            ws,
+            proj,
+            "notes/title.md",
+            "# Body title\n",
+            serde_json::json!({ "title": "Requested title" }),
+        );
+        request.title = Some("Requested title".into());
+        assert_title_matches_disk_and_reindex(&wiki, &store, request.clone(), "Requested title")
+            .await;
+        request.title = None;
+        assert_title_matches_disk_and_reindex(&wiki, &store, request, "Webhook title").await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_titles_keep_their_precedence_without_admission_for_single_and_batch_writes() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        for frontmatter in [
+            serde_json::Value::Null,
+            serde_json::json!({ "title": "Frontmatter title" }),
+        ] {
+            let mut request = req(ws, proj, "notes/title.md", "# Body title\n", frontmatter);
+            for title in [
+                "Explicit title",
+                "ANTHROPIC_API_KEY=sk-ant-title-fixture-1234567890abcdef",
+            ] {
+                request.title = Some(title.into());
+                let expected = wiki.sanitizer().scrub(title);
+                assert_title_matches_disk_and_reindex(&wiki, &store, request.clone(), &expected)
+                    .await;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn auto_improve_approval_admission_mutation_is_persisted_and_scrubbed() {
         use axum::http::StatusCode;
@@ -6654,6 +6885,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::WritePage],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6783,6 +7016,8 @@ mod tests {
                 failure_policy: FailurePolicy::Ignore,
                 events: vec![AdmissionOp::WritePage],
                 blocking: false,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6845,6 +7080,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::WritePage],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -7002,6 +7239,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -7156,6 +7395,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -7228,6 +7469,8 @@ mod tests {
                 failure_policy: FailurePolicy::Ignore,
                 events: vec![AdmissionOp::Delete],
                 blocking: false,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -7967,6 +8210,97 @@ mod tests {
         );
     }
 
+    /// `page_sources` (V112, #2164) is written in the page-upsert
+    /// transaction: when a later page of the batch fails in SQL, the staged
+    /// files and the sources the earlier page had already recorded go away
+    /// together. Control: the earlier page alone commits file and source.
+    #[tokio::test]
+    async fn apply_batch_rolls_back_page_sources_with_files_when_sql_batch_fails() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let session = ai_memory_core::SessionId::new();
+        let observation = ai_memory_core::ObservationId::new();
+        let db =
+            || rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        {
+            let db = db();
+            db.execute(
+                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+                 VALUES (?1, ?2, ?3, 'codex', '/w', 1)",
+                rusqlite::params![session.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'post-tool-use', 'tool', 'output', 1)",
+                rusqlite::params![
+                    observation.as_bytes(),
+                    session.as_bytes(),
+                    ws.as_bytes(),
+                    proj.as_bytes()
+                ],
+            )
+            .unwrap();
+        }
+        let source_rows = || -> i64 {
+            db().query_row("SELECT COUNT(*) FROM page_sources", [], |row| row.get(0))
+                .unwrap()
+        };
+        let compiled = PagePath::new("batch/compiled.md").unwrap();
+        let compiled_req = || {
+            let mut request = req(
+                ws,
+                proj,
+                compiled.as_str(),
+                "compiled from the session",
+                serde_json::json!({ "title": "Compiled" }),
+            );
+            request.evidence = vec![ai_memory_core::PageEvidence {
+                kind: ai_memory_core::PageEvidenceKind::Session,
+                source_id: session.to_string(),
+                observations: ai_memory_core::SourceObservations::Listed(vec![observation]),
+            }];
+            request
+        };
+        let failing = PagePath::new("batch/failing.md").unwrap();
+        let mut failing_req = req(
+            ws,
+            proj,
+            failing.as_str(),
+            "an unknown author fails the foreign key",
+            serde_json::json!({ "title": "Failing" }),
+        );
+        failing_req.author_id = Some(ai_memory_core::UserId::new());
+
+        let err = wiki
+            .apply_batch(vec![compiled_req(), failing_req])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("FOREIGN KEY") || err.to_string().contains("constraint"),
+            "expected FK failure, got {err}"
+        );
+        assert!(!wiki.abs_path(ws, proj, &compiled).exists());
+        assert!(!wiki.abs_path(ws, proj, &failing).exists());
+        assert_eq!(source_rows(), 0, "no source outlives the rollback");
+
+        wiki.apply_batch(vec![compiled_req()]).await.unwrap();
+        assert!(wiki.abs_path(ws, proj, &compiled).exists());
+        assert_eq!(source_rows(), 1);
+    }
+
     #[tokio::test]
     async fn apply_batch_runs_admission_and_scrubs_webhook_mutations() {
         use crate::admission::{
@@ -8016,6 +8350,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::Consolidate],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -8105,6 +8441,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::Consolidate],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -8312,6 +8650,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
 
@@ -9573,6 +9913,106 @@ mod tests {
         );
     }
 
+    /// `delete_page` reports whether it removed a page, even if the watcher
+    /// has not indexed the Markdown yet. An absent path returns `false`.
+    #[tokio::test]
+    async fn delete_page_reports_whether_a_page_existed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", Some("/repo/webapp".into()))
+            .await
+            .unwrap();
+
+        let absent = PagePath::new("profile/workflow/never-push.md").unwrap();
+        assert!(
+            !wiki
+                .delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
+            "deleting a path that holds no page must report nothing was removed"
+        );
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "profile/workflow/never-push.md",
+            "Never push.",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            wiki.delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
+            "deleting an existing page must report it was removed"
+        );
+        assert!(
+            !wiki
+                .delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
+            "deleting the now-gone page again must report nothing was removed"
+        );
+
+        let unindexed = PagePath::new("profile/workflow/hand-edited.md").unwrap();
+        let file = wiki.abs_path(ws, proj, &unindexed);
+        std::fs::write(&file, "# Hand-edited\n").unwrap();
+        assert!(
+            wiki.delete_page(ws, proj, &unindexed, None, None)
+                .await
+                .unwrap(),
+            "deleting an unindexed Markdown page must report it was removed"
+        );
+        assert!(!file.exists());
+
+        let namespace = PagePath::new("profile/workflow").unwrap();
+        let child = wiki.abs_path(ws, proj, &namespace).join("keep.md");
+        std::fs::write(&child, "# Keep\n").unwrap();
+        assert!(
+            !wiki
+                .delete_page(ws, proj, &namespace, None, None)
+                .await
+                .unwrap(),
+            "a directory containing pages is not itself a page"
+        );
+        assert!(child.is_file(), "the child page must remain in place");
+
+        let former_page = PagePath::new("profile/workflow/former-page").unwrap();
+        let latest = wiki
+            .write_page(req(
+                ws,
+                proj,
+                former_page.as_str(),
+                "A page replaced by a directory.",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let former_file = wiki.abs_path(ws, proj, &former_page);
+        std::fs::remove_file(&former_file).unwrap();
+        std::fs::create_dir(&former_file).unwrap();
+        let child = former_file.join("keep.md");
+        std::fs::write(&child, "# Keep\n").unwrap();
+
+        assert!(
+            wiki.delete_page_if_latest(ws, proj, &former_page, latest, None, None)
+                .await
+                .unwrap(),
+            "the indexed page still existed"
+        );
+        assert!(
+            child.is_file(),
+            "deleting the index entry preserves its children"
+        );
+    }
+
     /// #643 end-to-end: stop the server inside the window the issue
     /// describes — a project created after startup, so no backfill has ever
     /// seen it — and `reindex` still rebuilds it from the wiki tree alone.
@@ -9864,6 +10304,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::ClaudeCode,
                 cwd: Some("/repo/src".into()),
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -10101,6 +10542,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::Codex,
                 cwd: None,
                 actor_user: Some("user:purge-owner".into()),
+                origin: None,
             })
             .await
             .unwrap();

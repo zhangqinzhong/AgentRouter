@@ -407,6 +407,22 @@ impl OpenCodeResponsesProvider {
         let response = self
             .post(&self.build_request(&request, Some(text)), operation_id)
             .await?;
+        // An output-budget stop can arrive before any visible text. Keep it
+        // distinct so callers can split structured batches instead of parsing
+        // partial JSON or treating the answer as empty.
+        // https://developers.openai.com/api/docs/guides/reasoning#allocating-space-for-reasoning
+        if response.status.as_deref() == Some("incomplete")
+            && response
+                .incomplete_details
+                .as_ref()
+                .and_then(|details| details.reason.as_deref())
+                == Some("max_output_tokens")
+        {
+            return Err(LlmError::TruncatedResponse {
+                model: self.model.clone(),
+                completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+            });
+        }
         // No content at all is a distinct terminal failure, not a JSON parse
         // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
         // an empty string to serde, so the caller saw "EOF while parsing a value
@@ -528,9 +544,19 @@ struct ResponsesReasoning {
 struct ResponsesResponse {
     model: String,
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    incomplete_details: Option<ResponsesIncompleteDetails>,
+    #[serde(default)]
     output: Vec<ResponsesOutputItem>,
     #[serde(default)]
     usage: Option<ResponsesUsage>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -809,18 +835,23 @@ mod tests {
                     request_timeout_secs: 5,
                     reasoning_effort: Some(ReasoningEffort::High),
                     extra_headers: ExtraHeaders::parse(["x-test: routed"]).unwrap(),
+                    request_metadata_headers: false,
                 })
                 .unwrap();
                 let operation_id = LlmOperationId::new();
                 let request = ChatRequest::user_prompt("hello");
                 let response = provider
-                    .complete_with_operation_id(request.clone(), operation_id)
+                    .complete_with_operation_id(request.clone(), operation_id.clone())
                     .await
                     .unwrap();
                 assert_eq!(response.model, model);
                 let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]});
                 let result = provider
-                    .complete_structured_raw_with_operation_id(request, schema, operation_id)
+                    .complete_structured_raw_with_operation_id(
+                        request,
+                        schema,
+                        operation_id.clone(),
+                    )
                     .await
                     .unwrap();
                 assert_eq!(result, json!({"ok": true}));
@@ -1119,7 +1150,7 @@ mod tests {
         .unwrap();
         let operation_id = LlmOperationId::new();
         let response = provider
-            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id)
+            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id.clone())
             .await
             .unwrap();
 
@@ -1160,7 +1191,7 @@ mod tests {
         .unwrap();
         let operation_id = LlmOperationId::new();
         let response = provider
-            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id)
+            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id.clone())
             .await
             .unwrap();
 
@@ -1333,7 +1364,7 @@ mod tests {
         .unwrap();
         let operation_id = LlmOperationId::new();
         provider
-            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id)
+            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id.clone())
             .await
             .unwrap();
 
@@ -1386,7 +1417,7 @@ mod tests {
             .complete_structured_raw_with_operation_id(
                 ChatRequest::user_prompt("emit JSON"),
                 schema,
-                operation_id,
+                operation_id.clone(),
             )
             .await
             .unwrap();

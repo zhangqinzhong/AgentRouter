@@ -151,6 +151,7 @@ async fn seed_session(
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(cwd.into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -598,6 +599,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
             .await
             .unwrap()
     );
+    let commits = state.wiki.git().commit_count();
 
     let resp = post(
         &state,
@@ -606,6 +608,11 @@ async fn move_session_pending_job_or_open_session_needs_force() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused move must not write its pre-move checkpoint"
+    );
     let body = body_json(resp).await;
     assert!(
         body["error"]
@@ -642,6 +649,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -759,6 +767,7 @@ async fn move_session_batch_stops_at_first_error_and_reports_progress() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1108,6 +1117,7 @@ async fn move_session_rehome_of_open_session_needs_no_force() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo/dst".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1160,6 +1170,7 @@ async fn rooted_in_dst_with_stray_page(
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo/dst".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

@@ -123,6 +123,7 @@ async fn seed_ended_session_summary(
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -223,6 +224,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -398,6 +400,8 @@ async fn purge_session_reports_file_cleanup_failure_after_db_commit() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeSession],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -547,6 +551,8 @@ async fn purge_session_dry_run_does_not_dispatch_admission_webhook() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeSession],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -579,6 +585,49 @@ async fn purge_session_dry_run_does_not_dispatch_admission_webhook() {
     assert!(
         outcome.is_err(),
         "a dry run must not dispatch the purge-session admission webhook"
+    );
+}
+
+/// A confirmed purge of a session that is not in the scope answers 404
+/// without telling the admission webhook and without a pre-purge checkpoint.
+#[tokio::test]
+async fn purge_session_unknown_session_is_404_before_admission_and_checkpoint() {
+    let (url, rx) = spawn_capture_hook().await;
+    let tmp = TempDir::new().unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "async-mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::PurgeSession],
+        blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
+    }])
+    .unwrap();
+    let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
+    seed_ended_session_summary(
+        &store,
+        &state.wiki,
+        "default",
+        "audit",
+        SessionId::new(),
+        "uncommitted summary body",
+    )
+    .await;
+    let commits = state.wiki.git().commit_count();
+
+    let resp = post_purge_session(state.clone(), "default", "audit", SessionId::new()).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused purge must not write its pre-purge checkpoint"
+    );
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), rx).await;
+    assert!(
+        outcome.is_err(),
+        "a purge of an unknown session must not dispatch the admission webhook"
     );
 }
 
@@ -879,6 +928,7 @@ async fn purge_session_dry_run_and_confirmed_purge_both_report_collateral_damage
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1280,6 +1330,8 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::PurgeProject],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -1553,6 +1605,8 @@ async fn purge_project_dry_run_does_not_dispatch_admission_webhook() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeProject],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -1660,6 +1714,7 @@ async fn purge_project_dry_run_counts_observations_stamped_from_another_projects
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1803,6 +1858,7 @@ async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();

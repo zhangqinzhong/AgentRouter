@@ -390,6 +390,7 @@ jobs:
       - run: scripts/check-native-packaging.sh
       - run: tests/wrapper_upgrade.sh
       - run: tests/install_sh.sh
+      - run: bash tests/backup_snapshot.sh
 
   # `tests/hooks/test_lib.sh` covers `hooks/_lib.sh`, the POSIX shell bundle —
   # the one shipped surface no Rust job reaches. Its own header says "POSIX
@@ -481,6 +482,21 @@ jobs:
         run: docker build --target runtime-prebuilt-amd64 -f docker/Dockerfile -t ai-memory:ci .
       - name: --version smoke
         run: docker run --rm ai-memory:ci --version
+      - name: container init reaps orphaned helpers
+        run: |
+          test "$(docker image inspect ai-memory:ci --format '{{json .Config.Entrypoint}}')" = '["/usr/bin/tini","--","/usr/local/bin/ai-memory"]'
+          container=$(docker run -d --rm --entrypoint /usr/bin/tini ai-memory:ci -- sh -c 'sh -c "sleep 0.1 & exit 0"; exec sleep 10')
+          trap 'docker kill "$container" >/dev/null 2>&1 || true' EXIT
+          sleep 0.5
+          docker exec "$container" sh -ec '
+            test "$(cat /proc/1/comm)" = tini
+            for status in /proc/[0-9]*/status; do
+              if grep -q "^State:.*Z" "$status" 2>/dev/null; then
+                echo "unreaped child: $status" >&2
+                exit 1
+              fi
+            done
+          '
       - name: bundled hooks present
         run: docker run --rm --entrypoint sh ai-memory:ci -c "ls /usr/local/share/ai-memory/hooks/"
       - name: --help lists the v0.3 subcommands
@@ -525,6 +541,7 @@ jobs:
           --ignore GHSA-m665-v7pm-7grj
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0320
+          --ignore RUSTSEC-2026-0543
       - run: cargo audit --file companions/ai-memory-relay/Cargo.lock
       - run: cargo audit --file companions/ai-memory-importer/Cargo.lock
       - run: cargo audit --file companions/ai-memory-client/Cargo.lock

@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -89,13 +89,14 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "win-custody",
  "windows-registry",
  "zip",
 ]
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -122,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "fluent-bundle",
  "fluent-syntax",
@@ -141,12 +142,15 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
  "ai-memory-llm",
  "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
  "clap",
  "jiff",
  "reqwest 0.12.28",
@@ -165,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -195,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -207,6 +211,7 @@ dependencies = [
  "jiff",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "rstest",
  "schemars",
  "secrecy",
@@ -225,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -262,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -290,14 +295,14 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "socket2",
 ]
 
 [[package]]
 name = "ai-memory-web"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -324,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -351,12 +356,13 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "winapi-util",
 ]
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.4.5"
+version = "3.5.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -2488,9 +2494,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "libc",
@@ -3064,16 +3070,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.14"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4958,6 +4964,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "win-custody"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "399f5ddc7e473b74abf5633e31c84917491aa6cf0418ab310dd936645024dbfc"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

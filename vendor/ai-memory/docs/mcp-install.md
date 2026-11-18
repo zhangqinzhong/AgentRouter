@@ -150,8 +150,9 @@ ai-memory's canonical events when possible:
 ### Hermes Agent
 
 ai-memory ships a first-party Hermes integration: lifecycle hooks and an MCP
-entry, both printed for you to merge into `~/.hermes/config.yaml`
-(`$HERMES_HOME/config.yaml`), which ai-memory never writes.
+entry, both printed for you to merge into the Hermes home's `config.yaml`
+(`$HERMES_HOME`, else `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes`
+elsewhere), which ai-memory never writes.
 
 ```bash
 ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
@@ -179,8 +180,8 @@ install's own, which matters because Hermes passes MCP servers a filtered
 environment without `AI_MEMORY_AUTH_TOKEN`. Hermes is a static client, so the
 model passes `workspace` and `project` on project-scoped calls. `--apply` is
 refused. Hermes does not read MCP server instructions, so the routing rules
-reach the model only through the skills in `~/.hermes/skills` and the handoff
-in the next primary-session turn.
+reach the model only through the skills in the Hermes home's `skills/` and the
+handoff in the next primary-session turn.
 
 The community-maintained
 [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)
@@ -947,8 +948,15 @@ ai-memory install-hooks --agent gemini-cli --apply
 Gemini CLI's lifecycle event names differ from Claude Code's, so use
 `install-hooks --agent gemini-cli` rather than copying another agent's
 settings. ai-memory maps Gemini's `SessionStart`, `SessionEnd`,
-`BeforeTool`, `AfterTool`, and `PreCompress` events to the shared hook
-capture path; `SessionStart` also fetches pending handoffs.
+`BeforeAgent`, `AfterAgent`, `BeforeTool`, `AfterTool`, and `PreCompress`
+events to the shared hook capture path; `SessionStart` also fetches pending
+handoffs. `BeforeAgent` stores each user prompt and `AfterAgent` marks the
+end of each turn. Gemini hands both the prompt with the contents of every
+`@`-referenced file appended; ai-memory keeps only your words, and never
+stores the model's reply that `AfterAgent` carries. The script hooks of the
+Docker wrapper cannot cut the file contents out, so they skip a prompt that
+carries them. Re-run `install-hooks --agent gemini-cli --apply` to add the
+two events to an existing install.
 
 **Gotchas:**
 - Gemini supports stdio too via `command`/`args`, plus SSE via `url`.
@@ -986,9 +994,12 @@ install (every fresh `init`) writes a stdio `ai-memory mcp-bridge
 --no-session-id` entry instead of embedding the bearer, so Qwen is a static
 client: project-scoped calls still need `workspace` and `project`.
 
-The hook installer registers ten events: `SessionStart`, `UserPromptSubmit`,
+The hook installer registers eleven events: `SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`,
-`SessionEnd`, `SubagentStart` and `SubagentStop`. Definitions use an empty
+`StopFailure`, `SessionEnd`, `SubagentStart` and `SubagentStop`. `StopFailure`
+fires instead of `Stop` when an API error or loop detection ends the turn and
+runs the stop event; the turn end is stored as `stop failure: <error>`.
+Definitions use an empty
 `matcher`, which Qwen treats as match-all. Each command receives Qwen's
 Claude-shaped JSON on stdin (`session_id`, `cwd`, `tool_name`, `tool_input`,
 `tool_use_id`) and enforces capture exclusions over Qwen's Gemini-like
@@ -1053,6 +1064,56 @@ native transcript-store contract is documented.
 
 Sources: [Qoder hooks](https://docs.qoder.com/cli/hooks) and
 [Qoder MCP](https://docs.qoder.com/cli/mcp-reference).
+
+---
+
+## WorkBuddy
+
+**Status:** MCP and lifecycle hooks are supported. Managed workstreams and
+transcript backfill are not claimed.
+
+**Config file (MCP):** `~/.workbuddy/mcp.json`, servers under the root
+`mcpServers` map. **Config file (hooks):** `~/.workbuddy/settings.json`, under
+`hooks`. **Skills:** `~/.workbuddy/skills` (global) or `.workbuddy/skills`
+(project).
+
+```bash
+ai-memory install-mcp --client workbuddy --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent workbuddy --apply \
+    --server-url "https://memory.example" --auth-token "$TOKEN"
+ai-memory install-skills --scope global --agent workbuddy
+```
+
+The MCP entry uses Claude Code's shape: `type: "http"`, `url`, and an
+`Authorization: Bearer …` header when an explicit token is given. When the
+install's token lives in `[auth].bearer_token_file`, `install-mcp` writes the
+session-less `mcp-bridge` stdio entry instead, so the token never enters
+`mcp.json`; the bridge forwards no session id, so pass explicit `workspace`
+and `project` on project-scoped calls.
+
+**Trust the new server before using it.** WorkBuddy does not activate a
+newly written MCP entry on its own: open its **custom connector** settings
+(自定义连接器) and approve the added `ai-memory` server. The entry is present
+in `mcp.json` either way, but its tools stay unavailable until that approval.
+
+The hook installer writes CodeBuddy's native commands (no script bundle) for
+six Claude Code-shaped events: `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`. Capture exclusions are
+enforced by the same closed parser that handles Claude Code, and
+`SessionStart` delivers a pending handoff through
+`hookSpecificOutput.additionalContext`.
+
+**WorkBuddy fires no `SessionEnd` event.** `Stop` marks the end of a turn, not
+of the session, so an idle session stays open until you close it:
+
+```bash
+ai-memory finalize-session --agent workbuddy
+```
+
+`ai-memory setup` detects WorkBuddy when `~/.workbuddy` exists, and
+`ai-memory uninstall` removes the hook entries. There is no `ai-memory run
+workbuddy` adapter and no native transcript backfill.
 
 ---
 
@@ -1458,9 +1519,11 @@ fill both in:
   `SessionStart`, stores it in a single per-host slot
   (`<data-dir>/hook-state/devin-session-id`), reuses it for every later
   event, and clears it at `SessionEnd`. Set `AI_MEMORY_SESSION_ID` in the
-  hook environment to pin an externally managed run id instead. Because the
-  slot is per host+agent, two Devin sessions running *concurrently* on the
-  same machine share it: the newest `SessionStart` wins and earlier
+  hook environment to pin an externally managed run id instead. The native,
+  POSIX shell, and PowerShell hooks use that pin without changing the fallback
+  slot, and a pinned `SessionEnd` leaves the slot intact. Because the slot is per host+agent,
+  two unpinned Devin sessions running *concurrently* on the same machine
+  share it: the newest `SessionStart` wins and earlier
   sessions' remaining events are attributed to it (same graceful-degradation
   stance as the single-slot `/handoff` fallback). A payload that does carry
   its own `session_id` always wins over both.
@@ -1544,9 +1607,11 @@ ai-memory install-hooks --agent kimi-code --apply \
     --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-The installed entries cover 10 events (`SessionStart`, `SessionEnd`,
+The installed entries cover 12 events (`SessionStart`, `SessionEnd`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`
 (Kimi Code fires `PostToolUse` on successful calls only), `Stop`,
+`StopFailure` and `Interrupt` (fired in place of `Stop` when an error ends the
+turn or the user interrupts it, stored as failed or interrupted turn ends),
 `SubagentStart`, `SubagentStop`, and `PreCompact`) with a Kimi Code-specific
 script bundle /
 native `ai-memory hook --event … --agent kimi-code` commands (native is the
@@ -2040,7 +2105,10 @@ still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.
 
-Codex and Antigravity `Stop` events are not session ends. Codex's hook install
+Codex and Antigravity `Stop` events are not session ends, and neither is the
+`Interrupt` Codex fires instead of `Stop` when the user interrupts the turn:
+the hook install wires it to the same stop hook and it is stored as an
+`interrupt` turn end. Codex's hook install
 registers native `SessionEnd` for CLI 0.145.0 and later; Antigravity still needs
 explicit finalization. `ai-memory finalize-session` defaults to Codex for older
 clients or a missed native end, while `--agent antigravity-cli` selects

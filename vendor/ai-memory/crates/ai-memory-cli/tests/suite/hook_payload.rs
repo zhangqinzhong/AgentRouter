@@ -175,6 +175,63 @@ fn native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure
 }
 
 #[test]
+fn oversized_native_tool_result_keeps_usage_for_the_next_event() {
+    for agent in ["claude-code", "codex"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        let row = if agent == "claude-code" {
+            serde_json::json!({"type":"assistant","message":{
+                "id":"response-1","usage":{"input_tokens":100,"output_tokens":20}
+            }})
+        } else {
+            serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":20}
+            }}})
+        };
+        std::fs::write(&transcript, format!("{row}\n")).unwrap();
+        let payload = serde_json::json!({
+            "session_id": "oversized-tool-result", "cwd": tmp.path(),
+            "transcript_path": transcript, "tool_name": "Bash",
+            "tool_input": {"command": "echo test"}, "tool_response": "test",
+        });
+        let mut large = payload.clone();
+        // JSON string escaping makes the spool envelope exceed its cap even
+        // though the hook's stdin is well under the 10 MiB limit.
+        large["tool_response"] = "\"".repeat(3 * 1024 * 1024).into();
+        let large = serde_json::to_vec(&large).unwrap();
+        assert!(large.len() < 10 * 1024 * 1024);
+        let endpoint = ai_memory_test_support::dead_http_endpoint();
+        let dropped = run_hook_at(tmp.path(), agent, "post-tool-use", &large, false, &endpoint);
+        assert!(dropped.status.success());
+        assert!(
+            String::from_utf8_lossy(&dropped.stderr).contains("dropping one UNDELIVERED event")
+        );
+        let spool = tmp.path().join("hook-spool");
+        assert!(!spool.exists() || spool_entries(tmp.path()).is_empty());
+
+        let next = run_hook_at(
+            tmp.path(),
+            agent,
+            "post-tool-use",
+            &serde_json::to_vec(&payload).unwrap(),
+            false,
+            &endpoint,
+        );
+        assert!(
+            next.status.success(),
+            "{}",
+            String::from_utf8_lossy(&next.stderr)
+        );
+        let body: serde_json::Value = serde_json::from_str(&spooled_body(tmp.path())).unwrap();
+        assert_eq!(
+            body["_ai_memory_usage_calls"].as_array().map(Vec::len),
+            Some(1),
+            "{agent} must still deliver the unspooled response usage"
+        );
+    }
+}
+
+#[test]
 fn native_hook_reports_live_usage_for_every_supported_event_and_harness() {
     for agent in ["claude-code", "codex"] {
         for event in [
@@ -355,6 +412,68 @@ fn stop_hook_strips_last_assistant_message_from_spool_and_stderr() {
 }
 
 #[test]
+fn gemini_prompt_is_spooled_without_referenced_file_contents() {
+    // Gemini CLI's BeforeAgent `prompt` carries the contents of every
+    // `@`-referenced file after the user's words. The native hook cuts them
+    // before it spools, so they reach neither the disk nor the wire.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"gemini-at","cwd":"/tmp/project","hook_event_name":"BeforeAgent","prompt":"explain @.env\n--- Content from referenced files ---\nContent from @.env:\nAPI_KEY=SENTINEL_FILE_CONTENT\n--- End of content ---"}"#;
+
+    let output = run_hook_full_agent(
+        tmp.path(),
+        "gemini-cli",
+        "user-prompt-submit",
+        payload,
+        false,
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("SENTINEL_FILE_CONTENT"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let body = spooled_body(tmp.path());
+    assert!(
+        !body.contains("SENTINEL_FILE_CONTENT"),
+        "spooled body still carries the referenced file: {body}"
+    );
+    let spooled: serde_json::Value = serde_json::from_str(&body).expect("spooled body is JSON");
+    assert_eq!(spooled["prompt"], "explain @.env");
+    assert_eq!(spooled["session_id"], "gemini-at");
+}
+
+#[test]
+fn gemini_after_agent_is_spooled_without_the_reply_or_its_at_files() {
+    // AfterAgent repeats the expanded prompt and adds the model's reply as
+    // `prompt_response`. Neither the reply nor the referenced file reaches
+    // the spool while assistant capture is off.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"gemini-stop","cwd":"/tmp/project","hook_event_name":"AfterAgent","prompt":"explain @.env\n--- Content from referenced files ---\nAPI_KEY=SENTINEL_FILE_CONTENT\n--- End of content ---","prompt_response":"SENTINEL_ASSISTANT_MESSAGE","stop_hook_active":false}"#;
+
+    let output = run_hook_full_agent(tmp.path(), "gemini-cli", "stop", payload, false);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+
+    let body = spooled_body(tmp.path());
+    for leaked in [
+        "SENTINEL_ASSISTANT_MESSAGE",
+        "prompt_response",
+        "SENTINEL_FILE_CONTENT",
+    ] {
+        assert!(
+            !body.contains(leaked),
+            "spooled body still carries {leaked}: {body}"
+        );
+    }
+    assert!(
+        body.contains("gemini-stop"),
+        "session_id was dropped: {body}"
+    );
+}
+
+#[test]
 fn spool_files_never_leak_the_assistant_field_on_disk() {
     // Byte-level check across the whole spool file (not just the parsed body):
     // neither the value nor the raw key may survive anywhere in the entry.
@@ -467,16 +586,150 @@ fn oversized_core_bodies_are_capped_before_the_local_spool() {
             String::from_utf8_lossy(&output.stderr)
         );
         let body = spooled_body(tmp.path());
-        assert!(
-            !body.contains("TAIL_SENTINEL"),
-            "{event} spool was not capped"
-        );
         let json: serde_json::Value =
             serde_json::from_str(&body).expect("spooled body remains JSON");
         let excerpt = json[field].as_str().expect("body field is text");
         assert!(excerpt.len() <= cap, "{event} exceeded {cap} bytes");
-        assert!(excerpt.ends_with('…'));
+        if event == "user-prompt-submit" {
+            assert!(excerpt.ends_with("TAIL_SENTINEL"));
+            assert!(excerpt.contains("...[truncated "));
+        } else {
+            assert!(!excerpt.contains("TAIL_SENTINEL"));
+            assert!(excerpt.ends_with('…'));
+        }
     }
+}
+
+#[test]
+fn native_capture_selection_preserves_late_results_and_prompt_corrections() {
+    // The native client truncates both the assistant excerpt and the prompt at
+    // the 16 KiB client ceiling (OBSERVATION_BODY_MAX_BYTES); the configured
+    // stored-excerpt cap (#2118) is a server-side trim the spooled client body
+    // does not see. Drive every case past that ceiling so the client truncates
+    // head+tail and the preserved-both-ends assertions below bite.
+    for (agent, event, field, cap) in [
+        ("claude-code", "stop", "last_assistant_message", 16_384),
+        ("codex", "stop", "last_assistant_message", 16_384),
+        ("opencode", "stop", "last_assistant_message", 16_384),
+        ("claude-code", "user-prompt-submit", "prompt", 16_384),
+        ("codex", "user-prompt-submit", "prompt", 16_384),
+        ("opencode", "user-prompt-submit", "prompt", 16_384),
+        (
+            "qwen-code",
+            "user-prompt-submit",
+            "submitted_prompt",
+            16_384,
+        ),
+        ("kimi-code", "user-prompt-submit", "prompt", 16_384),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let text = format!(
+            "INITIAL_DECISION\n{}\nFINAL_CORRECTION",
+            "é🧪".repeat(cap / 3)
+        );
+        let value = if agent == "kimi-code" {
+            serde_json::json!([{"type": "text", "text": text}])
+        } else {
+            serde_json::json!(text)
+        };
+        let payload =
+            serde_json::json!({"session_id": "selected-text", (field): value}).to_string();
+        let output = run_hook_full_agent(
+            tmp.path(),
+            agent,
+            event,
+            payload.as_bytes(),
+            event == "stop",
+        );
+        assert!(output.status.success(), "{agent}/{event}");
+        let entry = spooled_entry(tmp.path());
+        let body: serde_json::Value =
+            serde_json::from_str(entry["body"].as_str().unwrap()).unwrap();
+        let selected = if event == "stop" {
+            assert!(body.get("last_assistant_message").is_none());
+            assert_eq!(body["_ai_memory_assistant"]["version"], 1);
+            assert!(
+                entry["url"]
+                    .as_str()
+                    .unwrap()
+                    .contains("capture_assistant=1")
+            );
+            body["_ai_memory_assistant"]["excerpt"].as_str().unwrap()
+        } else {
+            body[field].as_str().unwrap()
+        };
+        assert!(selected.starts_with("INITIAL_DECISION"), "{agent}/{event}");
+        assert!(selected.ends_with("FINAL_CORRECTION"), "{agent}/{event}");
+        assert!(selected.contains("...[truncated "));
+        assert!(selected.len() <= cap);
+        assert_eq!(body["session_id"], "selected-text");
+    }
+}
+
+#[test]
+fn transcript_prompt_selection_keeps_the_trailing_user_correction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("repo");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join(".ai-memory.toml"), "").unwrap();
+    let conversation = "capture-selection-conversation";
+    let logs = tmp
+        .path()
+        .join(".gemini/antigravity/brain")
+        .join(conversation)
+        .join(".system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript.jsonl");
+    let text = format!("INITIAL_REQUEST\n{}\nFINAL_CORRECTION", "x".repeat(20_000));
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+                "created_at": "2026-10-18T10:00:00Z", "content": text,
+            })
+        ),
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "conversationId": conversation, "workspacePaths": [workspace], "transcriptPath": transcript,
+        "artifactDirectoryPath": logs.parent().unwrap().parent().unwrap(),
+        "executionNum": 0, "terminationReason": "NO_TOOL_CALL", "fullyIdle": true,
+    })
+    .to_string();
+    let output = run_hook_full_agent(
+        tmp.path(),
+        "antigravity-cli",
+        "stop",
+        payload.as_bytes(),
+        false,
+    );
+    assert!(output.status.success());
+    let entries: Vec<serde_json::Value> = spool_entries(tmp.path())
+        .iter()
+        .map(|e| serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap())
+        .collect();
+    let prompts: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["url"].as_str().unwrap().contains("event=user-prompt&"))
+        .collect();
+    assert_eq!(prompts.len(), 1, "one transcript prompt per source record");
+    let body: serde_json::Value =
+        serde_json::from_str(prompts[0]["body"].as_str().unwrap()).unwrap();
+    let selected = body["prompt"].as_str().unwrap();
+    assert!(selected.starts_with("INITIAL_REQUEST") && selected.ends_with("FINAL_CORRECTION"));
+    assert!(selected.contains("...[truncated "));
+    assert!(selected.len() <= ai_memory_hooks::USER_PROMPT_EXCERPT_MAX_BYTES);
+    assert_eq!(body["conversationId"], conversation);
+    assert_eq!(body["occurred_at"], "2026-10-18T10:00:00Z");
+    assert!(body.get("transcriptPath").is_none());
+    assert!(
+        prompts[0]["url"]
+            .as_str()
+            .unwrap()
+            .contains("ingest_key=agy_")
+    );
 }
 
 #[test]
@@ -643,6 +896,122 @@ fn codex_capture_off_does_not_capture_assistant_message() {
     );
     // Unrelated fields survive so the Codex Stop event is still ingested.
     assert!(body.contains("codex-off"), "session_id was dropped: {body}");
+}
+
+// --- Pi assistant-capture runtime (#2240) ----------------------------------
+//
+// Pi is on the direct-HTTP capture path (no native binary in its own hook
+// flow), so its generated extension funnels the Stop event back through
+// `ai-memory hook --agent pi --event stop --capture-assistant` with the reply
+// piped to stdin under `last_assistant_message`. That native invocation is the
+// only sanctioned path into the Rust sanitizer (invariant #6). These cases
+// prove that invocation end-to-end at the client spool — identical wire shape
+// to Codex, the only runtime difference being `--agent pi`.
+
+#[test]
+fn pi_opted_in_stop_captures_and_sanitizes_assistant_message() {
+    // With --capture-assistant, a Pi Stop event spools the sanitized protocol
+    // marker (NOT the raw field), carries capture_assistant=1 on a pi URL, and a
+    // planted secret in the assistant message is redacted before it is spooled.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // AWS access-key shape (AKIA + 16 chars) → redacted by the built-in sanitizer.
+    let secret = format!("AKIA{}", "A".repeat(16));
+    // A unique, non-secret phrase proves the excerpt actually persisted, so the
+    // secret-absence below reflects redaction rather than an empty capture.
+    let survivor = "pi wrapped up the refactor";
+    let payload = serde_json::json!({
+        "session_id": "pi-capture",
+        "cwd": "/tmp/project",
+        "last_assistant_message": format!("{survivor} using key {secret}")
+    })
+    .to_string();
+
+    let output = run_hook_full_agent(tmp.path(), "pi", "stop", payload.as_bytes(), true);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"{}\n");
+
+    let entry = spooled_entry(tmp.path());
+    let body = entry["body"].as_str().expect("spooled body");
+    let url = entry["url"].as_str().expect("spooled url");
+
+    // 1. Captured: the sanitized protocol marker is spliced in, the raw field is
+    //    gone, and the server-gating flag rides the pi URL.
+    assert!(
+        !body.contains("last_assistant_message"),
+        "raw assistant field survived: {body}"
+    );
+    assert!(
+        body.contains("_ai_memory_assistant"),
+        "protocol marker missing from pi capture: {body}"
+    );
+    assert!(
+        body.contains(survivor),
+        "non-secret excerpt did not persist (capture may be empty): {body}"
+    );
+    assert!(
+        url.contains("capture_assistant=1"),
+        "capture flag missing from pi url: {url}"
+    );
+    assert!(url.contains("agent=pi"), "pi agent missing from url: {url}");
+
+    // 2. Sanitized: the planted secret must not survive anywhere in the spool
+    //    file bytes, and the sanitizer's redaction marker must be present.
+    let entries = spool_entries(tmp.path());
+    assert_eq!(entries.len(), 1);
+    let raw_bytes = std::fs::read(entries[0].path()).expect("read spool entry");
+    let raw_text = String::from_utf8_lossy(&raw_bytes);
+    assert!(
+        !raw_text.contains(&secret),
+        "planted secret leaked into the pi spool file bytes"
+    );
+    assert!(
+        body.contains("[REDACTED:aws_key]"),
+        "secret was not redacted in the captured excerpt: {body}"
+    );
+}
+
+#[test]
+fn pi_capture_off_does_not_capture_assistant_message() {
+    // Opt-in gating for Pi: WITHOUT --capture-assistant, the raw field is
+    // stripped defensively, no protocol marker is spliced, and the URL carries no
+    // capture flag — proving the flag actually gates Pi capture.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"pi-off","cwd":"/tmp/project","last_assistant_message":"SENTINEL_ASSISTANT_MESSAGE"}"#;
+
+    let output = run_hook_full_agent(tmp.path(), "pi", "stop", payload, false);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let entry = spooled_entry(tmp.path());
+    let body = entry["body"].as_str().expect("spooled body");
+    let url = entry["url"].as_str().expect("spooled url");
+    assert!(
+        !body.contains("SENTINEL_ASSISTANT_MESSAGE"),
+        "assistant message captured with capture OFF: {body}"
+    );
+    assert!(
+        !body.contains("last_assistant_message"),
+        "raw assistant field key survived: {body}"
+    );
+    assert!(
+        !body.contains("_ai_memory_assistant"),
+        "protocol marker spliced with capture OFF: {body}"
+    );
+    assert!(
+        !url.contains("capture_assistant=1"),
+        "capture flag present with capture OFF: {url}"
+    );
+    // Unrelated fields survive so the Pi Stop event is still ingested.
+    assert!(body.contains("pi-off"), "session_id was dropped: {body}");
 }
 
 // --- Lone UTF-16 surrogate escapes -----------------------------------------

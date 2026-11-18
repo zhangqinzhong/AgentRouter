@@ -62,6 +62,11 @@ const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGE
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
+/// How a launcher started this session (#2180). An orchestrator sets
+/// `AI_MEMORY_SESSION_ORIGIN=automation` so the server can stamp the session
+/// and the profile harvester can skip its prompts. Inherited execution
+/// context, like `AI_MEMORY_RUN_ID`; only a recognised token is forwarded.
+const SESSION_ORIGIN_ENV: &str = "AI_MEMORY_SESSION_ORIGIN";
 /// Per-execution opt-out of the automatic handoff (#1951): a falsy value
 /// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
 const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
@@ -505,6 +510,39 @@ fn sanitize_briefed_key(raw: &str) -> String {
         .collect()
 }
 
+/// `<data_dir>/project-brief/<key>` — the routing query of the last cwd this
+/// session sent for its mid-session project brief (#2103), keyed like the
+/// briefed markers. Session start records the starting query, so a prompt that
+/// stays in the starting project asks nothing, and a later prompt asks only
+/// when the marker routing changed. Bounded; losing it costs one extra
+/// request, which the server answers once per project per session anyway.
+fn project_brief_state_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    data_dir
+        .join("project-brief")
+        .join(briefed_session_key(agent, session_id, cwd))
+}
+
+const PROJECT_BRIEF_STATE_MAX_BYTES: usize = 2048;
+
+fn project_brief_state_matches(path: &Path, routing_qs: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|seen| seen == routing_qs)
+}
+
+fn record_project_brief_state(path: &Path, routing_qs: &str) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if routing_qs.len() > PROJECT_BRIEF_STATE_MAX_BYTES || fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = fs::write(path, routing_qs);
+}
+
 /// `<data_dir>/inbox-notice/<key>` — the last mid-session inbox notice this
 /// session was shown (#1942), keyed like the briefed markers (native session
 /// id when the payload carries one, else a stable hash of agent+cwd, so a
@@ -624,10 +662,14 @@ fn session_id_query_suffix(
     agent: &str,
     event: &str,
     raw: &serde_json::Value,
+    session_id_pin: Option<&str>,
 ) -> String {
     let agent_kind = AgentKind::from_wire(agent);
     if !agent_needs_session_id_state(agent_kind) || payload_has_session_id(raw) {
         return String::new();
+    }
+    if let Some(session_id) = session_id_pin {
+        return format!("&session_id={}", url_encode(session_id));
     }
 
     let session_id = if event == "session-start" {
@@ -810,6 +852,22 @@ fn managed_run_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<Stri
 
 fn managed_run_query_suffix() -> String {
     managed_run_query_suffix_with(env_lookup)
+}
+
+/// `&session_origin=<token>` when the launcher declared a recognised origin via
+/// `AI_MEMORY_SESSION_ORIGIN` (#2180). Validated against the closed set here so
+/// an unknown value never reaches the wire; absent sends nothing, matching an
+/// ordinary interactive session.
+fn session_origin_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
+    env_lookup(SESSION_ORIGIN_ENV)
+        .and_then(|value| ai_memory_core::SessionOrigin::parse_wire(&value))
+        .map_or_else(String::new, |origin| {
+            format!("&session_origin={}", url_encode(origin.as_str()))
+        })
+}
+
+fn session_origin_query_suffix() -> String {
+    session_origin_query_suffix_with(env_lookup)
 }
 
 /// `&auto_handoff=0` when `AI_MEMORY_AUTO_HANDOFF` turns the automatic
@@ -1167,14 +1225,15 @@ fn write_success_response<W: std::io::Write>(
         agent,
         AgentKind::Muse
             | AgentKind::CodeBuddy
+            | AgentKind::WorkBuddy
             | AgentKind::IbmBob
             | AgentKind::QwenCode
             | AgentKind::Qoder
     ) && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
     {
         // Muse and IBM Bob add SessionStart and UserPromptSubmit stdout to the
-        // turn as context, CodeBuddy appends exit-0 stdout of both to the
-        // session, and Qwen Code injects both as tagged model context, so a
+        // turn as context, CodeBuddy and WorkBuddy append exit-0 stdout of both
+        // to the session, and Qwen Code injects both as tagged model context, so a
         // capture-only reply stays empty rather than put `{}` in front of the
         // model on every prompt.
         Ok(())
@@ -1343,12 +1402,31 @@ fn is_compaction_session_start(raw: &serde_json::Value) -> bool {
 /// Muse reports a `compact` source but publishes no output contract for it,
 /// and Cursor runs Claude Code's settings with unverified handling of the
 /// envelope, so neither gets an anchor.
+///
+/// A subagent's compaction gets none either: the anchor quotes the session's
+/// own prompts as the source of truth for the task, and in a subagent that is
+/// the parent's task, not the one it was given.
 fn injects_compaction_anchor(agent: AgentKind, raw: &serde_json::Value) -> bool {
     matches!(
         agent,
         AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid
     ) && is_compaction_session_start(raw)
         && ai_memory_hooks::agent_from_payload(raw) != Some(AgentKind::Cursor)
+        && !fired_in_a_subagent(raw)
+}
+
+/// Whether a hook fired inside a subagent (or an in-process teammate) rather
+/// than in the session's own agent, which share one `session_id`. Claude Code
+/// names it with `agent_id` (<https://code.claude.com/docs/en/hooks>, common
+/// input fields) and sends it on a subagent's `PreCompact` and post-compaction
+/// `SessionStart` since v2.1.323 (changelog: "Fixed `PreCompact`, `PostCompact`
+/// and post-compaction `SessionStart` hooks not receiving `agent_id` and
+/// `agent_type` when a subagent compacts"). `agent_type` alone marks nothing:
+/// it is also set on a main session started with `--agent`.
+fn fired_in_a_subagent(raw: &serde_json::Value) -> bool {
+    raw.get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
 }
 
 /// `GET /recap?mode=anchor`: the session's first and latest operator prompts,
@@ -1465,7 +1543,8 @@ fn hermes_in_gateway(runtime_env: &RuntimeEnv) -> bool {
 /// (`PROFILE_ID_RE` in `hermes_constants.py`) before it becomes a path
 /// component. Profiles live in `<root>/profiles/<name>` (`get_profile_dir` in
 /// `hermes_cli/profiles.py`), where the root is the gateway's `HERMES_HOME`,
-/// else `~/.hermes`; a standalone gateway of a named profile runs with that
+/// else the platform default (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes`
+/// elsewhere); a standalone gateway of a named profile runs with that
 /// profile's directory as its `HERMES_HOME`.
 fn hermes_profile_marker_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Option<String> {
     if !hermes_in_gateway(runtime_env) || runtime_env.ignore_marker() {
@@ -1475,14 +1554,10 @@ fn hermes_profile_marker_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) ->
         *name != HERMES_GATEWAY_HOST_PROFILE
             && crate::commands::path_util::is_hermes_profile_id(name)
     })?;
-    let hermes_home = crate::commands::path_util::agent_config_home(
-        runtime_env.var_os("HERMES_HOME"),
-    )
-    .or_else(|| {
-        runtime_env
-            .home_dir()
-            .map(|home| Path::new(home).join(".hermes"))
-    })?;
+    let hermes_home = crate::commands::path_util::hermes_home(
+        runtime_env,
+        runtime_env.home_dir().map(Path::new),
+    )?;
     let standalone = hermes_home.file_name() == Some(std::ffi::OsStr::new(profile))
         && hermes_home
             .parent()
@@ -1579,6 +1654,12 @@ where
     }
     let agent_kind = AgentKind::from_wire(&args.agent);
     let mut hook_event = HookEvent::parse(&args.event);
+    // As in the script hooks, an execution's explicit id bypasses the shared
+    // fallback slot; a native payload id remains authoritative.
+    let session_id_pin = runtime_env
+        .var_os("AI_MEMORY_SESSION_ID")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty());
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
     // than server configuration. Hooks deliberately bypass Config::load, and
     // the captured runtime env (not a fresh global read) makes it injectable
@@ -1617,10 +1698,15 @@ where
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
         if agent_kind == AgentKind::Devin && hook_event == HookEvent::SessionEnd {
-            clear_session_id(
-                &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
-                agent_kind,
-            );
+            let pinned = session_id_pin.is_some()
+                && parse_hook_payload(payload)
+                    .is_ok_and(|(_, json)| !payload_has_session_id(&json));
+            if !pinned {
+                clear_session_id(
+                    &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+                    agent_kind,
+                );
+            }
         }
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -1638,6 +1724,9 @@ where
             return Ok(());
         }
     };
+    let session_id_pin = session_id_pin
+        .as_deref()
+        .filter(|_| !payload_has_session_id(&json));
     // Read before the Hermes shaping below drops `extra` and `profile`.
     // A delegated child's lifecycle belongs to the parent's session: storing
     // it would open a session nothing ever finalizes, and its first turn
@@ -1736,11 +1825,27 @@ where
         }
         false
     };
+    // Gemini CLI appends the contents of every `@`-referenced file to the
+    // prompt it hands BeforeAgent and AfterAgent. Cut them here, so they never
+    // reach the spool, the wire or a log, whatever `ignore_paths` says about
+    // those files.
+    if ai_memory_hooks::strip_gemini_prompt_expansion(agent_kind, &mut json) {
+        payload = serde_json::to_string(&json)?;
+    }
     if ai_memory_hooks::cap_lifecycle_body_for_client(&mut json, hook_event) {
         payload = serde_json::to_string(&json)?;
     }
     if agent_kind == AgentKind::AntigravityCli
         && ai_memory_hooks::enrich_antigravity_step_output(&mut json, hook_event, home.as_deref())
+    {
+        payload = serde_json::to_string(&json)?;
+    }
+    // The Codex hook supplies the label from the local index, never from stdin.
+    if agent_kind == AgentKind::Codex
+        && json
+            .as_object_mut()
+            .and_then(|body| body.remove(ai_memory_hooks::session_name::MARKER))
+            .is_some()
     {
         payload = serde_json::to_string(&json)?;
     }
@@ -1864,6 +1969,35 @@ where
         writeln!(stdout, "{output}")?;
         return Ok(());
     }
+    // #2122: a generated plugin that forwards a `server = "<profile>"`
+    // repository to the native hook (instead of dropping it) passes the profile
+    // name it read from the marker as `--expected-profile`. Our own route
+    // resolution must land on exactly that profile; anything else — the install
+    // default, a refusal, or a different profile — means the two marker walks
+    // diverged, so fail closed and emit nothing rather than deliver a routed
+    // repository to the wrong server (the same emit-nothing posture a refused
+    // profile below takes).
+    if let Some(expected_raw) = args.expected_profile.as_deref() {
+        let resolved_as_expected = matches!(
+            &route,
+            HookRoute::Profile(resolved)
+                if crate::server_profiles::ProfileName::parse(expected_raw)
+                    .is_some_and(|expected| expected == resolved.name)
+        );
+        if !resolved_as_expected {
+            eprintln!(
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook: this repository did not resolve to the expected \
+                     server profile `{expected_raw}`; nothing was captured or injected"
+                ))
+            );
+            // The agent's empty success envelope — never a handoff, never a
+            // capture — exactly as the refused-profile branch below emits.
+            write_success_response(stdout, agent_kind, hook_event)?;
+            return Ok(());
+        }
+    }
     // #992: a marker that selects a server profile which does not resolve
     // emits nothing — not the event, not a handoff fetch, not a backfill.
     // Delivering to the install default instead would hand one team's
@@ -1948,6 +2082,22 @@ where
         },
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
+    if !external_capture
+        && agent_kind == AgentKind::Codex
+        && hook_event == HookEvent::Stop
+        && json.get("_ai_memory_capture").is_none()
+        && let Some(home) = home.as_deref()
+        && let Some(session_id) = json.get("session_id").and_then(serde_json::Value::as_str)
+        && Some(session_id) == canonical_session_id.as_deref()
+        && let Some(name) = ai_memory_hooks::session_name::codex_marker(
+            &super::agent_plugins::codex_home(home, &|key| runtime_env.var_os(key)),
+            session_id,
+            &spool_policy.sanitize,
+        )
+    {
+        json[ai_memory_hooks::session_name::MARKER] = name;
+        payload = serde_json::to_string(&json)?;
+    }
     let mut live_batch = None;
     // Claude Code runs hooks inside subagents too, tagging their events with
     // `agent_id` while `transcript_path` still names the main session's
@@ -2025,10 +2175,11 @@ where
     let handoff_scoped = policy_cwd.is_some();
     let spool = hook_spool::spool_dir(&dd);
     let mut incremental_background_drain = false;
-    let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
+    let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json, session_id_pin);
     let managed_qs = managed_run_query_suffix();
+    let session_origin_qs = session_origin_query_suffix();
     let auto_handoff_qs = auto_handoff_query_suffix_with(env_lookup);
-    let hook_qs = format!("{qs}{session_qs}{managed_qs}{auto_handoff_qs}");
+    let hook_qs = format!("{qs}{session_qs}{managed_qs}{session_origin_qs}{auto_handoff_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
     // mode is decided without a round-trip: an explicit `--auth-token` is
@@ -2136,7 +2287,10 @@ where
         // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
         // per turn, so its stored id is cleared by `finalize-session` (or
         // overwritten by the next session-start), never by a hook event.
-        if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
+        if AgentKind::from_wire(&args.agent) == AgentKind::Devin
+            && args.event == "session-end"
+            && session_id_pin.is_none()
+        {
             clear_session_id(&dd, AgentKind::Devin);
         }
 
@@ -2239,6 +2393,22 @@ where
                 )
             );
         } else if agent_kind.session_start_injects_handoff() && handoff_scoped {
+            if agent_kind == AgentKind::ClaudeCode
+                && let Some(cwd) = policy_cwd.as_deref()
+            {
+                record_project_brief_state(
+                    &project_brief_state_path(
+                        &dd,
+                        &args.agent,
+                        canonical_session_id.as_deref(),
+                        policy_cwd.as_deref(),
+                    ),
+                    &marker_query_suffix_without_briefing(
+                        cwd,
+                        args.project_strategy.and_then(|s| s.baked()),
+                    ),
+                );
+            }
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
@@ -2445,6 +2615,46 @@ where
         // text. Empty handoff or any fetch error means print nothing at all
         // (kimi ignores empty stdout; warnings go to stderr).
         return Ok(());
+    }
+
+    // user-prompt, Claude Code only: `[routing] brief_on_project_change`
+    // (#2103). A prompt whose marker routes somewhere the session has not
+    // asked about asks `GET /brief` for that project's core brief. The server
+    // owns the opt-in, the "differs from the session's project" test and the
+    // once-per-project record; this side only avoids a request per prompt by
+    // asking when the marker routing changed since the last ask, and only for
+    // a marker-declared project (`project_src=marker`). The envelope is the one
+    // the inbox notice below uses. Cursor runs these hook settings too, so a
+    // Cursor payload gets nothing.
+    if hook_event == HookEvent::UserPrompt
+        && agent_kind == AgentKind::ClaudeCode
+        && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
+        && let Some(cwd) = policy_cwd.as_deref()
+        && let Some(session_id) = canonical_session_id.as_deref()
+    {
+        let routing_qs = marker_query_suffix_without_briefing(
+            cwd,
+            args.project_strategy.and_then(|s| s.baked()),
+        );
+        let asked = project_brief_state_path(&dd, &args.agent, Some(session_id), Some(cwd));
+        if routing_qs.contains("&project_src=marker")
+            && !project_brief_state_matches(&asked, &routing_qs)
+        {
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let brief_url = format!(
+                "{base}/brief?agent={}{routing_qs}&session_id={}&project_change=1",
+                args.agent,
+                url_encode(session_id),
+            );
+            let brief =
+                get_handoff(&client, &brief_url, bearer.as_deref(), handoff_timeout()).await;
+            record_project_brief_state(&asked, &routing_qs);
+            if let Some(brief) = brief {
+                writeln!(stdout, "{}", user_prompt_context_envelope(&brief))?;
+                return Ok(());
+            }
+        }
     }
 
     // user-prompt, Claude Code only: a repository that opted into
@@ -3333,6 +3543,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_origin_env_forwards_only_the_recognised_token() {
+        let lookup = |value: Option<&'static str>| {
+            move |name: &str| {
+                (name == SESSION_ORIGIN_ENV)
+                    .then_some(value)
+                    .flatten()
+                    .map(str::to_owned)
+            }
+        };
+        assert_eq!(
+            session_origin_query_suffix_with(lookup(Some("automation"))),
+            "&session_origin=automation",
+        );
+        assert_eq!(
+            session_origin_query_suffix_with(lookup(Some(" automation "))),
+            "&session_origin=automation",
+        );
+        // An unknown or absent origin forwards nothing, so the server sees an
+        // ordinary interactive session (#2180).
+        for none in [
+            None,
+            Some(""),
+            Some("auto"),
+            Some("Automation"),
+            Some("batch"),
+        ] {
+            assert_eq!(
+                session_origin_query_suffix_with(lookup(none)),
+                "",
+                "{none:?}"
+            );
+        }
+    }
+
     /// The regression this whole change exists for. `inspect` runs only for
     /// tool events, so a gate expressed through `CaptureDisposition` would
     /// leave prompt bodies spooling from a repository that never opted in —
@@ -3521,6 +3766,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -3701,6 +3947,17 @@ mod tests {
             (AgentKind::CodeBuddy, HookEvent::UserPrompt, b"".as_slice()),
             (
                 AgentKind::CodeBuddy,
+                HookEvent::PostToolUse,
+                b"{}\n".as_slice(),
+            ),
+            (
+                AgentKind::WorkBuddy,
+                HookEvent::SessionStart,
+                b"".as_slice(),
+            ),
+            (AgentKind::WorkBuddy, HookEvent::UserPrompt, b"".as_slice()),
+            (
+                AgentKind::WorkBuddy,
                 HookEvent::PostToolUse,
                 b"{}\n".as_slice(),
             ),
@@ -4007,8 +4264,10 @@ mod tests {
             "tool_response": {"success": true, "output": "ok", "error": null}
         });
 
-        let first = session_id_query_suffix(data_dir, "devin", "session-start", &session_start);
-        let second = session_id_query_suffix(data_dir, "devin", "post-tool-use", &post_tool_use);
+        let first =
+            session_id_query_suffix(data_dir, "devin", "session-start", &session_start, None);
+        let second =
+            session_id_query_suffix(data_dir, "devin", "post-tool-use", &post_tool_use, None);
 
         assert!(first.starts_with("&session_id="), "{first}");
         assert_eq!(second, first);
@@ -4065,6 +4324,7 @@ mod tests {
     async fn a_handoff_is_never_claimed_without_a_project_directory() {
         let cases = [
             ("codebuddy", "session-start", serde_json::json!({})),
+            ("workbuddy", "session-start", serde_json::json!({})),
             ("ibm-bob", "session-start", serde_json::json!({})),
             ("qwen-code", "session-start", serde_json::json!({})),
             ("claude-code", "session-start", serde_json::json!({})),
@@ -4287,10 +4547,122 @@ mod tests {
             "hook_event_name": "PostToolUse"
         });
 
-        let suffix = session_id_query_suffix(tmp.path(), "devin", "post-tool-use", &with_session);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "devin", "post-tool-use", &with_session, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::Devin).is_none());
+    }
+
+    #[tokio::test]
+    async fn native_hook_honours_session_id_env_without_replacing_native_ids_or_fallback_state() {
+        for agent in [AgentKind::Devin, AgentKind::Zcode] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            store_session_id(&data_dir, agent, "existing-fallback-session");
+            let payload = serde_json::json!({
+                "cwd": tmp.path(),
+                "hook_event_name": "PostToolUse",
+                "tool_name": "exec",
+                "tool_input": {"command": "printf fixture"},
+                "tool_response": {"success": true, "output": "fixture"}
+            });
+
+            for (pin, native, expected) in [
+                ("launch/a 1", None, Some("launch%2Fa%201")),
+                ("launch-b", None, Some("launch-b")),
+                ("launch-c", Some("native-session"), None),
+                ("", None, Some("existing-fallback-session")),
+                ("   ", None, Some("existing-fallback-session")),
+            ] {
+                let mut payload = payload.clone();
+                if let Some(native) = native {
+                    payload["session_id"] = native.into();
+                }
+                let mut args = devin_hook_args("post-tool-use");
+                args.agent = agent.as_str().into();
+                let mut stdout = Vec::new();
+                run_with_payload_in_home(
+                    Some(data_dir.clone()),
+                    args,
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| panic!("a single tool event must not start a drainer"),
+                    None,
+                    RuntimeEnv::with_process_env_for_tests(&[("AI_MEMORY_SESSION_ID", pin)]),
+                )
+                .await
+                .unwrap();
+
+                let entries = read_spooled_entries(&hook_spool::spool_dir(&data_dir));
+                let entry = entries.last().unwrap();
+                assert_eq!(
+                    query_param(&entry.url, "session_id"),
+                    expected,
+                    "{agent:?}: {pin:?}"
+                );
+                let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                assert_eq!(body.get("session_id").and_then(|id| id.as_str()), native);
+                assert_eq!(stdout, b"{}\n");
+                assert_eq!(
+                    stored_session_id(&data_dir, agent).as_deref(),
+                    Some("existing-fallback-session"),
+                    "an execution's pin must not replace another session's fallback slot"
+                );
+                // Unit-test spools hold at most three entries. Each case has
+                // already inspected its event; keep room for the next one.
+                for file in std::fs::read_dir(hook_spool::spool_dir(&data_dir)).unwrap() {
+                    let path = file.unwrap().path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                    {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_devin_session_end_keeps_the_unrelated_fallback_slot() {
+        for external_capture in [false, true] {
+            for (pin, native, expected) in [
+                ("pinned-run", None, Some("existing-fallback-session")),
+                ("", None, None),
+                ("pinned-run", Some("native-session"), None),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let data_dir = tmp.path().join("data");
+                store_session_id(&data_dir, AgentKind::Devin, "existing-fallback-session");
+                let mut payload = serde_json::json!({"cwd": tmp.path()});
+                if let Some(native) = native {
+                    payload["session_id"] = native.into();
+                }
+                let mut env = vec![("AI_MEMORY_SESSION_ID", pin)];
+                if external_capture {
+                    env.push(("AI_MEMORY_CAPTURE_OWNER", "external-fixture"));
+                }
+                let mut stdout = Vec::new();
+                run_with_payload_in_home(
+                    Some(data_dir.clone()),
+                    devin_hook_args("session-end"),
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| Ok(()),
+                    None,
+                    RuntimeEnv::with_process_env_for_tests(&env),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    stored_session_id(&data_dir, AgentKind::Devin).as_deref(),
+                    expected,
+                    "external={external_capture}, pin={pin:?}, native={native:?}"
+                );
+                assert_eq!(stdout, b"{}\n");
+            }
+        }
     }
 
     #[test]
@@ -4298,7 +4670,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
 
-        let suffix = session_id_query_suffix(tmp.path(), "claude-code", "post-tool-use", &raw);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "claude-code", "post-tool-use", &raw, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::ClaudeCode).is_none());
@@ -4313,9 +4686,9 @@ mod tests {
         let data_dir = tmp.path();
         let bare = serde_json::json!({"hook_event_name": "SessionStart"});
 
-        let first = session_id_query_suffix(data_dir, "zcode", "session-start", &bare);
-        let after_stop = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
-        let next_turn = session_id_query_suffix(data_dir, "zcode", "pre-tool-use", &bare);
+        let first = session_id_query_suffix(data_dir, "zcode", "session-start", &bare, None);
+        let after_stop = session_id_query_suffix(data_dir, "zcode", "stop", &bare, None);
+        let next_turn = session_id_query_suffix(data_dir, "zcode", "pre-tool-use", &bare, None);
 
         assert!(first.starts_with("&session_id="), "{first}");
         assert_eq!(after_stop, first);
@@ -4334,7 +4707,8 @@ mod tests {
             "hook_event_name": "PostToolUse"
         });
 
-        let suffix = session_id_query_suffix(tmp.path(), "zcode", "post-tool-use", &with_session);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "zcode", "post-tool-use", &with_session, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::Zcode).is_none());
@@ -4350,7 +4724,7 @@ mod tests {
         // id is cleared by `finalize-session` (or overwritten by the next
         // session-start), never by Stop.
         let bare = serde_json::json!({"hook_event_name": "Stop"});
-        let _ = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
+        let _ = session_id_query_suffix(data_dir, "zcode", "stop", &bare, None);
 
         assert_eq!(
             stored_session_id(data_dir, AgentKind::Zcode).as_deref(),
@@ -4594,6 +4968,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4637,6 +5012,7 @@ mod tests {
                 project_strategy: None,
                 check_capture: false,
                 capture_assistant: false,
+                expected_profile: None,
                 capture_mode: None,
             };
 
@@ -4692,6 +5068,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4725,6 +5102,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -4807,6 +5185,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4839,6 +5218,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -7471,6 +7851,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7513,6 +7894,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -7545,6 +7927,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7558,6 +7941,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7571,6 +7955,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7584,6 +7969,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -8400,6 +8786,7 @@ mod tests {
                 check_capture: false,
                 capture_assistant: false,
                 capture_mode: None,
+                expected_profile: None,
             };
             let mut stdout = Vec::new();
             run_with_payload_in_home(
@@ -9079,6 +9466,118 @@ mod tests {
         );
         assert_eq!(entries[1].token.as_deref(), Some("tok-b"));
         assert_eq!(entries[1].profile.as_deref(), Some("team-b"));
+    }
+
+    /// `--expected-profile` (#2122): a generated plugin that forwards a routed
+    /// repository to the native hook passes the profile name it read from the
+    /// marker. The native hook captures only when its own route resolution is
+    /// exactly that profile, and emits nothing — no spool entry, no stdout —
+    /// when the two diverge: a different profile, the install default, a
+    /// refused profile, or a malformed name. The matching control proves the
+    /// guard is not a blanket deny. Fails closed if the guard is removed
+    /// (every divergent case would then deliver to some server).
+    #[tokio::test]
+    async fn expected_profile_captures_on_a_match_and_fails_closed_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let work = tmp.path().join("work");
+        let repo_a = repo_with_marker(&work, "a", "server = \"team-a\"\n");
+        let repo_b = repo_with_marker(&work, "b", "server = \"team-b\"\n");
+        let plain = repo_with_marker(&work, "plain", "workspace = \"w\"\n");
+        let unknown = repo_with_marker(&work, "unknown", "server = \"nobody\"\n");
+        register_profile(
+            &data_dir,
+            "team-a",
+            "https://a.example",
+            &[&repo_a],
+            Some("tok-a"),
+        );
+        register_profile(
+            &data_dir,
+            "team-b",
+            "https://b.example",
+            &[&repo_b],
+            Some("tok-b"),
+        );
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+        let spool = hook_spool::spool_dir(&data_dir);
+
+        let expecting = |profile: &str| {
+            let mut args = claude_args("user-prompt-submit", "https://default.example");
+            args.expected_profile = Some(profile.to_string());
+            args
+        };
+
+        // Control: the expected profile is exactly the one the marker resolves
+        // to, so the event is captured to the profile's server with its token.
+        let out = run_prompt(&data_dir, expecting("team-a"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1, "a matching expected-profile captures");
+        assert_eq!(entries[0].profile.as_deref(), Some("team-a"));
+        assert_eq!(entries[0].token.as_deref(), Some("tok-a"));
+        assert!(
+            entries[0].url.starts_with("https://a.example/hook?"),
+            "{}",
+            entries[0].url
+        );
+
+        // Mismatch: the marker resolves to team-a, but team-b was expected.
+        let out = run_prompt(&data_dir, expecting("team-b"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a mismatched profile name spools nothing"
+        );
+
+        // Install default: a repo with no `server` key resolves to the install
+        // default, which is never the expected profile — do not fall back.
+        let out = run_prompt(&data_dir, expecting("team-a"), &plain).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "the install default is not the expected profile"
+        );
+
+        // Refused: the marker selects an unregistered profile (Rejected route).
+        let out = run_prompt(&data_dir, expecting("nobody"), &unknown).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a refused profile route spools nothing"
+        );
+
+        // Malformed name can never equal a validated profile.
+        let out = run_prompt(&data_dir, expecting("Bad/Name"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a malformed expected name captures nothing"
+        );
     }
 
     /// Front door for Meta Muse Code's settings.json hooks (adversarial),
@@ -11196,6 +11695,80 @@ mod tests {
         assert!(recap_requests(&seen).is_empty(), "{seen:?}");
     }
 
+    /// The client only re-asks for a mid-session project brief when the marker
+    /// routing changed, and never records an oversized routing (#2103).
+    #[test]
+    fn project_brief_state_tracks_the_last_marker_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = project_brief_state_path(tmp.path(), "claude-code", Some("s1"), Some("/w/api"));
+        let api = "&project=api&project_src=marker";
+        // Nothing recorded yet, so the first marker-routed prompt asks.
+        assert!(!project_brief_state_matches(&path, api));
+        record_project_brief_state(&path, api);
+        // The same routing on the next prompt matches: the client stays quiet.
+        assert!(project_brief_state_matches(&path, api));
+        // A move into another project changes the routing, so the client re-asks.
+        assert!(!project_brief_state_matches(
+            &path,
+            "&project=web&project_src=marker"
+        ));
+        // An oversized routing is refused, so the file keeps the old value and a
+        // hostile server cannot park unbounded text here.
+        let huge = "x".repeat(PROJECT_BRIEF_STATE_MAX_BYTES + 1);
+        record_project_brief_state(&path, &huge);
+        assert!(!project_brief_state_matches(&path, &huge));
+        assert!(project_brief_state_matches(&path, api));
+    }
+
+    /// A Claude Code prompt whose marker routes to a declared project asks for
+    /// that project's brief; a Cursor payload running the same Claude hook
+    /// settings asks nothing (#2103).
+    #[tokio::test]
+    async fn project_change_brief_skips_a_cursor_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join(".ai-memory.toml"), "project = \"other\"\n").unwrap();
+
+        // Claude Code: the marker routing triggers one project-change brief.
+        let (base, mut requests) = serve_requests("200 OK", "BRIEF-BODY").await;
+        let stdout = run_hook(
+            &tmp.path().join("data-claude"),
+            claude_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "claude-session",
+                "cwd": cwd,
+                "prompt": "hello"
+            }),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&stdout).contains("BRIEF-BODY"));
+        let seen = all_requests(&mut requests).await;
+        assert!(
+            seen.iter().any(|r| r.contains("project_change=1")),
+            "claude prompt must ask for the project brief: {seen:?}"
+        );
+
+        // Cursor runs the same Claude hook settings: it must not ask.
+        let (base2, mut requests2) = serve_requests("200 OK", "BRIEF-BODY").await;
+        let _ = run_hook(
+            &tmp.path().join("data-cursor"),
+            claude_args("user-prompt-submit", &base2),
+            serde_json::json!({
+                "session_id": "cursor-session",
+                "cwd": cwd,
+                "cursor_version": "2.0.0",
+                "prompt": "hello"
+            }),
+        )
+        .await;
+        let seen2 = all_requests(&mut requests2).await;
+        assert!(
+            !seen2.iter().any(|r| r.contains("project_change=1")),
+            "a Cursor payload must not ask for the project brief: {seen2:?}"
+        );
+    }
+
     #[tokio::test]
     async fn recap_server_down_leaves_the_prompt_alone() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11587,6 +12160,30 @@ mod tests {
         ));
     }
 
+    /// Claude Code 2.1.323 sends `agent_id` on a subagent's compaction, and
+    /// the session anchor is the parent's, so no agent injects it there. A
+    /// main session started with `--agent` carries `agent_type` alone and
+    /// keeps its anchor; a blank `agent_id` marks nothing.
+    #[test]
+    fn a_subagent_compaction_gets_no_anchor() {
+        let subagent = serde_json::json!({
+            "source": "compact",
+            "agent_id": "a7",
+            "agent_type": "Explore",
+        });
+        let main_with_agent = serde_json::json!({ "source": "compact", "agent_type": "reviewer" });
+        let blank_id = serde_json::json!({ "source": "compact", "agent_id": " " });
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Droid] {
+            assert!(!injects_compaction_anchor(agent, &subagent), "{agent:?}");
+            assert!(
+                injects_compaction_anchor(agent, &main_with_agent),
+                "{agent:?}"
+            );
+            assert!(injects_compaction_anchor(agent, &blank_id), "{agent:?}");
+        }
+        assert!(is_compaction_session_start(&subagent));
+    }
+
     /// A compaction `SessionStart` from an agent without a verified anchor
     /// contract (Muse, or Cursor running Claude Code's settings) is still
     /// mid-session: it must not claim a pending handoff, recovery snapshot or
@@ -11615,5 +12212,35 @@ mod tests {
             );
             assert!(recap_requests(&seen).is_empty(), "{name}: {seen:?}");
         }
+    }
+
+    /// A subagent's compaction `SessionStart` (Claude Code 2.1.323 adds the
+    /// subagent's `agent_id`) never fetches or prints the parent's anchor and
+    /// claims nothing, while the compaction itself still reaches the server.
+    #[tokio::test]
+    async fn subagent_compact_session_start_fetches_no_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
+        let mut payload = session_start_payload(tmp.path(), "compacted-session", "compact");
+        payload["agent_id"] = "a7".into();
+        payload["agent_type"] = "Explore".into();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("session-start", &base),
+            payload,
+        )
+        .await;
+        let stdout = String::from_utf8_lossy(&stdout);
+        assert!(!stdout.contains("post-compaction anchor"), "{stdout}");
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|r| r.starts_with("GET /handoff")),
+            "a compaction must not claim a handoff: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|r| r.starts_with("POST /hook")),
+            "the compaction itself is still captured: {seen:?}"
+        );
     }
 }

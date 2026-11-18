@@ -407,39 +407,63 @@ pub(crate) fn profile_harvest_projects(
 }
 
 /// User prompts of a project captured after `since`, oldest first, at most
-/// `limit`. Only `user-prompt` observations: tool output is never read.
+/// `limit` plus the rest of the last row's timestamp group, so a mark at that
+/// timestamp skips none of it. Only `user-prompt` observations: tool output is
+/// never read.
 pub(crate) fn profile_prompts_since(
     conn: &Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     since: i64,
     limit: usize,
+    skip_automation: bool,
 ) -> StoreResult<Vec<ProfilePromptRow>> {
     let limit = i64::try_from(limit.clamp(1, PROFILE_HARVEST_BATCH)).unwrap_or(1);
-    let mut stmt = conn.prepare_cached(
-        "SELECT o.session_id, o.created_at, o.body, s.actor_user \
+    // `[profile] harvest_prompts = "interactive"` drops prompts from sessions a
+    // launcher stamped as automation (#2180), so a generated orchestrator brief
+    // is not harvested as the operator's own preference. A row with no session
+    // (NULL-joined) or a NULL origin is an ordinary session and stays in.
+    let origin_filter = if skip_automation {
+        "AND (s.origin IS NULL OR s.origin != ?6) "
+    } else {
+        ""
+    };
+    // A hard `LIMIT ?5` can split a group of same-timestamp rows across batch
+    // boundaries, so the harvest mark advances past rows it never read. The
+    // cutoff CTE finds the timestamp of the limit-th row and keeps every row up
+    // to and including that group, tie-broken by id, so a mark at that
+    // timestamp skips none of it.
+    let sql = format!(
+        "WITH cutoff(at) AS ( \
+           SELECT created_at FROM observations \
+           WHERE workspace_id = ?1 AND project_id = ?2 AND kind = ?3 AND created_at > ?4 \
+           ORDER BY created_at ASC LIMIT 1 OFFSET ?5 - 1) \
+         SELECT o.session_id, o.created_at, o.body, s.actor_user \
          FROM observations o LEFT JOIN sessions s ON s.id = o.session_id \
          WHERE o.workspace_id = ?1 AND o.project_id = ?2 AND o.kind = ?3 \
            AND o.created_at > ?4 \
-         ORDER BY o.created_at ASC LIMIT ?5",
-    )?;
-    let rows = stmt.query_map(
-        params![
-            workspace_id.as_bytes(),
-            project_id.as_bytes(),
-            ai_memory_core::ObservationKind::UserPrompt.as_str(),
-            since,
-            limit
-        ],
-        |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        },
-    )?;
+           AND NOT EXISTS (SELECT 1 FROM cutoff WHERE o.created_at > cutoff.at) {origin_filter}\
+         ORDER BY o.created_at ASC, o.id ASC"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(workspace_id.as_bytes().to_vec()),
+        Box::new(project_id.as_bytes().to_vec()),
+        Box::new(ai_memory_core::ObservationKind::UserPrompt.as_str()),
+        Box::new(since),
+        Box::new(limit),
+    ];
+    if skip_automation {
+        binds.push(Box::new(ai_memory_core::SessionOrigin::Automation.as_str()));
+    }
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
     let mut prompts = Vec::new();
     for row in rows {
         let (session, created_at, body, contributor) = row?;
@@ -457,7 +481,7 @@ pub(crate) fn profile_prompts_since(
 }
 
 /// Curated pages of a project updated after `since`, oldest first, at most
-/// `limit`.
+/// `limit` plus the rest of the last row's timestamp group.
 pub(crate) fn profile_pages_since(
     conn: &Connection,
     workspace_id: WorkspaceId,
@@ -471,14 +495,21 @@ pub(crate) fn profile_pages_since(
         .map(|prefix| format!("pages.path GLOB '{prefix}*'"))
         .collect::<Vec<_>>()
         .join(" OR ");
+    let filter = format!(
+        "pages.workspace_id = ?1 AND pages.project_id = ?2 AND pages.is_latest = 1 \
+         AND pages.updated_at > ?3 AND ({prefixes}){not_expired}",
+        not_expired = not_expired("pages", "?4"),
+    );
     let sql = format!(
-        "SELECT pages.path, pages.title, pages.body, pages.frontmatter_json, pages.updated_at, \
+        "WITH cutoff(at) AS ( \
+           SELECT pages.updated_at FROM pages WHERE {filter} \
+           ORDER BY pages.updated_at ASC LIMIT 1 OFFSET ?5 - 1) \
+         SELECT pages.path, pages.title, pages.body, pages.frontmatter_json, pages.updated_at, \
                 u.username \
          FROM pages LEFT JOIN users u ON u.id = pages.author_id \
-         WHERE pages.workspace_id = ?1 AND pages.project_id = ?2 AND pages.is_latest = 1 \
-           AND pages.updated_at > ?3 AND ({prefixes}){not_expired} \
-         ORDER BY pages.updated_at ASC LIMIT ?5",
-        not_expired = not_expired("pages", "?4"),
+         WHERE {filter} \
+           AND NOT EXISTS (SELECT 1 FROM cutoff WHERE pages.updated_at > cutoff.at) \
+         ORDER BY pages.updated_at ASC, pages.path ASC",
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(

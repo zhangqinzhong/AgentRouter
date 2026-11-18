@@ -297,6 +297,14 @@ pub enum AgentKind {
     /// is appended to the session (#1299).
     #[serde(rename = "codebuddy", alias = "code-buddy")]
     CodeBuddy,
+    /// Tencent WorkBuddy (`workbuddy`). Hooks are Claude Code-shaped
+    /// (PascalCase events; `session_id`, `cwd`, `tool_name` and `tool_input`
+    /// on stdin), and `SessionStart` stdout's
+    /// `hookSpecificOutput.additionalContext` carries the handoff. WorkBuddy
+    /// fires no `SessionEnd` event, so a finished session closes with
+    /// `ai-memory finalize-session --agent workbuddy`.
+    #[serde(rename = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// IBM Bob IDE, whose lifecycle hooks send Claude Code-shaped payloads
     /// but consume `SessionStart` stdout as plain context text.
     #[serde(rename = "ibm-bob", alias = "bob")]
@@ -327,7 +335,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -353,6 +361,7 @@ impl AgentKind {
         Self::Droid,
         Self::Muse,
         Self::CodeBuddy,
+        Self::WorkBuddy,
         Self::IbmBob,
         Self::Dsh,
         Self::Cline,
@@ -390,6 +399,7 @@ impl AgentKind {
             Self::Droid => "droid",
             Self::Muse => "muse",
             Self::CodeBuddy => "codebuddy",
+            Self::WorkBuddy => "workbuddy",
             Self::IbmBob => "ibm-bob",
             Self::Dsh => "dsh",
             Self::Cline => "cline",
@@ -430,6 +440,7 @@ impl AgentKind {
             "droid" | "factory-droid" | "factory_droid" => Self::Droid,
             "muse" | "muse-code" | "musecode" => Self::Muse,
             "codebuddy" | "code-buddy" => Self::CodeBuddy,
+            "workbuddy" | "work-buddy" => Self::WorkBuddy,
             "ibm-bob" | "bob" => Self::IbmBob,
             "dsh" | "deepseek-harness" | "deepseek_harness" => Self::Dsh,
             "cline" | "cline-cli" => Self::Cline,
@@ -492,6 +503,9 @@ impl AgentKind {
     /// against v2.164.0–v2.167.0, #1299), so the native hook fetches the
     /// handoff for it. The fetch stays the built-in SessionStart path; a
     /// separate `GET /handoff` client is not part of the installer.
+    ///
+    /// WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract, so the
+    /// native hook fetches the handoff for it the same way.
     ///
     /// Qwen Code injects `hookSpecificOutput.additionalContext` from
     /// `SessionStart` stdout into the session (Qwen Code hooks reference:
@@ -910,6 +924,35 @@ mod tests {
     }
 
     #[test]
+    fn agent_kind_workbuddy_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::WorkBuddy.as_str(), "workbuddy");
+        for alias in ["workbuddy", "work-buddy"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::WorkBuddy, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::WorkBuddy).unwrap(),
+            "\"workbuddy\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"workbuddy\"").unwrap(),
+            AgentKind::WorkBuddy
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"work-buddy\"").unwrap(),
+            AgentKind::WorkBuddy
+        );
+        assert_eq!(AgentKind::from_wire("workbuddy-2"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("tencent"), AgentKind::Other);
+        // WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract, so
+        // the built-in SessionStart fetch is the delivery path. It fires no
+        // SessionEnd, so a session closes with `finalize-session`.
+        assert!(AgentKind::WorkBuddy.session_start_injects_handoff());
+        assert!(!AgentKind::WorkBuddy.user_prompt_injects_handoff());
+        assert!(!AgentKind::WorkBuddy.post_tool_injects_handoff());
+        assert!(!AgentKind::WorkBuddy.reuses_session_id_after_end());
+    }
+
+    #[test]
     fn agent_kind_ibm_bob_round_trips_and_injects_session_start_handoff() {
         assert_eq!(AgentKind::IbmBob.as_str(), "ibm-bob");
         for alias in ["ibm-bob", "bob"] {
@@ -1198,10 +1241,13 @@ mod tests {
 /// Names Windows reserves regardless of extension: `CON.md` is still the
 /// console device. Windows also treats the superscript digits `¹ ² ³` as
 /// port numbers, so `COM¹` is a serial port too.
+///
+/// The console aliases `CONIN$` and `CONOUT$` are reserved the same way: a
+/// write to `CONOUT$.md` opens the console handle and never creates a file.
 const DOS_DEVICE_NAMES: &[&str] = &[
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
     "com9", "com¹", "com²", "com³", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8",
-    "lpt9", "lpt¹", "lpt²", "lpt³",
+    "lpt9", "conin$", "conout$", "lpt¹", "lpt²", "lpt³",
 ];
 
 /// Whether `stem` (a file name without its extension) is a DOS device name
@@ -1234,6 +1280,29 @@ pub fn is_git_reserved_component(component: &str) -> bool {
     let b = component.as_bytes();
     component.eq_ignore_ascii_case(".git")
         || (b.len() == 5 && b[..4].eq_ignore_ascii_case(b"git~") && (b'1'..=b'4').contains(&b[4]))
+}
+
+/// Prefixes the engine gives its own staging files: `.ai-memory-tmp.` for a
+/// write still in flight (`atomic.rs`, `wiki.rs`) and `.ai-memory-delete.` for
+/// a page parked during a delete (`wiki.rs`).
+///
+/// The watcher and the checkpoint both skip them by file name
+/// (`watcher.rs` `is_tempfile`, `git.rs` `is_in_flight_write`), because each
+/// exists only between a write starting and its rename. A *page* under one of
+/// these names would therefore be written and indexed, then never indexed from
+/// disk and never committed: the markdown tree is the source of truth, and a
+/// page the engine refuses to look at is not in it.
+const ENGINE_STAGING_PREFIXES: &[&str] = &[".ai-memory-tmp.", ".ai-memory-delete."];
+
+/// Returns true when a path component carries one of the engine's staging
+/// prefixes, matched the way the watcher and the checkpoint match it: on the
+/// whole file name, so `.ai-memory-tmpX.md` and `my.ai-memory-tmp.md` are
+/// ordinary pages.
+#[must_use]
+pub fn is_engine_reserved_component(component: &str) -> bool {
+    ENGINE_STAGING_PREFIXES
+        .iter()
+        .any(|prefix| component.starts_with(prefix))
 }
 
 fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryError> {
@@ -1286,6 +1355,14 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
     if is_git_reserved_component(component) {
         return invalid("is reserved by Git for repository metadata and refused in tree entries");
     }
+    // The engine's own staging names are invisible to the watcher and to the
+    // checkpoint, so a page that uses one exists on disk and in the index while
+    // remaining absent from the markdown tree's only durable copy.
+    if is_engine_reserved_component(component) {
+        return invalid(
+            "carries one of the engine's staging prefixes, which the watcher and the checkpoint ignore",
+        );
+    }
     Ok(())
 }
 
@@ -1321,11 +1398,59 @@ mod portable_page_path_tests {
             "notes/a*b.md",
             "notes/a:b.md",
             "notes/a\u{1}b.md",
+            // Windows treats the superscript digits as port numbers too, so
+            // these stay beside the ASCII forms above; deleting them as
+            // "duplicates" would reopen the gap they close.
+            "notes/COM\u{00B9}.md",
+            "notes/com\u{00B2}.md",
+            "notes/LPT\u{00B3}.md",
+            "notes/lpt\u{00B9}.md",
+            // The console aliases resolve to devices on Windows even with an
+            // extension, like the port names above.
+            "notes/CONIN$.md",
+            "notes/CONOUT$.md",
+            "notes/conout$.txt",
         ] {
             let path = PagePath::new(raw).expect("still constructible: reads must keep working");
             assert!(
                 path.ensure_portable().is_err(),
                 "{raw:?} is not portable and must be refused at write time"
+            );
+        }
+    }
+
+    /// The engine's own staging prefixes are skipped by the watcher
+    /// (`is_tempfile`) and by the checkpoint (`is_in_flight_write`), so a page
+    /// created under one is written and indexed but never committed: the
+    /// markdown tree stops being the source of truth for it.
+    #[test]
+    fn engine_staging_prefixes_are_rejected() {
+        for raw in [
+            ".ai-memory-tmp.evil.md",
+            "notes/.ai-memory-tmp.notes.md",
+            ".ai-memory-delete.gone.md",
+            "notes/.ai-memory-delete.gone.md",
+            // The checkpoint matches the prefix before the extension too.
+            ".ai-memory-tmp.md.bak",
+        ] {
+            let path = PagePath::new(raw).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} carries an engine staging prefix and must be refused at write time"
+            );
+        }
+        // Only the leading run is reserved: a name that merely contains the
+        // text, or drops the separator dot, is an ordinary page.
+        for raw in [
+            "notes/ai-memory-tmp.md",
+            "notes/my.ai-memory-tmp.md",
+            "notes/.ai-memory-tmpX.md",
+            "notes/.ai-memory-deleted.md",
+        ] {
+            let path = PagePath::new(raw).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "{raw:?} is an ordinary page and must stay writable"
             );
         }
     }
@@ -1375,6 +1500,13 @@ mod portable_page_path_tests {
             "notes/.gitattributes",
             "notes/github.md",
             "git-notes/index.md",
+            // Only the reserved forms are refused: `com0` is not a port,
+            // `clock$` is an ordinary name on current Windows, and the
+            // console aliases are reserved only with their trailing `$`.
+            "notes/com0.md",
+            "notes/lpt0.md",
+            "notes/clock$.md",
+            "notes/conin.md",
         ] {
             let path = PagePath::new(raw).expect("valid path");
             assert!(

@@ -59,10 +59,14 @@ ai-memory-wikisync sync ... --apply --propagate-deletes
 - `plan` never writes, not even the state file.
 - `export --apply` writes/updates markdown files under `--dest` and prints
   the `git add` / `git commit` / `git push` commands you may run yourself.
-  The tool never runs git, never commits, and never pushes.
+  The tool never runs git, never commits, and never pushes. The printed
+  commands are quoted for a POSIX shell (`/bin/sh`, or Git Bash on Windows),
+  so a `--dest` containing spaces or an apostrophe stays a single argument
+  when copied.
 - `--include FAMILY` is a strict, explicit allowlist of top-level wiki
-  families: a directory (`_rules`, `decisions`, …) or a top-level Markdown
-  page with that stem (`roadmap` selects `roadmap.md`). At least one is
+  families: a directory (`_rules`, `decisions`, …) or the exact filename of a
+  top-level Markdown page (`--include roadmap.md` selects `roadmap.md`;
+  `--include roadmap` does not). At least one is
   required and a bare `*` is refused: only what you name is exported.
 - Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` (plus
   `AI_MEMORY_SERVER_URL` for the server origin). Tokens are never logged
@@ -117,9 +121,10 @@ This section describes `plan` and `export`; `sync` adds the rules under
 
 - **API-only.** Documented read-only `/api/v1` endpoints (incremental
   `recent` listing with cursor paging, single-page reads with
-  `ETag`/`If-None-Match` revalidation; the legacy array listing is
-  accepted as a fallback). No admin routes, and `plan` and `export` never
-  write to the server. `401`/`403`/`404` become clear errors; page count
+  `ETag`/`If-None-Match` revalidation; when a legacy server returns a limited
+  `recent` array, the full `pages` listing is fetched instead). No admin routes,
+  and `plan` and `export` never write to the server. `401`/`403`/`404` become
+  clear errors; page count
   and body size are bounded per run.
 - **Path safety.** Every server-reported path is validated into a
   portable shape (ASCII, no traversal, no dotfiles, no reserved Windows
@@ -204,7 +209,9 @@ Safety rules:
 - **Deletes are opt-in.** Without `--propagate-deletes` a delete is only
   reported, and the page keeps its state entry so the next run reports it
   again. With it, a side is deleted only if it is unchanged since the last
-  sync; a delete against an edit is a conflict like any other. Pages gone
+  sync; a delete against an edit is a conflict like any other. When both
+  server version IDs are available, a newer version conflicts with a
+  repository delete even if only unexported metadata changed. Pages gone
   from both sides drop out of the state.
 - **Delete safety.** More than `--max-deletes` deletes (default 10) refuses
   the whole run. A pinned server page is never deleted unless `--prefer repo`

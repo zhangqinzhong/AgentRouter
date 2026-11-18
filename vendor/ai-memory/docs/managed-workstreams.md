@@ -244,7 +244,7 @@ available through `ai-memory workstream-search`.
 
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
-              [--workstream NAME | --new NAME] [--executable PATH]
+              [--workstream NAME [--or-new] | --new NAME] [--executable PATH]
               [--yolo] [--fresh] [--force-unlock] [--no-exit-prompt] [--profile NAME]
               [--env KEY=VALUE]... [--env-file PATH] [--require-server]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity|copilot]
@@ -255,6 +255,20 @@ The default is the most recently selected workstream for the current repository
 and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
 branching controls; they do not switch harnesses.
+
+`--workstream NAME --or-new` is the "open the workstream for NAME" selector for
+a wrapper that does not want to look the name up first: it selects `NAME` when
+it exists (resume, lease check, chooser, `--fresh` all as usual) and creates it,
+exactly as `--new NAME` would, when the server reports it does not. The run line
+says which branch it took — `selected existing workstream NAME` or `created
+workstream NAME` — so a typo that silently starts a new line of work is visible
+at once. `--or-new` requires `--workstream` and cannot be combined with `--new`.
+The select-or-create is composed from the two existing server calls, so the
+duplicate-name guard stays the only arbiter: if another caller creates `NAME`
+between the miss and the create, that create is refused and `--or-new` selects
+what the other caller made rather than reporting a creation. Without the flag,
+`--workstream` still fails on a missing name and `--new` still fails on a
+duplicate.
 
 List the workstreams available to those selectors without launching a harness:
 
@@ -465,8 +479,9 @@ launch harness for the highlighted row. Each row remembers its choice while you
 navigate. `auto` is the initial choice and preserves bare `ai-memory run`'s
 discovery of the newest usable session; the remaining choices are supported
 harness executables detected in the host `PATH`. Enter launches the displayed
-workstream/harness combination. Escape clears a non-empty search, then cancels
-when the search is empty; Ctrl-C always cancels.
+workstream/harness combination. When the harness exits, including after Ctrl+C,
+the workstream picker reopens with an updated list. Escape clears a non-empty
+search, then returns to the shell when the search is empty; Ctrl-C always cancels.
 
 Just type to filter workstream names with a case-insensitive substring search;
 there is no search mode or prefix key. Results update immediately, and every
@@ -723,7 +738,18 @@ Crush cursors fingerprint every message revision in the newest one-second
 timestamp bucket. This preserves inserts whose UUID sorts below the prior
 cursor and edits whose native timestamp did not advance. Exact recovery ranges
 also retain the captured endpoint fingerprints, so a revision written later in
-that second is not pulled backward into an earlier interval.
+that second is not pulled backward into an earlier interval. Each import reads
+its events and cursor from one SQLite snapshot, so a concurrent native write
+remains available to the next import. Baseline cursor timestamps and revision
+fingerprints also share one snapshot.
+
+OpenCode V1 and OpenCode 2 cursors fingerprint the same way, over the newest
+`time_updated` millisecond bucket. Both native stores stamp `time_updated` with
+`Date.now()` rather than a unique revision number, so an in-place update keeps
+the same `(time_updated, id)` pair; the boundary fingerprints let the next
+export re-emit a same-millisecond revision or lower-id insert without replaying
+unchanged records. A pair-only cursor persisted before these fingerprints still
+deserializes and keeps its original strict id-ordering scan.
 
 Search and tail also return optional `source_record_id` and `metadata` fields.
 The text CLI prints the source record and correlation metadata as escaped JSON;
@@ -937,7 +963,11 @@ An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, Antigravity's `--conversation` / `--continue`, or Copilot's
 `--resume` / `--continue` / `--session-id` / `--connect` wins.
 ai-memory links the selected native session and resets an unrelated adapter
-cursor rather than assuming it belongs to the old session.
+cursor rather than assuming it belongs to the old session. Claude's `--resume`
+also takes a session name or the absolute path of a transcript; neither is the
+session id, so ai-memory links the id the session reports at start. A
+transcript resumed by path from outside `~/.claude/projects` is linked but not
+imported, because the adapter reads only that directory.
 
 When the linked Claude session is a Claude Code background session that is
 still running in the daemon, Claude refuses `--resume <id>` when another flag

@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, AgentMessage, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey,
+    AgentKind, AgentMessage, ApiCredentialId, Handoff, HandoffAcceptance, HandoffId, IdentityKey,
     ManagedRunId, MessageClaim, MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage,
     NewSession, NewSessionUsage, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
-    Sanitized, SessionId, UserId, UserRole, WorkspaceId,
+    Sanitized, SessionDisplayName, SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -43,10 +43,12 @@ use crate::workstream::{
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct StartupContextAcceptance {
     /// The requested single-use handoff changed from open to accepted.
     pub handoff_accepted: bool,
+    /// The handoff as claimed, captured before the claim transaction commits.
+    pub handoff: Option<Handoff>,
     /// The requested managed synchronization packet changed to delivered.
     pub managed_context_accepted: bool,
 }
@@ -82,6 +84,11 @@ pub(crate) enum WriteCmd {
     SetProjectProfileFlags {
         project_id: ProjectId,
         flags: crate::ProjectProfileFlags,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    SetProjectRetrievalCriteria {
+        project_id: ProjectId,
+        criteria: crate::RetrievalCriteria,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     RecordProfileHarvest {
@@ -199,7 +206,7 @@ pub(crate) enum WriteCmd {
         /// Authenticated operator recorded in the `audit_log` row (NULL when
         /// single-user / unauthenticated).
         author_id: Option<ai_memory_core::UserId>,
-        reply: oneshot::Sender<StoreResult<()>>,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     DeletePageIfLatest {
         workspace_id: WorkspaceId,
@@ -276,6 +283,7 @@ pub(crate) enum WriteCmd {
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
+        display_name: Option<SessionDisplayName>,
         reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
     },
     EndAdmittedSession {
@@ -455,6 +463,13 @@ pub(crate) enum WriteCmd {
         session: Option<String>,
         reply: oneshot::Sender<StoreResult<u32>>,
     },
+    /// Record one opt-in per-session retrieval call and its hits, then prune
+    /// the session's history to the newest `retention_cap` records (#2038).
+    RecordRetrievalHistory {
+        record: Box<crate::retrieval_history::NewRetrievalHistory>,
+        retention_cap: u32,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     /// Drop one implicit (query → page) association (#1941).
     ForgetQuerySignal {
         workspace_id: WorkspaceId,
@@ -572,6 +587,11 @@ pub(crate) enum WriteCmd {
     /// the actor. See [`WriterHandle::checkpoint_and_close`].
     Close {
         reply: oneshot::Sender<()>,
+    },
+    /// Atomically replace the persisted wiki file fingerprints table.
+    ReplaceWikiFileFingerprints {
+        rows: Vec<crate::WikiFileFingerprintRow>,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     /// Test seam: read `PRAGMA journal_size_limit` off the writer's own
     /// connection, the only place the pragma is set.
@@ -1106,6 +1126,28 @@ impl WriterHandle {
         self.send(WriteCmd::SetProjectProfileFlags {
             project_id,
             flags,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Persist a project's `[retrieval]` criteria (forwarded from its marker at
+    /// session start). A no-op when they already match; a `None` field clears
+    /// the column back to "inherit the global default".
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn set_project_retrieval_criteria(
+        &self,
+        project_id: ProjectId,
+        criteria: crate::RetrievalCriteria,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetProjectRetrievalCriteria {
+            project_id,
+            criteria,
             reply: tx,
         })
         .await?;
@@ -1745,6 +1787,27 @@ impl WriterHandle {
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
     ) -> StoreResult<HookSessionAdmission> {
+        self.admit_hook_session_event_with_name(
+            session,
+            obs,
+            owner_filter,
+            ingest_key,
+            moved_from_cwd,
+            None,
+        )
+        .await
+    }
+
+    /// Admit an event and apply its optional harness rename in the same transaction.
+    pub async fn admit_hook_session_event_with_name(
+        &self,
+        session: NewSession,
+        obs: Sanitized<NewObservation>,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
+        display_name: Option<SessionDisplayName>,
+    ) -> StoreResult<HookSessionAdmission> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AdmitHookSessionEvent {
             session,
@@ -1752,6 +1815,7 @@ impl WriterHandle {
             owner_filter,
             ingest_key,
             moved_from_cwd,
+            display_name,
             reply: tx,
         })
         .await?;
@@ -2429,6 +2493,27 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record one opt-in per-session retrieval call and its returned hits,
+    /// pruning the session's history to the newest `retention_cap` records. See
+    /// [`crate::retrieval_history::record_retrieval_history`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_retrieval_history(
+        &self,
+        record: crate::retrieval_history::NewRetrievalHistory,
+        retention_cap: u32,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordRetrievalHistory {
+            record: Box::new(record),
+            retention_cap,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Drop one implicit (query → page) association, returning whether a row
     /// was removed. See [`ops::forget_query_page_signal`].
     ///
@@ -2755,6 +2840,17 @@ impl WriterHandle {
             // dropped sender means the actor stopped without answering.
             let _ = rx.await;
         }
+    }
+
+    /// Atomically replace all persisted wiki file fingerprints.
+    pub async fn replace_wiki_file_fingerprints(
+        &self,
+        rows: Vec<crate::WikiFileFingerprintRow>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReplaceWikiFileFingerprints { rows, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
     /// `PRAGMA journal_size_limit` as the writer's connection reports it.
@@ -3189,7 +3285,9 @@ impl WriterHandle {
     /// Delete every version of a page (by path) from the index. The wiki file
     /// removal is the caller's concern; this drops the derived rows so the
     /// page stops appearing in search/recent (the watcher does NOT reconcile
-    /// file deletions — it only handles create/modify events).
+    /// file deletions — it only handles create/modify events). Idempotent;
+    /// returns `true` when a page existed and was removed, `false` for a no-op
+    /// delete of an absent path.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or a
@@ -3200,7 +3298,7 @@ impl WriterHandle {
         project_id: ProjectId,
         path: PagePath,
         author_id: Option<ai_memory_core::UserId>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeletePage {
             workspace_id,
@@ -3907,11 +4005,12 @@ impl WriterHandle {
     /// SessionStart response.
     ///
     /// When a managed run was requested but is no longer claimable, the
-    /// handoff remains open and both result fields are false. `busy_since` is
+    /// handoff remains open and neither context is returned. `busy_since` is
     /// the same cutoff the selection used
     /// ([`crate::ReaderPool::startup_handoff`]), re-applied in the claim's
     /// transaction: a baton whose open source captured anything after it stays
-    /// open.
+    /// open. A successful handoff claim returns its snapshot from that same
+    /// transaction, so a checkpoint refreshed after selection is not lost.
     pub async fn accept_startup_context(
         &self,
         handoff: Option<HandoffAcceptance>,
@@ -4052,6 +4151,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = crate::profile::set_project_profile_flags(&conn, project_id, flags);
                 send_or_warn(reply, result, "set_project_profile_flags");
+            }
+            WriteCmd::SetProjectRetrievalCriteria {
+                project_id,
+                criteria,
+                reply,
+            } => {
+                let result = crate::retrieval_criteria::set_project_retrieval_criteria(
+                    &conn, project_id, criteria,
+                );
+                send_or_warn(reply, result, "set_project_retrieval_criteria");
             }
             WriteCmd::RecordProfileHarvest {
                 workspace_id,
@@ -4438,6 +4547,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 owner_filter,
                 ingest_key,
                 moved_from_cwd,
+                display_name,
                 reply,
             } => {
                 let result = ops::admit_hook_session_event(
@@ -4447,6 +4557,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &owner_filter,
                     ingest_key.as_deref(),
                     moved_from_cwd.as_deref(),
+                    display_name.as_ref(),
                 );
                 send_or_warn(reply, result, "admit_hook_session_event");
             }
@@ -4734,6 +4845,18 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "record_query_page_signal");
             }
+            WriteCmd::RecordRetrievalHistory {
+                record,
+                retention_cap,
+                reply,
+            } => {
+                let result = crate::retrieval_history::record_retrieval_history(
+                    &mut conn,
+                    &record,
+                    retention_cap,
+                );
+                send_or_warn(reply, result, "record_retrieval_history");
+            }
             WriteCmd::ForgetQuerySignal {
                 workspace_id,
                 project_id,
@@ -4938,6 +5061,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 rx.close();
                 while rx.blocking_recv().is_some() {}
                 break;
+            }
+            WriteCmd::ReplaceWikiFileFingerprints { rows, reply } => {
+                let result = replace_wiki_file_fingerprints_tx(&mut conn, &rows);
+                send_or_warn(reply, result, "replace_wiki_file_fingerprints");
             }
             #[cfg(test)]
             WriteCmd::JournalSizeLimit { reply } => {
@@ -5506,17 +5633,36 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     if managed_run_id.is_some() && !managed_context_accepted {
                         return Ok(StartupContextAcceptance::default());
                     }
-                    let handoff_accepted = match handoff {
-                        Some(acceptance) => ops::accept_handoff_in_transaction(
-                            &tx,
-                            &acceptance,
-                            Some(busy_since.as_microsecond()),
-                        )?,
-                        None => false,
+                    let handoff = match handoff {
+                        Some(acceptance)
+                            if ops::accept_handoff_in_transaction(
+                                &tx,
+                                &acceptance,
+                                Some(busy_since.as_microsecond()),
+                            )? =>
+                        {
+                            // Checkpoints refresh an open row in place. Capture
+                            // what the claim consumed, not the earlier selection.
+                            Some(tx.query_row(
+                                "SELECT id, workspace_id, project_id, from_session_id, from_agent, \
+                                        to_agent, cwd, summary, open_questions, next_steps, \
+                                        files_touched, state, created_at, accepted_by, accepted_at, \
+                                        accepted_by_session, owner_user, accepted_by_user, manual \
+                                 FROM handoffs WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+                                rusqlite::params![
+                                    acceptance.handoff_id.as_bytes(),
+                                    acceptance.workspace_id.as_bytes(),
+                                    acceptance.project_id.as_bytes(),
+                                ],
+                                crate::reader::row_to_handoff,
+                            )??)
+                        }
+                        _ => None,
                     };
                     tx.commit()?;
                     Ok(StartupContextAcceptance {
-                        handoff_accepted,
+                        handoff_accepted: handoff.is_some(),
+                        handoff,
                         managed_context_accepted,
                     })
                 })();
@@ -5542,6 +5688,36 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
         }
     }
     tracing::debug!("writer thread exiting cleanly");
+}
+
+fn replace_wiki_file_fingerprints_tx(
+    conn: &mut Connection,
+    rows: &[crate::WikiFileFingerprintRow],
+) -> StoreResult<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM wiki_file_fingerprints", [])?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO wiki_file_fingerprints \
+             (workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for row in rows {
+            stmt.execute(rusqlite::params![
+                row.workspace_id.as_bytes(),
+                row.project_id.as_bytes(),
+                row.path.as_str(),
+                i64::try_from(row.file_len).unwrap_or(i64::MAX),
+                row.mtime_secs,
+                i64::from(row.mtime_nanos),
+                i64::try_from(row.inode).unwrap_or(i64::MAX),
+                row.ctime_secs,
+                row.ctime_nanos,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5874,6 +6050,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

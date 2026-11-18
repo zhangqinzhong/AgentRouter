@@ -192,7 +192,11 @@ GET /api/v1/projects?workspace=NAME   # projects in one workspace
     "project_id": "0193e7a1-0000-7000-8000-00000000000b",
     "project_name": "ai-memory",
     "page_count": 138,
-    "last_updated": "2026-05-28T14:02:11.123Z"
+    "session_count": 27,
+    "observation_count": 921,
+    "open_session_count": 1,
+    "last_updated": "2026-05-28T14:02:11.123Z",
+    "last_activity": "2026-05-28T14:05:00Z"
   }
 ]
 ```
@@ -201,6 +205,11 @@ GET /api/v1/projects?workspace=NAME   # projects in one workspace
 twin row can carry another project's old name), and the admin project
 operations accept the id where the name is ambiguous. A restricted project's
 row, id included, is hidden from a caller without a grant.
+
+Rows are ordered newest first by `last_activity`: the latest observation,
+session start, or latest unexpired page update. A project with none of these
+has `last_activity: null` and sorts last. `last_updated` measures only the
+latest unexpired page update.
 
 ### 4.3 Pages (list)
 
@@ -390,7 +399,8 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=10
 
 Same payload `memory_briefing` returns: counts + activity windows +
 last-observation + open handoffs + `_rules/` + `_slots/` + N most-recent
-pages. No LLM, deterministic.
+pages, plus `lint` (the counts of `_lint/report.md`) when the project has a
+report. No LLM, deterministic.
 
 **Response:** `BriefingSnapshot`
 
@@ -795,9 +805,9 @@ or `too_large`; `from` is `null` when `to` replaced nothing at this path.
   observation and page-history reads all use `Cache-Control: private,
   no-store`. The single-page read carries a SHA-256 `ETag` and uses
   `Cache-Control: private, no-cache`: the browser keeps the body but must
-  revalidate with `If-None-Match` every time, and because the server runs the
-  grant check before comparing the tag, a viewer without a grant receives `403`
-  rather than a `304` from the browser's copy. Search responses are not
+  revalidate with `If-None-Match` every time. The endpoint accepts weak tags,
+  tag lists and `*`. The server checks access before evaluating the
+  condition, so a viewer without a grant receives `403`. Search responses are not
   cacheable because the request body affects the result. The effect is that a
   browser cannot reuse Alice's response after credentials at the same URL
   switch to Bob.
@@ -991,8 +1001,9 @@ environment. The list is validated at startup:
 
 Invalid origins fail startup with a clear error rather than silently
 accepting wildcard. The layer allows `GET / POST / OPTIONS`,
-`Authorization` + `Content-Type` headers, and credentials, with a
-10-minute preflight cache.
+`Authorization`, `Content-Type`, `If-None-Match` and `X-CSRF-Token`
+headers, and credentials, with a 10-minute preflight cache. It exposes
+`ETag` so a cross-origin frontend can revalidate a page.
 
 The CORS layer sits outside authentication. A browser sends its preflight
 (`OPTIONS` with `Access-Control-Request-*`) without credentials, so the

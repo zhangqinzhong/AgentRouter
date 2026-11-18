@@ -84,6 +84,9 @@ struct Fixture {
     /// A server older than 3.0: no `expected_page_id` in the tool schema, no
     /// `id` on pages, and preconditions silently ignored.
     old_server: bool,
+    /// Pre-incremental `recent` returns at most 100 rows without a cursor.
+    legacy_listing: bool,
+    full_listing_status: Option<StatusCode>,
     /// Serve a listing for any project name, not only `app`. Lets a test model
     /// a second project on one server whose listing is successfully empty
     /// (#1708) instead of a 404.
@@ -120,6 +123,8 @@ impl Fixture {
             redact: None,
             edit_before_mcp: None,
             old_server: false,
+            legacy_listing: false,
+            full_listing_status: None,
             any_project: false,
             mcp_calls: Mutex::new(Vec::new()),
             reads_by_path: Mutex::new(BTreeMap::new()),
@@ -214,6 +219,20 @@ async fn recent_handler(
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     let all = fixture.pages.lock().unwrap().clone();
+    if fixture.legacy_listing {
+        let limit = query
+            .get("limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(20)
+            .clamp(1, 100);
+        return Json(
+            all.iter()
+                .take(limit)
+                .map(|page| json!({"path": page.path, "title": page.title}))
+                .collect::<Vec<_>>(),
+        )
+        .into_response();
+    }
     let end = (start + 2).min(all.len());
     let pages: Vec<serde_json::Value> = all[start..end]
         .iter()
@@ -238,6 +257,33 @@ async fn recent_handler(
         Json(json!({ "pages": pages, "next_cursor": next_cursor })),
     )
         .into_response()
+}
+
+async fn pages_handler(
+    State(fixture): State<Arc<Fixture>>,
+    Path((workspace, project)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(response) = fixture.authorize(&headers) {
+        return *response;
+    }
+    if !fixture.project_exists || workspace != "demo" || (project != "app" && !fixture.any_project)
+    {
+        return error_json(StatusCode::NOT_FOUND, "workspace or project not found");
+    }
+    if let Some(status) = fixture.full_listing_status {
+        return error_json(status, "listing refused");
+    }
+    Json(
+        fixture
+            .pages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|page| json!({"path": page.path, "title": page.title}))
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
 }
 
 /// Page read with the server's exact-ETag 304 contract.
@@ -477,6 +523,10 @@ async fn serve(fixture: Fixture) -> (SocketAddr, Arc<Fixture>) {
         .route(
             "/api/v1/workspaces/{workspace}/projects/{project}/recent",
             get(recent_handler),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace}/projects/{project}/pages",
+            get(pages_handler),
         )
         .route(
             "/api/v1/workspaces/{workspace}/projects/{project}/pages/{*path}",
@@ -824,6 +874,52 @@ async fn listing_follows_cursors_to_the_last_page() {
         "cursor pagination was exercised"
     );
     assert!(dest.join("notes/c.md").exists(), "last page reached");
+}
+
+#[tokio::test]
+async fn legacy_recent_fallback_exports_pages_beyond_the_recent_limit() {
+    let pages = (0..103)
+        .map(|index| {
+            (
+                format!("notes/page-{index}.md"),
+                format!("# Page {index}\n"),
+            )
+        })
+        .collect();
+    let mut fixture = Fixture::new(pages).with_token("fixture-token");
+    fixture.legacy_listing = true;
+    fixture.old_server = true;
+    let (addr, fixture) = serve(fixture).await;
+    let (_tmp, dest) = temp_dest();
+    let mut args = args(addr, &dest, &["notes"]);
+    args.token = Some("fixture-token".into());
+
+    run(&args, Mode::Apply).await.expect("legacy export");
+
+    assert_eq!(state::load(&dest).unwrap().pages.len(), 103);
+    assert_eq!(
+        fs::read(dest.join("notes/page-102.md")).unwrap(),
+        file("notes/page-102.md", "# Page 102\n"),
+    );
+    assert_eq!(fixture.recent_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.mcp_writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn legacy_fallback_refusal_does_not_export_the_partial_recent_list() {
+    let mut fixture = Fixture::new(fixture_pages());
+    fixture.legacy_listing = true;
+    fixture.full_listing_status = Some(StatusCode::FORBIDDEN);
+    let (addr, _) = serve(fixture).await;
+    let (_tmp, dest) = temp_dest();
+
+    let error = run(&args(addr, &dest, &["notes"]), Mode::Apply)
+        .await
+        .expect_err("a complete listing is required");
+
+    assert!(error.to_string().contains("403"), "{error}");
+    assert!(!dest.join("notes/a.md").exists());
+    assert!(!state::state_path(&dest).exists());
 }
 
 #[tokio::test]
@@ -1655,6 +1751,68 @@ async fn sync_delete_conflicts_follow_prefer() {
         .find(|call| call["name"] == "memory_write_page")
         .expect("write");
     assert_eq!(create["arguments"]["create_only"], true);
+}
+
+#[tokio::test]
+async fn sync_treats_server_only_metadata_edits_as_delete_conflicts() {
+    let mut page = decision();
+    page.pinned = false;
+    page.frontmatter["abstract"] = json!("Original abstract");
+    let path = page.path.clone();
+    let (addr, fixture) = serve(Fixture::with_pages(vec![page])).await;
+    let (_tmp, dest) = temp_dest();
+    sync(addr, &dest).await.expect("first sync");
+    let original = fs::read(dest.join(&path)).unwrap();
+    let base = state::load(&dest).unwrap();
+
+    fixture.update(&path, |page| {
+        page.frontmatter["abstract"] = json!("Server edit");
+    });
+    let edited_id = fixture.page(&path).unwrap().id;
+    assert_ne!(
+        base.pages[&path].page_id.as_deref(),
+        Some(edited_id.as_str())
+    );
+    fs::remove_file(dest.join(&path)).unwrap();
+    let args = deleting_args(addr, &dest, None);
+
+    let check = bidi::run(&args, SyncMode::Check).await.unwrap();
+    assert_eq!(check.status(), CheckStatus::Blocked);
+    let error = bidi::run(&args, SyncMode::Apply).await.unwrap_err();
+    assert!(error.to_string().contains("refused"), "{error}");
+    assert!(fixture.mcp_calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.page(&path).unwrap().id, edited_id);
+    assert_eq!(state::load(&dest).unwrap(), base);
+
+    bidi::run(
+        &deleting_args(addr, &dest, Some(Prefer::Server)),
+        SyncMode::Apply,
+    )
+    .await
+    .expect("prefer server restores the unchanged projection");
+    assert_eq!(fs::read(dest.join(&path)).unwrap(), original);
+    assert!(fixture.mcp_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        state::load(&dest).unwrap().pages[&path].page_id.as_deref(),
+        Some(edited_id.as_str())
+    );
+
+    fixture.update(&path, |page| {
+        page.frontmatter["abstract"] = json!("Another server edit");
+    });
+    let latest_id = fixture.page(&path).unwrap().id;
+    fs::remove_file(dest.join(&path)).unwrap();
+    bidi::run(
+        &deleting_args(addr, &dest, Some(Prefer::Repo)),
+        SyncMode::Apply,
+    )
+    .await
+    .expect("prefer repo explicitly chooses deletion");
+    assert!(fixture.page(&path).is_none());
+    let calls = fixture.mcp_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["name"], "memory_delete_page");
+    assert_eq!(calls[0]["arguments"]["expected_page_id"], latest_id);
 }
 
 #[tokio::test]

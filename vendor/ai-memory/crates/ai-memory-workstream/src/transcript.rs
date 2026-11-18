@@ -155,6 +155,13 @@ const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
 struct SqlCursor {
     updated: i64,
     id: String,
+    // OpenCode's native stores stamp `time_updated` with millisecond
+    // `Date.now()`, not a unique revision number, so an in-place update keeps
+    // the same `(updated, id)` pair. The boundary fingerprints every record at
+    // `updated` so a same-millisecond revision is detected as changed instead
+    // of silently skipped. Legacy cursors omit it and fall back to id ordering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    boundary: Vec<RecordRevision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -162,13 +169,30 @@ struct CrushCursor {
     updated: i64,
     id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    boundary: Vec<CrushRevision>,
+    boundary: Vec<RecordRevision>,
 }
 
+/// A record's id paired with a content fingerprint, so a cursor can tell an
+/// unchanged boundary record from an in-place revision at the same timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct CrushRevision {
+struct RecordRevision {
     id: String,
     digest: String,
+}
+
+/// Whether a boundary already acknowledges `revision`: an exact fingerprint
+/// match when fingerprints were captured, else the legacy id-ordering fallback
+/// for a cursor persisted before boundaries existed.
+fn boundary_acknowledges(
+    boundary: &[RecordRevision],
+    boundary_id: &str,
+    revision: &RecordRevision,
+) -> bool {
+    if boundary.is_empty() {
+        revision.id.as_str() <= boundary_id
+    } else {
+        boundary.iter().any(|known| known == revision)
+    }
 }
 
 /// Export unseen visible transcript records for one native session.
@@ -532,31 +556,18 @@ fn transcript_baseline_blocking(
     session_dir: Option<&Path>,
     native_session_id: &str,
 ) -> Result<String> {
-    let sql_cursor = |db: PathBuf, sql: &str| -> Result<String> {
-        let connection = Connection::open_with_flags(
-            &db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        let cursor = connection
-            .query_row(sql, params![native_session_id], |row| {
-                Ok(SqlCursor {
-                    updated: row.get(0)?,
-                    id: row.get(1)?,
-                })
-            })
-            .optional()?
-            .unwrap_or_default();
-        Ok(serde_json::to_string(&cursor)?)
-    };
+    let sql_cursor =
+        |db: PathBuf, capture: &dyn Fn(&Connection, &str) -> Result<SqlCursor>| -> Result<String> {
+            let connection = Connection::open_with_flags(
+                &db,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            let cursor = capture(&connection, native_session_id)?;
+            Ok(serde_json::to_string(&cursor)?)
+        };
     match harness {
-        ManagedHarness::OpenCode => sql_cursor(
-            opencode_db(home, session_dir),
-            "SELECT p.time_updated, p.id FROM part p WHERE p.session_id = ?1 ORDER BY p.time_updated DESC, p.id DESC LIMIT 1",
-        ),
-        ManagedHarness::OpenCode2 => sql_cursor(
-            opencode_db(home, session_dir),
-            "SELECT time_updated, id FROM session_message WHERE session_id = ?1 ORDER BY time_updated DESC, id DESC LIMIT 1",
-        ),
+        ManagedHarness::OpenCode => sql_cursor(opencode_db(home, session_dir), &opencode_cursor),
+        ManagedHarness::OpenCode2 => sql_cursor(opencode_db(home, session_dir), &opencode2_cursor),
         ManagedHarness::Crush => crush_cursor(
             &Connection::open_with_flags(
                 crush_db(home, cwd, session_dir),
@@ -1322,15 +1333,19 @@ fn export_jsonl_range(
             Sha256::new(),
         )
     };
-    let (mut reader, start): (Box<dyn BufRead>, u64) = if compressed {
-        // A zstd stream cannot seek: decode and drop the bytes before `start`.
-        // A shorter stream ends the skip early, which clamps `start` the way
-        // `min(len)` clamps it for a plain file.
-        let mut reader = transcript_reader(harness, path, file)?;
-        let skipped = std::io::copy(
-            &mut std::io::Read::by_ref(&mut reader).take(start),
-            &mut std::io::sink(),
-        )?;
+    let mut codex_turn_cwd: Option<String> = None;
+    let (mut reader, start): (Box<dyn BufRead>, u64) = if harness == ManagedHarness::Codex {
+        let mut reader = if compressed {
+            // A zstd stream cannot seek: decode and drop the bytes before `start`.
+            // A shorter stream ends the skip early, which clamps `start` the way
+            // `min(len)` clamps it for a plain file.
+            transcript_reader(harness, path, file)?
+        } else {
+            file.seek(SeekFrom::Start(0))?;
+            Box::new(BufReader::new(file))
+        };
+        let (skipped, cwd) = skip_codex_prefix(&mut reader, start)?;
+        codex_turn_cwd = cwd;
         (reader, skipped)
     } else {
         file.seek(SeekFrom::Start(start))?;
@@ -1345,7 +1360,6 @@ fn export_jsonl_range(
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
-    let mut codex_turn_cwd: Option<String> = None;
     loop {
         line.clear();
         let remaining = len.saturating_sub(offset);
@@ -1576,11 +1590,7 @@ fn export_jsonl_range(
         let record_cwd = match harness {
             ManagedHarness::Claude => value.get("cwd").and_then(Value::as_str),
             ManagedHarness::Codex => {
-                if matches!(
-                    value.get("type").and_then(Value::as_str),
-                    Some("session_meta" | "turn_context")
-                ) && let Some(cwd) = value.pointer("/payload/cwd").and_then(Value::as_str)
-                {
+                if let Some(cwd) = codex_context_cwd(&value) {
                     codex_turn_cwd = Some(cwd.to_owned());
                 }
                 codex_turn_cwd.as_deref()
@@ -1633,6 +1643,51 @@ fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
             metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
         }
     }
+}
+
+fn codex_context_cwd(value: &Value) -> Option<&str> {
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("session_meta" | "turn_context")
+    ) {
+        value.pointer("/payload/cwd").and_then(Value::as_str)
+    } else {
+        None
+    }
+}
+
+/// Codex persists a `turn_context` only when the turn context changed
+/// (https://github.com/openai/codex/blob/b1573f102413e96a6481087922bf425231222dee/codex-rs/core/src/session/mod.rs#L5600-L5621).
+fn skip_codex_prefix(reader: &mut impl BufRead, len: u64) -> Result<(u64, Option<String>)> {
+    let mut cwd = None;
+    let mut consumed = 0_u64;
+    let mut line = Vec::new();
+    while consumed < len {
+        line.clear();
+        let limit = (len - consumed).min((MAX_SOURCE_RECORD_BYTES + 1) as u64);
+        let read = reader.by_ref().take(limit).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        consumed += read as u64;
+        if read > MAX_SOURCE_RECORD_BYTES {
+            if !line.ends_with(b"\n") {
+                let (tail, _) = discard_through_newline(
+                    &mut reader.by_ref().take(len - consumed),
+                    &mut |_| {},
+                )?;
+                consumed += tail;
+            }
+            continue;
+        }
+        if line.ends_with(b"\n")
+            && let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && let Some(record_cwd) = codex_context_cwd(&value)
+        {
+            cwd = Some(record_cwd.to_owned());
+        }
+    }
+    Ok((consumed, cwd))
 }
 
 /// Count how many times each rewrite-in-place record identity (the SHA-256 of
@@ -3323,6 +3378,15 @@ fn parse_content_blocks(
                     agent.as_str()
                 ));
             }
+            // Claude `image` / `document` blocks (https://docs.anthropic.com/en/api/messages)
+            // and Codex `input_image` items (`ContentItem` in
+            // https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs).
+            "image" | "document" | "input_image" => {
+                losses.push(format!(
+                    "{} message attachments were intentionally excluded",
+                    agent.as_str()
+                ));
+            }
             _ => {}
         }
     }
@@ -3402,6 +3466,63 @@ fn export_opencode(
     export_opencode_range(home, session_dir, session, source_cursor, None)
 }
 
+/// Fingerprint one OpenCode part so a same-millisecond in-place revision is
+/// distinguishable from the record the cursor already acknowledged.
+fn opencode_revision(id: &str, part: &str) -> RecordRevision {
+    let seed = format!("{id}\0{part}");
+    RecordRevision {
+        id: id.to_owned(),
+        digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
+    }
+}
+
+/// Capture OpenCode's end-of-session cursor, fingerprinting every part sharing
+/// the newest `time_updated` so a later in-place revision at that millisecond is
+/// still emitted. Pins one read snapshot when the caller holds none.
+fn opencode_cursor(connection: &Connection, session: &str) -> Result<SqlCursor> {
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let newest = connection
+        .query_row(
+            "SELECT p.time_updated, p.id FROM part p WHERE p.session_id = ?1 \
+             ORDER BY p.time_updated DESC, p.id DESC LIMIT 1",
+            [session],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((updated, id)) = newest else {
+        return Ok(SqlCursor::default());
+    };
+    let mut statement = connection.prepare(
+        "SELECT p.id, p.data FROM part p WHERE p.session_id = ?1 AND p.time_updated = ?2 \
+         ORDER BY p.id LIMIT ?3",
+    )?;
+    let boundary = statement
+        .query_map(
+            params![session, updated, (MAX_SOURCE_RECORDS + 1) as i64],
+            |row| {
+                Ok(opencode_revision(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if boundary.len() > MAX_SOURCE_RECORDS {
+        return Err(anyhow!(
+            "OpenCode cursor boundary exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+        ));
+    }
+    Ok(SqlCursor {
+        updated,
+        id,
+        boundary,
+    })
+}
+
 fn export_opencode_range(
     home: &Path,
     session_dir: Option<&Path>,
@@ -3420,6 +3541,9 @@ fn export_opencode_range(
             db.display()
         )
     })?;
+    // The event query and the recomputed cursor must share one snapshot so a
+    // native WAL commit between them cannot advance the cursor past unseen rows.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
@@ -3430,26 +3554,35 @@ fn export_opencode_range(
         .unwrap_or(SqlCursor {
             updated: i64::MAX,
             id: "\u{10ffff}".to_string(),
+            boundary: Vec::new(),
         });
+    // A boundary-carrying cursor re-reads every part at its timestamp and
+    // re-emits only the revisions whose fingerprint changed; a legacy cursor
+    // without one keeps the strict id-ordering scan.
+    let revisit_boundary = i64::from(!cursor.boundary.is_empty());
+    let query_limit = MAX_SOURCE_RECORDS
+        .checked_add(cursor.boundary.len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("OpenCode transcript query limit overflow"))?;
     let mut statement = connection.prepare(
         "SELECT p.id, p.time_updated, length(m.data), length(p.data), m.data, p.data
          FROM part p JOIN message m ON m.id = p.message_id
-         WHERE p.session_id = ?1 AND (p.time_updated > ?2 OR (p.time_updated = ?2 AND p.id > ?3))
-           AND (p.time_updated < ?4 OR (p.time_updated = ?4 AND p.id <= ?5))
+         WHERE p.session_id = ?1
+           AND (p.time_updated > ?2 OR (p.time_updated = ?2 AND (?3 = 1 OR p.id > ?4)))
+           AND p.time_updated <= ?5
          ORDER BY p.time_updated, p.id
          LIMIT ?6",
     )?;
     let mut rows = statement.query(params![
         session,
         cursor.updated,
+        revisit_boundary,
         cursor.id,
         upper.updated,
-        upper.id,
-        (MAX_SOURCE_RECORDS + 1) as i64
+        query_limit as i64
     ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
-    let mut next_cursor = cursor;
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
@@ -3474,10 +3607,16 @@ fn export_opencode_range(
         let id = row.get::<_, String>(0)?;
         let message_raw = row.get::<_, String>(4)?;
         let part_raw = row.get::<_, String>(5)?;
-        next_cursor = SqlCursor {
-            updated,
-            id: id.clone(),
-        };
+        let revision = opencode_revision(&id, &part_raw);
+        if updated == cursor.updated
+            && boundary_acknowledges(&cursor.boundary, &cursor.id, &revision)
+        {
+            continue;
+        }
+        if updated == upper.updated && !boundary_acknowledges(&upper.boundary, &upper.id, &revision)
+        {
+            continue;
+        }
         let Ok(message) = serde_json::from_str::<Value>(&message_raw) else {
             losses.push(format!("malformed OpenCode message for part {id}"));
             continue;
@@ -3495,6 +3634,11 @@ fn export_opencode_range(
             0,
         )?;
     }
+    let next_cursor = if final_cursor.is_some() {
+        upper
+    } else {
+        opencode_cursor(&connection, session)?
+    };
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
         source_cursor: Some(serde_json::to_string(&next_cursor)?),
@@ -3514,15 +3658,35 @@ fn export_crush(
     export_crush_range(home, cwd, session_dir, session, source_cursor, None)
 }
 
-fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> CrushRevision {
+fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> RecordRevision {
     let seed = format!("{id}\0{role}\0{is_summary}\0{parts}");
-    CrushRevision {
+    RecordRevision {
         id: id.to_owned(),
         digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
     }
 }
 
 fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
+    crush_cursor_inner(
+        connection,
+        session,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn crush_cursor_inner(
+    connection: &Connection,
+    session: &str,
+    #[cfg(test)] after_newest: Option<&dyn Fn()>,
+) -> Result<CrushCursor> {
+    // Exports already hold a snapshot; a standalone baseline needs the same
+    // protection across its timestamp and revision queries.
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
     let newest = connection
         .query_row(
             "SELECT updated_at, id FROM messages WHERE session_id = ?1 \
@@ -3534,6 +3698,10 @@ fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
     let Some((updated, id)) = newest else {
         return Ok(CrushCursor::default());
     };
+    #[cfg(test)]
+    if let Some(after_newest) = after_newest {
+        after_newest();
+    }
     let mut statement = connection.prepare(
         "SELECT id, role, parts, is_summary_message FROM messages \
          WHERE session_id = ?1 AND updated_at = ?2 ORDER BY id LIMIT ?3",
@@ -3562,20 +3730,12 @@ fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
     })
 }
 
-fn crush_revision_is_known(cursor: &CrushCursor, revision: &CrushRevision) -> bool {
-    if cursor.boundary.is_empty() {
-        revision.id <= cursor.id
-    } else {
-        cursor.boundary.iter().any(|known| known == revision)
-    }
+fn crush_revision_is_known(cursor: &CrushCursor, revision: &RecordRevision) -> bool {
+    boundary_acknowledges(&cursor.boundary, &cursor.id, revision)
 }
 
-fn crush_revision_is_within(cursor: &CrushCursor, revision: &CrushRevision) -> bool {
-    if cursor.boundary.is_empty() {
-        revision.id <= cursor.id
-    } else {
-        cursor.boundary.iter().any(|known| known == revision)
-    }
+fn crush_revision_is_within(cursor: &CrushCursor, revision: &RecordRevision) -> bool {
+    boundary_acknowledges(&cursor.boundary, &cursor.id, revision)
 }
 
 fn export_crush_range(
@@ -3586,12 +3746,36 @@ fn export_crush_range(
     source_cursor: Option<&str>,
     final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
+    export_crush_range_inner(
+        home,
+        cwd,
+        session_dir,
+        session,
+        source_cursor,
+        final_cursor,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn export_crush_range_inner(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
+    #[cfg(test)] after_rows: Option<&dyn Fn()>,
+) -> Result<ExportedTranscript> {
     let db = crush_db(home, cwd, session_dir);
     let connection = Connection::open_with_flags(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("opening Crush session database {} read-only", db.display()))?;
+    // The cursor must acknowledge only revisions visible to the event query,
+    // even if the native WAL writer commits before that cursor is collected.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<CrushCursor>(raw).ok())
         .unwrap_or_default();
@@ -3682,6 +3866,10 @@ fn export_crush_range(
             &mut source_bytes,
             0,
         )?;
+    }
+    #[cfg(test)]
+    if let Some(after_rows) = after_rows {
+        after_rows();
     }
     let next_cursor = if final_cursor.is_some() {
         upper
@@ -3817,6 +4005,8 @@ fn parse_opencode(
         }
         "tool" => {
             let name = first_string(part, &["tool", "name"]).unwrap_or("tool");
+            // https://github.com/anomalyco/opencode/blob/c63a93995f1e5c28dd73cc032dcb224780f208ff/packages/schema/src/v1/session.ts#L315-L322
+            let call_id = first_string(part, &["callID"]);
             let state = part.get("state").unwrap_or(&Value::Null);
             let input = state.get("input").map(compact_json).unwrap_or_default();
             push_event(
@@ -3829,7 +4019,7 @@ fn parse_opencode(
                 Some("assistant"),
                 &format!("{name}: {input}"),
                 None,
-                json!({"tool": name}),
+                with_tool_use_id(json!({"tool": name}), call_id),
             );
             let status = state.get("status").and_then(Value::as_str);
             // V1 terminal failures store their visible result in `error`, not
@@ -3854,11 +4044,14 @@ fn parse_opencode(
                     Some("tool"),
                     &output,
                     None,
-                    if status == Some("error") {
-                        json!({"status": status, "is_error": true})
-                    } else {
-                        json!({"status": status})
-                    },
+                    with_tool_use_id(
+                        if status == Some("error") {
+                            json!({"status": status, "is_error": true})
+                        } else {
+                            json!({"status": status})
+                        },
+                        call_id,
+                    ),
                 );
             }
         }
@@ -4249,7 +4442,68 @@ fn cursor_path(harness: ManagedHarness, path: &Path) -> PathBuf {
 /// Open a transcript for sequential reads, decompressing a compressed Codex
 /// rollout.
 fn open_transcript(harness: ManagedHarness, path: &Path) -> std::io::Result<Box<dyn BufRead>> {
-    transcript_reader(harness, path, File::open(path)?)
+    transcript_reader(harness, path, open_regular_transcript(path)?)
+}
+
+/// Open `path` only when it is a regular file and still the same file once
+/// open. A transcript location is derived from a harness home and a native
+/// session id, so the caller's earlier checks race a symlink swapped in
+/// afterwards; `O_NOFOLLOW` refuses a final-component symlink, `O_NONBLOCK`
+/// keeps a FIFO swapped in from blocking the read forever, and the descriptor
+/// comparison refuses a path whose ancestor became a symlink in the meantime.
+fn open_regular_transcript(path: &Path) -> std::io::Result<File> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() {
+        return Err(not_a_regular_file(path));
+    }
+    let file = open_no_follow(path)?;
+    let after = file.metadata()?;
+    if !after.is_file() {
+        return Err(not_a_regular_file(path));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(not_a_regular_file(path));
+        }
+    }
+    // The descriptor's own path is the one the checks above admitted; an
+    // ancestor swapped for a symlink after them would still resolve here.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        if fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .is_ok_and(|opened| opened != path)
+        {
+            return Err(not_a_regular_file(path));
+        }
+    }
+    Ok(file)
+}
+
+fn not_a_regular_file(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{} is not a regular file", path.display()),
+    )
+}
+
+/// `O_NOFOLLOW` refuses a final-component symlink and `O_NONBLOCK` a FIFO, the
+/// way the Antigravity transcript reader opens its own files. Reads of a
+/// regular file are unaffected.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 /// [`open_transcript`] over a file already opened at `path`.
@@ -5799,6 +6053,64 @@ fn export_opencode2(
     export_opencode2_range(home, session_dir, session, source_cursor, None)
 }
 
+/// Fingerprint one OpenCode 2 message so a same-millisecond in-place revision is
+/// distinguishable from the record the cursor already acknowledged.
+fn opencode2_revision(id: &str, message_type: &str, data: &str) -> RecordRevision {
+    let seed = format!("{id}\0{message_type}\0{data}");
+    RecordRevision {
+        id: id.to_owned(),
+        digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
+    }
+}
+
+/// Capture OpenCode 2's end-of-session cursor, fingerprinting every message
+/// sharing the newest `time_updated`. Pins one read snapshot when the caller
+/// holds none.
+fn opencode2_cursor(connection: &Connection, session: &str) -> Result<SqlCursor> {
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let newest = connection
+        .query_row(
+            "SELECT time_updated, id FROM session_message WHERE session_id = ?1 \
+             ORDER BY time_updated DESC, id DESC LIMIT 1",
+            [session],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((updated, id)) = newest else {
+        return Ok(SqlCursor::default());
+    };
+    let mut statement = connection.prepare(
+        "SELECT id, type, data FROM session_message \
+         WHERE session_id = ?1 AND time_updated = ?2 ORDER BY id LIMIT ?3",
+    )?;
+    let boundary = statement
+        .query_map(
+            params![session, updated, (MAX_SOURCE_RECORDS + 1) as i64],
+            |row| {
+                Ok(opencode2_revision(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    &row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if boundary.len() > MAX_SOURCE_RECORDS {
+        return Err(anyhow!(
+            "OpenCode cursor boundary exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+        ));
+    }
+    Ok(SqlCursor {
+        updated,
+        id,
+        boundary,
+    })
+}
+
 fn export_opencode2_range(
     home: &Path,
     session_dir: Option<&Path>,
@@ -5817,6 +6129,9 @@ fn export_opencode2_range(
             db.display()
         )
     })?;
+    // The event query and the recomputed cursor must share one snapshot so a
+    // native WAL commit between them cannot advance the cursor past unseen rows.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
@@ -5827,24 +6142,33 @@ fn export_opencode2_range(
         .unwrap_or(SqlCursor {
             updated: i64::MAX,
             id: "\u{10ffff}".to_string(),
+            boundary: Vec::new(),
         });
+    // A boundary-carrying cursor re-reads every message at its timestamp and
+    // re-emits only the revisions whose fingerprint changed; a legacy cursor
+    // without one keeps the strict id-ordering scan.
+    let revisit_boundary = i64::from(!cursor.boundary.is_empty());
+    let query_limit = MAX_SOURCE_RECORDS
+        .checked_add(cursor.boundary.len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("OpenCode transcript query limit overflow"))?;
     let mut statement = connection.prepare(
         "SELECT id, time_updated, type, length(data), data FROM session_message \
-         WHERE session_id = ?1 AND (time_updated > ?2 OR (time_updated = ?2 AND id > ?3)) \
-           AND (time_updated < ?4 OR (time_updated = ?4 AND id <= ?5)) \
+         WHERE session_id = ?1 \
+           AND (time_updated > ?2 OR (time_updated = ?2 AND (?3 = 1 OR id > ?4))) \
+           AND time_updated <= ?5 \
          ORDER BY time_updated, id LIMIT ?6",
     )?;
     let mut rows = statement.query(params![
         session,
         cursor.updated,
+        revisit_boundary,
         cursor.id,
         upper.updated,
-        upper.id,
-        (MAX_SOURCE_RECORDS + 1) as i64
+        query_limit as i64
     ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
-    let mut next_cursor = cursor;
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
@@ -5868,10 +6192,16 @@ fn export_opencode2_range(
         let updated = row.get::<_, i64>(1)?;
         let message_type = row.get::<_, String>(2)?;
         let data_raw = row.get::<_, String>(4)?;
-        next_cursor = SqlCursor {
-            updated,
-            id: id.clone(),
-        };
+        let revision = opencode2_revision(&id, &message_type, &data_raw);
+        if updated == cursor.updated
+            && boundary_acknowledges(&cursor.boundary, &cursor.id, &revision)
+        {
+            continue;
+        }
+        if updated == upper.updated && !boundary_acknowledges(&upper.boundary, &upper.id, &revision)
+        {
+            continue;
+        }
         let Ok(data) = serde_json::from_str::<Value>(&data_raw) else {
             losses.push(format!("malformed OpenCode 2 message {id}"));
             continue;
@@ -5885,6 +6215,11 @@ fn export_opencode2_range(
             0,
         )?;
     }
+    let next_cursor = if final_cursor.is_some() {
+        upper
+    } else {
+        opencode2_cursor(&connection, session)?
+    };
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
         source_cursor: Some(serde_json::to_string(&next_cursor)?),
@@ -6411,6 +6746,49 @@ fn deduplicate_losses(losses: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transcript location is derived from a harness home and a native
+    /// session id, so the file itself can be a symlink planted after the
+    /// caller's checks. A directory is refused on every platform; the real
+    /// file still opens.
+    #[test]
+    fn a_non_regular_transcript_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("session.jsonl");
+        std::fs::write(&real, b"{\"type\":\"user\"}\n").unwrap();
+        assert!(
+            open_regular_transcript(&real).is_ok(),
+            "the file a session names still opens"
+        );
+        let error =
+            open_regular_transcript(dir.path()).expect_err("a directory is not a transcript");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    /// A symlink, a dangling link and a link reached through `open_transcript`
+    /// are refused. Unix-only, like the Antigravity reader's own symlink tests:
+    /// Windows needs a privilege to create the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_transcript_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("session.jsonl");
+        std::fs::write(&real, b"{\"type\":\"user\"}\n").unwrap();
+
+        let link = dir.path().join("link.jsonl");
+        symlink(&real, &link).unwrap();
+        let error = open_regular_transcript(&link).expect_err("a symlink must be refused");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(
+            open_transcript(ManagedHarness::Codex, &link).is_err(),
+            "the refusal holds through open_transcript"
+        );
+
+        let dangling = dir.path().join("dangling.jsonl");
+        symlink(dir.path().join("missing.jsonl"), &dangling).unwrap();
+        assert!(open_regular_transcript(&dangling).is_err());
+    }
 
     #[test]
     fn the_event_cut_drops_a_token_it_lands_inside() {
@@ -7062,6 +7440,37 @@ mod tests {
             losses
                 .iter()
                 .all(|loss| loss.ends_with("image tool results were intentionally excluded"))
+        );
+    }
+
+    #[test]
+    fn message_attachments_are_recorded_as_losses() {
+        let claude = json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+            {"type":"text","text":"what is wrong here?"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}},
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"cHJpdmF0ZSBwZGY="}}
+        ]}});
+        let codex = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"compare with this"},
+            {"type":"input_image","image_url":"data:image/png;base64,cHJpdmF0ZSBpbWFnZQ=="}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&claude, "session", "claude", &mut events, &mut losses);
+        parse_codex(&codex, "session", "codex", &mut events, &mut losses);
+
+        let messages = events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["what is wrong here?", "compare with this"]);
+        assert_eq!(
+            losses,
+            [
+                "claude-code message attachments were intentionally excluded",
+                "claude-code message attachments were intentionally excluded",
+                "codex message attachments were intentionally excluded",
+            ]
         );
     }
 
@@ -8180,6 +8589,157 @@ mod tests {
         );
     }
 
+    /// A native WAL writer may commit after the event query is exhausted.
+    /// Its unseen row must remain outside the returned cursor until the next read.
+    #[test]
+    fn crush_export_cursor_covers_only_its_event_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let data = cwd.join(".crush");
+        fs::create_dir_all(&data).unwrap();
+        let db = data.join("crush.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
+                 parts TEXT, updated_at INTEGER, is_summary_message INTEGER);",
+            )
+            .unwrap();
+        let insert = |connection: &Connection, id: &str, text: &str, updated: i64| {
+            connection
+                .execute(
+                    "INSERT INTO messages VALUES (?1, 's', 'assistant', ?2, ?3, 0)",
+                    params![
+                        id,
+                        json!([{"type":"text","data":{"text":text}}]).to_string(),
+                        updated
+                    ],
+                )
+                .unwrap();
+        };
+        insert(&writer, "before", "before export", 100);
+        let during = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let writer = Connection::open(&db).unwrap();
+                        insert(&writer, "during", "during export", 200);
+                    })
+                    .join()
+                    .unwrap();
+            });
+        };
+        let first =
+            export_crush_range_inner(temp.path(), &cwd, None, "s", None, None, Some(&during))
+                .unwrap();
+        assert_eq!(kinds_and_contents(&first), [("message", "before export")]);
+        let cursor: CrushCursor =
+            serde_json::from_str(first.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            cursor.updated, 100,
+            "the cursor must use the event query's snapshot"
+        );
+        assert_eq!(
+            cursor
+                .boundary
+                .iter()
+                .map(|revision| revision.id.as_str())
+                .collect::<Vec<_>>(),
+            ["before"]
+        );
+        assert!(first.losses.is_empty());
+
+        insert(&writer, "after", "after export", 300);
+        let second =
+            export_crush(temp.path(), &cwd, None, "s", first.source_cursor.as_deref()).unwrap();
+        assert_eq!(
+            kinds_and_contents(&second),
+            [("message", "during export"), ("message", "after export")]
+        );
+        assert!(second.losses.is_empty());
+        assert!(
+            export_crush(
+                temp.path(),
+                &cwd,
+                None,
+                "s",
+                second.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
+        );
+    }
+
+    /// Cursor timestamps and revision fingerprints must describe one snapshot,
+    /// including when a same-second insert lands between its two queries.
+    #[test]
+    fn crush_baseline_cursor_revisions_share_the_timestamp_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("crush.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
+                 parts TEXT, updated_at INTEGER, is_summary_message INTEGER);",
+            )
+            .unwrap();
+        let before = json!([{"type":"text","data":{"text":"before baseline"}}]).to_string();
+        writer
+            .execute(
+                "INSERT INTO messages VALUES ('m', 's', 'assistant', ?1, 100, 0)",
+                [&before],
+            )
+            .unwrap();
+        let reader = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let during = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let writer = Connection::open(&db).unwrap();
+                        let after =
+                            json!([{"type":"text","data":{"text":"during baseline"}}]).to_string();
+                        writer
+                            .execute(
+                                "INSERT INTO messages VALUES ('z', 's', 'assistant', ?1, 100, 0)",
+                                [&after],
+                            )
+                            .unwrap();
+                    })
+                    .join()
+                    .unwrap();
+            });
+        };
+        let cursor = crush_cursor_inner(&reader, "s", Some(&during)).unwrap();
+        assert_eq!(
+            cursor.boundary,
+            [crush_revision("m", "assistant", &before, 0)]
+        );
+        let next = export_crush(
+            temp.path(),
+            temp.path(),
+            Some(temp.path()),
+            "s",
+            Some(&serde_json::to_string(&cursor).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(kinds_and_contents(&next), [("message", "during baseline")]);
+        assert!(
+            export_crush(
+                temp.path(),
+                temp.path(),
+                Some(temp.path()),
+                "s",
+                next.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
+        );
+    }
+
     /// Claude Code writes `cwd` on every record and Codex in each
     /// `turn_context`; each event carries the cwd of the record it came from,
     /// so an import resolves relative tool arguments from where the call ran.
@@ -8237,6 +8797,52 @@ mod tests {
             .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
             .collect();
         assert_eq!(cwds, [root.to_str(), docs.to_str()], "{events:?}");
+    }
+
+    #[test]
+    fn incremental_codex_export_keeps_the_turn_cwd_from_before_the_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let docs = root.join("docs");
+        let codex = temp.path().join("codex.jsonl");
+        let item = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+        let lines = |values: &[Value]| {
+            values
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+        };
+        fs::write(
+            &codex,
+            lines(&[
+                json!({"type":"session_meta","payload":{"id":"s","cwd":root}}),
+                item("first turn"),
+                json!({"type":"turn_context","payload":{"cwd":docs}}),
+                item("second turn"),
+            ]),
+        )
+        .unwrap();
+        let first = export_jsonl(ManagedHarness::Codex, &codex, "s", None).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
+        std::io::Write::write_all(&mut file, lines(&[item("same turn, later")]).as_bytes())
+            .unwrap();
+        let next = export_jsonl(
+            ManagedHarness::Codex,
+            &codex,
+            "s",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(next.events.len(), 1, "{:?}", next.events);
+        assert_eq!(
+            next.events[0]
+                .metadata
+                .get(RECORD_CWD_KEY)
+                .and_then(Value::as_str),
+            docs.to_str(),
+            "{:?}",
+            next.events
+        );
     }
 
     #[test]
@@ -9514,6 +10120,132 @@ mod tests {
     }
 
     #[test]
+    fn opencode_cursor_keeps_same_millisecond_revisions() {
+        check_opencode_cursor_revisions(ManagedHarness::OpenCode);
+    }
+
+    #[test]
+    fn opencode2_cursor_keeps_same_millisecond_revisions() {
+        check_opencode_cursor_revisions(ManagedHarness::OpenCode2);
+    }
+
+    /// OpenCode's native stores stamp `time_updated` with millisecond
+    /// `Date.now()`, so updating a record in place keeps the same `(updated, id)`
+    /// pair. The incremental cursor must still re-emit that revision (and a
+    /// same-millisecond insert) without replaying unchanged records, keep exact
+    /// recovery intervals, and stay compatible with pair-only legacy cursors.
+    fn check_opencode_cursor_revisions(harness: ManagedHarness) {
+        let home = tempfile::tempdir().unwrap();
+        let db = opencode_db(home.path(), None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);\
+                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,\
+                                   time_updated INTEGER, data TEXT);\
+                 CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT,\
+                                             time_updated INTEGER, data TEXT);\
+                 INSERT INTO message VALUES ('m', 's', '{\"role\":\"assistant\"}');",
+            )
+            .unwrap();
+        let write = |id: &str, updated: i64, text: &str| {
+            let (sql, data) = if harness == ManagedHarness::OpenCode {
+                (
+                    "INSERT OR REPLACE INTO part VALUES (?1, 'm', 's', ?2, ?3)",
+                    json!({"type":"text", "text":text}),
+                )
+            } else {
+                (
+                    "INSERT OR REPLACE INTO session_message VALUES (?1, 's', 'assistant', ?2, ?3)",
+                    json!({"content":[{"type":"text", "text":text}]}),
+                )
+            };
+            connection
+                .execute(sql, params![id, updated, data.to_string()])
+                .unwrap();
+        };
+        let export = |start: Option<&str>, end: Option<&str>| {
+            export_transcript_blocking(harness, home.path(), home.path(), None, "s", start, end)
+                .unwrap()
+        };
+
+        // An empty session has no revision to acknowledge, so its baseline stays
+        // the pair-only shape old installs already persisted.
+        let empty =
+            transcript_baseline_blocking(harness, home.path(), home.path(), None, "s").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&empty).unwrap(),
+            json!({"updated":0, "id":""})
+        );
+
+        write("2000", 100, "unchanged");
+        write("f000", 100, "first");
+        let first = export(Some(&empty), None);
+        // The incremental export from the empty cursor matches a full export.
+        assert_eq!(
+            transcript_interval_digests(&first.events),
+            transcript_interval_digests(&export(None, None).events)
+        );
+        assert_eq!(exported_texts(&first), ["unchanged", "first"]);
+        // The returned cursor equals a standalone baseline of the same snapshot.
+        let baseline =
+            transcript_baseline_blocking(harness, home.path(), home.path(), None, "s").unwrap();
+        assert_eq!(first.source_cursor.as_deref(), Some(baseline.as_str()));
+
+        // A lower-id insert and an in-place update, both at the saved timestamp.
+        write("1000", 100, "same-millisecond insert");
+        write("f000", 100, "same-millisecond update");
+        let second = export(Some(&baseline), None);
+        assert_eq!(
+            exported_texts(&second),
+            ["same-millisecond insert", "same-millisecond update"],
+            "the lower-id insert and the same-(timestamp, id) update must both surface"
+        );
+        // Re-exporting the acknowledged snapshot replays nothing: the unchanged
+        // boundary record is not re-emitted.
+        assert!(
+            export(second.source_cursor.as_deref(), None)
+                .events
+                .is_empty()
+        );
+
+        // Exact ranges still bound by the captured endpoints, old and new.
+        assert_eq!(
+            exported_texts(&export(None, Some(&baseline))),
+            ["unchanged"]
+        );
+        let exact = export(Some(&baseline), second.source_cursor.as_deref());
+        assert_eq!(exported_texts(&exact), exported_texts(&second));
+
+        // A later millisecond advances past the recovered boundary cleanly.
+        write("g000", 101, "next-millisecond control");
+        let third = export(second.source_cursor.as_deref(), None);
+        assert_eq!(exported_texts(&third), ["next-millisecond control"]);
+        assert!(
+            export(third.source_cursor.as_deref(), None)
+                .events
+                .is_empty()
+        );
+
+        // A legacy pair-only cursor (no boundary) still deserializes and keeps
+        // its original strict id-ordering semantics at the boundary timestamp.
+        let legacy = json!({"updated":100, "id":"f000"}).to_string();
+        assert_eq!(
+            exported_texts(&export(Some(&legacy), None)),
+            ["next-millisecond control"]
+        );
+        assert_eq!(
+            exported_texts(&export(None, Some(&legacy))),
+            [
+                "same-millisecond insert",
+                "unchanged",
+                "same-millisecond update"
+            ]
+        );
+    }
+
+    #[test]
     fn opencode_adapter_reads_sqlite_incrementally_without_writing_it() {
         let home = tempfile::tempdir().unwrap();
         let db = opencode_db(home.path(), None);
@@ -9651,6 +10383,26 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn opencode_tool_calls_and_results_keep_their_call_id() {
+        let message = json!({"role":"assistant"});
+        let part = json!({
+            "type":"tool",
+            "callID":"call-1",
+            "tool":"bash",
+            "state":{"status":"completed","input":{"command":"ls"},"output":"file"}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_opencode(&message, &part, "s1", "p1", &mut events, &mut losses);
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolCall);
+        assert_eq!(events[0].metadata["tool_use_id"], "call-1");
+        assert_eq!(events[1].kind, WorkstreamEventKind::ToolResult);
+        assert_eq!(events[1].metadata["tool_use_id"], "call-1");
     }
 
     /// Beta store fixture: `session_v2` + `session_message` with the shapes

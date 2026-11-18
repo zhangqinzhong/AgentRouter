@@ -23,7 +23,8 @@ Markdown links in an exported bundle. Reindexing the extracted concept files
 preserves their link targets.
 
 Backup and OKF export downloads replace their output only after the whole
-response arrives. An interrupted download keeps the previous archive intact.
+response arrives and its first bytes match the gzip signature. An interrupted
+download or a response without that signature keeps the previous archive intact.
 New files and replacement symlinks are private; existing regular files keep
 their permissions and still require write access. Read-only files and
 directory destinations are refused. A symlink target is never changed.
@@ -63,6 +64,9 @@ Ordinary Markdown links use URL path encoding: `notes/my%20note.md` points
 to `notes/my note.md`. Import and the web UI decode that path once before
 resolving it. A literal percent sequence in a filename uses `%25` in a
 Markdown URL, while `[[wikilinks]]` continue to name literal page paths.
+Exported wikilink destinations also encode `&` as `%26`, so a filename such
+as `notes/a&copy;.md` keeps its literal spelling when a Markdown reader
+interprets character references.
 
 | OKF key | ai-memory source |
 |---|---|
@@ -92,6 +96,16 @@ existing `_meta.md` scope manifest is unchanged: it is ai-memory's
 identity record, and `index.md` is the OKF-facing description. Nothing in
 the current tree writes `index.md`, so that reserved name is free.
 `log.md` is not adopted: git is the log.
+
+OKF v0.2 §3.1 reserves `index.md` and `log.md` at every level. If a concept
+page (one with real frontmatter) occupies one of those names at any depth,
+the export refuses with that page's path rather than silently dropping it;
+rename the page and export again. A frontmatter-less file at a reserved name
+is raw capture, not a concept, and is skipped.
+
+Export excludes the project's root `_pending/` proposal staging directory.
+An identically named directory below a concept family, such as
+`notes/_pending/`, contains ordinary concept pages and is included.
 
 The hooks *do* write a raw per-month event ledger at the project root
 (`log-YYYY-MM.md`: `## [ts] event | title` lines, no frontmatter). It
@@ -163,7 +177,7 @@ so any later rewrite of an affected page (a restore, a hand edit, a
 
 ## Reconcile-delete safety net (opt-in, #929)
 
-The watcher's 30s reconcile pass only ever reindexes create/modify events by
+The watcher's 300s reconcile pass only ever reindexes create/modify events by
 default: a page whose file disappears from disk stays indexed until
 `ai-memory delete-page` removes it explicitly. `[maintenance]
 reconcile_tombstones_deleted_pages` (default `false`) opts into a background

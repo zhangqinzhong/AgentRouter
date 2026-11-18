@@ -8,7 +8,7 @@ use ai_memory_core::routing_skills::{
     CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
     GROK_HANDOFF_RULE_CONTENT, GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER,
     GROK_RULES_DIR, GROK_SKILL_DIR, HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill,
-    SKILLS_DIR,
+    SKILLS_DIR, WORKBUDDY_SKILL_DIR,
 };
 use anyhow::{Context, Result, bail};
 
@@ -207,6 +207,12 @@ fn resolve_target_roots_from_env(
         (InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli) => {
             Some(install_mcp::copilot_home_in(env.var_os("COPILOT_HOME"))?)
         }
+        // Hermes reads `skills/` from its own home (`get_skills_dir` in
+        // `hermes_constants.py`): `$HERMES_HOME`, else the platform default.
+        (InstallSkillsScope::Global, InstallSkillsAgent::Hermes) => Some(
+            crate::commands::path_util::hermes_home(env, home.as_deref())
+                .context("could not locate the Hermes home for global skill install")?,
+        ),
         _ => None,
     };
     let claude_config_dir = claude_config_dir(env.var_os("CLAUDE_CONFIG_DIR"));
@@ -316,6 +322,18 @@ fn resolve_target_roots_for_platform(
                 platform,
             )?]
         }
+        InstallSkillsAgent::WorkBuddy => {
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::WorkBuddy,
+                cwd,
+                home,
+                appdata,
+                agent_home,
+                claude_config_dir,
+                platform,
+            )?]
+        }
         // Antigravity reads workspace skills from the cross-agent root.
         InstallSkillsAgent::Antigravity if args.scope == InstallSkillsScope::Project => {
             vec![agent_root(
@@ -396,6 +414,7 @@ enum SkillRootKind {
     Grok,
     CopilotCli,
     Hermes,
+    WorkBuddy,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -419,7 +438,10 @@ fn agent_root(
     }
 
     if scope == InstallSkillsScope::Global
-        && matches!(kind, SkillRootKind::Grok | SkillRootKind::CopilotCli)
+        && matches!(
+            kind,
+            SkillRootKind::Grok | SkillRootKind::CopilotCli | SkillRootKind::Hermes
+        )
         && let Some(agent_home) = agent_home
     {
         return Ok(agent_home.join(SKILLS_DIR));
@@ -453,6 +475,7 @@ fn agent_root(
             InstallSkillsScope::Global => COPILOT_SKILL_DIR,
         },
         SkillRootKind::Hermes => HERMES_SKILL_DIR,
+        SkillRootKind::WorkBuddy => WORKBUDDY_SKILL_DIR,
     };
     Ok(base.join(agent_dir).join(SKILLS_DIR))
 }
@@ -762,6 +785,62 @@ mod tests {
         assert!(error.to_string().contains("$HOME"), "{error}");
     }
 
+    /// WorkBuddy reads skills from its own `.workbuddy/skills` root, global
+    /// (under `$HOME`) and project (under the checkout).
+    #[test]
+    fn workbuddy_skill_roots_are_its_own_directory() {
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+        let global = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::WorkBuddy),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&global), ["/home/alice/.workbuddy/skills"]);
+        let project = resolve_target_roots(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::WorkBuddy),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&project), ["/repo/.workbuddy/skills"]);
+    }
+
+    /// Hermes reads `skills/` from its own home (`get_skills_dir` in
+    /// `hermes_constants.py`), which on Windows is `%LOCALAPPDATA%\hermes`
+    /// and never `~/.hermes`; project scope stays under the checkout.
+    #[test]
+    fn global_hermes_skills_follow_the_resolved_hermes_home() {
+        let hermes_home = Path::new("C:/Users/alice/AppData/Local/hermes");
+        let global = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Hermes),
+            Path::new("C:/work"),
+            Some(Path::new("C:/Users/alice")),
+            None,
+            Some(hermes_home),
+            None,
+            SkillHostPlatform::Windows,
+        )
+        .unwrap();
+        assert_eq!(
+            root_names(&global),
+            ["C:/Users/alice/AppData/Local/hermes/skills"]
+        );
+
+        let project = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::Hermes),
+            Path::new("/repo"),
+            None,
+            None,
+            Some(Path::new("/srv/hermes")),
+            None,
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&project), ["/repo/.hermes/skills"]);
+    }
+
     #[test]
     fn devin_global_skill_root_matches_confirmed_windows_path() {
         let cwd = Path::new("/repo");
@@ -918,6 +997,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(root_names(&roots), ["/repo/.claude/skills"]);
+    }
+
+    /// Install and uninstall keep parallel skill-root lists; Hermes once
+    /// installed into a root uninstall never swept (#2285). Every agent, in
+    /// every scope and platform, with and without relocated homes, must
+    /// install only into roots `uninstall` sweeps. No agent is exempt.
+    #[test]
+    fn every_install_skill_root_is_swept_by_uninstall() {
+        use clap::ValueEnum;
+
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+        let appdata = Path::new("/appdata");
+        for relocated in [false, true] {
+            let grok_home = relocated.then_some(Path::new("/custom/grok"));
+            let copilot_home = relocated.then_some(Path::new("/custom/copilot"));
+            let hermes_home = relocated.then_some(Path::new("/custom/hermes"));
+            let claude_config_dir = relocated.then_some(Path::new("/custom/claude"));
+            let swept = crate::commands::uninstall::skill_roots(
+                cwd,
+                Some(home),
+                Some(appdata),
+                grok_home,
+                copilot_home,
+                claude_config_dir,
+                hermes_home,
+            );
+            for &agent in InstallSkillsAgent::value_variants() {
+                // Exhaustive on purpose: a new agent must say which relocated
+                // home (if any) its global install reads.
+                let agent_home = match agent {
+                    InstallSkillsAgent::Grok => grok_home,
+                    InstallSkillsAgent::CopilotCli => copilot_home,
+                    InstallSkillsAgent::Hermes => hermes_home,
+                    InstallSkillsAgent::ClaudeCode
+                    | InstallSkillsAgent::Agents
+                    | InstallSkillsAgent::Devin
+                    | InstallSkillsAgent::Antigravity
+                    | InstallSkillsAgent::WorkBuddy
+                    | InstallSkillsAgent::Both => None,
+                };
+                for &scope in InstallSkillsScope::value_variants() {
+                    for platform in [SkillHostPlatform::Other, SkillHostPlatform::Windows] {
+                        let roots = resolve_target_roots_for_platform(
+                            &args(scope, agent),
+                            cwd,
+                            Some(home),
+                            Some(appdata),
+                            agent_home,
+                            claude_config_dir,
+                            platform,
+                        )
+                        .unwrap();
+                        assert!(!roots.is_empty(), "{agent:?} {scope:?} {platform:?}");
+                        for root in roots {
+                            assert!(
+                                swept.contains(&root.path),
+                                "{agent:?} {scope:?} {platform:?} relocated={relocated}: \
+                                 install root {} is not swept by uninstall {swept:?}",
+                                root.path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

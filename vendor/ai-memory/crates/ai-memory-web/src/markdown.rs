@@ -507,13 +507,13 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for HeadingIdAssigner<'a, I> {
 
 /// State for tracking and deduplicating heading slugs across a rendered page.
 #[derive(Default)]
-struct HeadingSlugger {
+pub(crate) struct HeadingSlugger {
     seen: HashSet<String>,
     counts: HashMap<String, usize>,
 }
 
 impl HeadingSlugger {
-    fn slugify(&mut self, text: &str) -> String {
+    pub(crate) fn slugify(&mut self, text: &str) -> String {
         let base = slugify(text);
         self.deduplicate(&base)
     }
@@ -781,6 +781,32 @@ pub fn strip_leading_h1<'a>(body: &'a str, title: &str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_wikilink_destinations_preserve_literal_character_references() {
+        let page = PagePath::new("source.md").unwrap();
+        for target in [
+            "notes/a&copy;.md",
+            "notes/a&amp;.md",
+            "notes/a&b.md",
+            "notes/a%26copy;&copy;.md",
+        ] {
+            let exported =
+                ai_memory_wiki::rewrite_local_wikilinks(&format!("[[{target}]]"), &page, "proj");
+            let destination = Parser::new_ext(&exported, options())
+                .find_map(|event| match event {
+                    Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url),
+                    _ => None,
+                })
+                .expect("exported wikilink is an ordinary Markdown link");
+            assert_eq!(
+                ai_memory_wiki::decode_markdown_destination_path(&destination)
+                    .expect("valid URL path"),
+                target,
+                "{exported} must target the literal filename after Markdown parsing"
+            );
+        }
+    }
 
     #[test]
     fn renders_basic_markdown() {
@@ -1589,7 +1615,7 @@ mod reference_document_tests {
         let doc = crate::documentation::find("features").unwrap();
         let rendered = super::render_reference_document(
             "# Example\n\n<script>alert(1)</script>\n\n[x](javascript:alert) [guide](install.md) [local](#example)\n\n```text\n[[private-page]]\n```",
-            |url| crate::documentation::link(doc, "docs/features", url),
+            |url| crate::documentation::link_from(doc.source, "docs/features", url),
         );
         assert!(!rendered.html.contains("<script>"));
         assert!(rendered.html.contains("&lt;script&gt;"));

@@ -29,6 +29,9 @@
 //! - `--ingest whole-session|captured-session` writes one page per session
 //!   through the real page write path instead of replaying hooks;
 //! - `--date-prefix turn|session-start|none` moves the per-turn date.
+//!
+//! `--engine raw-rag` is an independent local-model reference over source
+//! windows, with its own `--raw-rag-*` protocol settings and no server.
 
 pub(crate) mod compare;
 pub(crate) mod dataset;
@@ -36,6 +39,7 @@ pub(crate) mod grep;
 pub(crate) mod ingest;
 pub(crate) mod qa;
 pub(crate) mod query;
+mod raw_rag;
 mod reachability;
 pub(crate) mod report;
 mod score;
@@ -44,6 +48,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ai_memory_core::Sanitizer;
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 
@@ -91,10 +96,14 @@ pub struct RetrievalArgs {
     #[arg(long = "question-id", value_delimiter = ',')]
     question_ids: Vec<String>,
 
-    /// `server` (the default) drives a real `ai-memory serve`; `grep`
-    /// scores the whole-session term-overlap baseline with no server.
+    /// `server` drives a real `ai-memory serve`; `grep` scores whole-session
+    /// term overlap; `raw-rag` runs local dense-window retrieval and a
+    /// cross-encoder without a server (see the `--raw-rag-*` options).
     #[arg(long, value_enum, default_value_t = Engine::Server)]
     engine: Engine,
+
+    #[command(flatten)]
+    raw_rag: raw_rag::Args,
 
     /// After ingest, report how much answer-bearing evidence reaches the
     /// page, the observations, and the local embedder's 512-token window.
@@ -242,6 +251,7 @@ impl Variant {
 enum Engine {
     Server,
     Grep,
+    RawRag,
 }
 
 /// Where local-embeddings runs keep haystack document vectors between runs,
@@ -294,11 +304,23 @@ impl Knobs {
             "embeddings={embeddings} reranker={}",
             if reranker { "on" } else { "off" }
         );
+        // A value kept in the summary still goes through the built-in
+        // sanitizer: a name check cannot see a password inside a URL or a
+        // provider key passed under an unrelated name.
+        let sanitizer = Sanitizer::builtin();
         for (k, v) in &env {
-            summary.push_str(&format!(" env:{k}={v}"));
+            // The summary is the report's `config:` line, which gets copied
+            // into docs/benchmarks/: a credential is named, never printed.
+            let shown = if is_credential_env_name(k) {
+                "<redacted>".to_owned()
+            } else {
+                sanitizer.scrub(v)
+            };
+            summary.push_str(&format!(" env:{k}={shown}"));
         }
         for (k, v) in &query_args {
-            summary.push_str(&format!(" arg:{k}={v}"));
+            let shown = sanitizer.scrub(&v.to_string());
+            summary.push_str(&format!(" arg:{k}={shown}"));
         }
         // Only non-default ablations are named, so a default run's summary
         // reads exactly as the published baselines do.
@@ -358,6 +380,26 @@ fn parse_env(side: &str, items: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+/// Whether a `--server-env` name holds a credential, judged by its
+/// `_`-separated words. Words rather than a closed list of names, because
+/// `[[llm_fallbacks]] api_key_env` lets an operator pick any variable name;
+/// `HEADERS` covers an `Authorization` header in `AI_MEMORY_LLM_HEADERS`.
+/// A false positive only hides a value from the report.
+fn is_credential_env_name(name: &str) -> bool {
+    const WORDS: [&str; 8] = [
+        "KEY",
+        "APIKEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIALS",
+        "HEADERS",
+    ];
+    name.split('_')
+        .any(|word| WORDS.iter().any(|w| word.eq_ignore_ascii_case(w)))
+}
+
 /// Reserved args the harness always sets; a config may not override them.
 const RESERVED_QUERY_ARGS: [&str; 4] = ["query", "workspace", "project", "limit"];
 
@@ -385,6 +427,27 @@ fn parse_query_args(
 }
 
 pub async fn run(args: RetrievalArgs) -> Result<()> {
+    if args.engine != Engine::RawRag && !args.raw_rag.is_default() {
+        bail!("--raw-rag-* options require --engine raw-rag");
+    }
+    if args.engine == Engine::RawRag {
+        args.raw_rag.validate()?;
+        if args.ab_mode()
+            || args.reachability
+            || args.reranker
+            || args.embeddings != "none"
+            || !args.server_env.is_empty()
+            || !args.query_arg.is_empty()
+            || args.ingest != IngestMode::Hooks
+            || args.date_prefix != DatePrefix::Turn
+            || args.keep_data_dir
+            || args.no_embedding_cache
+        {
+            bail!(
+                "--engine raw-rag runs alone: use --raw-rag-* options, not server/candidate/ingest/reachability knobs; --qa is supported"
+            );
+        }
+    }
     // Captured at launch: a long run must not stamp its report with a
     // commit that landed while it was in flight.
     let commit = report::commit_sha();
@@ -440,6 +503,29 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
             bail!("--engine grep runs alone: no candidate, --reachability, or --qa");
         }
         let report = run_grep(&args, variant, &questions, abstention.len(), &commit);
+        std::fs::create_dir_all(&run_dir)?;
+        std::fs::write(
+            run_dir.join("report.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        let md = report::to_markdown(&report);
+        std::fs::write(run_dir.join("report.md"), &md)?;
+        println!("{md}");
+        println!("run dir: {}", run_dir.display());
+        return Ok(());
+    }
+
+    if args.engine == Engine::RawRag {
+        let run = RunContext {
+            args: &args,
+            variant,
+            questions: &questions,
+            abstention_n: abstention.len(),
+            commit: &commit,
+            qa: resolve_qa(&args.qa),
+            embed_window: None,
+        };
+        let report = raw_rag::run(&run).await?;
         std::fs::create_dir_all(&run_dir)?;
         std::fs::write(
             run_dir.join("report.json"),
@@ -511,22 +597,7 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
     // grader once and share them across both configs. If QA is requested but
     // a provider/key can't be resolved, SKIP cleanly (retrieval metrics are
     // unaffected) rather than failing the run — mirroring live-LLM tests.
-    let qa_engine = if args.qa.enabled {
-        match qa::QaEngine::resolve(&args.qa) {
-            Ok(engine) => {
-                println!("QA-accuracy mode ON (live LLM): {}", engine.summary());
-                tracing::info!(qa = engine.summary(), "QA-accuracy mode enabled");
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                println!("QA-accuracy mode requested but SKIPPED: {e:#}");
-                tracing::warn!(error = %format!("{e:#}"), "QA-accuracy mode skipped");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let qa_engine = resolve_qa(&args.qa);
 
     // The embedder-window check reads the model's own tokenizer.
     let embed_window = if args.reachability {
@@ -573,6 +644,24 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
     }
     println!("run dir: {}", run_dir.display());
     Ok(())
+}
+
+fn resolve_qa(args: &qa::QaArgs) -> Option<Arc<qa::QaEngine>> {
+    if !args.enabled {
+        return None;
+    }
+    match qa::QaEngine::resolve(args) {
+        Ok(engine) => {
+            println!("QA-accuracy mode ON (live LLM): {}", engine.summary());
+            tracing::info!(qa = engine.summary(), "QA-accuracy mode enabled");
+            Some(Arc::new(engine))
+        }
+        Err(e) => {
+            println!("QA-accuracy mode requested but SKIPPED: {e:#}");
+            tracing::warn!(error = %format!("{e:#}"), "QA-accuracy mode skipped");
+            None
+        }
+    }
 }
 
 /// Everything a config run shares with its A/B twin.
@@ -781,6 +870,7 @@ async fn run_config(run: &RunContext<'_>, knobs: &Knobs) -> Result<report::Repor
             slices: reachability::aggregate(&reaches),
             per_question: reaches,
         }),
+        raw_rag: None,
         slices,
         per_question: scores,
     })
@@ -838,6 +928,7 @@ fn run_grep(
         qa: None,
         ingest: None,
         reachability: None,
+        raw_rag: None,
         slices,
         per_question: scores,
     }
@@ -945,5 +1036,101 @@ mod tests {
         let mut fts = parse("none");
         fts.use_embedding_cache(root);
         assert_eq!(fts.launch_config().embedding_cache, None);
+    }
+
+    #[test]
+    fn knobs_summary_names_credentials_without_their_values() {
+        let k = Knobs::parse(
+            "candidate",
+            "none",
+            true,
+            &[
+                "OPENAI_API_KEY=sk-test-123".into(),
+                "AI_MEMORY_AUTH_TOKEN=tok-456".into(),
+                "AI_MEMORY_LLM_HEADERS=authorization=Bearer hdr-789".into(),
+                "MY_ROUTER_SECRET=sec-000".into(),
+                "AI_MEMORY_LLM_PROVIDER=openai".into(),
+                "AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true".into(),
+            ],
+            &[],
+            IngestMode::Hooks,
+            DatePrefix::Turn,
+        )
+        .unwrap();
+        for secret in ["sk-test-123", "tok-456", "hdr-789", "sec-000"] {
+            assert!(
+                !k.summary.contains(secret),
+                "{secret} leaked: {}",
+                k.summary
+            );
+        }
+        assert!(k.summary.contains("env:OPENAI_API_KEY=<redacted>"));
+        assert!(k.summary.contains("env:AI_MEMORY_AUTH_TOKEN=<redacted>"));
+        // Other knobs keep their value: a published report says what ran.
+        assert!(k.summary.contains("env:AI_MEMORY_LLM_PROVIDER=openai"));
+        assert!(
+            k.summary
+                .contains("env:AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true")
+        );
+        // The server still gets the real value.
+        assert!(
+            k.env
+                .contains(&("OPENAI_API_KEY".into(), "sk-test-123".into()))
+        );
+    }
+
+    #[test]
+    fn knobs_summary_scrubs_secrets_in_values_it_keeps() {
+        let k = Knobs::parse(
+            "candidate",
+            "none",
+            true,
+            &[
+                "AI_MEMORY_LLM_BASE_URL=https://evaluser:hunter2pass@llm.example.test/v1".into(),
+                "AI_MEMORY_RERANKER_MODEL=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                "AI_MEMORY_LLM_PROVIDER=openai".into(),
+            ],
+            &[r#"filter={"note":"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#.into()],
+            IngestMode::Hooks,
+            DatePrefix::Turn,
+        )
+        .unwrap();
+        for secret in [
+            "hunter2pass",
+            "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(
+                !k.summary.contains(secret),
+                "{secret} leaked: {}",
+                k.summary
+            );
+        }
+        // Control: a value with nothing secret in it reads as given.
+        assert!(k.summary.contains("env:AI_MEMORY_LLM_PROVIDER=openai"));
+        assert!(k.summary.contains("env:AI_MEMORY_LLM_BASE_URL="));
+        // The server and the query still get the real values.
+        assert!(k.env.iter().any(|(_, v)| v.contains("hunter2pass")));
+    }
+
+    #[test]
+    fn credential_env_names_match_whole_words() {
+        for name in [
+            "OPENAI_API_KEY",
+            "LLM_API_KEY",
+            "ai_memory_auth_token",
+            "AI_MEMORY_LLM_HEADERS",
+            "ROUTER_APIKEY",
+            "PROXY_PASSWD",
+        ] {
+            assert!(is_credential_env_name(name), "{name}");
+        }
+        for name in [
+            "AI_MEMORY_LLM_PROVIDER",
+            "AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS",
+            "MONKEY_MODE",
+        ] {
+            assert!(!is_credential_env_name(name), "{name}");
+        }
     }
 }
