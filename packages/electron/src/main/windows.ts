@@ -26,6 +26,12 @@ const pluginAppTrafficLightPosition = {
 };
 const mainWindowDefaultHeight = 760;
 const mainWindowDefaultWidth = 1180;
+// After onboarding the window opens at a comfortable working size, not the whole screen.
+const mainWindowWorkingHeight = 880;
+const mainWindowWorkingWidth = 1320;
+const mainWindowWorkingScreenShare = 0.9;
+const mainWindowBoundsFile = "main-window-bounds.json";
+const mainWindowBoundsSaveDelayMs = 400;
 const mainWindowMargin = 48;
 const mainWindowMinHeight = 420;
 const mainWindowMinWidth = 360;
@@ -81,6 +87,7 @@ class WindowsManager {
     });
 
     this.windows.set("main", window);
+    this.rememberMainWindowBounds(window);
 
     window.once("ready-to-show", () => {
       if (!window.isDestroyed()) {
@@ -253,12 +260,33 @@ class WindowsManager {
     return window;
   }
 
-  resizeMainWindowToScreenSize(): void {
+  resizeMainWindowToWorkingSize(): void {
     const window = this.getWindow("main");
     if (!window) {
       return;
     }
-    window.setBounds(getMainWindowScreenBounds());
+    window.setBounds(getMainWindowWorkingBounds());
+  }
+
+  private rememberMainWindowBounds(window: BrowserWindow): void {
+    let timer: NodeJS.Timeout | undefined;
+    const save = () => {
+      timer = undefined;
+      if (!this.onboardingFinished || window.isDestroyed() || window.isFullScreen() || window.isMaximized() || window.isMinimized()) {
+        return;
+      }
+      writeSavedMainWindowBounds(window.getBounds());
+    };
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(save, mainWindowBoundsSaveDelayMs);
+    };
+    window.on("resize", schedule);
+    window.on("move", schedule);
+    window.on("close", () => {
+      if (timer) clearTimeout(timer);
+      save();
+    });
   }
 
   getWindow(name: WindowName): BrowserWindow | undefined {
@@ -306,7 +334,7 @@ function getMainWindowInitialBounds(onboardingFinished: boolean): WindowBounds {
   const { height: availableHeight, width: availableWidth } = screen.getPrimaryDisplay().workAreaSize;
 
   if (onboardingFinished) {
-    return getMainWindowScreenBounds();
+    return readSavedMainWindowBounds() ?? getMainWindowWorkingBounds();
   }
 
   return {
@@ -315,15 +343,59 @@ function getMainWindowInitialBounds(onboardingFinished: boolean): WindowBounds {
   };
 }
 
-function getMainWindowScreenBounds(): Required<WindowBounds> {
+function getMainWindowWorkingBounds(): Required<WindowBounds> {
   const { workArea } = screen.getPrimaryDisplay();
-
+  const width = fitWindowSize(
+    mainWindowWorkingWidth,
+    mainWindowMinWidth,
+    Math.min(workArea.width - mainWindowMargin, Math.round(workArea.width * mainWindowWorkingScreenShare))
+  );
+  const height = fitWindowSize(
+    mainWindowWorkingHeight,
+    mainWindowMinHeight,
+    Math.min(workArea.height - mainWindowMargin, Math.round(workArea.height * mainWindowWorkingScreenShare))
+  );
   return {
-    height: Math.max(mainWindowMinHeight, workArea.height),
-    width: Math.max(mainWindowMinWidth, workArea.width),
-    x: workArea.x,
-    y: workArea.y
+    height,
+    width,
+    x: workArea.x + Math.round((workArea.width - width) / 2),
+    y: workArea.y + Math.round((workArea.height - height) / 2)
   };
+}
+
+function mainWindowBoundsPath(): string {
+  return path.join(app.getPath("userData"), mainWindowBoundsFile);
+}
+
+// The last size and position the user chose, if it still fits on a connected display.
+function readSavedMainWindowBounds(): Required<WindowBounds> | undefined {
+  try {
+    const saved = JSON.parse(readFileSync(mainWindowBoundsPath(), "utf8")) as Partial<WindowBounds>;
+    const { height, width, x, y } = saved;
+    if (![height, width, x, y].every((value) => typeof value === "number" && Number.isFinite(value))) {
+      return undefined;
+    }
+    const bounds = { height: height!, width: width!, x: x!, y: y! };
+    const { workArea } = screen.getDisplayMatching(bounds);
+    if (bounds.width < mainWindowMinWidth || bounds.height < mainWindowMinHeight
+      || bounds.width > workArea.width || bounds.height > workArea.height
+      || bounds.x < workArea.x || bounds.y < workArea.y
+      || bounds.x + bounds.width > workArea.x + workArea.width
+      || bounds.y + bounds.height > workArea.y + workArea.height) {
+      return undefined;
+    }
+    return bounds;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeSavedMainWindowBounds(bounds: Required<WindowBounds>): void {
+  try {
+    writeFileSync(mainWindowBoundsPath(), JSON.stringify(bounds), { mode: 0o600 });
+  } catch {
+    // Remembering the window size is a convenience; a failed write keeps the default next time.
+  }
 }
 
 function getPluginAppWindowInitialBounds(): WindowBounds {

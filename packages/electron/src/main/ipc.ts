@@ -387,7 +387,7 @@ ipcMain.handle(IPC_CHANNELS.appSaveApiKeys, async (_event, apiKeys: ApiKeyConfig
 ipcMain.handle(IPC_CHANNELS.appSetOnboardingFinished, async () => {
   await markOnboardingFinished();
   windowsManager.setOnboardingFinished(true);
-  windowsManager.resizeMainWindowToScreenSize();
+  windowsManager.resizeMainWindowToWorkingSize();
   return true;
 });
 ipcMain.handle(IPC_CHANNELS.appRestartGateway, async () => {
