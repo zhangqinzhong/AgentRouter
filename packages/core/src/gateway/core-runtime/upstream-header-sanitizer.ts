@@ -3,6 +3,7 @@ import { applyMetaTokenFloor } from "@agentrouter/core/gateway/core-runtime/meta
 import { applyResponsesSessionAffinity, inboundMetadataUserId, resolveResponsesSessionKey } from "@agentrouter/core/gateway/core-runtime/responses-session-affinity";
 import type { ResponsesSessionAffinityInput } from "@agentrouter/core/gateway/core-runtime/responses-session-affinity";
 import { applyResponsesToolStrictness } from "@agentrouter/core/gateway/core-runtime/responses-tool-strictness";
+import { applyResponsesReasoningHistory, type ResponsesReasoningHistoryInput } from "@agentrouter/core/gateway/core-runtime/responses-reasoning-history";
 import type { ResponsesToolStrictnessInput } from "@agentrouter/core/gateway/core-runtime/responses-tool-strictness";
 import {
   normalizeDeepSeekCacheUsage,
@@ -365,6 +366,14 @@ export function createGatewayPlugin() {
         return {
           ok: true as const,
           value: applyResponsesToolStrictness(input)
+        };
+      }
+    }, {
+      key: "ar-responses-reasoning-history",
+      transformRequest(input: ResponsesReasoningHistoryInput) {
+        return {
+          ok: true as const,
+          value: applyResponsesReasoningHistory(input)
         };
       }
     }],
