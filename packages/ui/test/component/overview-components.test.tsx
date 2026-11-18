@@ -651,3 +651,37 @@ test("monthly trend preserves counts, costs and model totals when combining dail
   assert.equal(point.row.total_cost_usd,1);
   assert.deepEqual(point.row.models,{a:23,b:7});
 });
+
+
+test("OverviewBreakdowns omits empty model groups from rows and model count", () => {
+  const stats = usageStats("24h", { models: [
+    usageRow("empty", "unknown", { model: "unknown", totalTokens: 0, costUsd: 0, requestCount: 0 }),
+    usageRow("known-empty", "unused-model", { model: "unused-model", totalTokens: 0, costUsd: 0 }),
+    usageRow("active", "active-model", { model: "active-model", totalTokens: 123, costUsd: 0 }),
+  ] });
+  const html = renderToStaticMarkup(<OverviewBreakdowns providers={[]} usageStats={stats} />);
+  assert.doesNotMatch(html, /unknown|unused-model/);
+  assert.match(html, /1 Models/);
+  assert.match(html, /active-model/);
+});
+
+test("OverviewBreakdowns preserves unknown usage and cost-only models", () => {
+  const stats = usageStats("24h", { models: [
+    usageRow("unknown", "unknown", { model: "unknown", totalTokens: 123, costUsd: 0 }),
+    usageRow("cost-only", "cost-only", { model: "cost-only", totalTokens: 0, costUsd: 0.00001 }),
+  ] });
+  const html = renderToStaticMarkup(<OverviewBreakdowns providers={[]} usageStats={stats} />);
+  assert.match(html, /unknown/);
+  assert.match(html, /cost-only/);
+  assert.match(html, /2 Models/);
+});
+
+test("OverviewBreakdowns shows empty state for zero-only model usage", () => {
+  const stats = usageStats("24h", { models: [
+    usageRow("empty", "unknown", { model: "unknown", totalTokens: 0, costUsd: 0 }),
+  ] });
+  const html = renderToStaticMarkup(<OverviewBreakdowns providers={[]} usageStats={stats} />);
+  assert.match(html, /No model usage yet/);
+  assert.match(html, /0 Models/);
+  assert.doesNotMatch(html, /unknown/);
+});

@@ -165,7 +165,7 @@ export function OverviewBreakdowns({
   const modelRows = collapseAnalysisDisplayRows(
     "model",
     usageStats.models ?? [],
-  );
+  ).filter((row) => row.totalTokens > 0 || row.costUsd > 0);
   const clients = collapseAnalysisDisplayRows(
     "client",
     (usageStats.clientModels ?? []).filter(hasClientAttribution),
