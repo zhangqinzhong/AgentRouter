@@ -118,3 +118,13 @@ November 10, 2026 targeted backports, reviewed against upstream v1.5.17
 This is a selective source backport, not a replacement of the full collector or
 the upstream UI. Existing custom roots, profile attribution and AgentRouter data
 paths remain authoritative. See `docs/issue-reviews/2026-11-10-upstream-sync.md`.
+
+Pricing refreshed from upstream v1.5.24 (2026-11-18): Claude Fable 5.2 and its
+fast mode (`31929b8f`), Gemini 4 Carbon/Hydrogen and Muse Wonder Cursor
+variants plus Cursor Grok Bot subscription rows (`c58cf512`), GPT-6.2
+Astra/Sol/Astra Law Standard rates (`ce771c64`), and the bounded contained-key
+lookup that stops later numeric versions and preview SKUs from inheriting a
+base model's rate. AgentRouter does not model OpenAI speed tiers, so the GPT-6.2
+Ultrafast promotion and its session-time repricing are not part of this refresh.
+Trae, Qoder and Antigravity collector changes do not apply to AgentRouter's
+sources.

@@ -104,8 +104,8 @@ function normalizeClaudeModel(model) {
     .replace(/^-+|-+$/g, "")
     .replace(/-{2,}/g, "-");
 
-  if (/^claude-(sonnet|opus|haiku)-\d+\.\d+/.test(m)) {
-    return m.replace(/^(claude-(?:sonnet|opus|haiku)-\d+)\.(\d+)/, "$1-$2");
+  if (/^claude-(sonnet|opus|haiku|fable)-\d+\.\d+/.test(m)) {
+    return m.replace(/^(claude-(?:sonnet|opus|haiku|fable)-\d+)\.(\d+)/, "$1-$2");
   }
   if (/^(sonnet|opus|haiku)-\d+[.-]\d+/.test(m)) {
     return m
@@ -137,6 +137,13 @@ function normalizeCursorModel(model) {
     .replace(/-{2,}/g, "-");
   const parts = m.split("-");
   const isFast = parts.includes("fast");
+
+  if (/^gemini-4[.-](argon|carbon|hydrogen)(?:-(minimal|low|medium|high|xhigh))?$/.test(m)) {
+    return m.replace(/^gemini-4\./, "gemini-4-").replace(/-(minimal|low|medium|high|xhigh)$/, "");
+  }
+  if (/^muse-wonder-1[.-]0(?:-(minimal|low|medium|high|xhigh|extra-high|max))?$/.test(m)) {
+    return "muse-wonder-1.0";
+  }
 
   if (/^(?:cursor-)?grok-4[.-]7(?:-|$)/.test(m)) {
     return isFast ? "cursor-grok-4.7-fast" : "cursor-grok-4.7";
@@ -247,7 +254,18 @@ function lookupContainedExactCaseInsensitive(table, model) {
   const lower = model.toLowerCase();
   const keys = Object.keys(table).sort((a, b) => b.length - a.length);
   for (const key of keys) {
-    if (lower.includes(key.toLowerCase())) return table[key];
+    const start = lower.indexOf(key.toLowerCase());
+    if (start < 0) continue;
+    // A model generation must not match a later numeric version (Opus 5.5
+    // is a separate SKU from Opus 5). Dated and provider suffixes still work.
+    const suffix = lower.slice(start + key.length);
+    if (/^[.\d]/.test(suffix)) continue;
+    // Alternate SKU markers (preview/next/exp/…) must not inherit the base
+    // exact rate, including when they follow a date snapshot
+    // (`qwen3.8-max-2026-09-02-preview`, `qwen3-8-max-0902-preview`).
+    // Plain dated (-0902 / -YYYY-MM-DD) and provider-qualified suffixes still match.
+    if (/(?:^|-)(?:preview|next|exp|experimental|beta|alpha)(?:-|$)/.test(suffix)) continue;
+    return table[key];
   }
   return null;
 }
@@ -289,6 +307,36 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   if (curatedDotExact) {
     return { hit: true, source: "curated:exact-dot", value: curatedDotExact };
   }
+  // Floating Fable aliases (`claude-fable-latest` and every provider's
+  // `…/claude-fable-latest`) retarget on each release. Checked 2026-11-10: the
+  // Anthropic model overview and the Fable 5.2 pages do not document the alias,
+  // so nothing pins it to 5.2. Stop here, after exact lookups, so the
+  // fable-5.2 fuzzy needles and the broad fable matcher cannot price it, but
+  // an explicit exact entry added later still wins. Re-check on the next
+  // Fable release before pointing it anywhere.
+  if (/(?:^|\/)claude-fable-latest(?:$|[^a-z0-9])/.test(lower)) {
+    return { hit: false, source: "miss", value: null };
+  }
+
+  // Gemini 4's Cyber Permissive SKU and future variants must not inherit
+  // the cheaper introductory Standard rate through contained-key matching.
+  const gemini4 = lower.trim().match(/(?:^|\/)gemini-4[.-](carbon|hydrogen)(.*)$/);
+  if (gemini4 && !/^(?:-(?:minimal|low|medium|high|xhigh))?$/.test(gemini4[2])) {
+    return { hit: false, source: "miss", value: null };
+  }
+  // General Astra/Sol and the specialist Astra Law have confirmed rates. Do not let
+  // unknown SKUs/snapshots inherit their rates via contained/fuzzy matching.
+  // Explicit curated/LiteLLM exact prices above remain authoritative.
+  const gpt62 = (dotForm || lower).trim().match(/gpt-6\.2(?:-(.*))?$/);
+  if (gpt62) {
+    if (lower.includes("cline-free/") || lower.includes("cline-pass/")) {
+      return { hit: true, source: "curated:cline-gateway", value: curated.exact["cline-gateway-models"] };
+    }
+    const known = /^(astra-law|astra|sol)(?:-?(?:low|medium|high|xhigh|max)(?:-fast)?|-fast)?$/.exec(gpt62[1] || "");
+    const value = known && curated.exact?.[`gpt-6.2-${known[1]}`];
+    return value ? { hit: true, source: "curated:gpt-6.2", value }
+      : { hit: false, source: "miss", value: null };
+  }
   const curatedDotContainedExact = lookupContainedExactCaseInsensitive(curated.exact, dotForm);
   if (curatedDotContainedExact) {
     return { hit: true, source: "curated:exact-dot", value: curatedDotContainedExact };
@@ -324,10 +372,25 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
       if (!match || !ref) continue;
       const needle = match.toLowerCase();
       if (!curated.exact[ref]) continue;
-      if (lower.includes(needle)) {
+      // The Fable 5.2 needles are version-bounded. A plain substring lets the
+      // dot-restored form of a dated Fable 5 id through: claude-fable-5-20250901
+      // becomes claude-fable-5.20250901, which contains "fable-5.2". fable-5-20
+      // contains "fable-5-2" the same way. The minor must end the id or be
+      // followed by a non-digit, so -20261109 and -20 stay off the 5.2 rate.
+      const bounded = /^fable-5[.-]2(?:-fast)?$/.test(needle)
+        ? new RegExp(`${needle.replace(".", "\\.")}(?:$|[^0-9])`)
+        : null;
+      const matches = (value) => (bounded ? bounded.test(value) : value.includes(needle));
+      if (matches(lower)) {
         return { hit: true, source: "curated:fuzzy", value: curated.exact[ref] };
       }
-      if (dotForm && dotForm.includes(needle)) {
+      if (dotForm && matches(dotForm)) {
+        return { hit: true, source: "curated:fuzzy", value: curated.exact[ref] };
+      }
+      // Display names ("Claude Fable 5.2", "Fable 5.2 Fast") only reach this
+      // scan when no source normalizer ran. Fold spaces for the pinned 5.2
+      // needles only — a general fold would price unrelated display names.
+      if (bounded && bounded.test(lower.replace(/[^a-z0-9.]+/g, "-"))) {
         return { hit: true, source: "curated:fuzzy", value: curated.exact[ref] };
       }
     }
