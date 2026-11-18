@@ -1,6 +1,5 @@
 {
-  "baseVersion": "1.12.1",
+  "baseVersion": "1.13.0",
   "change": "minor",
-  "reason": "Add client and configuration-instance usage filters, local Claude Official quota, two-character CJK search and native MiMo subagent support; update collection and memory integration while preserving existing data.",
-  "candidate": "v1.13.0-rc.2"
+  "reason": "Add global profile recovery, per-provider deferred tool loading, OpenAI-compatible reasoning model metadata and new quota presets; absorb upstream gateway, pricing and memory updates and open the main window at a working size."
 }

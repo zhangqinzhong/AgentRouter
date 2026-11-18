@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 1.14.0-rc.1 - 2026-11-18
+
+### Features
+- Restore the original Claude Code or Codex settings of a system-default profile from Agent profiles; the takeover is disabled first and only AgentRouter-owned keys are reverted.
+- Turn off deferred tool loading per provider for upstreams that reject `defer_loading`.
+- Show selected models that are no longer configured and remove them from a profile.
+- Advertise reasoning metadata on the OpenAI-compatible `/v1/models` endpoint.
+- Add Z.ai and MiniMax plan quota meters.
+- Open the main window at a working size instead of full screen and remember its size and position.
+
+### Fixes
+- Explain failed gateway attempts with the provider, model and upstream cause, plus how to restore a broken system-default profile.
+- Send terminal errors at SSE event boundaries and report truncated upstream streams.
+- Drop readable reasoning history before official OpenAI Responses calls so Codex conversations no longer stop with 400 after switching models.
+- Keep vendor thinking parameters, take completion limits from the model author, and keep Anthropic `tool_result` images for other protocols.
+- Stop forwarding client proxy headers and cookies upstream; apply `API_TIMEOUT_MS` to the gateway child.
+- Count each request's outcome once in usage statistics and fix the provider usage series.
+- Keep stale profile model selections consistent, honor provider credential priority, and leave empty model groups out of the overview.
+- Harden Docker management origins, redact provider secrets in the web console and run container services as a non-root user.
+- Hide console windows for gateway and MCP child processes on Windows.
+
+### Maintenance
+- Refresh pricing for Claude Fable 5.2, GPT-6.2, Gemini 4 and Muse Wonder.
+- Upgrade the bundled ai-memory to 3.5.0 and the desktop runtime to Electron 42.11.18.
+
 ## 1.13.0 - 2026-11-10
 
 ### Features
