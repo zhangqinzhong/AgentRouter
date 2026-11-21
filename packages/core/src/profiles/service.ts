@@ -4,7 +4,7 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readlinkSync
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV, NO_AVAILABLE_GATEWAY_MODELS_MESSAGE, availableGatewayModelIds, enforceSingleEnabledGlobalProfilePerAgent, hasAvailableGatewayModels, isGatewayProviderEnabled, type AppConfig, type ProfileApplyResult, type ProfileClientApplyStatus, type ProfileClientKind, type ProfileConfig } from "@agentrouter/core/contracts/app";
+import { CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY_ENV, CODEX_NATIVE_IMAGE_GENERATION_HEADER, CODEX_NATIVE_IMAGE_GENERATION_MARKER, NO_AVAILABLE_GATEWAY_MODELS_MESSAGE, availableGatewayModelIds, enforceSingleEnabledGlobalProfilePerAgent, hasAvailableGatewayModels, isGatewayProviderEnabled, type AppConfig, type ProfileApplyResult, type ProfileClientApplyStatus, type ProfileClientKind, type ProfileConfig } from "@agentrouter/core/contracts/app";
 import { CLAUDE_CODE_AUTH_MODE_ENV, resolveClaudeCodeGatewayAuthMode, type ClaudeCodeGatewayAuthMode } from "@agentrouter/core/agents/claude-code/auth-mode";
 import { CLAUDE_CONFIG_DIR_ENV, claudeCodeConfigDirEnv, isDefaultClaudeConfigDir, resolveClaudeCodeGlobalConfigFile } from "@agentrouter/core/agents/claude-code/config-home";
 import { updatePersistedApiKeys } from "@agentrouter/core/config/config-repository";
@@ -669,6 +669,7 @@ function applyCodexProfile(config: AppConfig, profile: ProfileConfig, token: str
       : undefined;
     const nextConfig = buildCodexConfigToml(source, {
       baseUrl: endpoint,
+      codexNativeImageGeneration: profile.agent === "codex" && profile.codexNativeImageGeneration === true,
       contextArchiveMcp,
       modelCatalogFile,
       configFormat,
@@ -1172,6 +1173,7 @@ function buildCodexConfigToml(
   source: string,
   values: {
     baseUrl: string;
+    codexNativeImageGeneration: boolean;
     contextArchiveMcp?: CodexContextArchiveMcpConfig;
     modelCatalogFile: string;
     configFormat: "legacy" | "separate_profile_files";
@@ -1200,6 +1202,8 @@ function buildCodexConfigToml(
   if (values.configFormat === "separate_profile_files") {
     content = removeCodexProfileTable(content, values.providerId);
   }
+  const imageHeader = updateCodexImageGenerationHeader(content, values.providerId, values.codexNativeImageGeneration);
+  content = imageHeader.content;
 
   const firstTableIndex = firstTomlTableIndex(content);
   const rootSource = firstTableIndex === -1 ? content : content.slice(0, firstTableIndex);
@@ -1229,6 +1233,7 @@ function buildCodexConfigToml(
     `base_url = ${tomlString(values.baseUrl)}`,
     `experimental_bearer_token = ${tomlString(values.token)}`,
     'wire_api = "responses"',
+    ...(imageHeader.inline ? [`http_headers = ${tomlInlineStringTable({ [CODEX_NATIVE_IMAGE_GENERATION_HEADER]: CODEX_NATIVE_IMAGE_GENERATION_MARKER })}`] : []),
     managedProviderEnd,
     ""
   ].join("\n");
@@ -1242,6 +1247,24 @@ function normalizeCodexConfigPaths(source: string): string {
   const legacyPrefix = `${path.resolve(LEGACY_CONFIGDIR)}${path.sep}`;
   const currentPrefix = `${path.resolve(CONFIGDIR)}${path.sep}`;
   return source.split(legacyPrefix).join(currentPrefix);
+}
+
+function updateCodexImageGenerationHeader(content: string, providerId: string, enabled: boolean): { content: string; inline: boolean } {
+  const headerTables = [providerId, tomlQuotedKey(providerId)].map((key) => `[model_providers.${key}.http_headers]`);
+  const lines = content.split("\n");
+  const start = lines.findIndex((line) => headerTables.includes(line.split("#", 1)[0].trim()));
+  if (start < 0) return { content, inline: enabled };
+
+  const nextTable = lines.findIndex((line, index) => index > start && /^\s*\[/.test(line));
+  const end = nextTable < 0 ? lines.length : nextTable;
+  const marker = `${CODEX_NATIVE_IMAGE_GENERATION_HEADER} = ${tomlString(CODEX_NATIVE_IMAGE_GENERATION_MARKER)}`;
+  const headers = lines.slice(start + 1, end).filter((line) => line.trim() !== marker);
+  // Honor an explicit actor header and avoid defining the same TOML table twice.
+  if (enabled && !headers.some((line) => /^\s*["']?x-openai-actor-authorization["']?\s*=/i.test(line))) {
+    headers.unshift(marker);
+  }
+  lines.splice(start + 1, end - start - 1, ...headers);
+  return { content: lines.join("\n"), inline: false };
 }
 
 function buildCodexToolHubMcpBlock(runtime: ToolHubMcpRuntimeConfig | undefined): string {
@@ -2842,6 +2865,9 @@ function codexMiddlewareShellScript(
     "#!/bin/sh",
     ...envExports,
     ...agentEnvExports,
+    ...(profile.agent === "codex" ? shellEnvExports({
+      AR_CODEX_NATIVE_IMAGE_GENERATION: profile.codexNativeImageGeneration ? "1" : "0"
+    }) : []),
     ...shellProfileSurfaceExports(surface),
     ...botEnvExports,
     ...shellCodexlProfileSurfaceExports(),
@@ -2972,6 +2998,9 @@ function codexMiddlewareCmdScript(
     "@echo off",
     ...envExports,
     ...agentEnvExports,
+    ...(profile.agent === "codex" ? cmdEnvExports({
+      AR_CODEX_NATIVE_IMAGE_GENERATION: profile.codexNativeImageGeneration ? "1" : "0"
+    }) : []),
     ...cmdProfileSurfaceExports(surface),
     ...botEnvExports,
     ...cmdCodexlProfileSurfaceExports(),

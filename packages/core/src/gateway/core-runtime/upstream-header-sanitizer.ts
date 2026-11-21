@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { CODEX_NATIVE_IMAGE_GENERATION_HEADER, CODEX_NATIVE_IMAGE_GENERATION_MARKER } from "@agentrouter/core/contracts/app";
 import { applyMetaTokenFloor } from "@agentrouter/core/gateway/core-runtime/meta-token-floor";
 import { applyResponsesSessionAffinity, inboundMetadataUserId, resolveResponsesSessionKey } from "@agentrouter/core/gateway/core-runtime/responses-session-affinity";
 import type { ResponsesSessionAffinityInput } from "@agentrouter/core/gateway/core-runtime/responses-session-affinity";
@@ -178,7 +179,7 @@ export function sanitizeUpstreamProviderHeaders(headers: Record<string, string>)
   const sanitized: Record<string, string> = {};
   for (const [name, value] of Object.entries(headers)) {
     const normalized = name.trim().toLowerCase();
-    if (normalized.startsWith("x-ar-") || arAuthHeaderNames.has(normalized)) continue;
+    if (normalized.startsWith("x-ar-") || arAuthHeaderNames.has(normalized) || isCodexNativeImageGenerationMarker(normalized, value)) continue;
     sanitized[name] = value;
   }
   return sanitized;
@@ -206,13 +207,15 @@ export function mergeUpstreamProviderHeaders(
   const merged: Record<string, string> = {};
   for (const [name, value] of Object.entries(requestHeaders ?? {})) {
     const normalized = name.trim().toLowerCase();
+    const headerValue = Array.isArray(value) ? value.join(",") : value;
     if (
       !normalized ||
-      value === undefined ||
+      headerValue === undefined ||
       normalized.startsWith("x-ar-") ||
       arAuthHeaderNames.has(normalized) ||
       arRoutingHeaderNames.has(normalized) ||
       clientAuthHeaderNames.has(normalized) ||
+      isCodexNativeImageGenerationMarker(normalized, headerValue) ||
       proxyMetadataHeaderNames.has(normalized) ||
       normalized.startsWith("cf-") ||
       normalized.startsWith("x-forwarded-") ||
@@ -220,7 +223,7 @@ export function mergeUpstreamProviderHeaders(
     ) {
       continue;
     }
-    merged[normalized] = Array.isArray(value) ? value.join(",") : value;
+    merged[normalized] = headerValue;
   }
 
   for (const [name, value] of Object.entries(sanitizeUpstreamProviderHeaders(upstreamHeaders))) {
@@ -229,6 +232,11 @@ export function mergeUpstreamProviderHeaders(
     merged[normalized] = value;
   }
   return merged;
+}
+
+function isCodexNativeImageGenerationMarker(name: string, value: string): boolean {
+  return name === CODEX_NATIVE_IMAGE_GENERATION_HEADER
+    && value.split(",").some((token) => token.trim() === CODEX_NATIVE_IMAGE_GENERATION_MARKER);
 }
 
 export function rewriteUpstreamProviderUrl(

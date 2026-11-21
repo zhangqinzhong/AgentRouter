@@ -26,16 +26,22 @@ import {
 import { AnchoredPopover, ListboxSearch, useAnchoredPopoverLayout, useDismiss } from "@/components/ui/listbox";
 
 export function ModelSelector({
+  ariaLabel,
+  defaultOption,
   onChange,
   placeholder,
   providers,
   value,
+  valueUnavailable = false,
   virtualModelProfiles = []
 }: {
+  ariaLabel?: string;
+  defaultOption?: string;
   onChange: (value: string) => void;
   placeholder?: string;
   providers: GatewayProviderConfig[];
   value: string;
+  valueUnavailable?: boolean;
   virtualModelProfiles?: VirtualModelProfileConfig[];
 }) {
   const t = useAppText();
@@ -57,10 +63,14 @@ export function ModelSelector({
   const filteredModels = activeProvider
     ? activeProvider.models.filter((model) => profileModelMatchesQuery(activeProvider.name, model, query, profileModelOptionDisplayName(activeProvider, model)))
     : [];
-  const displayValue = profileModelDisplayValue(value, parsedValue, providers, placeholder, virtualModelProfiles);
+  const displayValue = profileModelDisplayValue(value, parsedValue, providers, defaultOption ?? placeholder, virtualModelProfiles);
+  const displayLabel = valueUnavailable ? `${displayValue} (${t("Unavailable")})` : displayValue;
+  const showDefaultOption = defaultOption?.toLowerCase().includes(query.trim().toLowerCase());
 
   const popoverLayout = useAnchoredPopoverLayout(open, rootRef, { flipBelow: 240, maxHeight: 360, minHeight: 144, minViewportWidth: 240, width: 560 });
-  const gridHeight = popoverLayout ? Math.max(128, Math.min(280, popoverLayout.maxHeight - 58)) : undefined;
+  const gridHeight = popoverLayout
+    ? Math.max(showDefaultOption ? 72 : 128, Math.min(280, popoverLayout.maxHeight - (showDefaultOption ? 98 : 58)))
+    : undefined;
   useDismiss(open, [rootRef, panelRef], () => setOpen(false), { restoreFocus: true });
 
   useEffect(() => {
@@ -78,10 +88,15 @@ export function ModelSelector({
     setOpen(false);
     setQuery("");
     setActiveProviderName(providerName);
+    focusTrigger();
   }
 
-  function openSelector() {
-    setOpen(true);
+  function focusTrigger() {
+    rootRef.current?.querySelector<HTMLElement>("[aria-haspopup]")?.focus({ preventScroll: true });
+  }
+
+  function toggleSelector() {
+    setOpen(!open);
     setQuery("");
     setActiveProviderName(parsedValue.provider || providerOptions[0]?.name || "");
   }
@@ -104,14 +119,16 @@ export function ModelSelector({
         )}
       >
         <Button
+          aria-description={ariaLabel ? displayLabel : undefined}
           aria-expanded={open}
           aria-haspopup="dialog"
+          aria-label={ariaLabel}
           className="min-w-0 flex-1 truncate text-left outline-none"
-          onClick={openSelector}
+          onClick={toggleSelector}
           type="button"
           unstyled
         >
-          {displayValue}
+          {displayLabel}
         </Button>
         {value.trim() ? (
           <Button
@@ -128,7 +145,7 @@ export function ModelSelector({
         <Button
           aria-label={open ? t("Collapse") : t("Expand")}
           className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-[5px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25"
-          onClick={openSelector}
+          onClick={toggleSelector}
           title={open ? t("Collapse") : t("Expand")}
           type="button"
           unstyled
@@ -138,7 +155,7 @@ export function ModelSelector({
       </div>
 
       <AnchoredPopover layout={popoverLayout} open={open && Boolean(popoverLayout)}>
-        <PopoverContent className="w-full overflow-hidden p-2" ref={panelRef}>
+        <PopoverContent aria-label={ariaLabel ?? t("Search models")} className="w-full overflow-hidden p-2" ref={panelRef} role="dialog">
           <ListboxSearch
             autoFocus
             aria-label={t("Search models")}
@@ -147,6 +164,25 @@ export function ModelSelector({
             placeholder={t("Search providers or models")}
             value={query}
           />
+
+          {showDefaultOption ? (
+            <Button
+              className={cn(
+                "mt-2 flex h-8 w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 text-left text-caption outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/25",
+                !value && "bg-primary/10 text-primary"
+              )}
+              onClick={() => {
+                onChange("");
+                setOpen(false);
+                focusTrigger();
+              }}
+              type="button"
+              unstyled
+            >
+              <span className="truncate">{defaultOption}</span>
+              {!value ? <Check className="h-3.5 w-3.5 shrink-0" /> : null}
+            </Button>
+          ) : null}
 
           {providerOptions.length === 0 ? (
             <div className="mt-2 rounded-md border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-caption text-muted-foreground">
