@@ -15,9 +15,11 @@ use ai_memory_core::{
     RenamedManagedWorkstream, Sanitizer, WorkstreamEventKind, WorkstreamId,
 };
 use ai_memory_store::{
-    FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, RenameWorkstream, ScopeResolutionError,
-    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle, authorize_scope_for,
-    create_explicit_scope_guarded, lookup_existing_scope_guarded, lookup_project_id_guarded,
+    FinishWorkstreamRun, LegacyWorkstreamFingerprints, PrepareWorkstreamRun, ReaderPool,
+    RenameWorkstream, ScopeCaller, ScopeResolutionError, StoreError, WorkstreamSelection,
+    WorkstreamSelector, WriterHandle, authorize_scope_for_caller,
+    create_explicit_scope_guarded_for_caller, lookup_existing_scope_guarded_for_caller,
+    lookup_project_id_guarded_for_caller,
 };
 use ai_memory_wiki::Wiki;
 use axum::extract::{Path as AxumPath, Query, State};
@@ -149,16 +151,15 @@ fn authorize(
     })
 }
 
-/// The user whose grants apply to this request, if any do.
-///
-/// [`ai_memory_core::AuthorizedViewer`] is stamped only when an operator has
-/// switched per-repository authorization on, and never for root. `None`
-/// therefore means no per-repository check applies, which leaves every
-/// existing install behaving exactly as it did before the guard existed.
-fn actor_user(
+/// Derive the scope authorization caller from HTTP auth extensions.
+fn scope_caller(
+    level: Option<Extension<AuthLevel>>,
     actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
-) -> Option<ai_memory_core::UserId> {
-    actor.map(|Extension(viewer)| viewer.user())
+) -> ScopeCaller {
+    ScopeCaller::from_auth(
+        level.map(|Extension(level)| level),
+        actor.map(|Extension(viewer)| viewer),
+    )
 }
 
 /// Authorize the caller on the repository `run_id` belongs to — see
@@ -167,10 +168,10 @@ fn actor_user(
 async fn authorize_run(
     state: &WorkstreamState,
     run_id: ManagedRunId,
-    viewer: Option<ai_memory_core::UserId>,
+    caller: ScopeCaller,
     required: ai_memory_store::ProjectAccess,
 ) -> Result<(), Response> {
-    if viewer.is_none() {
+    if caller == ScopeCaller::Unrestricted {
         return Ok(());
     }
     let scope = state
@@ -178,7 +179,7 @@ async fn authorize_run(
         .managed_run_scope(run_id)
         .await
         .map_err(|failure| error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()))?;
-    crate::grants::authorize_resolved(&state.reader, scope, viewer, required)
+    crate::grants::authorize_resolved(&state.reader, scope, caller, required)
         .await
         .map_err(scope_refusal)
 }
@@ -251,7 +252,7 @@ fn scope_refusal(failure: ScopeResolutionError) -> Response {
 async fn resolve_run_scope(
     state: &WorkstreamState,
     request: &PrepareManagedRunRequest,
-    viewer: Option<ai_memory_core::UserId>,
+    caller: ScopeCaller,
 ) -> Result<(ai_memory_store::ResolvedScope, bool), ScopeResolutionError> {
     use ai_memory_core::repository_identity::{
         IdentitySource, IdentityStyle, accept_wire_identity, path_style_name,
@@ -259,11 +260,11 @@ async fn resolve_run_scope(
     let workspace = request.workspace.trim();
     let project = request.project.trim();
     if let Some(project_id) = request.project_id {
-        return lookup_project_id_guarded(
+        return lookup_project_id_guarded_for_caller(
             &state.reader,
             workspace,
             project_id,
-            viewer,
+            caller,
             ai_memory_store::ProjectAccess::Write,
         )
         .await
@@ -276,9 +277,14 @@ async fn resolve_run_scope(
         .filter(|identity| path_style_name(identity).as_deref() == Some(project))
         .filter(|_| !ai_memory_core::profile::is_reserved_scope_project(project));
     let Some(identity) = identity else {
-        let resolved =
-            create_explicit_scope_guarded(&state.reader, &state.writer, workspace, project, viewer)
-                .await?;
+        let resolved = create_explicit_scope_guarded_for_caller(
+            &state.reader,
+            &state.writer,
+            workspace,
+            project,
+            caller,
+        )
+        .await?;
         return Ok((resolved.scope, resolved.promoted_from.is_some()));
     };
     let workspace_id = state
@@ -299,19 +305,19 @@ async fn resolve_run_scope(
             project,
             None,
             candidate,
-            viewer,
+            caller.user_id(),
         )
         .await?;
     // The writer claims or renames only for a caller who may write; matching
     // or finding a project is not access to it.
-    let scope = authorize_scope_for(
+    let scope = authorize_scope_for_caller(
         &state.reader,
         Some(&state.writer),
         ai_memory_store::ResolvedScope {
             workspace_id,
             project_id,
         },
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Write,
     )
     .await?;
@@ -377,6 +383,7 @@ async fn prepare_run(
             | AgentKind::Grok
             | AgentKind::AntigravityCli
             | AgentKind::CopilotCli
+            | AgentKind::GeminiCli
     ) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -420,6 +427,15 @@ async fn prepare_run(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
+    let legacy_fingerprints = match parse_legacy_fingerprints(
+        request.legacy_repo_fingerprint.clone(),
+        request.legacy_worktree_fingerprint.clone(),
+        &request.repo_fingerprint,
+        &request.worktree_fingerprint,
+    ) {
+        Ok(legacy) => legacy,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let selection = match (&request.workstream, &request.new_workstream) {
         (Some(name), None) => WorkstreamSelection::Named(name.trim().to_string()),
         (None, Some(name)) => WorkstreamSelection::New(name.trim().to_string()),
@@ -434,7 +450,8 @@ async fn prepare_run(
     if let Err(failure) = selection.validate() {
         return store_error_response(failure);
     }
-    let (scope, promoted) = match resolve_run_scope(&state, &request, actor_user(viewer)).await {
+    let caller = scope_caller(level, viewer);
+    let (scope, promoted) = match resolve_run_scope(&state, &request, caller).await {
         Ok(resolved) => resolved,
         Err(failure @ ScopeResolutionError::ProjectNameAmbiguous { .. }) => {
             let (status, mut body) = api_failure(StatusCode::BAD_REQUEST, failure.to_string());
@@ -506,7 +523,7 @@ async fn prepare_run(
     };
     let prepared = state
         .writer
-        .prepare_workstream_run_owned_with_unlock(
+        .prepare_workstream_run_with_legacy(
             PrepareWorkstreamRun {
                 workspace_id: scope.workspace_id,
                 project_id: scope.project_id,
@@ -520,8 +537,10 @@ async fn prepare_run(
                 selection,
                 lease_owner: request.lease_owner,
             },
+            legacy_fingerprints,
             owner_user,
             force_unlock,
+            request.fresh,
         )
         .await;
     match prepared {
@@ -560,7 +579,7 @@ async fn run_status(
     if let Err(response) = authorize_run(
         &state,
         run_id,
-        actor_user(actor),
+        scope_caller(level, actor),
         ai_memory_store::ProjectAccess::Read,
     )
     .await
@@ -650,7 +669,7 @@ async fn run_context(
     if let Err(response) = authorize_run(
         &state,
         run_id,
-        actor_user(actor),
+        scope_caller(level, actor),
         ai_memory_store::ProjectAccess::Write,
     )
     .await
@@ -763,14 +782,15 @@ async fn project_candidates(
         Ok(rows) => rows,
         Err(failure) => return store_error_response(failure),
     };
+    let caller = scope_caller(level, actor);
     let truncated = rows.len() > 100;
     let mut candidates = Vec::new();
     for (project_id, project) in rows.into_iter().take(100) {
-        match lookup_project_id_guarded(
+        match lookup_project_id_guarded_for_caller(
             &state.reader,
             request.workspace.trim(),
             project_id,
-            actor_user(actor),
+            caller,
             ai_memory_store::ProjectAccess::Write,
         )
         .await
@@ -823,21 +843,31 @@ async fn list_recent_workstreams(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
+    let legacy_fingerprints = match parse_legacy_fingerprints(
+        request.legacy_repo_fingerprint,
+        request.legacy_worktree_fingerprint,
+        &request.repo_fingerprint,
+        &request.worktree_fingerprint,
+    ) {
+        Ok(legacy) => legacy,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    let caller = scope_caller(level, actor);
     let resolved = if let Some(project_id) = request.project_id {
-        lookup_project_id_guarded(
+        lookup_project_id_guarded_for_caller(
             &state.reader,
             request.workspace.trim(),
             project_id,
-            actor_user(actor),
+            caller,
             ai_memory_store::ProjectAccess::Read,
         )
         .await
     } else {
-        lookup_existing_scope_guarded(
+        lookup_existing_scope_guarded_for_caller(
             &state.reader,
             request.workspace.trim(),
             request.project.trim(),
-            actor_user(actor),
+            caller,
             ai_memory_store::ProjectAccess::Read,
         )
         .await
@@ -863,20 +893,40 @@ async fn list_recent_workstreams(
         }
         Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
     };
-    let summaries = match state
-        .reader
-        .recent_workstreams_page(
-            scope.workspace_id,
-            scope.project_id,
-            request.repo_fingerprint,
-            request.worktree_fingerprint,
-            request.limit.clamp(1, 100),
-            request.offset,
-        )
-        .await
-    {
-        Ok(summaries) => summaries,
-        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+    let limit = request.limit.clamp(1, 100);
+    let summaries = if legacy_fingerprints.is_some() {
+        match state
+            .writer
+            .recent_workstreams_page_migrating(
+                scope.workspace_id,
+                scope.project_id,
+                request.repo_fingerprint,
+                request.worktree_fingerprint,
+                legacy_fingerprints,
+                limit,
+                request.offset,
+            )
+            .await
+        {
+            Ok(summaries) => summaries,
+            Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+        }
+    } else {
+        match state
+            .reader
+            .recent_workstreams_page(
+                scope.workspace_id,
+                scope.project_id,
+                request.repo_fingerprint,
+                request.worktree_fingerprint,
+                limit,
+                request.offset,
+            )
+            .await
+        {
+            Ok(summaries) => summaries,
+            Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+        }
     };
     let mut response = Vec::with_capacity(summaries.len());
     for summary in summaries {
@@ -933,6 +983,15 @@ async fn rename_workstream(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
+    let legacy_fingerprints = match parse_legacy_fingerprints(
+        request.legacy_repo_fingerprint,
+        request.legacy_worktree_fingerprint,
+        &request.repo_fingerprint,
+        &request.worktree_fingerprint,
+    ) {
+        Ok(legacy) => legacy,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let selector = match (request.from.as_deref(), request.workstream_id) {
         (Some(name), None) => {
             let name = name.trim();
@@ -958,11 +1017,11 @@ async fn rename_workstream(
             );
         }
     };
-    let scope = match lookup_existing_scope_guarded(
+    let scope = match lookup_existing_scope_guarded_for_caller(
         &state.reader,
         request.workspace.trim(),
         request.project.trim(),
-        actor_user(actor),
+        scope_caller(level, actor),
         ai_memory_store::ProjectAccess::Write,
     )
     .await
@@ -984,14 +1043,17 @@ async fn rename_workstream(
     };
     let renamed = match state
         .writer
-        .rename_workstream(RenameWorkstream {
-            workspace_id: scope.workspace_id,
-            project_id: scope.project_id,
-            repo_fingerprint: request.repo_fingerprint,
-            worktree_fingerprint: request.worktree_fingerprint,
-            selector,
-            new_name: request.to,
-        })
+        .rename_workstream_with_legacy(
+            RenameWorkstream {
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+                repo_fingerprint: request.repo_fingerprint,
+                worktree_fingerprint: request.worktree_fingerprint,
+                selector,
+                new_name: request.to,
+            },
+            legacy_fingerprints,
+        )
         .await
     {
         Ok(renamed) => renamed,
@@ -1003,6 +1065,40 @@ async fn rename_workstream(
         to: renamed.to,
     })
     .into_response()
+}
+
+fn parse_legacy_fingerprints(
+    legacy_repo: Option<String>,
+    legacy_worktree: Option<String>,
+    canonical_repo: &str,
+    canonical_worktree: &str,
+) -> Result<Option<LegacyWorkstreamFingerprints>, String> {
+    match (legacy_repo, legacy_worktree) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(
+            "legacy_repo_fingerprint and legacy_worktree_fingerprint must be sent together".into(),
+        ),
+        (Some(repo), Some(worktree)) => {
+            for (label, value) in [
+                ("legacy_repo_fingerprint", repo.as_str()),
+                ("legacy_worktree_fingerprint", worktree.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!("{label} cannot be empty"));
+                }
+                if value.len() > MAX_NAME_BYTES {
+                    return Err(format!("{label} is too long"));
+                }
+            }
+            if repo == canonical_repo && worktree == canonical_worktree {
+                return Ok(None);
+            }
+            Ok(Some(LegacyWorkstreamFingerprints {
+                repo_fingerprint: repo,
+                worktree_fingerprint: worktree,
+            }))
+        }
+    }
 }
 
 async fn search_events(
@@ -1020,7 +1116,8 @@ async fn search_events(
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid workstream id"),
     };
     // The id reaches a repository's event history without naming it.
-    if let Some(viewer) = actor_user(actor) {
+    let caller = scope_caller(level, actor);
+    if caller != ScopeCaller::Unrestricted {
         let scope = match state.reader.workstream_scope(workstream_id).await {
             Ok(scope) => scope,
             Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
@@ -1028,7 +1125,7 @@ async fn search_events(
         if let Err(failure) = crate::grants::authorize_resolved(
             &state.reader,
             scope,
-            Some(viewer),
+            caller,
             ai_memory_store::ProjectAccess::Read,
         )
         .await
@@ -1819,12 +1916,15 @@ mod tests {
             cwd: "/repo".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
             force_unlock: false,
+            fresh: false,
             lease_owner: "launcher".into(),
             repository_identity: None,
         };
@@ -1928,12 +2028,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: Some("existing".into()),
                 new_workstream: Some("new".into()),
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "launcher".into(),
                 repository_identity: None,
             }),
@@ -1999,12 +2102,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "launcher".into(),
                 repository_identity: None,
             }),
@@ -2096,12 +2202,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "launcher".into(),
                 repository_identity: None,
             }),
@@ -2181,12 +2290,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: Some("missing".into()),
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "launcher".into(),
                 repository_identity: None,
             }),
@@ -2769,6 +2881,8 @@ mod tests {
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 from: from.map(str::to_owned),
                 workstream_id: None,
                 to: to.into(),
@@ -2895,6 +3009,8 @@ mod tests {
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 limit: 20,
                 offset: 0,
             }),
@@ -2923,6 +3039,8 @@ mod tests {
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "other-worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 limit: 20,
                 offset: 0,
             }),
@@ -2946,6 +3064,8 @@ mod tests {
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 limit: 20,
                 offset: 0,
             }),
@@ -3036,6 +3156,8 @@ mod tests {
                     project: "managed".into(),
                     repo_fingerprint: "repo".into(),
                     worktree_fingerprint: "worktree".into(),
+                    legacy_repo_fingerprint: None,
+                    legacy_worktree_fingerprint: None,
                     limit: 100,
                     offset,
                 }),
@@ -3111,12 +3233,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::Codex, AgentKind::ClaudeCode],
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "automatic".into(),
                 repository_identity: None,
             }),
@@ -3151,12 +3276,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::KimiCode,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "explicit".into(),
                 repository_identity: None,
             }),
@@ -3203,12 +3331,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::KimiCode,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::KimiCode, AgentKind::ClaudeCode],
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "automatic".into(),
                 repository_identity: None,
             }),
@@ -3252,12 +3383,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "alice-launcher".into(),
                 repository_identity: None,
             }),
@@ -3356,12 +3490,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Grok,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "alice:1".into(),
                 repository_identity: None,
             }),
@@ -3495,12 +3632,15 @@ mod tests {
             cwd: "/repo".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
             force_unlock,
+            fresh: false,
             lease_owner: lease_owner.into(),
             repository_identity: None,
         };
@@ -3581,12 +3721,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::KiroCli,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "explicit".into(),
                 repository_identity: None,
             }),
@@ -3632,12 +3775,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::KiroCli,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::KiroCli],
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "automatic".into(),
                 repository_identity: None,
             }),
@@ -3664,12 +3810,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::CommandCode,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "explicit".into(),
                 repository_identity: None,
             }),
@@ -3715,12 +3864,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::CommandCode,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::CommandCode, AgentKind::ClaudeCode],
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "automatic".into(),
                 repository_identity: None,
             }),
@@ -3747,12 +3899,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Grok,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "explicit".into(),
                 repository_identity: None,
             }),
@@ -3798,12 +3953,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Grok,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::Grok],
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "automatic".into(),
                 repository_identity: None,
             }),
@@ -3833,6 +3991,15 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn gemini_cli_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+        assert_explicit_only_managed_harness(
+            AgentKind::GeminiCli,
+            "4c1ea47e-b134-4efe-a3d1-217a5d5c4e5d",
+        )
+        .await;
+    }
+
     async fn assert_explicit_only_managed_harness(agent: AgentKind, native_session_id: &str) {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
@@ -3850,12 +4017,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "explicit".into(),
                 repository_identity: None,
             }),
@@ -3901,12 +4071,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent,
                 automatic_harness: true,
                 available_agents: vec![agent],
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "automatic".into(),
                 repository_identity: None,
             }),
@@ -4187,12 +4360,15 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::ClaudeCode,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
+                fresh: false,
                 lease_owner: "alice".into(),
                 repository_identity: None,
             }),
@@ -5066,12 +5242,15 @@ mod tests {
             cwd: "/repo/new-space-game".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
             force_unlock: false,
+            fresh: false,
             lease_owner: "launcher".into(),
             repository_identity: identity.map(str::to_owned),
         }
@@ -5604,5 +5783,120 @@ mod tests {
             StatusCode::FORBIDDEN,
             "Forbidden must stay 403, not 404 or 400 (regression guard)",
         );
+    }
+
+    /// GHSA-v4vw-rf7v-cxgf: a non-root trusted-proxy caller (`AuthLevel::User`
+    /// with no `AuthorizedViewer`) must be refused `prepare_run` targeting
+    /// `default/_global` or `<ws>/_profile` with 403, while ordinary open
+    /// projects and `AuthLevel::Root` succeed.
+    #[tokio::test]
+    async fn non_root_proxy_user_cannot_prepare_run_in_reserved_shared_scope() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let mut state = test_state(&store, temp.path());
+        state.trusted_proxy_identity = true;
+
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let _global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        let _ws_profile = store
+            .writer
+            .get_or_create_project(
+                default_ws,
+                ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ordinary = store
+            .writer
+            .get_or_create_project(default_ws, "ordinary-app", None)
+            .await
+            .unwrap();
+
+        let make_req = |project: &str| PrepareManagedRunRequest {
+            workspace: "default".into(),
+            project: project.into(),
+            project_id: None,
+            repository_identity: None,
+            repo_fingerprint: format!("repo-{project}"),
+            worktree_fingerprint: format!("wt-{project}"),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
+            cwd: format!("/tmp/{project}"),
+            agent: AgentKind::ClaudeCode,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            workstream: None,
+            new_workstream: None,
+            lease_owner: "test-launcher".into(),
+            force_unlock: false,
+            fresh: false,
+        };
+
+        let proxy_actor = Some(Extension(ai_memory_core::ActorContext {
+            issuer: Some("https://idp.example".into()),
+            sub: Some("sub-bob".into()),
+            ..ai_memory_core::ActorContext::default()
+        }));
+
+        for reserved in [
+            ai_memory_core::GLOBAL_SCOPE_PROJECT,
+            ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT,
+        ] {
+            let resp = prepare_run(
+                State(state.clone()),
+                Some(Extension(AuthLevel::User)),
+                proxy_actor.clone(),
+                None,
+                Json(make_req(reserved)),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "non-root proxy user must get 403 on prepare_run for default/{reserved}"
+            );
+        }
+
+        // Control 1: ordinary open project succeeds for non-root proxy user.
+        let ordinary_resp = prepare_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::User)),
+            proxy_actor,
+            None,
+            Json(make_req("ordinary-app")),
+        )
+        .await;
+        assert_eq!(
+            ordinary_resp.status(),
+            StatusCode::OK,
+            "control: ordinary open project must succeed for non-root proxy user"
+        );
+
+        // Control 2: AuthLevel::Root succeeds on both reserved shared scopes.
+        for reserved in [
+            ai_memory_core::GLOBAL_SCOPE_PROJECT,
+            ai_memory_core::profile::WORKSPACE_PROFILE_PROJECT,
+        ] {
+            let root_resp = prepare_run(
+                State(state.clone()),
+                Some(Extension(AuthLevel::Root)),
+                None,
+                None,
+                Json(make_req(reserved)),
+            )
+            .await;
+            assert_eq!(
+                root_resp.status(),
+                StatusCode::OK,
+                "control: AuthLevel::Root must succeed on prepare_run for default/{reserved}"
+            );
+        }
     }
 }

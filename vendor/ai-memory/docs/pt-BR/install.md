@@ -1523,10 +1523,11 @@ que a reinstalação adicione `SessionStart`.
 
 ### Devin CLI
 
-Devin usa `~/.devin/config.json` para servidores MCP e `~/.devin/hooks.v1.json`
-para hooks de ciclo de vida por padrão. Se você preferir um único arquivo combinado de configuração do Devin,
-passe `--config-file ~/.devin/config.json` para `install-hooks`; ai-memory então
-mescla as entradas de hook sob a chave `hooks` daquele arquivo.
+O Devin mantém a configuração em nível de usuário em `~/.config/devin/` no
+Linux/macOS/WSL (`%APPDATA%\devin\` no Windows): `mcp_config.json` para
+servidores MCP e a chave `hooks` em `config.json` para hooks de ciclo de vida.
+Para hooks em nível de projeto, passe `--config-file .devin/hooks.v1.json` para
+`install-hooks`; o ai-memory então grava o mapa plano de eventos do projeto.
 
 ```bash
 ai-memory install-mcp --client devin --apply \
@@ -2561,6 +2562,31 @@ permanecem os mesmos. A saída de pré-visualização e todo `--apply` posterior
 `ai-memory upgrade` executa) leem a mesma configuração, de modo que regenerar mantém a sua
 escolha. Volte para `direct`, ou remova-a, para retornar ao padrão.
 
+#### Ferramentas seletivas diretas/adiadas do Pi (`pi_direct_tools`)
+
+Para manter um pequeno conjunto de ferramentas do ai-memory declaradas
+diretamente para o modelo enquanto adia os demais esquemas atrás do
+`tool_search` do Pi, defina `pi_direct_tools` no `config.toml` (ou
+`AI_MEMORY_PI_DIRECT_TOOLS` como um array JSON) e regenere a extensão:
+
+```toml
+pi_direct_tools = ["memory_query", "memory_briefing"]
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+As ferramentas listadas são registradas com `exposure: "direct"`, todas as
+demais ferramentas do ai-memory são registradas com `exposure: "deferred"`, uma
+dica concisa em `promptGuidelines` é anexada uma vez para que o modelo saiba
+usar `tool_search` para ferramentas de memória adiadas, e `session_start` ativa
+`tool_search` quando o Pi expõe `getActiveTools`/`setActiveTools`. Defina
+`pi_direct_tools = []` para adiar todas as ferramentas do ai-memory mantendo a
+ativação de `tool_search`. `pi_direct_tools` é mutuamente exclusivo com
+`pi_tool_exposure = "codemode"`. Remova a chave para voltar à saída padrão da
+extensão.
+
 ### Montagens bind vs docker cp
 
 O subcomando `setup-agent` faz a extração + renderização em uma única etapa
@@ -2982,7 +3008,7 @@ Nenhum plugin dedicado do mise ou entrada em registro
 é necessário; o backend funciona para qualquer repositório cujos artefatos de
 release sigam essa convenção de nomenclatura. Por padrão o mise também retém
 a versão mais recente por uma curta janela de segurança
-([`minimum_release_age`](https://mise.jdx.dev/dev-tools/github-backend.html)),
+([`minimum_release_age`](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)),
 portanto uma tag recém-lançada pode resolver para a versão anterior por um dia ou mais;
 fixe uma tag exata com `mise use -g github:akitaonrails/ai-memory@1.30.0` para
 contornar isso.
@@ -3648,7 +3674,7 @@ Raízes de destino de skills padrão:
 | Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` | `--agent hermes` | `--agent antigravity` |
 |---|---|---|---|---|---|---|---|
 | `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` | `.hermes/skills` | `.agents/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; não-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (padrão `~/.grok/skills`), mais a regra de primeiro turno `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (padrão `~/.copilot/skills`) | `~/.hermes/skills` | ambos `~/.gemini/config/skills` (Antigravity App e IDE) e `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; não-Windows: `~/.config/devin/skills` | `$GROK_HOME/skills` (padrão `~/.grok/skills`), mais a regra de primeiro turno `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (padrão `~/.copilot/skills`) | `~/.hermes/skills` | ambos `~/.gemini/config/skills` (Antigravity App e IDE) e `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
 
 Cada skill gerenciada é gravada como `<root>/<skill-name>/SKILL.md`.
 
@@ -4074,6 +4100,37 @@ o binário seja genuíno. Aponte apenas para origens que você controla. Prefira
 base `https://`; uma base puramente `http://` não possui proteção de trânsito, de modo que um
 invasor on-path pode substituir tanto o arquivo compactado quanto seu checksum correspondente.
 Cada corpo de resposta é limitado a 128 MiB.
+
+### Arquivos de hook após uma atualização
+
+`ai-memory upgrade` reescreve os scripts de hook e as integrações geradas que ele
+instalou quando uma release os altera; é o único caminho de atualização que faz
+isso. Todas as outras formas de atualização mantêm os arquivos instalados na
+versão antiga:
+
+- instalações gerenciadas por pacote (Homebrew, AUR, Scoop, Nix, `/usr`), que o
+  `upgrade` recusa e entrega ao gerenciador de pacotes;
+- um binário copiado no lugar à mão, que nunca toca a árvore de hooks;
+- instalações de hooks com escopo de projeto, que ficam em cada checkout em vez
+  da árvore de hooks do diretório de dados.
+
+Depois de qualquer uma delas, execute o instalador para cada agente cujos hooks
+você usa:
+
+```bash
+ai-memory install-hooks --agent <agent> --apply
+# instalação com escopo de projeto, em cada checkout:
+ai-memory install-hooks --agent <agent> --apply --scope project
+```
+
+Isso importa quando o `.ai-memory.toml` de um projeto define `[handoff]
+deliver_on_session_start = true` ou `[recovery] deliver_on_session_start =
+true` para sobrepor um `false` do servidor, como descrito em
+[marker-file.md](marker-file.md): os clientes atuais enviam o valor declarado
+(`handoff=1` / `recovery=1`), enquanto um arquivo de hook antigo envia apenas o
+opt-out `0` e a sobreposição do projeto não tem efeito. Um marcador definido
+como `false` continua funcionando sem a atualização, porque arquivos antigos já
+enviam `0`.
 
 ### Contêiner do servidor executado por você mesmo, cliente nativo no host
 

@@ -53,8 +53,8 @@ struct AppliedRestore {
 /// # Errors
 /// Returns an error when the archive is malformed, over budget, incomplete,
 /// inconsistent with its manifest, or cannot be restored safely.
-pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
-    let i18n = &_config.i18n;
+pub fn run(config: &Config, args: RestoreAgentsArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let home = home_dir().context(i18n.text("cli-backup-agents-locating-user-home-directory"))?;
     let cwd = std::env::current_dir()
         .context(i18n.text("cli-backup-agents-locating-current-working-directory"))?;
@@ -88,7 +88,19 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
     }
 
     let claude_override = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let codex_override = agent_config_home(config.runtime_env.var_os("CODEX_HOME"));
     let copilot_override = agent_config_home(std::env::var_os("COPILOT_HOME"));
+    let gemini_override = agent_config_home(config.runtime_env.var_os("GEMINI_CLI_HOME"));
+    let grok_override = agent_config_home(config.runtime_env.var_os("GROK_HOME"));
+    let kiro_override = agent_config_home(config.runtime_env.var_os("KIRO_HOME"));
+    let overrides = TargetOverrides {
+        claude: claude_override.as_deref(),
+        codex: codex_override.as_deref(),
+        copilot: copilot_override.as_deref(),
+        gemini: gemini_override.as_deref(),
+        grok: grok_override.as_deref(),
+        kiro: kiro_override.as_deref(),
+    };
     let mut archive_paths = HashSet::with_capacity(manifest.entries.len());
     let mut target_paths = HashSet::with_capacity(manifest.entries.len());
     let mut planned = Vec::new();
@@ -152,10 +164,6 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
             );
         }
 
-        let overrides = TargetOverrides {
-            claude: claude_override.as_deref(),
-            copilot: copilot_override.as_deref(),
-        };
         let (base, target_path) = resolve_target(entry, &home, &cwd, overrides)?;
         if !target_paths.insert(target_path.clone()) {
             bail!(
@@ -372,8 +380,16 @@ fn stage_archive(src: &Path, staging: &Path) -> Result<(Vec<u8>, HashMap<String,
 struct TargetOverrides<'a> {
     /// `CLAUDE_CONFIG_DIR`.
     claude: Option<&'a Path>,
+    /// `CODEX_HOME`.
+    codex: Option<&'a Path>,
     /// `COPILOT_HOME`.
     copilot: Option<&'a Path>,
+    /// `GEMINI_CLI_HOME`.
+    gemini: Option<&'a Path>,
+    /// `GROK_HOME`.
+    grok: Option<&'a Path>,
+    /// `KIRO_HOME`.
+    kiro: Option<&'a Path>,
 }
 
 fn resolve_target(
@@ -399,6 +415,14 @@ fn resolve_target(
             .to_path_buf();
         return Ok((base, target));
     }
+    if entry.agent == AgentKind::KimiCode
+        && let Some(relative) = entry.target_relative.strip_prefix(".kimi-code/")
+        && let Some(custom_dir) = agent_config_home(std::env::var_os("KIMI_CODE_HOME"))
+    {
+        let base = cwd.join(custom_dir);
+        let target = base.join(relative);
+        return Ok((base, target));
+    }
     if entry.agent == AgentKind::OpenCode
         && let Some(relative) = entry.target_relative.strip_prefix(".config/opencode/")
     {
@@ -415,9 +439,36 @@ fn resolve_target(
     {
         return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
     }
+    if entry.agent == AgentKind::Codex
+        && let Some(custom_dir) = overrides.codex
+        && let Some(relative) = entry.target_relative.strip_prefix(".codex/")
+    {
+        return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
+    }
     if entry.agent == AgentKind::CopilotCli
         && let Some(custom_dir) = overrides.copilot
         && let Some(relative) = entry.target_relative.strip_prefix(".copilot/")
+    {
+        return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
+    }
+    if entry.agent == AgentKind::GeminiCli
+        && let Some(custom_dir) = overrides.gemini
+        && entry.target_relative.starts_with(".gemini/")
+    {
+        return Ok((
+            custom_dir.to_path_buf(),
+            custom_dir.join(&entry.target_relative),
+        ));
+    }
+    if entry.agent == AgentKind::Grok
+        && let Some(custom_dir) = overrides.grok
+        && let Some(relative) = entry.target_relative.strip_prefix(".grok/")
+    {
+        return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
+    }
+    if entry.agent == AgentKind::KiroCli
+        && let Some(custom_dir) = overrides.kiro
+        && let Some(relative) = entry.target_relative.strip_prefix(".kiro/")
     {
         return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
     }
@@ -736,18 +787,22 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".gemini/",
                 ".cursor/",
                 ".config/opencode/",
+                ".config/devin/",
                 ".devin/",
                 ".grok/",
                 ".kiro/",
                 ".openclaw/",
                 ".commandcode/",
                 ".kimi/",
+                ".kimi-code/skills/",
                 ".qwen/",
                 ".qoder/",
                 ".copilot/skills/",
             ];
-            let allowed = rel_path == ".claude.json"
-                || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
+            let allowed = matches!(
+                rel_path,
+                ".claude.json" | ".kimi-code/mcp.json" | ".kimi-code/config.toml"
+            ) || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
             if !allowed {
                 bail!(
                     "refusing to restore global asset to unauthorized path: {:?}",

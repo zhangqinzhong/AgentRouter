@@ -203,7 +203,7 @@ runs, in order, the commands a native install otherwise needs one by one:
    `CODEX_HOME` and similar relocations). The plan numbers each agent and
    says what it was found by (its session store, its MCP config, or for Muse
    its directory), then lists the other agents `--agent` accepts. Cursor,
-   Gemini CLI, Droid and the other agents with no store to look for are
+   Droid and the other agents with no store to look for are
    wired by naming them. OpenCode 1 and 2 share one session store, so a
    detected or named `opencode` runs `opencode --version` once and wires the
    plugin and MCP entry for the major it reports, as `install-mcp --client
@@ -1412,7 +1412,8 @@ native `ai-memory` binary and `hooks/` tree, governs the existing LaunchAgent
 `config.toml`, the data directory, and logs. It does not replace those tools
 with a second dashboard.
 
-Needs a Rust toolchain and Xcode / Swift 6 (the same as a source build):
+Needs rustup, which applies the Rust version pinned in `rust-toolchain.toml`
+(a Homebrew or distro `rust` does not), and Xcode 16.2 or later (Swift 6):
 
 ```bash
 git clone https://github.com/akitaonrails/ai-memory
@@ -1611,10 +1612,11 @@ the reinstall adds `SessionStart`.
 
 ### Devin CLI
 
-Devin uses `~/.devin/config.json` for MCP servers and `~/.devin/hooks.v1.json`
-for lifecycle hooks by default. If you prefer one combined Devin config file,
-pass `--config-file ~/.devin/config.json` to `install-hooks`; ai-memory then
-merges the hook entries under that file's `hooks` key.
+Devin keeps user-level configuration under `~/.config/devin/` on
+Linux/macOS/WSL (`%APPDATA%\devin\` on Windows): `mcp_config.json` for MCP
+servers and the `hooks` key inside `config.json` for lifecycle hooks. For
+project-level hooks, pass `--config-file .devin/hooks.v1.json` to
+`install-hooks`; ai-memory then writes the flat project event map.
 
 ```bash
 ai-memory install-mcp --client devin --apply \
@@ -2593,6 +2595,13 @@ The Pi and OMP extensions use distinct filenames (`ai-memory-pi.ts` and
 `ai-memory-omp.ts`) so installing one never overwrites the other. They are
 not interchangeable: only Pi's bridges MCP tools.
 
+If ai-memory tools are missing, check the extension's startup warning. Discovery
+runs when the extension loads; a failed `initialize` or `tools/list` request does
+not stop lifecycle capture, but leaves the tools unavailable. Start or restore
+the server, check its URL and credentials, then run `/reload` in Pi to load the
+extension and discover the tools again. Starting a new session alone does not
+retry discovery.
+
 #### OMP profiles
 
 `omp --profile <name>` relocates OMP's agent home to
@@ -2658,6 +2667,30 @@ that route each call to the current project, and lifecycle capture stay the
 same. Preview output and every later `--apply` (including the refresh that
 `ai-memory upgrade` runs) read the same setting, so regenerating keeps your
 choice. Set it back to `direct`, or remove it, to return to the default.
+
+#### Pi selective direct/deferred tools (`pi_direct_tools`)
+
+To keep a small set of ai-memory tools directly declared to the model while
+deferring the remaining schemas behind Pi's `tool_search`, set
+`pi_direct_tools` in `config.toml` (or `AI_MEMORY_PI_DIRECT_TOOLS` as a JSON
+array) and regenerate the extension:
+
+```toml
+pi_direct_tools = ["memory_query", "memory_briefing"]
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Listed tools register with `exposure: "direct"`, all other ai-memory tools
+register with `exposure: "deferred"`, a concise `promptGuidelines` hint is
+attached once so the model knows to use `tool_search` for deferred memory
+tools, and `session_start` activates `tool_search` when Pi exposes
+`getActiveTools`/`setActiveTools`. Set `pi_direct_tools = []` to defer every
+ai-memory tool while still activating `tool_search`. `pi_direct_tools` is
+mutually exclusive with `pi_tool_exposure = "codemode"`. Remove the key to
+return to the default extension output.
 
 ### Bind mounts vs docker cp
 
@@ -3080,7 +3113,7 @@ No dedicated mise plugin or
 registry entry is required; the backend works against any repo whose
 release assets follow this naming convention. By default mise also holds back
 the very newest release for a short safety window
-([`minimum_release_age`](https://mise.jdx.dev/dev-tools/github-backend.html)),
+([`minimum_release_age`](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)),
 so a fresh tag may resolve to the previous version for a day or so; pin an
 exact tag with `mise use -g github:akitaonrails/ai-memory@1.30.0` to bypass
 that.
@@ -3169,7 +3202,7 @@ ai-memory works in three intensity tiers:
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ Cursor subscription** | Same LLM features using the logged-in Cursor Agent CLI. Read-only `--mode ask`; does not pass `--yolo` | `AI_MEMORY_LLM_PROVIDER=cursor` + `agent` on `PATH` (or `AI_MEMORY_CURSOR_AGENT`) | Uses your Cursor subscription |
 | **+ Google Cloud credits** | Same LLM features with Gemini through Vertex AI, billed to a Google Cloud project so Cloud credits pay for it | `AI_MEMORY_LLM_PROVIDER=vertex` + `gcloud auth application-default login` (or `GOOGLE_APPLICATION_CREDENTIALS`) + `GOOGLE_CLOUD_PROJECT` | Billed to your Google Cloud project |
-| **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
+| **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider, or `AI_MEMORY_RERANKER=decisions-choice` + `OPENAI_API_KEY` + `llm_model` (direct OpenAI Decisions) | One provider call per eligible query, at most four concurrently |
 | **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (or `EMBEDDING_API_KEY`) | ~$0.0001 / page on backfill |
 
 ### Recommended models (chosen as defaults)
@@ -3767,7 +3800,7 @@ Default skill target roots:
 | Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` | `--agent hermes` | `--agent antigravity` |
 |---|---|---|---|---|---|---|---|
 | `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` | `.hermes/skills` | `.agents/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) | `$HERMES_HOME/skills` (default `~/.hermes/skills`; Windows `%LOCALAPPDATA%\hermes\skills`) | both `~/.gemini/config/skills` (Antigravity App and IDE) and `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.config/devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) | `$HERMES_HOME/skills` (default `~/.hermes/skills`; Windows `%LOCALAPPDATA%\hermes\skills`) | both `~/.gemini/config/skills` (Antigravity App and IDE) and `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 
@@ -4071,9 +4104,9 @@ home-directory labels can prevent the helper container from reaching agent
 config even when its UID and GID match the host user. The wrapper checks both
 the host enforcement mode and the engine's advertised security options. For the
 short-lived helper commands that touch host files (`install-*`, `setup-agent`,
-`uninstall`, `backup`, `restore`, and `bootstrap`), it adds `--security-opt
-label=disable`; thin-client commands remain confined when they use the named
-data volume and implicit configuration. An explicit `--config` path or a valid
+`uninstall`, `backup`, `restore`, `bootstrap`, and `doctor`), it adds
+`--security-opt label=disable`; thin-client commands remain confined when they
+use the named data volume and implicit configuration. An explicit `--config` path or a valid
 host-backed `AI_MEMORY_DATA_DIR` also activates the host-file treatment. This
 relaxes SELinux label confinement only for that trusted helper invocation. It
 does not modify the long-lived ai-memory server, which uses an engine-managed
@@ -4084,6 +4117,10 @@ unmapped UID and a confined label block reads just as hard, and the failure is
 misleading: it degrades silently to `no .git found at /work; bootstrapping
 from README/docs/rules only` before dying with `Permission denied (os error
 13)`.
+
+`doctor` also reads host files: the home marker and local harness session
+stores. Without the host-file treatment, a denied read of the home marker
+is reported as `invalid home route map`, even when the marker does not exist.
 
 The two engines report these facts under different keys. Docker answers
 `docker info --format '{{.SecurityOptions}}'`; podman has no such field and
@@ -4197,13 +4234,48 @@ the binary is genuine. Point it only at origins you control. Prefer an
 on-path attacker can substitute both the archive and its matching checksum.
 Each response body is capped at 128 MiB.
 
-When no `server_url` or `AI_MEMORY_SERVER_URL` is set, the Claude Code
-refresh reuses the endpoint shared by its installed native hooks and leaves
-the hook credential files alone. If the hook commands use different URLs,
-contain inline credentials, or cannot be safely re-rendered as native hooks,
-upgrade refreshes the staged scripts and keeps the existing settings. To
-update those hooks, re-run `ai-memory install-hooks --apply --agent claude-code`
-with the original connection options.
+When no `server_url` or `AI_MEMORY_SERVER_URL` is set, the refresh reuses the
+endpoint an agent's installed native hooks share and leaves the hook
+credential files alone. This covers Claude Code, Codex, Copilot CLI, Cursor,
+Gemini CLI, Kimi Code and the other agents whose hooks file
+`install-hooks --apply` writes; the generated integrations (OpenCode, Omp, Pi,
+OpenClaw) keep the endpoint their file names. If Claude Code's hook commands
+use different URLs, contain inline credentials, or cannot be safely
+re-rendered as native hooks, upgrade refreshes the staged scripts and keeps
+the existing settings. To update those hooks, re-run
+`ai-memory install-hooks --apply --agent claude-code` with the original
+connection options. Another agent's hooks in that state are refreshed as
+before, with the configured connection, so re-run
+`ai-memory install-hooks --apply --agent <agent>` with the original
+`--server-url` and `--auth-token` if they pointed at a remote server.
+
+### Hook files after an update
+
+`ai-memory upgrade` rewrites the hook scripts and generated integrations it
+staged when a release changes them; it is the only update path that does. Every
+other way of updating leaves the installed files at their old version:
+
+- package-managed installs (Homebrew, AUR, Scoop, Nix, `/usr`), which `upgrade`
+  refuses and hands to the package manager;
+- a binary copied into place by hand, which never touches the hooks tree;
+- project-scoped hook installs, which live in each checkout instead of the
+  data-dir hooks tree.
+
+After any of those, run the installer for every agent whose hooks you use:
+
+```bash
+ai-memory install-hooks --agent <agent> --apply
+# project-scoped install, in each checkout:
+ai-memory install-hooks --agent <agent> --apply --scope project
+```
+
+This matters when a project's `.ai-memory.toml` sets `[handoff]
+deliver_on_session_start = true` or `[recovery] deliver_on_session_start =
+true` to override a server-wide `false`, as described in
+[marker-file.md](marker-file.md): the current clients forward the declared
+value (`handoff=1` / `recovery=1`), while an old hook file sends only the `0`
+opt-out and the project override has no effect. A marker set to `false` keeps
+working without the refresh, because old files already send `0`.
 
 ### Server container you run yourself, native client on the host
 

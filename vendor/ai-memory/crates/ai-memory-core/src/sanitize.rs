@@ -746,6 +746,18 @@ impl Sanitizer {
         Self::new(&SanitizeConfig::default()).expect("built-in patterns compile")
     }
 
+    /// Whether this sanitizer includes any operator-configured
+    /// `[sanitize].extra_patterns` beyond the built-in pattern set.
+    ///
+    /// Callers that apply a bounded pre-scrub window for built-in rules must
+    /// scrub the full text when this returns `true`, because custom regexes
+    /// can depend on context past the window (such as a multi-line delimited
+    /// block or an end-of-text `$` anchor).
+    #[must_use]
+    pub fn has_extra_patterns(&self) -> bool {
+        self.inner.patterns.len() > BUILTIN_PATTERNS.len()
+    }
+
     /// Scrub a single string. Each match is replaced with
     /// `[REDACTED:<kind>]` unless the matched substring contains an
     /// allowlist entry, in which case it is left alone.
@@ -1578,6 +1590,7 @@ mod tests {
             body: "see /home/user/.ssh/id_ed25519".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.title.contains("[REDACTED:"));
@@ -1601,6 +1614,7 @@ mod tests {
             body: String::new(),
             importance: 5,
             file_path: Some(file_path.into()),
+            trust_class: None,
         };
         let longest = "a".repeat(crate::FILE_PATH_MAX_CHARS);
         for kept in ["src/lib.rs", "docs/a b.md", longest.as_str()] {
@@ -1643,6 +1657,7 @@ mod tests {
             ),
             importance: 8,
             file_path: None,
+            trust_class: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
@@ -1680,6 +1695,7 @@ mod tests {
             body: String::new(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         let scrubbed = Sanitized::new(raw, &sanitizer).into_inner();
         assert!(
@@ -1787,6 +1803,25 @@ mod tests {
         let sn = Sanitizer::new(&cfg).unwrap();
         let out = sn.scrub("found CANARY-42 here");
         assert!(out.contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn has_extra_patterns_reports_operator_rules() {
+        assert!(!Sanitizer::builtin().has_extra_patterns());
+
+        let allowlist_only = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![],
+            allowlist: vec!["PROJECT_TOKEN_PUBLIC".to_string()],
+        })
+        .unwrap();
+        assert!(!allowlist_only.has_extra_patterns());
+
+        let with_extra = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"CANARY-[0-9]+".to_string()],
+            allowlist: vec![],
+        })
+        .unwrap();
+        assert!(with_extra.has_extra_patterns());
     }
 
     /// Typed labels let a later reader distinguish secret kinds without

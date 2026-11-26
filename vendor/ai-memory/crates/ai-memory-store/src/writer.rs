@@ -37,9 +37,10 @@ use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::web_sessions::{self, WebSession};
 use crate::workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
-    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LegacyWorkstreamFingerprints,
+    LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
+    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    StoredWorkstreamSummary,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -79,6 +80,7 @@ pub(crate) enum WriteCmd {
     SetAccessMode {
         project_id: ProjectId,
         mode: crate::AccessMode,
+        changed_by: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<Option<crate::AccessMode>>>,
     },
     SetProjectProfileFlags {
@@ -349,6 +351,11 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
+    RequeueTransportFailedSessionConsolidations {
+        now: i64,
+        limit: usize,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
@@ -593,6 +600,13 @@ pub(crate) enum WriteCmd {
         rows: Vec<crate::WikiFileFingerprintRow>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    /// Atomically apply incremental upserts and deletes to the persisted wiki
+    /// file fingerprints table.
+    ApplyWikiFileFingerprintDelta {
+        upserts: Vec<crate::WikiFileFingerprintRow>,
+        deletes: Vec<(WorkspaceId, ProjectId, PagePath)>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     /// Test seam: read `PRAGMA journal_size_limit` off the writer's own
     /// connection, the only place the pragma is set.
     #[cfg(test)]
@@ -751,6 +765,19 @@ pub(crate) enum WriteCmd {
         revoked_by: Option<UserId>,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    GrantWorkspace {
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        level: crate::GrantLevel,
+        granted_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<crate::grants::GrantOutcome>>,
+    },
+    RevokeWorkspace {
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        revoked_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     CreateHumanUser {
         new_user: NewUser,
         role: UserRole,
@@ -877,14 +904,20 @@ pub(crate) enum WriteCmd {
         error: String,
         reply: oneshot::Sender<StoreResult<u32>>,
     },
+    ParkInterruptedAutoImproveClaims {
+        now: jiff::Timestamp,
+        reply: oneshot::Sender<StoreResult<Vec<crate::auto_improve::InterruptedAutoImproveClaim>>>,
+    },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     PrepareWorkstreamRun {
         input: PrepareWorkstreamRun,
+        legacy: Option<LegacyWorkstreamFingerprints>,
         owner_user: Option<String>,
         force_unlock: bool,
+        fresh: bool,
         reply: oneshot::Sender<StoreResult<PreparedWorkstreamRun>>,
     },
     HeartbeatManagedRun {
@@ -903,7 +936,7 @@ pub(crate) enum WriteCmd {
     },
     LinkOrAdoptManagedRunSession {
         input: LinkOrAdoptManagedRunSession,
-        boundary: crate::workstream::ClaudeSessionBoundary,
+        boundary: crate::workstream::ManagedSessionBoundary,
         reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
     LinkManagedRunSessionInScope {
@@ -929,7 +962,18 @@ pub(crate) enum WriteCmd {
     },
     RenameWorkstream {
         input: RenameWorkstream,
+        legacy: Option<LegacyWorkstreamFingerprints>,
         reply: oneshot::Sender<StoreResult<RenamedWorkstream>>,
+    },
+    ListRecentWorkstreams {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        limit: usize,
+        offset: usize,
+        reply: oneshot::Sender<StoreResult<Vec<StoredWorkstreamSummary>>>,
     },
     AuthorizeProject {
         workspace_id: WorkspaceId,
@@ -1101,10 +1145,27 @@ impl WriterHandle {
         project_id: ProjectId,
         mode: crate::AccessMode,
     ) -> StoreResult<Option<crate::AccessMode>> {
+        self.set_access_mode_as(project_id, mode, None).await
+    }
+
+    /// Set a project's access mode and audit the change with its operator.
+    /// `None` identifies the root bearer, which has no users row. Repeats are
+    /// not audited. Returns the previous mode, or `None` for a missing project.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates SQL errors without committing an unaudited change.
+    pub async fn set_access_mode_as(
+        &self,
+        project_id: ProjectId,
+        mode: crate::AccessMode,
+        changed_by: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<Option<crate::AccessMode>> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::SetAccessMode {
             project_id,
             mode,
+            changed_by,
             reply: tx,
         })
         .await?;
@@ -2037,6 +2098,25 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Passively requeue up to `limit` transport-unreachable consolidation jobs
+    /// (`state = 'failed'` or `state = 'pending'` in slow outage backoff) whose
+    /// attempt count is still below [`crate::TRANSPORT_RECOVERY_MAX_ATTEMPTS`].
+    /// Returns the number of rows updated.
+    pub async fn requeue_transport_failed_session_consolidations(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RequeueTransportFailedSessionConsolidations {
+            now,
+            limit,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a new handoff in `open` state.
     ///
     /// # Errors
@@ -2853,6 +2933,26 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically apply incremental upserts and deletes to persisted wiki file
+    /// fingerprints without scanning or probing unchanged rows.
+    pub async fn apply_wiki_file_fingerprint_delta(
+        &self,
+        upserts: Vec<crate::WikiFileFingerprintRow>,
+        deletes: Vec<(WorkspaceId, ProjectId, PagePath)>,
+    ) -> StoreResult<()> {
+        if upserts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ApplyWikiFileFingerprintDelta {
+            upserts,
+            deletes,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// `PRAGMA journal_size_limit` as the writer's connection reports it.
     #[cfg(test)]
     pub(crate) async fn journal_size_limit(&self) -> StoreResult<i64> {
@@ -3435,6 +3535,54 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Grant `user_id` `level` on every project of `workspace_id`, present
+    /// and future; see [`crate::grants::grant_workspace`].
+    ///
+    /// # Errors
+    /// Writer closed, an unknown workspace, or SQL.
+    pub async fn grant_workspace(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        level: crate::GrantLevel,
+        granted_by: Option<UserId>,
+    ) -> StoreResult<crate::grants::GrantOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::GrantWorkspace {
+            user_id,
+            workspace_id,
+            level,
+            granted_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Revoke the workspace grant `user_id` holds on `workspace_id`. Project
+    /// grants inside the workspace stay in force.
+    ///
+    /// Returns whether anything was in force to revoke.
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn revoke_workspace(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        revoked_by: Option<UserId>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeWorkspace {
+            user_id,
+            workspace_id,
+            revoked_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a human identity. `new_user` MUST already have been validated.
     /// No API credential is created.
     ///
@@ -3864,6 +4012,24 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Park any in-flight auto-improve scheduler claims left behind by a prior
+    /// server shutdown or crash before a review run was recorded.
+    ///
+    /// Callers must invoke this only while holding the exclusive serve lock so
+    /// a second unguarded process cannot park an active sibling's claim.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the transaction fails.
+    pub async fn park_interrupted_auto_improve_claims(
+        &self,
+        now: jiff::Timestamp,
+    ) -> StoreResult<Vec<crate::auto_improve::InterruptedAutoImproveClaim>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ParkInterruptedAutoImproveClaims { now, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -3901,11 +4067,42 @@ impl WriterHandle {
         owner_user: Option<String>,
         force_unlock: bool,
     ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_owned_with_options(input, owner_user, force_unlock, false)
+            .await
+    }
+
+    /// Select a workstream, optionally replacing this same operator's active
+    /// lease and/or leaving `native_session_id` unset for a `--fresh` launch.
+    pub async fn prepare_workstream_run_owned_with_options(
+        &self,
+        input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
+        force_unlock: bool,
+        fresh: bool,
+    ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_with_legacy(input, None, owner_user, force_unlock, fresh)
+            .await
+    }
+
+    /// Select a workstream after migrating any legacy remote-seeded workstreams
+    /// onto the canonical fingerprints, optionally replacing this same
+    /// operator's active lease and/or leaving `native_session_id` unset for a
+    /// `--fresh` launch (#2413, #2423).
+    pub async fn prepare_workstream_run_with_legacy(
+        &self,
+        input: PrepareWorkstreamRun,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        owner_user: Option<String>,
+        force_unlock: bool,
+        fresh: bool,
+    ) -> StoreResult<PreparedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PrepareWorkstreamRun {
             input,
+            legacy,
             owner_user,
             force_unlock,
+            fresh,
             reply: tx,
         })
         .await?;
@@ -3954,22 +4151,24 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::LinkOrAdoptManagedRunSession {
             input,
-            boundary: crate::workstream::ClaudeSessionBoundary::Other,
+            boundary: crate::workstream::ManagedSessionBoundary::Other,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Relink an ID-selected Claude run after an authorized SessionStart
-    /// `clear` (to a never-seen native id) or `resume` (to one this
-    /// workstream held and no other live run holds). Rechecks the checkout,
-    /// operator, live lease and native-session boundary in the same
-    /// transaction that publishes the new current session.
-    pub async fn relink_managed_claude_session(
+    /// Relink an ID-selected Claude Code or Codex run after an authorized
+    /// SessionStart `clear` / `startup` (to a never-seen native id) or `resume`
+    /// (for Claude Code, to one this workstream held and no other live run
+    /// holds; for Codex, to one not held by another live run and not foreign to
+    /// the run's scope or operator). Rechecks the checkout, operator, live
+    /// lease and native-session boundary in the same transaction that publishes
+    /// the new current session.
+    pub async fn relink_managed_session(
         &self,
         input: LinkOrAdoptManagedRunSession,
-        boundary: crate::workstream::ClaudeSessionBoundary,
+        boundary: crate::workstream::ManagedSessionBoundary,
     ) -> StoreResult<ManagedRunSessionLink> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::LinkOrAdoptManagedRunSession {
@@ -4073,9 +4272,51 @@ impl WriterHandle {
         &self,
         input: RenameWorkstream,
     ) -> StoreResult<RenamedWorkstream> {
+        self.rename_workstream_with_legacy(input, None).await
+    }
+
+    /// Retitle one checkout-local workstream after migrating any legacy
+    /// remote-seeded workstreams onto the canonical fingerprints (#2423).
+    pub async fn rename_workstream_with_legacy(
+        &self,
+        input: RenameWorkstream,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+    ) -> StoreResult<RenamedWorkstream> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::RenameWorkstream { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::RenameWorkstream {
+            input,
+            legacy,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Migrate any legacy remote-seeded workstreams onto the canonical
+    /// fingerprints and list one bounded page for that checkout (#2423).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn recent_workstreams_page_migrating(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ListRecentWorkstreams {
+            workspace_id,
+            project_id,
+            repo_fingerprint,
+            worktree_fingerprint,
+            legacy,
+            limit,
+            offset,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -4139,9 +4380,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::SetAccessMode {
                 project_id,
                 mode,
+                changed_by,
                 reply,
             } => {
-                let result = crate::grants::set_access_mode(&conn, project_id, mode);
+                let result = crate::grants::set_access_mode(
+                    &conn,
+                    project_id,
+                    mode,
+                    changed_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
                 send_or_warn(reply, result, "set_access_mode");
             }
             WriteCmd::SetProjectProfileFlags {
@@ -4680,6 +4928,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     );
                 send_or_warn(reply, result, "reconcile_session_consolidation_completed");
             }
+            WriteCmd::RequeueTransportFailedSessionConsolidations { now, limit, reply } => {
+                let result =
+                    crate::session_consolidation::requeue_transport_failed(&mut conn, now, limit);
+                send_or_warn(
+                    reply,
+                    result,
+                    "requeue_transport_failed_session_consolidations",
+                );
+            }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
@@ -5066,6 +5323,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = replace_wiki_file_fingerprints_tx(&mut conn, &rows);
                 send_or_warn(reply, result, "replace_wiki_file_fingerprints");
             }
+            WriteCmd::ApplyWikiFileFingerprintDelta {
+                upserts,
+                deletes,
+                reply,
+            } => {
+                let result = apply_wiki_file_fingerprint_delta_tx(&mut conn, &upserts, &deletes);
+                send_or_warn(reply, result, "apply_wiki_file_fingerprint_delta");
+            }
             #[cfg(test)]
             WriteCmd::JournalSizeLimit { reply } => {
                 let result = conn
@@ -5308,6 +5573,38 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "revoke_memory");
             }
+            WriteCmd::GrantWorkspace {
+                user_id,
+                workspace_id,
+                level,
+                granted_by,
+                reply,
+            } => {
+                let result = crate::grants::grant_workspace(
+                    &conn,
+                    user_id,
+                    workspace_id,
+                    level,
+                    granted_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "grant_workspace");
+            }
+            WriteCmd::RevokeWorkspace {
+                user_id,
+                workspace_id,
+                revoked_by,
+                reply,
+            } => {
+                let result = crate::grants::revoke_workspace(
+                    &conn,
+                    user_id,
+                    workspace_id,
+                    revoked_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "revoke_workspace");
+            }
             WriteCmd::CreateHumanUser {
                 new_user,
                 role,
@@ -5544,21 +5841,29 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "record_auto_improve_claim_failure");
             }
+            WriteCmd::ParkInterruptedAutoImproveClaims { now, reply } => {
+                let result = crate::auto_improve::park_interrupted_claims(&mut conn, now);
+                send_or_warn(reply, result, "park_interrupted_auto_improve_claims");
+            }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);
                 send_or_warn(reply, result, "record_maintenance_job_success");
             }
             WriteCmd::PrepareWorkstreamRun {
                 input,
+                legacy,
                 owner_user,
                 force_unlock,
+                fresh,
                 reply,
             } => {
-                let result = crate::workstream::prepare_run(
+                let result = crate::workstream::prepare_run_with_legacy(
                     &mut conn,
                     &input,
+                    legacy.as_ref(),
                     owner_user.as_deref(),
                     force_unlock,
+                    fresh,
                 );
                 send_or_warn(reply, result, "prepare_workstream_run");
             }
@@ -5681,31 +5986,144 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 };
                 send_or_warn(reply, result, "finish_workstream_run");
             }
-            WriteCmd::RenameWorkstream { input, reply } => {
-                let result = crate::workstream::rename(&mut conn, &input);
+            WriteCmd::RenameWorkstream {
+                input,
+                legacy,
+                reply,
+            } => {
+                let result =
+                    crate::workstream::rename_with_legacy(&mut conn, &input, legacy.as_ref());
                 send_or_warn(reply, result, "rename_workstream");
+            }
+            WriteCmd::ListRecentWorkstreams {
+                workspace_id,
+                project_id,
+                repo_fingerprint,
+                worktree_fingerprint,
+                legacy,
+                limit,
+                offset,
+                reply,
+            } => {
+                let result = crate::workstream::list_recent_migrating(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &repo_fingerprint,
+                    &worktree_fingerprint,
+                    legacy.as_ref(),
+                    limit,
+                    offset,
+                );
+                send_or_warn(reply, result, "list_recent_workstreams");
             }
         }
     }
     tracing::debug!("writer thread exiting cleanly");
 }
 
+const DELETE_WIKI_FILE_FINGERPRINT_SQL: &str = "\
+    DELETE FROM wiki_file_fingerprints \
+     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3";
+
+const UPSERT_WIKI_FILE_FINGERPRINT_SQL: &str = "\
+    INSERT INTO wiki_file_fingerprints \
+     (workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+     ON CONFLICT (workspace_id, project_id, path) DO UPDATE SET \
+       file_len = excluded.file_len, mtime_secs = excluded.mtime_secs, \
+       mtime_nanos = excluded.mtime_nanos, inode = excluded.inode, \
+       ctime_secs = excluded.ctime_secs, ctime_nanos = excluded.ctime_nanos \
+     WHERE (file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
+       IS NOT (excluded.file_len, excluded.mtime_secs, excluded.mtime_nanos, \
+               excluded.inode, excluded.ctime_secs, excluded.ctime_nanos)";
+
 fn replace_wiki_file_fingerprints_tx(
     conn: &mut Connection,
     rows: &[crate::WikiFileFingerprintRow],
 ) -> StoreResult<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute("DELETE FROM wiki_file_fingerprints", [])?;
+    // Write only what changed (#2375): one edited file used to delete and
+    // re-insert the whole table on the single writer.
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO wiki_file_fingerprints \
-             (workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
+        let keep: std::collections::HashSet<([u8; 16], [u8; 16], &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    *row.workspace_id.as_bytes(),
+                    *row.project_id.as_bytes(),
+                    row.path.as_str(),
+                )
+            })
+            .collect();
+        let gone: Vec<([u8; 16], [u8; 16], String)> = {
+            let mut select =
+                tx.prepare("SELECT workspace_id, project_id, path FROM wiki_file_fingerprints")?;
+            let mut existing = select.query([])?;
+            let mut gone = Vec::new();
+            while let Some(r) = existing.next()? {
+                let ws: [u8; 16] = r.get(0)?;
+                let proj: [u8; 16] = r.get(1)?;
+                let path = r.get_ref(2)?.as_str().map_err(rusqlite::Error::from)?;
+                if !keep.contains(&(ws, proj, path)) {
+                    gone.push((ws, proj, path.to_owned()));
+                }
+            }
+            gone
+        };
+        if !gone.is_empty() {
+            let mut delete = tx.prepare(DELETE_WIKI_FILE_FINGERPRINT_SQL)?;
+            for (ws, proj, path) in &gone {
+                delete.execute(rusqlite::params![ws.as_slice(), proj.as_slice(), path])?;
+            }
+        }
+    }
+    if !rows.is_empty() {
+        // An unchanged row matches the WHERE of DO UPDATE as false: no write.
+        let mut stmt = tx.prepare(UPSERT_WIKI_FILE_FINGERPRINT_SQL)?;
         for row in rows {
             stmt.execute(rusqlite::params![
-                row.workspace_id.as_bytes(),
-                row.project_id.as_bytes(),
+                row.workspace_id.as_bytes().as_slice(),
+                row.project_id.as_bytes().as_slice(),
+                row.path.as_str(),
+                i64::try_from(row.file_len).unwrap_or(i64::MAX),
+                row.mtime_secs,
+                i64::from(row.mtime_nanos),
+                i64::try_from(row.inode).unwrap_or(i64::MAX),
+                row.ctime_secs,
+                row.ctime_nanos,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn apply_wiki_file_fingerprint_delta_tx(
+    conn: &mut Connection,
+    upserts: &[crate::WikiFileFingerprintRow],
+    deletes: &[(WorkspaceId, ProjectId, PagePath)],
+) -> StoreResult<()> {
+    if upserts.is_empty() && deletes.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if !deletes.is_empty() {
+        let mut delete = tx.prepare(DELETE_WIKI_FILE_FINGERPRINT_SQL)?;
+        for (ws, proj, path) in deletes {
+            delete.execute(rusqlite::params![
+                ws.as_bytes().as_slice(),
+                proj.as_bytes().as_slice(),
+                path.as_str(),
+            ])?;
+        }
+    }
+    if !upserts.is_empty() {
+        let mut upsert = tx.prepare(UPSERT_WIKI_FILE_FINGERPRINT_SQL)?;
+        for row in upserts {
+            upsert.execute(rusqlite::params![
+                row.workspace_id.as_bytes().as_slice(),
+                row.project_id.as_bytes().as_slice(),
                 row.path.as_str(),
                 i64::try_from(row.file_len).unwrap_or(i64::MAX),
                 row.mtime_secs,
@@ -5725,6 +6143,184 @@ mod tests {
     use super::*;
     use crate::Store;
     use ai_memory_core::{NewPage, PagePath, Tier};
+
+    /// #2375: one changed wiki file made the reconcile pass delete every
+    /// persisted fingerprint and insert them all again on the single writer.
+    /// Only the rows that changed, appeared or disappeared may be written.
+    #[test]
+    fn replacing_wiki_fingerprints_writes_only_the_rows_that_changed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/V103__wiki_file_fingerprints.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE probe (deleted INTEGER, inserted INTEGER, updated INTEGER);
+             INSERT INTO probe VALUES (0, 0, 0);
+             CREATE TRIGGER probe_d AFTER DELETE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET deleted = deleted + 1; END;
+             CREATE TRIGGER probe_i AFTER INSERT ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET inserted = inserted + 1; END;
+             CREATE TRIGGER probe_u AFTER UPDATE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET updated = updated + 1; END;",
+        )
+        .unwrap();
+        let (ws, proj) = (WorkspaceId::new(), ProjectId::new());
+        let row = |path: &str, file_len: u64| crate::WikiFileFingerprintRow {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            file_len,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            inode: 0,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+        };
+        let first: Vec<_> = (0..100).map(|i| row(&format!("notes/{i}.md"), 1)).collect();
+        replace_wiki_file_fingerprints_tx(&mut conn, &first).unwrap();
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+
+        let mut next = first.clone();
+        next[0].file_len = 2; // changed
+        next.remove(1); // gone
+        next.push(row("notes/new.md", 1)); // new
+        replace_wiki_file_fingerprints_tx(&mut conn, &next).unwrap();
+
+        let counts: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1), "(deleted, inserted, updated)");
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wiki_file_fingerprints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 100);
+        let changed: i64 = conn
+            .query_row(
+                "SELECT file_len FROM wiki_file_fingerprints WHERE path = 'notes/0.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(changed, 2);
+
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+        replace_wiki_file_fingerprints_tx(&mut conn, &next).unwrap();
+        let unchanged: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            unchanged,
+            (0, 0, 0),
+            "a pass with nothing changed writes nothing"
+        );
+    }
+
+    #[test]
+    fn applying_wiki_fingerprint_delta_writes_only_changed_and_deleted_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/V103__wiki_file_fingerprints.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE probe (deleted INTEGER, inserted INTEGER, updated INTEGER);
+             INSERT INTO probe VALUES (0, 0, 0);
+             CREATE TRIGGER probe_d AFTER DELETE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET deleted = deleted + 1; END;
+             CREATE TRIGGER probe_i AFTER INSERT ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET inserted = inserted + 1; END;
+             CREATE TRIGGER probe_u AFTER UPDATE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET updated = updated + 1; END;",
+        )
+        .unwrap();
+        let (ws, proj) = (WorkspaceId::new(), ProjectId::new());
+        let row = |path: &str, file_len: u64| crate::WikiFileFingerprintRow {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            file_len,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            inode: 0,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+        };
+        let initial: Vec<_> = (0..100).map(|i| row(&format!("notes/{i}.md"), 1)).collect();
+        apply_wiki_file_fingerprint_delta_tx(&mut conn, &initial, &[]).unwrap();
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+
+        // Update 1 row, insert 1 new row, delete 1 row; 98 rows are untouched.
+        let upserts = vec![row("notes/0.md", 2), row("notes/new.md", 1)];
+        let deletes = vec![(ws, proj, PagePath::new("notes/1.md").unwrap())];
+        apply_wiki_file_fingerprint_delta_tx(&mut conn, &upserts, &deletes).unwrap();
+
+        let counts: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1), "(deleted, inserted, updated)");
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wiki_file_fingerprints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 100);
+        let changed: i64 = conn
+            .query_row(
+                "SELECT file_len FROM wiki_file_fingerprints WHERE path = 'notes/0.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(changed, 2);
+
+        // Empty delta writes nothing.
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+        apply_wiki_file_fingerprint_delta_tx(&mut conn, &[], &[]).unwrap();
+        let empty: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(empty, (0, 0, 0), "empty delta writes nothing");
+
+        // Re-upserting an identical row writes nothing.
+        apply_wiki_file_fingerprint_delta_tx(&mut conn, &[row("notes/0.md", 2)], &[]).unwrap();
+        let noop_upsert: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            noop_upsert,
+            (0, 0, 0),
+            "identical upsert must not trigger an update"
+        );
+    }
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -5743,6 +6339,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 

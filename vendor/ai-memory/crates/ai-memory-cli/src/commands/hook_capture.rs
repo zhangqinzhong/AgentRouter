@@ -345,12 +345,11 @@ const INBOX_NOTICE_FLAGS: &str = "&inbox_only=1&handoff=0&recovery=0&profile_dig
 
 /// The query suffix of a count-only inbox notice fetch: the routing pairs of
 /// [`marker_query_suffix_without_briefing`] followed by
-/// [`INBOX_NOTICE_FLAGS`]. The marker's own `&handoff=0` / `&recovery=0`
-/// delivery opt-outs are left out because the fixed flags already carry
-/// them: `GET /handoff` deserializes its query into a struct, and a repeated
-/// key is a 400, which would hide the notice for exactly the repositories
-/// that turned delivery off. Both the Claude Code prompt notice and the
-/// `mcp-bridge --channel inbox` poll build their query here.
+/// [`INBOX_NOTICE_FLAGS`]. The marker's own `&handoff=` / `&recovery=` values
+/// are left out because the fixed flags already carry them: `GET /handoff`
+/// deserializes its query into a struct, and a repeated key is a 400. Both the
+/// Claude Code prompt notice and the `mcp-bridge --channel inbox` poll build
+/// their query here.
 pub fn inbox_notice_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
     match routing_selection(cwd) {
         Ok(selection) => inbox_notice_query_suffix_from_selection(cwd, default_strategy, selection),
@@ -370,7 +369,7 @@ fn inbox_notice_query_suffix_from_selection(
         default_strategy,
         None,
         selection,
-        DeliveryOptOuts::Omit,
+        DeliveryForwarding::Omit,
     );
     qs.push_str(INBOX_NOTICE_FLAGS);
     qs
@@ -749,17 +748,25 @@ fn marker_query_suffix_impl_from_selection(
         default_strategy,
         briefing_key,
         selection,
-        DeliveryOptOuts::Forward,
+        DeliveryForwarding::Forward,
     )
 }
 
-/// Whether a marker suffix carries the `[handoff]` / `[recovery]`
-/// `deliver_on_session_start` opt-outs as `&handoff=0` / `&recovery=0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeliveryOptOuts {
+enum DeliveryForwarding {
     Forward,
     /// The caller appends both flags itself ([`INBOX_NOTICE_FLAGS`]).
     Omit,
+}
+
+fn delivery_flag_value(raw: Option<String>) -> Option<&'static str> {
+    raw.map(|value| {
+        if crate::marker::is_falsy(&value) {
+            "0"
+        } else {
+            "1"
+        }
+    })
 }
 
 fn build_marker_query_suffix(
@@ -767,7 +774,7 @@ fn build_marker_query_suffix(
     default_strategy: Option<&str>,
     briefing_key: Option<BriefingKey>,
     selection: Option<RoutingSelection>,
-    delivery_opt_outs: DeliveryOptOuts,
+    delivery_forwarding: DeliveryForwarding,
 ) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
     let marker = selection.as_ref().map(|selection| selection.path.clone());
@@ -777,8 +784,8 @@ fn build_marker_query_suffix(
     let (mut profile_contribute, mut profile_consume) = (None, None);
     let mut default_result_limit = None;
     let mut min_relevance = None;
-    let mut handoff_off = false;
-    let mut recovery_off = false;
+    let mut handoff_delivery = None;
+    let mut recovery_delivery = None;
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
@@ -812,19 +819,16 @@ fn build_marker_query_suffix(
         // semantics as the limit: an absent key sends empty, clearing the stored
         // floor. The server validates the `0.0..=1.0` range.
         min_relevance = Some(parse_toml_flag(&marker, "min_relevance").unwrap_or_default());
-        // The delivery keys share a name but not a table. Keep legacy handoff
-        // parsing outside `[recovery]`; recovery itself is section-scoped.
-        handoff_off = crate::marker::parse_toml_flag_outside_section(
+        handoff_delivery = delivery_flag_value(crate::marker::parse_toml_flag_outside_section(
             &marker,
             "recovery",
             "deliver_on_session_start",
-        )
-        .as_deref()
-        .is_some_and(crate::marker::is_falsy);
-        recovery_off =
-            crate::marker::parse_toml_section_flag(&marker, "recovery", "deliver_on_session_start")
-                .as_deref()
-                .is_some_and(crate::marker::is_falsy);
+        ));
+        recovery_delivery = delivery_flag_value(crate::marker::parse_toml_section_flag(
+            &marker,
+            "recovery",
+            "deliver_on_session_start",
+        ));
     }
     if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
@@ -883,12 +887,12 @@ fn build_marker_query_suffix(
     if let Some(val) = min_relevance {
         qs.push_str(&format!("&min_relevance={}", url_encode(&val)));
     }
-    if delivery_opt_outs == DeliveryOptOuts::Forward {
-        if handoff_off {
-            qs.push_str("&handoff=0");
+    if delivery_forwarding == DeliveryForwarding::Forward {
+        if let Some(value) = handoff_delivery {
+            qs.push_str(&format!("&handoff={value}"));
         }
-        if recovery_off {
-            qs.push_str("&recovery=0");
+        if let Some(value) = recovery_delivery {
+            qs.push_str(&format!("&recovery={value}"));
         }
     }
     // Per-repo brief opt-in: forwarded on every request for simplicity (the
@@ -945,21 +949,54 @@ fn repository_identity(
 /// party, which has no use for it.
 const NATIVE_HOOK_CLIENT_KIND: &str = "hook";
 
+/// Longest a hook request may spend opening the connection before it surfaces
+/// as unreachable (#493). Also the threshold below which an overall request
+/// timeout cannot prove the request reached the server (#2465).
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Build a reqwest client for the hook's one-shot requests. `no_proxy`
 /// ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, which have no
 /// business on a loopback/LAN POST; reqwest is built without its
 /// `system-proxy` feature, so no OS proxy setting is read either way.
 /// Redirects are disabled so a 3xx from an SSO portal or proxy never drops
 /// spooled events, replays payloads, or injects foreign HTML into context.
+/// A bounded `connect_timeout` ensures a dead or blackholed host surfaces as
+/// a connect error (`Unreachable`, #493) rather than a post-connect response
+/// timeout (`Failed`, #2452).
 /// Built once per invocation and reused for both the event POST and the
 /// handoff GET. Default root certs are kept so HTTPS targets (e.g. a TLS
 /// proxy) still work.
 pub fn build_client() -> reqwest::Client {
+    build_client_with_connect_timeout(CONNECT_TIMEOUT)
+}
+
+pub(crate) fn build_client_with_connect_timeout(connect_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect_timeout)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// A request deadline that does not outlast `connect_timeout` cannot prove the
+/// request reached the server, so its timeout is deferred instead of charged
+/// (#2465).
+fn post_outcome_on_deadline_timeout(timeout: Duration, connect_timeout: Duration) -> PostOutcome {
+    if timeout <= connect_timeout {
+        return PostOutcome::Unreachable;
+    }
+
+    PostOutcome::Failed
+}
+
+/// Batch counterpart of [`post_outcome_on_deadline_timeout`].
+fn batch_outcome_on_deadline_timeout(timeout: Duration, connect_timeout: Duration) -> BatchOutcome {
+    if timeout <= connect_timeout {
+        return BatchOutcome::Unreachable;
+    }
+
+    BatchOutcome::Failed
 }
 
 /// Outcome of one spooled-event POST — enough for the drain loop to decide
@@ -974,15 +1011,18 @@ pub enum PostOutcome {
     /// backpressure, the event was never processed. Keep it queued WITHOUT
     /// bumping attempts so saturation never burns the entry's retry budget.
     Saturated,
-    /// Any other non-2xx: the server answered and refused. A genuine miss
-    /// that should count against the retry limit.
+    /// Any other non-2xx or a post-connect request/response timeout: the
+    /// server was reached (TCP connected) but failed or did not answer in
+    /// time. A genuine miss that should count against the retry limit (#2452).
     Failed,
     /// The request never reached a server — connection refused, DNS failure,
-    /// or timeout. Distinguished from [`Self::Failed`] because it says
+    /// or connect timeout. Distinguished from [`Self::Failed`] because it says
     /// something about the *endpoint* rather than the entry: every other
     /// spooled event addressed to the same endpoint will fail the same way,
     /// so the drain can skip past them instead of stopping at the first one
-    /// (#493).
+    /// (#493). A timeout whose deadline cannot outlast [`CONNECT_TIMEOUT`] is
+    /// included: it may have expired mid-connect and proves nothing about the
+    /// entry (#2465).
     Unreachable,
     /// `403` or `409` — the server understood the request and will never
     /// accept it. A 403 means the author may not write the project the event
@@ -1010,12 +1050,24 @@ pub enum PostOutcome {
 /// this with a budget that tolerates a remote/slow server. Returns a
 /// [`PostOutcome`] (never errors) so the drain can give a 429 (saturation) a
 /// free retry while still bounding genuine failures by `MAX_ATTEMPTS`.
+#[cfg(test)]
 pub async fn post_hook(
     client: &reqwest::Client,
     url: &str,
     body: &str,
     token: Option<&str>,
     timeout: Duration,
+) -> PostOutcome {
+    post_hook_with_connect_timeout(client, url, body, token, timeout, CONNECT_TIMEOUT).await
+}
+
+pub(crate) async fn post_hook_with_connect_timeout(
+    client: &reqwest::Client,
+    url: &str,
+    body: &str,
+    token: Option<&str>,
+    timeout: Duration,
+    connect_timeout: Duration,
 ) -> PostOutcome {
     let mut req = client
         .post(url)
@@ -1041,6 +1093,16 @@ pub async fn post_hook(
             PostOutcome::Refused
         }
         Ok(_) => PostOutcome::Failed,
+        // Post-connect timeout: the server accepted TCP and the request but
+        // did not answer before the deadline. Charge the entry like a 5xx so a
+        // slow/poison payload cannot stall the spool forever (#2452). Connect
+        // timeouts and DNS/refusal errors stay `Unreachable` (#493). A deadline
+        // no longer than the connect budget is ambiguous — it may have expired
+        // while still connecting — so it is deferred without charging a retry
+        // (#2465).
+        Err(err) if err.is_timeout() && !err.is_connect() => {
+            post_outcome_on_deadline_timeout(timeout, connect_timeout)
+        }
         Err(_) => PostOutcome::Unreachable,
     }
 }
@@ -1078,9 +1140,10 @@ pub enum BatchOutcome {
     /// when a global saturation happens after earlier skipped items.
     SaturatedIndices(Vec<usize>),
     /// The request never reached a server — connection refused, DNS failure,
-    /// or timeout. Says something about the *endpoint*, not the batch: every
-    /// other entry addressed there will fail identically, so the drain skips
-    /// past them rather than stopping at the first (#493).
+    /// or connect timeout. Says something about the *endpoint*, not the batch:
+    /// every other entry addressed there will fail identically, so the drain
+    /// skips past them rather than stopping at the first (#493). A timeout
+    /// whose deadline cannot outlast [`CONNECT_TIMEOUT`] is included (#2465).
     Unreachable,
     /// `404`/`405` — the server has no `/hook/batch` (a pre-upgrade build). The
     /// caller falls back to per-event `POST /hook` for the rest of the drain.
@@ -1089,9 +1152,10 @@ pub enum BatchOutcome {
     /// [`PostOutcome::Unauthorized`]; the whole batch shares one identity, so
     /// a rejected credential fails all of it and none of it was processed.
     Unauthorized,
-    /// Transport error or any other non-2xx: the batch outcome is unknown. The
-    /// drain charges conservatively so trailing events that may never have been
-    /// attempted do not burn retry budget.
+    /// Post-connect request/response timeout or any other non-2xx: the batch
+    /// outcome is unknown. The drain charges conservatively (head entry only)
+    /// so trailing events that may never have been attempted do not burn retry
+    /// budget while a poison head entry cannot stall the spool forever (#2452).
     Failed,
 }
 
@@ -1106,6 +1170,18 @@ pub async fn post_batch(
     payload: &str,
     token: Option<&str>,
     timeout: Duration,
+) -> BatchOutcome {
+    post_batch_with_connect_timeout(client, batch_url, payload, token, timeout, CONNECT_TIMEOUT)
+        .await
+}
+
+pub(crate) async fn post_batch_with_connect_timeout(
+    client: &reqwest::Client,
+    batch_url: &str,
+    payload: &str,
+    token: Option<&str>,
+    timeout: Duration,
+    connect_timeout: Duration,
 ) -> BatchOutcome {
     let mut req = client
         .post(batch_url)
@@ -1165,6 +1241,12 @@ pub async fn post_batch(
             } else {
                 BatchOutcome::Failed
             }
+        }
+        // A deadline no longer than the connect budget is ambiguous — it may
+        // have expired while still connecting — so it is deferred without
+        // charging a retry (#2465).
+        Err(err) if err.is_timeout() && !err.is_connect() => {
+            batch_outcome_on_deadline_timeout(timeout, connect_timeout)
         }
         Err(_) => BatchOutcome::Unreachable,
     }
@@ -1312,6 +1394,21 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
         });
         format!("http://{addr}/handoff")
+    }
+
+    /// Accept one connection and never answer it, holding the stream open so
+    /// the client's failure is a request timeout, not a connect error. The
+    /// accept proves TCP connected even though the request never got a reply
+    /// (#2465).
+    async fn serve_silent_once(path: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        format!("http://{addr}{path}")
     }
 
     #[test]
@@ -1471,6 +1568,109 @@ mod tests {
                 post_batch(&build_client(), &url, "[]", None, Duration::from_secs(1)).await;
             assert_eq!(outcome, BatchOutcome::Failed, "{status} is retryable");
         }
+    }
+
+    #[tokio::test]
+    async fn post_hook_and_post_batch_response_timeout_is_failed_not_unreachable() {
+        // #2452: once TCP connects and the HTTP request is sent, a response
+        // timeout must classify as `Failed` (not `Unreachable`) so the spool
+        // drain charges `attempts` on a poison entry instead of stalling
+        // forever, while connection-refused stays `Unreachable` (#493). The
+        // deadline has to outlast CONNECT_TIMEOUT, or the timeout is ambiguous
+        // and deferred instead (#2465).
+        async fn serve_slow_once(delay: Duration) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    tokio::time::sleep(delay).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                        .await;
+                }
+            });
+            format!("http://{addr}/hook/batch")
+        }
+
+        let connect_timeout = Duration::from_millis(50);
+        let client = build_client_with_connect_timeout(connect_timeout);
+        let deadline = connect_timeout + Duration::from_millis(50);
+        let batch_url = serve_slow_once(deadline + Duration::from_millis(300)).await;
+        let hook_url = serve_slow_once(deadline + Duration::from_millis(300)).await;
+        let (batch_outcome, hook_outcome) = tokio::join!(
+            post_batch_with_connect_timeout(
+                &client,
+                &batch_url,
+                "[]",
+                None,
+                deadline,
+                connect_timeout,
+            ),
+            post_hook_with_connect_timeout(
+                &client,
+                &hook_url,
+                "{}",
+                None,
+                deadline,
+                connect_timeout,
+            ),
+        );
+        assert_eq!(
+            batch_outcome,
+            BatchOutcome::Failed,
+            "post-connect batch timeout must charge attempts as Failed, not Unreachable"
+        );
+        assert_eq!(
+            hook_outcome,
+            PostOutcome::Failed,
+            "post-connect single-event timeout must charge attempts as Failed, not Unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_hook_defers_a_timeout_shorter_than_the_connect_budget() {
+        // #2465: the drain passes the remainder of the session-start budget,
+        // often ~1s and so shorter than CONNECT_TIMEOUT. Such a deadline
+        // cannot prove the request reached the server, so the event must stay
+        // queued instead of costing a retry attempt.
+        let url = serve_silent_once("/hook").await;
+        let outcome = post_hook(
+            &build_client(),
+            &url,
+            "{}",
+            None,
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(outcome, PostOutcome::Unreachable);
+        assert_ne!(
+            outcome,
+            PostOutcome::Failed,
+            "a short-deadline timeout must not charge a retry attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_batch_defers_a_timeout_shorter_than_the_connect_budget() {
+        // #2465, batch path: same short-deadline ambiguity as `post_hook`, so
+        // the batch stays queued rather than charging the head entry.
+        let url = serve_silent_once("/hook/batch").await;
+        let outcome = post_batch(
+            &build_client(),
+            &url,
+            "[]",
+            None,
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(outcome, BatchOutcome::Unreachable);
+        assert_ne!(
+            outcome,
+            BatchOutcome::Failed,
+            "a short-deadline batch timeout must not charge a retry attempt"
+        );
     }
 
     #[tokio::test]
@@ -2258,11 +2458,12 @@ drop_subagent_captures = "true"
         assert!(!none.contains("min_relevance"), "{none}");
     }
 
-    /// `[handoff] deliver_on_session_start` is forwarded as `&handoff=0` only
-    /// when explicitly falsy; every other shape leaves the request unchanged,
-    /// and a `[handoff]`-only marker is a settings boundary.
+    /// `[handoff] deliver_on_session_start` forwards its declared value as
+    /// `&handoff=0` when falsy and `&handoff=1` otherwise, so the server can
+    /// override its configured default; an absent key sends nothing, and a
+    /// `[handoff]`-only marker is a settings boundary.
     #[test]
-    fn marker_query_suffix_forwards_the_handoff_opt_out_only_when_falsy() {
+    fn marker_query_suffix_forwards_the_handoff_delivery_value() {
         let tmp = tempfile::TempDir::new().unwrap();
         let inner = tmp.path().join("inner");
         std::fs::create_dir(&inner).unwrap();
@@ -2291,19 +2492,29 @@ drop_subagent_captures = "true"
             )
             .unwrap();
             let qs = marker_query_suffix(inner.to_str().unwrap(), None);
-            assert!(!qs.contains("handoff"), "{on}: {qs}");
+            assert!(qs.contains("&handoff=1"), "{on}: {qs}");
         }
-        // The sibling project keeps delivering: the opt-out is read from the
-        // nearest settings marker only.
+        std::fs::write(inner.join(".ai-memory.toml"), "workspace = \"outer\"\n").unwrap();
+        let absent = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(!absent.contains("handoff"), "{absent}");
+        std::fs::write(
+            inner.join(".ai-memory.toml"),
+            "workspace = \"inner-ws\"\n[handoff]\ndeliver_on_session_start = \"\"\n",
+        )
+        .unwrap();
+        let empty = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(empty.contains("workspace=inner-ws"), "{empty}");
+        assert!(!empty.contains("handoff"), "{empty}");
         let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
         assert!(!outer.contains("handoff"), "{outer}");
     }
 
     /// `[recovery]` has its own delivery flag and is a settings boundary. Its
-    /// same-named key never disables handoffs, and every non-falsy value keeps
-    /// the request byte-identical to a marker without the key.
+    /// same-named key never touches handoff delivery, and it forwards its
+    /// declared value (`0` falsy, `1` otherwise) so the server can override its
+    /// configured default.
     #[test]
-    fn marker_query_suffix_forwards_recovery_independently_only_when_falsy() {
+    fn marker_query_suffix_forwards_the_recovery_delivery_value_independently() {
         let tmp = tempfile::TempDir::new().unwrap();
         let inner = tmp.path().join("inner");
         std::fs::create_dir(&inner).unwrap();
@@ -2339,10 +2550,19 @@ drop_subagent_captures = "true"
             .unwrap();
             assert_eq!(
                 marker_query_suffix(inner.to_str().unwrap(), None),
-                unchanged,
+                format!("{unchanged}&recovery=1"),
                 "{on}"
             );
         }
+
+        std::fs::write(
+            &marker,
+            "workspace = \"inner-ws\"\n[recovery]\ndeliver_on_session_start = \"\"\n",
+        )
+        .unwrap();
+        let empty = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(empty.contains("workspace=inner-ws"), "{empty}");
+        assert!(!empty.contains("recovery="), "{empty}");
 
         std::fs::write(
             &marker,
@@ -2363,14 +2583,14 @@ drop_subagent_captures = "true"
     }
 
     /// The inbox notice query (#1942) appends its own `handoff=0` and
-    /// `recovery=0`, so it must not also forward the marker's delivery
-    /// opt-outs: `GET /handoff` deserializes its query into `HandoffQuery`,
-    /// which rejects a repeated key, and the notice would never appear for a
-    /// repository that turned handoff or recovery delivery off. Every shape is
+    /// `recovery=0`, so it must not also forward the marker's declared
+    /// `handoff` / `recovery` values: `GET /handoff` deserializes its query
+    /// into `HandoffQuery`, which rejects a repeated key, and the notice would
+    /// never appear for a repository that declares either. Every shape is
     /// parsed with the server's own extractor; the control proves that
     /// extractor rejects the old composition.
     #[test]
-    fn inbox_notice_query_parses_as_a_handoff_query_under_every_delivery_opt_out() {
+    fn inbox_notice_query_parses_as_a_handoff_query_under_every_declared_delivery_value() {
         use ai_memory_hooks::router::HandoffQuery;
         use axum::extract::Query;
 
@@ -2422,13 +2642,30 @@ drop_subagent_captures = "true"
             assert_eq!(query.cwd.as_deref(), Some(cwd), "{name}");
             assert!(query.briefing.is_none(), "{name}: {qs}");
 
-            // Control: the routing suffix that forwards the opt-outs, followed
-            // by the fixed flags, is what both callers used to send.
             let forwarded = marker_query_suffix_impl_from_selection(cwd, None, None, selection());
             let old = format!("{forwarded}{INBOX_NOTICE_FLAGS}");
-            let opted_out = forwarded.contains("&handoff=0") || forwarded.contains("&recovery=0");
-            assert_eq!(parse(&old).is_err(), opted_out, "{name}: {old}");
+            let declared = forwarded.contains("&handoff=") || forwarded.contains("&recovery=");
+            assert_eq!(parse(&old).is_err(), declared, "{name}: {old}");
         }
+    }
+
+    /// The inbox notice query appends its own `handoff=0` and `recovery=0`;
+    /// a marker that declares both keys truthy must not add a second copy,
+    /// because `GET /handoff` rejects a repeated query key.
+    #[test]
+    fn inbox_notice_suffix_never_repeats_delivery_flags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[handoff]\ndeliver_on_session_start = true\n\
+             [recovery]\ndeliver_on_session_start = true\n",
+        )
+        .unwrap();
+        let qs = inbox_notice_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert_eq!(qs.matches("handoff=").count(), 1, "{qs}");
+        assert_eq!(qs.matches("recovery=").count(), 1, "{qs}");
+        assert!(qs.contains("&handoff=0"), "{qs}");
+        assert!(qs.contains("&recovery=0"), "{qs}");
     }
 
     /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so

@@ -539,7 +539,9 @@ a origem tiver uma sessão aberta ou um lease de execução gerenciada ativa nã
 colisão de mesmo caminho produz uma nova versão cujo corpo é o corpo de destino, um
 marcador `<!-- ai-memory:merged-from workspace/source -->` e o corpo de origem.
 O frontmatter de destino prevalece; `expires_at`/`stale_after` sobrevivem apenas quando ambos
-os lados estavam expirando. A nova página mantém o horário de criação anterior e recebe
+os lados estavam expirando. Sua classe de confiança (#2164) é a menos confiável dos dois lados,
+então um texto compilado de um resultado de ferramenta mantém essa classe na página combinada.
+A nova página mantém o horário de criação anterior e recebe
 feedback `stale` nomeando a origem, de modo que `memory_lint` continua relatando-a
 até que uma pessoa ou agente reconcilie a prosa combinada. Cada versão anterior de destino e
 origem permanece sob o caminho de destino e fica disponível para histórico e
@@ -1408,6 +1410,9 @@ O que não é reconstruído:
 
 - Sessões, observações, handoffs, usuários/tokens, linhas de auditoria, contadores de acesso
   e embeddings. Esses são estados exclusivos do banco de dados; mantenha um backup se precisar deles.
+- Classes de confiança das páginas (`trust_class`, #2164). O markdown não as guarda, então toda
+  página reconstruída fica `model_generated`, a classe de uma linha cuja origem nunca foi
+  registrada, e não `operator_authored`.
 
 Cada diretório de escopo traz o manifesto `_meta.md` do qual `reindex` lê o
 nome do espaço de trabalho/projeto. Manifestos de projeto com suporte a identidade também contêm

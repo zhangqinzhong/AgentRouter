@@ -94,6 +94,7 @@ fn new_page(
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -116,6 +117,7 @@ fn wiki_req(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -1330,6 +1332,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1352,6 +1355,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -2034,6 +2038,7 @@ async fn seed_session(
                     body: (*body).to_owned(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &ai_memory_core::Sanitizer::builtin(),
             ))
@@ -3590,6 +3595,7 @@ async fn viewer_filtered_api_reads_are_never_served_from_cache() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3795,6 +3801,7 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3968,6 +3975,7 @@ async fn api_page_handler_etag_differs_per_page() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3984,6 +3992,7 @@ async fn api_page_handler_etag_differs_per_page() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -5657,6 +5666,55 @@ async fn api_recent_incremental_paginates_over_120_pages_and_binds_cursor() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn api_recent_incremental_continues_after_a_long_nested_path() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let directory = "section".repeat(16) + "/";
+    let long_path = format!("docs/{}first.md", directory.repeat(20));
+    assert!(long_path.len() > 2048);
+    // Seed via the writer so the cursor regression does not depend on the
+    // host filesystem supporting this total path length.
+    for path in [long_path.as_str(), "other.md"] {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, path, "Page", "Body"))
+            .await
+            .unwrap();
+    }
+
+    let app = api_router(store.reader.clone(), wiki);
+    let base = "/workspaces/default/projects/scratch/recent";
+    let (status, body) = get_body(
+        &app,
+        &format!("{base}?updated_since=2000-01-01T00:00:00Z&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first: Value = serde_json::from_str(&body).unwrap();
+    let pages = first["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["path"], long_path);
+    let cursor = first["next_cursor"].as_str().unwrap();
+
+    let (status, body) = get_body(&app, &format!("{base}?cursor={cursor}&limit=1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let last: Value = serde_json::from_str(&body).unwrap();
+    let pages = last["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["path"], "other.md");
+    assert_eq!(last["next_cursor"], Value::Null);
 }
 
 #[tokio::test]

@@ -126,6 +126,7 @@ impl MultiUserHarness {
                     expires_at: None,
                     entities: Vec::new(),
                     evidence: Vec::new(),
+                    trust_class: None,
                 })
                 .await
                 .expect("seed page");
@@ -182,6 +183,8 @@ impl MultiUserHarness {
             capture_assistant_enabled: false,
             assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
             claim_handoff_on_session_start: true,
+            deliver_handoff_on_session_start: true,
+            deliver_recovery_on_session_start: true,
             create_handoff_on_session_end: true,
             per_user_slots: false,
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),

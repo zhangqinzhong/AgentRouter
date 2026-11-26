@@ -794,9 +794,9 @@ function captureGlobsIntersect(left: string[], right: string[]): boolean { const
 function captureMatchGlobs(paths: string[], config: CaptureConfig): boolean | undefined { const budget = { work: 0 }; for (const path of paths) { if (/[\[\]{}()!]/.test(path)) return undefined; const readings = captureAllReadings(captureResolve(path, config.base, config.windowsHost), config.windowsHost); if (!readings) return undefined; for (const candidate of readings) { const match = captureMatchCandidate(candidate, true, config, budget); if (match !== false) return match; } } return false; }
 function captureMatchCandidate(raw: { path: string; windows: boolean }, toolGlob: boolean, config: CaptureConfig, budget: { work: number }): boolean | undefined { const candidate = { path: captureFold(raw.path), windows: raw.windows }; const glob = /[*?]/.test(candidate.path); const directory = toolGlob && !glob; for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; const insensitive = toolGlob || pattern.windows || captureFoldCase; const under = captureStartsWith(candidate.path, pattern.prefix, insensitive); if (!under && !glob && !directory) continue; if (under) { const directory = pattern.directory ? captureGlob(pattern.directory, candidate.path, insensitive, budget) : false; if (directory !== false) return directory; const match = captureGlob(pattern.path, candidate.path, insensitive, budget); if (match !== false) return match; } if (glob) { const reaches = captureGlobstarReaches(candidate.path, pattern.prefix, insensitive, budget); if (reaches !== false) return reaches; } if (directory) { const below = captureGlobBelow(pattern.path, candidate.path, insensitive, budget); if (below !== false) return below; } } return false; }
 function captureGlobstarReaches(glob: string, prefix: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const star = glob.indexOf("**"); if (star < 0) return captureGlobReaches(glob, prefix, insensitive, budget); const slash = glob.lastIndexOf("/", star); const head = slash < 0 ? "" : glob.slice(0, slash); const depth = head.split("/").filter(Boolean).length; let seen = 0; let offset = 0; for (const part of prefix.split("/")) { if (seen === depth) break; offset += part.length; if (part) seen++; if (seen < depth) offset++; } if (seen < depth) return captureGlobReaches(glob, prefix, insensitive, budget); return captureGlob(head, prefix.slice(0, offset), insensitive, budget); }
-function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; powershell?: boolean; inline?: boolean; workdir?: string; globs?: boolean; reader?: boolean; search?: { roots: string[]; patterns: string[] }; patch?: string[]; readings?: string[] } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (CAPTURE_SEARCH_TOOLS.includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call, search: captureSearchScope(name, args) }; if (CAPTURE_NON_FILE_TOOLS.includes(name)) { const workdir = ["workdir","dir_path","directory"].map((k) => args?.[k]).find((v) => v !== undefined); return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", powershell: name === "powershell", inline: CAPTURE_INLINE_CODE_TOOLS.includes(name), workdir: typeof workdir === "string" && workdir.trim() ? workdir : undefined }; } if (!CAPTURE_FILE_TOOLS.includes(name)) return { family: "unknown", extraction: "extracted", callID: call, reader: CAPTURE_OUTPUT_READER_TOOLS.includes(name) }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (name === "read_many_files" && args && "include" in args) { const include = args.include; if (!Array.isArray(include) || include.some((x: unknown) => typeof x !== "string") || (paths?.length ?? 0) + include.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else paths = [...(paths ?? []), ...(include as string[])]; } if ((name === "read" || name === "fs_read") && args && "operations" in args) { const entries = args.operations; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || !paths.length || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call, patch: capturePatchPaths(name, payload.args) }; const agent = typeof AGENT === "string" ? AGENT : ""; const readings = agent === "omp" ? captureOmpReadings(paths, CAPTURE_OMP_PATH_TOOLS.includes(name)) : agent === "pi" ? paths.map(capturePiExpand).filter((p): p is string => p !== undefined) : []; if (!readings) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, readings, extraction: "extracted", callID: call, globs: name === "read_many_files" }; }
+function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; powershell?: boolean; inline?: boolean; workdir?: string; globs?: boolean; reader?: boolean; search?: { roots: string[]; patterns: string[] }; patch?: string[]; readings?: string[] } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (CAPTURE_SEARCH_TOOLS.includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call, search: captureSearchScope(name, args) }; if (CAPTURE_NON_FILE_TOOLS.includes(name)) { const workdir = ["workdir","dir_path","directory"].map((k) => args?.[k]).find((v) => v !== undefined); return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", powershell: name === "powershell", inline: CAPTURE_INLINE_CODE_TOOLS.includes(name), workdir: typeof workdir === "string" && workdir.trim() ? workdir : undefined }; } if (!CAPTURE_FILE_TOOLS.includes(name)) return { family: "unknown", extraction: "extracted", callID: call, reader: CAPTURE_OUTPUT_READER_TOOLS.includes(name) }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","Path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (name === "read_many_files" && args && "include" in args) { const include = args.include; if (!Array.isArray(include) || include.some((x: unknown) => typeof x !== "string") || (paths?.length ?? 0) + include.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else paths = [...(paths ?? []), ...(include as string[])]; } if ((name === "read" || name === "fs_read") && args && "operations" in args) { const entries = args.operations; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || !paths.length || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call, patch: capturePatchPaths(name, payload.args) }; const agent = typeof AGENT === "string" ? AGENT : ""; const readings = agent === "omp" ? captureOmpReadings(paths, CAPTURE_OMP_PATH_TOOLS.includes(name)) : agent === "pi" ? paths.map(capturePiExpand).filter((p): p is string => p !== undefined) : []; if (!readings) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, readings, extraction: "extracted", callID: call, globs: name === "read_many_files" }; }
 // Where a search/list tool reads, for the cross-checkout lookup: its directory and file arguments, a glob tool's `pattern`, and a content search's file filters (a grep `pattern` is a regular expression). Undefined when one is not a string; mirrors `search_scope`.
-function captureSearchScope(name: string, args: unknown): { roots: string[]; patterns: string[] } | undefined { if (args === undefined || args === null) return { roots: [], patterns: [] }; if (typeof args !== "object" || Array.isArray(args)) return undefined; const o = args as Record<string, unknown>; const roots: string[] = []; const patterns: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile","dir_path","directory","DirectoryPath","SearchDirectory","SearchPath"]) if (k in o) { if (typeof o[k] !== "string") return undefined; roots.push(o[k] as string); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; roots.push(...(o.paths as string[])); } for (const k of [...(["glob","find","find_by_name"].includes(name) ? ["pattern","Pattern"] : []), "glob","include","file_pattern","file_glob","Includes"]) { if (!(k in o)) continue; const v = o[k]; if (typeof v === "string") patterns.push(v); else if (Array.isArray(v) && v.every((x) => typeof x === "string")) patterns.push(...(v as string[])); else return undefined; } return roots.length + patterns.length <= CAPTURE_MAX_CANDIDATES && [...roots, ...patterns].every((p) => p.trim() && [...p].length <= CAPTURE_MAX_PATH_CHARS) ? { roots, patterns } : undefined; }
+function captureSearchScope(name: string, args: unknown): { roots: string[]; patterns: string[] } | undefined { if (args === undefined || args === null) return { roots: [], patterns: [] }; if (typeof args !== "object" || Array.isArray(args)) return undefined; const o = args as Record<string, unknown>; const roots: string[] = []; const patterns: string[] = []; for (const k of ["file_path","filePath","path","Path","absolute_path","AbsolutePath","notebook_path","TargetFile","dir_path","directory","DirectoryPath","SearchDirectory","SearchPath"]) if (k in o) { if (typeof o[k] !== "string") return undefined; roots.push(o[k] as string); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; roots.push(...(o.paths as string[])); } for (const k of [...(["glob","find","find_by_name"].includes(name) ? ["pattern","Pattern"] : []), "glob","include","file_pattern","file_glob","Includes"]) { if (!(k in o)) continue; const v = o[k]; if (typeof v === "string") patterns.push(v); else if (Array.isArray(v) && v.every((x) => typeof x === "string")) patterns.push(...(v as string[])); else return undefined; } return roots.length + patterns.length <= CAPTURE_MAX_CANDIDATES && [...roots, ...patterns].every((p) => p.trim() && [...p].length <= CAPTURE_MAX_PATH_CHARS) ? { roots, patterns } : undefined; }
 // The files an `apply_patch` patch names in its Add/Update/Delete File and Move to headers, for the cross-checkout lookup only; mirrors `patch_paths`.
 function capturePatchPaths(name: string, args: unknown): string[] | undefined { if (name !== "apply_patch" && name !== "patch") return undefined; const o = args as Record<string, unknown> | undefined; const text = typeof args === "string" ? args : o && typeof o === "object" ? ["command","patch","patchText","input"].map((k) => o[k]).find((v): v is string => typeof v === "string") : undefined; if (text === undefined) return undefined; const paths: string[] = []; for (const line of text.split(/\r?\n/)) { const trimmed = line.trimStart(); const header = ["*** Add File:","*** Update File:","*** Delete File:","*** Move to:"].find((h) => trimmed.startsWith(h)); if (!header) continue; const path = trimmed.slice(header.length).trim(); if (!path || [...path].length > CAPTURE_MAX_PATH_CHARS || paths.length === CAPTURE_MAX_CANDIDATES) return undefined; paths.push(path); } return paths.length ? paths : undefined; }
 // The other files an OMP `read` or `write` path can name: every part of it before a `:` or `?`, since OMP reads `secrets.env:1-20` as `secrets.env`, `archive.zip:dir/file` as the archive, `app.db:users:42` as the database and `data.json?q=.x` as the file whenever no file has the full name; a Windows root prefix's `?` and `:` (`\\?\`, `\\.\`, `C:`) end no part, and past the candidate bound it proves nothing (undefined). Mirrors `omp_path_readings`.
@@ -2919,7 +2919,7 @@ fn windows_native_hook_command_with_exe(
     let mut cmd = format!(
         "{}{}{} hook --event {event} --agent {agent} --server-url {}",
         powershell_call_operator(context.agent),
-        quote_field(&exe),
+        quote.path(&exe),
         native_data_dir_arg(context.data_dir, quote),
         quote_field(server_url),
         agent = context.agent,
@@ -3022,6 +3022,53 @@ impl NativeQuote {
             Self::PowerShell => powershell_quote(s),
         }
     }
+
+    /// [`Self::field`] for a filesystem path. The bare form cannot keep a
+    /// spaced path in one argv entry (#2353), so an existing one is written
+    /// by its 8.3 short name; without one it falls back to the caret escape.
+    fn path(self, s: &str) -> String {
+        match self {
+            Self::WindowsBare => {
+                self.field(&windows_short_path(s).unwrap_or_else(|| s.to_string()))
+            }
+            _ => self.field(s),
+        }
+    }
+}
+
+/// The 8.3 short form of an existing Windows `path` that contains a space,
+/// asked of `cmd` (`%~sI`) since the workspace forbids the `unsafe` a direct
+/// `GetShortPathNameW` call needs. `None` when there is no space, the path
+/// does not exist, 8.3 names are off on its volume, or the answer does not
+/// name the same file.
+#[cfg(windows)]
+fn windows_short_path(path: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Reject cmd metacharacters/wildcards/newlines and skip spawning cmd.exe for missing paths.
+    if !path.contains(' ')
+        || path.contains(['%', '"', '\r', '\n', '\0', '*', '?'])
+        || !std::path::Path::new(path).exists()
+    {
+        return None;
+    }
+    let output = std::process::Command::new("cmd.exe")
+        .raw_arg(format!(r#"/d /s /c "for %I in ("{path}") do @echo %~sI""#))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    // Non-ASCII output would arrive in the console code page; leave it alone.
+    let short = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if !output.status.success() || !short.is_ascii() || short.contains(' ') {
+        return None;
+    }
+    let same = std::fs::canonicalize(&short).ok()? == std::fs::canonicalize(path).ok()?;
+    same.then_some(short)
+}
+
+#[cfg(not(windows))]
+fn windows_short_path(_path: &str) -> Option<String> {
+    None
 }
 
 /// Whether an agent's Windows hook executor needs the command rendered
@@ -3040,7 +3087,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     // Render safe verbatim Windows data-dir forms as plain paths (#116).
     let lossy = data_dir.to_string_lossy();
     let path = strip_windows_verbatim_prefix(&lossy);
-    format!(" --data-dir {}", quote.field(&path))
+    format!(" --data-dir {}", quote.path(&path))
 }
 
 /// Append ` --project-strategy <value>` to a native hook command when an
@@ -3100,7 +3147,7 @@ pub(crate) fn native_shell_quote(s: &str) -> String {
     }
 }
 
-fn powershell_quote(s: &str) -> String {
+pub(crate) fn powershell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -3127,7 +3174,7 @@ fn powershell_quote(s: &str) -> String {
 /// observed, because both the failure and the false fix are silent: a wrong
 /// answer either way produces a hook that installs cleanly and captures
 /// nothing.
-fn powershell_call_operator(agent: &str) -> &'static str {
+pub(crate) fn powershell_call_operator(agent: &str) -> &'static str {
     // Codex evaluates `~/.codex/hooks.json` command strings with PowerShell
     // on Windows (#515, reproduced against Codex CLI on a native install).
     // Grok Build CLI does the same for `~/.grok/hooks/*.json` (observed on
@@ -3567,10 +3614,80 @@ function hookSpoolDir(): string {
 const spoolSeqPrefix = Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, "0");
 let spoolSeq = 0;
 
+// Windows ignores the mode bits, so a directory made with mkdirSync takes the
+// access list of the folder above it. When anything grants read there (a
+// sandbox group with read-and-execute on %LOCALAPPDATA%, say), every account in
+// that grant can read the spool, and a spooled entry carries the bearer. Mirror
+// the native writer (`path_util::create_private_dir`, #2396): every directory
+// this creates gets an owner-only list that its contents inherit, and an
+// existing directory is left as it is. Each one is built under a temporary name
+// and renamed into place only after icacls succeeds, so the final name never
+// exists with the inherited list, even for a moment. Throws when a directory
+// cannot be made private; the caller then does not spool.
+let spoolOwnerSid: string | undefined;
+
+// System32 explicitly, so a Git for Windows or MSYS2 tool earlier on PATH
+// cannot stand in for it (the same lookup the native writer does).
+function windowsSystemTool(name: string): string {
+  const root = process.env.SystemRoot?.trim();
+  return root ? join(root, "System32", name) : name;
+}
+
+// The SID, not the account name: it does not depend on the display language
+// or on how the name resolves.
+function spoolOwner(): string {
+  if (spoolOwnerSid) return spoolOwnerSid;
+  const out = execFileSync(windowsSystemTool("whoami.exe"), ["/user", "/fo", "csv", "/nh"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 5000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const sid = (out.trim().split(",").pop() ?? "").replace(/"/g, "").trim();
+  if (!/^S-1-\d+(-\d+)+$/.test(sid)) throw new Error("unexpected whoami output");
+  spoolOwnerSid = sid;
+  return sid;
+}
+
+function makePrivateSpoolDir(dir: string): void {
+  if (process.platform !== "win32") {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return;
+  }
+  const missing: string[] = [];
+  for (let p = dir; !existsSync(p); ) {
+    missing.unshift(p);
+    const parent = dirname(p);
+    if (parent === p) break;
+    p = parent;
+  }
+  for (const target of missing) {
+    const staging = `${target}.${spoolSeqPrefix}${Date.now().toString(16)}.tmp`;
+    mkdirSync(staging);
+    try {
+      execFileSync(
+        windowsSystemTool("icacls.exe"),
+        [staging, "/inheritance:r", "/grant:r", `*${spoolOwner()}:(OI)(CI)F`],
+        { windowsHide: true, timeout: 5000, stdio: "ignore" },
+      );
+      try {
+        renameSync(staging, target);
+      } catch (e) {
+        // Another writer created it first; it keeps its own list.
+        if (!existsSync(target)) throw e;
+        rmdirSync(staging);
+      }
+    } catch (e) {
+      try { rmdirSync(staging); } catch (_e) {}
+      throw e;
+    }
+  }
+}
+
 function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): void {
   try {
     const dir = hookSpoolDir();
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    makePrivateSpoolDir(dir);
     const createdMs = Date.now();
     // Idempotency key minted ONCE at spool time and baked into the URL,
     // so this plugin's drain and the CLI's drain can both deliver the
@@ -3894,6 +4011,127 @@ try {
             output.status.success(),
             "spool runtime evidence failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Windows ignores the mode bits the TS spool hands to `mkdirSync`, so a
+    /// spool directory a plugin creates must get an owner-only list of its own
+    /// instead of inheriting a read grant from above the data dir (#2396
+    /// follow-up). The grant is the built-in Users group's, the way a sandbox
+    /// group's read on `%LOCALAPPDATA%` reaches the data dir.
+    #[cfg(windows)]
+    #[test]
+    fn generated_ts_spool_keeps_a_new_spool_dir_from_a_grant_inherited_from_above() {
+        use crate::commands::path_util::acl_probe;
+        let Some(()) = node_strip_types_available() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let granted = temp.path().join("granted");
+        fs::create_dir(&granted).unwrap();
+        acl_probe::grant_users_read(&granted);
+        let control = granted.join("control.txt");
+        fs::write(&control, "x").unwrap();
+        assert!(
+            acl_probe::names_users(&acl_probe::allowed_sids(&control)),
+            "control: the fixture grant reaches an ordinary file"
+        );
+
+        let module = temp.path().join("spool-acl.mts");
+        const HARNESS: &str = r#"
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+const AGENT = "open-code";
+function resolveToken(): string | undefined { return "probe-bearer"; }
+// Node needs a real SystemRoot to start, so the failure case swaps it only
+// once the process is up, for the spool's own tool lookup.
+if (process.env.PROBE_SYSTEMROOT) process.env.SystemRoot = process.env.PROBE_SYSTEMROOT;
+spoolFailedHook("http://127.0.0.1:1/hook?event=stop", { e: "acl" });
+"#;
+        fs::write(
+            &module,
+            format!("{}{}\n{HARNESS}", ts_spool_runtime(), ts_timeout_signal()),
+        )
+        .unwrap();
+        let spool = |data_dir: &Path, system_root: Option<&Path>| {
+            let mut command = Command::new("node");
+            command
+                .arg("--experimental-strip-types")
+                .arg(&module)
+                .env("AI_MEMORY_DATA_DIR", data_dir);
+            if let Some(root) = system_root {
+                command.env("PROBE_SYSTEMROOT", root);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "spool runtime failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let entries = |dir: &Path| -> Vec<PathBuf> {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect()
+        };
+        let leftovers = |dir: &Path| -> Vec<PathBuf> {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+                .collect()
+        };
+        let me = acl_probe::current_sid();
+
+        // A data dir and spool dir the plugin creates itself.
+        let data = granted.join("data");
+        spool(&data, None);
+        let spool_dir = data.join("hook-spool");
+        let written = entries(&spool_dir);
+        assert_eq!(written.len(), 1, "one entry spooled");
+        assert!(
+            fs::read_to_string(&written[0])
+                .unwrap()
+                .contains("probe-bearer")
+        );
+        for path in [&data, &spool_dir, &written[0]] {
+            let sids = acl_probe::allowed_sids(path);
+            assert!(
+                !acl_probe::names_users(&sids),
+                "{path:?} kept the grant: {sids:?}"
+            );
+            assert!(sids.contains(&me), "{path:?} lost the owner: {sids:?}");
+        }
+        assert!(
+            leftovers(&granted).is_empty(),
+            "staging dir left in the root"
+        );
+        assert!(
+            leftovers(&data).is_empty(),
+            "staging dir left in the data dir"
+        );
+
+        // An existing spool dir keeps its list, like the native writer.
+        let existing = granted.join("existing");
+        fs::create_dir_all(existing.join("hook-spool")).unwrap();
+        spool(&existing, None);
+        assert!(acl_probe::names_users(&acl_probe::allowed_sids(
+            &existing.join("hook-spool")
+        )));
+        assert_eq!(entries(&existing.join("hook-spool")).len(), 1);
+
+        // When the directory cannot be made private, nothing is spooled and no
+        // directory is left behind for a later write to take as private.
+        let refused = granted.join("refused");
+        spool(&refused, Some(&temp.path().join("no-such-windows")));
+        assert!(!refused.exists(), "failed restriction left a data dir");
+        assert!(
+            leftovers(&granted).is_empty(),
+            "failed restriction left a staging dir"
         );
     }
 
@@ -5644,6 +5882,46 @@ if (inheritOnly) {
             !quoted_field.contains('"'),
             "a quote in a field must not be written back: {quoted_field}"
         );
+    }
+
+    /// #2353: cmd drops the carets and hands the child an unquoted command
+    /// line, so `First^ Last\…\ai-memory.exe` reaches it as two argv entries
+    /// and clap reads the second as a subcommand. An existing path is
+    /// rendered by its 8.3 short name instead, which has no space to split.
+    #[cfg(windows)]
+    #[test]
+    fn antigravity_renders_existing_spaced_paths_by_their_short_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let spaced = temp.path().join("First Last");
+        let data_dir = spaced.join("AppData Local");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let exe = spaced.join("ai-memory.exe");
+        std::fs::write(&exe, b"").unwrap();
+
+        let cmd = windows_native_hook_command_with_exe(
+            &exe,
+            Path::new("pre-tool-use.sh"),
+            "http://127.0.0.1:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(&data_dir),
+                None,
+            ),
+        );
+        assert!(!cmd.contains('"'), "must not reopen #611: {cmd}");
+        assert!(!cmd.contains('^'), "no caret left to drop: {cmd}");
+        // Split the way the child's argv parser will, with nothing quoted.
+        let argv: Vec<&str> = cmd.split(' ').collect();
+        let same = |a: &str, b: &Path| {
+            std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
+                && std::fs::canonicalize(b).is_ok()
+        };
+        assert!(same(argv[0], &exe), "argv[0] must be the exe: {cmd}");
+        assert_eq!(argv[1], "--data-dir", "{cmd}");
+        assert!(same(argv[2], &data_dir), "--data-dir value: {cmd}");
+        assert_eq!(argv[3], "hook", "{cmd}");
     }
 
     #[test]

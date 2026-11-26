@@ -117,7 +117,7 @@ async fn build_recap(
     if let Err(e) = crate::grants::authorize_resolved(
         &state.reader,
         Some((ws, proj)),
-        viewer,
+        ai_memory_store::ScopeCaller::from(viewer),
         ProjectAccess::Read,
     )
     .await
@@ -1463,6 +1463,7 @@ mod tests {
                             body: (*body).into(),
                             importance: 5,
                             file_path: None,
+                            trust_class: None,
                         },
                         &Sanitizer::builtin(),
                     ))

@@ -632,6 +632,9 @@ pub enum RunHarnessChoice {
     /// here the way `install-mcp --client copilot` does.
     #[value(name = "copilot", alias = "copilot-cli")]
     Copilot,
+    /// Google Gemini CLI (`gemini`).
+    #[value(name = "gemini", alias = "gemini-cli")]
+    Gemini,
 }
 
 /// Parses the `run` harness positional, additionally wildcarding every
@@ -1024,9 +1027,13 @@ pub struct UserGrantArgs {
     /// The workspace the project lives in.
     #[arg(long, default_value = "default")]
     pub workspace: String,
-    /// The project, by name.
-    #[arg(long)]
-    pub project: String,
+    /// The project, by name. Required unless `--all-projects` is given.
+    #[arg(long, required_unless_present = "all_projects")]
+    pub project: Option<String>,
+    /// Grant every project of the workspace, present and future, instead of
+    /// one project. Never implied: leaving `--project` out is an error.
+    #[arg(long, conflicts_with = "project")]
+    pub all_projects: bool,
     /// `read` or `write`. Required: a level left unsaid is not guessed at.
     #[arg(long)]
     pub level: String,
@@ -1041,9 +1048,13 @@ pub struct UserRevokeArgs {
     /// The workspace the project lives in.
     #[arg(long, default_value = "default")]
     pub workspace: String,
-    /// The project, by name.
-    #[arg(long)]
-    pub project: String,
+    /// The project, by name. Required unless `--all-projects` is given.
+    #[arg(long, required_unless_present = "all_projects")]
+    pub project: Option<String>,
+    /// Revoke the grant on the whole workspace instead of one project's.
+    /// Project grants the user holds inside the workspace stay in force.
+    #[arg(long, conflicts_with = "project")]
+    pub all_projects: bool,
 }
 
 /// Arguments for `user grants`.
@@ -1219,11 +1230,13 @@ pub enum UserCommand {
     Enable(UserEnableArgs),
     /// Update display name, email, and/or role (`root` or `user`).
     Patch(UserPatchArgs),
-    /// Grant a user `read` or `write` on a project, or change the level they
-    /// hold (#708). Grants decide access to `restricted` projects; an `open`
-    /// project admits every user — see `ai-memory project access`.
+    /// Grant a user `read` or `write` on a project, or with `--all-projects`
+    /// on every project of a workspace, or change the level they hold (#708).
+    /// Grants decide access to `restricted` projects; an `open` project admits
+    /// every user — see `ai-memory project access`.
     Grant(UserGrantArgs),
-    /// Take away whatever a user holds on a project.
+    /// Take away whatever a user holds on a project, or with `--all-projects`
+    /// their grant on the whole workspace.
     Revoke(UserRevokeArgs),
     /// List grants: one user's with `--user`, else every grant on the server.
     Grants(UserGrantsArgs),
@@ -1951,7 +1964,8 @@ pub enum InstallSkillsAgent {
     ClaudeCode,
     /// Cross-agent `.agents/skills` directory.
     Agents,
-    /// Devin's `.devin/skills` directory.
+    /// Devin's `.devin/skills` (project) or `~/.config/devin/skills` /
+    /// `%APPDATA%\devin\skills` (global) directory.
     Devin,
     /// Grok Build CLI's `.grok/skills` directory.
     Grok,
@@ -2632,7 +2646,8 @@ pub enum AgentChoice {
     /// via the MCP `memory_handoff_accept` tool.
     Zero,
     /// Devin CLI — JSON-config hooks in
-    /// `~/.devin/hooks.v1.json` or `~/.devin/config.json` hooks key.
+    /// `~/.config/devin/config.json` (`%APPDATA%\devin\config.json` on Windows)
+    /// under the `"hooks"` key, or project-level `.devin/hooks.v1.json`.
     /// Native `ai-memory hook --event` integration using Devin-specific
     /// hook scripts. Devin consumes the handoff via
     /// `hookSpecificOutput.additionalContext` on `SessionStart`.
@@ -3012,7 +3027,7 @@ pub enum McpClient {
     /// entry schema is strict: unknown keys make it drop the server
     /// silently, so the generated entry carries nothing else.
     Zcode,
-    /// Devin CLI — `~/.devin/config.json`.
+    /// Devin CLI — `~/.config/devin/mcp_config.json` (`%APPDATA%\devin\mcp_config.json` on Windows).
     Devin,
     /// xAI Grok Build CLI — `~/.grok/config.toml` under
     /// `[mcp_servers.<name>]` with native HTTP `url` + `headers`.
@@ -4221,11 +4236,12 @@ mod tests {
             (
                 args.user.as_str(),
                 args.workspace.as_str(),
-                args.project.as_str(),
+                args.project.as_deref(),
                 args.level.as_str()
             ),
-            ("alice", "acme", "api", "write")
+            ("alice", "acme", Some("api"), "write")
         );
+        assert!(!args.all_projects);
         assert!(
             Cli::try_parse_from([
                 "ai-memory",
@@ -4256,6 +4272,47 @@ mod tests {
             Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
         assert!(Cli::try_parse_from(["ai-memory", "grant", "list"]).is_err());
+    }
+
+    /// A workspace grant is asked for by name. Leaving `--project` out must
+    /// stay an error, or a forgotten flag would widen a grant from one
+    /// project to every project of the workspace.
+    #[test]
+    fn a_workspace_grant_needs_all_projects_and_never_follows_a_missing_project() {
+        let grant = |tail: &[&'static str]| {
+            let mut argv = vec!["ai-memory", "user", "grant", "--user", "alice"];
+            argv.extend_from_slice(tail);
+            Cli::try_parse_from(argv)
+        };
+        let parsed = grant(&["--workspace", "acme", "--all-projects", "--level", "read"])
+            .expect("a workspace grant parses");
+        let Command::User(UserArgs {
+            command: UserCommand::Grant(args),
+        }) = parsed.command
+        else {
+            panic!("expected user grant");
+        };
+        assert!(args.all_projects);
+        assert_eq!(args.project, None);
+        assert_eq!(args.workspace, "acme");
+
+        assert!(
+            grant(&["--workspace", "acme", "--level", "read"]).is_err(),
+            "no --project and no --all-projects is refused"
+        );
+        assert!(
+            grant(&["--project", "api", "--all-projects", "--level", "read"]).is_err(),
+            "one project and every project together is refused"
+        );
+
+        let revoke = |tail: &[&'static str]| {
+            let mut argv = vec!["ai-memory", "user", "revoke", "--user", "alice"];
+            argv.extend_from_slice(tail);
+            Cli::try_parse_from(argv)
+        };
+        assert!(revoke(&["--workspace", "acme", "--all-projects"]).is_ok());
+        assert!(revoke(&["--workspace", "acme"]).is_err());
+        assert!(revoke(&["--project", "api", "--all-projects"]).is_err());
     }
 
     #[test]

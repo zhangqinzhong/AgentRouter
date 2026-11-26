@@ -835,6 +835,7 @@ pub(crate) async fn run_sweep_at(
                                 author_id: None,
                                 actor: ActorContext::anonymous(),
                                 evidence: Vec::new(),
+                                trust_class: None,
                             },
                             PagePrecondition::Latest(page.id),
                         ));
@@ -1432,6 +1433,7 @@ async fn plan_cold_cluster_dedup(
                     author_id: None,
                     actor: ActorContext::anonymous(),
                     evidence: Vec::new(),
+                    trust_class: None,
                 },
                 PagePrecondition::Latest(member.id),
             ));
@@ -1474,6 +1476,7 @@ async fn plan_cold_cluster_dedup(
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence,
+            trust_class: None,
         };
 
         // Record. Survivor write goes first in this cluster's slice, so its
@@ -1565,6 +1568,7 @@ mod tests {
         let c = DecayCandidate {
             id: PageId::new(),
             path: ai_memory_core::PagePath::new("x.md").unwrap(),
+            title: String::new(),
             tier: Tier::Semantic,
             pinned: false,
             updated_at_us: 0,
@@ -1583,6 +1587,7 @@ mod tests {
         let c = DecayCandidate {
             id: PageId::new(),
             path: ai_memory_core::PagePath::new("x.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: true,
             updated_at_us: 0,
@@ -1601,6 +1606,7 @@ mod tests {
         let c = DecayCandidate {
             id: PageId::new(),
             path: ai_memory_core::PagePath::new("x.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: false,
             updated_at_us: 0,
@@ -1619,6 +1625,7 @@ mod tests {
         let c = DecayCandidate {
             id: PageId::new(),
             path: ai_memory_core::PagePath::new("x.md").unwrap(),
+            title: String::new(),
             tier: Tier::Episodic,
             pinned: false,
             updated_at_us: 0,

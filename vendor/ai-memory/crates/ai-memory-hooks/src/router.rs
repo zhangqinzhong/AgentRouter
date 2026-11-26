@@ -303,6 +303,9 @@ impl ProjectBriefs {
     }
 }
 
+type CwdProbeGate = tokio::sync::Mutex<()>;
+type CwdProbeGateMap = HashMap<String, Weak<CwdProbeGate>>;
+
 /// Runs the hook resolver's filesystem probes of a caller-supplied cwd (git
 /// discovery, canonicalization) off the async workers (#1514).
 ///
@@ -314,9 +317,16 @@ impl ProjectBriefs {
 /// probe runs on the blocking pool, holding one of a fixed number of permits
 /// until the syscall really returns, so probes that never return pin at most
 /// that many threads, and the caller gives up after a deadline.
+///
+/// One cwd's probes take turns (#2434). Each event from a directory that
+/// blocks used to pin a permit of its own, so a handful of events from one
+/// such directory left no permit for any other cwd and every hook event on
+/// the server failed. Queued behind the stuck probe they hold nothing, and
+/// the directory pins one thread however many events name it.
 #[derive(Clone)]
 pub struct CwdProbes {
     permits: Arc<tokio::sync::Semaphore>,
+    gates: Arc<tokio::sync::Mutex<CwdProbeGateMap>>,
     timeout: std::time::Duration,
 }
 
@@ -330,13 +340,15 @@ impl CwdProbes {
     fn new(max_in_flight: usize, timeout: std::time::Duration) -> Self {
         Self {
             permits: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+            gates: Arc::default(),
             timeout,
         }
     }
 
-    /// Run `probe` on the blocking pool. Fails when no permit frees up or
-    /// the probe does not finish before the deadline; the event then fails
-    /// rather than routing on a guess, and nothing is cached.
+    /// Run `probe` on the blocking pool once no earlier probe of the same
+    /// cwd is still running. Fails when that turn or a permit does not come,
+    /// or the probe does not finish, before the deadline; the event then
+    /// fails rather than routing on a guess, and nothing is cached.
     async fn run<T: Send + 'static>(
         &self,
         cwd: &str,
@@ -344,9 +356,12 @@ impl CwdProbes {
     ) -> anyhow::Result<T> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let finished = async {
+            // The cwd's turn before a permit: an event waiting behind a stuck
+            // probe of its own directory holds no permit while it waits.
+            let turn = self.gate(cwd).await.lock_owned().await;
             let permit = self.permits.clone().acquire_owned().await.ok()?;
             tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+                let _held = (permit, turn);
                 probe()
             })
             .await
@@ -362,6 +377,21 @@ impl CwdProbes {
                 self.timeout
             )),
         }
+    }
+
+    /// The gate `cwd`'s probes queue on, keyed like the project cache so
+    /// every spelling of one directory shares it. Entries are weak, and dead
+    /// ones are dropped when a new cwd arrives, so only gates in use stay.
+    async fn gate(&self, cwd: &str) -> Arc<CwdProbeGate> {
+        let key = normalize_project_path_key(cwd);
+        let mut gates = self.gates.lock().await;
+        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(CwdProbeGate::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
     }
 }
 
@@ -759,6 +789,17 @@ pub struct HookState {
     /// handoff; it renders a non-consuming notice instead and leaves the
     /// claim to an explicit `memory_handoff_accept` (design: #959).
     pub claim_handoff_on_session_start: bool,
+    /// `[handoff].deliver_on_session_start` (default `true` — unchanged
+    /// behavior). When `false`, a session start that names no `handoff` flag
+    /// reads no baton, posts no continuity notice, and claims nothing; the
+    /// handoff stays open for `memory_handoff_accept`. A request's explicit
+    /// `handoff=1` still overrides it.
+    pub deliver_handoff_on_session_start: bool,
+    /// `[recovery].deliver_on_session_start` (default `true` — unchanged
+    /// behavior). When `false`, a session start that names no `recovery` flag
+    /// skips the unfinished-session recovery snapshot and its backfill marker.
+    /// A request's explicit `recovery=1` still overrides it.
+    pub deliver_recovery_on_session_start: bool,
     /// `[handoff].create_on_session_end` (default `true` — unchanged
     /// behavior). When `false`, `SessionEnd` writes the summary page and
     /// consolidates as usual, but skips automatic handoff creation (#1043).
@@ -1060,6 +1101,13 @@ async fn admit_hook(
             StatusCode::ACCEPTED,
             "harness self-maintenance session dropped",
         );
+    }
+    // A Code Mode result is not a prompt the person typed (#2366). Dropped
+    // here, ahead of the semaphore and the rate limiter, because a Code Mode
+    // session sends one for every piece of code it runs.
+    if is_code_mode_poll_event(&env) {
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+        return (StatusCode::ACCEPTED, "code mode poll event dropped");
     }
     // Capture request extensions before the spawned processor owns the event.
     let actor = actor_identity(actor_ext);
@@ -1372,6 +1420,17 @@ async fn handle_hook_batch(
         // A harness's own background run is accepted and stored nowhere, the
         // same contract as the subagent drop above (#1674).
         if is_harness_self_maintenance(&env) {
+            HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedPolicy,
+            });
+            accepted_indices.push(idx);
+            continue;
+        }
+        // So is a Code Mode result (#2366). The native hook spools every
+        // prompt and delivers it through this route, not the single one.
+        if is_code_mode_poll_event(&env) {
             HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
             results.push(HookBatchResult {
                 index: idx,
@@ -1814,6 +1873,22 @@ fn is_harness_self_maintenance(env: &HookEnvelope) -> bool {
         .is_some_and(|prompt| ai_memory_core::looks_like_codex_memory_agent_prompt(&prompt))
 }
 
+/// Whether the event is a Claude Code Code Mode result rather than a prompt
+/// (#2366).
+///
+/// When code can run in the background, as in auto mode, Claude Code hands every
+/// result of its `REPL` tool back to the model as a `UserPromptSubmit` with
+/// `source: "poll_event"`, the text an `<event kind="repl-eval" …>` envelope.
+/// Stored, it became the session's latest "request": the handoff told the next
+/// session to continue from a code result. Nobody typed it, and the calls the
+/// code made arrive as their own tool events, so it is accepted (202) and
+/// stored nowhere. A typed prompt carries no `source`.
+fn is_code_mode_poll_event(env: &HookEnvelope) -> bool {
+    env.agent == AgentKind::ClaudeCode
+        && env.event == HookEvent::UserPrompt
+        && env.raw.get("source").and_then(serde_json::Value::as_str) == Some("poll_event")
+}
+
 /// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
 /// maintaining the subagent-session set. Returns `true` to drop. Seeds the
 /// session on `SubagentStart` and on any marker-bearing event; keeps it through
@@ -1968,6 +2043,10 @@ pub struct HandoffQuery {
     pub managed_run: Option<String>,
     /// Native session identifier observed in the SessionStart payload.
     pub session_id: Option<String>,
+    /// Optional SessionStart `source` (`startup`, `clear`, `resume`, `compact`)
+    /// forwarded from the hook payload so pinned managed runs can apply the
+    /// same SessionStart relink boundary on `GET /handoff` as on `POST /hook`.
+    pub source: Option<String>,
     /// Repository identity the client resolved (#708). Same contract as
     /// [`crate::payload::HookQuery::identity`].
     pub identity: Option<String>,
@@ -1999,16 +2078,20 @@ pub struct HandoffQuery {
     /// Set falsy by a client that re-fetches on every prompt (Kimi Code) once
     /// the session already received the digest, so it is delivered once.
     pub profile_digest: Option<String>,
-    /// The marker's `[handoff] deliver_on_session_start`, sent as `0` only
-    /// when the project opted out. An explicit falsy value keeps this
-    /// project's handoff and continuity notice out of its session starts: the
-    /// handoff stays open and unclaimed, and the rest of the on-start context
-    /// is delivered as usual. Absent or anything else delivers as before.
+    /// The marker's `[handoff] deliver_on_session_start`, forwarded as `0`
+    /// when falsy and `1` for any other declared value. An explicit falsy
+    /// value keeps this project's handoff and continuity notice out of its
+    /// session starts: the handoff stays open and unclaimed, and the rest of
+    /// the on-start context is delivered as usual. An explicit truthy value
+    /// delivers even when the server's `[handoff] deliver_on_session_start`
+    /// is `false`; absent or unrecognized follows that server default.
     pub handoff: Option<String>,
-    /// The marker's `[recovery] deliver_on_session_start`, sent as `0` only
-    /// when the project opted out. An explicit falsy value suppresses only the
-    /// unfinished-session recovery snapshot and its backfill marker. Absent or
-    /// anything else delivers recovery as before.
+    /// The marker's `[recovery] deliver_on_session_start`, forwarded as `0`
+    /// when falsy and `1` for any other declared value. An explicit falsy
+    /// value suppresses only the unfinished-session recovery snapshot and its
+    /// backfill marker; an explicit truthy value delivers even when the
+    /// server's `[recovery] deliver_on_session_start` is `false`, and absent
+    /// or unrecognized follows that server default.
     pub recovery: Option<String>,
     /// Per-request claim suppression, sent falsy (`claim=0`) by an execution
     /// that must not consume the pending baton — an external-capture run
@@ -2077,8 +2160,20 @@ async fn handle_handoff(
 ) -> impl IntoResponse {
     let actor = actor_identity(actor_ext);
     let skip_webhooks = admission_skips(level_ext, &headers);
-    let viewer = viewer_ext.map(|axum::Extension(viewer)| viewer.user());
-    match fetch_and_accept_handoff(&state, query, actor, skip_webhooks, viewer).await {
+    let caller = ai_memory_store::ScopeCaller::from_auth(
+        level_ext.map(|axum::Extension(level)| level),
+        viewer_ext.map(|axum::Extension(viewer)| viewer),
+    );
+    match fetch_and_accept_handoff_at_for_caller(
+        &state,
+        query,
+        actor,
+        skip_webhooks,
+        caller,
+        jiff::Timestamp::now(),
+    )
+    .await
+    {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
         // A refusal is the one failure that must not look like "no handoff":
@@ -2099,6 +2194,7 @@ async fn handle_handoff(
     }
 }
 
+#[cfg(test)]
 async fn fetch_and_accept_handoff(
     state: &HookState,
     query: HandoffQuery,
@@ -2106,17 +2202,28 @@ async fn fetch_and_accept_handoff(
     skip_webhooks: Vec<String>,
     viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<Option<String>> {
-    fetch_and_accept_handoff_at(
+    fetch_and_accept_handoff_at_for_caller(
         state,
         query,
         actor,
         skip_webhooks,
-        viewer,
+        ai_memory_store::ScopeCaller::from(viewer),
         jiff::Timestamp::now(),
     )
     .await
 }
 
+fn delivery_flag_enabled(value: Option<&str>, default: bool) -> bool {
+    if crate::payload::query_flag_falsy(value) {
+        false
+    } else if crate::payload::query_flag_truthy(value) {
+        true
+    } else {
+        default
+    }
+}
+
+#[cfg(test)]
 async fn fetch_and_accept_handoff_at(
     state: &HookState,
     query: HandoffQuery,
@@ -2125,6 +2232,26 @@ async fn fetch_and_accept_handoff_at(
     viewer: Option<ai_memory_core::UserId>,
     now: jiff::Timestamp,
 ) -> anyhow::Result<Option<String>> {
+    fetch_and_accept_handoff_at_for_caller(
+        state,
+        query,
+        actor,
+        skip_webhooks,
+        ai_memory_store::ScopeCaller::from(viewer),
+        now,
+    )
+    .await
+}
+
+async fn fetch_and_accept_handoff_at_for_caller(
+    state: &HookState,
+    query: HandoffQuery,
+    actor: Option<IdentityKey>,
+    skip_webhooks: Vec<String>,
+    caller: ai_memory_store::ScopeCaller,
+    now: jiff::Timestamp,
+) -> anyhow::Result<Option<String>> {
+    let viewer = caller.user_id();
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     // Keep the active-project key compatible with MCP transports: the native
     // session id is carried separately below to bind a destructive handoff
@@ -2136,7 +2263,7 @@ async fn fetch_and_accept_handoff_at(
     // Authorized before the active-project pointer is published, so a refused
     // repository does not become the caller's default for later calls.
     let (ws, proj) =
-        resolve_authorized_startup_scope(state, &query, actor.as_ref(), viewer).await?;
+        resolve_authorized_startup_scope_for_caller(state, &query, actor.as_ref(), caller).await?;
     // Mid-session notice poll (#1942): authorized like a session start, then
     // read-only. Returning here skips every claim, write and pointer publish
     // below.
@@ -2187,7 +2314,10 @@ async fn fetch_and_accept_handoff_at(
     // `[handoff] deliver_on_session_start = false` never reads the baton, so
     // there is nothing to claim, announce or render; it stays open for a
     // project that has not opted out (or for `memory_handoff_accept`).
-    let deliver_handoff = !crate::payload::query_flag_falsy(query.handoff.as_deref());
+    let deliver_handoff = delivery_flag_enabled(
+        query.handoff.as_deref(),
+        state.deliver_handoff_on_session_start,
+    );
     let handoff = if deliver_handoff {
         state
             .reader
@@ -2210,7 +2340,10 @@ async fn fetch_and_accept_handoff_at(
     // The source row stays open because it may belong to a legitimate parallel
     // agent; the packet says so explicitly and is never claimed/consumed.
     // `[recovery] deliver_on_session_start = false` skips only this packet.
-    let interrupted_md = if crate::payload::query_flag_falsy(query.recovery.as_deref()) {
+    let interrupted_md = if !delivery_flag_enabled(
+        query.recovery.as_deref(),
+        state.deliver_recovery_on_session_start,
+    ) {
         None
     } else {
         render_interrupted_session_context(state, ws, proj, owner_filter.clone(), accepting_session)
@@ -2227,7 +2360,7 @@ async fn fetch_and_accept_handoff_at(
     let may_write_profile = match crate::grants::authorize_resolved(
         &state.reader,
         Some((ws, proj)),
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Write,
     )
     .await
@@ -2455,7 +2588,7 @@ struct ManagedHookHint<'a> {
     cwd: Option<&'a str>,
     native_session: Option<&'a str>,
     session_start: bool,
-    claude_boundary: ai_memory_store::ClaudeSessionBoundary,
+    session_boundary: ai_memory_store::ManagedSessionBoundary,
 }
 
 /// Only a run prepared through the ID selector may supply its stored scope.
@@ -2465,7 +2598,7 @@ async fn pinned_managed_hook_scope(
     state: &HookState,
     hint: ManagedHookHint<'_>,
     actor: Option<&IdentityKey>,
-    viewer: Option<ai_memory_core::UserId>,
+    caller: ai_memory_store::ScopeCaller,
 ) -> anyhow::Result<Option<(WorkspaceId, ProjectId)>> {
     let Some(run_id) = hint.run.and_then(|raw| ManagedRunId::from_str(raw).ok()) else {
         return Ok(None);
@@ -2485,7 +2618,7 @@ async fn pinned_managed_hook_scope(
             native_session_id: hint.native_session.unwrap_or_default().to_owned(),
             owner_user: owner_user.clone(),
             session_start: hint.session_start,
-            claude_boundary: hint.claude_boundary,
+            session_boundary: hint.session_boundary,
         })
         .await?;
     let Some((workspace_id, project_id)) = scope else {
@@ -2495,21 +2628,21 @@ async fn pinned_managed_hook_scope(
         hint.native_session.unwrap_or_default(),
         &state.sanitizer,
     )?;
-    ai_memory_store::authorize_scope_for(
+    ai_memory_store::authorize_scope_for_caller(
         &state.reader,
         None,
         ai_memory_store::ResolvedScope {
             workspace_id,
             project_id,
         },
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Write,
     )
     .await?;
-    let linked = if hint.claude_boundary != ai_memory_store::ClaudeSessionBoundary::Other {
+    let linked = if hint.session_boundary != ai_memory_store::ManagedSessionBoundary::Other {
         state
             .writer
-            .relink_managed_claude_session(
+            .relink_managed_session(
                 ai_memory_store::LinkOrAdoptManagedRunSession {
                     supplied_run_id: run_id,
                     workspace_id,
@@ -2519,7 +2652,7 @@ async fn pinned_managed_hook_scope(
                     native_session_id: native.into_string(),
                     owner_user,
                 },
-                hint.claude_boundary,
+                hint.session_boundary,
             )
             .await?
     } else {
@@ -2545,24 +2678,45 @@ async fn pinned_managed_hook_scope(
 
 /// Resolve startup scope from a validated pinned run or the normal marker/name
 /// route, then apply the corresponding current project authorization.
+#[cfg(test)]
 async fn resolve_authorized_startup_scope(
     state: &HookState,
     query: &HandoffQuery,
     actor: Option<&IdentityKey>,
     viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
+    resolve_authorized_startup_scope_for_caller(
+        state,
+        query,
+        actor,
+        ai_memory_store::ScopeCaller::from(viewer),
+    )
+    .await
+}
+
+async fn resolve_authorized_startup_scope_for_caller(
+    state: &HookState,
+    query: &HandoffQuery,
+    actor: Option<&IdentityKey>,
+    caller: ai_memory_store::ScopeCaller,
+) -> anyhow::Result<(WorkspaceId, ProjectId)> {
+    let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     if let Some(scope) = pinned_managed_hook_scope(
         state,
         ManagedHookHint {
             run: query.managed_run.as_deref(),
-            agent: query.agent.as_deref().map_or(AgentKind::Other, parse_agent),
+            agent,
             cwd: query.cwd.as_deref(),
             native_session: query.session_id.as_deref(),
             session_start: true,
-            claude_boundary: ai_memory_store::ClaudeSessionBoundary::Other,
+            session_boundary: ai_memory_store::ManagedSessionBoundary::from_session_start(
+                agent,
+                true,
+                query.source.as_deref(),
+            ),
         },
         actor,
-        viewer,
+        caller,
     )
     .await?
     {
@@ -2587,13 +2741,13 @@ async fn resolve_authorized_startup_scope(
         &aliases,
         ProjectSource::parse(query.project_src.as_deref()),
         false,
-        viewer,
+        caller.user_id(),
     )
     .await?;
     crate::grants::authorize_resolved(
         &state.reader,
         Some((ws, proj)),
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Read,
     )
     .await?;
@@ -2611,11 +2765,15 @@ async fn handle_brief(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
 ) -> impl IntoResponse {
     let actor = actor_identity(actor_ext);
-    let viewer = viewer_ext.map(|axum::Extension(viewer)| viewer.user());
-    match fetch_brief(&state, &query, actor.as_ref(), viewer).await {
+    let caller = ai_memory_store::ScopeCaller::from_auth(
+        level_ext.map(|axum::Extension(level)| level),
+        viewer_ext.map(|axum::Extension(viewer)| viewer),
+    );
+    match fetch_brief(&state, &query, actor.as_ref(), caller).await {
         Ok(brief) => (StatusCode::OK, brief.unwrap_or_default()),
         Err(e) => match e.downcast_ref::<ai_memory_store::ScopeResolutionError>() {
             Some(refusal) if refusal.is_forbidden() => (StatusCode::FORBIDDEN, refusal.to_string()),
@@ -2631,7 +2789,7 @@ async fn fetch_brief(
     state: &HookState,
     query: &HandoffQuery,
     actor: Option<&IdentityKey>,
-    viewer: Option<ai_memory_core::UserId>,
+    caller: ai_memory_store::ScopeCaller,
 ) -> anyhow::Result<Option<String>> {
     let project_change = crate::payload::query_flag_truthy(query.project_change.as_deref());
     if project_change && !state.project_briefs.enabled {
@@ -2643,7 +2801,8 @@ async fn fetch_brief(
     {
         return Ok(None);
     }
-    let (ws, proj) = resolve_authorized_startup_scope(state, query, actor, viewer).await?;
+    let (ws, proj) =
+        resolve_authorized_startup_scope_for_caller(state, query, actor, caller).await?;
     let forced;
     let query = if project_change {
         let Some(session) = query
@@ -3096,7 +3255,8 @@ fn render_interrupted_session_markdown(
         }
     }
 
-    let activity: Vec<&ObservationRecord> = records
+    const MAX_ACTIVITY_ITEMS: usize = 8;
+    let (mut activity, stubs): (Vec<&ObservationRecord>, Vec<&ObservationRecord>) = records
         .iter()
         .filter(|record| {
             record.kind != ObservationKind::SessionStart.as_str()
@@ -3104,8 +3264,11 @@ fn render_interrupted_session_markdown(
                 && record.kind != ObservationKind::Stop.as_str()
                 && (!record.title.trim().is_empty() || !record.body.trim().is_empty())
         })
-        .take(8)
-        .collect();
+        .partition(|record| !is_opaque_unknown_tool_stub(record));
+    activity.truncate(MAX_ACTIVITY_ITEMS);
+    if activity.len() < MAX_ACTIVITY_ITEMS {
+        activity.extend(stubs.into_iter().take(MAX_ACTIVITY_ITEMS - activity.len()));
+    }
     if !activity.is_empty() {
         buf.push_str("\n**Most recent recorded activity** (newest first)\n");
         for record in activity {
@@ -3148,6 +3311,23 @@ fn render_interrupted_session_markdown(
     buf.push('\n');
     buf.push_str(INTERRUPTED_SESSION_FOOTER);
     Some(buf)
+}
+
+fn is_opaque_unknown_tool_stub(record: &ObservationRecord) -> bool {
+    if record.kind != ObservationKind::PreToolUse.as_str()
+        && record.kind != ObservationKind::PostToolUse.as_str()
+    {
+        return false;
+    }
+    let body = record.body.trim();
+    if body.is_empty() || body.contains(ai_memory_core::TOOL_BODY_SEPARATOR) {
+        return false;
+    }
+    let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty());
+    if lines.next() != Some("tool_family: unknown") {
+        return false;
+    }
+    lines.all(|line| line.starts_with("tool_call_id: ") || line == "outcome: unknown")
 }
 
 fn cap_recovery_item(value: &str) -> String {
@@ -5267,19 +5447,45 @@ fn is_subagent_compaction(env: &HookEnvelope) -> bool {
         && body_is_subagent(env.agent, &env.raw)
 }
 
-/// Durable body for a hook observation: scrub the **full** excerpt first,
-/// then apply the per-event ceiling to the redacted text.
+/// Extra bytes past `durable_body_cap(event)` included in the prefix passed to
+/// [`Sanitizer::scrub`] when `[sanitize].extra_patterns` is empty (#2452).
+///
+/// Any built-in secret straddling the durable-body cap (API keys, JWTs, bearer
+/// tokens, env-var assignments, complete PEM/PGP private-key blocks, and
+/// unterminated PEM blocks) completes well inside 64 KiB past the cut, while
+/// multi-MiB tool outputs no longer run every built-in sanitizer regex and
+/// shadow-view pass over megabytes that `truncate_utf8_bytes` would
+/// immediately discard. When `[sanitize].extra_patterns` is non-empty,
+/// `durable_body` bypasses this pre-slice and scrubs the full excerpt so
+/// custom patterns depending on context past `cap + 64 KiB` still match.
+const DURABLE_BODY_SCRUB_OVERLAP_BYTES: usize = 64 * 1024;
+
+/// Durable body for a hook observation: scrub first, then apply the per-event
+/// ceiling to the redacted text.
 ///
 /// The cap used to run inside excerpt extraction in `payload`, before the
 /// sanitizer ever saw the text — a secret straddling the cutoff was cut in
 /// half, leaving a prefix too short to match a pattern, stored in clear text
-/// (#1114). This is the body-side twin of the #980 title-hint fix: scrub and
-/// cap together, in that order, at the persistence boundary.
+/// (#1114). When `[sanitize].extra_patterns` is empty, scrubbing a bounded
+/// UTF-8 prefix (`cap + DURABLE_BODY_SCRUB_OVERLAP_BYTES`) preserves full
+/// straddling-secret redaction for all built-in rules (including PEM private
+/// keys) without spending seconds scanning multi-MiB tool responses that are
+/// immediately truncated to `cap` (#2452). When operator `extra_patterns` are
+/// configured (`sanitizer.has_extra_patterns()`), the bounded pre-slice is
+/// bypassed and the full excerpt is scrubbed so multi-line delimited blocks or
+/// end-anchored (`$`) custom rules cannot miss context past `cap + 64 KiB`.
 fn durable_body(event: HookEvent, excerpt: Option<&str>, sanitizer: &Sanitizer) -> String {
     let Some(excerpt) = excerpt else {
         return String::new();
     };
-    truncate_utf8_bytes(&sanitizer.scrub(excerpt), durable_body_cap(event))
+    let cap = durable_body_cap(event);
+    let window_limit = cap.saturating_add(DURABLE_BODY_SCRUB_OVERLAP_BYTES);
+    let window = if excerpt.len() <= window_limit || sanitizer.has_extra_patterns() {
+        excerpt
+    } else {
+        &excerpt[..excerpt.floor_char_boundary(window_limit)]
+    };
+    truncate_utf8_bytes(&sanitizer.scrub(window), cap)
 }
 
 async fn process_authorized(
@@ -5333,10 +5539,19 @@ async fn process_authorized(
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return Ok(HookProcessingOutcome::DroppedPolicy);
     }
+    // Likewise a Code Mode result: no caller stores it as a prompt (#2366).
+    if is_code_mode_poll_event(&env) {
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+        return Ok(HookProcessingOutcome::DroppedPolicy);
+    }
     let actor_key = ai_memory_core::ActorKey {
         user: actor.as_ref().map(IdentityKey::storage_key),
         session_id: env.session_id.clone(),
     };
+    let caller = ai_memory_store::ScopeCaller::from_auth(
+        Some(level),
+        viewer.map(ai_memory_core::AuthorizedViewer),
+    );
     let pinned_scope = pinned_managed_hook_scope(
         state,
         ManagedHookHint {
@@ -5345,16 +5560,19 @@ async fn process_authorized(
             cwd: env.cwd.as_deref(),
             native_session: env.session_id.as_deref(),
             session_start: env.event == HookEvent::SessionStart,
-            // Claude documents `clear` and `resume` separately from startup
-            // and compact: https://code.claude.com/docs/en/hooks#sessionstart-input
-            claude_boundary: ai_memory_store::ClaudeSessionBoundary::from_session_start(
+            // Claude Code documents `clear` and `resume` separately from
+            // startup and compact
+            // (https://code.claude.com/docs/en/hooks#sessionstart-input);
+            // Codex emits `startup`/`clear` for a new thread and `resume` when
+            // resuming/switching threads.
+            session_boundary: ai_memory_store::ManagedSessionBoundary::from_session_start(
                 env.agent,
                 env.event == HookEvent::SessionStart,
                 env.raw.get("source").and_then(serde_json::Value::as_str),
             ),
         },
         actor.as_ref(),
-        viewer,
+        caller,
     )
     .await?;
     // Session-sticky attribution: for an event whose session already
@@ -5457,14 +5675,14 @@ async fn process_authorized(
     // Decided on the read pool, not the writer actor: this runs for every
     // captured event, and a round trip through the single writer per event is
     // the contention the hook path is built to avoid.
-    match ai_memory_store::authorize_scope_for(
+    match ai_memory_store::authorize_scope_for_caller(
         &state.reader,
         None,
         ai_memory_store::ResolvedScope {
             workspace_id: ws,
             project_id: proj,
         },
-        viewer,
+        caller,
         ai_memory_store::ProjectAccess::Write,
     )
     .await
@@ -5474,22 +5692,6 @@ async fn process_authorized(
         Err(err) => return Err(err.into()),
     }
 
-    // Hooks are fire-and-forget and may arrive out of order. Begin the
-    // session idempotently before every observation so a resumed agent
-    // session, or a prompt racing ahead of SessionStart, cannot trip the
-    // observations.session_id foreign key.
-    // Stamp the authenticated operator so anything that later picks "the open
-    // session for this scope" can tell whose it is — but only where operators
-    // are actually told apart. On an unauthenticated server, and on one that
-    // authenticates a single operator, this stays None and the session is
-    // shared, as before. The same value owns the SessionEnd handoff below, so
-    // the session and its baton can never disagree about who they belong to.
-    let owner_stamp = owner_stamp_for_event(state, actor.as_ref()).await;
-    // A keyed event claims its project-scoped key in the same transaction as
-    // the observation. A pending replay resumes the downstream wiki/handoff
-    // effects without duplicating the observation; only a delivery whose
-    // effects were marked complete is skipped.
-    let ingest_key = env.ingest_key.clone();
     let owner_filter = if env.all_owners_requested {
         if !matches!(env.event, HookEvent::SessionEnd) {
             return Err(StoreError::SessionCollision.into());
@@ -5512,6 +5714,45 @@ async fn process_authorized(
                 ai_memory_core::OwnerFilter::User(id.storage_key())
             })
     };
+
+    // A completed ordinary key has already stored its observation and finished
+    // its downstream effects. Rebuilding the body here scrubs the whole excerpt
+    // again, which for a multi-megabyte tool result outlives the spool drain
+    // timeout and the entry is retried forever (#2452). Recovery keys stay on
+    // the full path: a mismatched identity is a collision, not an ack.
+    // SessionEnd stays there too. A replay of an ended session is
+    // `AlreadyEnded`, which can still repair the wiki commit, and that
+    // decision is made inside admission rather than from the key alone.
+    // The reader check also verifies the 30-day key TTL and live session
+    // invariants (unpurged, owner-admitted, matching agent) so expired keys,
+    // purged sessions, and owner/agent collisions still fall through to full
+    // admission.
+    if env.event != HookEvent::SessionEnd
+        && let Some(key) = env.ingest_key.as_deref()
+        && state
+            .reader
+            .ordinary_ingest_key_completed(ws, proj, session_id, env.agent, &owner_filter, key)
+            .await?
+    {
+        return Ok(HookProcessingOutcome::Replayed);
+    }
+
+    // Hooks are fire-and-forget and may arrive out of order. Begin the
+    // session idempotently before every observation so a resumed agent
+    // session, or a prompt racing ahead of SessionStart, cannot trip the
+    // observations.session_id foreign key.
+    // Stamp the authenticated operator so anything that later picks "the open
+    // session for this scope" can tell whose it is — but only where operators
+    // are actually told apart. On an unauthenticated server, and on one that
+    // authenticates a single operator, this stays None and the session is
+    // shared, as before. The same value owns the SessionEnd handoff below, so
+    // the session and its baton can never disagree about who they belong to.
+    let owner_stamp = owner_stamp_for_event(state, actor.as_ref()).await;
+    // A keyed event claims its project-scoped key in the same transaction as
+    // the observation. A pending replay resumes the downstream wiki/handoff
+    // effects without duplicating the observation; only a delivery whose
+    // effects were marked complete is skipped.
+    let ingest_key = env.ingest_key.clone();
     let cwd_norm = env
         .cwd
         .as_deref()
@@ -5567,6 +5808,7 @@ async fn process_authorized(
                 .clone()
                 .unwrap_or_else(|| kind.as_str().to_string())
         };
+        let trust_class = ai_memory_core::TrustClass::from_observation_kind(kind);
         let raw_obs = NewObservation {
             session_id,
             workspace_id: ws,
@@ -5579,6 +5821,7 @@ async fn process_authorized(
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
             file_path: env.file_path.clone(),
+            trust_class: Some(trust_class),
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -6117,6 +6360,7 @@ async fn process_authorized(
                         // predate owner recording.
                         actor: session_actor.clone(),
                         evidence: Vec::new(),
+                        trust_class: new_page.trust_class,
                     })
                     .await?
             }
@@ -6594,7 +6838,7 @@ fn derive_open_questions(facts: &HandoffFacts, last_prompt: &Option<String>) -> 
     // Heuristic 1: last prompt is a question → it is the open question.
     if let Some(p) = last_prompt_obs {
         let body = p.body.trim();
-        if body.ends_with('?') || body.ends_with('？') {
+        if body.ends_with('?') || body.ends_with('？') || body.ends_with('؟') {
             return vec![format!("Unresolved question: {}", cap_handoff_text(body))];
         }
     }
@@ -6687,6 +6931,17 @@ fn is_acknowledgment(text: &str) -> bool {
         "明白",
         "了解",
         "可以的",
+        // Arabic acknowledgments.
+        "تمام",
+        "شكرا",
+        "شكراً",
+        "حسنا",
+        "حسناً",
+        "ممتاز",
+        "واضح",
+        "مفهوم",
+        "تم",
+        "طيب",
     ];
     if trimmed.chars().count() <= 20 && ACK_PHRASES.contains(&trimmed) {
         return true;
@@ -6704,7 +6959,7 @@ fn is_acknowledgment(text: &str) -> bool {
         // Any whitespace separates phrases: a multi-line "ok\nthanks" is
         // the same acknowledgment as "ok thanks".
         rest = rest.trim_start_matches(|c: char| {
-            c.is_whitespace() || matches!(c, ',' | '.' | '!' | '，' | '。' | '！')
+            c.is_whitespace() || matches!(c, ',' | '.' | '!' | '，' | '。' | '！' | '،' | '؛')
         });
         if rest.is_empty() {
             return true;
@@ -6713,11 +6968,10 @@ fn is_acknowledgment(text: &str) -> bool {
             .iter()
             .filter(|phrase| {
                 rest.strip_prefix(**phrase).is_some_and(|after| {
-                    !phrase.is_ascii()
-                        || !after
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_alphanumeric())
+                    phrase
+                        .chars()
+                        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+                        || !after.chars().next().is_some_and(char::is_alphanumeric)
                 })
             })
             .max_by_key(|phrase| phrase.len());
@@ -6830,6 +7084,7 @@ async fn write_checkpoint_page(
             author_id: None,
             actor,
             evidence: Vec::new(),
+            trust_class: new_page.trust_class,
         })
         .await?;
     if checkpoint.track_page_write && previous_page_id != Some(page_id) {
@@ -7127,6 +7382,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -7252,6 +7508,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -8785,6 +9042,81 @@ pub(crate) mod tests {
         assert_eq!(ordinary, HookProcessingOutcome::Stored);
     }
 
+    /// A Code Mode result as Claude Code hands it to `UserPromptSubmit` (#2366).
+    const CODE_MODE_RESULT: &str =
+        "<event kind=\"repl-eval\" eval=\"1\" status=\"settled\">\n<result>ok</result>\n</event>";
+
+    /// Claude Code's Code Mode hands each code result back to the model as a
+    /// `UserPromptSubmit` with `source: "poll_event"` (#2366). It is accepted
+    /// and stored nowhere, so it never becomes the session's latest request,
+    /// while the typed prompt of the same session is still captured. The field
+    /// is Claude Code's: another agent's prompt carrying it is kept.
+    #[tokio::test]
+    async fn claude_code_mode_results_are_accepted_and_stored_nowhere() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let capture = |agent: &'static str, body: serde_json::Value| {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                body,
+            );
+            let state = state.clone();
+            async move {
+                process_authorized(
+                    &state,
+                    env,
+                    None,
+                    ai_memory_core::AuthLevel::User,
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let session = SessionId::new().to_string();
+        let cwd = tmp.path().join("repo");
+        let typed = serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.to_string_lossy(),
+            "prompt": "run the tests",
+        });
+        let result = serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.to_string_lossy(),
+            "prompt": CODE_MODE_RESULT,
+            "source": "poll_event",
+        });
+
+        assert_eq!(
+            capture("claude-code", typed).await,
+            HookProcessingOutcome::Stored
+        );
+        assert_eq!(
+            capture("claude-code", result.clone()).await,
+            HookProcessingOutcome::DroppedPolicy,
+            "a Code Mode result is not captured as a prompt"
+        );
+        let prompts: Vec<String> = state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|obs| obs.kind == ObservationKind::UserPrompt)
+            .map(|obs| obs.body)
+            .collect();
+        assert_eq!(prompts, ["run the tests"]);
+
+        let mut other = result;
+        other["session_id"] = serde_json::json!(SessionId::new().to_string());
+        assert_eq!(capture("codex", other).await, HookProcessingOutcome::Stored);
+    }
+
     /// A git-remote capture whose marker asked for `identity_style`.
     async fn capture_styled(
         state: &HookState,
@@ -9439,6 +9771,8 @@ pub(crate) mod tests {
             capture_assistant_enabled: false,
             assistant_excerpt_max_bytes: crate::assistant_capture::ASSISTANT_EXCERPT_MAX_BYTES,
             claim_handoff_on_session_start: true,
+            deliver_handoff_on_session_start: true,
+            deliver_recovery_on_session_start: true,
             create_handoff_on_session_end: true,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
@@ -9787,6 +10121,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -10265,6 +10600,58 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(healthy, 7);
+    }
+
+    /// A directory whose probe never returns holds one permit however many
+    /// events name it (#2434). A later probe of the same directory, here
+    /// spelled with a trailing slash, waits behind the stuck one and never
+    /// starts, so the second permit still serves another directory. Without
+    /// the per-cwd gate that probe takes the second permit and blocks too,
+    /// and no other directory resolves.
+    #[tokio::test]
+    async fn cwd_probes_give_a_stuck_directory_one_permit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let probes = CwdProbes::new(2, std::time::Duration::from_millis(200));
+        // The stuck probes return when these senders drop, at the end of the
+        // test or on a failed assertion, and after ten seconds at most, so a
+        // regression fails the test instead of hanging it.
+        let (_release_first, first_released) = std::sync::mpsc::channel::<()>();
+        let (_release_second, second_released) = std::sync::mpsc::channel::<()>();
+        let stuck = std::time::Duration::from_secs(10);
+
+        let first = probes
+            .run("/Volumes/stuck", move || {
+                let _ = first_released.recv_timeout(stuck);
+            })
+            .await;
+        assert!(first.is_err(), "the caller gives up at the deadline");
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = probes
+            .run("/Volumes/stuck/", {
+                let ran = ran.clone();
+                move || {
+                    ran.store(true, Ordering::SeqCst);
+                    let _ = second_released.recv_timeout(stuck);
+                }
+            })
+            .await;
+        assert!(second.is_err(), "the directory is still blocked");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a second thread blocked on the stuck directory"
+        );
+
+        let other = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = probes.run("/w/other", || 7).await {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("another directory still gets a permit");
+        assert_eq!(other, 7);
     }
 
     /// The resolver's filesystem rungs go through the bounded probe path: with
@@ -11665,6 +12052,7 @@ pub(crate) mod tests {
                     body: "hello".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &state.sanitizer,
             )
@@ -11743,6 +12131,295 @@ pub(crate) mod tests {
             6,
             "session-start + resumed pending + first keyed + fresh key + 2 keyless"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_key_fast_path_enforces_ttl_and_session_invariants() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+        let sid = "77777777-7777-7777-7777-777777777777";
+        let cwd = tmp.path().join("fast-path-invariants");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let make_env = |event: &str, agent: &str, key: Option<&str>, prompt: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some(agent.into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ingest_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd.to_string_lossy(),
+                    "prompt": prompt,
+                }),
+            )
+        };
+
+        // 1. Store an ordinary keyed event for Alice (claude-code).
+        let stored = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "hello",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored, HookProcessingOutcome::Stored);
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let (ws, proj, _) = state
+            .reader
+            .find_session_scope(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 2. Completed ordinary ingest key replay returns Replayed and does not re-insert.
+        let replayed = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "hello",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed, HookProcessingOutcome::Replayed);
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 3. `all_owners_requested` on non-SessionEnd still rejects with SessionCollision.
+        let mut all_owners_env = make_env(
+            "user-prompt-submit",
+            "claude-code",
+            Some("entry-1"),
+            "hello",
+        );
+        all_owners_env.all_owners_requested = true;
+        let all_owners_err = process_authorized(
+            &state,
+            all_owners_env,
+            alice.clone(),
+            ai_memory_core::AuthLevel::Root,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            all_owners_err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        // 4. Cross-owner replay on a completed ordinary key still rejects with SessionCollision.
+        let cross_owner_err = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "hello",
+            ),
+            bob.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            cross_owner_err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        // 5. Wrong-agent replay on a completed ordinary key still rejects with SessionAgentMismatch.
+        let wrong_agent_err = process_authorized(
+            &state,
+            make_env("user-prompt-submit", "codex", Some("entry-1"), "hello"),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            wrong_agent_err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionAgentMismatch {
+                bound: AgentKind::ClaudeCode
+            })
+        ));
+
+        // 6. Expired completed ordinary key (>30d seen_at) falls through and is swept/accepted.
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute(
+            "UPDATE ingest_keys SET seen_at = 1 WHERE project_id = ?1 AND key = 'entry-1'",
+            rusqlite::params![proj.as_bytes()],
+        )
+        .unwrap();
+        drop(db);
+        let expired_reused = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "reused",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(expired_reused, HookProcessingOutcome::Stored);
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // 7. Recovery keys stay on the full path: mismatched identity is a SessionCollision.
+        let recovery_key = format!("recovery_{}", "b".repeat(55));
+        let recovery_stored = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some(&recovery_key),
+                "original recovery body",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovery_stored, HookProcessingOutcome::Stored);
+        let recovery_collision = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some(&recovery_key),
+                "tampered recovery body",
+            ),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            recovery_collision.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        // 8. SessionEnd stays on the full admission path even with a completed ordinary key.
+        let ended = process_authorized(
+            &state,
+            make_env("session-end", "claude-code", Some("entry-end"), "done"),
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ended, HookProcessingOutcome::Stored);
+        let mut non_admin_all_owners_end =
+            make_env("session-end", "claude-code", Some("entry-end"), "done");
+        non_admin_all_owners_end.all_owners_requested = true;
+        let end_collision = process_authorized(
+            &state,
+            non_admin_all_owners_end,
+            alice.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            end_collision.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        // 9. Purged session replay on a completed ordinary key falls through to SessionPurged.
+        state
+            .writer
+            .purge_session(
+                ws,
+                proj,
+                session_id,
+                None,
+                ai_memory_store::Compaction::Skip,
+                ai_memory_store::PurgeMode::Commit,
+            )
+            .await
+            .unwrap();
+        let purged_err = process_authorized(
+            &state,
+            make_env(
+                "user-prompt-submit",
+                "claude-code",
+                Some("entry-1"),
+                "hello",
+            ),
+            alice,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            purged_err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionPurged(_))
+        ));
     }
 
     #[tokio::test]
@@ -12020,6 +12697,70 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"queued");
+    }
+
+    /// A Code Mode session sends a result for every piece of code it runs
+    /// (#2366), so the drop comes before any ingest capacity is spent: with the
+    /// semaphore exhausted, the single route still answers 202 with the drop
+    /// reason and a batch still clears the result from the spool, while a
+    /// typed prompt is shed with 429.
+    #[tokio::test]
+    async fn code_mode_results_are_dropped_before_any_capacity_is_spent() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = Arc::new(state);
+        let result = serde_json::json!({
+            "session_id": "code-mode",
+            "prompt": CODE_MODE_RESULT,
+            "source": "poll_event",
+        });
+        let single = |body: serde_json::Value| {
+            handle_hook(
+                State(state.clone()),
+                Query(HookQuery {
+                    event: "user-prompt-submit".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                Json(body),
+            )
+        };
+
+        let response = single(result.clone()).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"code mode poll event dropped");
+        // Control: a typed prompt reaches the exhausted semaphore.
+        let prompt = serde_json::json!({ "session_id": "code-mode", "prompt": "hello" });
+        let typed = single(prompt).await.into_response();
+        assert_eq!(typed.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: result,
+            }]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 1, "a Code Mode result clears the spool");
     }
 
     #[tokio::test]
@@ -16596,6 +17337,325 @@ pub(crate) mod tests {
         );
     }
 
+    /// A `scope_by_id = 1` Codex run pre-linked to `N` relinks on `SessionStart`
+    /// (`startup`/`clear` to fresh `F`, `resume` to existing `S`) and keeps
+    /// capturing `/hook/batch` `PreToolUse`/`PostToolUse` events, while refusing
+    /// non-`SessionStart` switches and delayed events for abandoned `N`.
+    #[tokio::test]
+    async fn managed_codex_pinned_run_relinks_on_session_start_and_captures_batch() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let run = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "codex-repo".into(),
+                worktree_fingerprint: "codex-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "codex-test".into(),
+            })
+            .await
+            .unwrap();
+        // Pre-link to prior thread `N` as `ai-memory run` does (#1993).
+        assert!(
+            state
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "thread-n")
+                .await
+                .unwrap()
+        );
+
+        // Switch to fresh thread `F` via `SessionStart` (`source: "startup"`)
+        // followed by `PreToolUse` and `PostToolUse` in `/hook/batch`.
+        let batch_fresh = vec![
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=session-start&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-f",
+                    "cwd": "/tmp/scratch",
+                    "source": "startup"
+                }),
+            },
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=pre-tool-use&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-f",
+                    "cwd": "/tmp/scratch",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "cargo test"}
+                }),
+            },
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=post-tool-use&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-f",
+                    "cwd": "/tmp/scratch",
+                    "tool_name": "Bash",
+                    "tool_response": "ok"
+                }),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(batch_fresh),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 3);
+        assert_eq!(state.ingest_metrics.snapshot().dropped_invalid, 0);
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("thread-f")
+        );
+        let fresh_sid = ai_memory_core::SessionId::from_native("thread-f");
+        assert!(
+            state
+                .reader
+                .observations_for_session(fresh_sid)
+                .await
+                .unwrap()
+                .len()
+                >= 2
+        );
+
+        // Non-SessionStart for abandoned `thread-n` is refused, and `startup`
+        // cannot rewind to already-bound `thread-n`.
+        let mut stale_tool = session_envelope("pre-tool-use", "thread-n", "/tmp/scratch");
+        stale_tool.agent = AgentKind::Codex;
+        stale_tool.managed_run = Some(run.run_id.to_string());
+        assert!(process(&state, stale_tool, None, Vec::new()).await.is_err());
+
+        let mut rewind = session_envelope("session-start", "thread-n", "/tmp/scratch");
+        rewind.agent = AgentKind::Codex;
+        rewind.managed_run = Some(run.run_id.to_string());
+        rewind.raw["source"] = serde_json::json!("startup");
+        assert!(process(&state, rewind, None, Vec::new()).await.is_err());
+
+        // `GET /handoff` with `source=resume` relinks to resumed thread `S`.
+        let handoff_resp = handle_handoff(
+            State(state.clone()),
+            Query(HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/scratch".into()),
+                managed_run: Some(run.run_id.to_string()),
+                session_id: Some("thread-s".into()),
+                source: Some("resume".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(handoff_resp.status(), StatusCode::OK);
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("thread-s")
+        );
+
+        // Subsequent `/hook/batch` `PreToolUse`/`PostToolUse` on `thread-s` capture.
+        let batch_resume = vec![
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=pre-tool-use&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-s",
+                    "cwd": "/tmp/scratch",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status"}
+                }),
+            },
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=post-tool-use&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-s",
+                    "cwd": "/tmp/scratch",
+                    "tool_name": "Bash",
+                    "tool_response": "clean"
+                }),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(batch_resume),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 2);
+        let resumed_sid = ai_memory_core::SessionId::from_native("thread-s");
+        assert!(
+            !state
+                .reader
+                .observations_for_session(resumed_sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A shared Codex daemon carrying a terminal `scope_by_id = 1` run id
+    /// falls through `pinned_hook_scope` on `SessionStart` and adopts the sole
+    /// live, undelivered, unlinked Codex run in the same scope/cwd/owner.
+    /// Non-Codex and non-`SessionStart` terminal pins remain refused.
+    #[tokio::test]
+    async fn managed_codex_stale_terminal_pinned_run_adopts_sole_live_unlinked_run() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let old_codex = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "codex-adopt-repo".into(),
+                worktree_fingerprint: "codex-adopt-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "codex-old".into(),
+            })
+            .await
+            .unwrap();
+        state
+            .writer
+            .cancel_managed_run(old_codex.run_id)
+            .await
+            .unwrap();
+
+        let live_codex = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "codex-adopt-repo".into(),
+                worktree_fingerprint: "codex-adopt-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "codex-live".into(),
+            })
+            .await
+            .unwrap();
+
+        // Non-SessionStart on the terminal Codex pin stays refused.
+        let mut stale_tool = session_envelope("pre-tool-use", "adopted-thread", "/tmp/scratch");
+        stale_tool.agent = AgentKind::Codex;
+        stale_tool.managed_run = Some(old_codex.run_id.to_string());
+        assert!(process(&state, stale_tool, None, Vec::new()).await.is_err());
+
+        // Non-Codex (ClaudeCode) terminal pin stays refused even on SessionStart.
+        let old_claude = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "claude-term-repo".into(),
+                worktree_fingerprint: "claude-term-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "claude-old".into(),
+            })
+            .await
+            .unwrap();
+        state
+            .writer
+            .cancel_managed_run(old_claude.run_id)
+            .await
+            .unwrap();
+        let mut claude_start = session_envelope("session-start", "claude-fresh", "/tmp/scratch");
+        claude_start.agent = AgentKind::ClaudeCode;
+        claude_start.managed_run = Some(old_claude.run_id.to_string());
+        assert!(
+            process(&state, claude_start, None, Vec::new())
+                .await
+                .is_err()
+        );
+
+        // Codex SessionStart (`POST /hook` + `GET /handoff`) carrying the stale
+        // terminal `scope_by_id = 1` run id falls through and adopts `live_codex`.
+        let mut codex_start = session_envelope("session-start", "adopted-thread", "/tmp/scratch");
+        codex_start.agent = AgentKind::Codex;
+        codex_start.managed_run = Some(old_codex.run_id.to_string());
+        codex_start.workspace_override = Some("default".into());
+        codex_start.project_override = Some("scratch".into());
+        process(&state, codex_start, None, Vec::new())
+            .await
+            .unwrap();
+
+        let handoff_resp = handle_handoff(
+            State(state.clone()),
+            Query(HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/scratch".into()),
+                workspace: Some("default".into()),
+                project: Some("scratch".into()),
+                managed_run: Some(old_codex.run_id.to_string()),
+                session_id: Some("adopted-thread".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(handoff_resp.status(), StatusCode::OK);
+        assert_eq!(
+            run_native_session(&state, live_codex.run_id)
+                .await
+                .as_deref(),
+            Some("adopted-thread")
+        );
+    }
+
     /// `/clear` then an in-session `/resume` back to the pre-clear
     /// conversation: Claude sends SessionStart `resume` with the old id, the
     /// run follows it and capture continues there. A `resume` to an id the
@@ -17253,6 +18313,7 @@ pub(crate) mod tests {
                                 body: String::new(),
                                 importance: 1,
                                 file_path: None,
+                                trust_class: None,
                             },
                             &state.sanitizer
                         ),
@@ -17860,6 +18921,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -18421,6 +19483,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -20437,6 +21500,96 @@ pub(crate) mod tests {
         assert!(!project_b.contains("RECOVERY-SOURCE-A"));
     }
 
+    /// A server with `[recovery] deliver_on_session_start = false` skips the
+    /// snapshot for a start that names no `recovery` flag (or an unrecognized
+    /// value) while the brief, profile digest and inbox notice still arrive; a
+    /// project marker's explicit `recovery=1` opts back in.
+    #[tokio::test]
+    async fn server_recovery_default_off_is_overridden_by_marker_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.deliver_recovery_on_session_start = false;
+        process(
+            &state,
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt".into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some("/tmp/project-a".into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "56565656-5656-5656-5656-565656565656",
+                    "cwd": "/tmp/project-a",
+                    "prompt": "RECOVERY-DEFAULT-OFF-SOURCE",
+                    "occurred_at": "2020-01-01T00:00:00Z"
+                }),
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .upsert_page(brief_page(
+                state.workspace_id,
+                state.project_id,
+                "_rules/recovery-default.md",
+                "RECOVERY-DEFAULT-OFF-BRIEF",
+                true,
+            ))
+            .await
+            .unwrap();
+        seed_global_profile(&state).await;
+        seed_inbox(&state, 1).await;
+
+        let query = |recovery: Option<&str>| HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some("/tmp/project-a".into()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            briefing: Some("true".into()),
+            recovery: recovery.map(str::to_string),
+            ..Default::default()
+        };
+        for absent in [None, Some("banana")] {
+            let body = fetch_and_accept_handoff(&state, query(absent), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("the other startup context must survive the server default");
+            for unwanted in [
+                "unfinished-session recovery snapshot",
+                BACKFILL_MARKER_PREFIX,
+                "RECOVERY-DEFAULT-OFF-SOURCE",
+            ] {
+                assert!(!body.contains(unwanted), "{absent:?}: {unwanted}: {body}");
+            }
+            for retained in [
+                "RECOVERY-DEFAULT-OFF-BRIEF",
+                "Use pnpm, not npm.",
+                "1 cross-project message waiting",
+            ] {
+                assert!(
+                    body.contains(retained),
+                    "{absent:?}: missing {retained}: {body}"
+                );
+            }
+        }
+
+        let body = fetch_and_accept_handoff(&state, query(Some("1")), None, Vec::new(), None)
+            .await
+            .unwrap()
+            .expect("the other startup context must survive the server default");
+        assert!(
+            body.contains("unfinished-session recovery snapshot"),
+            "{body}"
+        );
+        assert!(body.contains("RECOVERY-DEFAULT-OFF-SOURCE"), "{body}");
+    }
+
     #[tokio::test]
     async fn unfinished_session_recovery_is_owner_scoped_and_excludes_receiver() {
         let tmp = TempDir::new().unwrap();
@@ -20596,6 +21749,80 @@ pub(crate) mod tests {
         assert_eq!(rendered.matches(UNTRUSTED_HISTORY_START).count(), 1);
         assert_eq!(rendered.matches(UNTRUSTED_HISTORY_END).count(), 1);
         assert!(rendered.ends_with(INTERRUPTED_SESSION_FOOTER));
+    }
+
+    #[test]
+    fn interrupted_session_renderer_prefers_substantive_over_opaque_unknown_stubs() {
+        let candidate = InterruptedSessionCandidate {
+            session_id: SessionId::new(),
+            agent_kind: AgentKind::AntigravityCli,
+            last_activity_at: "2026-11-23T12:00:00Z".into(),
+            cwd: None,
+        };
+        let make_obs = |kind: ObservationKind, title: &str, body: &str| ObservationRecord {
+            id: ai_memory_core::ObservationId::new(),
+            session_id: candidate.session_id,
+            kind: kind.as_str().into(),
+            title: title.into(),
+            body: body.into(),
+            importance: 3,
+            created_at: candidate.last_activity_at.clone(),
+            extension: None,
+            source_event: None,
+        };
+
+        // 10 newest observations are opaque metadata-only unknown stubs (e.g., parallel
+        // `call_mcp_tool` PreToolUse/PostToolUse pairs); real file and command work sits
+        // beneath them.
+        let mut records = Vec::new();
+        for idx in 0..5 {
+            records.push(make_obs(
+                ObservationKind::PostToolUse,
+                "post_tool_use: unknown",
+                &format!("tool_family: unknown\ntool_call_id: call-{idx}\noutcome: unknown"),
+            ));
+            records.push(make_obs(
+                ObservationKind::PreToolUse,
+                "pre_tool_use: unknown",
+                "tool_family: unknown",
+            ));
+        }
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: file",
+            "tool_family: file\noutcome: unknown\n\npub fn edited_code() {}",
+        ));
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: non-file",
+            "tool_family: non-file\noutcome: unknown\n\ncargo test passed",
+        ));
+        records.push(make_obs(
+            ObservationKind::PostToolUse,
+            "post_tool_use: unknown",
+            "tool_family: unknown\noutcome: error",
+        ));
+
+        let rendered = render_interrupted_session_markdown(&candidate, &records, 13, 0)
+            .expect("recovery snapshot renders");
+
+        // All 3 substantive observations must appear (not crowded out by the 10 stubs).
+        assert!(rendered.contains("pub fn edited_code() {}"));
+        assert!(rendered.contains("cargo test passed"));
+        assert!(rendered.contains("outcome: error"));
+        // Remaining 5 of 8 slots fall back to the newest opaque stubs.
+        let activity_section = rendered
+            .split("**Most recent recorded activity** (newest first)\n")
+            .nth(1)
+            .expect("activity section present")
+            .split("\n**Bounds**")
+            .next()
+            .unwrap();
+        let item_count = activity_section
+            .lines()
+            .filter(|line| line.starts_with("- `"))
+            .count();
+        assert_eq!(item_count, 8);
     }
 
     /// Backfill-close must be strictly stricter than the
@@ -21518,6 +22745,7 @@ pub(crate) mod tests {
                     briefing: None,
                     briefing_budget: None,
                     managed_run: None,
+                    source: None,
                     session_id: None,
                     identity: None,
                     identity_src: None,
@@ -22151,6 +23379,7 @@ pub(crate) mod tests {
             briefing: Some("1".into()),
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -22247,6 +23476,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -22362,6 +23592,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -22564,6 +23795,7 @@ pub(crate) mod tests {
                     briefing: None,
                     briefing_budget: None,
                     managed_run: None,
+                    source: None,
                     session_id: None,
                     identity: None,
                     identity_src: None,
@@ -22608,6 +23840,56 @@ pub(crate) mod tests {
         }
 
         // Control: anything but an explicit falsy value delivers and claims.
+        let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", Some("1")).await;
+        assert!(body.contains("HANDOFF-MARKER"), "{body}");
+        assert!(!open_handoff_exists(&state).await);
+    }
+
+    /// A server with `[handoff] deliver_on_session_start = false` delivers no
+    /// baton or continuity notice for a start that sends no `handoff` flag (or
+    /// an unrecognized value) and leaves the handoff open; a project marker's
+    /// explicit `handoff=1` delivers and claims it.
+    #[tokio::test]
+    async fn server_handoff_default_off_is_overridden_by_marker_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state_with_admission(
+            &tmp,
+            ai_memory_wiki::AdmissionChain::new(Vec::new()).unwrap(),
+        )
+        .await;
+        state.deliver_handoff_on_session_start = false;
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "HANDOFF-MARKER".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        for absent in [None, Some("banana")] {
+            let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", absent).await;
+            assert!(
+                !body.contains("HANDOFF-MARKER") && !body.to_lowercase().contains("handoff"),
+                "{absent:?}: a server default off must deliver no handoff or notice: {body}",
+            );
+            assert!(
+                open_handoff_exists(&state).await,
+                "{absent:?}: the server default must leave the baton open",
+            );
+        }
+
         let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", Some("1")).await;
         assert!(body.contains("HANDOFF-MARKER"), "{body}");
         assert!(!open_handoff_exists(&state).await);
@@ -23259,6 +24541,7 @@ pub(crate) mod tests {
                     body: "finish".into(),
                     importance: 7,
                     file_path: None,
+                    trust_class: None,
                 },
                 &state.sanitizer,
             )
@@ -23302,6 +24585,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -23745,6 +25029,7 @@ pub(crate) mod tests {
                 briefing: None,
                 briefing_budget: None,
                 managed_run: None,
+                source: None,
                 session_id: None,
                 identity: None,
                 identity_src: None,
@@ -23836,6 +25121,7 @@ pub(crate) mod tests {
                 briefing: None,
                 briefing_budget: None,
                 managed_run: None,
+                source: None,
                 session_id: None,
                 identity: None,
                 identity_src: None,
@@ -23918,6 +25204,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: Some(session_id.into()),
             identity: None,
             identity_src: None,
@@ -24083,6 +25370,7 @@ pub(crate) mod tests {
             // Codex's shared app-server may retain the previous finished run
             // id even though this launcher opened `run` (#987).
             managed_run: Some(first.run_id.to_string()),
+            source: None,
             session_id: Some("native-2".into()),
             identity: None,
             identity_src: None,
@@ -24153,6 +25441,7 @@ pub(crate) mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 
@@ -24210,6 +25499,7 @@ pub(crate) mod tests {
             briefing: Some("true".into()),
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -24301,6 +25591,7 @@ pub(crate) mod tests {
             briefing: Some("true".into()),
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -24335,8 +25626,10 @@ pub(crate) mod tests {
     }
 
     async fn subagent_brief(state: &Arc<HookState>, query: HandoffQuery) -> (StatusCode, String) {
-        read_handoff_response(handle_brief(State(state.clone()), Query(query), None, None).await)
-            .await
+        read_handoff_response(
+            handle_brief(State(state.clone()), Query(query), None, None, None).await,
+        )
+        .await
     }
 
     async fn upsert_brief_page(state: &HookState, cwd: &str, path: &str, body: &str) {
@@ -24560,6 +25853,7 @@ pub(crate) mod tests {
                 Query(subagent_brief_query(cwd, Some("true"))),
                 Some(axum::Extension(carol)),
                 None,
+                None,
             )
             .await,
         )
@@ -24642,6 +25936,7 @@ pub(crate) mod tests {
                     handle_brief(
                         State(state),
                         Query(query),
+                        None,
                         None,
                         Some(axum::Extension(AuthorizedViewer(viewer))),
                     )
@@ -24914,6 +26209,7 @@ pub(crate) mod tests {
                         State(state),
                         Query(mid_session_query(&cwd, moved)),
                         None,
+                        None,
                         Some(axum::Extension(AuthorizedViewer(viewer))),
                     )
                     .await,
@@ -25008,6 +26304,7 @@ pub(crate) mod tests {
             briefing: briefing.map(str::to_owned),
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -25181,6 +26478,7 @@ pub(crate) mod tests {
             briefing: briefing.map(str::to_owned),
             briefing_budget: None,
             managed_run: Some(kimi.run_id.to_string()),
+            source: None,
             session_id: Some("kimi-session".into()),
             identity: None,
             identity_src: None,
@@ -26043,6 +27341,7 @@ pub(crate) mod tests {
                 briefing: None,
                 briefing_budget: None,
                 managed_run: None,
+                source: None,
                 session_id: None,
                 identity: None,
                 identity_src: None,
@@ -27115,52 +28414,54 @@ pub(crate) mod tests {
     /// (much shorter) redacted title is what gets capped at 80 chars.
     #[tokio::test]
     async fn issue_980_user_prompt_title_is_sanitized_before_truncated() {
-        let tmp = TempDir::new().unwrap();
-        let mut state = make_state(&tmp).await;
-        state.sanitizer = Sanitizer::new(&SanitizeConfig {
-            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
-            allowlist: Vec::new(),
-        })
-        .unwrap();
-        let secret = format!("SECRET{}", "Z".repeat(30));
-        let prompt = format!("{} {secret}", "x".repeat(70));
-        let sid = SessionId::new();
-        let env = HookEnvelope::from_query_and_body(
-            HookQuery {
-                event: "user-prompt".into(),
-                agent: Some("claude-code".into()),
-                ..Default::default()
-            },
-            serde_json::json!({
-                "session_id": sid.to_string(),
-                "cwd": "/repo",
-                "prompt": prompt,
-            }),
-        );
-        process(&state, env, None, Vec::new()).await.unwrap();
+        for prefix in ["", "\n \t\r\n"] {
+            let tmp = TempDir::new().unwrap();
+            let mut state = make_state(&tmp).await;
+            state.sanitizer = Sanitizer::new(&SanitizeConfig {
+                extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+                allowlist: Vec::new(),
+            })
+            .unwrap();
+            let secret = format!("SECRET{}", "Z".repeat(30));
+            let prompt = format!("{prefix}{} {secret}", "x".repeat(70));
+            let sid = SessionId::new();
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid.to_string(),
+                    "cwd": "/repo",
+                    "prompt": prompt,
+                }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
 
-        let observations = state.reader.observations_for_session(sid).await.unwrap();
-        let obs = observations
-            .iter()
-            .find(|o| o.kind == ObservationKind::UserPrompt)
-            .expect("user prompt observation was recorded");
+            let observations = state.reader.observations_for_session(sid).await.unwrap();
+            let obs = observations
+                .iter()
+                .find(|o| o.kind == ObservationKind::UserPrompt)
+                .expect("user prompt observation was recorded");
 
-        assert!(
-            !obs.title.contains(&secret),
-            "full raw secret leaked into title: {:?}",
-            obs.title
-        );
-        assert!(
-            obs.title.contains("REDACT"),
-            "title carries no trace of redaction \u{2014} the sanitizer never \
-             saw enough of the secret to match it: {:?}",
-            obs.title
-        );
-        assert!(
-            obs.title.chars().count() <= 80,
-            "title exceeded the 80-char display cap: {:?}",
-            obs.title
-        );
+            assert!(
+                !obs.title.contains(&secret),
+                "full raw secret leaked into title: {:?}",
+                obs.title
+            );
+            assert!(
+                obs.title.contains("REDACT"),
+                "title carries no trace of redaction \u{2014} the sanitizer never \
+                 saw enough of the secret to match it: {:?}",
+                obs.title
+            );
+            assert!(
+                obs.title.chars().count() <= 80,
+                "title exceeded the 80-char display cap: {:?}",
+                obs.title
+            );
+        }
     }
 
     /// End to end through `/hook`: a credential with an invisible formatting
@@ -27381,6 +28682,268 @@ pub(crate) mod tests {
             "body exceeded the 2 KB cap: {body:?}"
         );
         assert!(body.ends_with('…'));
+    }
+
+    /// Regression for #2452: a multi-MiB `PostToolUse` `tool_response` must
+    /// finish `durable_body` and ingest well under 1s instead of running every
+    /// sanitizer regex and shadow-view pass over megabytes that are immediately
+    /// discarded at `TOOL_EXCERPT_MAX_BYTES`.
+    #[tokio::test]
+    async fn durable_body_bounds_scrub_window_for_multi_mb_tool_response() {
+        let sanitizer = Sanitizer::builtin();
+        // Include backslashes so `Sanitizer::scrub` builds the Shadow view too.
+        let huge = format!("line\\n{}", "a\\b".repeat(2 * 1024 * 1024));
+        let start = std::time::Instant::now();
+        let body = durable_body(HookEvent::PostToolUse, Some(&huge), &sanitizer);
+        let elapsed = start.elapsed();
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "body exceeded 2 KB cap: len={}",
+            body.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "durable_body took {elapsed:?} on a multi-MiB tool_response"
+        );
+
+        // End-to-end through `process` with a 4 MiB PostToolUse payload.
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-2452-huge",
+                "tool_response": "x".repeat(4 * 1024 * 1024),
+            }),
+        );
+        let start = std::time::Instant::now();
+        process(&state, env, None, Vec::new()).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "PostToolUse ingest took {elapsed:?} on a 4 MiB tool_response"
+        );
+    }
+
+    /// Security control for #1114 + #2452: bounding `durable_body`'s scrub
+    /// window to `cap + DURABLE_BODY_SCRUB_OVERLAP_BYTES` must still completely
+    /// redact both an API key and a PEM private-key block (complete and
+    /// unterminated) starting just before `TOOL_EXCERPT_MAX_BYTES` in a
+    /// multi-MiB `tool_response`.
+    #[tokio::test]
+    async fn issue_1114_straddling_api_key_and_pem_redacted_in_large_tool_response() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let api_key = "sk-ant-leak-0123456789abcdef0123456789abcdef";
+        let pem_begin = concat!("-----BEGIN ", "PRIVATE KEY-----");
+        let pem_end = concat!("-----END ", "PRIVATE KEY-----");
+        let pem_line = format!("MIIE{}", "A".repeat(60));
+        let complete_pem = format!("{pem_begin}\n{pem_line}\n{pem_line}\n{pem_line}\n{pem_end}");
+        let unterminated_pem = format!(
+            "{pem_begin}\n{}",
+            format!("{pem_line}\n").repeat(1_200) // > 64 KiB so the window cuts mid-PEM
+        );
+        let trailing_mb = "z".repeat(4 * 1024 * 1024);
+
+        for (label, secret, needle) in [
+            ("api_key", api_key.to_string(), "sk-ant-leak"),
+            ("complete_pem", complete_pem, pem_begin),
+            ("unterminated_pem", unterminated_pem, pem_begin),
+        ] {
+            let sid = SessionId::new();
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PostToolUse".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid.to_string(),
+                    "cwd": "/repo",
+                    "tool_name": "Read",
+                    "tool_use_id": format!("call-2452-{label}"),
+                    "tool_response": format!("{} {secret}\n{trailing_mb}", "x".repeat(1_890)),
+                }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
+
+            let observations = state.reader.observations_for_session(sid).await.unwrap();
+            let body = observations
+                .iter()
+                .find(|o| o.kind == ObservationKind::PostToolUse)
+                .unwrap_or_else(|| panic!("{label}: post-tool-use observation recorded"))
+                .body
+                .clone();
+            assert!(
+                !body.contains(needle) && !body.contains(&pem_line),
+                "{label}: unredacted secret fragment survived the cap: {body:?}"
+            );
+            assert!(
+                body.contains("REDACT"),
+                "{label}: body carries no redaction marker: {body:?}"
+            );
+            assert!(
+                body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+                "{label}: body exceeded 2 KB cap: len={}",
+                body.len()
+            );
+        }
+    }
+
+    /// Regression for GHSA-qxwf-7hw8-qw28: when `[sanitize].extra_patterns` is
+    /// configured, `durable_body` must bypass the `cap + 64 KiB` pre-slice so a
+    /// delimited custom pattern whose closing token sits past the overlap
+    /// window still redacts the secret inside the stored body.
+    #[tokio::test]
+    async fn extra_pattern_spanning_beyond_scrub_overlap_window_redacts_durable_body() {
+        let sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"(?s)BEGIN_CUSTOM_SECRET.*?END_CUSTOM_SECRET".to_string()],
+            allowlist: vec![],
+        })
+        .unwrap();
+        let padding = "p".repeat(DURABLE_BODY_SCRUB_OVERLAP_BYTES + 8 * 1024);
+        let payload = format!(
+            "prefix BEGIN_CUSTOM_SECRET\nSENSITIVE_CUSTOM_PAYLOAD_MARKER\n{padding}\nEND_CUSTOM_SECRET\ntrailing"
+        );
+
+        let direct = durable_body(HookEvent::PostToolUse, Some(&payload), &sanitizer);
+        assert!(
+            !direct.contains("BEGIN_CUSTOM_SECRET")
+                && !direct.contains("SENSITIVE_CUSTOM_PAYLOAD_MARKER"),
+            "direct durable_body leaked custom secret: {direct:?}"
+        );
+        assert!(
+            direct.contains("[REDACTED:custom]"),
+            "direct durable_body missing custom redaction marker: {direct:?}"
+        );
+        assert!(
+            direct.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "direct durable_body exceeded 2 KB cap: len={}",
+            direct.len()
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = sanitizer;
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-ghsa-qxwf-delimited",
+                "tool_response": payload,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::PostToolUse)
+            .expect("post-tool-use observation recorded")
+            .body
+            .clone();
+        assert!(
+            !body.contains("BEGIN_CUSTOM_SECRET")
+                && !body.contains("SENSITIVE_CUSTOM_PAYLOAD_MARKER"),
+            "stored body leaked custom secret: {body:?}"
+        );
+        assert!(
+            body.contains("[REDACTED:custom]"),
+            "stored body missing custom redaction marker: {body:?}"
+        );
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "stored body exceeded 2 KB cap: len={}",
+            body.len()
+        );
+    }
+
+    /// Regression for GHSA-qxwf-7hw8-qw28: an end-anchored (`$`) operator
+    /// pattern whose match ends past `cap + 64 KiB` must still redact the
+    /// sensitive prefix stored in `durable_body`.
+    #[tokio::test]
+    async fn extra_pattern_end_anchored_rule_redacts_beyond_scrub_overlap_window() {
+        let sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"(?s)ANCHORED_SECRET_START.*END_MARKER$".to_string()],
+            allowlist: vec![],
+        })
+        .unwrap();
+        let padding = "q".repeat(DURABLE_BODY_SCRUB_OVERLAP_BYTES + 8 * 1024);
+        let payload =
+            format!("prefix ANCHORED_SECRET_START SENSITIVE_ANCHORED_TOKEN {padding} END_MARKER");
+
+        let direct = durable_body(HookEvent::PostToolUse, Some(&payload), &sanitizer);
+        assert!(
+            !direct.contains("ANCHORED_SECRET_START")
+                && !direct.contains("SENSITIVE_ANCHORED_TOKEN"),
+            "direct durable_body leaked end-anchored secret: {direct:?}"
+        );
+        assert!(
+            direct.contains("[REDACTED:custom]"),
+            "direct durable_body missing custom redaction marker: {direct:?}"
+        );
+        assert!(
+            direct.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "direct durable_body exceeded 2 KB cap: len={}",
+            direct.len()
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = sanitizer;
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-ghsa-qxwf-anchored",
+                "tool_response": payload,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::PostToolUse)
+            .expect("post-tool-use observation recorded")
+            .body
+            .clone();
+        assert!(
+            !body.contains("ANCHORED_SECRET_START") && !body.contains("SENSITIVE_ANCHORED_TOKEN"),
+            "stored body leaked end-anchored secret: {body:?}"
+        );
+        assert!(
+            body.contains("[REDACTED:custom]"),
+            "stored body missing custom redaction marker: {body:?}"
+        );
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "stored body exceeded 2 KB cap: len={}",
+            body.len()
+        );
     }
 
     #[test]
@@ -28916,6 +30479,7 @@ pub(crate) mod tests {
             body: body.into(),
             importance: 5,
             created_at: jiff::Timestamp::now(),
+            trust_class: ai_memory_core::TrustClass::from_observation_kind(kind),
         }
     }
 
@@ -29668,6 +31232,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn open_questions_arabic_question_mark_and_ack_detected() {
+        let obs = vec![mk_obs(
+            ObservationKind::UserPrompt,
+            "q",
+            "هل يمكننا ترحيل قاعدة البيانات؟",
+        )];
+        let last = Some("هل يمكننا ترحيل قاعدة البيانات؟".to_string());
+        let qs = derive_open_questions(&obs, &last);
+        assert_eq!(
+            qs,
+            vec!["Unresolved question: هل يمكننا ترحيل قاعدة البيانات؟"]
+        );
+        assert!(is_acknowledgment("تم، شكراً!"));
+        assert!(is_acknowledgment("تمام"));
+        assert!(!is_acknowledgment("تمكين المصادقة الثنائية"));
+    }
+
+    #[test]
     fn open_questions_chinese_question_mark_detected() {
         let obs = vec![mk_obs(
             ObservationKind::UserPrompt,
@@ -30335,6 +31917,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -30744,6 +32327,7 @@ pub(crate) mod tests {
                         body: habit.into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &ai_memory_core::Sanitizer::builtin(),
                 ))

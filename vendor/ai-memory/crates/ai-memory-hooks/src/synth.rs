@@ -93,6 +93,7 @@ pub fn synthesize_session_page(
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: Some(digest.trust_class),
     }
 }
 
@@ -294,6 +295,10 @@ pub struct SessionDigest {
     title: String,
     /// What the handoff and the abrupt-ending note read.
     handoff: HandoffFacts,
+    /// Least-trusted observation class in this session (#2164), used to set
+    /// `pages.trust_class` on zero-LLM rule-based `sessions/<id>.md` pages
+    /// without creating synthetic `page_evidence` rows.
+    trust_class: ai_memory_core::TrustClass,
 }
 
 /// What loading a [`SessionDigest`] cost, for a bound test and for debugging.
@@ -575,6 +580,9 @@ fn build_digest(
             .collect(),
     };
 
+    let trust_class = snapshot
+        .least_trusted_class()?
+        .unwrap_or(ai_memory_core::TrustClass::ModelGenerated);
     let stats = DigestLoadStats {
         rows_read: snapshot.rows_read(),
         prompt_titles: prompts.total,
@@ -594,6 +602,7 @@ fn build_digest(
             failed_tool_calls: summary.failed_tool_calls,
             title,
             handoff,
+            trust_class,
         },
         stats,
     ))
@@ -954,7 +963,7 @@ fn abrupt_ending_note(facts: &HandoffFacts) -> Option<&'static str> {
         } else {
             prompt.body.trim()
         };
-        if text.ends_with('?') || text.ends_with('？') {
+        if text.ends_with('?') || text.ends_with('？') || text.ends_with('؟') {
             return Some(
                 "Session ended without a normal stop; the final prompt was never answered.",
             );
@@ -1110,6 +1119,10 @@ impl SessionDigest {
             failed_tool_calls: observations.iter().filter(|o| is_failed_tool(o)).count(),
             title,
             handoff: HandoffFacts::from_observations(observations),
+            trust_class: ai_memory_core::TrustClass::least_trusted_of(
+                observations.iter().map(|o| o.trust_class),
+            )
+            .unwrap_or(ai_memory_core::TrustClass::ModelGenerated),
         }
     }
 }
@@ -1200,6 +1213,7 @@ mod tests {
             body: String::new(),
             importance: 5,
             created_at: Timestamp::now(),
+            trust_class: ai_memory_core::TrustClass::from_observation_kind(kind),
         }
     }
 
@@ -1709,6 +1723,10 @@ mod tests {
         let obs = vec![
             obs(
                 ObservationKind::UserPrompt,
+                "<agent-message from=\"worker-1\">\n[Subagent hand-back] finished",
+            ),
+            obs(
+                ObservationKind::UserPrompt,
                 "<teammate-message teammate_id=\"team-lead\" summary=\"heads up\">rollout note",
             ),
             obs(ObservationKind::UserPrompt, "fix the auth bug"),
@@ -1735,6 +1753,10 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(prompts.trim(), "1. fix the auth bug");
+        assert!(
+            body.contains("<agent-message"),
+            "subagent hand-backs remain in raw session history"
+        );
     }
 
     #[test]
@@ -2195,6 +2217,7 @@ mod load_with_count_scopes {
             importance: 5,
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         store
             .writer

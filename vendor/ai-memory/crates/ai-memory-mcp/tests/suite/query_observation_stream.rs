@@ -111,6 +111,7 @@ async fn seed_session(
                     .into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -137,6 +138,7 @@ async fn seed_session(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("session page");
@@ -158,6 +160,7 @@ async fn seed_session(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("distractor");
@@ -324,4 +327,44 @@ async fn explain_timings_follow_the_observation_stream() {
     let timings = payload["timings"].as_object().expect("timings");
     assert!(timings.contains_key("fts_ms"), "{payload}");
     assert!(!timings.contains_key("observation_ms"), "{payload}");
+}
+
+#[tokio::test]
+async fn memory_query_omits_observation_stream_when_path_prefix_excludes_sessions() {
+    let seeded = seeded(true).await;
+
+    let mut excluded = args();
+    excluded["path_prefix"] = json!("decisions/");
+    let payload = query(&seeded.router, excluded).await;
+    let streams = payload["streams_active"].as_array().expect("streams");
+    assert!(
+        !streams.contains(&json!("observation")),
+        "path_prefix=decisions/ must omit observation stream: {streams:?}"
+    );
+    let timings = payload["timings"].as_object().expect("timings");
+    assert!(
+        !timings.contains_key("observation_ms"),
+        "path_prefix=decisions/ must not time the skipped observation stream: {payload}"
+    );
+
+    let mut included = args();
+    included["path_prefix"] = json!("sessions/");
+    let payload = query(&seeded.router, included).await;
+    let streams = payload["streams_active"].as_array().expect("streams");
+    assert!(
+        streams.contains(&json!("observation")),
+        "path_prefix=sessions/ must keep observation stream: {streams:?}"
+    );
+    assert!(
+        payload["timings"]["observation_ms"]
+            .as_f64()
+            .is_some_and(|ms| ms >= 0.0),
+        "{payload}"
+    );
+    let session_path = format!("sessions/{}.md", seeded.session_id);
+    let hits = payload["hits"].as_array().expect("hits");
+    assert!(
+        hits.iter().any(|h| h["path"] == session_path.as_str()),
+        "session page missing under path_prefix=sessions/: {payload}"
+    );
 }

@@ -262,6 +262,8 @@ export type PagePatchEdit =
 
 /** Arguments of {@link PagesNamespace.patch}. */
 export interface PatchPageArgs extends ScopedArgs {
+  /** Patch a page in the reserved cross-project global scope. Cannot be combined with `scope`. */
+  global?: boolean;
   /** Existing page path. */
   path: string;
   /** Required latest page version returned by a read or mutation. */
@@ -835,6 +837,13 @@ export interface BeginHandoffArgs extends ScopedArgs {
 export interface BeginHandoffResult {
   /** Id to accept or cancel exactly this handoff. */
   readonly handoffId: string;
+  /**
+   * `true` when a size cap cut any of the text you sent; absent when
+   * everything fit. The server counts the secret-scrubbed text.
+   */
+  readonly truncated: boolean | undefined;
+  /** What each cut field lost, keyed by its wire name (`body`, `summary`, ...). */
+  readonly truncatedFields: Readonly<Record<string, FieldTruncation>> | undefined;
   /** The server's decoded JSON. */
   readonly raw: Raw;
 }
@@ -968,10 +977,32 @@ export interface SendMessageArgs {
   evidence?: string;
 }
 
+/**
+ * How much of one field a write-time size cap kept, as
+ * {@link MessagesNamespace.send} and {@link HandoffsNamespace.begin} report it.
+ */
+export interface FieldTruncation {
+  /** Characters sent (after secret scrubbing). For a list, summed over its items. */
+  readonly originalChars: number;
+  /** Characters stored, excluding truncation markers. */
+  readonly storedChars: number;
+  /** For a list field: items sent. */
+  readonly originalItems: number | undefined;
+  /** For a list field: items stored; the rest were dropped. */
+  readonly storedItems: number | undefined;
+}
+
 /** Result of {@link MessagesNamespace.send}. */
 export interface SendMessageResult {
   /** Message id. */
   readonly messageId: string;
+  /**
+   * `true` when a size cap cut any of the text you sent; absent when
+   * everything fit. The server counts the secret-scrubbed text.
+   */
+  readonly truncated: boolean | undefined;
+  /** What each cut field lost, keyed by its wire name (`body`, `summary`, ...). */
+  readonly truncatedFields: Readonly<Record<string, FieldTruncation>> | undefined;
   /** The server's decoded JSON. */
   readonly raw: Raw;
 }

@@ -104,13 +104,17 @@ log_level = "info"
 # MCP URL. Env equivalent: `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`.
 # gemini_safe_schemas = false
 
-# Optional final LLM relevance pass for project/scopes memory_query calls.
-# Requires an LLM provider and adds at most one provider call per eligible
-# query. The bounded query, page titles, and search snippets are sent to that
-# provider as JSON-encoded untrusted data. Any failed or invalid response keeps
-# the normal ranking. Concurrent provider calls are capped at four; saturated
-# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER=llm`.
+# Optional final relevance pass for project/scopes memory_query calls.
+# The "llm" value requires a generative provider. Both backends add at most one
+# provider call per eligible query and send the bounded query, page titles,
+# and snippets as JSON-encoded untrusted data. Failed or invalid responses
+# keep the normal ranking. Concurrent calls are capped at four; saturated
+# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER`.
 # reranker = "llm"
+# The other value, "decisions-choice", uses OpenAI Decisions directly and needs
+# OPENAI_API_KEY plus an explicit llm_model, but no generative provider.
+# Choice probabilities are relative to the pool; leave min_relevance unset.
+#   reranker = "decisions-choice"
 
 # Seconds one reranker call may take before memory_query keeps its pre-rerank
 # order. Raise it when an LLM fallback chain answers slowly. Must be at least 1.
@@ -175,6 +179,15 @@ log_level = "info"
 # maps the value to its own request field. Env equivalent:
 # `AI_MEMORY_LLM_REASONING_EFFORT`.
 #   llm_reasoning_effort = "medium"
+
+# openai-compat only: read the API key from this file instead of `LLM_API_KEY`,
+# for a gateway whose bearer token rotates while the server runs (a login CLI or
+# a secrets agent rewrites the file). The file is read on first use and read
+# again once after the endpoint answers 401; ai-memory never writes it. A
+# relative path resolves against the data dir. When set, an ambient
+# `LLM_API_KEY` is ignored. Unset by default. Env equivalent:
+# `AI_MEMORY_LLM_API_KEY_FILE`.
+#   llm_api_key_file = "/path/to/api-key"
 
 # Extra HTTP headers attached to every LLM chat request, as `Name: Value` or
 # `Name=Value` entries. Empty by default. Use it for a gateway that wants a
@@ -244,6 +257,16 @@ log_level = "info"
 # it. Env equivalent: `AI_MEMORY_PI_TOOL_EXPOSURE`.
 # pi_tool_exposure = "direct"
 
+# Optional list of ai-memory MCP tool names to keep directly exposed in the
+# generated Pi extension while deferring all other ai-memory tools behind Pi's
+# `tool_search` (`exposure: "deferred"`). Unset by default (every tool follows
+# `pi_tool_exposure`). Set to `[]` to defer all ai-memory tools and activate
+# `tool_search`. Mutually exclusive with `pi_tool_exposure = "codemode"`.
+# Re-run `ai-memory install-hooks --agent pi --apply` and restart Pi after
+# changing it. Env equivalent: `AI_MEMORY_PI_DIRECT_TOOLS` (JSON array, e.g.
+# `["memory_query","memory_briefing"]`).
+# pi_direct_tools = ["memory_query", "memory_briefing"]
+
 # Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
 # contradiction: same topic without being a near-duplicate. Pages at or above
 # the min and below the max are flagged; at or above the max they count as
@@ -308,7 +331,11 @@ log_level = "info"
 # 384-dim), no API key, no data egress. The ~87 MB model is fetched once
 # into <data_dir>/models/ in the background (checksum-pinned; hybrid search
 # enables on the next start), and existing pages are backfilled
-# automatically at startup. See docs/local-embeddings.md.
+# automatically at startup. For non-English wikis, set embedding_model to
+# "intfloat/multilingual-e5-small" (or alias "multilingual-e5-small", ~470 MB,
+# 384-dim, automatic "query: " / "passage: " prefixes). With no provider set,
+# any other embedding_model is ignored with a startup warning and the default
+# model runs. See docs/local-embeddings.md.
 #   embedding_provider = "none"           # opt out (FTS + entity + graph only)
 #   embedding_provider = "openai"         # or voyage | google | gemini |
 #                                         # openai-compat | local | copilot | none
@@ -731,8 +758,8 @@ brief_on_project_change = false
 # [hook_spool]
 # max_attempts = 8
 
-# Session handoff delivery and creation. Both keys apply to every operator on
-# the server.
+# Session handoff delivery and creation. These settings apply to every operator
+# on the server.
 #
 # claim_on_session_start true (the default) makes a SessionStart that finds a
 # pending handoff claim it automatically. False makes it render a notice with
@@ -745,9 +772,25 @@ brief_on_project_change = false
 # create an automatic open handoff. False still writes the session summary page
 # and queues consolidation but creates no handoff (#1043). Handoffs from
 # `memory_handoff_begin` and managed runs are unaffected.
+#
+# deliver_on_session_start true (the default) delivers a pending handoff at
+# session start, claiming it when claim_on_session_start is on. False delivers
+# no handoff and posts no continuity notice; the baton stays open for
+# `memory_handoff_accept`. A project's `.ai-memory.toml` `[handoff]
+# deliver_on_session_start` overrides this default in either direction.
 # [handoff]
 # claim_on_session_start = true
+# deliver_on_session_start = true
 # create_on_session_end = true
+
+# Session-start unfinished-session recovery. deliver_on_session_start true
+# (the default) renders the bounded recovery snapshot and its backfill marker.
+# False skips only that snapshot; the source session stays open and the brief,
+# profile digest, handoffs and inbox notice are unchanged. A project's
+# `.ai-memory.toml` `[recovery] deliver_on_session_start` overrides this
+# default in either direction.
+# [recovery]
+# deliver_on_session_start = true
 
 # Scheduled server jobs. `enabled` is the master switch. The interval keys are
 # in seconds and 0 disables that job. The forget sweep and lint persist their

@@ -372,7 +372,11 @@ there. The Codex plugin likewise registers `ai-memory mcp-bridge
   instead of `postToolUse` when a tool fails, times out or is denied. A
   failed or timed-out call is stored as `outcome: error` with Cursor's
   `error_message`, so the session page counts it and the handoff names it;
-  a denied call keeps its message but stays `outcome: unknown`.
+  a denied call keeps its message but stays `outcome: unknown`. Cursor's
+  `stop` reports how the turn ended in `status`: an `aborted` turn is stored
+  as an interrupted turn end (`interrupt`) and an `error` one as a failed
+  turn end (`stop failure`), as Claude Code's `StopFailure` is; `completed`
+  stays a normal turn end.
 - When the default data dir's path needs quoting, `install-hooks --agent
   cursor` leaves `--data-dir` out of each hook command and the hook finds that
   directory itself. This covers the macOS default
@@ -744,10 +748,21 @@ dsh` refuses to write it):
         configPath: '<data-dir>/hooks/dsh/hooks.json'
 ```
 
-Install the bridge package into the profile first (`dsh plugin --profile
-<profile> add @deepseek-ai/dsh-hooks-claude-code`), then reload or restart
-the profile. Without `--apply`, `install-hooks --agent dsh` prints the same
-`hooks.json` and patch fragment for a manual merge.
+Install the bridge package together with its required `@deepseek-ai/dsh-hook-protocol`
+peer into the profile first (DSH profiles disable automatic peer installation,
+and npm's `latest` tag can trail the running DSH prerelease, so pin both
+packages to your installed DSH version or `@next`), for example:
+
+```bash
+dsh plugin --profile <profile> add \
+  @deepseek-ai/dsh-hooks-claude-code@<dsh-version> \
+  @deepseek-ai/dsh-hook-protocol@<dsh-version>
+```
+
+(If you also install `@deepseek-ai/dsh-mcp-client` manually into a profile, pin
+it to the same DSH version or `@next`.) Then reload or restart the profile.
+Without `--apply`, `install-hooks --agent dsh` prints the same `hooks.json` and
+patch fragment for a manual merge.
 
 Two bridge constraints shape DSH capture:
 
@@ -919,10 +934,12 @@ stdio shim. Requires Node.js installed on the same machine.
 ## Gemini CLI
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
-`ai-memory install-hooks --agent gemini-cli --apply`.
+`ai-memory install-hooks --agent gemini-cli --apply`. ✅ Managed workstreams
+supported via `ai-memory run gemini` (alias `gemini-cli`; see
+[`docs/managed-workstreams.md`](managed-workstreams.md)).
 
 **Config file:**
-- User: `~/.gemini/settings.json`
+- User: `~/.gemini/settings.json` (or `$GEMINI_CLI_HOME/.gemini/settings.json`)
 - Project: `.gemini/settings.json`
 
 Gemini CLI uses `httpUrl` (not `url`) for streamable-HTTP MCP
@@ -1466,7 +1483,8 @@ the supported path for uninstall isolation and hooks URL inference.
 
 ## Devin CLI
 
-Devin manages MCP servers in `~/.devin/config.json` under `mcpServers`:
+Devin manages user-level MCP servers in `~/.config/devin/mcp_config.json`
+(`%APPDATA%\devin\mcp_config.json` on Windows) under `mcpServers`:
 
 ```bash
 ai-memory install-mcp --client devin --apply \
@@ -1494,10 +1512,10 @@ ai-memory install-hooks --agent devin --apply \
     --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-By default this writes `~/.devin/hooks.v1.json`, whose root object is the
-event map. If you want the hook entries inside `~/.devin/config.json` instead,
-pass that path with `--config-file`; ai-memory then merges them under the
-`hooks` key.
+By default this merges the hook entries under the `hooks` key of
+`~/.config/devin/config.json` (`%APPDATA%\devin\config.json` on Windows). For
+project-level hooks in `.devin/hooks.v1.json` (whose root object is the flat
+event map), pass `--config-file .devin/hooks.v1.json`.
 
 Devin's supported lifecycle events are `SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PostCompaction`, `Stop`, and `SessionEnd`.

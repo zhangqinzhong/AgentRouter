@@ -214,7 +214,7 @@ or prompt routing for learning review.
 - **Store:** `rusqlite` (bundled SQLite, backup API), `refinery`
   migrations, FTS5, `parking_lot`.
 - **Wiki:** atomic markdown writes (tmp + rename + fsync),
-  `notify-debouncer-full` watcher, `git2` with vendored libgit2
+  event-driven `notify` watcher, `git2` with vendored libgit2
   checkpoints.
 - **LLM:** typed providers in `ai-memory-llm` behind `LlmProvider` /
   `Embedder` traits; `reqwest` (rustls) for provider HTTP.
@@ -850,7 +850,7 @@ Additional boundary rules:
 - **Branch model.** `main` is the patch line: it takes fixes and docs only
   (`[Unreleased]` holds only `### Fixed`), and patch tags are cut from it.
   Additive work targets the standing `release/X.Y` branch for the next
-  minor or major (currently `release/3.5`; 3.4.0 shipped from `main`). Keep `main` an
+  minor or major (currently `release/3.6`). Keep `main` an
   ancestor of it by forward-merging
   `main` into it after every fix lands, never the reverse; when a patch
   release ships, rebuild the branch's `[Unreleased]` as only its own entries

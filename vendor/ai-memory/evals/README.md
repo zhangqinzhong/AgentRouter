@@ -578,9 +578,11 @@ Baseline knobs: `--embeddings none|local` (also = vectors off/on),
 knobs like `pin_first` / `include_superseded` can be A/B'd;
 `query`/`workspace`/`project`/`limit` are reserved). Each has a
 `--candidate-*` twin (`--candidate-embeddings`, `--candidate-reranker`,
-`--candidate-server-env`, `--candidate-query-arg`); a candidate knob left
-unset mirrors the baseline. The report's config line names every
-`--server-env` variable, but prints `<redacted>` for the value of any name
+`--candidate-server-env`, `--candidate-query-arg`). Without
+`--candidate-embeddings`, the candidate inherits the baseline embedding mode.
+Set the reranker, server environment, and query arguments independently for
+each side. The report's config line names every `--server-env` variable and
+prints `<redacted>` for the value of any variable
 with a `KEY`, `APIKEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
 `CREDENTIALS` or `HEADERS` word
 (`OPENAI_API_KEY`, `AI_MEMORY_LLM_HEADERS`), so a provider key passed for
@@ -593,6 +595,16 @@ The spawned servers do not inherit `AI_MEMORY_*` settings from the evaluator's
 environment. Pass intended server settings through `--server-env` or
 `--candidate-server-env` so the report records them. System settings such as
 `PATH`, home directories and certificate configuration remain inherited.
+
+To investigate local-embedding run variance, pass `--query-arg explain=true`
+for the baseline and `--candidate-query-arg explain=true` for the candidate
+in an A/B run. When the server returns `streams_active`, each question's JSON
+record contains `vector_stream_active` and the Markdown report counts active,
+inactive, and unreported queries. The vector stream can be active with zero
+hits. Capacity limits, provider errors, and FTS-only query modes can all leave
+it inactive. Missing diagnostics from an older server are unreported. Keep the
+explain setting the same when comparing latency because the explanation adds
+work to the query.
 
 ```bash
 # Determinism check — baseline == candidate ⇒ accuracy/context delta = 0:
@@ -644,11 +656,14 @@ cargo run --release -p ai-memory-eval -- retrieval-compare \
 Moves of one cutoff in both directions, spread across types, are what
 questions near a cutoff trading places look like. Moves that skip cutoffs,
 all go one way, or cluster in one type point at a ranking change (#1854).
-`--fts` takes the candidate build's FTS run and marks moved questions whose
-candidate row equals the FTS row in every hit, recall, retrieved-session
-and context-token value. With a latency at or above the 250 ms query
-embedding wait, that is a local query that ran without its vector. An A/B
-`report.json` is refused; compare the single-config runs instead.
+`--fts` takes the candidate build's FTS run. The comparison marks a moved
+question `yes` if its row matches the FTS row's hit, recall,
+retrieved-session, and context-token values, or `no` if those values differ.
+A question missing from the FTS run is marked `unavailable`. A match near
+the 250 ms query embedding wait can suggest fallback. To confirm whether
+the vector stream ran, check `vector_stream_active` in retrieval reports
+generated with `--query-arg explain=true`. Compare single-config reports
+when starting from an A/B run.
 
 Strict `recall-all@k` scores each question as 1 only when every evidence
 session appears in the top k distinct retrieved sessions, otherwise 0.

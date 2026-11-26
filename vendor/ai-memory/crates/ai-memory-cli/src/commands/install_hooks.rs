@@ -28,7 +28,7 @@ use crate::commands::apply_shared::{
 };
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
-use crate::commands::path_util::{home_dir, strip_windows_verbatim_prefix};
+use crate::commands::path_util::{devin_user_config_dir, home_dir, strip_windows_verbatim_prefix};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, DSH_EVENTS, GEMINI_PROFILE, HermesHookSet,
@@ -39,8 +39,9 @@ use crate::commands::render_shared::{
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
     is_portable_home_arg, kimi_code_hook_commands, local_hook_policy_v1_supported, mask_secret,
-    portable_hook_home, posix_path_arg, shell_quote, ts_auth_headers_fn, ts_capture_policy_v1,
-    ts_string_literal, ts_timeout_signal, yaml_single_quote,
+    portable_hook_home, posix_path_arg, powershell_call_operator, powershell_quote, shell_quote,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
+    yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL, PiToolExposure};
@@ -167,6 +168,21 @@ pub(crate) fn document_carries_ai_memory_hooks(document: &serde_json::Value) -> 
     ai_memory_claude_hooks(document).is_some()
 }
 
+/// The endpoint a generated integration (OpenCode, OpenCode 2, Omp, Pi,
+/// OpenClaw) baked as `const SERVER = "<url>".replace(...)`, so a refresh with
+/// no configured `server_url` keeps it instead of falling back to the loopback
+/// default (#2374). `None` when the file has no such line.
+pub(crate) fn baked_generated_server_url(content: &str) -> Option<String> {
+    let literal = content
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("const SERVER = "))?
+        .rsplit_once(".replace(")?
+        .0;
+    serde_json::from_str::<String>(literal)
+        .ok()
+        .filter(|url| !url.is_empty())
+}
+
 /// Only a single endpoint shared by every owned native handler can be
 /// re-rendered without changing where a hook sends observations.
 pub(crate) fn installed_claude_hook_url(
@@ -178,10 +194,72 @@ pub(crate) fn installed_claude_hook_url(
     }
     let existing = existing_agent_config(args)?;
     let document: serde_json::Value = serde_json::from_str(&existing).ok()?;
-    baked_claude_hook_url(&document, data_dir)
+    baked_hook_url(&document, data_dir, "claude-code")
 }
 
-fn baked_claude_hook_url(document: &serde_json::Value, data_dir: &Path) -> Option<String> {
+/// [`installed_claude_hook_url`] for any agent whose `--apply` writes native
+/// hook commands into a hooks document: the endpoint they all share, so
+/// `upgrade` can re-render them in place instead of moving them to the
+/// loopback default. `None` when the installed config holds no ai-memory hooks,
+/// they disagree, or one carries something a refresh would lose.
+pub(crate) fn installed_hook_url(config: &Config, args: &InstallHooksArgs) -> Option<String> {
+    if args.agent == AgentChoice::ClaudeCode {
+        return installed_claude_hook_url(args, &config.data_dir);
+    }
+    if !local_hook_policy_v1_supported() {
+        return None;
+    }
+    let existing = match (args.agent, &args.config_file) {
+        // `run` resolves the CODEX_HOME-relative file into `args.config_file`
+        // before reading it; resolve it the same way here.
+        (AgentChoice::Codex, None) => {
+            fs::read_to_string(codex_hooks_path(&config.runtime_env).ok()?).ok()?
+        }
+        // DSH's hook config is the `hooks.json` its `--apply` generates beside
+        // the staged scripts, which DSH's patch points at.
+        (AgentChoice::Dsh, None) => fs::read_to_string(
+            hook_staging_root(
+                &config.data_dir,
+                ai_memory_wiki::backup::running_in_container(),
+            )
+            .join("hooks")
+            .join("dsh")
+            .join("hooks.json"),
+        )
+        .ok()?,
+        _ => existing_agent_config(args)?,
+    };
+    let agent = args.agent.kind().as_str();
+    if args.agent == AgentChoice::KimiCode {
+        return baked_toml_hook_url(&existing, &config.data_dir, agent);
+    }
+    let document: serde_json::Value = serde_json::from_str(&existing).ok()?;
+    baked_hook_url(&document, &config.data_dir, agent)
+}
+
+/// [`baked_hook_url`] for Kimi Code's `config.toml`, whose hooks are an array
+/// of `[[hooks]]` tables with one `command` string each.
+fn baked_toml_hook_url(existing: &str, data_dir: &Path, agent: &str) -> Option<String> {
+    let document: toml_edit::DocumentMut = existing.parse().ok()?;
+    let data_dir = data_dir.to_string_lossy();
+    let data_dir = strip_windows_verbatim_prefix(&data_dir);
+    let mut urls = document
+        .get("hooks")?
+        .as_array_of_tables()?
+        .iter()
+        .filter(|entry| is_ai_memory_toml_hook_entry(entry))
+        .map(|entry| {
+            let command = entry.get("command")?.as_str()?;
+            native_hook_url(&serde_json::json!({ "command": command }), &data_dir, agent)
+        });
+    let url = urls.next()??;
+    urls.all(|other| other.as_deref() == Some(url.as_str()))
+        .then_some(url)
+}
+
+/// The one endpoint every ai-memory handler in a hooks document (`hooks` keyed
+/// by event, entries nested under `hooks` or flat) sends to for `agent`.
+fn baked_hook_url(document: &serde_json::Value, data_dir: &Path, agent: &str) -> Option<String> {
     let hooks = ai_memory_claude_hooks(document)?;
     let data_dir = data_dir.to_string_lossy();
     let data_dir = strip_windows_verbatim_prefix(&data_dir);
@@ -196,20 +274,37 @@ fn baked_claude_hook_url(document: &serde_json::Value, data_dir: &Path) -> Optio
                 .map_or_else(|| std::slice::from_ref(entry), Vec::as_slice)
         })
         .filter(|handler| is_ai_memory_hook_entry(handler));
-    let url = native_claude_hook_url(handlers.next()?, &data_dir)?;
+    let url = native_hook_url(handlers.next()?, &data_dir, agent)?;
     handlers
-        .all(|handler| native_claude_hook_url(handler, &data_dir).as_deref() == Some(url.as_str()))
+        .all(|handler| native_hook_url(handler, &data_dir, agent).as_deref() == Some(url.as_str()))
         .then_some(url)
 }
 
-fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option<String> {
+/// The endpoint one installer-rendered native hook handler for `agent` sends
+/// to, when the handler carries nothing a refresh would lose: the same data
+/// dir, no inline credential, no custom prefix or extra flag.
+fn native_hook_url(handler: &serde_json::Value, data_dir: &str, agent: &str) -> Option<String> {
     let command = handler.get("command")?.as_str()?;
     let exec = handler.get("args");
     // A legacy Windows command double-quotes an absolute executable. A POSIX
     // home-relative command (#2035) also opens with a double quote, but as
     // `"$HOME/..."`; it must take the POSIX branch, not the Windows one.
-    let legacy_windows =
-        exec.is_none() && command.starts_with('"') && !command.starts_with("\"$HOME");
+    // A PowerShell runner's Windows command invokes a single-quoted
+    // executable through the call operator (`& 'C:\...'`, #1462).
+    let quote = if exec.is_none()
+        && command.starts_with("& '")
+        && !powershell_call_operator(agent).is_empty()
+    {
+        HookCommandQuote::PowerShell
+    } else if exec.is_none() && command.starts_with('"') && !command.starts_with("\"$HOME") {
+        HookCommandQuote::Windows
+    } else {
+        HookCommandQuote::Posix
+    };
+    let command = match quote {
+        HookCommandQuote::PowerShell => command.strip_prefix("& ")?,
+        _ => command,
+    };
     let words: Vec<&str> = if let Some(args) = exec {
         args.as_array()?
             .iter()
@@ -220,17 +315,19 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
         // The installer renders the data dir either absolute (`shell_quote`)
         // or, when it sits under `$HOME`, as the portable `"$HOME/..."` form
         // (#2035). Try both so a home-relative install is still recognized.
-        let rendered_dirs: Vec<String> = if legacy_windows {
-            vec![format!("\"{data_dir}\"")]
-        } else {
-            let mut forms = vec![shell_quote(data_dir)];
-            if let Some(home) = portable_hook_home("claude-code", false) {
-                let portable = posix_path_arg(Path::new(data_dir), Some(&home));
-                if !forms.contains(&portable) {
-                    forms.push(portable);
+        let rendered_dirs: Vec<String> = match quote {
+            HookCommandQuote::Windows => vec![format!("\"{data_dir}\"")],
+            HookCommandQuote::PowerShell => vec![powershell_quote(data_dir)],
+            HookCommandQuote::Posix => {
+                let mut forms = vec![shell_quote(data_dir)];
+                if let Some(home) = portable_hook_home(agent, false) {
+                    let portable = posix_path_arg(Path::new(data_dir), Some(&home));
+                    if !forms.contains(&portable) {
+                        forms.push(portable);
+                    }
                 }
+                forms
             }
-            forms
         };
         // Retain the connection only when the replacement will use the
         // same data directory for that endpoint's credentials.
@@ -241,12 +338,12 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
         // bare/shell-quoted word, the portable `"$HOME/..."` form (#2035), or
         // an older Linux upgrade's kernel deleted-executable marker. A complex
         // shell prefix can carry per-hook policy that a refresh would lose.
+        let posix = quote == HookCommandQuote::Posix;
         let is_installer_word = |word: &str| {
-            native_claude_hook_word(word, legacy_windows).is_some()
-                || (!legacy_windows && is_portable_home_arg(word))
+            native_hook_word(word, quote).is_some() || (posix && is_portable_home_arg(word))
         };
         (is_installer_word(executable)
-            || (!legacy_windows
+            || (posix
                 && executable
                     .strip_suffix(" (deleted)")
                     .is_some_and(is_installer_word)))
@@ -265,7 +362,7 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
         "--event",
         _,
         "--agent",
-        "claude-code",
+        named,
         "--server-url",
         raw,
         tail @ ..,
@@ -273,6 +370,9 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
     else {
         return None;
     };
+    if *named != agent {
+        return None;
+    }
     let tail = match tail {
         ["--project-strategy", _, rest @ ..] => rest,
         tail => tail,
@@ -285,7 +385,7 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
     let url = if exec.is_some() {
         (*raw).to_owned()
     } else {
-        native_claude_hook_word(raw, legacy_windows)?
+        native_hook_word(raw, quote)?
     };
     let parsed = reqwest::Url::parse(&url).ok()?;
     (matches!(parsed.scheme(), "http" | "https")
@@ -296,8 +396,27 @@ fn native_claude_hook_url(handler: &serde_json::Value, data_dir: &str) -> Option
     .then_some(url)
 }
 
-fn native_claude_hook_word(raw: &str, legacy_windows: bool) -> Option<String> {
-    if legacy_windows {
+/// How an installer-rendered native hook command string quotes its words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookCommandQuote {
+    /// POSIX `shell_quote`, plus the portable `"$HOME/..."` path form (#2035).
+    Posix,
+    /// The double-quoted Windows command string.
+    Windows,
+    /// The Windows command string of an agent that runs hooks through
+    /// PowerShell: `& ` and single-quoted words, `''` standing for a quote.
+    PowerShell,
+}
+
+fn native_hook_word(raw: &str, quote: HookCommandQuote) -> Option<String> {
+    if quote == HookCommandQuote::PowerShell {
+        let value = raw
+            .strip_prefix('\'')?
+            .strip_suffix('\'')?
+            .replace("''", "'");
+        return (!value.is_empty() && powershell_quote(&value) == raw).then_some(value);
+    }
+    if quote == HookCommandQuote::Windows {
         let value = raw.strip_prefix('"')?.strip_suffix('"')?;
         return (!value.is_empty() && !value.contains('"')).then(|| value.to_owned());
     }
@@ -534,12 +653,16 @@ fn declares_cursor_agent(entry: &serde_json::Value) -> bool {
         })
 }
 
-/// `~/.gemini/settings.json`.
+/// `~/.gemini/settings.json` (or `$GEMINI_CLI_HOME/.gemini/settings.json`).
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.gemini/settings.json")?
-        .join(".gemini")
-        .join("settings.json"))
+    gemini_settings_path_in(std::env::var_os("GEMINI_CLI_HOME"))
+}
+
+/// [`gemini_settings_path`] with the `GEMINI_CLI_HOME` value passed in.
+fn gemini_settings_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(install_mcp::gemini_home_in(env_override)?.join("settings.json"))
 }
 
 /// `~/.gemini/config/hooks.json` — Antigravity CLI lifecycle hooks.
@@ -654,19 +777,20 @@ pub(crate) fn zcode_config_path() -> anyhow::Result<std::path::PathBuf> {
         .join("config.json"))
 }
 
-/// `~/.devin/hooks.v1.json` — Devin CLI lifecycle hooks (default target).
+/// `<devin_user_config_dir>/hooks.v1.json` — Devin CLI flat hooks file (standalone
+/// `hooks.v1.json` is normally project-level `.devin/hooks.v1.json`).
 pub(crate) fn devin_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.devin/hooks.v1.json")?
-        .join(".devin")
+    Ok(devin_user_config_dir()
+        .context("could not locate $HOME for ~/.config/devin/hooks.v1.json")?
         .join("hooks.v1.json"))
 }
 
-/// `~/.devin/config.json` — Devin CLI lifecycle hooks (alternative target under `hooks` key).
+/// `<devin_user_config_dir>/config.json` — Devin CLI user-level lifecycle hooks
+/// (default target, merged under the `"hooks"` key; `~/.config/devin/config.json`
+/// on Linux/macOS/WSL and `%APPDATA%\devin\config.json` on Windows).
 pub(crate) fn devin_config_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.devin/config.json")?
-        .join(".devin")
+    Ok(devin_user_config_dir()
+        .context("could not locate $HOME for ~/.config/devin/config.json")?
         .join("config.json"))
 }
 
@@ -825,12 +949,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     run_with_hook_connection(config, args, dialect, mcp_config_path, None)
 }
 
-pub(crate) fn run_with_preserved_claude_hook_url(
+pub(crate) fn run_with_preserved_hook_url(
     config: &Config,
     args: InstallHooksArgs,
+    dialect: Option<ai_memory_workstream::OpenCodeDialect>,
     url: &str,
 ) -> Result<()> {
-    run_with_hook_connection(config, args, None, None, Some(url))
+    run_with_hook_connection(config, args, dialect, None, Some(url))
 }
 
 fn run_with_hook_connection(
@@ -838,7 +963,7 @@ fn run_with_hook_connection(
     mut args: InstallHooksArgs,
     dialect: Option<ai_memory_workstream::OpenCodeDialect>,
     mcp_config_path: Option<&Path>,
-    preserved_claude_url: Option<&str>,
+    preserved_hook_url: Option<&str>,
 ) -> Result<()> {
     let i18n = &config.i18n;
     let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
@@ -854,13 +979,12 @@ fn run_with_hook_connection(
     };
     let needs_inferred_url = args.server_url.is_none() && !config.server_url_configured();
     let needs_inferred_token = args.auth_token.is_none() && config.auth.bearer_token.is_none();
-    let inferred = if preserved_claude_url.is_none() && (needs_inferred_url || needs_inferred_token)
-    {
+    let inferred = if preserved_hook_url.is_none() && (needs_inferred_url || needs_inferred_token) {
         infer_installed_mcp_config(i18n, args.agent, mcp_config_path)?
     } else {
         None
     };
-    let server_url = preserved_claude_url.map_or_else(
+    let server_url = preserved_hook_url.map_or_else(
         || effective_hook_server_url(config, &args, inferred.as_ref()),
         str::to_owned,
     );
@@ -872,7 +996,7 @@ fn run_with_hook_connection(
     // The installed URL has no matching authority in the current config.
     // Retain its on-disk hook credentials and OIDC wiring without importing
     // another server's bearer from configuration or an MCP entry.
-    let (token_file, renderable_token) = if preserved_claude_url.is_some() {
+    let (token_file, renderable_token) = if preserved_hook_url.is_some() {
         (None, None)
     } else {
         let token_file = config.auth.token_file_path();
@@ -1099,6 +1223,7 @@ fn run_with_hook_connection(
                 &args,
                 &capture_mode,
                 config.pi_tool_exposure,
+                config.pi_direct_tools.as_deref(),
             ),
             AgentChoice::Omp => {
                 apply_to_omp_extension(&config.i18n, &server_url, auth, &args, &capture_mode)
@@ -1379,6 +1504,7 @@ fn run_with_hook_connection(
             &preview_capture_mode,
             args.capture_assistant,
             config.pi_tool_exposure,
+            config.pi_direct_tools.as_deref(),
         ),
         AgentChoice::Omp => render_omp_extension(
             &server_url,
@@ -1787,7 +1913,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             // never writes, so there is no install-owned file to recover a
             // baked project strategy from.
             AgentChoice::Hermes => return None,
-            AgentChoice::Devin => devin_hooks_path().ok()?,
+            AgentChoice::Devin => devin_config_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
             // Pool's hook config is per-repo (`.poolside/settings.yaml`), not a
@@ -2320,6 +2446,7 @@ pub(crate) fn hook_config_target_with(
         AgentChoice::Grok => grok_hooks_path_in(env("GROK_HOME")),
         AgentChoice::AntigravityCli => antigravity_hooks_path(),
         AgentChoice::CopilotCli => copilot_cli_hooks_path_in(env("COPILOT_HOME")),
+        AgentChoice::GeminiCli => gemini_settings_path_in(env("GEMINI_CLI_HOME")),
         AgentChoice::Cline => cline_hooks_path_in(env("HOME")),
         other => anyhow::bail!(
             "{} is not auto-wired by `ai-memory run`",
@@ -2895,7 +3022,9 @@ fn apply_to_grok_settings(
     Ok(())
 }
 
-/// Mutate Devin's hook config (either `~/.devin/hooks.v1.json` or `~/.devin/config.json` hooks key).
+/// Mutate Devin's hook config (defaults to `<devin_user_config_dir>/config.json`
+/// under the `"hooks"` key; `--config-file .../.devin/hooks.v1.json` writes the
+/// flat project-level event map).
 /// Devin uses the same nested hook JSON shape as Claude Code/Grok, but with DEVIN_EVENTS
 /// (PostCompaction instead of PreCompact, no subagent events). SessionStart injects
 /// the handoff via hookSpecificOutput.additionalContext.
@@ -2934,7 +3063,7 @@ fn apply_to_devin_settings_with_staged(
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
-        None => devin_hooks_path()?,
+        None => devin_config_path()?,
     };
     let command_dir = staged_command_dir(staged, "devin");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -4655,7 +4784,7 @@ fn build_opencode2_plugin(
     // The shared prelude already imports `spawn` and bakes `NATIVE_HOOK` /
     // `NATIVE_PROJECT_STRATEGY` (#2122); V2 only adds its own `ingest_key`
     // dedup source and the assistant-capture opt-in.
-    rebuilt.push_str("import { randomBytes } from \"node:crypto\";\n");
+    rebuilt.push_str("import { createHash, randomBytes } from \"node:crypto\";\n");
     rebuilt.push_str("const AiMemoryOpencode2: Plugin.Plugin = {\n  id: \"ai-memory-opencode2\",\n  setup: async (ctx) => {\n");
     rebuilt.push_str(&format!("const CAPTURE_ASSISTANT = {capture_assistant};\n"));
     // A module is shared by location graphs; queues and session ownership are not.
@@ -4708,9 +4837,91 @@ const OPENCODE2_BINDING: &str = r#"
     // lookup into a request (and a server worker) per model call.
     const handoffFailures = new Map<SessionID, number>();
     const HANDOFF_MAX_ATTEMPTS = 3;
+    const SESSION_MARKER_CAP = 512;
     // Stops listening on unload. Deliveries keep `hookAbort` until the queued
     // events have had their drain budget.
     const unload = new AbortController();
+
+    function sessionMarkersDir(): string {
+      return join(dirname(hookSpoolDir()), "opencode2-sessions");
+    }
+
+    function sessionMarkerPath(id: SessionID): string {
+      const digest = createHash("sha256").update(id).digest("hex");
+      return join(sessionMarkersDir(), `${digest}.json`);
+    }
+
+    function isSessionCaptured(id: SessionID, cwd: string): boolean {
+      const probe = new URL(`${SERVER}/hook`);
+      if (!applyMarkerParams(probe, cwd)) return false;
+      const policy = capturePolicy({ sessionID: id, cwd }, cwd, "session-start");
+      return policy.disposition !== "drop" || Boolean(policy.serverRoutedProfile && NATIVE_HOOK);
+    }
+
+    function pruneSessionMarkers(dir: string): void {
+      try {
+        const files = readdirSync(dir).filter((name) => name.endsWith(".json"));
+        if (files.length <= SESSION_MARKER_CAP) return;
+        const dated = files.map((name) => {
+          const full = join(dir, name);
+          try {
+            return { full, mtimeMs: statSync(full).mtimeMs };
+          } catch (_e) {
+            return { full, mtimeMs: 0 };
+          }
+        });
+        dated.sort((a, b) => a.mtimeMs - b.mtimeMs);
+        const excess = dated.length - SESSION_MARKER_CAP;
+        for (let i = 0; i < excess; i++) {
+          try { unlinkSync(dated[i].full); } catch (_e) {}
+        }
+      } catch (_e) {
+        // Best-effort pruning.
+      }
+    }
+
+    function writeSessionMarker(id: SessionID, cwd: string, parentID?: string): void {
+      if (!isSessionCaptured(id, cwd)) return;
+      try {
+        const dir = sessionMarkersDir();
+        makePrivateSpoolDir(dir);
+        const target = sessionMarkerPath(id);
+        const tmp = `${target}.${spoolSeqPrefix}${randomBytes(6).toString("hex")}.tmp`;
+        const marker: { cwd: string; parentID?: string } = { cwd };
+        if (typeof parentID === "string" && parentID) marker.parentID = parentID;
+        writeFileSync(tmp, JSON.stringify(marker), { mode: 0o600 });
+        try {
+          renameSync(tmp, target);
+        } catch (e) {
+          try { unlinkSync(tmp); } catch (_e) {}
+          throw e;
+        }
+        pruneSessionMarkers(dir);
+      } catch (_e) {
+        // Best-effort persistence; never block the agent.
+      }
+    }
+
+    function readSessionMarker(id: SessionID): { cwd: string; parentID?: string } | undefined {
+      try {
+        const parsed = JSON.parse(readMarkerText(sessionMarkerPath(id), "utf8"));
+        if (!parsed || typeof parsed.cwd !== "string" || !parsed.cwd) return undefined;
+        return typeof parsed.parentID === "string" && parsed.parentID
+          ? { cwd: parsed.cwd, parentID: parsed.parentID }
+          : { cwd: parsed.cwd };
+      } catch (_e) {
+        return undefined;
+      }
+    }
+
+    function removeSessionMarker(id: SessionID): boolean {
+      try {
+        unlinkSync(sessionMarkerPath(id));
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    }
 
     async function sessionInfo(id: SessionID): Promise<SessionInfo> {
       let pending = sessions.get(id);
@@ -4748,7 +4959,11 @@ const OPENCODE2_BINDING: &str = r#"
         sessions.delete(id);
         return undefined;
       }
+      const isNew = !startedSessions.has(id);
       startSession(id, session.location.directory, { title: session.title, ...subagentMarker(session) });
+      if (isNew) {
+        writeSessionMarker(id, session.location.directory, session.parentID);
+      }
       return session;
     }
 
@@ -4817,24 +5032,49 @@ const OPENCODE2_BINDING: &str = r#"
               await postStop(event.data.sessionID);
             } else if (event.type === "session.deleted") {
               const id = event.data.sessionID;
-              const session = await sessions.get(id)?.catch(() => undefined);
-              endSession(id, directory, undefined, subagentMarker(session));
-              forgetSession(id);
+              const eventDir = (event as { location?: { directory?: string } }).location?.directory;
+              if (eventDir && eventDir !== directory) continue;
+              if (startedSessions.has(id)) {
+                removeSessionMarker(id);
+                const session = await sessions.get(id)?.catch(() => undefined);
+                endSession(id, directory, undefined, subagentMarker(session));
+                forgetSession(id);
+              } else {
+                const marker = readSessionMarker(id);
+                if (marker && marker.cwd === directory && removeSessionMarker(id)) {
+                  postHook("session-end", {
+                    sessionID: id,
+                    cwd: marker.cwd,
+                    ...(marker.parentID ? { agent_id: marker.parentID } : {}),
+                  });
+                  forgetSession(id);
+                }
+              }
             } else if (event.type === "session.moved") {
               const id = event.data.sessionID;
+              const nextCwd = event.data.location.directory;
               const previousCwd = sessionCwds.get(id);
               const previous = await sessions.get(id)?.catch(() => undefined);
+              const persisted = readSessionMarker(id);
               // Only the old owner emits the explicit transition. Replayed
               // moves keep their ingest key, and stale ordinary events cannot
               // silently rebind a live session in the store.
-              if (previousCwd === directory && event.data.location.directory !== previousCwd) {
+              if (previousCwd === directory && nextCwd !== previousCwd) {
                 postHook("session-start", {
                   sessionID: id,
-                  cwd: event.data.location.directory,
+                  cwd: nextCwd,
                   session_moved: true,
                   session_moved_from_cwd: previousCwd,
                   ...subagentMarker(previous),
                 });
+              }
+              if (previousCwd === directory || persisted?.cwd === directory || (persisted && nextCwd === directory)) {
+                const parentID = previous?.parentID ?? persisted?.parentID;
+                if (nextCwd && isSessionCaptured(id, nextCwd)) {
+                  writeSessionMarker(id, nextCwd, parentID);
+                } else {
+                  removeSessionMarker(id);
+                }
               }
               forgetSession(id);
               startedSessions.delete(id);
@@ -5082,8 +5322,8 @@ pub(crate) fn ts_apply_marker_params(
   let profileConsume: string | undefined;
   let defaultResultLimit: string | undefined;
   let minRelevance: string | undefined;
-  let handoffOff = false;
-  let recoveryOff = false;
+  let handoffValue: string | undefined;
+  let recoveryValue: string | undefined;
   let explicitIdentity: string | undefined;
   let identityStyle: string | undefined;
   let aliases: string | undefined;
@@ -5103,8 +5343,8 @@ pub(crate) fn ts_apply_marker_params(
         briefingBudget = tomlFlag(body, "max_chars");
         profileContribute = profileFlag(tomlFlag(body, "contribute"));
         profileConsume = profileFlag(tomlFlag(body, "consume"));
-        handoffOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true)) === "0";
-        recoveryOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false)) === "0";
+        handoffValue = deliveryFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true));
+        recoveryValue = deliveryFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false));
         if (route) {
           routed = true;
           workspace = route.workspace;
@@ -5139,8 +5379,8 @@ pub(crate) fn ts_apply_marker_params(
       profileConsume = profileFlag(tomlFlag(body, "consume"));
       defaultResultLimit = tomlFlag(body, "default_result_limit") ?? "";
       minRelevance = tomlFlag(body, "min_relevance") ?? "";
-      handoffOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true)) === "0";
-      recoveryOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false)) === "0";
+      handoffValue = deliveryFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true));
+      recoveryValue = deliveryFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false));
       explicitIdentity = tomlKey(body, "identity");
       identityStyle = tomlKey(body, "identity_style");
       aliases = markerAliases(body);
@@ -5174,8 +5414,8 @@ pub(crate) fn ts_apply_marker_params(
   if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
   if (defaultResultLimit !== undefined) url.searchParams.set("default_result_limit", defaultResultLimit);
   if (minRelevance !== undefined) url.searchParams.set("min_relevance", minRelevance);
-  if (handoffOff) url.searchParams.set("handoff", "0");
-  if (recoveryOff) url.searchParams.set("recovery", "0");
+  if (handoffValue !== undefined) url.searchParams.set("handoff", handoffValue);
+  if (recoveryValue !== undefined) url.searchParams.set("recovery", recoveryValue);
   return true;
 }"#
     .replace("__DEFAULT_LINE__", apply_default)
@@ -5469,6 +5709,9 @@ function tomlScopedFlag(text: string, key: string, section: string, exclude: boo
 // Parity with `profile_flag_value` in hook_capture.rs.
 function profileFlag(value: string | undefined): string {
   return value !== undefined && ["0", "false", "no", "off"].includes(value.trim().toLowerCase()) ? "0" : "1";
+}
+function deliveryFlag(value: string | undefined): string | undefined {
+  return value === undefined || value === "" ? undefined : profileFlag(value);
 }"#;
 
 /// `repoRootProject`, shared by every generated TypeScript integration: the
@@ -5599,7 +5842,7 @@ fn add_hook_spooling(source: String) -> Result<String> {
     }
     out = out.replacen(
         import_anchor,
-        "import { closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from \"node:fs\";",
+        "import { closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from \"node:fs\";",
         1,
     );
     Ok(out)
@@ -6429,6 +6672,7 @@ fn apply_to_pi_extension(
     args: &InstallHooksArgs,
     capture_mode: &str,
     exposure: PiToolExposure,
+    direct_tools: Option<&[String]>,
 ) -> Result<()> {
     let path = resolve_pi_extension_path(args)?;
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -6439,6 +6683,7 @@ fn apply_to_pi_extension(
         capture_mode,
         args.capture_assistant,
         exposure,
+        direct_tools,
     );
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -6479,6 +6724,7 @@ fn render_pi_extension(
     capture_mode: &str,
     capture_assistant: bool,
     exposure: PiToolExposure,
+    direct_tools: Option<&[String]>,
 ) -> Result<()> {
     println!(
         "// Pi extension — write to {}",
@@ -6495,7 +6741,8 @@ fn render_pi_extension(
             project_strategy,
             capture_mode,
             capture_assistant,
-            exposure
+            exposure,
+            direct_tools,
         )
     );
     Ok(())
@@ -6577,6 +6824,7 @@ fn build_pi_extension(
     capture_mode: &str,
     capture_assistant: bool,
     exposure: PiToolExposure,
+    direct_tools: Option<&[String]>,
 ) -> String {
     // When capture is off the output is byte-identical to the pre-#2240 Pi
     // extension: no `CAPTURE_ASSISTANT`/`NATIVE_HOOK` consts, no `spawn` import,
@@ -6612,7 +6860,7 @@ fn build_pi_extension(
     let export_injection = format!(
         "{}\n{}{}\nexport default function AiMemoryExtension(pi: any): void {{\n  try {{ void bootstrapMcpBridge(pi); }} catch (_e) {{}}",
         pi_session_usage_source(),
-        pi_mcp_bridge_source(exposure),
+        pi_mcp_bridge_source(exposure, direct_tools),
         capture_source,
     );
     let mut lifecycle = build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
@@ -6639,6 +6887,15 @@ fn build_pi_extension(
             &export_injection,
         )
         .replace("api.on(\"", "pi.on(\"");
+    if direct_tools.is_some() && exposure == PiToolExposure::Direct {
+        const SESSION_START_BODY: &str = "  pi.on(\"session_start\", (_event: any, ctx: any) => {\n    noteSubagent(ctx);\n    startSession(ctx);\n  });";
+        debug_assert_eq!(lifecycle.matches(SESSION_START_BODY).count(), 1);
+        lifecycle = lifecycle.replacen(
+            SESSION_START_BODY,
+            "  pi.on(\"session_start\", (_event: any, ctx: any) => {\n    noteSubagent(ctx);\n    startSession(ctx);\n    try { if (typeof pi.getActiveTools === \"function\" && typeof pi.setActiveTools === \"function\") { pi.setActiveTools([...new Set([...pi.getActiveTools(), \"tool_search\"])]); } } catch (_e) {}\n  });",
+            1,
+        );
+    }
     if capture_assistant {
         lifecycle = lifecycle.replace(
             "import { execFileSync } from \"node:child_process\";",
@@ -6689,20 +6946,56 @@ function piSessionPayload(ctx: any): Record<string, unknown> {
 /// The registration line [`pi_mcp_bridge_source`] adds `exposure` after.
 const PI_TOOL_LABEL_LINE: &str = "          label: tool.name,\n";
 
-/// The MCP bridge half of the Pi extension. `direct` is Pi's default
-/// `exposure`, so it is left out and the file stays as earlier releases wrote
-/// it; `codemode` is spelled out on every registration (#1988). Values per
+/// The MCP bridge half of the Pi extension. `direct` with `direct_tools: None`
+/// leaves `exposure` out so the file stays byte-identical to earlier releases;
+/// `codemode` spells out `exposure: "codemode"` on every registration (#1988);
+/// `direct_tools: Some(list)` keeps listed tools `direct`, marks all others
+/// `deferred`, and attaches a single `promptGuidelines` discovery hint (#2428).
+/// Values per
 /// <https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure>.
-fn pi_mcp_bridge_source(exposure: PiToolExposure) -> String {
+fn pi_mcp_bridge_source(exposure: PiToolExposure, direct_tools: Option<&[String]>) -> String {
     let source = PI_MCP_BRIDGE_SOURCE;
     debug_assert_eq!(source.matches(PI_TOOL_LABEL_LINE).count(), 1);
-    match exposure {
-        PiToolExposure::Direct => source.to_string(),
-        PiToolExposure::Codemode => source.replacen(
+    match (exposure, direct_tools) {
+        (PiToolExposure::Direct, None) => source.to_string(),
+        (PiToolExposure::Codemode, _) => source.replacen(
             PI_TOOL_LABEL_LINE,
             &format!("{PI_TOOL_LABEL_LINE}          exposure: \"codemode\",\n"),
             1,
         ),
+        (PiToolExposure::Direct, Some(tools)) => {
+            const TIMEOUT_LINE: &str = "const MCP_REQUEST_TIMEOUT_MS = 10000;\n";
+            const LOOP_LINE: &str = "    for (const tool of listed?.tools ?? []) {\n";
+            debug_assert_eq!(source.matches(TIMEOUT_LINE).count(), 1);
+            debug_assert_eq!(source.matches(LOOP_LINE).count(), 1);
+            let serialized = serde_json::to_string(tools)
+                .expect("serializing pi_direct_tools to JSON cannot fail");
+            source
+                .replacen(
+                    TIMEOUT_LINE,
+                    &format!("{TIMEOUT_LINE}const DIRECT_TOOLS = new Set({serialized});\n"),
+                    1,
+                )
+                .replacen(
+                    LOOP_LINE,
+                    "    const listedTools = listed?.tools ?? [];\n    \
+                     const guidelineTarget = (DIRECT_TOOLS.has(\"memory_query\") && listedTools.some((t: any) => t?.name === \"memory_query\"))\n      \
+                     ? \"memory_query\"\n      \
+                     : listedTools.find((t: any) => DIRECT_TOOLS.has(t?.name))?.name ?? listedTools[0]?.name;\n    \
+                     for (const tool of listedTools) {\n",
+                    1,
+                )
+                .replacen(
+                    PI_TOOL_LABEL_LINE,
+                    &format!(
+                        "{PI_TOOL_LABEL_LINE}\
+                         {indent}exposure: DIRECT_TOOLS.has(tool.name) ? \"direct\" : \"deferred\",\n\
+                         {indent}...(guidelineTarget && tool.name === guidelineTarget ? {{ promptGuidelines: [\"Additional ai-memory tools are deferred; use tool_search to discover and load them when needed.\"] }} : {{}}),\n",
+                        indent = "          "
+                    ),
+                    1,
+                )
+        }
     }
 }
 
@@ -6809,6 +7102,8 @@ async function bootstrapMcpBridge(pi: any): Promise<void> {
     }
   } catch (_e) {
     // MCP bridge is best-effort; extension load and lifecycle capture must survive.
+    // Do not print the exception: a server response can contain private details.
+    console.warn("ai-memory: MCP tool discovery failed. Check that the server is running and reachable, then run /reload in Pi to retry. Lifecycle capture remains enabled.");
   }
 }
 "#;
@@ -9028,14 +9323,14 @@ fn render_devin(
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing devin hook config")?;
     println!(
-        "# Devin CLI hook config — write to ~/.devin/hooks.v1.json or ~/.devin/config.json hooks key"
+        "# Devin CLI hook config — merge into ~/.config/devin/config.json (or project .devin/hooks.v1.json)"
     );
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
         println!(
-            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600)."
+            "#       Treat ~/.config/devin/config.json (or .devin/hooks.v1.json) as sensitive (chmod 600)."
         );
     }
     println!(
@@ -9727,7 +10022,7 @@ mod tests {
     const CAPTURE_ADMIT_GATE_TS: &str = "const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === \"allowlist\" && !markerPresent) return { disposition: \"drop\", payload };";
 
     #[test]
-    fn baked_claude_hook_url_requires_one_owned_native_endpoint() {
+    fn baked_hook_url_requires_one_owned_native_claude_endpoint() {
         let url = "https://memory.example.invalid/a!b";
         let data_dir = Path::new("data with spaces");
         let posix = serde_json::json!({
@@ -9749,16 +10044,16 @@ mod tests {
             "SessionEnd": [{"matcher": "", "hooks": [legacy_windows]}]
         }});
         assert_eq!(
-            baked_claude_hook_url(&settings, data_dir).as_deref(),
+            baked_hook_url(&settings, data_dir, "claude-code").as_deref(),
             Some(url)
         );
-        assert!(baked_claude_hook_url(&settings, Path::new("other data")).is_none());
+        assert!(baked_hook_url(&settings, Path::new("other data"), "claude-code").is_none());
 
         let args = settings["hooks"]["SessionStart"][0]["hooks"][0]["args"]
             .as_array_mut()
             .unwrap();
         args[8] = serde_json::json!("https://other.example.invalid");
-        assert!(baked_claude_hook_url(&settings, data_dir).is_none());
+        assert!(baked_hook_url(&settings, data_dir, "claude-code").is_none());
 
         let args = settings["hooks"]["SessionStart"][0]["hooks"][0]["args"]
             .as_array_mut()
@@ -9768,11 +10063,11 @@ mod tests {
             serde_json::json!("--auth-token"),
             serde_json::json!("synthetic-inline"),
         ]);
-        assert!(baked_claude_hook_url(&settings, data_dir).is_none());
+        assert!(baked_hook_url(&settings, data_dir, "claude-code").is_none());
     }
 
     #[test]
-    fn baked_claude_hook_url_preserves_custom_command_prefixes_for_manual_refresh() {
+    fn baked_hook_url_preserves_custom_claude_command_prefixes_for_manual_refresh() {
         let data_dir = Path::new("data with spaces");
         let settings = |executable: &str| {
             serde_json::json!({"hooks": {
@@ -9788,7 +10083,7 @@ mod tests {
             "'/old o'\\''brien/ai-memory'",
         ] {
             assert_eq!(
-                baked_claude_hook_url(&settings(executable), data_dir).as_deref(),
+                baked_hook_url(&settings(executable), data_dir, "claude-code").as_deref(),
                 Some("https://memory.example.invalid"),
                 "a canonical stale executable can be refreshed"
             );
@@ -9803,10 +10098,242 @@ mod tests {
             "/bin/wrapper /bin/ai-memory (deleted)",
         ] {
             assert!(
-                baked_claude_hook_url(&settings(executable), data_dir).is_none(),
+                baked_hook_url(&settings(executable), data_dir, "claude-code").is_none(),
                 "a custom prefix must stay available for manual refresh"
             );
         }
+    }
+
+    /// What `install-hooks --server-url` writes for each agent that keeps its
+    /// hooks in a JSON document reads back as that endpoint, and only for that
+    /// agent and data dir, so `upgrade` re-renders it instead of moving it to
+    /// loopback.
+    #[test]
+    fn baked_hook_url_reads_the_endpoint_every_json_hook_agent_renders() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let emit_root = Path::new("/srv/ai memory/data/hooks");
+        for (profile, agent) in [
+            (&CODEX_PROFILE, "codex"),
+            (&COPILOT_CLI_PROFILE, "copilot-cli"),
+            (&CURSOR_PROFILE, "cursor"),
+            (&GEMINI_PROFILE, "gemini-cli"),
+            (&COMMAND_CODE_PROFILE, "command-code"),
+        ] {
+            let document = build_profile_payload_for_agent(
+                profile,
+                emit_root,
+                remote,
+                None,
+                agent,
+                Some(data_dir),
+                None,
+                false,
+                true,
+            );
+            assert_eq!(
+                baked_hook_url(&document, data_dir, agent).as_deref(),
+                Some(remote),
+                "{agent}: {document}"
+            );
+            assert!(
+                baked_hook_url(&document, data_dir, "claude-code").is_none(),
+                "{agent}: another agent's commands are not this install"
+            );
+            assert!(
+                baked_hook_url(&document, Path::new("/srv/other"), agent).is_none(),
+                "{agent}: another data dir keeps other credentials"
+            );
+        }
+    }
+
+    /// DSH's generated `hooks.json` is the same kind of document, so the
+    /// endpoint it bakes reads back the same way.
+    #[test]
+    fn baked_hook_url_reads_the_endpoint_dsh_generates() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let document = build_dsh_hooks_payload(
+            Path::new("/srv/ai memory/data/hooks/dsh"),
+            remote,
+            None,
+            Some(data_dir),
+            None,
+            true,
+        );
+        assert_eq!(
+            baked_hook_url(&document, data_dir, "dsh").as_deref(),
+            Some(remote),
+            "{document}"
+        );
+        assert!(baked_hook_url(&document, Path::new("/srv/other"), "dsh").is_none());
+    }
+
+    /// The refresh keeps an endpoint only when re-rendering loses nothing, for
+    /// every agent as for Claude Code: a third-party hook in the same file is
+    /// ignored, while a second endpoint, an inline credential or a custom
+    /// prefix on one ai-memory hook leaves the endpoint unrecovered.
+    #[test]
+    fn baked_hook_url_refuses_what_a_refresh_would_lose_for_any_agent() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai-memory");
+        let handler = |prefix: &str, event: &str, url: &str, suffix: &str| {
+            serde_json::json!({
+                "type": "command",
+                "matcher": "",
+                "command": format!(
+                    "{prefix}/usr/local/bin/ai-memory --data-dir /srv/ai-memory hook --event {event} --agent cursor --server-url {}{suffix}",
+                    shell_quote(url)
+                )
+            })
+        };
+        let document = |stop: serde_json::Value| {
+            serde_json::json!({"version": 1, "hooks": {
+                "sessionStart": [handler("", "session-start", remote, "")],
+                "afterShellExecution": [{
+                    "type": "command",
+                    "command": "/opt/audit/bin/notify --server-url https://audit.example.invalid"
+                }],
+                "stop": [stop]
+            }})
+        };
+
+        let installed = document(handler("", "stop", remote, ""));
+        assert_eq!(
+            baked_hook_url(&installed, data_dir, "cursor").as_deref(),
+            Some(remote)
+        );
+        for (case, stop) in [
+            (
+                "a second endpoint",
+                handler("", "stop", "https://other.example.invalid", ""),
+            ),
+            (
+                "an inline credential",
+                handler("", "stop", remote, " --auth-token synthetic-inline"),
+            ),
+            (
+                "a custom prefix",
+                handler("AI_MEMORY_AUTO_HANDOFF=off ", "stop", remote, ""),
+            ),
+            (
+                "userinfo in the endpoint",
+                handler("", "stop", "https://user:pw@memory.example.invalid", ""),
+            ),
+        ] {
+            assert!(
+                baked_hook_url(&document(stop), data_dir, "cursor").is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    /// Kimi Code's `[[hooks]]` tables in `config.toml` read back the same way,
+    /// beside the user's own settings and hooks.
+    #[test]
+    fn baked_toml_hook_url_reads_kimi_code_hooks() {
+        let remote = "https://memory.example.invalid/team";
+        let data_dir = Path::new("/srv/ai memory/data");
+        let render = |stop_url: &str| {
+            let mut document: toml_edit::DocumentMut =
+                "default_model = \"kimi-k2\"\n\n[[hooks]]\nevent = \"Stop\"\ncommand = \"notify-send done --server-url https://other.example.invalid\"\n"
+                    .parse()
+                    .unwrap();
+            let hooks = document["hooks"].as_array_of_tables_mut().unwrap();
+            for (event, command) in kimi_code_hook_commands(
+                Path::new("/srv/ai memory/data/hooks/kimi-code"),
+                remote,
+                None,
+                Some(data_dir),
+                None,
+                true,
+            ) {
+                let command = if event == "Stop" {
+                    command.replace(&shell_quote(remote), &shell_quote(stop_url))
+                } else {
+                    command
+                };
+                let mut table = toml_edit::Table::new();
+                table["event"] = toml_edit::value(event);
+                table["command"] = toml_edit::value(command);
+                hooks.push(table);
+            }
+            document.to_string()
+        };
+
+        assert_eq!(
+            baked_toml_hook_url(&render(remote), data_dir, "kimi-code").as_deref(),
+            Some(remote)
+        );
+        assert!(
+            baked_toml_hook_url(
+                &render("https://other.example.invalid"),
+                data_dir,
+                "kimi-code"
+            )
+            .is_none(),
+            "a second endpoint"
+        );
+        assert!(
+            baked_toml_hook_url(&render(remote), Path::new("/srv/other"), "kimi-code").is_none(),
+            "another data dir"
+        );
+        assert!(
+            baked_toml_hook_url("default_model = \"kimi-k2\"\n", data_dir, "kimi-code").is_none(),
+            "no hooks installed"
+        );
+    }
+
+    /// The Windows command of an agent that runs hooks through PowerShell,
+    /// composed as the renderer composes it: the call operator, then
+    /// single-quoted words with `''` for a quote (#1462).
+    #[test]
+    fn native_hook_url_reads_powershell_run_windows_commands() {
+        let remote = "https://memory.example.invalid/o'brien";
+        let exe = r"C:\Program Files\ai-memory\ai-memory.exe";
+        let data_dir = r"C:\Users\o'brien\AppData\Local\ai-memory";
+        let handler = |prefix: &str, agent: &str, suffix: &str| {
+            serde_json::json!({ "type": "command", "command": format!(
+                "{prefix}{} --data-dir {} hook --event session-start --agent {agent} --server-url {}{suffix}",
+                powershell_quote(exe),
+                powershell_quote(data_dir),
+                powershell_quote(remote)
+            )})
+        };
+        for agent in ["codex", "copilot-cli", "gemini-cli", "grok", "dsh"] {
+            assert_eq!(
+                native_hook_url(&handler("& ", agent, ""), data_dir, agent).as_deref(),
+                Some(remote),
+                "{agent}"
+            );
+            assert!(
+                native_hook_url(
+                    &handler("& ", agent, " --auth-token 'synthetic'"),
+                    data_dir,
+                    agent
+                )
+                .is_none(),
+                "{agent}: an inline credential"
+            );
+            assert!(
+                native_hook_url(
+                    &handler("& 'C:\\bin\\wrapper.exe' ", agent, ""),
+                    data_dir,
+                    agent
+                )
+                .is_none(),
+                "{agent}: a custom prefix"
+            );
+        }
+        // Cursor's Windows runner is not PowerShell, so the installer never
+        // writes this form for it.
+        assert!(native_hook_url(&handler("& ", "cursor", ""), data_dir, "cursor").is_none());
+        // A word PowerShell would read differently is not the installer's.
+        let unbalanced = serde_json::json!({ "command": format!(
+            "& 'C:\\ai-memory.exe' --data-dir {} hook --event stop --agent codex --server-url 'https://a.invalid/x'y'",
+            powershell_quote(data_dir)
+        )});
+        assert!(native_hook_url(&unbalanced, data_dir, "codex").is_none());
     }
 
     /// A home-relative install (#2035 renders the binary and data dir as
@@ -9816,7 +10343,7 @@ mod tests {
     /// restaging scripts, losing the endpoint.
     #[cfg(unix)]
     #[test]
-    fn native_claude_hook_url_recognizes_home_relative_commands() {
+    fn native_hook_url_recognizes_home_relative_claude_commands() {
         use crate::commands::render_shared::TestHookHome;
 
         let data_dir = "/home/tester/.local/share/ai-memory";
@@ -9838,7 +10365,7 @@ mod tests {
             "/opt/ai-memory/bin/ai-memory",
         ] {
             assert_eq!(
-                native_claude_hook_url(&settings(executable), data_dir).as_deref(),
+                native_hook_url(&settings(executable), data_dir, "claude-code").as_deref(),
                 Some("https://memory.example.invalid/team"),
                 "home-relative command should be recognized: {executable}"
             );
@@ -9850,7 +10377,7 @@ mod tests {
             "/bin/wrapper \"$HOME/.local/bin/ai-memory\"",
         ] {
             assert!(
-                native_claude_hook_url(&settings(executable), data_dir).is_none(),
+                native_hook_url(&settings(executable), data_dir, "claude-code").is_none(),
                 "a custom prefix must stay available for manual refresh: {executable}"
             );
         }
@@ -14310,6 +14837,7 @@ model = "gpt-5"
                     "denylist",
                     false,
                     PiToolExposure::Direct,
+                    None,
                 ),
             ),
             (
@@ -14721,6 +15249,7 @@ model = "gpt-5"
                 "denylist",
                 false,
                 PiToolExposure::Direct,
+                None,
             ),
         ] {
             assert!(!extension.contains("/recap"));
@@ -14742,14 +15271,17 @@ model = "gpt-5"
                 "denylist",
                 false,
                 PiToolExposure::Direct,
+                None,
             ),
         ] {
             for expected in [
                 "function tomlScopedFlag",
+                "function deliveryFlag",
+                "value === undefined || value === \"\" ? undefined",
                 "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)",
                 "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", false)",
-                "url.searchParams.set(\"handoff\", \"0\")",
-                "url.searchParams.set(\"recovery\", \"0\")",
+                "url.searchParams.set(\"handoff\", handoffValue)",
+                "url.searchParams.set(\"recovery\", recoveryValue)",
             ] {
                 assert!(generated.contains(expected), "missing {expected}");
             }
@@ -14807,7 +15339,7 @@ model = "gpt-5"
             plugin
                 .contains("tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)")
         );
-        assert!(plugin.contains("url.searchParams.set(\"handoff\", \"0\")"));
+        assert!(plugin.contains("url.searchParams.set(\"handoff\", handoffValue)"));
         // #668: applyMarkerParams resolves scope/settings via the
         // settings-walk, not the nearest-marker findMarker, so a nested
         // capture-only marker does not shadow an outer marker's scope.
@@ -14862,9 +15394,9 @@ model = "gpt-5"
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        // Three spool-delivery spawns plus the two #2122 server-routed native
-        // spawns (capture and handoff).
-        assert_eq!(plugin.matches("windowsHide: true").count(), 5);
+        // Three spool-delivery spawns, the two #2122 server-routed native
+        // spawns (capture and handoff), and the spool dir's whoami and icacls.
+        assert_eq!(plugin.matches("windowsHide: true").count(), 7);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -15134,7 +15666,7 @@ model = "gpt-5"
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success() && stdout.matches("PASS:").count() == 3,
+            output.status.success() && stdout.matches("PASS:").count() == 4,
             "opencode2 host fixture failed ({})\nstdout:\n{stdout}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stderr),
@@ -15469,7 +16001,7 @@ model = "gpt-5"
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(extension.contains("function repoRootProject"));
         assert!(extension.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(extension.matches("windowsHide: true").count(), 3);
+        assert_eq!(extension.matches("windowsHide: true").count(), 5); // three before, plus the spool dir's whoami and icacls
         assert!(extension.contains("--git-common-dir"));
         assert!(
             extension
@@ -16140,6 +16672,7 @@ model = "gpt-5"
             "allowlist",
             false,
             PiToolExposure::Direct,
+            None,
         );
         assert!(
             extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
@@ -16179,6 +16712,7 @@ model = "gpt-5"
                     "denylist",
                     false,
                     PiToolExposure::Direct,
+                    None,
                 ),
             ),
         ];
@@ -16246,6 +16780,7 @@ model = "gpt-5"
                     "denylist",
                     false,
                     PiToolExposure::Direct,
+                    None,
                 ),
             ),
         ];
@@ -16293,6 +16828,7 @@ model = "gpt-5"
                     "allowlist",
                     false,
                     PiToolExposure::Direct,
+                    None,
                 ),
             ),
         ];
@@ -16361,12 +16897,11 @@ const ctx = (id: string, cwd?: string) => ({
 });
 const unscoped = await handlers["before_agent_start"]({ prompt: "continue" }, ctx("s-unscoped", ""));
 const scoped = await handlers["before_agent_start"]({ prompt: "continue" }, ctx("s-scoped", project));
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   claims,
   unscoped: unscoped?.message?.content ?? null,
   scoped: scoped?.message?.content ?? null,
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         fn node_strips_types() -> bool {
@@ -16555,8 +17090,7 @@ while (!hooks.some((hook) => hook.event === "session-end" && hook.sessionID === 
   if (Date.now() > deadline) break;
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
-console.log(JSON.stringify({ claims, delivered, hooks }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ claims, delivered, hooks }) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -16718,8 +17252,7 @@ while (!sessions.every(ended)) {
   if (Date.now() > deadline) break;
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
-console.log(JSON.stringify({ claims, delivered, hooks }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ claims, delivered, hooks }) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -16863,8 +17396,8 @@ const reload = await modelCall("root");
 await compacting("root");
 const afterNext = await modelCall("root");
 await plugin.dispose();
-console.log(JSON.stringify({ oldAfter, before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ oldAfter, before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }) + "\n",
+  (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -16985,13 +17518,12 @@ for (let i = 0; i < 100 && !drained(); i++) {
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
 await new Promise((resolve) => setTimeout(resolve, 300));
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   handoff: reply?.message?.content ?? null,
   loginHits,
   drained: drained(),
   spooled: readdirSync(spool).filter((name) => name.endsWith(".json")).sort(),
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         /// Followed, the gateway's redirect would put its login page in the
@@ -17034,6 +17566,7 @@ process.exit(0);
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
         assert!(
             extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
@@ -17051,6 +17584,7 @@ process.exit(0);
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
 
         assert!(extension.contains("export default function AiMemoryExtension(pi: any): void"));
@@ -17112,7 +17646,7 @@ process.exit(0);
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(!extension.contains(".omp"));
         assert!(extension.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(extension.matches("windowsHide: true").count(), 3);
+        assert_eq!(extension.matches("windowsHide: true").count(), 5); // three before, plus the spool dir's whoami and icacls
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
         // #676: the pi string-transform (api.on( -> pi.on() must still
@@ -17146,6 +17680,7 @@ process.exit(0);
             "denylist",
             true,
             PiToolExposure::Direct,
+            None,
         );
         assert!(on.contains("const CAPTURE_ASSISTANT = true;"), "{on}");
         assert!(
@@ -17211,6 +17746,7 @@ process.exit(0);
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
         assert!(!off.contains("CAPTURE_ASSISTANT"), "{off}");
         assert!(!off.contains("NATIVE_HOOK"), "{off}");
@@ -17236,6 +17772,7 @@ process.exit(0);
             "denylist",
             true,
             PiToolExposure::Direct,
+            None,
         );
         let strategy_decl = "const NATIVE_PROJECT_STRATEGY: string | undefined = \"repo-root\";";
         let push_line = concat!(
@@ -17252,6 +17789,7 @@ process.exit(0);
             "denylist",
             true,
             PiToolExposure::Direct,
+            None,
         );
         let unset_decl = "const NATIVE_PROJECT_STRATEGY: string | undefined = undefined;";
         assert!(no_strategy.contains(unset_decl), "{no_strategy}");
@@ -17265,6 +17803,7 @@ process.exit(0);
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
         assert!(
             !capture_off.contains("NATIVE_PROJECT_STRATEGY"),
@@ -17289,6 +17828,7 @@ process.exit(0);
             "denylist",
             false,
             PiToolExposure::Direct,
+            None,
         );
 
         let notify_start = extension
@@ -17325,6 +17865,96 @@ process.exit(0);
         );
     }
 
+    /// #2429: failed discovery must give an actionable recovery path without
+    /// leaking the server's response or preventing lifecycle registration.
+    #[test]
+    fn pi_tool_discovery_failure_reports_reload_in_node() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        const HARNESS: &str = r#"
+import { pathToFileURL } from "node:url";
+const failedMethod = process.argv[3];
+const warnings: string[] = [];
+const tools: any[] = [];
+const handlers: string[] = [];
+console.warn = (...values: unknown[]) => { warnings.push(values.join(" ")); };
+globalThis.fetch = async (_url: any, options: any) => {
+  const body = JSON.parse(options.body);
+  if (body.method === failedMethod) {
+    return new Response("private-server-detail", { status: 503 });
+  }
+  if (body.id === undefined) return new Response(null, { status: 202 });
+  const result = body.method === "tools/list"
+    ? { tools: [{ name: "memory_query", description: "d", inputSchema: { type: "object" } }] }
+    : {};
+  return Response.json({ jsonrpc: "2.0", id: body.id, result });
+};
+const { default: extension } = await import(pathToFileURL(process.argv[2]).href);
+extension({
+  on: (name: string) => handlers.push(name),
+  registerTool: (tool: any) => tools.push(tool),
+});
+for (let i = 0; i < 200 && !warnings.length && !tools.length; i++) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+process.stdout.write(JSON.stringify({
+  warnings,
+  names: tools.map((tool) => tool.name),
+  lifecycle: handlers.length > 0,
+}) + "\n", (error) => process.exit(error ? 1 : 0));
+"#;
+        for failed_method in ["initialize", "tools/list", "healthy"] {
+            let tmp = TempDir::new().unwrap();
+            let extension = tmp.path().join("ai-memory-pi.ts");
+            fs::write(
+                &extension,
+                build_pi_extension(
+                    "http://127.0.0.1:49600",
+                    None,
+                    None,
+                    "denylist",
+                    false,
+                    PiToolExposure::Direct,
+                    None,
+                ),
+            )
+            .unwrap();
+            fs::write(tmp.path().join("harness.ts"), HARNESS).unwrap();
+            let mut command = Command::new("node");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AI_MEMORY_") {
+                    command.env_remove(&key);
+                }
+            }
+            let output = command
+                .args(["--experimental-strip-types", "--no-warnings", "harness.ts"])
+                .arg(&extension)
+                .arg(failed_method)
+                .current_dir(tmp.path())
+                .env("HOME", tmp.path())
+                .env("USERPROFILE", tmp.path())
+                .env("AI_MEMORY_DATA_DIR", tmp.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{failed_method}: {output:?}");
+            let seen: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(seen["lifecycle"], true);
+            if failed_method == "healthy" {
+                assert_eq!(seen["warnings"], serde_json::json!([]));
+                assert_eq!(seen["names"], serde_json::json!(["memory_query"]));
+            } else {
+                assert_eq!(seen["names"], serde_json::json!([]));
+                let warnings = seen["warnings"].as_array().unwrap();
+                assert_eq!(warnings.len(), 1, "{failed_method}: {seen}");
+                let warning = warnings[0].as_str().unwrap();
+                assert!(warning.contains("/reload"), "{warning}");
+                assert!(warning.contains("server"), "{warning}");
+                assert!(!warning.contains("private-server-detail"), "{warning}");
+            }
+        }
+    }
+
     /// #1988: `codemode` adds Pi's `exposure: "codemode"` to the one
     /// `pi.registerTool` call, and `direct` (Pi's own default) leaves the
     /// property out so an existing install re-renders byte for byte.
@@ -17338,6 +17968,7 @@ process.exit(0);
                 "denylist",
                 false,
                 exposure,
+                None,
             )
         };
         let direct = render(PiToolExposure::Direct);
@@ -17413,14 +18044,13 @@ for (let i = 0; i < 200 && tools.length === 0; i++) await new Promise((r) => set
 const ctx = { cwd: process.cwd(), sessionManager: { getSessionId: () => "pi-codemode-session" } };
 const result = await tools[0].execute("call-1", { query: "x" }, undefined, undefined, ctx);
 const call = calls.find((c) => c.method === "tools/call");
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   names: tools.map((t) => t.name),
   exposure: tools[0].exposure ?? null,
   text: result.content[0].text,
   actor: call.headers["X-Memory-Actor-Session-Id"] ?? null,
   mcp: call.headers["Mcp-Session-Id"] ?? null,
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
         for (exposure, expected) in [
             (PiToolExposure::Direct, serde_json::Value::Null),
@@ -17437,6 +18067,7 @@ process.exit(0);
                     "denylist",
                     false,
                     exposure,
+                    None,
                 ),
             )
             .unwrap();
@@ -17474,6 +18105,220 @@ process.exit(0);
                     "mcp": "pi-codemode-session",
                 }),
                 "{exposure:?}"
+            );
+        }
+    }
+
+    /// #2428: `pi_direct_tools` emits `DIRECT_TOOLS`, conditional `exposure`,
+    /// a single `promptGuidelines` hint, and `session_start` `tool_search`
+    /// activation; `None` stays byte-identical to the default extension.
+    #[test]
+    fn pi_direct_tools_is_baked_into_registration_and_session_start() {
+        let render = |direct_tools: Option<&[String]>| {
+            build_pi_extension(
+                "http://127.0.0.1:49374",
+                Some("tok"),
+                None,
+                "denylist",
+                false,
+                PiToolExposure::Direct,
+                direct_tools,
+            )
+        };
+        let baseline = render(None);
+        assert!(!baseline.contains("DIRECT_TOOLS"), "{baseline}");
+        assert!(!baseline.contains("exposure"), "{baseline}");
+        assert!(!baseline.contains("promptGuidelines"), "{baseline}");
+        assert!(!baseline.contains("setActiveTools"), "{baseline}");
+
+        let list = vec!["memory_query".to_string(), "memory_briefing".to_string()];
+        let selective = render(Some(&list));
+        assert!(
+            selective
+                .contains("const DIRECT_TOOLS = new Set([\"memory_query\",\"memory_briefing\"]);"),
+            "{selective}"
+        );
+        assert!(
+            selective
+                .contains("exposure: DIRECT_TOOLS.has(tool.name) ? \"direct\" : \"deferred\","),
+            "{selective}"
+        );
+        assert!(selective.contains("promptGuidelines:"), "{selective}");
+        let session_start = selective.find("pi.on(\"session_start\"").unwrap();
+        let next_handler = session_start
+            + selective[session_start..]
+                .find("pi.on(\"before_agent_start\"")
+                .unwrap();
+        let activate = selective.find("pi.setActiveTools").unwrap();
+        assert!(session_start < activate && activate < next_handler);
+
+        let defer_all = render(Some(&[]));
+        assert!(
+            defer_all.contains("const DIRECT_TOOLS = new Set([]);"),
+            "{defer_all}"
+        );
+        assert!(defer_all.contains("pi.setActiveTools"), "{defer_all}");
+    }
+
+    /// #2428: `install-hooks --agent pi --apply` respects `pi_direct_tools`,
+    /// is idempotent on re-run, and restores the byte-identical baseline when
+    /// `pi_direct_tools` is unset.
+    #[test]
+    fn pi_apply_follows_pi_direct_tools_idempotently() {
+        let home = TempDir::new().unwrap();
+        let extension = home.path().join("ai-memory-pi.ts");
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let args = || InstallHooksArgs {
+            agent: AgentChoice::Pi,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            config_file: Some(extension.clone()),
+            ..default_hook_args()
+        };
+
+        run(&config, args()).unwrap();
+        let baseline = fs::read_to_string(&extension).unwrap();
+        assert!(!baseline.contains("DIRECT_TOOLS"), "{baseline}");
+
+        config.pi_direct_tools = Some(vec!["memory_query".to_string()]);
+        run(&config, args()).unwrap();
+        let selective = fs::read_to_string(&extension).unwrap();
+        assert!(
+            selective.contains("const DIRECT_TOOLS = new Set([\"memory_query\"]);"),
+            "{selective}"
+        );
+        run(&config, args()).unwrap();
+        assert_eq!(fs::read_to_string(&extension).unwrap(), selective);
+
+        config.pi_direct_tools = None;
+        run(&config, args()).unwrap();
+        assert_eq!(fs::read_to_string(&extension).unwrap(), baseline);
+    }
+
+    /// #2428 in Node: verifies direct vs deferred registration, single
+    /// `promptGuidelines` placement (preferring `memory_query`, then first
+    /// direct tool, then first tool fallback), and `session_start` activating
+    /// `tool_search` via `getActiveTools`/`setActiveTools`.
+    #[test]
+    fn pi_direct_tools_registers_direct_and_deferred_tools_in_node() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        const HARNESS: &str = r#"
+import { pathToFileURL } from "node:url";
+globalThis.fetch = async (url: any, options: any) => {
+  const target = new URL(url);
+  if (target.pathname !== "/mcp") return new Response(null, { status: 202 });
+  const body = JSON.parse(options.body);
+  if (body.id === undefined) return new Response(null, { status: 202 });
+  const result = body.method === "tools/list"
+    ? {
+        tools: [
+          { name: "memory_write_page", description: "w", inputSchema: { type: "object" } },
+          { name: "memory_briefing", description: "b", inputSchema: { type: "object" } },
+          { name: "memory_query", description: "q", inputSchema: { type: "object" } },
+        ],
+      }
+    : {};
+  return Response.json({ jsonrpc: "2.0", id: body.id, result });
+};
+const tools: any[] = [];
+const handlers: Record<string, any> = {};
+let activeTools = ["bash", "read"];
+const { default: extension } = await import(pathToFileURL(process.argv[2]).href);
+extension({
+  on: (event: string, fn: any) => { handlers[event] = fn; },
+  registerTool: (tool: any) => tools.push(tool),
+  getActiveTools: () => activeTools,
+  setActiveTools: (next: string[]) => { activeTools = next; },
+});
+for (let i = 0; i < 200 && tools.length < 3; i++) await new Promise((r) => setTimeout(r, 10));
+handlers["session_start"]?.({}, { cwd: process.cwd(), sessionManager: { getSessionId: () => "pi-s1" } });
+process.stdout.write(JSON.stringify({
+  tools: tools.map((t) => ({
+    name: t.name,
+    exposure: t.exposure ?? null,
+    guidelines: t.promptGuidelines?.length ?? 0,
+  })),
+  activeTools,
+}) + "\n", (error) => process.exit(error ? 1 : 0));
+"#;
+        let cases: &[(&[&str], serde_json::Value)] = &[
+            (
+                &["memory_query", "memory_briefing"],
+                serde_json::json!([
+                    {"name": "memory_write_page", "exposure": "deferred", "guidelines": 0},
+                    {"name": "memory_briefing", "exposure": "direct", "guidelines": 0},
+                    {"name": "memory_query", "exposure": "direct", "guidelines": 1},
+                ]),
+            ),
+            (
+                &["memory_briefing"],
+                serde_json::json!([
+                    {"name": "memory_write_page", "exposure": "deferred", "guidelines": 0},
+                    {"name": "memory_briefing", "exposure": "direct", "guidelines": 1},
+                    {"name": "memory_query", "exposure": "deferred", "guidelines": 0},
+                ]),
+            ),
+            (
+                &[],
+                serde_json::json!([
+                    {"name": "memory_write_page", "exposure": "deferred", "guidelines": 1},
+                    {"name": "memory_briefing", "exposure": "deferred", "guidelines": 0},
+                    {"name": "memory_query", "exposure": "deferred", "guidelines": 0},
+                ]),
+            ),
+        ];
+
+        for (direct, expected_tools) in cases {
+            let direct_vec: Vec<String> = direct.iter().map(|s| (*s).to_string()).collect();
+            let tmp = TempDir::new().unwrap();
+            let extension = tmp.path().join("ai-memory-pi.ts");
+            fs::write(
+                &extension,
+                build_pi_extension(
+                    "http://127.0.0.1:49600",
+                    None,
+                    None,
+                    "denylist",
+                    false,
+                    PiToolExposure::Direct,
+                    Some(&direct_vec),
+                ),
+            )
+            .unwrap();
+            fs::write(tmp.path().join("harness.ts"), HARNESS).unwrap();
+            let mut command = Command::new("node");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AI_MEMORY_") {
+                    command.env_remove(&key);
+                }
+            }
+            let output = command
+                .args(["--experimental-strip-types", "--no-warnings", "harness.ts"])
+                .arg(&extension)
+                .current_dir(tmp.path())
+                .env("HOME", tmp.path())
+                .env("USERPROFILE", tmp.path())
+                .env("AI_MEMORY_DATA_DIR", tmp.path().join("data"))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{direct:?}: harness failed\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let seen: serde_json::Value =
+                serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+            assert_eq!(
+                seen,
+                serde_json::json!({
+                    "tools": expected_tools,
+                    "activeTools": ["bash", "read", "tool_search"],
+                }),
+                "{direct:?}"
             );
         }
     }
@@ -19352,7 +20197,29 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
     // ----------------------------------------------------------------
 
     #[test]
-    fn devin_apply_writes_hooks_v1_json_by_default() {
+    fn devin_default_config_path_uses_user_config_dir() {
+        let path = devin_config_path().unwrap();
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("config.json")
+        );
+        #[cfg(not(windows))]
+        {
+            let parent = path.parent().unwrap();
+            assert_eq!(parent.file_name().and_then(|s| s.to_str()), Some("devin"));
+            assert_eq!(
+                parent
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .and_then(|s| s.to_str()),
+                Some(".config")
+            );
+        }
+    }
+
+    #[test]
+    fn devin_apply_project_hooks_v1_json_writes_flat_event_map() {
         let hooks_tmp = TempDir::new().unwrap();
         stub_scripts(
             hooks_tmp.path(),
@@ -20208,6 +21075,36 @@ mod identity_parity_tests {
                 case["name"]
             );
         }
+    }
+
+    /// The generated TypeScript treats an exact empty delivery value as absent;
+    /// a whitespace-only value still forwards `1`, like native and shell.
+    #[test]
+    fn generated_typescript_treats_an_empty_delivery_value_as_absent() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let module = tmp.path().join("delivery-flag.ts");
+        std::fs::write(
+            &module,
+            format!(
+                "{}\nfor (const value of [\"\", \"  \", \"true\", \"false\"]) process.stdout.write((deliveryFlag(value) ?? \"absent\") + \",\");\n",
+                super::TS_TOML_FLAG
+            ),
+        )
+        .unwrap();
+        let output = Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "absent,1,1,0,");
     }
 
     /// #1951: the generated TypeScript adapters forward

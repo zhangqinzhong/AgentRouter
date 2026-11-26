@@ -355,7 +355,7 @@ mod tests {
             selection: crate::WorkstreamSelection::Named("default".into()),
             lease_owner: "host:2".into(),
         };
-        assert!(crate::workstream::prepare_run(&mut conn, &input, None, true).is_err());
+        assert!(crate::workstream::prepare_run(&mut conn, &input, None, true, false).is_err());
         assert_eq!(
             snapshot(&conn),
             ("active".into(), 3, 7, true, false),
@@ -366,7 +366,8 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         conn.execute_batch("DROP TRIGGER reject_new_run;").unwrap();
-        let prepared = crate::workstream::prepare_run(&mut conn, &input, None, true).unwrap();
+        let prepared =
+            crate::workstream::prepare_run(&mut conn, &input, None, true, false).unwrap();
         let pinned: bool = conn
             .query_row(
                 "SELECT scope_by_id FROM managed_runs WHERE id = ?1",
@@ -766,6 +767,7 @@ mod tests {
                 body: "continue".into(),
                 importance: 8,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -2689,6 +2691,7 @@ mod tests {
             body: body.into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         let body = "edited crates/ai-memory-store/src/reader.rs in ai-memory";
         let page = [4_u8; 16];
@@ -2803,6 +2806,7 @@ mod tests {
                 body: BODY.into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -2983,6 +2987,7 @@ mod tests {
                 body: "after V99".into(),
                 importance: 5,
                 file_path: Some("src/lib.rs".into()),
+                trust_class: None,
             },
         )
         .unwrap();
@@ -3042,6 +3047,7 @@ mod tests {
                 body: "before V112".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -3063,6 +3069,7 @@ mod tests {
                 source_id: session_id.to_string(),
                 observations,
             }],
+            trust_class: None,
         };
         // What the older build wrote: the session citation alone.
         let old_page =
@@ -3176,5 +3183,248 @@ mod tests {
             max_supported_version(),
             "the fresh install is at the newest embedded migration"
         );
+    }
+
+    /// V113 adds `trust_class` to `observations` and `pages`: pre-V113 rows
+    /// default to `model_generated`, post-V113 rows persist their assigned or
+    /// derived class, and the CHECK constraint rejects unknown values.
+    #[test]
+    fn v113_adds_trust_class_columns_with_model_generated_default() {
+        use ai_memory_core::{NewPage, PagePath, Tier, TrustClass};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 112).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        let legacy_obs = crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "legacy obs".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: None,
+            },
+        )
+        .unwrap();
+        let legacy_page = crate::ops::upsert_page(
+            &mut conn,
+            &NewPage {
+                workspace_id,
+                project_id,
+                path: PagePath::new("notes/legacy.md").unwrap(),
+                title: "legacy".into(),
+                body: "before V113".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+                trust_class: None,
+            },
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let obs_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM observations WHERE id = ?1",
+                [legacy_obs.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_trust, "model_generated");
+
+        let page_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM pages WHERE id = ?1",
+                [legacy_page.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_trust, "model_generated");
+
+        // Post-V113 observation persists its ingress trust class.
+        let new_obs = crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "after V113".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: Some(TrustClass::ToolResult),
+            },
+        )
+        .unwrap();
+        let new_obs_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM observations WHERE id = ?1",
+                [new_obs.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_obs_trust, "tool_result");
+
+        // CHECK constraint rejects invalid trust_class values.
+        let invalid = conn.execute(
+            "UPDATE pages SET trust_class = 'forged' WHERE id = ?1",
+            [legacy_page.as_bytes()],
+        );
+        assert!(
+            invalid.is_err(),
+            "CHECK constraint must reject invalid trust_class"
+        );
+    }
+
+    /// V114 rebuilds the auxiliary rows of pages and observations stored
+    /// before #2426 taught `cjk_index_terms` Arabic. Those rows exist with no
+    /// terms, so the startup backfill (an anti-join above its watermark)
+    /// skipped them and a normalized Arabic query never reached them (#2439).
+    /// A row without Arabic text keeps its auxiliary row.
+    #[test]
+    fn v114_reindexes_arabic_rows_stored_before_the_arabic_terms() {
+        use ai_memory_core::{NewPage, PagePath, Tier};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 113).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "إدارة المعرفة".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: None,
+            },
+        )
+        .unwrap();
+        // The Arabic page comes first, so a watermark left at the top rowid
+        // sits above it.
+        for (path, body) in [
+            ("notes/arabic.md", "إدارة المعرفة"),
+            ("notes/latin.md", "plain latin notes"),
+        ] {
+            crate::ops::upsert_page(
+                &mut conn,
+                &NewPage {
+                    workspace_id,
+                    project_id,
+                    path: PagePath::new(path).unwrap(),
+                    title: "notes".into(),
+                    body: body.into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                    evidence: Vec::new(),
+                    trust_class: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // What a store written before #2426 holds: an auxiliary row for every
+        // source row, with no terms for Arabic text, and both watermarks at
+        // the top rowid after a finished backfill.
+        conn.execute_batch(
+            "UPDATE pages_cjk_fts SET title = '', body = '', path_search = ''; \
+             UPDATE observations_cjk_fts SET title = '', body = ''; \
+             INSERT INTO backfill_watermarks (name, max_rowid) \
+                 SELECT 'cjk_pages', max(rowid) FROM pages; \
+             INSERT INTO backfill_watermarks (name, max_rowid) \
+                 SELECT 'cjk_observations', max(rowid) FROM observations;",
+        )
+        .unwrap();
+        let arabic_matches = |conn: &Connection, table: &str| -> i64 {
+            // A variant spelling: bare Alef where the stored text has Hamza.
+            let query = crate::fts_query::prepare_cjk_fts5_query("ادارة").unwrap();
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1"),
+                [query],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let stale = crate::ops::backfill_cjk_indexes(&mut conn).unwrap();
+        assert_eq!((stale.pages, stale.observations), (0, 0));
+        for table in ["pages_cjk_fts", "observations_cjk_fts"] {
+            assert_eq!(arabic_matches(&conn, table), 0, "{table} before V114");
+        }
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        // Only the Arabic rows lost their auxiliary rows, and both watermarks
+        // moved below them, so the next backfill rebuilds exactly those.
+        let rebuilt = crate::ops::backfill_cjk_indexes(&mut conn).unwrap();
+        assert_eq!((rebuilt.pages, rebuilt.observations), (1, 1));
+        for table in ["pages_cjk_fts", "observations_cjk_fts"] {
+            assert_eq!(arabic_matches(&conn, table), 1, "{table} after V114");
+        }
     }
 }
