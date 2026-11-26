@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 1.14.0-rc.2 - 2026-11-25
+
+### Features
+- Generate images natively in Codex profiles through a configured Images API provider and model.
+
+### Fixes
+- Launch the Codex app-server under ChatGPT's signed Node in the current ChatGPT.app layout.
+- Read Antigravity 2.34 quotas after the removal of GetUnleashData.
+- Price free Grok Build rows at zero and keep Batch/Flex tiers and unpinned Claude Mythos aliases off standard rates.
+
+### Maintenance
+- Add qwen4-max, Claude Mythos 5.2 and Gemini 4 Neon pricing.
+- Upgrade the bundled ai-memory to 3.6.2.
+
 ## 1.14.0-rc.1 - 2026-11-18
 
 ### Features
