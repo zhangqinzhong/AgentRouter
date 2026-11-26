@@ -1,5 +1,5 @@
 {
   "baseVersion": "1.13.0",
   "change": "minor",
-  "reason": "Add global profile recovery, per-provider deferred tool loading, OpenAI-compatible reasoning model metadata and new quota presets; absorb upstream gateway, pricing and memory updates and open the main window at a working size."
+  "reason": "Add global profile recovery, per-provider deferred tool loading, OpenAI-compatible reasoning model metadata, new quota presets and native image generation in Codex profiles; absorb upstream gateway, pricing and memory updates and open the main window at a working size."
 }
