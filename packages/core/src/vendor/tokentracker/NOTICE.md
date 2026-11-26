@@ -128,3 +128,13 @@ base model's rate. AgentRouter does not model OpenAI speed tiers, so the GPT-6.2
 Ultrafast promotion and its session-time repricing are not part of this refresh.
 Trae, Qoder and Antigravity collector changes do not apply to AgentRouter's
 sources.
+
+Refreshed from upstream v1.5.25–v1.5.27 (2026-11-25, `432156a1`): qwen4-max and
+Claude Mythos 5.2 rates with unpinned Mythos aliases left unpriced (#1145),
+Gemini 4 Neon Standard rates (#1149), Batch/Flex delivery tiers kept off
+standard-rate aliases, provider-qualified LiteLLM exact lookups, free Grok Build
+rows at zero cost, and Antigravity 2.34 limits read through `GetUserStatus` and
+the daemon hub file after `GetUnleashData` was removed (#1159). Not included:
+pricing refetches triggered by every unpriced model (AgentRouter keeps its daily
+refresh), the source-recorded cost provenance of v1.5.27 (it serves TokenTracker's
+cloud upload and dashboard), and the DeepAI Code source.

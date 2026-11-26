@@ -54,6 +54,7 @@ const seedRaw = loadSeedSync();
 
 const state = {
   loaded: false,
+  generation: 0,
   loadingPromise: null,
   revision: 0,
   litellmRawMap: seedRaw, // raw per-token; field shape from LiteLLM JSON
@@ -62,6 +63,11 @@ const state = {
   // negativeCache prevents re-walking the LiteLLM map for models we've already
   // determined are unknown. Cleared on every reload.
   negativeCache: new Set(),
+  refreshPromise: null,
+  refreshOptions: null,
+  lastRefreshAttempt: 0,
+  fetchedAt: null,
+  refreshFailed: false,
 };
 
 function defaultCachePath() {
@@ -79,6 +85,8 @@ async function ensurePricingLoaded(opts = {}) {
       state.litellmRawMap = data || {};
       state.litellmPerMillionMap = buildLitellmPerMillionMap(state.litellmRawMap);
       state.source = source;
+      state.refreshOptions = { ...opts, cachePath };
+      state.fetchedAt = source === "upstream" ? new Date().toISOString() : null;
       state.loaded = true;
       state.revision += 1;
       state.negativeCache.clear();
@@ -91,10 +99,52 @@ async function ensurePricingLoaded(opts = {}) {
   return state.loadingPromise;
 }
 
+// Misses never block a synchronous calculation. Only initialized server processes
+// refresh automatically; a module import (tests, offline tools) does not fetch.
+function refreshPricing(opts = {}) {
+  if (state.refreshPromise) return state.refreshPromise;
+  const now = opts.now ?? Date.now();
+  if (state.lastRefreshAttempt && now - state.lastRefreshAttempt < 60_000) return Promise.resolve(false);
+  state.lastRefreshAttempt = now;
+  const generation = state.generation;
+  const options = { ...(state.refreshOptions || {}), ...opts };
+  state.refreshPromise = (async () => {
+    try {
+      const result = await loadLitellmData({ ...options, cachePath: options.cachePath || defaultCachePath(), ttlMs: 0 });
+      if (generation !== state.generation) return false;
+      if (result.source !== "upstream") { state.refreshFailed = true; return false; }
+      const map = buildLitellmPerMillionMap(result.data);
+      if (!Object.keys(map).length) { state.refreshFailed = true; return false; }
+      state.litellmRawMap = result.data;
+      state.litellmPerMillionMap = map;
+      state.source = result.source;
+      state.fetchedAt = new Date().toISOString();
+      state.refreshFailed = false;
+      state.revision += 1;
+      state.negativeCache.clear();
+      return true;
+    } catch (_) { if (generation === state.generation) state.refreshFailed = true; return false; }
+    finally { if (generation === state.generation) state.refreshPromise = null; }
+  })();
+  return state.refreshPromise;
+}
+
+function getPricingHealth() {
+  return { source: state.source, revision: state.revision, fetched_at: state.fetchedAt,
+    refreshing: !!state.refreshPromise, status: state.refreshFailed || (state.fetchedAt && Date.now() - Date.parse(state.fetchedAt) > 24 * 60 * 60_000) ? "stale" : state.fetchedAt ? "fresh" : "cached",
+    known_models: Object.keys(state.litellmPerMillionMap).length };
+}
+
 // For tests: drop loaded state so a fresh call can re-load. Seeds with the
 // bundled snapshot so getModelPricing() still works without ensurePricingLoaded.
 function resetPricingForTests() {
+  state.generation += 1;
   state.loaded = false;
+  state.refreshOptions = null;
+  state.lastRefreshAttempt = 0;
+  state.refreshFailed = false;
+  state.fetchedAt = null;
+  state.refreshPromise = null;
   state.loadingPromise = null;
   state.litellmRawMap = seedRaw;
   state.litellmPerMillionMap = buildLitellmPerMillionMap(seedRaw);
@@ -168,7 +218,7 @@ function computeModelPricingInfo(model, opts, sourceKey) {
   return {
     status: !result.hit ? "unpriced" : [rates.input, rates.output, rates.cache_read, rates.cache_write]
       .some((value) => Number(value) > 0) ? "priced" : "free",
-    source: result.hit ? result.source : null,
+    source: result.hit || result.source === "ambiguous" ? result.source : null,
     input: Number(rates.input) || 0,
     output: Number(rates.output) || 0,
     cache_read: Number(rates.cache_read) || 0,
@@ -227,6 +277,10 @@ function getRowPricing(row) {
 // server share one source of truth.
 function computeRowCost(row) {
   if (LOCAL_INFERENCE_SOURCES.has(String(row?.source || "").toLowerCase())) return 0;
+  if (row?.source === "grok") {
+    const grokModel = String(row?.model || "").toLowerCase();
+    if (grokModel.includes("build-free") || grokModel.includes("free-tier") || grokModel.endsWith("-free")) return 0;
+  }
   // Pi can route a turn through a subscription-backed Copilot provider. Pi's
   // usage record reports a zero marginal cost for those turns; do not
   // reinterpret the Claude model name as an Anthropic API bill.
@@ -303,6 +357,8 @@ const MODEL_PRICING = curatedOverrides.exact;
 
 module.exports = {
   ensurePricingLoaded,
+  refreshPricing,
+  getPricingHealth,
   getPricingRevision,
   getModelPricing,
   getModelPricingInfo,
