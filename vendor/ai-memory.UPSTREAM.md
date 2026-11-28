@@ -1,10 +1,10 @@
 # ai-memory provenance
 
 - Upstream: https://github.com/akitaonrails/ai-memory
-- Release: v3.6.2
-- Commit: `45a97cf8157ac646abc1633f430fc1a52a9f874a`
+- Release: v3.6.4
+- Commit: `e1abfd7158883647f90047d56979d4780d82106e`
 - License: MIT, retained verbatim in `ai-memory/LICENSE`.
-- Import: complete GitHub source archive at the pinned v3.6.2 commit, without the upstream Git database.
+- Import: complete GitHub source archive at the pinned v3.6.4 commit, without the upstream Git database.
 
 The source matches the pinned release archive. Upstream sanitizer fixtures use
 explicit FAKE test credentials; no local credentials are included.

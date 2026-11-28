@@ -13,7 +13,8 @@ team's shared memory can live as reviewable markdown in git:
 - `sync --check` is a read-only CI gate, and `install-hook` runs `sync`
   after every git merge.
 
-`sync --apply` needs ai-memory 3.0 or later: every write and delete is
+`sync --apply` supports both HTTP transport modes, including
+`serve --http-stateful`. It needs ai-memory 3.0 or later: every write and delete is
 conditional on the page version the plan saw, and an older server would
 ignore that condition, so `sync` refuses to write to one.
 
@@ -221,7 +222,10 @@ Safety rules:
   the tool rechecks that its repository file is still absent. A file restored
   during planning keeps the server page and baseline, even with `--prefer repo`;
   the run reports the change and exits non-zero so the next sync can reconsider
-  it. The tool never runs git: it prints the `git rm` to stage the deletes.
+  it. Before deleting repository files, the tool refreshes the server page
+  listing. A page present in the refreshed listing keeps its file and
+  baseline, including with `--prefer server`, and is reported for the next
+  sync. The tool never runs git: it prints the `git rm` to stage the deletes.
   Apply order is imports, exports, server deletes, file deletes.
 
 ## CI and post-merge

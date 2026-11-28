@@ -11,6 +11,90 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.6.4] - 2026-11-27
+
+### Fixed
+
+- Paused queued session consolidation when its LLM route ran out of credit
+  or quota. The pause survived restarts and kept pending jobs from spending
+  retries before the route could accept work again. ([#2499](https://github.com/akitaonrails/ai-memory/pull/2499))
+- Applied host-file permissions to `backup-agents` and `restore-agents` in
+  the POSIX container wrapper. Rootless Docker and Podman can now read and
+  write agent assets and archives under the invoking user's bind mounts.
+  These commands also use the existing host-file treatment on
+  SELinux-enforcing hosts.
+- Rejected pre-migration backups with missing or corrupt gzip trailers before
+  saving their receipts or starting the wiki migration.
+- File-based imports reject a `--manifest-out` path that resolves to one of
+  their input files. A dry run could otherwise replace the source document,
+  conversation, export, mapping file, or SQLite database with its manifest.
+- Fixed `reclaim-ledger-versions --drop-latest` answering "nothing to reclaim"
+  when only recognized live ledger heads were selected: the preview and the
+  `--confirm` report now count the selected heads' paths and rows, and report
+  heads apart from superseded versions. (#2513)
+- Stopped the `/web` Features page from reporting automatic learning as
+  "Scheduled" when only `[auto_improve] on_session_end` was set. The key has
+  no effect, since session-end triggering stays off and
+  `[auto_improve.scheduler]` runs reviews; the config template, the key's
+  documentation and the page's next step said otherwise. (#2515)
+- Scoped the project dashboard's summary query to the project being viewed,
+  avoiding aggregates for unrelated projects during recurring refreshes.
+- Preserved the current fallback session ID when `finalize-session` closes
+  a different session. The fallback clears only when its own session-end
+  is acknowledged, including when a later request in `--all` fails.
+- Fixed `ai-memory-wikisync sync --apply` against servers started with
+  `--http-stateful`. The companion initializes one MCP session before
+  checking tool capabilities and reuses it for conditional writes and deletes.
+- Native `antigravity-cli` `stop` hooks now emit `{"decision":""}` on stdout to
+  match Antigravity's documented `Stop` response contract and the shell and
+  PowerShell hook bundles. (#2521)
+- `ai-memory run antigravity` now recognizes `--resume` and `-r` (added in
+  Antigravity CLI 1.5.16 as aliases for `--conversation`) as explicit native
+  session selectors, preventing linked-session overrides and preserving exact
+  `finalize-session` targeting on exit. (#2522)
+- Updated `install-hooks --agent antigravity-cli` finalization guidance and the
+  Antigravity / Command Code documentation in `docs/support-matrix.md` and
+  `docs/managed-workstreams.md` to cover `ai-memory run` automatic
+  finalization (interactive and headless), `[sessions] idle_end_after_hours`,
+  and headless `agy -p --output-format json` `conversation_id` finalization.
+- Fixed `backup-agents` to archive Claude Desktop's `claude_desktop_config.json`
+  on Linux, from `$XDG_CONFIG_HOME/Claude` where `install-mcp` writes it.
+  `restore-agents` already restored the entry there. (#2528)
+- Fixed `backup-agents` and `restore-agents` on Windows to use Devin's
+  `%APPDATA%\devin` for its global `config.json`, `mcp_config.json` and skills,
+  where `install-mcp`, `install-hooks` and `install-skills` write them. A backup
+  no longer reads `%USERPROFILE%\.config\devin` in their place, and a restore
+  writes the entries back under the destination's `%APPDATA%\devin`. (#2530)
+- Forwarded `CODEX_HOME` and sibling agent config-home environment overrides
+  (`COPILOT_HOME`, `GEMINI_CLI_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`,
+  `KIRO_HOME`, `HERMES_HOME`) through the POSIX and PowerShell container
+  wrappers so helper commands such as `backup-agents` and `restore-agents`
+  honor non-default agent homes. (#2508)
+
+## [3.6.3] - 2026-11-26
+
+### Fixed
+
+- Kept repository files and their sync state when their server pages
+  reappear before `ai-memory-wikisync` applies local deletions. (#986)
+- Kept validated MCP server and tool names from Antigravity CLI tool hooks
+  while retaining the metadata-only capture policy. (#2505)
+- Raised `ai-memory-wikisync`'s per-segment filename limit (`MAX_SEGMENT_BYTES`)
+  from 64 to 128 bytes so legitimate server-generated ASCII filenames (such as
+  ~80-byte auto-improve gotcha pages) no longer abort the entire project
+  export or sync batch, while keeping `MAX_PATH_BYTES` (180), `MAX_DEPTH` (8),
+  and fail-closed rejection of unsafe paths intact. (#2488)
+- Rule-based session pages now compute `started_at` and session duration from
+  the earliest `SessionStart` observation instead of the latest one, so
+  compacted or resumed sessions no longer lose the time spent before the last
+  compaction or resume. (#2502)
+- Resuming an ended session and exiting without a user prompt or tool call no
+  longer re-ends the session, rewrites its wiki page, refreshes its
+  auto-handoff, or enqueues a duplicate LLM consolidation job. `AlreadyEnded`
+  detection now requires substantive observations past the end watermark, and
+  ended-session consolidation jobs key their generation on
+  `ended_observation_count`. (#2504)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
@@ -6463,7 +6547,9 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.4...HEAD
+[3.6.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.4
+[3.6.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.3
 [3.6.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.2
 [3.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1
 [3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0
