@@ -49,3 +49,17 @@ Baseline: AgentRouter `1f7fe64ba` (1.14.0-rc.1), integrated on `main`.
 grants). A copy of a live 3.5.0 store migrated with page, observation and
 session counts unchanged and `quick_check` ok. Back up `~/.agentrouter/ai-memory`
 before installing.
+
+## 2026-11-27 follow-up (1.14.0-rc.3)
+
+- TokenTracker v1.5.28–v1.5.34: GPT-6.2 Healthcare, `qwen4-max-preview` and
+  `grok-4.7-latest` rates (#1179) are integrated. The Claude cli/sdk-cli dedup
+  (#1167) was checked against the local Claude stores: none of 61,152 messages
+  carries two request ids, so it is not ported. The Codex session-cache and
+  legacy-bucket fixes (#1175, #1130) repair code paths AgentRouter does not
+  have; Cloudflare backends, T3 Code quotas and platform app fixes do not apply.
+- ai-memory v3.6.4 (`e1abfd71`): no new migrations; duplicate consolidation
+  after empty resumes and consolidation pause on provider billing exhaustion.
+- CCR and CliRelay: no releases since the previous review.
+- The memory runtime is not connected to the Claude desktop Code tab, at the
+  user's request.

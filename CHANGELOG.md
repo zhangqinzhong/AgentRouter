@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.14.0-rc.3 - 2026-11-27
+
+### Maintenance
+- Add GPT-6.2 Healthcare, qwen4-max-preview and grok-4.7-latest pricing.
+- Upgrade the bundled ai-memory to 3.6.4.
+
 ## 1.14.0-rc.2 - 2026-11-25
 
 ### Features
