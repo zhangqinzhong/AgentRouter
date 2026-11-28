@@ -138,3 +138,13 @@ the daemon hub file after `GetUnleashData` was removed (#1159). Not included:
 pricing refetches triggered by every unpriced model (AgentRouter keeps its daily
 refresh), the source-recorded cost provenance of v1.5.27 (it serves TokenTracker's
 cloud upload and dashboard), and the DeepAI Code source.
+
+Pricing refreshed from upstream v1.5.32 (2026-11-27, `b37fc286`, #1179): GPT-6.2
+Healthcare configurations at their Standard rates, the retired but callable
+`qwen4-max-preview` id at the qwen4-max rate (dated preview snapshots stay
+unpriced), and the official `grok-4.7-latest` alias. Reviewed and not included
+from v1.5.28–v1.5.34: the Claude cli/sdk-cli dedup (#1167; no message in the
+local Claude stores carries two request ids), the Codex session-cache and
+legacy-bucket fixes (#1175, #1130; they repair code paths AgentRouter does not
+have), the OMP transcript prefilter, Cloudflare account backends, T3 Code
+quotas, Windows and macOS app fixes.
